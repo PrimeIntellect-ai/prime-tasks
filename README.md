@@ -1,2 +1,2 @@
-# research-tasks
-Large-scale Harbor task data backing research-environments tasksets.
+# prime-tasks
+Harbor task data backing tasksets in prime-envs.
