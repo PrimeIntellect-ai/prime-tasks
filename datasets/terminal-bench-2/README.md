@@ -25,5 +25,5 @@ uv run prime images push tb2-qemu-startup:20251031-eol --context qemu-startup/en
 uv run prime images push tb2-qemu-alpine-ssh:20251031-eol --context qemu-alpine-ssh/environment --public
 ```
 
-The `terminal-bench-2` environment in `prime-envs` loads the other 87 tasks
+The `pi-terminal-bench-2` environment in `prime-envs` loads the other 87 tasks
 directly from the upstream Harbor dataset.
