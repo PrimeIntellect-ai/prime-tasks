@@ -17,13 +17,11 @@ in `environment/Dockerfile`.
 image and installs CA certificates. The task files stay in Harbor. The
 `pi-terminal-bench-2` environment substitutes only this task's image reference.
 
-The QEMU images are published as:
+The images are published as:
 
 - `prime/primeintellect/tb2-qemu-startup:20251031-eol`
 - `prime/primeintellect/tb2-qemu-alpine-ssh:20251031-eol`
-
-The planned financial document image is
-`prime/primeintellect/tb2-financial-document-processor:20251031-ca`.
+- `prime/primeintellect/tb2-financial-document-processor:20251031-ca`
 
 To build from this directory:
 
