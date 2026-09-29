@@ -3,15 +3,23 @@
 The 200 ProgramBench tasks exported from the upstream Harbor dataset proposal at
 [bencalvert04/harbor-datasets@3e438b1](https://github.com/bencalvert04/harbor-datasets/tree/3e438b1706ffad23308db57fb681a3ac3f9c30d4/datasets/programbench).
 The upstream calculator fixture is excluded. Instructions, source images, oracle
-solutions, hidden-test metadata, and evaluator scripts are preserved.
+solutions, test cases, and evaluator scripts are preserved. Task-specific verifier
+settings account for demonstrated environment incompatibilities:
 
-Each `tests/Dockerfile` is built unchanged as a public Linux amd64 Prime image:
+- oha uses `branch_env.NO_COLOR = "true"`; its CLI rejects the value `"1"`.
+- age disables the suite-wide `script` PTY so non-TTY passphrase tests return
+  instead of prompting. Tests requiring a terminal create their own.
+
+Each `tests/Dockerfile` is built as a public Linux amd64 Prime image. The imported
+images use:
 
 ```text
 prime/primeintellect/programbench-verifier.x86.<task-directory>:3e438b1
 ```
 
-The task manifest adds that image to `[verifier.environment].docker_image`.
+Each task's `[verifier.environment].docker_image` is authoritative. oha pins a
+rebuilt image containing its corrected test metadata. Dedicated verifier images
+own `/tests`; changing packaged tests or metadata alone does not update grading.
 The explicit `[verifier].user = "root"` field is omitted because the verifier
 images already run as root; the Verifiers Harbor loader does not accept user
 overrides. Verification remains in a separate sandbox, with only declared
@@ -34,9 +42,35 @@ JSONL format (one entry per task):
 Then build and publish using the configured Prime Intellect team:
 
 ```bash
-prime images push-bulk --manifest verifier-builds.jsonl --public --plain
+uv run --no-project prime images push-bulk --manifest verifier-builds.jsonl --public --plain
 ```
 
 Select a new tag for changed build inputs and update each task manifest to the
 returned image reference. The `programbench_env` package in `prime-envs` loads
 these tasks through the native Harbor integration.
+
+## Validate oracle results
+
+Run the oracle through the native solver-to-fresh-verifier path and retain
+`programbench_eval.json`, `harbor_diagnostics.json`, and `reward.json`. Then check
+the saved logs against the exact task metadata used by the verifier:
+
+```bash
+uv run --no-project scripts/programbench/check_oracle.py \
+  datasets/programbench/filosottile--age.706dfc1 /path/to/saved/verifier-logs
+```
+
+This author-side gate requires a nonempty applicable-test set, every applicable
+test passing, no top-level or branch errors, and consistent reward/diagnostic
+files. It lists missing cases even when `infra_error` is zero. A zero reward or
+partial oracle is not a validation pass. This gate does not replace candidate
+scoring or classify every candidate timeout as infrastructure failure.
+
+Use VF's safe artifact-link support (verifiers PR #2710 or a later version
+containing it) when validating realistic Rust submissions. `.gitignore` does not
+filter the declared workspace artifact handoff.
+
+The imported oracle reconstructs the reference executable; it does not establish
+that an original-source gold patch builds on a fresh checkout. Validate empty
+submissions separately (expected reward zero) and retain the underlying failure
+reason so a broken grader cannot masquerade as a successful negative control.
