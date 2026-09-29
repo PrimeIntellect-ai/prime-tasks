@@ -51,6 +51,21 @@ these tasks through the native Harbor integration.
 
 ## Validate oracle results
 
+Run both controls without a model, using the published images and VF's native
+artifact transfer and separate-verifier lifecycle:
+
+```bash
+uv run scripts/programbench/validate.py --output /path/to/programbench-qc
+```
+
+Use `--task <directory-name>` to select a task, or `--control gold|empty` to run
+one control. The command checks all selected manifests before provisioning,
+retains logs and runtime IDs, and exits unsuccessfully if any control fails.
+Gold also checks that normal hard links and confined relative symlinks survive
+artifact transfer and that the verifier initially contains no reference binary.
+Successful results are reusable only for the same task-file fingerprint; failed
+and stale attempts are retained when rerunning the command.
+
 Run the oracle through the native solver-to-fresh-verifier path and retain
 `programbench_eval.json`, `harbor_diagnostics.json`, and `reward.json`. Then check
 the saved logs against the exact task metadata used by the verifier:
