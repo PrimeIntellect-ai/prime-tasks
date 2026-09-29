@@ -4,6 +4,9 @@ set -euo pipefail
 # Verifier exec may not inherit image ENV (Modal/gVisor, login-shell resets).
 export PATH="/usr/local/go/bin:/go/bin:/usr/local/cargo/bin:/root/.cargo/bin:${PATH}"
 
+# Match the unprivileged ICMP socket permission supplied by Docker.
+sysctl -q -w "net.ipv4.ping_group_range=0 2147483647"
+
 mkdir -p /logs/verifier /logs/artifacts
 
 write_failure() {
