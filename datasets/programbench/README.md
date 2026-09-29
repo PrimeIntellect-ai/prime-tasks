@@ -61,6 +61,11 @@ artifact transfer and that the verifier initially contains no reference binary.
 Successful results are reusable only for the same task-file fingerprint; failed
 and stale attempts are retained when rerunning the command.
 
+[`qc-evidence.json`](qc-evidence.json) records the verified subset, task
+fingerprints, published image references, active-case counts, and hashes of the
+saved control logs. Its `verified_tasks` count must reach `expected_tasks` before
+the full dataset is considered validated.
+
 Run the oracle through the native solver-to-fresh-verifier path and retain
 `programbench_eval.json`, `harbor_diagnostics.json`, and `reward.json`. Then check
 the saved logs against the exact task metadata used by the verifier:

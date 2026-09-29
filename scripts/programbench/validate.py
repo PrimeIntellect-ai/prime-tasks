@@ -53,14 +53,36 @@ def empty_workspace() -> bytes:
     return buffer.getvalue()
 
 
+def check_control(
+    path: Path, folder: Path, control: str, reward: float
+) -> tuple[bool, dict]:
+    qc = check(path, folder)
+    if control == "gold":
+        return reward == 1 and qc["oracle_pass"], qc
+    return (
+        reward == 0
+        and qc["outputs_consistent"]
+        and qc["n_expected"] > 0
+        and qc["error_code"] == "missing_compile_sh"
+        and qc["statuses"] == {"not_run": qc["n_expected"]}
+        and not qc["branch_errors"],
+        qc,
+    )
+
+
 async def validate(path: Path, index: int, control: str, output: Path) -> dict:
     folder = output / path.name / control
     fingerprint_value = fingerprint(path)
     previous = folder / "result.json"
     if previous.exists():
-        old = json.loads(previous.read_text())
-        if old.get("passed") and old.get("task_sha256") == fingerprint_value:
-            return old
+        try:
+            old = json.loads(previous.read_text())
+            if old.get("passed") and old.get("task_sha256") == fingerprint_value:
+                passed, _ = check_control(path, folder, control, old["reward"])
+                if passed:
+                    return old
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass  # Preserve invalid cached evidence as a failed attempt below.
     if folder.exists():
         # Retain every failed or stale attempt, including its logs and VM IDs.
         folder.rename(folder.with_name(f"{control}-attempt-{time.time_ns()}"))
@@ -172,15 +194,11 @@ async def validate(path: Path, index: int, control: str, output: Path) -> dict:
             episode = vf.Episode(task=trace.task, traces=[trace])
             await env.finalize(task, episode)
         record["reward"] = episode.traces[0].rewards["reward"].score
-        if control == "gold":
-            record["qc"] = check(path, folder)
-            record["passed"] = record["reward"] == 1 and record["qc"]["oracle_pass"]
-        else:
-            result = json.loads((folder / "programbench_eval.json").read_text())
-            record["error_code"] = result["error_code"]
-            record["passed"] = (
-                record["reward"] == 0 and result["error_code"] == "missing_compile_sh"
-            )
+        record["passed"], record["qc"] = check_control(
+            path, folder, control, record["reward"]
+        )
+        if control == "empty":
+            record["error_code"] = record["qc"]["error_code"]
         record["status"] = "passed" if record["passed"] else "control_failed"
     except Exception as exc:  # noqa: BLE001 - report each task failure without abandoning the batch
         record.update(status="execution_error", error=f"{type(exc).__name__}: {exc}")
