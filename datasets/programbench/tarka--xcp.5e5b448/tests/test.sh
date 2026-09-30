@@ -4,6 +4,8 @@ set -euo pipefail
 # Verifier exec may not inherit image ENV (Modal/gVisor, login-shell resets).
 export PATH="/usr/local/go/bin:/go/bin:/usr/local/cargo/bin:/root/.cargo/bin:${PATH}"
 
+mount -o remount,size=3G,noatime /dev/shm
+
 mkdir -p /logs/verifier /logs/artifacts
 
 write_failure() {

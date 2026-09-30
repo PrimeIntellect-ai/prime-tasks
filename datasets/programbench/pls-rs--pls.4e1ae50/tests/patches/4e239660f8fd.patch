@@ -1,0 +1,140 @@
+--- a/eval/tests/test_detail_size_time.py
++++ b/eval/tests/test_detail_size_time.py
+@@ -16,17 +16,23 @@
+ RESOURCES = Path(__file__).parent.parent / "test_resources" / "test_detail_size_time"
+ 
+ 
+-def setup_module():
++def _setup_large_files():
+     """Setup large sparse files that are too big to commit to git."""
+-    largefile_dir = RESOURCES / "largefile"
++    import tempfile
++    global LARGEFILES
++    # tmpfs supports these logical sizes without allocating data blocks.
++    # Each worker owns its fixture; native ext4 can cap sparse files below 5TiB.
++    LARGEFILES = Path(tempfile.mkdtemp(prefix="pls-large-", dir="/dev/shm"))
++    largefile_dir = LARGEFILES
++    (largefile_dir / ".gitkeep").touch()
+     largefile_dir.mkdir(parents=True, exist_ok=True)
+     
+     sparse_1tib = largefile_dir / "sparse_1tib.txt"
+     sparse_5tib = largefile_dir / "sparse_5tib.txt"
+     
+-    if not sparse_1tib.exists():
++    if not sparse_1tib.exists() or sparse_1tib.stat().st_size != 1024**4:
+         subprocess.run(["truncate", "-s", "1T", str(sparse_1tib)], check=True)
+-    if not sparse_5tib.exists():
++    if not sparse_5tib.exists() or sparse_5tib.stat().st_size != 5 * 1024**4:
+         subprocess.run(["truncate", "-s", "5T", str(sparse_5tib)], check=True)
+     
+     alignment_dir = RESOURCES / "alignment"
+@@ -625,7 +631,7 @@
+     
+     Golden files: terabyte.golden -- TiB-scale files with binary units
+     """
+-    result = run_binary(["--det", "size", str(RESOURCES / "largefile")])
++    result = run_binary(["--det", "size", str(LARGEFILES)])
+     assert result.returncode == 0, f"Failed: {result.stderr}"
+     assert result.stdout == (RESOURCES / "terabyte.golden").read_text()
+ 
+@@ -639,7 +645,7 @@
+     Golden files: terabyte_decimal.golden -- TiB-scale files with decimal units
+     """
+     result = run_binary(["--det", "size", "--unit", "decimal", 
+-                        str(RESOURCES / "largefile")])
++                        str(LARGEFILES)])
+     assert result.returncode == 0, f"Failed: {result.stderr}"
+     assert result.stdout == (RESOURCES / "terabyte_decimal.golden").read_text()
+ 
+@@ -665,10 +671,18 @@
+     
+     Golden files: sparse_vs_real.golden -- 10MB sparse vs real file blocks comparison
+     """
++    sparse = RESOURCES / "sparse_vs_real" / "sparse_10mb.txt"
++    with sparse.open("wb") as stream:
++        stream.seek(10 * 1024**2 - 1)
++        stream.write(b"\0")
++    real = RESOURCES / "sparse_vs_real" / "real_10mb.txt"
++    assert real.stat().st_size == sparse.stat().st_size
++    assert real.stat().st_blocks > sparse.stat().st_blocks
+     result = run_binary(["--det", "size", "--det", "blocks", 
+                         str(RESOURCES / "sparse_vs_real")])
+     assert result.returncode == 0, f"Failed: {result.stderr}"
+-    assert result.stdout == (RESOURCES / "sparse_vs_real.golden").read_text()
++    expected = expected_blocks((RESOURCES / "sparse_vs_real.golden").read_text(), RESOURCES / "sparse_vs_real")
++    assert result.stdout == expected
+ 
+ 
+ def test_none_detail_shows_only_names(run_binary):
+@@ -844,7 +858,8 @@
+     result = run_binary(["--det", "size", "--det", "blocks", 
+                         str(RESOURCES / "blocktest")])
+     assert result.returncode == 0, f"Failed: {result.stderr}"
+-    assert result.stdout == (RESOURCES / "empty_vs_nonzero_blocks.golden").read_text()
++    expected = expected_blocks((RESOURCES / "empty_vs_nonzero_blocks.golden").read_text(), RESOURCES / "blocktest")
++    assert result.stdout == expected
+ 
+ 
+ def test_multiple_unit_flags_last_wins(run_binary):
+@@ -871,3 +886,30 @@
+     result = run_binary(["--det", "size", str(RESOURCES / "rounding")])
+     assert result.returncode == 0, f"Failed: {result.stderr}"
+     assert result.stdout == (RESOURCES / "rounding_binary.golden").read_text()
++
++
++def teardown_module():
++    import shutil
++    if "LARGEFILES" in globals():
++        shutil.rmtree(LARGEFILES)
++
++
++def setup_module():
++    # Every xdist worker imports this module. Keep files invisible to other
++    # tests until truncate has established their final sparse logical size.
++    import fcntl
++    with open("/tmp/pls-large-fixtures.lock", "w") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        _setup_large_files()
++
++
++def expected_blocks(golden, directory):
++    """Preserve the snapshot's layout, using independent native block counts."""
++    import re
++    lines = golden.splitlines(keepends=True)
++    for index, line in enumerate(lines[1:], 1):
++        name = line.split()[-1]
++        blocks = (directory / name).stat().st_blocks
++        # The Blocks column is six characters wide (including its heading).
++        lines[index] = re.sub(r"(?<=B) +[0-9]+(?= )", f" {blocks:6d}", line, count=1)
++    return "".join(lines)
+--- a/eval/tests/conftest.py
++++ b/eval/tests/conftest.py
+@@ -103,3 +103,13 @@
+             shutil.rmtree(self.tmpdir, ignore_errors=True)
+     
+     return TempFS()
++
++
++@pytest.fixture(scope="session", autouse=True)
++def archived_fixture_modes():
++    resources = Path(__file__).resolve().parents[1] / "test_resources"
++    for relative in ("test_args_output/stable_dir", "test_presentation/collapse_test"):
++        tree = resources / relative
++        for path in (tree, *tree.rglob("*")):
++            if not path.is_symlink():
++                path.chmod(0o755 if path.is_dir() else 0o644)
+--- a/eval/tests/test_sorting.py
++++ b/eval/tests/test_sorting.py
+@@ -1056,4 +1056,11 @@
+     """
+     result = run_binary(["eval/test_resources/test_sorting/sample_files", "--sort=size", "--sort=name_", "--det=size"])
+     assert result.returncode == 0, result.stderr
+-    assert result.stdout == (RESOURCES / "sort_mixed_forward_reverse.golden").read_text()
++    # The directory participates in size sorting too; its size is filesystem
++    # dependent. Sort independently by native metadata and reversed names.
++    directory = RESOURCES / "sample_files"
++    expected = sorted(directory.iterdir(), key=lambda path: path.name, reverse=True)
++    expected.sort(key=lambda path: path.stat().st_size)
++    lines = result.stdout.splitlines()
++    assert lines[0].strip() == "Size Name"
++    assert [line.split()[-1].rstrip("/") for line in lines[1:]] == [path.name for path in expected]

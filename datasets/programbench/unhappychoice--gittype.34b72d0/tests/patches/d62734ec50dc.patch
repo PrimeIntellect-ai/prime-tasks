@@ -1,0 +1,226 @@
+--- a/eval/tests/conftest.py
++++ b/eval/tests/conftest.py
+@@ -14,36 +14,35 @@
+ 
+ @pytest.fixture(autouse=True)
+ def _reap_orphaned_descendants():
+-    """After each test, SIGKILL descendants the test forgot to clean up.
+-
+-    Some tests spawn the gittype binary (a TUI) inside `script -q -c` or
+-    via tmux/tui2cli. If a test errors before its teardown runs, those
+-    children survive — kept alive by their open pty — and accumulate
+-    across the run. With xdist's --max-worker-restart cap they eventually
+-    starve every worker. Best-effort sweep with pgrep + os.kill keeps the
+-    blast radius to the failing test.
+-    """
+-    yield
++    """Adopt and reap PTY children which start their own process sessions."""
++    import ctypes
++    import time
++    # script(1) puts its child in a different session, so killing only the
++    # script process group leaves the TUI alive. Adopt those children here.
++    libc = ctypes.CDLL(None, use_errno=True)
++    assert libc.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
++    def children():
++        result = subprocess.run(["pgrep", "-P", str(os.getpid())], capture_output=True, text=True)
++        return {int(pid) for pid in result.stdout.split()}
++    existing = children()
+     try:
+-        out = subprocess.check_output(
+-            ["pgrep", "-P", str(os.getpid()), "-f", "executable|tmux|script"],
+-            text=True,
+-        )
+-    except subprocess.CalledProcessError:
+-        return
+-    for raw in out.split():
+-        try:
+-            pid = int(raw)
+-        except ValueError:
+-            continue
+-        # Use os.kill, not os.killpg: pgrep returns regular pids, not
+-        # pgids; killpg silently no-ops (ESRCH) on non-leaders. Tests that
+-        # spawn via start_new_session/setsid will see their leader killed
+-        # here and the rest of the group reaped by the kernel.
+-        try:
+-            os.kill(pid, signal.SIGKILL)
+-        except (ProcessLookupError, PermissionError):
+-            pass
++        yield
++    finally:
++        for _ in range(8):
++            remaining = children() - existing
++            if not remaining:
++                break
++            for pid in remaining:
++                try:
++                    os.kill(pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++            time.sleep(0.01)
++            for pid in remaining:
++                try:
++                    os.waitpid(pid, os.WNOHANG)
++                except ChildProcessError:
++                    pass
+ 
+ 
+ @pytest.fixture
+@@ -235,3 +234,48 @@
+         return cleaned_result
+ 
+     return _run
++
++
++@pytest.fixture
++def qc_small_repo():
++    import tempfile
++    import shutil
++    # GitType's default filters exclude every file below /tmp or /temp.
++    repo = Path(tempfile.mkdtemp(prefix="qc-input-", dir="/workspace"))
++    try:
++        code = "\n\n".join(
++            f"def greeting_{index}(name, count):\n"
++            "    message = 'Hello, ' + name\n"
++            "    greetings = []\n"
++            "    for item in range(count):\n"
++            "        greetings.append(str(item) + message)\n"
++            "    return '\\n'.join(greetings)\n"
++            for index in range(5)
++        )
++        (repo / "sample.py").write_text(code)
++        for args in (["init", "-q"], ["add", "."], ["-c", "user.name=QC", "-c", "user.email=qc@example.invalid", "commit", "-qm", "fixture"]):
++            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
++        yield repo
++    finally:
++        shutil.rmtree(repo)
++
++
++def fixed_version_cache(home, latest="0.8.0"):
++    import json
++    from datetime import datetime, timezone
++    cache = home / ".gittype"
++    cache.mkdir(parents=True, exist_ok=True)
++    (cache / "version_cache.json").write_text(json.dumps({
++        "current_version": "0.8.0", "latest_version": latest,
++        "update_available": latest != "0.8.0",
++        "last_checked": datetime.now(timezone.utc).isoformat(),
++    }))
++
++
++def pytest_runtest_call(item):
++    if not item.path.name.startswith("test_tui_"):
++        return
++    # TUI fixtures use a fixed update response after selecting their HOME.
++    # Persistence tests deliberately exercise an absent .gittype directory.
++    latest = "0.9.0" if "version_check" in item.name else "0.8.0"
++    fixed_version_cache(Path(os.environ["HOME"]), latest)
+--- a/eval/tests/test_global_args.py
++++ b/eval/tests/test_global_args.py
+@@ -174,7 +174,7 @@
+     assert "For more information, try '--help'" in result.stderr
+ 
+ 
+-def test_invalid_single_language(run_binary):
++def test_invalid_single_language(run_binary, qc_small_repo):
+     """CATCHES: implementations that accept invalid language names, don't validate
+     against supported languages list, or fail to show comprehensive error message
+     with all supported languages when validation fails.
+@@ -182,7 +182,7 @@
+     Golden files: invalid_language.golden -- script -q -c "./executable --langs invalidlang"
+     """
+     # Need PTY for this to work properly
+-    result = _run_pty("./executable --langs invalidlang", cwd=Path(__file__).parent.parent.parent)
++    result = _run_pty(f"{Path(__file__).parent.parent.parent / 'executable'} --langs invalidlang", cwd=qc_small_repo)
+     
+     # Strip ANSI codes and normalize line endings
+     output = result.stdout
+@@ -202,14 +202,14 @@
+     assert "python" in output
+ 
+ 
+-def test_invalid_language_in_list(run_binary):
++def test_invalid_language_in_list(run_binary, qc_small_repo):
+     """CATCHES: implementations that accept lists containing invalid languages,
+     process valid languages and silently ignore invalid ones, or don't properly
+     report which specific language in a comma-separated list is unsupported.
+     
+     Golden files: multiple_invalid_languages.golden
+     """
+-    result = _run_pty("./executable --langs rust,invalid,python", cwd=Path(__file__).parent.parent.parent)
++    result = _run_pty(f"{Path(__file__).parent.parent.parent / 'executable'} --langs rust,invalid,python", cwd=qc_small_repo)
+     
+     output = result.stdout
+     import re
+@@ -564,3 +564,11 @@
+     # Should not be argument parsing error (exit code 2)
+     assert result.returncode != 2, "no arguments should not be argument parsing error"
+     # Will likely be TTY error or other runtime error, but validates arg parsing worked
++
++
++@pytest.fixture(autouse=True)
++def fixed_version_input(monkeypatch, tmp_path):
++    from conftest import fixed_version_cache
++    home = tmp_path / "home"
++    fixed_version_cache(home)
++    monkeypatch.setenv("HOME", str(home))
+--- a/eval/tests/test_tui_results.py
++++ b/eval/tests/test_tui_results.py
+@@ -9,6 +9,7 @@
+ import pytest
+ from pathlib import Path
+ import uuid
++import os
+ 
+ WORKSPACE_ROOT = Path(__file__).parent.parent.parent
+ EXECUTABLE = WORKSPACE_ROOT / "executable"
+@@ -47,6 +48,8 @@
+ 
+ def start_tui(session_name, repo_path, timeout=5):
+     """Start the TUI in a tmux session."""
++    if str(repo_path) == "/workspace":
++        repo_path = os.environ["GITTYPE_QC_REPO"]
+     result = subprocess.run(
+         [str(TUI2CLI), "-n", session_name, "start", "--", str(EXECUTABLE), str(repo_path)],
+         capture_output=True,
+@@ -926,3 +929,14 @@
+     assert "[ESC] Back" in screen
+ 
+ 
++
++
++@pytest.fixture(autouse=True)
++def isolated_screen_fixture(monkeypatch, tmp_path, qc_small_repo):
++    home = tmp_path / "home"
++    home.mkdir()
++    from conftest import fixed_version_cache
++    fixed_version_cache(home)
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local/share"))
++    monkeypatch.setenv("GITTYPE_QC_REPO", str(qc_small_repo))
+--- a/eval/tests/test_tui_trending.py
++++ b/eval/tests/test_tui_trending.py
+@@ -915,3 +915,24 @@
+     # Exact match
+     golden = (RESOURCES / "repo_python_list.golden").read_text()
+     assert normalize_screen(screen) == normalize_screen(golden)
++
++
++@pytest.fixture(autouse=True)
++def local_trending_inputs(monkeypatch, tmp_path):
++    # Trending screens require a fixed list, not today's public API response.
++    import hashlib
++    import json
++    home = tmp_path / "home"
++    cache = home / ".gittype/trending_cache"
++    cache.mkdir(parents=True)
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local/share"))
++    repositories = {'Rust': [{'repo_name': 'rtk-ai/rtk', 'primary_language': 'Rust', 'description': 'CLI proxy that reduc', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'farion1231/cc-switch', 'primary_language': 'Rust', 'description': 'A cross-platform des', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'QuipNetwork/quip-node-manager', 'primary_language': 'Rust', 'description': 'A simple GUI client', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'AlexsJones/llmfit', 'primary_language': 'Rust', 'description': 'Hundreds of models &', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'jlcodes99/cockpit-tools', 'primary_language': 'Rust', 'description': ' 🚀 通用 AI IDE 账号', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'vercel-labs/agent-browser', 'primary_language': 'Rust', 'description': 'Browser automation C', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'microsoft/RustTraining', 'primary_language': 'Rust', 'description': 'Beginner, advanced,', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'tonhowtf/omniget', 'primary_language': 'Rust', 'description': ' Desktop app to down', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'mayocream/koharu', 'primary_language': 'Rust', 'description': 'ML-powered manga tra', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'googleworkspace/cli', 'primary_language': 'Rust', 'description': 'Google Workspace CLI', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'BloopAI/vibe-kanban', 'primary_language': 'Rust', 'description': 'Get 10X more out of', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'breezewish/CodexPotter', 'primary_language': 'Rust', 'description': 'Ralph loop for codex', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'Polymarket/polymarket-cli', 'primary_language': 'Rust', 'description': '', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'mikeyobrien/ralph-orchestrator', 'primary_language': 'Rust', 'description': 'An improved implemen', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'RightNow-AI/openfang', 'primary_language': 'Rust', 'description': 'Open-source Agent Op', 'stars': '100', 'forks': '10', 'total_score': '110'}], 'Python': [{'repo_name': 'NousResearch/hermes-agent', 'primary_language': 'Python', 'description': 'The agent that grows', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'JuliusBrussee/caveman', 'primary_language': 'Python', 'description': '🪨 why use many toke', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'safishamsi/graphify', 'primary_language': 'Python', 'description': 'AI coding assistant', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'OpenBMB/VoxCPM', 'primary_language': 'Python', 'description': 'VoxCPM2: Tokenizer-F', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'alchaincyf/nuwa-skill', 'primary_language': 'Python', 'description': '你想蒸馏的下一个员工', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'nikopueringer/CorridorKey', 'primary_language': 'Python', 'description': 'Perfect Green Screen', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'tirth8205/code-review-graph', 'primary_language': 'Python', 'description': 'Local knowledge grap', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'coleam00/Archon', 'primary_language': 'Python', 'description': 'Beta release of Arch', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'virattt/ai-hedge-fund', 'primary_language': 'Python', 'description': 'An AI Hedge Fund Tea', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'mvanhorn/last30days-skill', 'primary_language': 'Python', 'description': 'AI agent skill that', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'titanwings/colleague-skill', 'primary_language': 'Python', 'description': '将冰冷的离别化为温暖', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'HKUDS/DeepTutor', 'primary_language': 'Python', 'description': '"DeepTutor: Agent-Na', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'NousResearch/hermes-agent-self-e...', 'primary_language': 'Python', 'description': '⚒ Evolutionary self-', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'luongnv89/claude-howto', 'primary_language': 'Python', 'description': 'A visual, example-dr', 'stars': '100', 'forks': '10', 'total_score': '110'}, {'repo_name': 'jd-opensource/JoyAI-Image', 'primary_language': 'Python', 'description': 'JoyAI-Image is the u', 'stars': '100', 'forks': '10', 'total_score': '110'}], 'C++': [{'repo_name': 'qc/cpp', 'primary_language': 'C++', 'description': 'C++ fixture', 'stars': '100', 'forks': '10', 'total_score': '110'}]}
++    languages = ["C", "C#", "C++", "Clojure", "Dart", "Go", "Haskell", "Java",
++                 "JavaScript", "Kotlin", "PHP", "Python", "Ruby", "Rust", "Swift", "TypeScript"]
++    for lang in languages:
++        for spelling in {lang, lang.lower()}:
++            key = f"{spelling}:daily"
++            data = {"repositories": repositories.get(lang, [{"repo_name": "qc/example", "primary_language": lang, "description": lang + " fixture", "stars": "100", "forks": "10", "total_score": "110"}]),
++                    "timestamp": int(time.time()), "cache_key": key}
++            (cache / (hashlib.sha256(key.encode()).hexdigest() + ".json")).write_text(json.dumps(data))

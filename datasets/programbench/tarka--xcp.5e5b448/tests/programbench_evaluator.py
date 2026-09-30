@@ -61,7 +61,7 @@ HIGH_FAILURE_SERIAL_RETRY_FRACTION = 0.5
 HIGH_FAILURE_SERIAL_RETRY_MIN_TESTS = 8
 
 DEFAULT_HF_REPO_ID = "programbench/ProgramBench-Tests"
-DEFAULT_HF_REVISION = "main"
+DEFAULT_HF_REVISION = "de0ddfb637590c7ecb54fa0b5301f6dc7dfbcee5"
 
 # Oracle agent handoff files (see solution/solve.sh). Must not appear in the
 # post-compile workspace snapshot or they pollute tree-scanning tests (dutree).
@@ -752,12 +752,6 @@ def branch_env(
         addopts.extend(["--reruns=2", "--reruns-delay=1"])
     env = {
         "PYTEST_ADDOPTS": " ".join(addopts),
-        # Match upstream non-TTY regression environments (dirble log format, etc.).
-        "NO_COLOR": "1",
-        "TERM": "dumb",
-        "CLICOLOR": "0",
-        "CLICOLOR_FORCE": "0",
-        "COLORTERM": "",
     }
     if extras:
         env.update(extras)
@@ -809,7 +803,7 @@ def resolve_blob_dir(instance_id: str, metadata: dict[str, Any]) -> Path:
        tree on disk (``<dir>/<instance_id>/tests/<branch>.tar.gz``). Useful
        for offline reruns sharing a cache across many tasks.
     3. ``huggingface_hub.snapshot_download`` from
-       ``programbench/ProgramBench-Tests`` (default repo, ``main`` revision).
+       ``programbench/ProgramBench-Tests`` (default repo, the pinned revision).
 
     The returned directory contains ``tests/<branch>.tar.gz`` per active
     branch — same shape as ``programbench/ProgramBench-Tests/<instance_id>/``
@@ -946,7 +940,7 @@ def evaluate(metadata: dict[str, Any]) -> dict[str, Any]:
             result["executable_hash"] = sha256(STASHED_EXECUTABLE)
             result["log"].append(
                 run_step(
-                    "pip3 install -q --disable-pip-version-check pytest-rerunfailures",
+                    "pip3 install -q --disable-pip-version-check pytest-rerunfailures==16.4",
                     WORKSPACE,
                     timeout=120,
                     step="install_rerunfailures",
@@ -1030,6 +1024,15 @@ def evaluate(metadata: dict[str, Any]) -> dict[str, Any]:
                 branch_log.append(cleanup_lingering_processes())
                 restore_workspace(compiled_snapshot)
                 extract_trusted_blob(blob, WORKSPACE)
+                # Reviewed author fixture repairs are part of this verifier
+                # image, never supplied by the candidate or fetched unpinned.
+                patch_file = METADATA_PATH.parent / "patches" / f"{branch}.patch"
+                if patch_file.exists():
+                    branch_log.append(run_step(
+                        "git apply --check " + shlex.quote(str(patch_file))
+                        + " && git apply " + shlex.quote(str(patch_file)),
+                        WORKSPACE, timeout=30, step="apply_fixture_patch",
+                    ))
                 restore_reference_executable()
                 actual_hash = sha256(WORKSPACE / "executable")
                 if actual_hash != result["executable_hash"]:
@@ -1053,13 +1056,11 @@ def evaluate(metadata: dict[str, Any]) -> dict[str, Any]:
                     ]
                     inject_not_run(result, branch, tests, "missing_run_sh")
                     break
-                # Upstream rewrites thread→signal so xdist workers fail cleanly
-                # instead of os._exit(1) on timeout. That works in fresh
-                # containers per branch; here we reuse one container and
-                # signal timeouts leave TUI/log-watcher subprocesses alive
-                # (e.g. lazygit --logs + tail -f), wedging pytest for up to
-                # branch_timeout. Keep the blob's thread method and rely on
-                # cleanup_lingering_processes + serial fallback after crashes.
+                # Preserve timed-out cases in JUnit instead of terminating the
+                # xdist worker and losing its queued cases (upstream behavior).
+                run_sh.write_text(run_sh.read_text().replace(
+                    "--timeout-method=thread", "--timeout-method=signal"
+                ))
                 env = branch_env(
                     serial=serial,
                     has_rerunfailures=has_rerunfailures,

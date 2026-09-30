@@ -30,7 +30,7 @@ RUN rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true \
 # branch would poison pytest for the whole task. PIP_CONSTRAINT is honored even
 # by `--upgrade`, is a no-op for tasks that never upgrade, and keeps libtmux
 # importable for tasks whose tests use it — so this is safe across the dataset.
-RUN printf 'pytest<9.1\n' > /etc/pip-constraint.txt
+RUN printf 'pytest<9.1\npytest-rerunfailures==16.4\n' > /etc/pip-constraint.txt
 ENV PIP_CONSTRAINT=/etc/pip-constraint.txt
 
 # Ensure Go/Rust/Haskell toolchains stay on PATH for `bash -lc` (eval/run.sh).
@@ -54,9 +54,9 @@ ENV PATH="/usr/local/go/bin:/go/bin:/usr/local/cargo/bin:/root/.cargo/bin:${PATH
 # Install verifier runtime dependencies. ``huggingface-hub`` is required when
 # optional hidden-test blobs were intentionally omitted from the registry
 # dataset: the evaluator then resolves them from Hugging Face at verify time.
-# Best-effort: the cleanroom image may already have these packages.
+# Fail the build if required verifier dependencies cannot be installed.
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check \
-    pytest pytest-rerunfailures huggingface-hub || true
+    pytest pytest-rerunfailures==16.4 huggingface-hub
 
 # ``script`` provides a pseudo-TTY for Modal/gVisor (see PROGRAMBENCH_SCRIPT_PTY).
 RUN command -v script >/dev/null 2>&1 || ( \
@@ -70,3 +70,6 @@ RUN command -v script >/dev/null 2>&1 || ( \
 # image's /tests/.
 COPY . /tests/
 RUN chmod +x /tests/test.sh && rm -f /tests/Dockerfile
+
+# Time zones and a controlled private-address fixture.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata iproute2 && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,5 @@
+The release tests retain all scored output assertions. Cases that inspect different properties of identical inputs share that submission's generated build, rather than issuing repeated anonymous GitHub requests. No reference-generated outputs are supplied to the candidate or substituted for its outputs. Input repositories are pinned to reviewed commits, and the changelog-index case uses the existing dated release fixture.
+
+A native verifier healthcheck independently checks the three required release endpoints before grading starts. Unavailable or empty release data fails setup. Suites run with one worker because dev-server tests share fixed ports.
+
+This remains a network-dependent task. The readiness check cannot guarantee that an external service stays available throughout grading. A gold validation pass establishes compatibility for the recorded run, not hermetic execution. New synthetic tasks should use local inputs or an explicitly configurable local service instead of this pattern.

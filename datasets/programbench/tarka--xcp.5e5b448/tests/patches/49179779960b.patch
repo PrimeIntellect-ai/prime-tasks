@@ -1,0 +1,195 @@
+--- a/eval/tests/conftest.py
++++ b/eval/tests/conftest.py
+@@ -40,3 +40,24 @@
+ def temp_dir(tmp_path):
+     """Provides a temporary directory for test operations."""
+     return tmp_path
++
++
++@pytest.fixture
++def check_reflink():
++    def check(result, source, dest):
++        # Independently probe the filesystem; do not infer support from xcp.
++        import errno
++        import fcntl
++        import tempfile
++        with source.open("rb") as src, tempfile.TemporaryFile(dir=source.parent) as probe:
++            try:
++                fcntl.ioctl(probe.fileno(), 0x40049409, src.fileno())  # FICLONE
++            except OSError as exc:
++                assert exc.errno in (errno.EOPNOTSUPP, errno.ENOTTY, errno.EXDEV)
++                assert result.returncode == 1
++                assert "Failed to reflink" in result.stderr
++                assert "'always' was specified" in result.stderr
++            else:
++                assert result.returncode == 0, result.stderr
++                assert dest.read_bytes() == source.read_bytes()
++    return check
+--- a/eval/tests/test_advanced.py
++++ b/eval/tests/test_advanced.py
+@@ -832,7 +832,7 @@
+         os.close(dest_fd)
+ 
+ 
+-def test_reflink_always_with_large_file(run_xcp, temp_dir):
++def test_reflink_always_with_large_file(run_xcp, temp_dir, check_reflink):
+     """
+     CATCHES: implementations where --reflink=always behaves differently with
+     large files - on filesystems that support reflinks, should succeed; on
+@@ -847,9 +847,7 @@
+     result = run_xcp("--reflink=always", str(source), str(dest))
+     
+     # Should succeed (either with reflink or kernel fallback)
+-    assert result.returncode == 0, f"Reflink always should succeed: {result.stderr}"
+-    assert dest.exists()
+-    assert dest.read_bytes() == source.read_bytes()
++    check_reflink(result, source, dest)
+ 
+ 
+ def test_dereference_chain_of_relative_symlinks(run_xcp, temp_dir):
+--- a/eval/tests/test_config_additional.py
++++ b/eval/tests/test_config_additional.py
+@@ -38,7 +38,7 @@
+     return _run
+ 
+ 
+-def test_reflink_always_on_non_reflink_filesystem(run_xcp, tmp_path):
++def test_reflink_always_on_non_reflink_filesystem(run_xcp, tmp_path, check_reflink):
+     """CATCHES: implementations that silently fall back to regular copy when
+     --reflink=always is specified on a filesystem that doesn't support reflinks,
+     instead of erroring as documented. The help text states 'always' will return
+@@ -57,10 +57,7 @@
+     result = run_xcp("--reflink", "always", str(source), str(dest))
+     
+     # The binary currently succeeds on tmp_path filesystem
+-    assert result.returncode == 0, \
+-        f"--reflink=always should be accepted, got: {result.stderr}"
+-    assert dest.exists(), "Destination file was not created"
+-    assert dest.read_text() == source.read_text(), "Content mismatch"
++    check_reflink(result, source, dest)
+ 
+ 
+ def test_reflink_auto_succeeds_on_non_reflink_filesystem(run_xcp, tmp_path):
+--- a/eval/tests/test_libfs_gaps.py
++++ b/eval/tests/test_libfs_gaps.py
+@@ -774,7 +774,7 @@
+     assert dest.read_text() == source.read_text()
+ 
+ 
+-def test_reflink_always_mode_fallback(run_xcp, temp_dir):
++def test_reflink_always_mode_fallback(run_xcp, temp_dir, check_reflink):
+     """CATCHES: implementations that don't handle --reflink=always correctly,
+     either crashing when reflink is unavailable or producing incorrect output."""
+     source = temp_dir / "always_reflink_source.txt"
+@@ -787,5 +787,4 @@
+     result = run_xcp("--reflink", "always", str(source), str(dest))
+     
+     # On this system (overlay fs), it succeeds
+-    assert result.returncode == 0
+-    assert dest.read_text() == content
++    check_reflink(result, source, dest)
+--- a/eval/tests/test_operations_gaps.py
++++ b/eval/tests/test_operations_gaps.py
+@@ -513,7 +513,7 @@
+         assert sf.read(1000) == df.read(1000), "End content should match"
+ 
+ 
+-def test_reflink_always_on_unsupported_filesystem(run_xcp, tmp_path):
++def test_reflink_always_on_unsupported_filesystem(run_xcp, tmp_path, check_reflink):
+     """CATCHES: implementations where --reflink=always doesn't properly fail
+     when filesystem doesn't support reflinks - try_reflink() should return
+     Err(ReflinkFailed) when reflink fails and Reflink::Always is set, not
+@@ -528,9 +528,7 @@
+     result = run_xcp("--reflink=always", str(source), str(dest))
+     
+     # In our container environment, reflink succeeds (kernel may override)
+-    assert result.returncode == 0, f"--reflink=always should succeed in this environment: {result.stderr}"
+-    assert dest.exists()
+-    assert dest.read_text() == content
++    check_reflink(result, source, dest)
+ 
+ 
+ def test_directory_creation_failure_propagation(run_xcp, tmp_path):
+--- a/eval/tests/test_core_operations.py
++++ b/eval/tests/test_core_operations.py
+@@ -294,6 +294,8 @@
+     source = RESOURCES / "executable_script.sh"
+     dest = temp_dir / "copied_script.sh"
+     
++    # Git archives preserve executable-ness, not the exact group mode.
++    source.chmod(0o755)
+     # Verify source is executable
+     source_mode = source.stat().st_mode & 0o777
+     assert source_mode == 0o755, f"Source should be 755, got {oct(source_mode)}"
+--- a/eval/tests/test_parallel.py
++++ b/eval/tests/test_parallel.py
+@@ -765,12 +765,13 @@
+     dest = temp_dir / "dest.txt"
+     source.write_text("test content for zero block size")
+     
+-    result = run_xcp("--driver", "parblock", "--block-size", "0",
+-                     str(source), str(dest))
+-    
+-    # The implementation accepts 0 block size
+-    assert result.returncode == 0, f"Should accept 0 block size: {result.stderr}"
+-    assert dest.read_text() == "test content for zero block size"
++    result = run_xcp("--driver", "parblock", "--reflink", "never", "--block-size", "0",
++                     str(source), str(dest))
++    
++    # Force the block-copy path: reflink would bypass this invalid block size.
++    assert result.returncode == 1
++    assert "attempt to divide by zero" in result.stderr
++    assert "Error dispatching copy operation" in result.stderr
+ 
+ 
+ def test_very_large_worker_count(run_xcp, temp_dir):
+--- a/eval/tests/test_parblock_gaps.py
++++ b/eval/tests/test_parblock_gaps.py
+@@ -373,11 +373,12 @@
+     src.write_text("test with zero block size config")
+     dest = tmp_path / "dest.txt"
+     
+-    result = run_binary(["--driver", "parblock", "--block-size", "0", str(src), str(dest)])
+-    
+-    # Should succeed (implementation accepts this)
+-    assert result.returncode == 0, f"Should handle block-size 0: {result.stderr}"
+-    assert dest.read_text() == "test with zero block size config", "Content must be preserved"
++    result = run_binary(["--driver", "parblock", "--reflink", "never", "--block-size", "0", str(src), str(dest)])
++    
++    # Force the block-copy path: reflink would bypass this invalid block size.
++    assert result.returncode == 1
++    assert "attempt to divide by zero" in result.stderr
++    assert "Error dispatching copy operation" in result.stderr
+ 
+ 
+ def test_parblock_block_size_larger_than_file(run_binary, tmp_path):
+--- a/eval/tests/test_attributes.py
++++ b/eval/tests/test_attributes.py
+@@ -1266,3 +1266,12 @@
+     assert dest_stat.st_mtime == source_stat.st_mtime
+ 
+ 
++
++
++@pytest.fixture
++def tmp_path():
++    # These fixtures need nanosecond timestamps without read-side atime changes
++    # and the full 64 KiB xattr limit. Other tests retain disk-backed temp files.
++    import tempfile
++    with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
++        yield Path(directory)
+--- a/eval/tests/test_linux_features.py
++++ b/eval/tests/test_linux_features.py
+@@ -794,3 +794,12 @@
+     # Verify readonly permissions also preserved
+     dest_mode = dest.stat().st_mode
+     assert (dest_mode & 0o777) == 0o400
++
++
++@pytest.fixture
++def tmp_path():
++    # These fixtures need nanosecond timestamps without read-side atime changes
++    # and the full 64 KiB xattr limit. Other tests retain disk-backed temp files.
++    import tempfile
++    with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
++        yield Path(directory)
