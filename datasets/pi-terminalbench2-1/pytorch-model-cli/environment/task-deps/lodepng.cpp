@@ -1,5 +1,6 @@
 /*
 LodePNG version 20250506
+Modified for PI-TerminalBench2.1: check pixel-bit sizes and use size_t for scanline arithmetic.
 
 Copyright (c) 2005-2025 Lode Vandevenne
 
@@ -3106,6 +3107,7 @@ static int lodepng_pixel_overflow(unsigned w, unsigned h,
   size_t line; /* bytes per line in worst case */
 
   if(lodepng_mulofl((size_t)w, (size_t)h, &numpixels)) return 1;
+  if(lodepng_mulofl(numpixels, bpp, &total)) return 1; /* pixel-bit offsets must fit size_t */
   if(lodepng_mulofl(numpixels, 8, &total)) return 1; /* bit pointer with 8-bit color, or 8 bytes per channel color */
 
   /* Bytes per scanline with the expression "(w / 8u) * bpp) + ((w & 7u) * bpp + 7u) / 8u" */
@@ -4340,7 +4342,7 @@ bpp: bits per pixel
  end at a full byte
 */
 static void Adam7_getpassvalues(unsigned passw[7], unsigned passh[7], size_t filter_passstart[8],
-                                size_t padded_passstart[8], size_t passstart[8], unsigned w, unsigned h, unsigned bpp) {
+                                size_t padded_passstart[8], size_t passstart[8], unsigned w, unsigned h, size_t bpp) {
   /*the passstart values have 8 values: the 8th one indicates the byte after the end of the 7th (= last) pass*/
   unsigned i;
 
@@ -4360,7 +4362,7 @@ static void Adam7_getpassvalues(unsigned passw[7], unsigned passh[7], size_t fil
     /*bits padded if needed to fill full byte at end of each scanline*/
     padded_passstart[i + 1] = padded_passstart[i] + passh[i] * ((passw[i] * bpp + 7u) / 8u);
     /*only padded at end of reduced image*/
-    passstart[i + 1] = passstart[i] + (passh[i] * passw[i] * bpp + 7u) / 8u;
+    passstart[i + 1] = passstart[i] + ((size_t)passh[i] * passw[i] * bpp + 7u) / 8u;
   }
 }
 
@@ -4743,7 +4745,7 @@ static unsigned postProcessScanlines(unsigned char* out, unsigned char* in,
   *) if adam7: 1) 7x unfilter 2) 7x remove padding bits 3) Adam7_deinterlace
   NOTE: the in buffer will be overwritten with intermediate data!
   */
-  unsigned bpp = lodepng_get_bpp(&info_png->color);
+  size_t bpp = lodepng_get_bpp(&info_png->color);
   if(bpp == 0) return 31; /*error: invalid colortype*/
 
   if(info_png->interlace_method == 0) {

@@ -26,9 +26,13 @@ author checks live here; the Python environment package owns only the loader.
   `extract-moves-from-video`, `install-windows-3-11`, `mcmc-sampling-stan`,
   `mteb-leaderboard`, `mteb-retrieve`, and `protein-assembly`.
 
-The import preserves all task-file contents except the image references in
+The initial import preserved all task-file contents except the image references in
 `task.toml`, which now identify the existing Prime images. It does not change
 prompts, scoring rules, solutions, data assets, or task selection.
+
+The bundled LodePNG decoder in `pytorch-model-cli` checks pixel-bit sizes and
+uses `size_t` for scanline arithmetic to prevent intermediate integer overflow.
+This preserves the task contract and decoded pixels for its MNIST images.
 
 ## Images
 
@@ -37,8 +41,8 @@ two separate verifier images. These `prime/primeintellect/pitb21-*` artifacts
 are currently private and require Prime Intellect team access. The task files
 are public; image visibility is a separate registry setting.
 
-The references identify the completed images used for the reviewed source
-revision. They do not use mutable `latest` tags. The Caffe correction changes
+The references identify completed image builds for the task sources. They do not
+use mutable `latest` tags. The Caffe correction changes
 its staged verifier only, so its solver image remains the `661a2f2` image.
 
 Build selected images locally from the repository root:
@@ -72,6 +76,7 @@ or creating sandboxes:
 uv run --python 3.12 scripts/pi-terminalbench2-1/check.py -q
 ```
 
+A C and C++ compiler is required for the bundled PNG decoder checks.
 The suite checks grader acceptance/rejection behavior and verifier setup and
 lifecycle behavior. Linux privilege-boundary checks are skipped on other hosts.
 These checks do not establish that all reference solutions pass end to end;
