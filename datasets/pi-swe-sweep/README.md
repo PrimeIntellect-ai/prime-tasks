@@ -17,6 +17,7 @@ Repaired SWE-sweep repository tasks from `facebookresearch/swe-sweep` at `48e6bf
 | symfony | 149 | 39497 | 0 / 1 / 0 |
 | syn | 13 | 111 | 0 / 1 / 0 |
 | tokio | 12 | 1260 | 0 / 1 / 0 |
+| v | 239 | 1374 | 0 / 1 / 0 |
 
 Baselines are intersections of repeated pristine runs. Existing failing, skipped, unmeasurable, and recorded unstable cases are not treated as regression references. Oxc additionally excludes three regression IDs that are themselves tracked fail-to-pass tests, so its historical behavior changes are not mislabeled as regressions. The original ignored-test lists are preserved for hidden grading.
 
