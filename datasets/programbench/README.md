@@ -17,6 +17,16 @@ images already run as root; the Verifiers Harbor loader does not accept user
 overrides. Verification remains in a separate sandbox, with only declared
 artifacts transferred from the solver.
 
+The solver runs as the cleanroom images' unprivileged `agent` user (`[agent].user =
+"agent"`, honored by Verifiers since PR #2748 / `4fd5921`). The images ship that
+user with a writable home, a world-readable `/root` for harness installs, and the
+reference `/workspace/executable` as root-owned and execute-only (`0111`), so the
+agent can run the reference but not read or copy it, as in ProgramBench 1.1.
+Older Verifiers ignore the field and run the agent as root, which can read the
+reference. Adding the field changed every task's file fingerprint; the
+`task_sha256` values in `qc-evidence.json` were recomputed for it without rerunning
+the controls, which exercise only the verifier.
+
 The verifier image removes the reference workspace at build time and includes
 the tests and evaluator. Hidden test blobs are fetched from the pinned
 `ProgramBench-Tests` revision when needed; trusted fixture patches are baked into
