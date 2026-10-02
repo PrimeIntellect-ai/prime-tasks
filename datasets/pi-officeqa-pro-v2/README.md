@@ -1,4 +1,20 @@
-# PI-OfficeQA Pro V2 offline corpus
+# PI-OfficeQA Pro V2 tasks and offline corpus
+
+## Tasks
+
+[`tasks.json`](tasks.json) contains the final **78 tasks** loaded by `prime-envs`.
+It is derived from Databricks' `officeqa_pro_v2.csv` at Hugging Face revision
+`65a2b315780417bc50d7bfe6e5bdb904e63fda65`. The 15 prompt repairs and two revised
+answers are stored directly in the rows; the 12 excluded tasks are absent. See
+[`AUDIT.md`](AUDIT.md) for the evidence and restoration criteria.
+
+Rows preserve the upstream `uid`, original row position as `idx`, `source_docs`,
+and `source_files`. Only `question` is shown to the solver; `answer` is used by the
+evaluator. The question dataset is downloaded on the evaluator and is never
+included in the corpus archive or sandbox image. These tasks retain the upstream
+[CC-BY-SA 4.0 license](LICENSE-CC-BY-SA) and attribution in [NOTICE](NOTICE).
+
+## Corpus
 
 This corpus adds exactly **50 reference documents** to the 1,435 upstream documents:
 **1,485 searchable documents total**, a 3.48% increase. Every task receives the same corpus.
