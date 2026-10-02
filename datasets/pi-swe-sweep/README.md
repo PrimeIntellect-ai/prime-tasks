@@ -6,6 +6,7 @@ Repaired SWE-sweep repository tasks from `facebookresearch/swe-sweep` at `48e6bf
 | --- | ---: | ---: | --- |
 | clippy | 76 | 1629 | 0 / 1 / 0 |
 | cvc5 | 38 | 1872 | 0 / 1 / 0 |
+| dart-sdk | 50 | 9638 | 0 / 1 / 0 |
 | datafusion | 38 | 7466 | 0 / 1 / 0 |
 | dmd | 112 | 3263 | 0 / 1 / 0 |
 | jest | 20 | 4590 | 0 / 1 / 0 |
