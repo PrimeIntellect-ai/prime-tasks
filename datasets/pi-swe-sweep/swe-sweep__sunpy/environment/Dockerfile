@@ -96,3 +96,7 @@ RUN git init -q \
     && git add -A && git commit -q -m "sunpy maxbug source" && git tag baseline
 
 CMD ["python", "-c", "import sunpy; print('sunpy', sunpy.__version__)"]
+
+# Keep astronomy imports deterministic and offline using the bundled IERS tables.
+RUN mkdir -p /root/.astropy/config \
+    && printf '%s\n' '[utils.iers.iers]' 'auto_download = False' > /root/.astropy/config/astropy.cfg

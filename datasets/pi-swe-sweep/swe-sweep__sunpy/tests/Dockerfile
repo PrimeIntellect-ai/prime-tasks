@@ -110,3 +110,7 @@ CMD ["sleep", "infinity"]
 COPY --from=swesweep-python /opt/swesweep/python /opt/swesweep/python
 COPY . /tests
 RUN chmod +x /tests/test.sh
+
+# Keep astronomy imports deterministic and offline using the bundled IERS tables.
+RUN mkdir -p /root/.astropy/config \
+    && printf '%s\n' '[utils.iers.iers]' 'auto_download = False' > /root/.astropy/config/astropy.cfg
