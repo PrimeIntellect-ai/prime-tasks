@@ -125,4 +125,11 @@ RUN for attempt in 1 2 3; do \
     done; \
     echo "maven could not warm the test half" >&2; exit 1
 
+# Resolve the sandbox's own hostname locally. Offline DNS timeouts otherwise
+# block Logback initialization longer than Netty's existing test timeouts.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libnss-myhostname \
+ && sed -i 's/^hosts:.*/hosts: files myhostname dns/' /etc/nsswitch.conf \
+ && rm -rf /var/lib/apt/lists/*
+
 CMD ["mvn", "-v"]

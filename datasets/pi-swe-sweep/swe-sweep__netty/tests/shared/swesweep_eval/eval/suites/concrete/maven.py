@@ -123,7 +123,10 @@ class MavenSuite(ReproductionSuite):
                 "-DfailIfNoTests=false", "-Dsurefire.failIfNoSpecifiedTests=false",
             ]
         if files is None and self.whole_modules:
-            cmd += ["-pl", ",".join(self.whole_modules), "-am", "-fae"]
+            # Keep dependent modules running after an existing test failure. The
+            # regression gate judges the individual JUnit outcomes, not Maven's exit code.
+            cmd += ["-pl", ",".join(self.whole_modules), "-am", "-fae",
+                    "-Dmaven.test.failure.ignore=true"]
         cmd += self.mvn_args + [self.goal]
         r = _run(env, cmd, timeout=timeout, cwd=self._cwd(repo))
         if r is None:

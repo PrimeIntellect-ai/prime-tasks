@@ -9,7 +9,7 @@ Repaired SWE-sweep repository tasks from `facebookresearch/swe-sweep` at `48e6bf
 | datafusion | 38 | 7466 | 0 / 1 / 0 |
 | dmd | 112 | 3263 | 0 / 1 / 0 |
 | jest | 20 | 4590 | 0 / 1 / 0 |
-| netty | 96 | 9625 | Pending |
+| netty | 96 | 12108 | 0 / 1 / 0 |
 | nim | 192 | 2159 | 0 / 1 / 0 (gold in four disjoint batches) |
 | oxc | 6 | 780 | 0 / 1 / 0 |
 | phpspreadsheet | 9 | 5889 | 0 / 1 / 0 |
@@ -29,6 +29,6 @@ The oracle applies each gold independently. It does not prove the fixes compose 
 
 Agent images contain the source tree and tooling. Hidden tests and golds are in separate verifier images; only the collected Git patch crosses the boundary. Images are private to the Prime Intellect team. Dockerfiles and immutable content-derived image tags are included.
 
-Repairs include test discovery and result parsing, dependency caches for offline operation, release-compatible dependencies, process isolation, and stable per-test regression identities. Benchmark source bugs and reference fixes are preserved. CVC5 retains local autoconf helper URLs so reset/reconfigure stays offline.
+Repairs include test discovery and result parsing, dependency caches for offline operation, release-compatible dependencies, process isolation, and stable per-test regression identities. Benchmark source bugs, bug IDs, and reference fixes are preserved. Netty’s LocalChannel reproducer adds deterministic event-loop ordering after an empty patch incorrectly received credit; the existing test IDs are retained. CVC5 retains local autoconf helper URLs so reset/reconfigure stays offline.
 
 Upstream license: [LICENSE.upstream](LICENSE.upstream). Original copyright notices are retained.
