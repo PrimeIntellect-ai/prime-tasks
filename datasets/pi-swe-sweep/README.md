@@ -8,6 +8,7 @@ Repaired SWE-sweep repository tasks from `facebookresearch/swe-sweep` at `48e6bf
 | cvc5 | 38 | 1872 | 0 / 1 / 0 |
 | datafusion | 38 | 7466 | 0 / 1 / 0 |
 | dmd | 112 | 3263 | 0 / 1 / 0 |
+| jest | 20 | 4590 | 0 / 1 / 0 |
 | netty | 96 | 9625 | Pending |
 | nim | 192 | 2159 | 0 / 1 / 0 (gold in four disjoint batches) |
 | oxc | 6 | 780 | 0 / 1 / 0 |
