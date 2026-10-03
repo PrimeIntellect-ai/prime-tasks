@@ -8,16 +8,16 @@ in the model-facing question.
 
 ## Dataset scope
 
-In [tasks.json](tasks.json), **15 items receive repairs, task 88 is restored unchanged,
+In [tasks.json](tasks.json), **17 items receive repairs, task 88 is restored unchanged,
 and 9 unresolved items are excluded**, including task 38 after follow-up source
 verification. The dataset also excludes **3 visual-only tasks (46, 53, 54)**, leaving
-**78 tasks**. Of the repaired tasks, 13 retain their original answer; tasks 36
-and 71 have recomputed answers for their explicit source and account specifications.
+**78 tasks**. Of the repaired tasks, 13 retain their original answer; tasks 36,
+64, 71 and 85 have recomputed answers for their explicit source and account specifications.
 All retained task IDs are preserved. The upstream corpus files are unchanged; the
 offline image adds references and companion PDFs as described in [README.md](README.md).
 
 The separate [OfficeQA-Pro-v2 environment](https://github.com/PrimeIntellect-ai/prime-envs/tree/main/environments/search/officeqa_pro_v2)
-loads all **90 original prompts and answers**, including tasks 36 and 71's original
+loads all **90 original prompts and answers**, including tasks 36, 64, 71 and 85's original
 keys. Report the benchmark variant with results: this corrected 78-task dataset is
 not directly comparable to the original benchmark. Other source-extraction disagreements and visual-evidence dependencies
 are not automatically classified as broken tasks. Task 55 remains included and needs
@@ -38,10 +38,12 @@ its bundled chart PDF. This is not certification of all 78 remaining source answ
 | 36 | Specify FY1981–1988, next-report prior-year columns in printed millions, and SES squared-error objective. | Recomputed key **25,196.60** for this explicit specification; see derivation below. |
 | 51 | Restore documented FY1991–2000 transitions and FY1990 base; identify FRED RIFSPFFNA weights. | Metadata explicitly identifies CY1991–2000; extracted inputs reproduce 47.6821%. |
 | 58 | Identify the current-year Salaries account under Public Printer. | The cited FY1913 account has $192,020.00 appropriated less $179,418.74 disbursed, leaving $12,601.26; preserve [1913, 12601.26]. |
+| 64 | Preserve negative excess repayments when aggregating the named station accounts; keep the question unchanged. | Signed annual disbursements give **[16101, 16436, 15297, 16276, 15232, 12045, 10773, 10683, 14183, 14441]**. |
 | 70 | Specify fund aggregation, positive/negative net transactions, receipts-to-redemptions direction and seven embedded triples. | First-order empirical conditional mutual information gives 0.4636 bits. |
 | 71 | Include the FY1936–FY1938 Payment to Indians of Sioux reservations entries; use current-year appropriations in each year's own report. | Ten annual amounts total $3,634,075.00, giving the revised mean **$363,407.50**. |
 | 77 | Specify surplus on lagged debt in nominal levels, 17 observations, intercept and no other regressors. | OLS on the extracted panel gives [-15163536.69, 0.38]. |
 | 78 | Replace the ambiguous “debt acceleration” request with the second difference of annual fiscal deficits and its formula. | D1907 − 2D1906 + D1905 = -9893712.48. Deficits already proxy changes in debt, so these concepts must not be conflated. |
+| 85 | Use the explicitly requested gross customs-collection outlays before repayments; keep the question unchanged. | Correlation of the four annual growth-rate pairs is **-0.6132**; the original -0.6525 uses net outlays. |
 | 88 | Restore without changing the prompt or reference; the existing revision instruction already applies. | The FY1928 correction to FY1927 tolls reproduces the unchanged **-55,649,725**. |
 
 The source-vintage choice in task 31 is deliberate: the upstream annotations cite
@@ -151,6 +153,35 @@ $192,020.00, disbursement $179,418.74, and unexpended balance **$12,601.26**.
 The correction names that account; the seal-year question and reference stay
 unchanged. This does not newly establish the first appearance of the seal.
 
+## Task 64: preserve repayment signs
+
+In the FY1904–FY1919 disbursement tables, excess repayments reduce disbursements.
+The original key treats seven repayment magnitudes as positive spending:
+FY1911 $1,463.94; FY1913 $1,927.82; FY1914 $837.04; FY1916 $1,664.73;
+FY1917 $2,967.47; FY1918 $1,707.23; and FY1919 $3,778.70.
+These signs are recoverable from agency subtotals and the appropriation accounts:
+disbursement = opening balance + appropriation − surplus transfer − closing balance.
+For example, the FY1913 special fund opens at $5,670.27 and closes at $7,598.09,
+with no appropriation or surplus transfer: disbursement is **-$1,927.82**.
+
+The signed totals of the accounts named in the question, in FY1904–FY1919 order, are:
+
+```text
+11478.38, 39503.13, 9420.56, 3039.70, 46762.05, 29487.59, 7241.60, 37137.30,
+19943.67, 2418.76, 11036.42, 6719.78, 13645.01, 8307.66, 48140.88, 24224.97
+```
+
+Taking the population standard deviation of each consecutive seven-year window
+and rounding only the result to whole dollars gives:
+
+```text
+[16101, 16436, 15297, 16276, 15232, 12045, 10773, 10683, 14183, 14441]
+```
+
+Sources are `combined_statement__historical__cs-1904.json` through `cs-1919.json`;
+the original per-year page references remain in `source_docs`. Treating the seven
+repayments as positive reproduces the original key, identifying the sign error.
+
 ## Task 71: account scope and source vintage
 
 The upstream key **$294,407.50** equals the sum of FY1929–FY1935 appropriations
@@ -194,6 +225,30 @@ The evidence above comes from tool-returned corpus tables in hosted evaluation
 trace `6dd7a132bb37440884288be085348dea`, tool node 28 (58); and
 `936e6ec5f4654aa6b61bd949e2026f7e`, tool nodes 34 and 36 (71).
 These are recorded source excerpts, not a new PDF/OCR audit or a regrade of that run.
+
+## Task 85: gross outlays before repayments
+
+The question explicitly requests gross customs-collection outlays before repayments.
+The Treasurer's reports list the gross amount before “From which deduct the following
+repayments”; the original key instead uses the amount remaining after that deduction.
+
+| FY | Receipts credited against collection costs | Gross outlays before repayments | Net outlays after repayments |
+|---|---:|---:|---:|
+| 1875 | 1,340,913.07 | 7,081,054.20 | 7,029,215.27 |
+| 1876 | 1,210,101.45 | 6,805,834.16 | 6,702,351.04 |
+| 1877 | 1,044,696.68 | 6,591,682.05 | 6,501,037.57 |
+| 1878 | 1,046,864.36 | 5,887,443.69 | 5,826,974.32 |
+| 1879 | 1,100,871.66 | 5,564,104.67 | 5,485,543.87 |
+
+For each series, calculate four simple annual growth rates as `current / previous - 1`.
+Their Pearson correlation is **-0.613211579360...**, rounding to **-0.6132**.
+Substituting net outlays reproduces the original **-0.652493591392... → -0.6525**.
+
+The credited receipts come from `combined_statement__historical__cs-1875.json`
+through `cs-1879.json`; gross and net outlays come from the corresponding
+`govinfo_receipts__1875__...json` through `govinfo_receipts__1879__...json`
+Treasurer's reports. Full filenames and page references remain in `source_docs`.
+The question and source annotations are unchanged.
 
 ## Task 88: restore the original task with corrected tolls
 

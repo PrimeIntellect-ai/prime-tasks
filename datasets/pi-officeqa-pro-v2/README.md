@@ -4,7 +4,7 @@
 
 [`tasks.json`](tasks.json) contains the final **78 tasks** loaded by `prime-envs`.
 It is derived from Databricks' `officeqa_pro_v2.csv` at Hugging Face revision
-`65a2b315780417bc50d7bfe6e5bdb904e63fda65`. The 15 prompt repairs and two revised
+`65a2b315780417bc50d7bfe6e5bdb904e63fda65`. The 15 prompt repairs and four revised
 answers are stored directly in the rows; the 12 excluded tasks are absent. See
 [`AUDIT.md`](AUDIT.md) for the evidence and restoration criteria.
 
