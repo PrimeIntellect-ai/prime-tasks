@@ -8,16 +8,16 @@ in the model-facing question.
 
 ## Dataset scope
 
-In [tasks.json](tasks.json), **17 items receive repairs, task 88 is restored unchanged,
+In [tasks.json](tasks.json), **18 items receive repairs, task 88 is restored unchanged,
 and 9 unresolved items are excluded**, including task 38 after follow-up source
 verification. The dataset also excludes **3 visual-only tasks (46, 53, 54)**, leaving
 **78 tasks**. Of the repaired tasks, 13 retain their original answer; tasks 36,
-64, 71 and 85 have recomputed answers for their explicit source and account specifications.
+56, 64, 71 and 85 have recomputed answers for their explicit source and account specifications.
 All retained task IDs are preserved. The upstream corpus files are unchanged; the
 offline image adds references and companion PDFs as described in [README.md](README.md).
 
 The separate [OfficeQA-Pro-v2 environment](https://github.com/PrimeIntellect-ai/prime-envs/tree/main/environments/search/officeqa_pro_v2)
-loads all **90 original prompts and answers**, including tasks 36, 64, 71 and 85's original
+loads all **90 original prompts and answers**, including tasks 36, 56, 64, 71 and 85's original
 keys. Report the benchmark variant with results: this corrected 78-task dataset is
 not directly comparable to the original benchmark. Other source-extraction disagreements and visual-evidence dependencies
 are not automatically classified as broken tasks. Task 55 remains included and needs
@@ -37,6 +37,7 @@ its bundled chart PDF. This is not certification of all 78 remaining source answ
 | 35 | Rank ratios descending; select third-highest. | Extracted four-year ratios select [1979, 0.7865]. |
 | 36 | Specify FY1981–1988, next-report prior-year columns in printed millions, and SES squared-error objective. | Recomputed key **25,196.60** for this explicit specification; see derivation below. |
 | 51 | Restore documented FY1991–2000 transitions and FY1990 base; identify FRED RIFSPFFNA weights. | Metadata explicitly identifies CY1991–2000; extracted inputs reproduce 47.6821%. |
+| 56 | Specify the following year's comparative Defense budget totals, including revisions and reclassifications; use matching calendar-year PPIACO means and an AR(1) intercept. | The FY1961–FY1970 comparative tables give a persistence coefficient of **0.9605** for FY1960–FY1969 spending. |
 | 58 | Identify the current-year Salaries account under Public Printer. | The cited FY1913 account has $192,020.00 appropriated less $179,418.74 disbursed, leaving $12,601.26; preserve [1913, 12601.26]. |
 | 64 | Preserve negative excess repayments when aggregating the named station accounts; keep the question unchanged. | Signed annual disbursements give **[16101, 16436, 15297, 16276, 15232, 12045, 10773, 10683, 14183, 14441]**. |
 | 70 | Specify fund aggregation, positive/negative net transactions, receipts-to-redemptions direction and seven embedded triples. | First-order empirical conditional mutual information gives 0.4636 bits. |
@@ -142,6 +143,45 @@ FRED CSV download was unavailable during validation; the intended interval and
 series are established by upstream metadata independently of the numeric match.
 The FY1990 total also appears as 1,031,308 in another table, so this interval
 repair is not certification of every last-digit source-vintage choice.
+
+## Task 56: following-year comparative Defense totals
+
+The question uses each fiscal year's Defense budget expenditure total as restated
+in the following year's comparative Treasury table. This fixes the publication
+vintage and retains the components grouped under Defense in that table, including
+the report's revisions and reclassifications. The original key **0.9492** instead
+uses contemporaneous annual agency totals.
+
+| Spending FY | Treasury report FY | Restated Defense expenditures, dollars |
+|---|---|---:|
+| 1960 | 1961 | 43,726,450,476.42 |
+| 1961 | 1962 | 45,647,985,498.11 |
+| 1962 | 1963 | 47,814,692,279.78 |
+| 1963 | 1964 | 49,380,486,503.35 |
+| 1964 | 1965 | 50,912,633,564.34 |
+| 1965 | 1966 | 47,406,716,441.57 |
+| 1966 | 1967 | 55,718,166,235.03 |
+| 1967 | 1968 | 68,763,224,492.67 |
+| 1968 | 1969 | 78,672,893,688.75 |
+| 1969 | 1970 | 79,137,136,574.21 |
+
+Source files are `combined_statement__historical__cs-1961.json` through
+`cs-1970.json`. The comparative table element IDs are 317, 349, 194, 193, 233,
+223, 239, 191, 217 and 215, respectively. The row's `source_docs` and
+`source_files` retain the upstream annotations; this section identifies the
+sources for the repaired specification.
+
+Divide each nominal value by the arithmetic mean of the corresponding calendar
+year's 12 monthly observations in the bundled `fred__ppiaco.txt`. Regress the
+nine FY1961–FY1969 real-spending observations on their previous-year values with
+an intercept. The slope is **0.960469052526...**, rounding to **0.9605**.
+
+The series follows the reported classifications rather than imposing a fixed
+program boundary. For example, the FY1963 report moves $1,390,011,406.79 of
+FY1962 military assistance from Defense to funds appropriated to the President.
+The FY1968 report introduces unified-budget coverage, and the FY1969/FY1970
+comparisons explicitly revise prior-year military outlays. The repaired question
+includes these changes; it does not claim a constant accounting boundary.
 
 ## Task 58: account selection
 
