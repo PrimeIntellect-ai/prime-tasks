@@ -40,17 +40,9 @@ in both train and eval. The importer checks this explicitly. Fixed membership
 lets a source-specific run retain the same evaluation boundary as an all-source run.
 
 The question/rubric dataset is evaluator-side data. A taskset presents `question`
-to the solver and keeps evaluation criteria on the evaluator; do not place this JSONL in a solver
+to the solver and keeps `rubrics` for scoring; do not place this JSONL in a solver
 workspace or image. A standard JSON dataset loader can read the file from a URL
 pinned to a `prime-tasks` commit. These QA rows need no Harbor task wrappers.
-
-## Frontier evaluation profile
-
-[`frontier-v1.jsonl`](frontier-v1.jsonl) and [FRONTIER.md](FRONTIER.md) define the
-new question-conditioned research standard. The environment uses this profile
-for content scoring; original per-question rubrics remain here as provenance.
-The profile does not certify the questions, supply missing context, or establish
-factual correctness without a separate grounding check.
 
 ## Reproduce the import
 
