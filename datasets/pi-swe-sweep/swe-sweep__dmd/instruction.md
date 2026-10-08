@@ -111,7 +111,6 @@ The following is considered to be cheating, a violation of fairplay:
 
 - You must discover all bugs and fix them by looking at the source present only. Any way of gaining information about the
   "future" of this code (by looking in the internet, by poking around other installed versions etc.) is not allowed.
-- You do not have internet access. You MUST NOT try to gain internet access.
 - You MUST NOT attempt to gain access to source code other than the repository that is checked out at `/dmd`.
 - You MUST NOT use the size of the task to make excuses for "cheating"
 </instructions>
