@@ -19,6 +19,53 @@ pretty_name: "openai/math as Harbor environments"
 > **Experimental.** Built on a research release that is itself new and not yet independently
 > reviewed. Expect rough edges, and read any proof that scores 1 before relying on it.
 
+## Prime Intellect import
+
+Mirrored from [FineEnvs/openai-math](https://huggingface.co/datasets/FineEnvs/openai-math) at
+revision `d7056fd31c19fd1a0aed0a0bc3e99026d412b2ca`; the first commit adding this directory is a
+byte-identical copy. The `openai-math` taskset in
+[`prime-envs`](https://github.com/PrimeIntellect-ai/prime-envs) runs these tasks on Prime VM
+sandboxes instead of Daytona. The changes below are made identically in `generator/` and in every
+task. Statements, Comparator configs, permitted axioms, resources, timeouts and the reward are
+unchanged.
+
+- **Image.** Each `task.toml` declares the prebuilt image
+  `prime/primeintellect/openai-math:adc7f12-d7056fd-prime1`, built from `environment/`, because
+  Verifiers does not build Dockerfiles.
+- **Build sandbox.** Prime VM guests have no Landlock LSM, so landrun's `--best-effort` mode would
+  run Comparator's builds unconfined. They also have no Yama, so such a build could ptrace
+  Comparator itself. `environment/landrun_bwrap.py`, installed as `/usr/local/bin/landrun-bwrap`
+  in a final image layer alongside `bubblewrap` and `nftables`, accepts the landrun arguments
+  Comparator passes and applies the same policy with bubblewrap:
+  - read-only `/`,
+  - writable `.lake` only,
+  - no network,
+  - fresh user and PID namespaces.
+
+  landrun's executable allow-list has no bubblewrap equivalent and is not reproduced, so a build
+  can execute a shell. It still cannot write outside `.lake`, open connections, or see processes
+  outside the sandbox. `tests/grade.py` points Comparator at the shim through
+  `COMPARATOR_LANDRUN`, and `check_build_sandbox` verifies the shim before every grading.
+- **Network block.** Prime guests cannot load the iptables `owner` match, so upstream's rule fails
+  and grading would always error. `tests/grade.py` installs the equivalent nftables rule
+  (`meta skuid grader reject`). It probes the rule with a loopback listener it opens itself,
+  rather than Daytona's in-sandbox service on port 2280.
+- **Open files.** Prime guests start with a system-wide limit of about 98k open files, which a
+  parallel Lean build exhausts. `tests/grade.py` raises `fs.file-max` to 2^20, as the
+  `prime-envs` taskset does in the agent's sandbox.
+- **Disk.** Prime counts the image (about 9.2 GB) toward a sandbox's disk, while Daytona's 10 GB
+  is working space on top of it. The `prime-envs` taskset adds the image size to `storage_mb`.
+
+To rebuild the image, use a builder with more than 4 GB of memory; the Lean builds in
+`lean_setup.sh` were killed in 4 GB VMs:
+
+```bash
+uv run prime images push openai-math:adc7f12-d7056fd-prime1 --context generator/image
+```
+
+`scripts/openai-math/validate.py` re-runs the gold (official proof), empty and adversarial
+controls through Verifiers' separate-verifier lifecycle on Prime.
+
 We ported the math problems from OpenAI's [openai/math](https://github.com/openai/math) release
 (commit `adc7f12`) into [Harbor](https://github.com/harbor-framework/harbor) environments.
 The release formalizes **405** of its results as Lean statements. This dataset contains

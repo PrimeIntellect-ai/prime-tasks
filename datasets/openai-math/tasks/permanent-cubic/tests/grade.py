@@ -19,6 +19,12 @@ reward.txt is 1 only when Comparator prints its success line and exits 0. A reje
 non-compiling submission scores 0. A broken grading setup (the trusted Challenge fails to build,
 the network block cannot be installed) writes no reward, so Harbor reports an error instead of a
 score.
+
+Prime Intellect changes for Prime VM sandboxes, whose guest kernel has neither Landlock nor the
+iptables `owner` match: Comparator runs its builds through landrun-bwrap (bubblewrap, same file
+system and network policy) instead of landrun, which `check_build_sandbox` verifies before grading;
+the grader's network block is the nftables equivalent of the iptables rule, probed against a
+listener opened here; and the system-wide open-file limit is raised to what a Lean build needs.
 """
 
 from __future__ import annotations
@@ -45,6 +51,9 @@ SUBMISSION_TAR = Path("/logs/artifacts/submission.tar")
 LEAN_ENV = Path("/opt/lean-env")
 RUN_ROOT = Path("/var/lib/oai-grade")
 GRADER = "grader"
+COMPARATOR_LANDRUN = "/usr/local/bin/landrun-bwrap"
+NFT_TABLE = "openai_math_grade"
+FILE_MAX_PATH, FILE_MAX = Path("/proc/sys/fs/file-max"), 1 << 20
 SUCCESS_LINE = "Your solution is okay!"
 GRADE_THREADS = "2"
 SCRATCH_SWEEP_SEC = 15
@@ -204,29 +213,97 @@ def ensure_readable(roots: tuple[str, ...] = ("/opt/elan", str(LEAN_ENV))) -> in
     return changed
 
 
+def raise_open_file_limit() -> None:
+    """Every Lean process opens each imported Mathlib module's .olean files (three per module), so a
+    parallel build exceeds the ~98k system-wide open files Prime guests start with."""
+    if int(FILE_MAX_PATH.read_text()) < FILE_MAX:
+        FILE_MAX_PATH.write_text(f"{FILE_MAX}\n")
+
+
 def block_grader_network() -> None:
     """Reject every socket the grader user opens, loopback included.
 
-    landrun already denies TCP to the sandboxed build. This rule also covers the grader's own
-    processes outside landrun and services listening inside the sandbox.
+    The build sandbox already has no network. This rule also covers the grader's own processes
+    outside it and services listening inside the sandbox (sandboxd on Prime). It is the nftables
+    form of `iptables -m owner --uid-owner grader -j REJECT`, which Prime guests cannot load.
     """
-    uid = str(pwd.getpwnam(GRADER).pw_uid)
-    for tool in ("iptables", "ip6tables"):
-        rule = ["OUTPUT", "-m", "owner", "--uid-owner", uid, "-j", "REJECT"]
-        if subprocess.run([tool, "-C", *rule], capture_output=True).returncode == 0:
-            continue
-        res = subprocess.run([tool, "-I", *rule], capture_output=True, text=True)
-        if res.returncode != 0:
-            raise GradingError(f"cannot install the {tool} rule for {GRADER}: {res.stderr.strip()}")
-    probe = subprocess.run(
-        ["runuser", "-u", GRADER, "--", sys.executable, "-c",
-         "import socket,sys\n"
-         "s=socket.socket(); s.settimeout(3)\n"
-         "sys.exit(0 if s.connect_ex(('127.0.0.1', 2280)) == 0 else 1)"],
-        capture_output=True,
+    uid = pwd.getpwnam(GRADER).pw_uid
+    ruleset = (
+        f"table inet {NFT_TABLE}\n"
+        f"delete table inet {NFT_TABLE}\n"
+        f"table inet {NFT_TABLE} {{\n"
+        "  chain output {\n"
+        "    type filter hook output priority 0; policy accept;\n"
+        f"    meta skuid {uid} reject\n"
+        "  }\n"
+        "}\n"
     )
-    if probe.returncode == 0:
-        raise GradingError("the grader user can still open loopback connections")
+    res = subprocess.run(["nft", "-f", "-"], input=ruleset, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise GradingError(f"cannot install the nftables rule for {GRADER}: {res.stderr.strip()}")
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        with socket.socket(family) as listener:
+            listener.bind((host, 0))
+            listener.listen()
+            probe = subprocess.run(
+                ["runuser", "-u", GRADER, "--", sys.executable, "-c",
+                 "import socket,sys\n"
+                 f"s=socket.socket({int(family)}); s.settimeout(3)\n"
+                 f"sys.exit(3 if s.connect_ex(({host!r}, {listener.getsockname()[1]})) == 0 else 0)"],
+                capture_output=True,
+            )
+        if probe.returncode == 3:
+            raise GradingError("the grader user can still open loopback connections")
+        if probe.returncode != 0:
+            raise GradingError(f"the network probe failed: {probe.stderr.decode(errors='replace')[-500:]}")
+
+
+# Run as the grader inside landrun-bwrap by `check_build_sandbox`. argv: the run directory.
+SANDBOX_PROBE = r"""
+import os, socket, sys
+run = sys.argv[1]
+failures = []
+def denied(path):
+    try:
+        with open(path, "w"):
+            pass
+    except OSError:
+        return True
+    os.unlink(path)
+    return False
+if denied(os.path.join(run, ".lake", ".sandbox-probe")):
+    failures.append("cannot write the writable .lake directory")
+for path in (os.path.join(run, ".sandbox-probe"), "/tmp/.sandbox-probe", "/var/lib/oai-grade/.sandbox-probe"):
+    if not denied(path):
+        failures.append(f"could write {path}")
+s = socket.socket()
+s.settimeout(3)
+if s.connect_ex(("1.1.1.1", 443)) == 0:
+    failures.append("could open a TCP connection")
+pids = [p for p in os.listdir("/proc") if p.isdigit()]
+if len(pids) > 3:
+    failures.append(f"sees {len(pids)} processes")
+print("; ".join(failures))
+sys.exit(1 if failures else 0)
+"""
+
+
+def check_build_sandbox(run: Path) -> None:
+    """Refuse to grade unless landrun-bwrap confines the grader the way Comparator relies on.
+
+    Comparator gives the builds it runs read-only access to `/`, write access to `.lake` only, no
+    network, and (through landrun's Landlock domain) no way to reach processes outside. The probe
+    runs as the grader through the same entry point and with the same kind of arguments.
+    """
+    cmd = [
+        "runuser", "-u", GRADER, "--", "env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin",
+        COMPARATOR_LANDRUN, "--best-effort", "--ro", "/", "--rw", "/dev", "-ldd", "-add-exec",
+        "--env", "PATH", "--ro", str(run), "--rwx", str(run / ".lake"),
+        "--", "python3", "-c", SANDBOX_PROBE, str(run),
+    ]
+    res = subprocess.run(cmd, cwd=run, capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+        raise GradingError(f"the build sandbox check failed: {(res.stdout + res.stderr).strip()[-500:]}")
 
 
 def kill_grader() -> None:
@@ -294,6 +371,7 @@ def run_comparator(run: Path, timeout_sec: int, threads: str = GRADE_THREADS) ->
         # Lean sees every host CPU, not the sandbox's 4; bound Lake's parallel builds so a large
         # proof fits in 8 GB. Needs the image's Comparator, which passes this into landrun.
         "LEAN_NUM_THREADS": threads,
+        "COMPARATOR_LANDRUN": COMPARATOR_LANDRUN,
     }
     cmd = [
         "runuser", "-u", GRADER, "--", "env", "-i", *(f"{k}={v}" for k, v in env.items()),
@@ -371,7 +449,9 @@ def main() -> int:
         deadline = time.time() + int(task["grade_timeout_sec"])
         run = fresh_run(task)
         details["permission_fixes"] = ensure_readable()
+        raise_open_file_limit()
         block_grader_network()
+        check_build_sandbox(run)
         details["submission"] = unpack_submission(run)
         code, out = run_comparator(run, int(deadline - time.time()))
         log = out
