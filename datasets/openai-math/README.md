@@ -56,8 +56,7 @@ unchanged.
 - **Disk.** Prime counts the image (about 9.2 GB) toward a sandbox's disk, while Daytona's 10 GB
   is working space on top of it. The `prime-envs` taskset adds the image size to `storage_mb`.
 
-To rebuild the image, use a builder with more than 4 GB of memory; the Lean builds in
-`lean_setup.sh` were killed in 4 GB VMs:
+To rebuild the image:
 
 ```bash
 uv run prime images push openai-math:adc7f12-d7056fd-prime1 --context generator/image
