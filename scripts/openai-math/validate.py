@@ -168,7 +168,7 @@ async def main() -> None:
     parser.add_argument("--task", action="append", default=[], help="Exact task directory name; repeat to select tasks")
     parser.add_argument("--control", choices=("gold", "empty", "attacks"), action="append", default=[])
     parser.add_argument("--attack-task", default="truffet-counterexample", help="Task the generic attack probes use")
-    parser.add_argument("--image-disk-gb", type=float, default=10.0)
+    parser.add_argument("--image-disk-gb", type=float, default=11.0)
     parser.add_argument("--concurrency", type=int, default=4)
     args = parser.parse_args()
     if args.concurrency < 1:
