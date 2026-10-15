@@ -35,9 +35,8 @@ RUN /root/.local/bin/uv pip install --python /opt/venv/bin/python \
 
 # Expose the baked stack on PATH for both the agent phase and the verifier.
 ENV PATH="/opt/venv/bin:${PATH}"
-# Disable external model/package downloads; distributed workers still communicate locally.
+# Keep model downloads offline; the runtime restricts networking after harness setup.
 ENV HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    UV_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1
 
 WORKDIR /app

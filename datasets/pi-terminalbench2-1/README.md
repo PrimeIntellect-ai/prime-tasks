@@ -37,7 +37,7 @@ This preserves the task contract and decoded pixels for its MNIST images.
 ## Images
 
 Each manifest is authoritative for its image references: 82 solver images and
-two separate verifier images. These `prime/primeintellect/pitb21-*` artifacts
+two separate verifier images. These Prime registry artifacts
 are currently private and require Prime Intellect team access. The task files
 are public; image visibility is a separate registry setting.
 
