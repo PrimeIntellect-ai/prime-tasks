@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
         asciinema \
+        ca-certificates curl git ripgrep \
         build-essential=12.12 \
         dpkg-dev \
         xz-utils \

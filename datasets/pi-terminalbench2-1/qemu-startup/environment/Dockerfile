@@ -55,6 +55,5 @@ RUN curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh \
         pytest==8.4.1 \
         pytest-json-ctrf==0.3.5
 
-# Runtime guard: any later uv invocation must stay offline.
-ENV PATH="/root/.local/bin:$PATH"
-ENV UV_OFFLINE=1
+# Use the baked Python for harness setup; the runtime enforces task networking.
+ENV PATH="/opt/testenv/bin:/root/.local/bin:$PATH"
