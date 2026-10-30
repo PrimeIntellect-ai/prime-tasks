@@ -11,13 +11,13 @@ in the model-facing question.
 In [tasks.json](tasks.json), **18 items receive repairs, task 88 is restored unchanged,
 and 9 unresolved items are excluded**, including task 38 after follow-up source
 verification. The dataset also excludes **3 visual-only tasks (46, 53, 54)**, leaving
-**78 tasks**. Of the repaired tasks, 13 retain their original answer; tasks 36,
-56, 64, 71 and 85 have recomputed answers for their explicit source and account specifications.
+**78 tasks**. Of the repaired tasks, 12 retain their original answer; tasks 36,
+51, 56, 64, 71 and 85 have recomputed answers for their source and account specifications.
 All retained task IDs are preserved. The upstream corpus files are unchanged; the
 offline image adds references and companion PDFs as described in [README.md](README.md).
 
 The separate [OfficeQA-Pro-v2 environment](https://github.com/PrimeIntellect-ai/prime-envs/tree/main/environments/search/officeqa_pro_v2)
-loads all **90 original prompts and answers**, including tasks 36, 56, 64, 71 and 85's original
+loads all **90 original prompts and answers**, including tasks 36, 51, 56, 64, 71 and 85's original
 keys. Report the benchmark variant with results: this corrected 78-task dataset is
 not directly comparable to the original benchmark. Other source-extraction disagreements and visual-evidence dependencies
 are not automatically classified as broken tasks. Task 55 remains included and needs
@@ -36,7 +36,7 @@ its bundled chart PDF. This is not certification of all 78 remaining source answ
 | 33 | Specify inverse HHI and bureau-level denominator, excluding subtotals and offsetting non-bureau rows. | Pinned FY1971/1975/1979 bureau tables give effective counts 8.2730, 7.5295, 7.3338; result [1971, 8.27]. |
 | 35 | Rank ratios descending; select third-highest. | Extracted four-year ratios select [1979, 0.7865]. |
 | 36 | Specify FY1981–1988, next-report prior-year columns in printed millions, and SES squared-error objective. | Recomputed key **25,196.60** for this explicit specification; see derivation below. |
-| 51 | Restore documented FY1991–2000 transitions and FY1990 base; identify FRED RIFSPFFNA weights. | Metadata explicitly identifies CY1991–2000; extracted inputs reproduce 47.6821%. |
+| 51 | Restore documented FY1991–2000 transitions and FY1990 base; identify FRED RIFSPFFNA weights and apply the general latest-revision rule. | Revised Treasury receipt levels and the bundled annual weights give **47.7172%**; see derivation below. |
 | 56 | Specify the following year's comparative Defense budget totals, including revisions and reclassifications; use matching calendar-year PPIACO means and an AR(1) intercept. | The FY1961–FY1970 comparative tables give a persistence coefficient of **0.9605** for FY1960–FY1969 spending. |
 | 58 | Identify the current-year Salaries account under Public Printer. | The cited FY1913 account has $192,020.00 appropriated less $179,418.74 disbursed, leaving $12,601.26; preserve [1913, 12601.26]. |
 | 64 | Preserve negative excess repayments when aggregating the named station accounts; keep the question unchanged. | Signed annual disbursements give **[16101, 16436, 15297, 16276, 15232, 12045, 10773, 10683, 14183, 14441]**. |
@@ -118,10 +118,12 @@ The upstream **25,196.36** is not asserted to be impossible under every alternat
 source panel. The new answer applies to the now explicitly specified printed
 source values. Original mode preserves the upstream question and answer.
 
-## Task 51: interval evidence
+## Task 51: interval and revised receipt levels
 
-The CSV explicitly names `RIFSPFFNA` weights for **CY1991–CY2000**. The following
-receipt observations reproduce the unchanged **47.6821%** reference:
+The CSV explicitly names `RIFSPFFNA` weights for **CY1991–CY2000**. The general
+solver instruction requires the most up-to-date revision unless the question
+specifies an exact date or document. The following receipt levels from the pinned
+corpus give the corrected **47.7172%** reference:
 
 ```text
 FY1990–FY2000 individual income tax receipts (millions):
@@ -129,20 +131,33 @@ FY1990–FY2000 individual income tax receipts (millions):
 656417, 737466, 828587, 879480, 1004461
 
 FY1990–FY2000 total receipts (millions):
-1031307, 1054265, 1090453, 1153226, 1257453, 1351495,
-1452765, 1578953, 1721465, 1827302, 2025037
+1031308, 1054265, 1090453, 1153226, 1258411, 1351495,
+1452765, 1578953, 1721465, 1827302, 2025060
 
 CY1991–CY2000 annual weights:
 5.69, 3.52, 3.02, 4.21, 5.83, 5.30, 5.46, 5.35, 4.97, 6.24
 ```
 
 The calculation is 100 × sum(weight × change in individual taxes / change in
-total receipts) / sum(weights). Treasury values were checked in the pinned
-`cs-1991` through `cs-1994` and `annrpt96` through `annrpt00` sources. A fresh
-FRED CSV download was unavailable during validation; the intended interval and
-series are established by upstream metadata independently of the numeric match.
-The FY1990 total also appears as 1,031,308 in another table, so this interval
-repair is not certification of every last-digit source-vintage choice.
+total receipts) / sum(weights), with the ten weights summing to 49.59. It gives
+**47.7171681197093657...%**, rounded to four decimal places. The annual weights
+are preserved in the bundled `fred__rifspffna.txt`; no live FRED refresh is needed.
+
+Three total-receipt levels replace the older values used by the previous key:
+
+| FY | Previous total, millions | Revised total, millions | Pinned source |
+|---|---:|---:|---|
+| 1990 | 1,031,307 | 1,031,308 | `combined_statement__historical__cs-1994.json`, five-year summary, element 118, parsed page 26. |
+| 1994 | 1,257,453 | 1,258,411 | `combined_statement__transition__annrpt96.json`, element 85, parsed page 11; explicitly marked `r=revised`, and repeated in `annrpt97` and `annrpt98`. |
+| 2000 | 2,025,037 | 2,025,060 | `combined_statement__modern__2001__receipt.json`, prior-year column, element 8, parsed page 1. |
+
+Individual income-tax levels come from the following-year receipt comparisons in
+`cs-1991` through `cs-1994`, `annrpt95` through `annrpt00`, and `2001__receipt`.
+The other total-receipt levels come from the five-year summaries in `annrpt95`
+through `annrpt00`. Page IDs above are zero-based parsed `bbox.page_id` values.
+Replacing only the three revised totals with their previous values reproduces
+**47.6821%**, identifying the source-vintage mismatch. The question, transition
+interval, weights, and upstream source annotations are unchanged.
 
 ## Task 56: following-year comparative Defense totals
 
