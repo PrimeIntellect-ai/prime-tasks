@@ -37,9 +37,10 @@ This preserves the task contract and decoded pixels for its MNIST images.
 ## Images
 
 Each manifest is authoritative for its image references: 82 solver images and
-two separate verifier images. These Prime registry artifacts
-are currently private and require Prime Intellect team access. The task files
-are public; image visibility is a separate registry setting.
+two separate verifier images. All images belong to PI Research and use
+`prime/primeintellect/pi-terminalbench2-1-<task>:<build-hash>`; separate verifiers
+append `-verifier` to the task name. Private images require PI Research access.
+The task files are public; image visibility is a separate registry setting.
 
 The references identify completed image builds for the task sources. They do not
 use mutable `latest` tags. The Caffe correction changes
@@ -59,7 +60,8 @@ when build inputs change, and update the manifest to the returned reference.
 For example:
 
 ```bash
-prime images push pitb21-caffe-cifar-10:<new-tag> \
+PRIME_TEAM_ID=clyvldofb0000gg1kx39rgzjq \
+prime images push pi-terminalbench2-1-caffe-cifar-10:<build-hash> \
   --context datasets/pi-terminalbench2-1/caffe-cifar-10/environment --private
 ```
 
