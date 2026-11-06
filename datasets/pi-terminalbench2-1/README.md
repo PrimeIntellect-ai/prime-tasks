@@ -39,7 +39,8 @@ This preserves the task contract and decoded pixels for its MNIST images.
 Each manifest is authoritative for its image references: 82 solver images and
 two separate verifier images. All images belong to PI Research and use
 `prime/primeintellect/pi-terminalbench2-1-<task>:<build-hash>`; separate verifiers
-append `-verifier` to the task name. Private images require PI Research access.
+append `-verifier` to the task name. All 84 images are public and do not require
+PI Research membership.
 The task files are public; image visibility is a separate registry setting.
 
 The references identify completed image builds for the task sources. They do not
@@ -62,7 +63,7 @@ For example:
 ```bash
 PRIME_TEAM_ID=clyvldofb0000gg1kx39rgzjq \
 prime images push pi-terminalbench2-1-caffe-cifar-10:<build-hash> \
-  --context datasets/pi-terminalbench2-1/caffe-cifar-10/environment --private
+  --context datasets/pi-terminalbench2-1/caffe-cifar-10/environment --public
 ```
 
 Shared verifiers receive their packaged `tests/` files at grading time. Separate
