@@ -1,16 +1,158 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import json
+import math
+import os
+import random
+import shutil
+import subprocess
+import tempfile
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import pandas as pd
+import pytest
+
+SCRIPT = "/home/user/process_data.py"
+REPORT = "/home/user/validation_report.json"
+ALPHA = "/home/user/exp_alpha.csv"
+BETA = "/home/user/exp_beta.csv"
+EXPECTED_KEYS = {
+    "alpha_covariance",
+    "alpha_correlation",
+    "beta_covariance",
+    "beta_correlation",
+    "alpha_valid_rows",
+    "beta_valid_rows",
+}
+
+
+def test_process_data_script_exists():
+    assert os.path.isfile(SCRIPT), f"Expected script {SCRIPT} is missing. Please ensure you saved your code to this location."
+
+
+def test_validation_report_exists():
+    assert os.path.isfile(REPORT), f"Expected output file {REPORT} is missing. Did your script generate it?"
+
+
+def test_validation_report_content():
+    assert os.path.isfile(REPORT), "Validation report not found."
+
+    with open(REPORT, "r") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            pytest.fail(f"File {REPORT} does not contain valid JSON.")
+
+    missing_keys = EXPECTED_KEYS - set(data.keys())
+    assert not missing_keys, f"Validation report is missing keys: {missing_keys}"
+
+    assert data["alpha_valid_rows"] == 101, f"Expected alpha_valid_rows to be 101, got {data['alpha_valid_rows']}"
+    assert data["beta_valid_rows"] == 84, f"Expected beta_valid_rows to be 84, got {data['beta_valid_rows']}"
+
+    assert abs(data["alpha_covariance"] - 11.2386) < 1e-4, f"alpha_covariance {data['alpha_covariance']} is incorrect."
+    assert abs(data["alpha_correlation"] - 0.9859) < 1e-4, f"alpha_correlation {data['alpha_correlation']} is incorrect."
+    assert abs(data["beta_covariance"] - (-10.9996)) < 1e-4, f"beta_covariance {data['beta_covariance']} is incorrect."
+    assert abs(data["beta_correlation"] - (-0.6277)) < 1e-4, f"beta_correlation {data['beta_correlation']} is incorrect."
+
+
+def test_script_recomputes_report_from_csv_inputs():
+    backup_dir = tempfile.mkdtemp(prefix="process_data_backup_")
+    backups = {}
+    for path in (ALPHA, BETA, REPORT):
+        backup = os.path.join(backup_dir, os.path.basename(path))
+        shutil.copy2(path, backup)
+        backups[path] = backup
+
+    try:
+        rng = random.Random(int.from_bytes(os.urandom(16), "big"))
+
+        alpha_x = [rng.uniform(-20.0, 30.0) for _ in range(19)]
+        alpha_y = [2.35 * x + rng.uniform(-4.0, 4.0) for x in alpha_x]
+        alpha = pd.DataFrame({
+            "trial_id": list(range(1001, 1020)),
+            "signal_x": alpha_x,
+            "signal_y": alpha_y,
+        })
+        alpha.loc[2, "signal_x"] = float("nan")
+        alpha.loc[7, "signal_y"] = float("nan")
+        alpha.loc[15, ["signal_x", "signal_y"]] = float("nan")
+
+        beta_x = [rng.uniform(-12.0, 18.0) for _ in range(23)]
+        beta_y = [-1.7 * x + rng.uniform(-8.0, 8.0) for x in beta_x]
+        beta = pd.DataFrame({
+            "trial_id": list(range(2001, 2024)),
+            "signal_x": beta_x,
+            "signal_y": beta_y,
+        })
+        beta.loc[1, "signal_y"] = float("nan")
+        beta.loc[9, "signal_x"] = float("nan")
+        beta.loc[18, "signal_y"] = float("nan")
+        beta.loc[21, ["signal_x", "signal_y"]] = float("nan")
+
+        alpha.to_csv(ALPHA, index=False)
+        beta.to_csv(BETA, index=False)
+
+        # Derive expectations from the actual serialized challenge inputs.
+        clean_alpha = pd.read_csv(ALPHA).dropna()
+        clean_beta = pd.read_csv(BETA).dropna()
+        expected = {
+            "alpha_covariance": round(float(clean_alpha["signal_x"].cov(clean_alpha["signal_y"], ddof=1)), 4),
+            "alpha_correlation": round(float(clean_alpha["signal_x"].corr(clean_alpha["signal_y"])), 4),
+            "beta_covariance": round(float(clean_beta["signal_x"].cov(clean_beta["signal_y"], ddof=1)), 4),
+            "beta_correlation": round(float(clean_beta["signal_x"].corr(clean_beta["signal_y"])), 4),
+            "alpha_valid_rows": int(len(clean_alpha)),
+            "beta_valid_rows": int(len(clean_beta)),
+        }
+
+        if os.path.exists(REPORT):
+            os.remove(REPORT)
+
+        result = subprocess.run(
+            ["python3", SCRIPT],
+            cwd="/home/user",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"Running {SCRIPT} failed with exit code {result.returncode}.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert os.path.isfile(REPORT), "The script did not generate validation_report.json when executed."
+
+        try:
+            with open(REPORT, "r") as f:
+                actual = json.load(f)
+        except json.JSONDecodeError as exc:
+            pytest.fail(f"The report generated by the script is not valid JSON: {exc}")
+
+        missing_keys = EXPECTED_KEYS - set(actual.keys())
+        assert not missing_keys, f"Generated report is missing keys: {missing_keys}"
+        assert actual["alpha_valid_rows"] == expected["alpha_valid_rows"]
+        assert actual["beta_valid_rows"] == expected["beta_valid_rows"]
+
+        for key in (
+            "alpha_covariance",
+            "alpha_correlation",
+            "beta_covariance",
+            "beta_correlation",
+        ):
+            assert isinstance(actual[key], (int, float)) and not isinstance(actual[key], bool), f"{key} must be numeric"
+            assert math.isfinite(float(actual[key])), f"{key} must be finite"
+            assert math.isclose(float(actual[key]), expected[key], rel_tol=0.0, abs_tol=5e-5), (
+                f"{key} was {actual[key]}, expected {expected[key]} for the challenge CSV data"
+            )
+    finally:
+        for path, backup in backups.items():
+            shutil.copy2(backup, path)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

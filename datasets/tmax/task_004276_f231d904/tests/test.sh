@@ -1,16 +1,175 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import ast
+import configparser
+import json
+import os
+import re
+import secrets
+import subprocess
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+
+def test_metrics_fstab():
+    fstab_path = "/home/user/metrics_fstab"
+    assert os.path.exists(fstab_path), f"File {fstab_path} does not exist."
+
+    with open(fstab_path, "r") as f:
+        lines = f.read().splitlines()
+
+    assert len(lines) == 1, f"{fstab_path} must contain exactly one line."
+    pattern = r"^/dev/loop99\s+/home/user/metrics_data\s+ext4\s+ro,user,noauto\s+0\s+0$"
+    assert re.fullmatch(pattern, lines[0].strip()), f"The line in {fstab_path} does not match the required fstab format."
+
+
+def test_metrics_data_directory_and_acls():
+    dir_path = "/home/user/metrics_data"
+    assert os.path.isdir(dir_path), f"Directory {dir_path} does not exist."
+
+    result = subprocess.run(["getfacl", dir_path], capture_output=True, text=True)
+    assert result.returncode == 0, "Failed to run getfacl."
+
+    output = result.stdout
+    assert re.search(r"^user:2048:r-x$", output, re.MULTILINE), f"ACL for UID 2048 (r-x) not found on {dir_path}."
+    assert re.search(r"^default:user:2048:r-x$", output, re.MULTILINE), f"Default ACL for UID 2048 (r-x) not found on {dir_path}."
+
+
+def test_dash_config_ini():
+    ini_path = "/home/user/dash_config.ini"
+    assert os.path.exists(ini_path), f"File {ini_path} does not exist."
+
+    config = configparser.ConfigParser()
+    config.read(ini_path)
+
+    assert "Dashboard" in config, "Section [Dashboard] missing in dash_config.ini."
+    assert config["Dashboard"].get("theme") == "dark", "Theme is not 'dark'."
+    assert config["Dashboard"].get("refresh_rate") == "15", "Refresh rate is not '15'."
+
+    assert "Metrics" in config, "Section [Metrics] missing in dash_config.ini."
+    assert config["Metrics"].get("source") == "/home/user/metrics_data", "Source is incorrect in [Metrics]."
+
+
+def test_build_dash_script_exists_and_works():
+    script_path = "/home/user/build_dash.py"
+    ini_path = "/home/user/dash_config.ini"
+    json_path = "/home/user/dashboard.json"
+    assert os.path.isfile(script_path), f"Python script {script_path} does not exist or is not a regular file."
+
+    with open(script_path, "r") as f:
+        source = f.read()
+    try:
+        tree = ast.parse(source, filename=script_path)
+    except SyntaxError as exc:
+        assert False, f"Python script is not syntactically valid: {exc}"
+
+    module_aliases = set()
+    constructor_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "configparser":
+                    module_aliases.add(alias.asname or "configparser")
+        elif isinstance(node, ast.ImportFrom) and node.module == "configparser":
+            for alias in node.names:
+                if alias.name == "ConfigParser":
+                    constructor_names.add(alias.asname or "ConfigParser")
+
+    uses_configparser = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in constructor_names:
+            uses_configparser = True
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ConfigParser"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in module_aliases
+        ):
+            uses_configparser = True
+    assert uses_configparser, "build_dash.py must create a configparser.ConfigParser instance."
+
+    with open(ini_path, "rb") as f:
+        original_ini = f.read()
+
+    token = secrets.token_hex(8)
+    theme = f"theme_{token}"
+    refresh = secrets.randbelow(9000) + 1000
+    data_source = f"/tmp/metrics_{token}"
+    alternate_ini = (
+        "[Dashboard]\n"
+        f"theme = {theme}\n"
+        f"refresh_rate = {refresh}\n"
+        "[Metrics]\n"
+        f"source = {data_source}\n"
+    )
+
+    try:
+        with open(ini_path, "w") as f:
+            f.write(alternate_ini)
+        if os.path.exists(json_path):
+            os.remove(json_path)
+
+        result = subprocess.run(
+            ["python3", script_path],
+            cwd="/home/user",
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"build_dash.py failed: {result.stderr}"
+        assert os.path.isfile(json_path), "build_dash.py did not generate dashboard.json."
+
+        with open(json_path, "r") as f:
+            generated = json.load(f)
+        expected = {
+            "config": {"theme": theme, "refresh": refresh},
+            "status": "tuned",
+            "data_source": data_source,
+        }
+        assert generated == expected, "build_dash.py did not derive dashboard.json from the INI configuration."
+        assert isinstance(generated["config"]["refresh"], int), "Refresh value generated by the script must be an integer."
+    finally:
+        with open(ini_path, "wb") as f:
+            f.write(original_ini)
+        if os.path.exists(json_path):
+            os.remove(json_path)
+        subprocess.run(
+            ["python3", script_path],
+            cwd="/home/user",
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+
+def test_dashboard_json():
+    json_path = "/home/user/dashboard.json"
+    assert os.path.exists(json_path), f"JSON file {json_path} does not exist. Did the script run?"
+
+    with open(json_path, "r") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            assert False, f"File {json_path} is not valid JSON."
+
+    expected_data = {
+        "config": {
+            "theme": "dark",
+            "refresh": 15
+        },
+        "status": "tuned",
+        "data_source": "/home/user/metrics_data"
+    }
+
+    assert data == expected_data, f"JSON content in {json_path} does not match expected output."
+    assert isinstance(data.get("config", {}).get("refresh"), int), "Refresh value in JSON must be an integer."
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

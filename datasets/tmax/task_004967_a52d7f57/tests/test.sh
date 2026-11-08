@@ -1,16 +1,35 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
+import os
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+def test_anomaly_threshold_file():
+    filepath = '/home/user/anomaly_threshold.txt'
+    assert os.path.isfile(filepath), f"FAIL: {filepath} does not exist. The task requires writing the final threshold to this file."
+
+    with open(filepath, 'r') as f:
+        content = f.read().strip()
+
+    # Check if the content is a valid float
+    try:
+        val = float(content)
+    except ValueError:
+        assert False, f"FAIL: The content of {filepath} ('{content}') is not a valid float."
+
+    # Check if it has exactly 4 decimal places
+    parts = content.split('.')
+    assert len(parts) == 2 and len(parts[1]) == 4, f"FAIL: The threshold must be rounded to exactly 4 decimal places, got '{content}'."
+
+    # Check against the deterministic expected value based on the fixed random seed in the setup
+    expected_val = "8.0694"
+    assert content == expected_val, f"FAIL: Expected threshold to be '{expected_val}', got '{content}'."
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

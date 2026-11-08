@@ -1,16 +1,24 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
+import os
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+def test_decrypted_secret():
+    path = "/home/user/decrypted_secret.txt"
+    assert os.path.isfile(path), f"File {path} does not exist."
+
+    with open(path, "r") as f:
+        content = f.read()
+
+    expected = "OPERATION_MIDNIGHT_ECLIPSE"
+    assert content == expected, f"File {path} content is incorrect. Expected '{expected}', got '{content}'."
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

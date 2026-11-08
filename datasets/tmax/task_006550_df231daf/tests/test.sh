@@ -1,16 +1,208 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import csv
+import json
+import os
+import py_compile
+import random
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+from urllib.parse import unquote, urlsplit
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+HOME = '/home/user'
+APP = os.path.join(HOME, 'app.py')
+LOG = os.path.join(HOME, 'security_events.log')
+ANALYZER = os.path.join(HOME, 'analyze.py')
+CSV_PATH = os.path.join(HOME, 'audit_trail.csv')
+BLOCK_PATH = os.path.join(HOME, 'block_ips.sh')
+
+
+def remove_artifact(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+def run_analyzer():
+    remove_artifact(CSV_PATH)
+    remove_artifact(BLOCK_PATH)
+    return subprocess.run(
+        [sys.executable, ANALYZER],
+        cwd=HOME,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+
+
+def derive_expected(records, vulnerable_endpoint):
+    matched = []
+    pattern = re.compile(r"'\s*(?:UNION|SELECT|--)", re.IGNORECASE)
+    for event in records:
+        decoded = unquote(event['path'])
+        if urlsplit(decoded).path != vulnerable_endpoint:
+            continue
+        if event['status_code'] != 200 or not pattern.search(decoded):
+            continue
+        headers = event['response_headers']
+        missing_both = (
+            'Content-Security-Policy' not in headers
+            and 'Strict-Transport-Security' not in headers
+        )
+        matched.append([
+            event['timestamp'],
+            event['source_ip'],
+            vulnerable_endpoint,
+            str(missing_both),
+        ])
+    matched.sort(key=lambda row: row[0])
+    rules = [f"iptables -A INPUT -s {ip} -j DROP" for ip in sorted({row[1] for row in matched})]
+    return matched, rules
+
+
+def test_analyzer_exists_and_handles_generated_fixture():
+    assert os.path.isfile(ANALYZER), f'{ANALYZER} does not exist or is not a regular file.'
+    py_compile.compile(ANALYZER, doraise=True)
+
+    with open(APP, 'rb') as f:
+        original_app = f.read()
+    with open(LOG, 'rb') as f:
+        original_log = f.read()
+
+    token = uuid.uuid4().hex[:10]
+    vulnerable_endpoint = f'/api/v7/search_{token}'
+    safe_endpoint = f'/api/v7/users_{token}'
+    octets = random.sample(range(10, 240), 3)
+    ip_a = f'198.51.100.{octets[0]}'
+    ip_b = f'203.0.113.{octets[1]}'
+    ip_c = f'192.0.2.{octets[2]}'
+    day = random.randint(10, 20)
+
+    fixture_app = f'''import sqlite3
+from flask import Flask, request
+
+app = Flask(__name__)
+
+def get_db():
+    return sqlite3.connect("test.db")
+
+@app.route("{safe_endpoint}", methods=["GET"])
+def safe_lookup():
+    user_id = request.args.get("id")
+    db = get_db()
+    cursor = db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return {{"data": cursor.fetchall()}}
+
+@app.route("{vulnerable_endpoint}", methods=["GET"])
+def vulnerable_lookup():
+    query = request.args.get("q", "")
+    db = get_db()
+    sql = f"SELECT * FROM items WHERE name = '{{query}}' AND public = 1"
+    cursor = db.execute(sql)
+    return {{"data": cursor.fetchall()}}
+'''
+
+    records = [
+        {'timestamp': f'2024-06-{day:02d}T12:30:00Z', 'source_ip': ip_a, 'method': 'GET', 'path': f'{vulnerable_endpoint}?q=x%27%20UNION%20SELECT%201--', 'status_code': 200, 'response_headers': {'Content-Type': 'application/json'}},
+        {'timestamp': f'2024-06-{day:02d}T10:10:00Z', 'source_ip': ip_b, 'method': 'GET', 'path': f'{vulnerable_endpoint}?q=name%27--', 'status_code': 200, 'response_headers': {'Content-Security-Policy': "default-src 'none'"}},
+        {'timestamp': f'2024-06-{day:02d}T11:20:00Z', 'source_ip': ip_a, 'method': 'GET', 'path': f'{vulnerable_endpoint}?q=z%27%20sElEcT%201', 'status_code': 200, 'response_headers': {'Strict-Transport-Security': 'max-age=100'}},
+        {'timestamp': f'2024-06-{day:02d}T09:00:00Z', 'source_ip': ip_c, 'method': 'GET', 'path': f'{safe_endpoint}?q=x%27%20UNION%20SELECT%201', 'status_code': 200, 'response_headers': {}},
+        {'timestamp': f'2024-06-{day:02d}T13:00:00Z', 'source_ip': ip_c, 'method': 'GET', 'path': f'{vulnerable_endpoint}?q=x%27%20UNION%20SELECT%201', 'status_code': 500, 'response_headers': {}},
+        {'timestamp': f'2024-06-{day:02d}T14:00:00Z', 'source_ip': ip_c, 'method': 'GET', 'path': f'{vulnerable_endpoint}?q=ordinary', 'status_code': 200, 'response_headers': {}},
+    ]
+    expected_rows, expected_rules = derive_expected(records, vulnerable_endpoint)
+
+    try:
+        with open(APP, 'w') as f:
+            f.write(fixture_app)
+        with open(LOG, 'w') as f:
+            for record in records:
+                f.write(json.dumps(record) + '\n')
+
+        result = run_analyzer()
+        assert result.returncode == 0, f'analyze.py failed on generated input:\n{result.stdout}\n{result.stderr}'
+        assert os.path.isfile(CSV_PATH), f'{CSV_PATH} was not generated by analyze.py.'
+        assert os.path.isfile(BLOCK_PATH), f'{BLOCK_PATH} was not generated by analyze.py.'
+
+        with open(CSV_PATH, newline='') as f:
+            rows = list(csv.reader(f))
+        assert rows[0] == ['Timestamp', 'Attacker_IP', 'Vulnerable_Endpoint', 'Missing_Security_Headers']
+        assert rows[1:] == expected_rows, f'Generated-fixture CSV mismatch. Expected {expected_rows}, got {rows[1:]}'
+
+        st = os.stat(BLOCK_PATH)
+        assert bool(st.st_mode & stat.S_IXUSR), f'{BLOCK_PATH} is not executable.'
+        with open(BLOCK_PATH) as f:
+            rules = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+        assert rules == expected_rules, f'Generated-fixture rules mismatch. Expected {expected_rules}, got {rules}'
+    finally:
+        with open(APP, 'wb') as f:
+            f.write(original_app)
+        with open(LOG, 'wb') as f:
+            f.write(original_log)
+        try:
+            run_analyzer()
+        except Exception:
+            pass
+
+
+def test_audit_trail_csv():
+    csv_path = '/home/user/audit_trail.csv'
+    assert os.path.isfile(csv_path), f"{csv_path} does not exist."
+
+    expected_header = ['Timestamp', 'Attacker_IP', 'Vulnerable_Endpoint', 'Missing_Security_Headers']
+    expected_rows = [
+        ['2023-10-25T10:00:00Z', '192.168.1.50', '/api/v1/search', 'True'],
+        ['2023-10-25T10:30:00Z', '192.168.1.100', '/api/v1/search', 'True'],
+        ['2023-10-25T11:00:00Z', '203.0.113.5', '/api/v1/search', 'False']
+    ]
+
+    with open(csv_path, 'r', newline='') as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    assert len(rows) > 0, f"{csv_path} is empty."
+    assert rows[0] == expected_header, f"Header row in {csv_path} is incorrect. Expected {expected_header}, got {rows[0]}"
+
+    data_rows = rows[1:]
+    assert len(data_rows) == len(expected_rows), f"Expected {len(expected_rows)} data rows, found {len(data_rows)}."
+
+    for i, (actual, expected) in enumerate(zip(data_rows, expected_rows)):
+        assert actual == expected, f"Row {i+1} mismatch. Expected {expected}, got {actual}."
+
+
+def test_block_ips_script():
+    script_path = '/home/user/block_ips.sh'
+    assert os.path.isfile(script_path), f"{script_path} does not exist."
+
+    st = os.stat(script_path)
+    assert bool(st.st_mode & stat.S_IXUSR), f"{script_path} is not executable."
+
+    expected_lines = [
+        "iptables -A INPUT -s 192.168.1.100 -j DROP",
+        "iptables -A INPUT -s 192.168.1.50 -j DROP",
+        "iptables -A INPUT -s 203.0.113.5 -j DROP"
+    ]
+
+    with open(script_path, 'r') as f:
+        lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+
+    assert len(lines) == len(expected_lines), f"Expected {len(expected_lines)} iptables rules, found {len(lines)}."
+
+    for i, (actual, expected) in enumerate(zip(lines, expected_lines)):
+        assert actual == expected, f"Rule {i+1} mismatch in {script_path}. Expected '{expected}', got '{actual}'."
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

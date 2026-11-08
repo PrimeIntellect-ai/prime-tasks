@@ -1,6 +1,4 @@
-FROM ubuntu:22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-COPY post_install.sh /tmp/post_install.sh
-RUN bash /tmp/post_install.sh && rm /tmp/post_install.sh
+FROM --platform=linux/amd64 hamishi740/swerl-tmax-v3:df79717e27d3
+USER root
+RUN mkdir -p /workspace /output /logs/verifier /root && ([ -d /app ] || ln -sf /workspace /app)
+WORKDIR /app

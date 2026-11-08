@@ -1,16 +1,320 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import ast
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import pytest
+import requests
+
+ROOT = Path('/home/user/polymath')
+LOG_PATH = ROOT / 'results.log'
+SCRIPT_PATH = Path('/home/user/test_run.py')
+REQUIRED_EXPR = '14 + 2 * ( 18 - 6 ) / 4'
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+def run_script(env=None, timeout=45):
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT_PATH)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate()
+        pytest.fail(f'test_run.py timed out. stdout={stdout!r}, stderr={stderr!r}')
+    assert proc.returncode == 0, (
+        f'test_run.py exited with {proc.returncode}. '
+        f'stdout={stdout!r}, stderr={stderr!r}'
+    )
+
+
+def expected_value(expression):
+    tree = ast.parse(expression, mode='eval')
+
+    def visit(node):
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) is int and node.value >= 0:
+            return node.value
+        if isinstance(node, ast.BinOp):
+            left, right = visit(node.left), visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+        raise AssertionError(f'Unexpected verifier expression node: {ast.dump(node)}')
+
+    return visit(tree)
+
+
+def assert_result(actual, expected):
+    assert isinstance(actual, dict), f'Expected a JSON object, got {actual!r}'
+    assert 'result' in actual, "JSON response does not contain 'result' key"
+    assert isinstance(actual['result'], (int, float)) and not isinstance(actual['result'], bool)
+    assert math.isclose(actual['result'], expected, rel_tol=1e-9, abs_tol=1e-9), (
+        f"Expected result {expected}, got {actual['result']}"
+    )
+
+
+def exercise_server_js(server_js, expressions):
+    port = free_port()
+    env = os.environ.copy()
+    env['PORT'] = str(port)
+    proc = subprocess.Popen(
+        ['node', str(server_js)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.time() + 15
+        last_error = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                pytest.fail(
+                    f'Bundled Node server exited early with {proc.returncode}. '
+                    f'stdout={stdout!r}, stderr={stderr!r}'
+                )
+            try:
+                response = requests.post(
+                    f'http://127.0.0.1:{port}/calc',
+                    json={'expression': expressions[0]},
+                    timeout=1,
+                )
+                if response.status_code < 500:
+                    break
+            except requests.RequestException as exc:
+                last_error = exc
+            time.sleep(0.2)
+        else:
+            pytest.fail(f'Bundled Node server did not become ready: {last_error}')
+
+        for expression in expressions:
+            response = requests.post(
+                f'http://127.0.0.1:{port}/calc',
+                json={'expression': expression},
+                timeout=5,
+            )
+            assert response.status_code == 200, (
+                f'/calc returned HTTP {response.status_code} for {expression!r}: {response.text}'
+            )
+            try:
+                payload = response.json()
+            except ValueError:
+                pytest.fail(f'/calc did not return JSON for {expression!r}: {response.text!r}')
+            assert_result(payload, expected_value(expression))
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def test_results_log_exists_and_correct_after_real_execution():
+    assert SCRIPT_PATH.is_file(), f'Test script {SCRIPT_PATH} does not exist'
+    LOG_PATH.unlink(missing_ok=True)
+    run_script()
+    assert LOG_PATH.is_file(), f'Log file {LOG_PATH} was not generated by test_run.py'
+    content = LOG_PATH.read_text().strip()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        pytest.fail(f'Log file {LOG_PATH} does not contain valid JSON. Content: {content}')
+    assert_result(data, expected_value(REQUIRED_EXPR))
+
+
+def test_test_run_uses_client_lifecycle_and_writes_evaluate_response(tmp_path):
+    fake_root = tmp_path / 'fake'
+    fake_package = fake_root / 'poly_calc'
+    fake_package.mkdir(parents=True)
+    trace_path = tmp_path / 'trace.json'
+    sentinel = 918273.125
+    (fake_package / '__init__.py').write_text(f'''\
+import json, os
+_trace = []
+def _save():
+    with open(os.environ["POLYCALC_TRACE"], "w") as f:
+        json.dump(_trace, f)
+class PolyCalcClient:
+    def __init__(self, *args, **kwargs):
+        _trace.append(["init"]); _save(); self.started = False
+    def start_server(self):
+        self.started = True; _trace.append(["start"]); _save()
+    def evaluate(self, expr):
+        if not self.started:
+            raise RuntimeError("evaluate called before start_server")
+        _trace.append(["evaluate", expr]); _save()
+        return {{"result": {sentinel!r}}}
+    def stop_server(self):
+        if not self.started:
+            raise RuntimeError("stop_server called before start_server")
+        self.started = False; _trace.append(["stop"]); _save()
+''')
+
+    LOG_PATH.unlink(missing_ok=True)
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(fake_root)
+    env['POLYCALC_TRACE'] = str(trace_path)
+    run_script(env=env)
+
+    assert trace_path.is_file(), 'test_run.py did not instantiate and use PolyCalcClient'
+    trace = json.loads(trace_path.read_text())
+    names = [entry[0] for entry in trace]
+    assert 'start' in names, 'test_run.py did not call start_server()'
+    assert ['evaluate', REQUIRED_EXPR] in trace, (
+        f'test_run.py did not evaluate the exact required expression {REQUIRED_EXPR!r}'
+    )
+    assert 'stop' in names, 'test_run.py did not call stop_server()'
+    assert names.index('start') < names.index('evaluate') < names.index('stop'), (
+        f'Client lifecycle calls occurred in the wrong order: {trace!r}'
+    )
+    assert LOG_PATH.is_file(), 'test_run.py did not write results.log'
+    assert json.loads(LOG_PATH.read_text()) == {'result': sentinel}, (
+        'test_run.py did not write the exact response returned by evaluate()'
+    )
+
+
+def test_package_installed_with_node_api():
+    try:
+        import poly_calc
+    except ImportError:
+        pytest.fail("poly_calc package is not installed. Did you run 'pip install .' in python_client?")
+
+    package_dir = os.path.dirname(poly_calc.__file__)
+    node_api_dir = os.path.join(package_dir, 'node_api')
+    node_modules_dir = os.path.join(node_api_dir, 'node_modules')
+    server_js_path = os.path.join(node_api_dir, 'server.js')
+
+    assert os.path.isdir(node_api_dir), f'node_api directory not found in bundled package at {node_api_dir}'
+    assert os.path.isdir(node_modules_dir), (
+        f'node_modules directory not found in bundled package at {node_modules_dir}. '
+        'The build process should run npm install.'
+    )
+    assert os.path.isfile(server_js_path), f'server.js not found in bundled package at {server_js_path}'
+
+
+def test_installed_client_and_parser_behavior():
+    from poly_calc import PolyCalcClient
+
+    expressions = [
+        REQUIRED_EXPR,
+        '2 + 3 * 4',
+        '( 8 + 4 ) / 3',
+        '20 - 3 * ( 2 + 1 )',
+        '7 / 2 + 5 * ( 9 - 7 )',
+        '( ( 15 - 3 ) * 2 + 6 ) / 5',
+    ]
+    client = PolyCalcClient(port=free_port())
+    try:
+        client.start_server()
+        assert client.process is not None and client.process.poll() is None, 'start_server() did not start Node'
+        for expression in expressions:
+            assert_result(client.evaluate(expression), expected_value(expression))
+    finally:
+        client.stop_server()
+    assert client.process.poll() is not None, 'stop_server() did not stop Node gracefully'
+
+
+def test_setup_build_hook_runs_npm_and_bundles_complete_node_api(tmp_path):
+    project = tmp_path / 'project'
+    python_client = project / 'python_client'
+    node_api = project / 'node_api'
+    shutil.copytree(ROOT / 'python_client', python_client)
+    shutil.copytree(ROOT / 'node_api', node_api)
+
+    marker = tmp_path / 'npm-ran.marker'
+    sentinel_name = 'verifier-build-sentinel.txt'
+    (node_api / sentinel_name).write_text('copied from node_api')
+
+    package_json_path = node_api / 'package.json'
+    package_json = json.loads(package_json_path.read_text())
+    scripts = package_json.setdefault('scripts', {})
+    scripts['postinstall'] = (
+        "node -e \"require('fs').writeFileSync(process.env.POLYMATH_NPM_MARKER, 'ran')\""
+    )
+    package_json_path.write_text(json.dumps(package_json))
+
+    target = tmp_path / 'installed'
+    env = os.environ.copy()
+    env['POLYMATH_NPM_MARKER'] = str(marker)
+    completed = subprocess.run(
+        [
+            sys.executable, '-m', 'pip', 'install', '.',
+            '--target', str(target), '--no-deps', '--no-build-isolation', '--no-cache-dir'
+        ],
+        cwd=python_client,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=240,
+    )
+    assert completed.returncode == 0, f'pip install failed:\n{completed.stdout}'
+    assert marker.is_file(), 'setup.py did not run npm install in ../node_api during the build'
+
+    bundled = target / 'poly_calc' / 'node_api'
+    assert bundled.is_dir(), 'Fresh pip install did not bundle node_api beside poly_calc/__init__.py'
+    assert (bundled / 'server.js').is_file(), 'Fresh build did not bundle server.js'
+    assert (bundled / 'node_modules').is_dir(), 'Fresh build did not bundle node_modules'
+    assert (bundled / 'node_modules' / 'express').is_dir(), 'Bundled node_modules does not contain Express'
+    assert (bundled / sentinel_name).read_text() == 'copied from node_api', (
+        'setup.py did not copy the entire node_api directory into package data'
+    )
+
+    exercise_server_js(
+        bundled / 'server.js',
+        [REQUIRED_EXPR, '3 * ( 4 + 5 ) - 8 / 2', '18 / ( 2 * 3 ) + 7'],
+    )
+
+
+def test_no_eval_in_server():
+    server_js_path = '/home/user/polymath/node_api/server.js'
+    assert os.path.isfile(server_js_path), f'File {server_js_path} does not exist'
+    content = Path(server_js_path).read_text()
+    assert not re.search(r'\beval\s*\(', content), 'Usage of eval() is strictly forbidden in server.js'
+    assert not re.search(r'\bFunction\s*\(', content), 'Usage of Function constructor is strictly forbidden in server.js'
+
+
+def test_test_run_script_exists():
+    assert SCRIPT_PATH.is_file(), f'Test script {SCRIPT_PATH} does not exist'
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

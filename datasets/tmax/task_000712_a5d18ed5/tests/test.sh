@@ -1,16 +1,175 @@
 #!/bin/bash
-set -e
-
+set -u
 mkdir -p /logs/verifier
+echo "0" > /logs/verifier/reward.txt
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import math
+import os
+import re
+import time
+import uuid
+import wave
+from pathlib import Path
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import pytest
+import requests
+
+BASE = "http://127.0.0.1:8080"
+CURRENT = Path("/app/current_version.txt")
+PROCESSOR = Path("/app/data_processor.py")
+AUDIO = Path("/app/build_command.wav")
+REPORT = Path("/home/user/build_artifacts/memory_report.txt")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def restore_fixtures():
+    originals = {
+        CURRENT: CURRENT.read_bytes(),
+        PROCESSOR: PROCESSOR.read_bytes(),
+        AUDIO: AUDIO.read_bytes(),
+    }
+    yield
+    for path, content in originals.items():
+        path.write_bytes(content)
+
+
+def post_build(timeout=120):
+    try:
+        return requests.post(f"{BASE}/build", timeout=timeout)
+    except requests.exceptions.RequestException as exc:
+        pytest.fail(f"Failed to connect to {BASE}/build: {exc}")
+
+
+def parse_report():
+    assert REPORT.is_file(), f"Memory report file not found at {REPORT}"
+    content = REPORT.read_text().strip()
+    assert re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", content), \
+        f"Memory report must contain strictly one finite float, got {content!r}"
+    value = float(content)
+    assert math.isfinite(value) and value > 0, \
+        f"Expected finite memory usage greater than 0, got {value}"
+    return value
+
+
+def install_processor(mebibytes, marker):
+    PROCESSOR.write_text(
+        "import time\n"
+        "def process_data():\n"
+        f"    data = bytearray({mebibytes} * 1024 * 1024)\n"
+        "    for i in range(0, len(data), 4096):\n"
+        "        data[i] = 1\n"
+        f"    with open({str(marker)!r}, 'a') as f:\n"
+        f"        f.write({str(mebibytes)!r} + '\\n')\n"
+        "    time.sleep(1.2)\n"
+        "    return len(data)\n"
+        "if __name__ == '__main__':\n"
+        "    process_data()\n"
+    )
+
+
+def assert_success(response):
+    assert response.status_code == 200, \
+        f"Expected status code 200, got {response.status_code}. Response body: {response.text}"
+    try:
+        data = response.json()
+    except ValueError:
+        pytest.fail(f"Response is not valid JSON: {response.text}")
+    expected = {"status": "success", "target_version": "2.1.0"}
+    assert data == expected, f"Expected {expected}, got {data}"
+
+
+def test_01_environment_and_health_endpoint():
+    assert Path("/home/user/venv/pyvenv.cfg").is_file(), "Virtual environment was not created"
+    assert Path("/home/user/venv/bin/python").is_file(), "Virtual environment has no Python executable"
+
+    url = f"{BASE}/health"
+    try:
+        response = requests.get(url, timeout=5)
+    except requests.exceptions.RequestException as exc:
+        pytest.fail(f"Failed to connect to {url}: {exc}")
+    assert response.status_code == 200, f"Expected status code 200, got {response.status_code}"
+    try:
+        data = response.json()
+    except ValueError:
+        pytest.fail(f"Response is not valid JSON: {response.text}")
+    assert data == {"status": "ok"}, f"Expected {{'status': 'ok'}}, got {data}"
+
+
+def test_02_original_build_and_memory_report():
+    CURRENT.write_text("1.4.2\n")
+    if REPORT.exists():
+        REPORT.unlink()
+    started = time.time()
+    response = post_build()
+    assert_success(response)
+    value = parse_report()
+    assert value > 0
+    assert REPORT.stat().st_mtime >= started - 1, "Build did not create a fresh memory report"
+
+
+def test_03_semantic_version_must_be_strictly_greater():
+    CURRENT.write_text("2.1.0\n")
+    response = post_build()
+    assert response.status_code == 400, \
+        f"Expected downgrade status 400 when versions are equal, got {response.status_code}: {response.text}"
+    try:
+        data = response.json()
+    except ValueError:
+        pytest.fail(f"Downgrade response is not valid JSON: {response.text}")
+    assert data == {"error": "version downgrade"}, data
+
+    CURRENT.write_text("10.0.0\n")
+    response = post_build()
+    assert response.status_code == 400, \
+        f"Expected numeric semantic-version downgrade status 400, got {response.status_code}: {response.text}"
+    assert response.json() == {"error": "version downgrade"}
+
+
+def test_04_processor_is_executed_and_memory_is_profiled():
+    CURRENT.write_text("1.4.2\n")
+    marker = Path(f"/tmp/processor_marker_{uuid.uuid4().hex}")
+
+    measurements = []
+    for size in (6, 70):
+        install_processor(size, marker)
+        if REPORT.exists():
+            REPORT.unlink()
+        started = time.time()
+        response = post_build()
+        assert_success(response)
+        assert marker.is_file(), "/app/data_processor.py was not executed"
+        assert marker.read_text().splitlines()[-1] == str(size), \
+            "The currently installed data processor was not executed"
+        assert REPORT.stat().st_mtime >= started - 1, "Memory report was not regenerated by this build"
+        measurements.append(parse_report())
+
+    low, high = measurements
+    assert high >= low + 30.0, \
+        f"Reported peak memory did not track processor allocation: low={low} MiB, high={high} MiB"
+
+
+def test_05_build_depends_on_audio_fixture():
+    CURRENT.write_text("1.4.2\n")
+    with wave.open(str(AUDIO), "rb") as source:
+        params = source.getparams()
+        frame_count = source.getnframes()
+    with wave.open(str(AUDIO), "wb") as target:
+        target.setparams(params)
+        target.writeframes(b"\x00" * frame_count * params.nchannels * params.sampwidth)
+
+    response = post_build()
+    if response.status_code == 200:
+        try:
+            data = response.json()
+        except ValueError:
+            return
+        assert data != {"status": "success", "target_version": "2.1.0"}, \
+            "Build returned the prerecorded answer even after the spoken command was removed"
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

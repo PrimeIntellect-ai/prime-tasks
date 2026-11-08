@@ -1,16 +1,30 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
+import os
+import pytest
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+def test_closest_pair_file_exists():
+    output_file = "/home/user/closest_pair.txt"
+    assert os.path.exists(output_file), f"Output file does not exist at {output_file}"
+    assert os.path.isfile(output_file), f"Path {output_file} is not a file"
+
+def test_closest_pair_content():
+    output_file = "/home/user/closest_pair.txt"
+    assert os.path.exists(output_file), f"Output file does not exist at {output_file}"
+
+    with open(output_file, "r") as f:
+        content = f.read().strip()
+
+    expected = "apple,banana"
+    assert content == expected, f"Expected '{expected}', but got '{content}'"
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

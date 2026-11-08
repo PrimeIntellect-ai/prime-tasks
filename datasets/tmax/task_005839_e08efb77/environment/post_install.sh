@@ -1,9 +1,0 @@
-apt-get update && apt-get install -y python3 python3-pip
-    pip3 install pytest
-
-    # Install required system packages
-    apt-get install -y g++ wget curl tar libomp-dev
-
-    # Create user and set permissions
-    useradd -m -s /bin/bash user || true
-    chmod -R 777 /home/user

@@ -1,9 +1,0 @@
-apt-get update && apt-get install -y python3 python3-pip tzdata
-    pip3 install pytest
-
-    useradd -m -s /bin/bash user || true
-
-    mkdir -p /home/user/run
-    mkdir -p /home/user/app_data/run
-
-    chmod -R 777 /home/user

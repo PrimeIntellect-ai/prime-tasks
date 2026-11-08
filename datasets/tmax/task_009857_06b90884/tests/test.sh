@@ -1,16 +1,35 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import os
+import pytest
+
+def test_bad_commit_file_exists():
+    path = "/home/user/bad_commit.txt"
+    assert os.path.isfile(path), f"Expected file {path} to exist."
+
+def test_bad_commit_hash_correct():
+    actual_path = "/home/user/bad_commit.txt"
+    expected_path = "/tests/.secret_bad_commit"
+
+    assert os.path.isfile(actual_path), f"Cannot verify hash because {actual_path} is missing."
+    assert os.path.isfile(expected_path), f"Truth file {expected_path} is missing."
+
+    with open(actual_path, "r") as f:
+        actual_hash = f.read().strip()
+
+    with open(expected_path, "r") as f:
+        expected_hash = f.read().strip()
+
+    assert actual_hash == expected_hash, f"Incorrect commit hash in {actual_path}. Expected {expected_hash}, got {actual_hash}."
+TEST_EOF
+
+if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0
