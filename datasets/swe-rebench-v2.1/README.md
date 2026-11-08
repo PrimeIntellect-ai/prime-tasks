@@ -16,7 +16,9 @@ uv run scripts/swe-rebench-v2.1/import_tasks.py
 ```
 
 The `swerebench_v2` environment in `prime-envs` loads this directory through the native
-Verifiers Harbor integration, pinned to a Git commit.
+Verifiers Harbor integration, pinned to a Git commit. It snapshots the starting tree before the
+agent runs and writes `/logs/artifacts/model.patch` when the agent stops. Harbor has no step
+before the agent phase, so other runners must write that diff themselves.
 
 ## Task contract
 
@@ -28,10 +30,10 @@ Verifiers Harbor integration, pinned to a Git commit.
   command, and grades the log with `tests/grade.py`, a standard-library grader, against the
   FAIL_TO_PASS and PASS_TO_PASS lists in `tests/config.json`. The reward is 1 when every
   FAIL_TO_PASS test passes and no PASS_TO_PASS test fails.
-- The verifier runs in a separate box from the same image. A `[[verifier.collect]]` hook writes the
-  agent's repository diff against the task's base commit to `/logs/artifacts/model.patch`, or an
-  empty diff when the repository is broken. `tests/test.sh` applies that diff first and scores 0
-  when it does not apply.
+- The verifier runs in a separate box from the same image, which receives only
+  `/logs/artifacts/model.patch`: the agent's diff against the image's starting tree, tracked and
+  untracked files included. `tests/test.sh` applies that diff first and scores 0 when it does not
+  apply; without a diff it grades the untouched repository.
 - `solution/solve.sh` applies the reference patch `solution/gold.patch`.
 
 ## Changes relative to SWE-rebench V2
@@ -60,9 +62,11 @@ Compared with their SWE-rebench V2 rows:
 
 The import script changes three things in each upstream task:
 
-- `task.toml` sets `[verifier].environment_mode = "separate"` and adds the collect hook. Its base
-  commit comes from the task's row in `nebius/SWE-rebench-V2` at revision `d7608f0`, because V2.1
-  metadata omits it.
+- `task.toml` sets `[verifier].environment_mode = "separate"`.
 - `tests/test.sh` applies `/logs/artifacts/model.patch` before restoring the test files.
 - `tests/test.sh` raises the open-file limit to the hard limit. Prime sandboxes default to 1,024
   open files, under which meilisearch's integration tests fail even with the reference patch.
+
+The diff is taken against the starting tree rather than the base commit because 2,944 images
+(22%) start with a modified tracked file or untracked files, mostly lockfiles rewritten by the
+dependency install and downloaded Go toolchain archives.
