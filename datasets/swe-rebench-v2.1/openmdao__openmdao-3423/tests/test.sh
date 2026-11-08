@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/OpenMDAO
 TEST_FILES=(openmdao/code_review/test_common_problems.py openmdao/components/tests/test_exec_comp.py openmdao/components/tests/test_meta_model_structured_comp.py openmdao/core/tests/test_check_totals.py openmdao/core/tests/test_parallel_groups.py openmdao/jacobians/tests/test_jacobian.py openmdao/jacobians/tests/test_jacobian_features.py openmdao/utils/tests/test_cmdline.py openmdao/utils/tests/test_options_dictionary.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/kroxylicious
 TEST_FILES=(kroxylicious-operator/src/test/java/io/kroxylicious/kubernetes/operator/DerivedResourcesTest.java kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-api-not-declared/in-KafkaProxy.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-api-not-declared/in-One-filter-one.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-api-not-declared/in-Two-filter-two.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-api-not-declared/out-Deployment-example.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-api-not-declared/out-Secret-example.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-api-not-declared/out-Service-bar.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-resource-not-found/in-KafkaProxy.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-resource-not-found/in-One-filter-one.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-resource-not-found/in-Two-filter-two.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-resource-not-found/out-Deployment-example.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-resource-not-found/out-Secret-example.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/filter-resource-not-found/out-Service-bar.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/minimal/in-KafkaProxy.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/minimal/out-Deployment-minimal.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/minimal/out-Secret-minimal.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/minimal/out-Service-one.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-clusters/in-KafkaProxy.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-clusters/out-Deployment-twocluster.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-clusters/out-Secret-twocluster.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-clusters/out-Service-bar.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-clusters/out-Service-foo.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-filters/in-KafkaProxy.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-filters/in-One-filter-one.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-filters/in-Two-filter-two.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-filters/out-Deployment-example.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-filters/out-Secret-example.yaml kroxylicious-operator/src/test/resources/DerivedResourcesTest/two-filters/out-Service-foo.yaml)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

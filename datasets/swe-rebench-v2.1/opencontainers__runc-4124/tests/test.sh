@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/runc
 TEST_FILES=(libcontainer/configs/validate/validator_test.go libcontainer/integration/exec_test.go libcontainer/specconv/spec_linux_test.go tests/integration/delete.bats tests/integration/events.bats tests/integration/helpers.bash tests/integration/idmap.bats tests/integration/kill.bats tests/integration/mounts.bats tests/integration/run.bats tests/integration/timens.bats tests/integration/userns.bats)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

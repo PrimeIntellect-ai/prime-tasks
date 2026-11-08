@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/router
 TEST_FILES=(packages/router-generator/tests/deny-route-group-config.test.ts 'packages/router-generator/tests/deny-route-group-config/flat-flat/(group).index.tsx' 'packages/router-generator/tests/deny-route-group-config/flat-flat/(group).tsx' packages/router-generator/tests/deny-route-group-config/flat-flat/__root.tsx packages/router-generator/tests/deny-route-group-config/flat-flat/about.tsx packages/router-generator/tests/deny-route-group-config/flat-nested/__root.tsx packages/router-generator/tests/deny-route-group-config/flat-nested/about.tsx 'packages/router-generator/tests/deny-route-group-config/flat-nested/nested/(group).index.tsx' 'packages/router-generator/tests/deny-route-group-config/flat-nested/nested/(group).tsx' 'packages/router-generator/tests/deny-route-group-config/nested-flat/(group).tsx' 'packages/router-generator/tests/deny-route-group-config/nested-flat/(group)/index.tsx' packages/router-generator/tests/deny-route-group-config/nested-flat/__root.tsx packages/router-generator/tests/deny-route-group-config/nested-flat/about.tsx packages/router-generator/tests/deny-route-group-config/nested-nested/__root.tsx packages/router-generator/tests/deny-route-group-config/nested-nested/about.tsx 'packages/router-generator/tests/deny-route-group-config/nested-nested/nested/(group).tsx' 'packages/router-generator/tests/deny-route-group-config/nested-nested/nested/(group)/index.tsx' packages/router-generator/tests/generator.test.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/sfmc-devtools
 TEST_FILES=(test/resourceFactory.js test/resources/9999999/asset/block-1157-retrieve-expected.html test/resources/9999999/asset/block-1157-retrieve-expected.json test/resources/9999999/asset/v1/content/assets/1209971/get-response.json test/resources/9999999/asset/v1/content/assets/1295064/get-response.json test/resources/9999999/asset/v1/content/assets/808714/get-response.json test/resources/9999999/asset/v1/content/assets/query/post-response.json test/resources/9999999/dataFolder/retrieve-ContentType=asset-sharedORContentType=asset-response.xml test/type.asset.test.js)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

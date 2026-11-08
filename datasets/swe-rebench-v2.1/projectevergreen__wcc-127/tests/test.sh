@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/wcc
 TEST_FILES=(test/cases/attributes/attributes.spec.js test/cases/attributes/src/components/counter.js test/cases/children-and-slots/children-and-slots.spec.js test/cases/custom-extension/custom-extension.spec.js test/cases/get-data/get-data.spec.js test/cases/get-data/src/components/counter.js test/cases/nested-elements/nested-elements.spec.js test/cases/nested-elements/src/components/header.js test/cases/render-from-html/render-from-html.spec.js test/cases/single-element/single-element.spec.js)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

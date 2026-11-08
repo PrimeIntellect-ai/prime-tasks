@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/hipparchus
 TEST_FILES=(hipparchus-core/src/test/java/org/hipparchus/analysis/differentiation/FieldGradientTest.java hipparchus-core/src/test/java/org/hipparchus/analysis/differentiation/GradientTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/ClassicalRungeKuttaFieldIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/ClassicalRungeKuttaIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/EulerFieldIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/EulerIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/GillFieldIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/GillIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/LutherFieldIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/LutherIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/MidpointFieldIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/MidpointIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/RungeKuttaFieldIntegratorAbstractTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/RungeKuttaIntegratorAbstractTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/ThreeEighthesFieldIntegratorTest.java hipparchus-ode/src/test/java/org/hipparchus/ode/nonstiff/ThreeEighthesIntegratorTest.java)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

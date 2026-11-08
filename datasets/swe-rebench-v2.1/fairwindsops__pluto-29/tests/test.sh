@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/pluto
 TEST_FILES=(e2e/tests/00_static_files.yaml e2e/tests/01_helm-detect-3.yaml e2e/tests/02_helm-detect-2.yaml e2e/tests/assets/helm2/helm2configmap-deprecated.yaml e2e/tests/assets/helm2/helm2configmap-no-deprecated.yaml e2e/tests/assets/helm3chart/.helmignore e2e/tests/assets/helm3chart/Chart.yaml e2e/tests/assets/helm3chart/templates/NOTES.txt e2e/tests/assets/helm3chart/templates/_helpers.tpl e2e/tests/assets/helm3chart/templates/deployment-deprecated.yaml e2e/tests/assets/helm3chart/templates/deployment.yaml e2e/tests/assets/helm3chart/values.yaml e2e/tests/assets/helmchartest/templates/serviceaccount.yaml pkg/api/output_test.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

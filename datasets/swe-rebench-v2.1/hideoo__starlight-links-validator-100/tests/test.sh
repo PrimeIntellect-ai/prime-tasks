@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/starlight-links-validator
 TEST_FILES=(packages/starlight-links-validator/tests/base-path.test.ts packages/starlight-links-validator/tests/fixtures/base-path/astro.config.ts packages/starlight-links-validator/tests/fixtures/base-path/src/content/docs/test.md packages/starlight-links-validator/tests/fixtures/invalid-links/astro.config.ts packages/starlight-links-validator/tests/fixtures/invalid-links/src/content/docs/guides/example.mdx packages/starlight-links-validator/tests/fixtures/invalid-links/src/content/docs/test.md packages/starlight-links-validator/tests/fixtures/same-site-error/astro.config.ts packages/starlight-links-validator/tests/fixtures/same-site-error/package.json packages/starlight-links-validator/tests/fixtures/same-site-error/src/content.config.ts packages/starlight-links-validator/tests/fixtures/same-site-error/src/content/docs/guides/example.md packages/starlight-links-validator/tests/fixtures/same-site-error/src/content/docs/test.md packages/starlight-links-validator/tests/fixtures/same-site-validate/astro.config.ts packages/starlight-links-validator/tests/fixtures/same-site-validate/package.json packages/starlight-links-validator/tests/fixtures/same-site-validate/src/content.config.ts packages/starlight-links-validator/tests/fixtures/same-site-validate/src/content/docs/guides/example.md packages/starlight-links-validator/tests/fixtures/same-site-validate/src/content/docs/index.md packages/starlight-links-validator/tests/fixtures/same-site-validate/src/content/docs/test.md packages/starlight-links-validator/tests/fixtures/valid-links/astro.config.ts packages/starlight-links-validator/tests/fixtures/valid-links/src/content/docs/index.md packages/starlight-links-validator/tests/same-site.test.ts packages/starlight-links-validator/tests/utils.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

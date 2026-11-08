@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/memefish
 TEST_FILES=(testdata/input/query/aggregate_function_calls.sql testdata/result/ddl/alter_table_add_column_with_if_expression.sql.txt testdata/result/ddl/create_table.sql.txt testdata/result/ddl/create_table_with_sequence_function.sql.txt testdata/result/dml/insert_with_sequence_function.sql.txt testdata/result/query/aggregate_function_calls.sql.txt testdata/result/query/select_call_with_named_expr.sql.txt testdata/result/query/select_count_distinct.sql.txt testdata/result/query/select_expr.sql.txt testdata/result/query/select_literals_all.sql.txt testdata/result/query/select_literals_date.sql.txt testdata/result/query/select_with_sequence_function.sql.txt testdata/result/statement/aggregate_function_calls.sql.txt testdata/result/statement/alter_table_add_column_with_if_expression.sql.txt testdata/result/statement/create_table.sql.txt testdata/result/statement/create_table_with_sequence_function.sql.txt testdata/result/statement/insert_with_sequence_function.sql.txt testdata/result/statement/select_call_with_named_expr.sql.txt testdata/result/statement/select_count_distinct.sql.txt testdata/result/statement/select_expr.sql.txt testdata/result/statement/select_literals_all.sql.txt testdata/result/statement/select_literals_date.sql.txt testdata/result/statement/select_with_sequence_function.sql.txt)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

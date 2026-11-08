@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/Carbon
 TEST_FILES=(tests/Localization/BsBaTest.php tests/Localization/BsCyrlTest.php tests/Localization/BsLatnTest.php tests/Localization/BsTest.php tests/Localization/SrCyrlBaTest.php tests/Localization/SrCyrlMeTest.php tests/Localization/SrCyrlTest.php tests/Localization/SrCyrlXkTest.php tests/Localization/SrLatnBaTest.php tests/Localization/SrLatnMeTest.php tests/Localization/SrLatnTest.php tests/Localization/SrLatnXkTest.php tests/Localization/SrMeTest.php tests/Localization/SrRsLatinTest.php tests/Localization/SrRsTest.php tests/Localization/SrTest.php)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

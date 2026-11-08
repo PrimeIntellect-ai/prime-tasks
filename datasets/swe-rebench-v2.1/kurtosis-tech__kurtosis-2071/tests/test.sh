@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/kurtosis
 TEST_FILES=(container-engine-lib/lib/backend_interface/objects/service/service_config_test.go container-engine-lib/lib/database_accessors/enclave_db/service_registration/repository_test.go core/server/api_container/server/service_network/default_service_network_test.go core/server/api_container/server/startosis_engine/kurtosis_instruction/add_service/add_service_shared_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/add_service_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/add_services_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/service_config_image_build_spec_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/service_config_image_registry_spec_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/service_config_minimal_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/service_config_toleration_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/static_constants.go internal_testsuites/starlark/taints_and_tolerations/taints_and_toleration_test.star)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/twigcs
 TEST_FILES=(tests/Config/ConfigResolverTest.php tests/Console/LintCommandTest.php tests/data/config/external/.twig_cs.dist.php tests/data/config/external/.twig_cs_with_display_blocking.dist.php tests/data/config/loaders/.twig_cs.dist.php tests/data/config/namespaced_loaders/.twig_cs.dist tests/data/config/namespaced_loaders/a/child.html.twig tests/data/config/namespaced_loaders/b/parent.html.twig)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

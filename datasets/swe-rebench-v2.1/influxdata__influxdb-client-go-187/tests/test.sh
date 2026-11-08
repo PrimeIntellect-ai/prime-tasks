@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/influxdb-client-go
 TEST_FILES=(api/authorizations_e2e_test.go api/buckets_e2e_test.go api/delete_e2e_test.go api/examples_test.go api/http/options_test.go api/labels_e2e_test.go api/organizations_e2e_test.go api/paging_test.go api/query_test.go api/users_e2e_test.go api/write/options_test.go api/writeAPIBlocking_test.go api/write_test.go client_e2e_test.go client_test.go examples_test.go internal/gzip/gzip_test.go internal/log/logger_test.go internal/test/http_service.go internal/write/service_test.go log/logger_test.go options_test.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

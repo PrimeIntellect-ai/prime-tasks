@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/cargo-dist
 TEST_FILES=(cargo-dist/tests/snapshots/akaikatana_basic.snap cargo-dist/tests/snapshots/akaikatana_musl.snap cargo-dist/tests/snapshots/akaikatana_one_alias_among_many_binaries.snap cargo-dist/tests/snapshots/akaikatana_two_bin_aliases.snap cargo-dist/tests/snapshots/akaikatana_updaters.snap cargo-dist/tests/snapshots/axolotlsay_abyss.snap cargo-dist/tests/snapshots/axolotlsay_abyss_only.snap cargo-dist/tests/snapshots/axolotlsay_alias.snap cargo-dist/tests/snapshots/axolotlsay_alias_ignores_missing_bins.snap cargo-dist/tests/snapshots/axolotlsay_basic.snap cargo-dist/tests/snapshots/axolotlsay_basic_lies.snap cargo-dist/tests/snapshots/axolotlsay_build_setup_steps.snap cargo-dist/tests/snapshots/axolotlsay_checksum_blake2b.snap cargo-dist/tests/snapshots/axolotlsay_checksum_blake2s.snap cargo-dist/tests/snapshots/axolotlsay_checksum_sha3_256.snap cargo-dist/tests/snapshots/axolotlsay_checksum_sha3_512.snap cargo-dist/tests/snapshots/axolotlsay_custom_formula.snap cargo-dist/tests/snapshots/axolotlsay_custom_github_runners.snap cargo-dist/tests/snapshots/axolotlsay_disable_source_tarball.snap cargo-dist/tests/snapshots/axolotlsay_dispatch.snap cargo-dist/tests/snapshots/axolotlsay_dispatch_abyss.snap cargo-dist/tests/snapshots/axolotlsay_dispatch_abyss_only.snap cargo-dist/tests/snapshots/axolotlsay_edit_existing.snap cargo-dist/tests/snapshots/axolotlsay_generic_workspace_basic.snap cargo-dist/tests/snapshots/axolotlsay_homebrew_packages.snap cargo-dist/tests/snapshots/axolotlsay_musl.snap cargo-dist/tests/snapshots/axolotlsay_musl_no_gnu.snap cargo-dist/tests/snapshots/axolotlsay_no_homebrew_publish.snap cargo-dist/tests/snapshots/axolotlsay_no_locals.snap cargo-dist/tests/snapshots/axolotlsay_no_locals_but_custom.snap cargo-dist/tests/snapshots/axolotlsay_several_aliases.snap cargo-dist/tests/snapshots/axolotlsay_ssldotcom_windows_sign.snap cargo-dist/tests/snapshots/axolotlsay_ssldotcom_windows_sign_prod.snap cargo-dist/tests/snapshots/axolotlsay_tag_namespace.snap cargo-dist/tests/snapshots/axolotlsay_updaters.snap cargo-dist/tests/snapshots/axolotlsay_user_global_build_job.snap cargo-dist/tests/snapshots/axolotlsay_user_host_job.snap cargo-dist/tests/snapshots/axolotlsay_user_local_build_job.snap cargo-dist/tests/snapshots/axolotlsay_user_plan_job.snap cargo-dist/tests/snapshots/axolotlsay_user_publish_job.snap)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

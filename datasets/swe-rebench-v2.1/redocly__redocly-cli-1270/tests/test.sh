@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/redocly-cli
 TEST_FILES=(__tests__/build-docs/build-docs-with-config-option/nested/openapi.yaml __tests__/bundle/bundle-lint-format/openapi.yaml __tests__/bundle/primitive-types/openapi.yaml __tests__/bundle/primitive-types/snapshot.js __tests__/commands.test.ts __tests__/join/decorate/bar.yaml __tests__/join/decorate/foo.yaml __tests__/join/decorate/snapshot.js __tests__/join/ignore-decorators/bar.yaml __tests__/join/ignore-decorators/foo.yaml __tests__/join/ignore-decorators/snapshot.js __tests__/join/references-in-parameters/bar.yaml __tests__/join/references-in-parameters/foo.yaml __tests__/join/references-in-parameters/snapshot.js __tests__/join/with-metadata/pet.yaml __tests__/join/with-metadata/snapshot.js __tests__/join/with-metadata/test.yaml __tests__/lint/assertions-camel-case-twice/openapi.yaml __tests__/lint/assertions-error/openapi.yaml __tests__/lint/assertions-error/snapshot.js __tests__/lint/assertions/openapi.yaml __tests__/lint/no-server-variables-empty-enum-errror/openapi.yaml __tests__/lint/no-server-variables-empty-enum-errror/snapshot.js __tests__/lint/no-server-variables-empty-enum/openapi.yaml __tests__/lint/oas3.1-error/openapi.yaml __tests__/lint/oas3.1/openapi.yaml __tests__/miscellaneous/resolve-refs-in-preprocessors/openapi.yaml __tests__/miscellaneous/resolve-refs-in-preprocessors/snapshot.js __tests__/smoke/openapi.yaml packages/core/src/__tests__/lint.test.ts packages/core/src/rules/oas3/__tests__/no-server-example.com.test.ts packages/core/src/rules/oas3/__tests__/spec/spec.test.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

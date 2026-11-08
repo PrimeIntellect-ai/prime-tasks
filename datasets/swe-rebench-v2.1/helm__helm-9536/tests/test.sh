@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/helm
 TEST_FILES=(cmd/helm/install_test.go cmd/helm/template_test.go cmd/helm/testdata/output/install-name-template.txt cmd/helm/testdata/output/template-chart-with-template-lib-archive-dep.txt cmd/helm/testdata/output/template-chart-with-template-lib-dep.txt cmd/helm/testdata/output/template-name-template.txt cmd/helm/testdata/output/template-set.txt cmd/helm/testdata/output/template-show-only-multiple.txt cmd/helm/testdata/output/template-show-only-one.txt cmd/helm/testdata/output/template-skip-tests.txt cmd/helm/testdata/output/template-values-files.txt cmd/helm/testdata/output/template-with-api-version.txt cmd/helm/testdata/output/template-with-crds.txt cmd/helm/testdata/output/template-with-invalid-yaml-debug.txt cmd/helm/testdata/output/template-with-kube-version.txt cmd/helm/testdata/output/template.txt cmd/helm/testdata/testcharts/chart-with-template-lib-dep/charts/common/README.md cmd/helm/testdata/testcharts/lib-chart/README.md pkg/action/install_test.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/schemars
 TEST_FILES=(schemars/tests/integration/enums.rs 'schemars/tests/integration/snapshots/schemars/tests/integration/contract.rs~untagged_enum.de.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/contract.rs~untagged_enum.ser.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/enums.rs~untagged_enum.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/enums_deny_unknown_fields.rs~untagged_enum.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/enums_untagged_variant.rs~adjacently_tagged_enum.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/enums_untagged_variant.rs~externally_tagged_enum.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/enums_untagged_variant.rs~internally_tagged_enum.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/extend.rs~extend_untagged_enum.json' 'schemars/tests/integration/snapshots/schemars/tests/integration/remote_derive.rs~type_param.json' schemars/tests/integration/test_helper.rs)
@@ -34,6 +35,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

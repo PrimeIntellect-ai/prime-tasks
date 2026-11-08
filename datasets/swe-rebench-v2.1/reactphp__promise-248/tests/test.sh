@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/promise
 TEST_FILES=(tests/DeferredTest.php tests/DeferredTestCancelNoopThenRejectShouldNotReportUnhandled.phpt tests/DeferredTestCancelThatRejectsShouldNotReportUnhandled.phpt tests/DeferredTestRejectShouldReportUnhandled.phpt tests/DeferredTestRejectThenCancelShouldNotReportUnhandled.phpt tests/FunctionAllTest.php tests/FunctionAllTestRejectedShouldReportUnhandled.phpt tests/FunctionAllTestRejectedThenMatchingThatReturnsShouldNotReportUnhandled.phpt tests/FunctionAnyTestRejectedShouldReportUnhandled.phpt tests/FunctionAnyTestRejectedThenMatchingThatReturnsShouldNotReportUnhandled.phpt tests/FunctionRaceTestRejectedShouldReportUnhandled.phpt tests/FunctionRaceTestRejectedThenMatchingThatReturnsShouldNotReportUnhandled.phpt tests/FunctionRejectTestCancelShouldNotReportUnhandled.phpt tests/FunctionRejectTestCatchMatchingShouldNotReportUnhandled.phpt tests/FunctionRejectTestCatchMismatchShouldReportUnhandled.phpt tests/FunctionRejectTestFinallyThatReturnsShouldReportUnhandled.phpt tests/FunctionRejectTestFinallyThatThrowsNewExceptionShouldReportUnhandledForNewExceptionOnly.phpt tests/FunctionRejectTestShouldReportUnhandled.phpt tests/FunctionRejectTestThenMatchingThatReturnsShouldNotReportUnhandled.phpt tests/FunctionRejectTestThenMatchingThatThrowsNewExceptionShouldReportUnhandledRejectionForNewExceptionOnly.phpt tests/FunctionRejectTestThenMismatchThrowsTypeErrorAndShouldReportUnhandledForTypeErrorOnlyOnPhp7.phpt tests/FunctionRejectTestThenMismatchThrowsTypeErrorAndShouldReportUnhandledForTypeErrorOnlyOnPhp8.phpt tests/FunctionResolveTest.php tests/FunctionResolveTestThenShouldNotReportUnhandled.phpt tests/PromiseTest.php tests/PromiseTest/PromiseRejectedTestTrait.php tests/PromiseTest/PromiseSettledTestTrait.php tests/PromiseTestCancelThatRejectsAfterwardsShouldNotReportUnhandled.phpt tests/PromiseTestCancelThatRejectsShouldNotReportUnhandled.phpt)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

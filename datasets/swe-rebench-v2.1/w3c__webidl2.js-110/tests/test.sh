@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/webidl2.js
 TEST_FILES=(test/syntax/json/allowany.json test/syntax/json/constructor.json test/syntax/json/extended-attributes.json test/syntax/json/iterable.json test/syntax/json/maplike.json test/syntax/json/nointerfaceobject.json test/syntax/json/overloading.json test/syntax/json/overridebuiltins.json test/syntax/json/prototyperoot.json test/syntax/json/record.json test/syntax/json/replaceable.json test/syntax/json/sequence.json test/syntax/json/setlike.json test/syntax/json/stringifier-attribute.json test/syntax/json/stringifier-custom.json test/syntax/json/typedef.json test/syntax/json/uniontype.json)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

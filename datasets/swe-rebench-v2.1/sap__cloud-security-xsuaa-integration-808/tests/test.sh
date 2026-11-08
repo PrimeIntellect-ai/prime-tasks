@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/cloud-security-xsuaa-integration
 TEST_FILES=(java-security/src/test/java/com/sap/cloud/security/servlet/IasTokenAuthenticatorX509Test.java java-security/src/test/java/com/sap/cloud/security/token/validation/validators/JwtX5tValidatorTest.java spring-security/src/test/java/com/sap/cloud/security/spring/autoconfig/HybridIdentityServicesAutoConfigurationTest.java spring-security/src/test/java/com/sap/cloud/security/spring/token/authentication/HybridJwtDecoderTest.java spring-security/src/test/java/com/sap/cloud/security/spring/token/authentication/JwtDecoderBuilderTest.java spring-xsuaa/src/test/java/com/sap/cloud/security/xsuaa/XsuaaServiceConfigurationDefaultTest.java spring-xsuaa/src/test/java/com/sap/cloud/security/xsuaa/XsuaaServicePropertySourceFactoryTest.java)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/swc
 TEST_FILES=(crates/swc/tests/fixture/issues-6xxx/6459/1/output/index.ts crates/swc/tests/fixture/issues-6xxx/6459/3/output/index.ts crates/swc/tests/tsc-references/deleteChain.1.normal.js crates/swc/tests/tsc-references/deleteChain.2.minified.js crates/swc/tests/tsc-references/parentheses.1.normal.js crates/swc/tests/tsc-references/parentheses.2.minified.js crates/swc_ecma_transforms_compat/tests/opt-chain/issue-7312/exec.js)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

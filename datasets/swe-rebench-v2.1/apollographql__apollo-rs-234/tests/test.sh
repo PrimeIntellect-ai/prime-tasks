@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/apollo-rs
 TEST_FILES=(crates/apollo-compiler/test_data/err/0016_schema_with_built_in_scalar_definition.graphql crates/apollo-compiler/test_data/err/0016_schema_with_built_in_scalar_definition.txt crates/apollo-compiler/test_data/err/0017_schema_with_unspecified_scalar.graphql crates/apollo-compiler/test_data/err/0017_schema_with_unspecified_scalar.txt crates/apollo-compiler/test_data/err/0018_schema_with_specified_scalar_missing_values.graphql crates/apollo-compiler/test_data/err/0018_schema_with_specified_scalar_missing_values.txt crates/apollo-compiler/test_data/ok/0004_schema_with_custom_scalars.graphql crates/apollo-compiler/test_data/ok/0004_schema_with_custom_scalars.txt)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/polyfactory
 TEST_FILES=(tests/constraints/test_date_constraints.py tests/constraints/test_decimal_constraints.py tests/constraints/test_list_constraints.py tests/test_annotated_fields.py tests/test_base_factories.py tests/test_build.py tests/test_collection_length.py tests/test_complex_types.py tests/test_constrained_attribute_parsing.py tests/test_data_parsing.py tests/test_dicts.py tests/test_factory_fields.py tests/test_factory_subclassing.py tests/test_new_types.py tests/test_optional_model_field_inference.py tests/test_options_validation.py tests/test_persistence_handlers.py tests/test_pydantic_factory.py tests/test_pydantic_v1_v2.py tests/test_pytest_plugin.py tests/test_recursive_models.py tests/test_setting_default_factories.py tests/test_typeddict_factory.py tests/test_union_handling.py tests/test_utils.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/ariadne-codegen
 TEST_FILES=(tests/main/custom_base_client/pyproject.toml tests/main/custom_files_names/pyproject.toml tests/main/custom_scalars/pyproject.toml tests/main/example/pyproject.toml tests/main/extended_models/pyproject.toml tests/main/inline_fragments/pyproject.toml tests/main/invalid_pyprojects/no_files.toml tests/main/invalid_pyprojects/operation_not_valid_for_schema.toml tests/main/remote_schema/pyproject.toml tests/test_config.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

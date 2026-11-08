@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/Twig
 TEST_FILES=(tests/Fixtures/filters/capitalize.test tests/Fixtures/filters/convert_encoding.test tests/Fixtures/filters/escape.test tests/Fixtures/filters/first.test tests/Fixtures/filters/last.test tests/Fixtures/filters/lower.test tests/Fixtures/filters/number_format.test tests/Fixtures/filters/replace.test tests/Fixtures/filters/reverse.test tests/Fixtures/filters/round.test tests/Fixtures/filters/spaceless.test tests/Fixtures/filters/split.test tests/Fixtures/filters/title.test tests/Fixtures/filters/trim.test tests/Fixtures/filters/upper.test tests/Fixtures/filters/urlencode.test)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

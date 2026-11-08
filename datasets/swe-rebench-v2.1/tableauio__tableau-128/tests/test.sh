@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/tableau
 TEST_FILES=(test/functest/conf/HorizontalUnionList.json test/functest/conf/VerticalIncellUnionList.json test/functest/conf/VerticalUnionList.json test/functest/proto/excel__list__horizontal_list.proto test/functest/proto/excel__list__list.proto test/functest/proto/excel__list__vertical_list.proto 'test/functest/testdata/excel/list/HorizontalList#HorizontalUnionList.csv' 'test/functest/testdata/excel/list/VerticalList#VerticalIncellUnionList.csv' 'test/functest/testdata/excel/list/VerticalList#VerticalUnionList.csv')
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

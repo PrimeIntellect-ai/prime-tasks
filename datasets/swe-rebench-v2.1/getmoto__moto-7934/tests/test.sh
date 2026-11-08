@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/moto
 TEST_FILES=(tests/__init__.py tests/test_applicationautoscaling/test_applicationautoscaling.py tests/test_athena/__init__.py tests/test_athena/test_athena_integration.py tests/test_cloudformation/__init__.py tests/test_cloudformation/test_cloudformation_stack_crud_boto3.py tests/test_cloudformation/test_conditions.py tests/test_kms/__init__.py tests/test_kms/test_kms_encrypt.py tests/test_ses/__init__.py tests/test_ses/test_ses_boto3.py tests/test_sqs/__init__.py tests/test_sqs/test_sqs.py tests/test_timestreamwrite/__init__.py tests/test_timestreamwrite/test_timestreamwrite_database.py tests/test_timestreamwrite/test_timestreamwrite_table.py tests/test_timestreamwrite/test_timestreamwrite_tagging.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

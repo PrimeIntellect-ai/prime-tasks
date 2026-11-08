@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/memefish
 TEST_FILES=(testdata/input/expr/array_literal_empty_with_types.sql testdata/input/expr/array_literal_empty_without_array_keyword.sql testdata/input/expr/array_literal_empty_without_types.sql testdata/result/dml/insert_select.sql.txt testdata/result/expr/array_literal_empty_with_types.sql.txt testdata/result/expr/array_literal_empty_without_array_keyword.sql.txt testdata/result/expr/array_literal_empty_without_types.sql.txt testdata/result/query/select_cast.sql.txt testdata/result/query/select_expr.sql.txt testdata/result/query/select_literals_all.sql.txt testdata/result/query/select_literals_array.sql.txt testdata/result/query/select_literals_array_invalid.sql.txt testdata/result/query/select_unnest_with_offset.sql.txt testdata/result/query/select_unnest_with_offset_and_alias.sql.txt testdata/result/query/select_unnest_with_offset_and_alias_min.sql.txt testdata/result/statement/insert_select.sql.txt testdata/result/statement/select_cast.sql.txt testdata/result/statement/select_expr.sql.txt testdata/result/statement/select_literals_all.sql.txt testdata/result/statement/select_literals_array.sql.txt testdata/result/statement/select_literals_array_invalid.sql.txt testdata/result/statement/select_unnest_with_offset.sql.txt testdata/result/statement/select_unnest_with_offset_and_alias.sql.txt testdata/result/statement/select_unnest_with_offset_and_alias_min.sql.txt)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

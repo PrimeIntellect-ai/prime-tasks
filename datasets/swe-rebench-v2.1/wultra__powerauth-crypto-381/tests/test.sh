@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/powerauth-crypto
 TEST_FILES=(powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/activation/ActivationStatusBlobInfoTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/activation/PowerAuthActivationTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/activation/PowerAuthRecoveryCodeTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/ec/InvalidPointTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/encryption/EciesEncryptorTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/generator/ActivationCodeGeneratorTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/lib/util/Argon2Test.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/lib/util/CRC16Test.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/lib/util/GenerateVectorDataTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/lib/util/HashBasedCounterUtilsTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/lib/util/KeyConversionUtilsTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/lib/util/PasswordHashTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/signature/PowerAuthSignatureFormatTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/signature/PowerAuthSignatureTest.java powerauth-java-crypto/src/test/java/io/getlime/security/powerauth/crypto/vault/VaultTest.java powerauth-java-http/src/test/java/io/getlime/security/powerauth/http/PowerAuthHttpBodyTest.java)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

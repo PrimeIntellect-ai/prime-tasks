@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/sqlc
 TEST_FILES=(examples/authors/sqlite/db_test.go examples/booktest/sqlite/db_test.go examples/ondeck/sqlite/db_test.go internal/endtoend/testdata/process_plugin_format_json/exec.json internal/endtoend/testdata/process_plugin_format_json/gen/hello.txt internal/endtoend/testdata/process_plugin_format_json/query.sql internal/endtoend/testdata/process_plugin_format_json/schema.sql internal/endtoend/testdata/process_plugin_format_json/sqlc.json internal/sqltest/sqlite.go scripts/test-json-process-plugin/main.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

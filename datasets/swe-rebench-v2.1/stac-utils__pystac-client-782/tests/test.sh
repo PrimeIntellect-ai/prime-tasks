@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/pystac-client
 TEST_FILES=(tests/data/test-case-1/catalog.json tests/data/test-case-1/country-1/area-1-1/area-1-1-imagery/area-1-1-imagery.json tests/data/test-case-1/country-1/area-1-1/area-1-1-labels/area-1-1-labels.json tests/data/test-case-1/country-1/area-1-1/collection.json tests/data/test-case-1/country-1/area-1-2/area-1-2-imagery/area-1-2-imagery.json tests/data/test-case-1/country-1/area-1-2/area-1-2-labels/area-1-2-labels.json tests/data/test-case-1/country-1/area-1-2/collection.json tests/data/test-case-1/country-1/catalog.json tests/data/test-case-1/country-2/area-2-1/area-2-1-imagery/area-2-1-imagery.json tests/data/test-case-1/country-2/area-2-1/area-2-1-labels/area-2-1-labels.json tests/data/test-case-1/country-2/area-2-1/collection.json tests/data/test-case-1/country-2/area-2-2/area-2-2-imagery/area-2-2-imagery.json tests/data/test-case-1/country-2/area-2-2/area-2-2-labels/area-2-2-labels.json tests/data/test-case-1/country-2/area-2-2/collection.json tests/data/test-case-1/country-2/catalog.json tests/test_client.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

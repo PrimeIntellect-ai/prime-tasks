@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/wild
 TEST_FILES=(wild/tests/integration_tests.rs wild/tests/sources/basic-comdat.s wild/tests/sources/copy-relocations.c wild/tests/sources/data-pointers.c wild/tests/sources/empty.c wild/tests/sources/exclude-libs.c wild/tests/sources/export-dynamic.c wild/tests/sources/linker-script.c wild/tests/sources/mixed-verdef-verneed.c wild/tests/sources/preinit-array.c wild/tests/sources/shared-priority.c wild/tests/sources/shared.c wild/tests/sources/shlib-undefined.c wild/tests/sources/trivial-dynamic.c wild/tests/sources/visibility-merging.c wild/tests/sources/z-defs.c)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

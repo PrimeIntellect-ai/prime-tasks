@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/tengo
 TEST_FILES=(bytecode_test.go compiler_test.go example_test.go objects_test.go parser/ast_test.go parser/parser_test.go parser/scanner_test.go script_test.go stdlib/func_typedefs_test.go stdlib/json/json_test.go stdlib/os_test.go stdlib/rand_test.go stdlib/stdlib_test.go stdlib/text_test.go stdlib/times_test.go symbol_table_test.go tengo_test.go variable_test.go vm_test.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

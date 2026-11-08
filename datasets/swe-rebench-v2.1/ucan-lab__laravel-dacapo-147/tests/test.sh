@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/laravel-dacapo
 TEST_FILES=(tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys/migrations/1970_01_01_000001_create_child_table.php tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys/migrations/1970_01_01_000001_create_parent_table.php tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys/migrations/1970_01_01_000003_constraint_child_foreign_key.php tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys/schemas/schema.yml tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys_deprecated/migrations/1970_01_01_000001_create_child_table.php tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys_deprecated/migrations/1970_01_01_000001_create_parent_table.php tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys_deprecated/migrations/1970_01_01_000003_constraint_child_foreign_key.php tests/Application/UseCase/DacapoCommandTest/mysql/foreign_keys_deprecated/schemas/schema.yml)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

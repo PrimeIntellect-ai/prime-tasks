@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/prism
 TEST_FILES=(docs/core-concepts/testing.md src/Testing/PrismFake.php tests/Fixtures/xai/generate-text-with-a-prompt-1.json tests/Fixtures/xai/generate-text-with-multiple-tools-1.json tests/Fixtures/xai/generate-text-with-multiple-tools-2.json tests/Fixtures/xai/generate-text-with-multiple-tools-3.json tests/Fixtures/xai/generate-text-with-required-tool-call-1.json tests/Fixtures/xai/generate-text-with-system-prompt-1.json tests/Providers/XAI/XAITextTest.php)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

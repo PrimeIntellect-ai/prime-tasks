@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/mark
 TEST_FILES=(pkg/mark/markdown_test.go pkg/mark/testdata/codes-droph1.html pkg/mark/testdata/codes-stripnewlines.html pkg/mark/testdata/header-droph1.html pkg/mark/testdata/header-stripnewlines.html pkg/mark/testdata/issue-64-broken-link-droph1.html pkg/mark/testdata/issue-64-broken-link-stripnewlines.html pkg/mark/testdata/links-droph1.html pkg/mark/testdata/links-stripnewlines.html pkg/mark/testdata/lists-droph1.html pkg/mark/testdata/lists-stripnewlines.html pkg/mark/testdata/macro-include-droph1.html pkg/mark/testdata/macro-include-stripnewlines.html pkg/mark/testdata/newlines-droph1.html pkg/mark/testdata/newlines-stripnewlines.html pkg/mark/testdata/pagelayout-droph1.html pkg/mark/testdata/pagelayout-stripnewlines.html pkg/mark/testdata/quotes-droph1.html pkg/mark/testdata/quotes-stripnewlines.html pkg/mark/testdata/table-droph1.html pkg/mark/testdata/table-stripnewlines.html pkg/mark/testdata/tags-droph1.html pkg/mark/testdata/tags-stripnewlines.html)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

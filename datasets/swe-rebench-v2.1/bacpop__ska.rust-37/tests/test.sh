@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/ska.rust
 TEST_FILES=(tests/map.rs tests/test_files_in/test_ref_two_chrom_repeats.fa tests/test_results_correct/map_all_repeats.masked.stdout tests/test_results_correct/map_aln_k9.masked.stdout tests/test_results_correct/map_aln_two_chrom.masked.stdout tests/test_results_correct/map_vcf_k9.masked.stdout tests/test_results_correct/map_vcf_two_chrom.masked.stdout)
@@ -34,6 +35,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

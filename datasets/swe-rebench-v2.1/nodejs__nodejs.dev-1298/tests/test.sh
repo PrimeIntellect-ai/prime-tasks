@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/nodejs.dev
 TEST_FILES=(src/components/Footer/__tests__/__snapshots__/footer.test.tsx.snap src/components/Layout/__tests__/__snapshots__/centered-layout.test.tsx.snap src/components/Layout/__tests__/__snapshots__/page-layout.test.tsx.snap test/__fixtures__/page.tsx test/pages/__snapshots__/404.test.tsx.snap test/pages/__snapshots__/blog.test.tsx.snap test/pages/__snapshots__/download.test.tsx.snap test/pages/__snapshots__/home.test.tsx.snap test/pages/trademark.test.tsx test/templates/__snapshots__/blog.test.tsx.snap test/templates/__snapshots__/learn.test.tsx.snap)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

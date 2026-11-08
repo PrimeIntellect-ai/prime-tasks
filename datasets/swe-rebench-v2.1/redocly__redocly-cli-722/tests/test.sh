@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/redocly-cli
 TEST_FILES=(__tests__/index.test.ts __tests__/join/fails-if-component-conflicts/bar.yaml __tests__/join/fails-if-component-conflicts/foo.yaml __tests__/join/fails-if-no-info-section/snapshot.js __tests__/join/fails-if-tags-duplication/bar.yaml __tests__/join/fails-if-tags-duplication/foo.yaml __tests__/join/prefix-components-with-info-prop/bar.yaml __tests__/join/prefix-components-with-info-prop/foo.yaml __tests__/join/prefix-components-with-info-prop/snapshot.js __tests__/join/prefix-tags-with-filename/bar.yaml __tests__/join/prefix-tags-with-filename/foo.yaml __tests__/join/prefix-tags-with-filename/snapshot.js __tests__/join/prefix-tags-with-info-prop/bar.yaml __tests__/join/prefix-tags-with-info-prop/foo.yaml __tests__/join/prefix-tags-with-info-prop/snapshot.js __tests__/join/reference-in-description/bar.yaml __tests__/join/reference-in-description/foo.yaml __tests__/join/reference-in-description/snapshot.js __tests__/join/two-files-with-no-errors/bar.yaml __tests__/join/two-files-with-no-errors/foo.yaml __tests__/join/two-files-with-no-errors/snapshot.js __tests__/join/without-x-tag-groups/bar.yaml __tests__/join/without-x-tag-groups/foo.yaml packages/cli/src/__tests__/commands/join.test.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

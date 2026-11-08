@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/prettier-plugin-svelte
 TEST_FILES=(test/printer/samples/attribute-quoted.html test/printer/samples/each-block-else-with-nested-if-block-else.html test/printer/samples/each-block-else-with-nested-if-block-elseif-else.html test/printer/samples/each-block-else-with-nested-if-block-elseif.html test/printer/samples/each-block-else-with-nested-if-block.html test/printer/samples/each-block-else-with-nested-if-inline-else.html test/printer/samples/each-block-else-with-nested-if-inline-elseif-else.html test/printer/samples/each-block-else-with-nested-if-inline-elseif.html test/printer/samples/each-block-else-with-nested-if-inline.html test/printer/samples/single-quote.html test/printer/samples/single-quote.options.json test/printer/samples/unicode-mustache.html)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

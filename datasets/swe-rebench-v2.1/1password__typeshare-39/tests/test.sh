@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/typeshare
 TEST_FILES=(core/data/tests/anonymous_struct_with_rename/output.kt core/data/tests/can_apply_prefix_correctly/output.kt core/data/tests/can_generate_generic_enum/output.kt core/data/tests/can_generate_generic_struct/output.kt core/data/tests/can_generate_simple_struct_with_a_comment/output.kt core/data/tests/can_generate_struct_with_skipped_fields/output.kt core/data/tests/can_handle_anonymous_struct/output.kt core/data/tests/can_handle_serde_rename/output.kt core/data/tests/can_handle_serde_rename_all/output.kt core/data/tests/can_handle_serde_rename_on_top_level/output.kt core/data/tests/can_handle_unit_type/output.kt core/data/tests/generate_types/output.kt core/data/tests/kebab_case_rename/output.kt core/data/tests/recursive_enum_decorator/output.kt core/data/tests/resolves_qualified_type/output.kt core/data/tests/serialize_field_as/output.kt core/data/tests/test_i54_u53_type/output.kt core/data/tests/test_serde_default_struct/output.kt core/data/tests/test_serde_iso8601/output.kt core/data/tests/test_serde_url/output.kt core/data/tests/test_type_alias/output.kt core/data/tests/use_correct_integer_types/output.kt)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

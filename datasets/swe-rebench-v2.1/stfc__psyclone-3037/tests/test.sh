@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/PSyclone
 TEST_FILES=(src/psyclone/tests/core/single_variable_access_info_test.py src/psyclone/tests/core/variables_access_map_test.py src/psyclone/tests/dependency_test.py src/psyclone/tests/domain/lfric/kern_call_arg_list_test.py src/psyclone/tests/psyir/nodes/call_test.py src/psyclone/tests/psyir/tools/call_tree_utils_test.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

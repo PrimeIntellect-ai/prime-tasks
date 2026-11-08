@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/sushi
 TEST_FILES=(test/fhirdefs/fixtures/customized-ig-with-resources/ig-data/input/resources/nested/StructureDefinition-MyNestedPatient.json test/fhirdefs/load.test.ts test/ig/IGExporter.IG.test.ts test/ig/fixtures/customized-ig-with-nested-resources/input/examples/Patient-BarPatient.json test/ig/fixtures/customized-ig-with-nested-resources/input/resources/StructureDefinition-MyPatient.json test/ig/fixtures/customized-ig-with-nested-resources/input/resources/nested1/StructureDefinition-MyTitlePatient.json test/ig/fixtures/customized-ig-with-nested-resources/input/resources/nested2/ValueSet-MyVS.json)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

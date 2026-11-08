@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/mozdownload
 TEST_FILES=(tests/daily_scraper/test_daily_scraper.py tests/daily_scraper/test_revision.py tests/data/firefox/candidates/23.0.1-candidates/build1/linux-i686/en-US/firefox-23.0.1.tar.xz tests/data/firefox/candidates/23.0.1-candidates/build1/linux-x86_64/en-US/firefox-23.0.1.tar.xz tests/data/firefox/candidates/23.0.1-candidates/build3/linux-i686/en-US/firefox-23.0.1.tar.xz tests/data/firefox/candidates/23.0.1-candidates/build3/linux-x86_64/en-US/firefox-23.0.1.tar.xz tests/data/firefox/nightly/2013/10/2013-10-01-03-02-04-mozilla-central/firefox-27.0a1.en-US.linux-aarch64.tar.xz tests/data/firefox/nightly/2013/10/2013-10-01-03-02-04-mozilla-central/firefox-27.0a1.en-US.linux-i686.tar.xz tests/data/firefox/nightly/2013/10/2013-10-01-03-02-04-mozilla-central/firefox-27.0a1.en-US.linux-x86_64.tar.xz tests/data/firefox/releases/23.0.1/linux-i686/en-US/firefox-23.0.1.tar.xz tests/data/firefox/releases/23.0.1/linux-x86_64/en-US/firefox-23.0.1.tar.xz tests/data/thunderbird/candidates/17.0-candidates/build3/linux-i686/en-US/thunderbird-17.0.tar.xz tests/data/thunderbird/candidates/17.0-candidates/build3/linux-x86_64/en-US/thunderbird-17.0.tar.xz tests/data/thunderbird/nightly/2013/10/2013-10-01-03-02-04-comm-central/thunderbird-27.0a1.en-US.linux-i686.tar.xz tests/data/thunderbird/nightly/2013/10/2013-10-01-03-02-04-comm-central/thunderbird-27.0a1.en-US.linux-x86_64.tar.xz tests/data/thunderbird/releases/17.0/linux-i686/en-US/thunderbird-17.0.tar.xz tests/data/thunderbird/releases/17.0/linux-x86_64/en-US/thunderbird-17.0.tar.xz tests/release_candidate_scraper/test_release_candidate_scraper.py tests/release_candidate_scraper/test_release_candidate_scraper_latest.py tests/release_scraper/test_release_scraper.py tests/release_scraper/test_release_scraper_latest.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

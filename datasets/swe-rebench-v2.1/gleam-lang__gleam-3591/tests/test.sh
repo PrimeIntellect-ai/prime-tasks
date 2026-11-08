@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/gleam
 TEST_FILES=(compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__errors__type_imported_as_value.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__import_type_duplicate.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__unqualified_import_errors_do_not_block_later_unqualified.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__unqualified_using_opaque_constructo.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__unqualified_using_private_constructo.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__unqualified_using_private_constructor_pattern.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__unqualified_using_private_function.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_opaque_constructo.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_constructo.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_constructor_pattern.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_custom_type.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_external_type.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_function.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_type_alias.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_unqualified_custom_type.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_unqualified_external_type.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__imports__using_private_unqualified_type_alias.snap test-package-compiler/src/snapshots/test_package_compiler__generated_tests__opaque_type_destructure.snap test-package-compiler/src/snapshots/test_package_compiler__generated_tests__unknown_module_field_in_constant.snap test-package-compiler/src/snapshots/test_package_compiler__generated_tests__unknown_module_field_in_expression.snap test-package-compiler/src/snapshots/test_package_compiler__generated_tests__unknown_module_field_in_import.snap)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

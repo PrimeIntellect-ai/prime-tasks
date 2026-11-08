@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/veryl
 TEST_FILES=(testcases/sv/03_operator.sv testcases/sv/06_function.sv testcases/sv/09_struct_enum.sv testcases/sv/11_let.sv testcases/sv/13_range_operator.sv testcases/sv/18_concatenation.sv testcases/sv/20_if_case_expression.sv testcases/sv/21_cast.sv testcases/sv/27_string.sv testcases/sv/28_msblsb.sv testcases/sv/32_inside_outside.sv testcases/sv/37_package_ref.sv testcases/sv/38_typedef.sv testcases/sv/39_modport.sv testcases/sv/40_enum_resolve.sv testcases/sv/41_union.sv testcases/sv/43_sv_member.sv testcases/sv/44_import_resolve.sv)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/autoDocstring
 TEST_FILES=(src/test/integration/integration.test.ts src/test/integration/python_test_files/file_4.py src/test/integration/python_test_files/file_4_output.py src/test/integration/python_test_files/file_7.py src/test/integration/python_test_files/file_7_output.py src/test/parse/guess_type.spec.ts src/test/parse/parse_parameters.spec.ts src/test/parse/tokenize_definition.spec.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

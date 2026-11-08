@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/TatSu
 TEST_FILES=(test/__init__.py test/__main__.py test/ast_test.py test/buffering_test.py test/codegen_test.py test/diagram_test.py test/grammar/directive_test.py test/grammar/firstfollow_test.py test/grammar/join_test.py test/grammar/keyword_test.py test/grammar/left_recursion_test.py test/grammar/lookahead_test.py test/grammar/parameter_test.py test/grammar/pattern_test.py test/grammar/pretty_test.py test/grammar/semantics_test.py test/grammar/stateful_test.py test/grammar/syntax_test.py test/model_test.py test/parser_equivalence_test.py test/parsing_test.py test/walker_test.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/kurtosis
 TEST_FILES=(core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/import_module_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/import_module_with_local_absolute_locator_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/read_file_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/static_constants.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/suite_kurtosis_helper_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/upload_files_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/upload_files_update_framework_test.go core/server/api_container/server/startosis_engine/kurtosis_starlark_framework/test_engine/upload_files_without_name_framework_test.go internal_testsuites/starlark/no-run-in-main-star/main.star internal_testsuites/starlark/upload-file-package/main.star internal_testsuites/starlark/valid-kurtosis-package-with-input/main.star)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

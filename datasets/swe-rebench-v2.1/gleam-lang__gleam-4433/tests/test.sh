@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/gleam
 TEST_FILES=(compiler-core/src/language_server/tests/action.rs compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__action__inline_variable_with_record_field.snap compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__action__wrap_case_clause_inside_assignment_in_block.snap compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__action__wrap_case_clause_with_multiple_patterns_in_block.snap compiler-core/src/type_/tests/snapshots/gleam_core__type___tests__warnings__unused_record_access_raises_a_warning.snap)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

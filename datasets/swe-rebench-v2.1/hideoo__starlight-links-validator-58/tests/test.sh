@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/starlight-links-validator
 TEST_FILES=(packages/starlight-links-validator/tests/base-path.test.ts packages/starlight-links-validator/tests/basics.test.ts packages/starlight-links-validator/tests/custom-ids.test.ts packages/starlight-links-validator/tests/fallback.test.ts packages/starlight-links-validator/tests/fixtures/basics-invalid-links/src/content/docs/guides/example.mdx packages/starlight-links-validator/tests/fixtures/basics-invalid-links/src/content/docs/test.md packages/starlight-links-validator/tests/fixtures/basics-valid-links/src/content/docs/guides/example.mdx packages/starlight-links-validator/tests/fixtures/basics-valid-links/src/content/docs/index.md packages/starlight-links-validator/tests/fixtures/invalid-hashes-invalid-links/astro.config.ts packages/starlight-links-validator/tests/fixtures/invalid-hashes-invalid-links/src/content/docs/guides/example.mdx packages/starlight-links-validator/tests/fixtures/invalid-hashes-invalid-links/src/content/docs/test.md packages/starlight-links-validator/tests/fixtures/invalid-hashes-valid-links/astro.config.ts packages/starlight-links-validator/tests/fixtures/invalid-hashes-valid-links/src/content/docs/guides/example.mdx packages/starlight-links-validator/tests/fixtures/invalid-hashes-valid-links/src/content/docs/index.md packages/starlight-links-validator/tests/fixtures/invalid-hashes-valid-links/src/content/docs/test.md packages/starlight-links-validator/tests/invalid-hashes.test.ts packages/starlight-links-validator/tests/relative.test.ts packages/starlight-links-validator/tests/src-dir.test.ts packages/starlight-links-validator/tests/trailing.test.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

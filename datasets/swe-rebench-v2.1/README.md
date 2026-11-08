@@ -5,10 +5,11 @@ Nebius's [SWE-rebench V2.1 RL](https://hub.harborframework.com/datasets/ibragim-
 [SWE-rebench V2](https://huggingface.co/datasets/nebius/SWE-rebench-V2)
 ([paper](https://arxiv.org/abs/2602.23866)).
 
-Exported verbatim from Harbor Hub package `ibragim-badertdinov/swe-rebench-v2.1-rl`, revision 3
+Exported from Harbor Hub package `ibragim-badertdinov/swe-rebench-v2.1-rl`, revision 3
 (published 2026-11-05), digest
-`sha256:0dcba0d99e8c2bc7f1a8aefdd2e3cf8f5aae2387659d6390a06446ed5f3612b3`. SWE-rebench V2 is
-licensed CC-BY-4.0; each task's repository keeps its own license. To export again:
+`sha256:0dcba0d99e8c2bc7f1a8aefdd2e3cf8f5aae2387659d6390a06446ed5f3612b3`, and converted to
+separate verifiers. SWE-rebench V2 is licensed CC-BY-4.0; each task's repository keeps its own
+license. To export and convert again:
 
 ```bash
 uv run scripts/swe-rebench-v2.1/import_tasks.py
@@ -27,6 +28,10 @@ Verifiers Harbor integration, pinned to a Git commit.
   command, and grades the log with `tests/grade.py`, a standard-library grader, against the
   FAIL_TO_PASS and PASS_TO_PASS lists in `tests/config.json`. The reward is 1 when every
   FAIL_TO_PASS test passes and no PASS_TO_PASS test fails.
+- The verifier runs in a separate box from the same image. A `[[verifier.collect]]` hook writes the
+  agent's repository diff against the task's base commit to `/logs/artifacts/model.patch`, or an
+  empty diff when the repository is broken. `tests/test.sh` applies that diff first and scores 0
+  when it does not apply.
 - `solution/solve.sh` applies the reference patch `solution/gold.patch`.
 
 ## Changes relative to SWE-rebench V2
@@ -50,3 +55,14 @@ Compared with their SWE-rebench V2 rows:
 | Image replaced by a rebuilt image | 183 |
 
 741 statements still link to GitHub pull requests, commits, or comparisons.
+
+## Conversion to separate verifiers
+
+The import script changes three things in each upstream task:
+
+- `task.toml` sets `[verifier].environment_mode = "separate"` and adds the collect hook. Its base
+  commit comes from the task's row in `nebius/SWE-rebench-V2` at revision `d7608f0`, because V2.1
+  metadata omits it.
+- `tests/test.sh` applies `/logs/artifacts/model.patch` before restoring the test files.
+- `tests/test.sh` raises the open-file limit to the hard limit. Prime sandboxes default to 1,024
+  open files, under which meilisearch's integration tests fail even with the reference patch.

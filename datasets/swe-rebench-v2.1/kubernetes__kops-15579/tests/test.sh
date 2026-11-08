@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/kops
 TEST_FILES=(tests/integration/update_cluster/containerd-custom/data/aws_launch_template_master-us-test-1a.masters.containerd.example.com_user_data tests/integration/update_cluster/containerd-custom/data/aws_launch_template_nodes.containerd.example.com_user_data tests/integration/update_cluster/containerd-custom/data/aws_s3_object_cluster-completed.spec_content tests/integration/update_cluster/containerd-custom/data/aws_s3_object_nodeupconfig-master-us-test-1a_content tests/integration/update_cluster/containerd-custom/data/aws_s3_object_nodeupconfig-nodes_content tests/integration/update_cluster/containerd-custom/in-v1alpha2.yaml)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

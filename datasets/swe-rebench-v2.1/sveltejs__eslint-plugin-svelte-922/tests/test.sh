@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/eslint-plugin-svelte
 TEST_FILES=(packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/invalid/_requirements.json packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/invalid/children-snippet01-errors.yaml packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/invalid/children-snippet01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/valid/_requirements.json packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/valid/implicit-snippet01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/valid/named-snippet01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/valid/snippet-with-params01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/no-useless-children-snippet/valid/standalone-snippet01-input.svelte packages/eslint-plugin-svelte/tests/src/rules/no-useless-children-snippet.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/cerbos
 TEST_FILES=(internal/compile/manager_test.go internal/engine/engine_test.go internal/namer/namer_test.go internal/storage/bundle/local_source_test.go internal/storage/db/internal/tests.go internal/storage/index/index_test.go internal/storage/overlay/store_test.go internal/test/mocks/Index.go internal/test/testdata/engine/case_12.yaml internal/test/testdata/engine_lenient_scope_search/case_lenient_00.yaml internal/test/testdata/engine_lenient_scope_search/case_lenient_01.yaml)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

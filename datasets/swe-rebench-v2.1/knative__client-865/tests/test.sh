@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/client
 TEST_FILES=(pkg/kn/commands/source/apiserver/apiserver_test.go pkg/kn/commands/source/apiserver/create_test.go pkg/kn/commands/source/apiserver/describe_test.go pkg/kn/commands/source/apiserver/list_test.go pkg/kn/commands/source/apiserver/update_test.go pkg/kn/commands/source/binding/binding_test.go pkg/kn/commands/source/binding/update_test.go pkg/kn/commands/source/ping/create_test.go pkg/kn/commands/source/ping/describe_test.go pkg/kn/commands/source/ping/list_test.go pkg/kn/commands/source/ping/ping_test.go pkg/kn/commands/source/ping/update_test.go pkg/sources/v1alpha2/apiserver_client_test.go pkg/sources/v1alpha2/binding_client_test.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

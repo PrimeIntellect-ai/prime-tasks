@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/idaes-pse
 TEST_FILES=(idaes/models/properties/modular_properties/base/tests/test_generic_property.py idaes/models/properties/modular_properties/base/tests/test_noncondense.py idaes/models/properties/modular_properties/base/tests/test_noncondense_PR.py idaes/models/properties/modular_properties/base/tests/test_nonvap.py idaes/models/properties/modular_properties/base/tests/test_nonvap_PR.py idaes/models/properties/modular_properties/base/tests/test_vle.py idaes/models/properties/modular_properties/examples/tests/test_ASU_PR.py idaes/models/properties/modular_properties/examples/tests/test_ASU_PR_Dowling_2015.py idaes/models/properties/modular_properties/examples/tests/test_BTIdeal.py idaes/models/properties/modular_properties/examples/tests/test_BTIdeal_FPhx.py idaes/models/properties/modular_properties/examples/tests/test_BTIdeal_FcPh.py idaes/models/properties/modular_properties/examples/tests/test_BTIdeal_FcTP.py idaes/models/properties/modular_properties/examples/tests/test_CO2_H2O_Ideal_VLE.py idaes/models/properties/modular_properties/examples/tests/test_CO2_bmimPF6_PR.py idaes/models/properties/modular_properties/examples/tests/test_HC_PR.py idaes/models/properties/modular_properties/state_definitions/tests/test_FTPx.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

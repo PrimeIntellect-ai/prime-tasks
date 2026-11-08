@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/eslint-plugin-svelte
 TEST_FILES=(tests/fixtures/rules/no-unused-svelte-ignore/invalid/invalid-svelte-ignore01-errors.yaml tests/fixtures/rules/no-unused-svelte-ignore/invalid/invalid-svelte-ignore01-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/invalid/invalid-svelte-ignore02-errors.yaml tests/fixtures/rules/no-unused-svelte-ignore/invalid/invalid-svelte-ignore02-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/invalid/invalid-svelte-ignore03-errors.yaml tests/fixtures/rules/no-unused-svelte-ignore/invalid/invalid-svelte-ignore03-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore01-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore02-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore03-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore04-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore05-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore06-input.svelte tests/fixtures/rules/no-unused-svelte-ignore/valid/svelte-ignore07-input.svelte tests/fixtures/rules/valid-compile/invalid/invalid-svelte-ignore01-errors.yaml tests/fixtures/rules/valid-compile/invalid/invalid-svelte-ignore01-input.svelte tests/fixtures/rules/valid-compile/invalid/invalid-svelte-ignore02-errors.yaml tests/fixtures/rules/valid-compile/invalid/invalid-svelte-ignore02-input.svelte tests/fixtures/rules/valid-compile/invalid/invalid-svelte-ignore03-errors.yaml tests/fixtures/rules/valid-compile/invalid/invalid-svelte-ignore03-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore01-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore02-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore03-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore04-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore05-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore06-input.svelte tests/fixtures/rules/valid-compile/valid/svelte-ignore07-input.svelte)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/git-cliff
 TEST_FILES=(.github/fixtures/test-bump-version/cliff.toml .github/fixtures/test-bumped-version/cliff.toml .github/fixtures/test-commit-footers/cliff.toml .github/fixtures/test-commit-preprocessors/cliff.toml .github/fixtures/test-custom-scope/cliff.toml .github/fixtures/test-date-order/cliff.toml .github/fixtures/test-footer-template/cliff.toml .github/fixtures/test-footer-template/commit.sh .github/fixtures/test-footer-template/expected.md .github/fixtures/test-ignore-tags/cliff.toml .github/fixtures/test-keep-a-changelog-links/cliff.toml .github/fixtures/test-latest-with-one-tag/cliff.toml .github/fixtures/test-limit-commits/cliff.toml .github/fixtures/test-skip-breaking-changes/cliff.toml .github/fixtures/test-split-commits/cliff.toml .github/fixtures/test-topo-order-arg/cliff.toml .github/fixtures/test-topo-order/cliff.toml .github/workflows/test-fixtures.yml git-cliff-core/tests/integration_test.rs)
@@ -34,6 +35,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

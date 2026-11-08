@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/sass-lint
 TEST_FILES=(tests/ruleToggler.js tests/sass/border-zero.scss tests/sass/empty-file.sass tests/sass/ruleToggler-disable-a-block.sass tests/sass/ruleToggler-disable-a-block.scss tests/sass/ruleToggler-disable-a-line.sass tests/sass/ruleToggler-disable-a-line.scss tests/sass/ruleToggler-disable-a-rule.sass tests/sass/ruleToggler-disable-a-rule.scss tests/sass/ruleToggler-disable-all-then-reenable.sass tests/sass/ruleToggler-disable-all-then-reenable.scss tests/sass/ruleToggler-disable-all.sass tests/sass/ruleToggler-disable-all.scss tests/sass/ruleToggler-disable-multiple-rules.sass tests/sass/ruleToggler-disable-multiple-rules.scss tests/sass/ruleToggler-disable-then-enable.sass tests/sass/ruleToggler-disable-then-enable.scss tests/sass/ruleToggler-empty-comment.sass tests/sass/ruleToggler-empty-comment.scss tests/sass/ruleToggler-guarantee-order.sass tests/sass/ruleToggler-guarantee-order.scss tests/sass/ruleToggler-ignore-unknown.sass tests/sass/ruleToggler-ignore-unknown.scss)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

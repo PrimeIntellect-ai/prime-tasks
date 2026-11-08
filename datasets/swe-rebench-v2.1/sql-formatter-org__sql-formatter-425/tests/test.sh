@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/sql-formatter
 TEST_FILES=(test/behavesLikeMariaDbFormatter.ts test/bigquery.test.ts test/db2.test.ts test/features/identifiers.ts test/features/strings.ts test/hive.test.ts test/n1ql.test.ts test/plsql.test.ts test/postgresql.test.ts test/redshift.test.ts test/spark.test.ts test/sql.test.ts test/sqlite.test.ts test/trino.test.ts test/tsql.test.ts test/unit/Parser.test.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

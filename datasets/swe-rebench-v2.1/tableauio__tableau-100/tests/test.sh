@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/tableau
 TEST_FILES=(internal/confgen/prop/prop_test.go internal/protogen/exporter_test.go internal/protogen/field_prop_test.go test/functest/conf/EquipConf.json test/functest/conf/UniqueFalse.json test/functest/conf/VerticalPredefinedStructList.json test/functest/proto/excel__fieldprop__field_prop.proto test/functest/proto/excel__keyedlist__keyed_list.proto test/functest/proto/excel__list__list.proto test/functest/proto/excel__list__vertical_list.proto test/functest/proto/excel__map__horizontal_map.proto test/functest/proto/excel__map__map.proto test/functest/proto/excel__map__vertical_map.proto test/functest/proto/excel__metasheet__merger_1.proto test/functest/proto/excel__metasheet__metasheet.proto test/functest/proto/excel__metasheet__scatter_1.proto test/functest/proto/excel__misc__type_reuse.proto test/functest/proto/excel__nesting__list_in_list.proto test/functest/proto/excel__nesting__list_in_map.proto test/functest/proto/excel__nesting__map_in_list.proto test/functest/proto/excel__nesting__map_in_map.proto test/functest/proto/excel__nesting__struct_in_list.proto test/functest/proto/excel__nesting__struct_in_map.proto test/functest/proto/excel__nesting__struct_in_struct.proto test/functest/proto/excel__scalar__scalar.proto test/functest/proto/excel__wellknown__well_known.proto test/functest/proto/xml__keyedlist__keyed_list.proto test/functest/proto/xml__list__list.proto test/functest/proto/xml__map__map.proto test/functest/proto/xml__metasheet__metasheet.proto 'test/functest/testdata/excel/fieldprop/FieldProp#UniqueFalse.csv')
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

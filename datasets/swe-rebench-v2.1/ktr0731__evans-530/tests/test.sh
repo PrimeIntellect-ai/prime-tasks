@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/evans
 TEST_FILES=(e2e/cli_test.go e2e/e2e_test.go e2e/testdata/fixtures/teste2e_cli-call_failure_unary_rpc_with_--enrich_and_json_format.golden e2e/testdata/fixtures/teste2e_cli-call_failure_unary_rpc_with_--enrich_flag.golden e2e/testdata/fixtures/teste2e_cli-call_failure_unary_rpc_with_--enrich_flag_against_to_grpc-web_server.golden e2e/testdata/fixtures/teste2e_cli-call_failure_unary_rpc_with_--enrich_flag_without_reflection.golden e2e/testdata/fixtures/teste2e_cli-call_failure_unary_rpc_with_--enrich_flag_without_reflection_against_to_grpc-web_server.golden e2e/testdata/fixtures/teste2e_repl-call_unaryheadertrailerfailure_by_selecting_package_and_service_with_enriched_output.golden e2e/testdata/test.proto)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

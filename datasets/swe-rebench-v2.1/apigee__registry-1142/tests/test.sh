@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/registry
 TEST_FILES=(cmd/registry/cmd/annotate/annotate_test.go cmd/registry/cmd/apply/apply_test.go cmd/registry/cmd/check/check_test.go cmd/registry/cmd/check/lint/checker_test.go cmd/registry/cmd/check/rules/rule1000/rule1000_test.go cmd/registry/cmd/check/rules/rule1001/rule1001_test.go cmd/registry/cmd/check/rules/rule1003/rule1003_test.go cmd/registry/cmd/check/rules/rule101/rule101_test.go cmd/registry/cmd/check/rules/rule102/rule102_test.go cmd/registry/cmd/check/rules/rule104/rule104_test.go cmd/registry/cmd/check/rules/rule106/rule106_test.go cmd/registry/cmd/compute/complexity/complexity_test.go cmd/registry/cmd/compute/conformance/conformance_test.go cmd/registry/cmd/compute/lint/lint_test.go cmd/registry/cmd/compute/lintstats/lintstats_test.go cmd/registry/cmd/compute/score/score_test.go cmd/registry/cmd/compute/scorecard/scorecard_test.go cmd/registry/cmd/compute/vocabulary/vocabulary_test.go cmd/registry/cmd/config/configurations/configurations_test.go cmd/registry/cmd/delete/delete_test.go cmd/registry/cmd/export/export_test.go cmd/registry/cmd/get/get_test.go cmd/registry/cmd/label/label_test.go cmd/registry/cmd/resolve/resolve_test.go cmd/registry/cmd/upload/upload_test.go cmd/registry/conformance/conformance_test.go cmd/registry/controller/controller_test.go cmd/registry/patch/patch_test.go cmd/registry/scoring/scoring_test.go pkg/config/configuration_test.go pkg/connection/client_test.go pkg/connection/grpctest/server.go pkg/visitor/visit_test.go pkg/wipeout/wipeout_test.go tests/crud/crud_test.go tests/demo/demo_test.go tests/filters_test.go)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

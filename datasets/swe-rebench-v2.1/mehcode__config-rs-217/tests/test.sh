@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/config-rs
 TEST_FILES=(tests/Settings.hjson tests/Settings.json tests/Settings.json5 tests/Settings.ron tests/Settings.toml tests/Settings.yaml tests/async_builder.rs tests/errors.rs tests/file_hjson.rs tests/file_json.rs tests/file_json5.rs tests/file_ron.rs tests/file_toml.rs tests/file_yaml.rs tests/get.rs tests/legacy/errors.rs tests/legacy/file_hjson.rs tests/legacy/file_json.rs tests/legacy/file_ron.rs tests/legacy/file_toml.rs tests/legacy/file_yaml.rs tests/legacy/get.rs tests/legacy/merge.rs tests/merge.rs)
@@ -34,6 +35,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/compose2nix
 TEST_FILES=(nix_test.go nixos-test/docker-compose.nix nixos-test/docker-compose.yml nixos-test/podman-compose.nix nixos-test/test.nix testdata/TestBasic.docker.nix testdata/TestEnvFilesOnly.docker.nix testdata/TestNoRestart.compose.yml testdata/TestNoRestart.docker.nix testdata/TestNoRestart.podman.nix testdata/TestNoWriteNixSetup.docker.nix testdata/TestOverrideSystemdStopTimeout.docker.nix testdata/TestProject.docker.nix testdata/TestRemoveVolumes.docker.nix testdata/TestSystemdMount.docker.nix testdata/TestUpheldBy.docker.nix testdata/compose.yml)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/mini-css-extract-plugin
 TEST_FILES=(test/cases/publicpath-function-2/expected/webpack-5-importModule/c9e192c015437a21dea1.svg test/cases/publicpath-function-2/expected/webpack-5-importModule/nested/again/style.css test/cases/publicpath-function-2/expected/webpack-5-importModule/nested/style.css test/cases/publicpath-function-2/expected/webpack-5/c9e192c015437a21dea1.svg test/cases/publicpath-function-2/expected/webpack-5/nested/again/style.css test/cases/publicpath-function-2/expected/webpack-5/nested/style.css test/cases/publicpath-function-2/nested/again/style.css test/cases/publicpath-function-2/nested/style.css test/cases/publicpath-function-2/react.svg test/cases/publicpath-function-2/webpack.config.js)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

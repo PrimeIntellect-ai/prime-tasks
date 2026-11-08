@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/eslint-plugin-svelte
 TEST_FILES=(packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/invalid/invalid-css01-errors.yaml packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/invalid/invalid-css01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/invalid/invalid-scss01-errors.yaml packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/invalid/invalid-scss01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/invalid/unknown-lang01-errors.yaml packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/invalid/unknown-lang01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/valid/no-style01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/valid/valid-css01-input.svelte packages/eslint-plugin-svelte/tests/fixtures/rules/valid-style-parse/valid/valid-scss01-input.svelte packages/eslint-plugin-svelte/tests/src/rules/valid-style-parse.ts)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

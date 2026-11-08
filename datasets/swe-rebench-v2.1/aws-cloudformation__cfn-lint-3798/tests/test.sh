@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/cfn-lint
 TEST_FILES=(test/integration/jsonschema/test_validator_cfn.py test/unit/module/jsonschema/test_validator.py test/unit/rules/functions/test_dynamic_reference.py test/unit/rules/functions/test_find_in_map.py test/unit/rules/functions/test_if.py test/unit/rules/functions/test_sub.py test/unit/rules/functions/test_tojsonstring.py test/unit/rules/mappings/test_configuration.py test/unit/rules/outputs/test_configuration.py test/unit/rules/parameters/test_configuration.py test/unit/rules/resources/ecs/test_service_health_check_grace_period_seconds.py test/unit/rules/resources/elbv2/test_loadbalancer_application_subnets.py test/unit/rules/resources/properties/test_tagging.py test/unit/rules/resources/route53/test_recordsets.py test/unit/rules/templates/test_limitsize_description.py)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

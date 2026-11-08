@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/swc
 TEST_FILES=(crates/swc/tests/tsc-references/logicalAssignment1_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment1_es2015.2.minified.js crates/swc/tests/tsc-references/logicalAssignment1_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment1_es5.2.minified.js crates/swc/tests/tsc-references/logicalAssignment2_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment2_es2015.2.minified.js crates/swc/tests/tsc-references/logicalAssignment2_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment2_es5.2.minified.js crates/swc/tests/tsc-references/logicalAssignment4_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment4_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment5_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment5_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment6_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment6_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment7_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment7_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment8_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment8_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment9_es2015.1.normal.js crates/swc/tests/tsc-references/logicalAssignment9_es2015.2.minified.js crates/swc/tests/tsc-references/logicalAssignment9_es5.1.normal.js crates/swc/tests/tsc-references/logicalAssignment9_es5.2.minified.js crates/swc_ecma_transforms_compat/tests/es2021_logcal_assignments.rs)
@@ -35,6 +36,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -uo pipefail
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 WORKDIR=/couper
 TEST_FILES=(eval/context_test.go eval/lib/jwt_test.go handler/endpoint_test.go handler/transport/backend_test.go server/testdata/endpoints/01_couper.hcl server/testdata/endpoints/03_couper.hcl server/testdata/endpoints/04_couper.hcl server/testdata/endpoints/06_couper.hcl server/testdata/endpoints/07_couper.hcl server/testdata/integration/api/06_couper.hcl server/testdata/integration/config/03_couper.hcl server/testdata/integration/endpoint_eval/01_couper.hcl server/testdata/integration/endpoint_eval/04_couper.hcl server/testdata/integration/endpoint_eval/08_couper.hcl server/testdata/integration/endpoint_eval/12_couper.hcl server/testdata/integration/endpoint_eval/13_couper.hcl server/testdata/integration/endpoint_eval/14_couper.hcl server/testdata/integration/endpoint_eval/15_couper.hcl)
@@ -33,6 +34,13 @@ apply_patch() (
   exit 1
 )
 
+if [ -s /logs/artifacts/model.patch ]; then
+  if ! (EXCLUDES=(); apply_patch /logs/artifacts/model.patch) > "$V/model_patch_apply.log" 2>&1; then
+    echo "MODEL_PATCH_APPLY_FAILED"
+    cat "$V/model_patch_apply.log"
+    exit 0
+  fi
+fi
 for f in "${TEST_FILES[@]}"; do
   if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git restore "$f" 2>/dev/null; else rm -f "$f"; fi
 done
