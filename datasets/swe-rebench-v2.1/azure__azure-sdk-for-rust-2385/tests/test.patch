@@ -1,0 +1,164 @@
+diff --git a/eng/common/TestResources/New-TestResources.ps1 b/eng/common/TestResources/New-TestResources.ps1
+index fce3bd020..ca2d33fe9 100755
+--- a/eng/common/TestResources/New-TestResources.ps1
++++ b/eng/common/TestResources/New-TestResources.ps1
+@@ -93,6 +93,11 @@ param (
+     })]
+     [array] $AllowIpRanges = @(),
+ 
++    # Instead of running the post script, create a wrapped file to run it with parameters
++    # so that CI can run it in a subsequent step with a refreshed azure login
++    [Parameter()]
++    [string] $SelfContainedPostScript,
++
+     [Parameter()]
+     [switch] $CI = ($null -ne $env:SYSTEM_TEAMPROJECTID),
+ 
+@@ -625,9 +630,41 @@ try {
+         SetResourceNetworkAccessRules -ResourceGroupName $ResourceGroupName -AllowIpRanges $AllowIpRanges -CI:$CI
+ 
+         $postDeploymentScript = $templateFile.originalFilePath | Split-Path | Join-Path -ChildPath "$ResourceType-resources-post.ps1"
++
++        if ($SelfContainedPostScript -and !(Test-Path $postDeploymentScript)) {
++            throw "-SelfContainedPostScript is not supported if there is no 'test-resources-post.ps1' script in the deployment template directory"
++        }
++
+         if (Test-Path $postDeploymentScript) {
+-            Log "Invoking post-deployment script '$postDeploymentScript'"
+-            &$postDeploymentScript -ResourceGroupName $ResourceGroupName -DeploymentOutputs $deploymentOutputs @PSBoundParameters
++            if ($SelfContainedPostScript) {
++                Log "Creating invokable post-deployment script '$SelfContainedPostScript' from '$postDeploymentScript'"
++
++                $deserialized = @{}
++                foreach ($parameter in $PSBoundParameters.GetEnumerator()) {
++                    if ($parameter.Value -is [System.Management.Automation.SwitchParameter]) {
++                        $deserialized[$parameter.Key] = $parameter.Value.ToBool()
++                    } else {
++                        $deserialized[$parameter.Key] = $parameter.Value
++                    }
++                }
++                $deserialized['ResourceGroupName'] = $ResourceGroupName
++                $deserialized['DeploymentOutputs'] = $deploymentOutputs
++                $serialized = $deserialized | ConvertTo-Json
++
++                $outScript = @"
++`$parameters = `@'
++$serialized
++'`@ | ConvertFrom-Json -AsHashtable
++# Set global variables that aren't always passed as parameters
++`$ResourceGroupName = `$parameters.ResourceGroupName
++`$DeploymentOutputs = `$parameters.DeploymentOutputs
++$postDeploymentScript `@parameters
++"@
++                $outScript | Out-File $SelfContainedPostScript
++            } else {
++                Log "Invoking post-deployment script '$postDeploymentScript'"
++                &$postDeploymentScript -ResourceGroupName $ResourceGroupName -DeploymentOutputs $deploymentOutputs @PSBoundParameters
++            }
+         }
+ 
+         if ($templateFile.jsonFilePath.EndsWith('.compiled.json')) {
+diff --git a/eng/common/TestResources/deploy-test-resources.yml b/eng/common/TestResources/deploy-test-resources.yml
+index 22a232d43..7a4593af8 100644
+--- a/eng/common/TestResources/deploy-test-resources.yml
++++ b/eng/common/TestResources/deploy-test-resources.yml
+@@ -9,6 +9,7 @@ parameters:
+   ResourceType: test
+   UseFederatedAuth: true
+   PersistOidcToken: false
++  SelfContainedPostScript: self-contained-test-resources-post.ps1
+ 
+ # SubscriptionConfiguration will be splatted into the parameters of the test
+ # resources script. It should be JSON in the form:
+@@ -89,6 +90,8 @@ steps:
+           # Write the new SubscriptionConfiguration to be used by the remove test resources
+           Write-Host "##vso[task.setvariable variable=SubscriptionConfiguration;]$($subscriptionConfiguration | ConvertTo-Json -Compress)"
+ 
++          $postScriptPath = $${{ parameters.PersistOidcToken }} ? '$(Agent.TempDirectory)/${{ parameters.SelfContainedPostScript }}' : $null
++
+           # The subscriptionConfiguration may have ArmTemplateParameters defined, so
+           # pass those in via the ArmTemplateParameters flag, and handle any
+           # additional parameters from the pipelines via AdditionalParameters
+@@ -100,10 +103,31 @@ steps:
+             @subscriptionConfiguration `
+             -AdditionalParameters ${{ parameters.ArmTemplateParameters }} `
+             -AllowIpRanges ('$(azsdk-corp-net-ip-ranges)' -split ',') `
++            -SelfContainedPostScript $postScriptPath `
+             -CI `
+             -Force `
+             -Verbose | Out-Null
+ 
++    - ${{ if eq(parameters.PersistOidcToken, true) }}:
++      # ARM deployments that take longer than 10-15 minutes (e.g. HSM) can
++      # cause post scripts to fail with expired credentials.
++      # Add a new task with a refreshed token as a workaround to this issue.
++      - task: AzureCLI@2
++        displayName: Test Resources Post with refreshed login
++        env:
++          ${{ insert }}: ${{ parameters.EnvVars }}
++        inputs:
++          azureSubscription: ${{ parameters.ServiceConnection }}
++          addSpnToEnvironment: true
++          scriptLocation: inlineScript
++          scriptType: pscore
++          inlineScript: |
++            $env:ARM_OIDC_TOKEN = $env:idToken
++            $scriptPath = '$(Agent.TempDirectory)/${{ parameters.SelfContainedPostScript }}'
++            Write-Host "Executing self contained test resources post script '$scriptPath'"
++            & $scriptPath
++            Remove-Item $scriptPath  # avoid any possible complications when we run multiple deploy templates
++
+   - ${{ else }}:
+     - pwsh: |
+         eng/common/scripts/Import-AzModules.ps1
+diff --git a/sdk/core/azure_core_test/src/credentials.rs b/sdk/core/azure_core_test/src/credentials.rs
+index 6337d3ecb..82d3bd7a6 100644
+--- a/sdk/core/azure_core_test/src/credentials.rs
++++ b/sdk/core/azure_core_test/src/credentials.rs
+@@ -26,10 +26,6 @@ impl TokenCredential for MockCredential {
+         );
+         Ok(AccessToken { token, expires_on })
+     }
+-
+-    async fn clear_cache(&self) -> azure_core::Result<()> {
+-        Ok(())
+-    }
+ }
+ 
+ /// Gets a `TokenCredential` appropriate for the current environment.
+@@ -68,3 +64,35 @@ pub fn from_env(
+             as Arc<dyn TokenCredential>,
+     )
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Probe trait sharing the name of the method that was removed from `TokenCredential`.
++    ///
++    /// If `TokenCredential` still exposed a `clear_cache` method on `MockCredential`, the call
++    /// below would be ambiguous and this module would fail to compile.
++    trait ClearCacheProbe {
++        fn clear_cache(&self) -> bool {
++            true
++        }
++    }
++
++    impl ClearCacheProbe for MockCredential {}
++
++    #[test]
++    fn token_credential_has_no_clear_cache_method() {
++        assert!(MockCredential.clear_cache());
++    }
++
++    #[tokio::test]
++    async fn get_token_issues_token_through_trait_object() {
++        let credential: Arc<dyn TokenCredential> = Arc::new(MockCredential);
++        let token = credential
++            .get_token(&["https://example.invalid/.default"])
++            .await
++            .expect("mock credential should issue a token");
++        assert!(token.token.secret().contains("https://example.invalid/.default"));
++    }
++}

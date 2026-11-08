@@ -1,0 +1,85 @@
+Submodel inputs are not set correctly sometimes
+### Description
+
+@naylor-b, @crecine, and I briefly chatted about this. It looks like maybe the indexing within the `compute()` for `SubmodelComp` has a bug.
+
+I've attached a small example that shows this behavior. These two cases should both pass but only one does. @naylor-b, please let me know if I can provide more info!
+
+### Example
+
+```
+import unittest
+import numpy as np
+
+import openmdao.api as om
+from openmdao.utils.assert_utils import assert_near_equal
+
+
+def build_submodel(compute_x=False):
+    p = om.Problem()
+    supmodel = om.Group()
+    supmodel.add_subsystem('supComp', om.ExecComp('diameter = r * theta'),
+                            promotes_inputs=['*'],
+                            promotes_outputs=['*', ('diameter', 'aircraft:fuselage:diameter')])
+
+    subprob1 = om.Problem()
+    submodel1 = subprob1.model.add_subsystem('submodel1', om.Group(), promotes=['*'])
+
+    if compute_x:
+        submodel1.add_subsystem('x', om.ExecComp('x = diameter * 2 * r * theta'), promotes=['*', ('diameter', 'aircraft:fuselage:diameter')])
+    submodel1.add_subsystem('y', om.ExecComp('y = mass * donkey_kong'), promotes=['*', ('mass', 'dynamic:mission:mass'), ('donkey_kong', 'aircraft:engine:donkey_kong')])
+
+
+    p.model.add_subsystem('supModel', supmodel, promotes_inputs=['*'],
+                            promotes_outputs=['*'])
+
+
+    submodel = om.SubmodelComp(problem=subprob1, inputs=['*'], outputs=['*'])
+    p.model.add_subsystem('sub1', submodel,
+                            promotes_inputs=['*'],
+                            promotes_outputs=['*'])
+
+    p.model.set_input_defaults('r', 1.25)
+    p.model.set_input_defaults('theta', np.pi)
+
+    p.setup(force_alloc_complex=True)
+
+    p.set_val('r', 1.25)
+    p.set_val('theta', 0.5)
+    p.set_val('dynamic:mission:mass', 2.0)
+    p.set_val('aircraft:engine:donkey_kong', 3.0)
+    p.set_val('aircraft:fuselage:diameter', 3.5)
+
+    return p
+
+
+
+class TestSubModelBug(unittest.TestCase):
+
+    def test_submodel_bug(self):
+        p = build_submodel(compute_x=False)
+
+        p.run_model()
+
+        assert_near_equal(p.get_val('y'), 2.0 * 3.0)
+
+
+    def test_submodel_bug_fails(self):
+        p = build_submodel(compute_x=True)
+
+        p.run_model()
+
+        assert_near_equal(p.get_val('y'), 2.0 * 3.0)
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### OpenMDAO Version
+
+3.31.2-dev
+
+### Relevant environment information
+
+_No response_

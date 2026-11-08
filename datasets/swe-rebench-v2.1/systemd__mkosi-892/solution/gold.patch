@@ -1,0 +1,310 @@
+diff --git a/mkosi.md b/mkosi.md
+index 335b4899..0ad3f43b 100644
+--- a/mkosi.md
++++ b/mkosi.md
+@@ -314,14 +314,22 @@ a boolean argument: either "1", "yes", or "true" to enable, or "0",
+ 
+ `UseHostRepositories=`, `--use-host-repositories`
+ 
+-: This option is only applicable for dnf-based distributions:
++: This option is only applicable for RPM-based distributions:
+   *CentOS*, *Fedora Linux*, *Mageia*, *Photon*, *Rocky Linux*, *Alma Linux*
+   and *OpenMandriva*.
+-  Allows use of the host's existing dnf repositories.
+-  By default, a hardcoded set of default dnf repositories is generated and used.
++  Allows use of the host's existing RPM repositories.
++  By default, a hardcoded set of default RPM repositories is generated and used.
+   Use `--repositories=` to identify a custom set of repositories to be enabled
+   and used for the build.
+ 
++`RepositoryDirectory`, `--repository-directory`
++
++: This option can (for now) only be used with RPM-based istributions and Arch
++  Linux. It identifies a directory containing extra repository definitions that
++  will be used when installing packages. The files are passed directly to the
++  corresponding package manager and should be written in the format expected by
++  the package manager of the image's distro.
++
+ `Architecture=`, `--architecture=`
+ 
+ : The architecture to build the image for. Note that this currently
+@@ -1087,6 +1095,13 @@ a machine ID.
+ : When used with the `qemu` verb, this options sets `qemu`'s `-m`
+   argument which controls the amount of guest's RAM. Defaults to `1G`.
+ 
++`NspawnKeepUnit=`, `--nspawn-keep-unit`
++
++: When used, this option instructs underlying calls of systemd-nspawn to
++  use the current unit scope, instead of creating a dedicated transcient
++  scope unit for the containers. This option should be used when mkosi is
++  run by a service unit.
++
+ `Netdev=`, `--netdev`
+ 
+ : When used with the boot or qemu verbs, this option creates a virtual
+@@ -1508,6 +1523,10 @@ local directory:
+   build result of a preceding run might be copied into a build image
+   as part of the source tree (see above).
+ 
++* The **`mkosi.reposdir/`** directory, if it exists, is automatically
++  used as the repository directory for extra repository files. See
++  the `RepositoryDirectory` option for more information.
++
+ All these files are optional.
+ 
+ Note that the location of all these files may also be configured
+diff --git a/mkosi/__init__.py b/mkosi/__init__.py
+index 1cc54386..9714a355 100644
+--- a/mkosi/__init__.py
++++ b/mkosi/__init__.py
+@@ -81,6 +81,7 @@ from .backend import (
+     Verb,
+     die,
+     install_grub,
++    is_rpm_distribution,
+     nspawn_params_for_blockdev_access,
+     nspawn_rlimit_params,
+     patch_file,
+@@ -1683,6 +1684,8 @@ def root_home(args: MkosiArgs, root: Path) -> Path:
+ 
+ def prepare_tree(args: MkosiArgs, root: Path, do_run_build_script: bool, cached: bool) -> None:
+     if cached:
++        # Reuse machine-id from cached image.
++        args.machine_id = uuid.UUID(root.joinpath("etc/machine-id").read_text().strip()).hex
+         return
+ 
+     with complete_step("Setting up basic OS tree…"):
+@@ -2012,6 +2015,22 @@ def invoke_dnf(
+     with mount_api_vfs(args, root):
+         run(cmdline)
+ 
++    distribution, release = detect_distribution()
++    if distribution not in (Distribution.debian, Distribution.ubuntu):
++        return
++
++    # On Debian, rpm/dnf ship with a patch to store the rpmdb under ~/
++    # so it needs to be copied back in the right location, otherwise
++    # the rpmdb will be broken. See: https://bugs.debian.org/1004863
++    rpmdb_home = root / "root/.rpmdb"
++    if rpmdb_home.exists():
++        # Take into account the new location in F36
++        rpmdb = root / "usr/lib/sysimage/rpm"
++        if not rpmdb.exists():
++            rpmdb = root / "var/lib/rpm"
++        unlink_try_hard(rpmdb)
++        shutil.move(cast(str, rpmdb_home), rpmdb)
++
+ 
+ def install_packages_dnf(
+     args: MkosiArgs,
+@@ -2107,7 +2126,11 @@ def setup_dnf(args: MkosiArgs, root: Path, repos: Sequence[Repo] = ()) -> None:
+     if args.use_host_repositories:
+         default_repos  = ""
+     else:
+-        default_repos  = f"{'repodir' if args.distribution == Distribution.photon else 'reposdir'}={workspace(root)}"
++        option = "repodir" if args.distribution == Distribution.photon else "reposdir"
++        default_repos  = f"{option}={workspace(root)} {args.repos_dir if args.repos_dir else ''}"
++
++    vars_dir = workspace(root) / "vars"
++    vars_dir.mkdir(exist_ok=True)
+ 
+     config_file = workspace(root) / "dnf.conf"
+     config_file.write_text(
+@@ -2116,6 +2139,7 @@ def setup_dnf(args: MkosiArgs, root: Path, repos: Sequence[Repo] = ()) -> None:
+             [main]
+             gpgcheck={'1' if gpgcheck else '0'}
+             {default_repos }
++            varsdir={vars_dir}
+             """
+         )
+     )
+@@ -2546,6 +2570,9 @@ def install_centos(args: MkosiArgs, root: Path, do_run_build_script: bool) -> No
+     else:
+         install_centos_stream_repos(args, root, epel_release)
+ 
++    if "-stream" in args.release:
++        workspace(root).joinpath("vars/stream").write_text(args.release)
++
+     packages = {*args.packages}
+     add_packages(args, packages, "centos-release", "systemd")
+     if not do_run_build_script and args.bootable:
+@@ -2583,6 +2610,15 @@ def install_centos(args: MkosiArgs, root: Path, do_run_build_script: bool) -> No
+ 
+     install_packages_dnf(args, root, packages, do_run_build_script)
+ 
++    # Centos Stream 8 and below can't write to the sqlite db backend used by
++    # default in newer RPM releases so let's rebuild the DB to use the old bdb
++    # backend instead. Because newer RPM releases have dropped support for the
++    # bdb backend completely, we check if rpm is installed and use
++    # run_workspace_command() to rebuild the rpm db.
++    if epel_release <= 8 and root.joinpath("usr/bin/rpm").exists():
++        cmdline = ["rpm", "--rebuilddb", "--define", "_db_backend bdb"]
++        run_workspace_command(args, root, cmdline)
++
+ 
+ @complete_step("Installing Rocky Linux…")
+ def install_rocky(args: MkosiArgs, root: Path, do_run_build_script: bool) -> None:
+@@ -2871,16 +2907,17 @@ def install_arch(args: MkosiArgs, root: Path, do_run_build_script: bool) -> None
+             dedent(
+                 f"""\
+                 [options]
+-                RootDir     = {root}
+-                LogFile     = /dev/null
+-                CacheDir    = {root}/var/cache/pacman/pkg/
+-                GPGDir      = {root}/etc/pacman.d/gnupg/
+-                HookDir     = {root}/etc/pacman.d/hooks/
+-                HoldPkg     = pacman glibc
++                RootDir = {root}
++                LogFile = /dev/null
++                CacheDir = {root}/var/cache/pacman/pkg/
++                GPGDir = {root}/etc/pacman.d/gnupg/
++                HookDir = {root}/etc/pacman.d/hooks/
++                HoldPkg = pacman glibc
+                 Architecture = auto
+                 Color
+                 CheckSpace
+-                SigLevel    = Required DatabaseOptional TrustAll
++                SigLevel = Required DatabaseOptional TrustAll
++                ParallelDownloads = 5
+ 
+                 [core]
+                 {server}
+@@ -2890,6 +2927,8 @@ def install_arch(args: MkosiArgs, root: Path, do_run_build_script: bool) -> None
+ 
+                 [community]
+                 {server}
++
++                {f"Include = {args.repos_dir}/*" if args.repos_dir else ""}
+                 """
+             )
+         )
+@@ -3559,12 +3598,12 @@ def install_build_src(args: MkosiArgs, root: Path, do_run_build_script: bool, fo
+     if for_cache:
+         return
+ 
+-    if args.build_script is None:
+-        return
+-
+     if do_run_build_script:
+-        with complete_step("Copying in build script…"):
+-            copy_file(args.build_script, root_home(args, root) / args.build_script.name)
++        if args.build_script is not None:
++            with complete_step("Copying in build script…"):
++                copy_file(args.build_script, root_home(args, root) / args.build_script.name)
++        else:
++            return
+ 
+     sft: Optional[SourceFileTransfer] = None
+     resolve_symlinks: bool = False
+@@ -5114,6 +5153,8 @@ def create_parser() -> ArgumentParserMkosi:
+         action=BooleanAction,
+         help="Use host's existing software repositories (only for dnf-based distributions)",
+     )
++    group.add_argument("--repository-directory", metavar="PATH", dest="repos_dir",
++                       help="Directory container extra distribution specific repository files")
+     group.add_argument("--architecture", help="Override the architecture of installation")
+ 
+     group = parser.add_argument_group("Output")
+@@ -5589,6 +5630,11 @@ def create_parser() -> ArgumentParserMkosi:
+     group.add_argument("--qemu-headless", action=BooleanAction, help="Configure image for qemu's -nographic mode")
+     group.add_argument("--qemu-smp", help="Configure guest's SMP settings", metavar="SMP", default="2")
+     group.add_argument("--qemu-mem", help="Configure guest's RAM size", metavar="MEM", default="1G")
++    group.add_argument(
++        "--nspawn-keep-unit",
++        action=BooleanAction,
++        help="If specified, underlying systemd-nspawn containers use the ressources of the current unit."
++    )
+     group.add_argument(
+         "--network-veth",
+         dest="netdev",
+@@ -6203,6 +6249,7 @@ def load_args(args: argparse.Namespace) -> MkosiArgs:
+     args_find_path(args, "output_dir", "mkosi.output/")
+     args_find_path(args, "workspace_dir", "mkosi.workspace/")
+     args_find_path(args, "mksquashfs_tool", "mkosi.mksquashfs-tool", as_list=True)
++    args_find_path(args, "repos_dir", "mkosi.reposdir/")
+ 
+     find_extra(args)
+     find_skeleton(args)
+@@ -6570,6 +6617,9 @@ def load_args(args: argparse.Namespace) -> MkosiArgs:
+     if args.ssh_port <= 0:
+         die("--ssh-port must be > 0")
+ 
++    if args.repos_dir and not (is_rpm_distribution(args.distribution) or args.distribution == Distribution.arch):
++        die("--repository-directory is only supported on RPM based distributions and Arch")
++
+     # We set a reasonable umask so that files that are created in the image
+     # will have reasonable permissions. We don't want those permissions to be
+     # influenced by the caller's umask which will be used only for output files.
+@@ -7213,6 +7263,9 @@ def run_build_script(args: MkosiArgs, root: Path, raw: Optional[BinaryIO]) -> No
+         if args.usr_only:
+             cmdline += [f"--bind={root_home(args, root)}:/root"]
+ 
++        if args.nspawn_keep_unit:
++            cmdline += ["--keep-unit"]
++
+         cmdline += [f"/root/{args.build_script.name}"]
+         cmdline += args.cmdline
+ 
+@@ -7474,6 +7527,9 @@ def run_shell_cmdline(args: MkosiArgs, pipe: bool = False, commands: Optional[Se
+ 
+     cmdline += ["--machine", virt_name(args)]
+ 
++    if args.nspawn_keep_unit:
++        cmdline += ["--keep-unit"]
++
+     if commands or args.cmdline:
+         # If the verb is 'shell', args.cmdline contains the command to run.
+         # Otherwise, the verb is 'boot', and we assume args.cmdline contains nspawn arguments.
+diff --git a/mkosi/backend.py b/mkosi/backend.py
+index af9c5044..36c856f9 100644
+--- a/mkosi/backend.py
++++ b/mkosi/backend.py
+@@ -168,6 +168,20 @@ class Distribution(enum.Enum):
+     def __str__(self) -> str:
+         return self.name
+ 
++def is_rpm_distribution(d: Distribution) -> bool:
++    return d in (
++        Distribution.fedora,
++        Distribution.mageia,
++        Distribution.centos,
++        Distribution.centos_epel,
++        Distribution.photon,
++        Distribution.openmandriva,
++        Distribution.rocky,
++        Distribution.rocky_epel,
++        Distribution.alma,
++        Distribution.alma_epel
++    )
++
+ 
+ class SourceFileTransfer(enum.Enum):
+     copy_all = "copy-all"
+@@ -404,6 +418,7 @@ class MkosiArgs:
+     mirror: Optional[str]
+     repositories: List[str]
+     use_host_repositories: bool
++    repos_dir: Optional[str]
+     architecture: Optional[str]
+     output_format: OutputFormat
+     manifest_format: List[ManifestFormat]
+@@ -502,6 +517,9 @@ class MkosiArgs:
+     qemu_smp: str
+     qemu_mem: str
+ 
++    # systemd-nspawn specific options
++    nspawn_keep_unit: bool
++
+     # Some extra stuff that's stored in MkosiArgs for convenience but isn't populated by arguments
+     machine_id_is_fixed: bool
+     original_umask: int
+@@ -646,6 +664,9 @@ def run_workspace_command(
+         stdout = subprocess.PIPE
+         nspawn += ["--console=pipe"]
+ 
++    if args.nspawn_keep_unit:
++        nspawn += ["--keep-unit"]
++
+     result = run([*nspawn, "--", *cmd], check=False, stdout=stdout, text=capture_stdout)
+     if result.returncode != 0:
+         if "workspace-command" in ARG_DEBUG:

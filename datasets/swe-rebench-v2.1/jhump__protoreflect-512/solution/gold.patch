@@ -1,0 +1,186 @@
+diff --git a/desc/builder/message.go b/desc/builder/message.go
+index 5956a8a..2f0aa7f 100644
+--- a/desc/builder/message.go
++++ b/desc/builder/message.go
+@@ -819,7 +819,7 @@ func (mb *MessageBuilder) buildProto(path []int32, sourceInfo *dpb.SourceCodeInf
+ 	}
+ 
+ 	if mb.GetFile().IsProto3 {
+-		internal.ProcessProto3OptionalFields(md)
++		internal.ProcessProto3OptionalFields(md, nil)
+ 	}
+ 
+ 	return md, nil
+diff --git a/desc/internal/proto3_optional.go b/desc/internal/proto3_optional.go
+index 9aa4a3e..ef35cdd 100644
+--- a/desc/internal/proto3_optional.go
++++ b/desc/internal/proto3_optional.go
+@@ -68,8 +68,9 @@ func SetProto3Optional(fd *dpb.FieldDescriptorProto) {
+ 
+ // ProcessProto3OptionalFields adds synthetic oneofs to the given message descriptor
+ // for each proto3 optional field. It also updates the fields to have the correct
+-// oneof index reference.
+-func ProcessProto3OptionalFields(msgd *dpb.DescriptorProto) {
++// oneof index reference. The given callback, if not nil, is called for each synthetic
++// oneof created.
++func ProcessProto3OptionalFields(msgd *dpb.DescriptorProto, callback func(*dpb.FieldDescriptorProto, *dpb.OneofDescriptorProto)) {
+ 	var allNames map[string]struct{}
+ 	for _, fd := range msgd.Field {
+ 		if GetProto3Optional(fd) {
+@@ -79,8 +80,17 @@ func ProcessProto3OptionalFields(msgd *dpb.DescriptorProto) {
+ 				for _, fd := range msgd.Field {
+ 					allNames[fd.GetName()] = struct{}{}
+ 				}
+-				for _, fd := range msgd.Extension {
+-					allNames[fd.GetName()] = struct{}{}
++				for _, od := range msgd.OneofDecl {
++					allNames[od.GetName()] = struct{}{}
++				}
++				// NB: protoc only considers names of other fields and oneofs
++				// when computing the synthetic oneof name. But that feels like
++				// a bug, since it means it could generate a name that conflicts
++				// with some other symbol defined in the message. If it's decided
++				// that's NOT a bug and is desirable, then we should remove the
++				// following four loops to mimic protoc's behavior.
++				for _, xd := range msgd.Extension {
++					allNames[xd.GetName()] = struct{}{}
+ 				}
+ 				for _, ed := range msgd.EnumType {
+ 					allNames[ed.GetName()] = struct{}{}
+@@ -114,7 +124,11 @@ func ProcessProto3OptionalFields(msgd *dpb.DescriptorProto) {
+ 			}
+ 
+ 			fd.OneofIndex = proto.Int32(int32(len(msgd.OneofDecl)))
+-			msgd.OneofDecl = append(msgd.OneofDecl, &dpb.OneofDescriptorProto{Name: proto.String(ooName)})
++			ood := &dpb.OneofDescriptorProto{Name: proto.String(ooName)}
++			msgd.OneofDecl = append(msgd.OneofDecl, ood)
++			if callback != nil {
++				callback(fd, ood)
++			}
+ 		}
+ 	}
+ }
+diff --git a/desc/protoparse/ast/field.go b/desc/protoparse/ast/field.go
+index b5183af..0d77f27 100644
+--- a/desc/protoparse/ast/field.go
++++ b/desc/protoparse/ast/field.go
+@@ -8,6 +8,7 @@ import "fmt"
+ //  - *FieldNode
+ //  - *GroupNode
+ //  - *MapFieldNode
++//  - *SyntheticMapField
+ // This also allows NoSourceNode to be used in place of one of the above
+ // for some usages.
+ type FieldDeclNode interface {
+@@ -306,6 +307,17 @@ func (n *GroupNode) MessageName() Node {
+ 	return n.Name
+ }
+ 
++// OneOfDeclNode is a node in the AST that defines a oneof. There are
++// multiple types of AST nodes that declare oneofs:
++//  - *OneOfNode
++//  - *SyntheticOneOf
++// This also allows NoSourceNode to be used in place of one of the above
++// for some usages.
++type OneOfDeclNode interface {
++	Node
++	OneOfName() Node
++}
++
+ // OneOfNode represents a one-of declaration. Example:
+ //
+ //  oneof query {
+@@ -373,6 +385,43 @@ func NewOneOfNode(keyword *KeywordNode, name *IdentNode, openBrace *RuneNode, de
+ 	}
+ }
+ 
++func (n *OneOfNode) OneOfName() Node {
++	return n.Name
++}
++
++// SyntheticOneOf is not an actual node in the AST but a synthetic node
++// that implements OneOfDeclNode. These are used to represent the implicit
++// oneof declarations that enclose "proto3 optional" fields.
++type SyntheticOneOf struct {
++	Field *FieldNode
++}
++
++// NewSyntheticOneOf creates a new *SyntheticOneOf that corresponds to the
++// given proto3 optional field.
++func NewSyntheticOneOf(field *FieldNode) *SyntheticOneOf {
++	return &SyntheticOneOf{Field: field}
++}
++
++func (n *SyntheticOneOf) Start() *SourcePos {
++	return n.Field.Start()
++}
++
++func (n *SyntheticOneOf) End() *SourcePos {
++	return n.Field.End()
++}
++
++func (n *SyntheticOneOf) LeadingComments() []Comment {
++	return nil
++}
++
++func (n *SyntheticOneOf) TrailingComments() []Comment {
++	return nil
++}
++
++func (n *SyntheticOneOf) OneOfName() Node {
++	return n.Field.FieldName()
++}
++
+ // OneOfElement is an interface implemented by all AST nodes that can
+ // appear in the body of a oneof declaration.
+ type OneOfElement interface {
+diff --git a/desc/protoparse/descriptor_protos.go b/desc/protoparse/descriptor_protos.go
+index eee8cb6..740677d 100644
+--- a/desc/protoparse/descriptor_protos.go
++++ b/desc/protoparse/descriptor_protos.go
+@@ -477,7 +477,14 @@ func (r *parseResult) addMessageBody(msgd *dpb.DescriptorProto, body *ast.Messag
+ 
+ 	// process any proto3_optional fields
+ 	if isProto3 {
+-		internal.ProcessProto3OptionalFields(msgd)
++		callback := func(fd *dpb.FieldDescriptorProto, ood *dpb.OneofDescriptorProto) {
++			node, ok := r.getFieldNode(fd).(*ast.FieldNode)
++			if ok {
++				r.putOneOfNode(ood, ast.NewSyntheticOneOf(node))
++			}
++			// TODO: the !ok case should really never happen... log an error?
++		}
++		internal.ProcessProto3OptionalFields(msgd, callback)
+ 	}
+ }
+ 
+diff --git a/desc/protoparse/linker.go b/desc/protoparse/linker.go
+index 7bc27b0..30e306f 100644
+--- a/desc/protoparse/linker.go
++++ b/desc/protoparse/linker.go
+@@ -146,6 +146,12 @@ func (l *linker) createDescriptorPool() error {
+ 					desc1, desc2 = desc2, desc1
+ 				}
+ 				node := l.files[file2].getNode(desc2)
++				if node == nil {
++					// TODO: this should never happen, but in case there is a bug where
++					// we get back a nil node, we'd rather fail to report line+column
++					// info than panic with a nil dereference below
++					node = ast.NewNoSourceNode(file2)
++				}
+ 				if err := l.errs.handleErrorWithPos(node.Start(), "duplicate symbol %s: already defined as %s in %q", k, descriptorType(desc1), file1); err != nil {
+ 					return err
+ 				}
+diff --git a/desc/protoparse/parser.go b/desc/protoparse/parser.go
+index 428a382..817d0f0 100644
+--- a/desc/protoparse/parser.go
++++ b/desc/protoparse/parser.go
+@@ -739,7 +739,7 @@ func (r *parseResult) putFieldNode(f *dpb.FieldDescriptorProto, n ast.FieldDeclN
+ 	r.nodes[f] = n
+ }
+ 
+-func (r *parseResult) putOneOfNode(o *dpb.OneofDescriptorProto, n *ast.OneOfNode) {
++func (r *parseResult) putOneOfNode(o *dpb.OneofDescriptorProto, n ast.OneOfDeclNode) {
+ 	r.nodes[o] = n
+ }
+ 

@@ -1,0 +1,180 @@
+diff --git a/pkg/op/device_test.go b/pkg/op/device_test.go
+index cf94c3f..b758b1b 100644
+--- a/pkg/op/device_test.go
++++ b/pkg/op/device_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"crypto/rand"
+ 	"encoding/base64"
++	"encoding/json"
+ 	"io"
+ 	mr "math/rand"
+ 	"net/http"
+@@ -16,10 +17,47 @@ import (
+ 	"github.com/muhlemmer/gu"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	"github.com/zitadel/oidc/v2/example/server/storage"
+ 	"github.com/zitadel/oidc/v2/pkg/oidc"
+ 	"github.com/zitadel/oidc/v2/pkg/op"
+ )
+ 
++type deviceGrantClient struct {
++	op.Client
++}
++
++func (deviceGrantClient) GrantTypes() []oidc.GrantType {
++	return []oidc.GrantType{oidc.GrantTypeDeviceCode}
++}
++
++type deviceGrantStorage struct {
++	op.Storage
++	op.DeviceAuthorizationStorage
++}
++
++func (s deviceGrantStorage) GetClientByClientID(ctx context.Context, clientID string) (op.Client, error) {
++	client, err := s.Storage.GetClientByClientID(ctx, clientID)
++	if err != nil {
++		return nil, err
++	}
++	if clientID == "device" {
++		return deviceGrantClient{Client: client}, nil
++	}
++	return client, nil
++}
++
++func newDeviceTestProvider(config *op.Config) op.OpenIDProvider {
++	store := storage.NewStorage(storage.NewUserStore(testIssuer))
++	provider, err := op.NewOpenIDProvider(testIssuer, config, deviceGrantStorage{
++		Storage:                    store,
++		DeviceAuthorizationStorage: store,
++	}, op.WithAllowInsecure())
++	if err != nil {
++		panic(err)
++	}
++	return provider
++}
++
+ func Test_deviceAuthorizationHandler(t *testing.T) {
+ 	type conf struct {
+ 		UserFormURL  string
+@@ -44,21 +82,23 @@ func Test_deviceAuthorizationHandler(t *testing.T) {
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
++			storage.RegisterClients(storage.WebClient("device", "secret"))
+ 			conf := gu.PtrCopy(testConfig)
+ 			conf.DeviceAuthorization.UserFormURL = tt.conf.UserFormURL
+ 			conf.DeviceAuthorization.UserFormPath = tt.conf.UserFormPath
+-			provider := newTestProvider(conf)
++			provider := newDeviceTestProvider(conf)
+ 
+ 			req := &oidc.DeviceAuthorizationRequest{
+ 				Scopes:   []string{"foo", "bar"},
+-				ClientID: "web",
++				ClientID: "device",
+ 			}
+ 			values := make(url.Values)
+-			testProvider.Encoder().Encode(req, values)
++			provider.Encoder().Encode(req, values)
+ 			body := strings.NewReader(values.Encode())
+ 
+ 			r := httptest.NewRequest(http.MethodPost, "/", body)
+ 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++			r.SetBasicAuth("device", "secret")
+ 			r = r.WithContext(op.ContextWithIssuer(r.Context(), testIssuer))
+ 
+ 			w := httptest.NewRecorder()
+@@ -69,15 +109,64 @@ func Test_deviceAuthorizationHandler(t *testing.T) {
+ 
+ 			result := w.Result()
+ 
+-			assert.Less(t, result.StatusCode, 300)
++			assert.Equal(t, http.StatusOK, result.StatusCode)
+ 
+-			got, _ := io.ReadAll(result.Body)
+-			assert.JSONEq(t, `{"device_code":"Uv38ByGCZU8WP18PmmIdcg", "expires_in":300, "interval":5, "user_code":"JKRV-FRGK", "verification_uri":"https://localhost:9998/device", "verification_uri_complete":"https://localhost:9998/device?user_code=JKRV-FRGK"}`, string(got))
++			got, err := io.ReadAll(result.Body)
++			require.NoError(t, err)
++			var response struct {
++				DeviceCode              string `json:"device_code"`
++				ExpiresIn               int    `json:"expires_in"`
++				Interval                int    `json:"interval"`
++				UserCode                string `json:"user_code"`
++				VerificationURI         string `json:"verification_uri"`
++				VerificationURIComplete string `json:"verification_uri_complete"`
++			}
++			require.NoError(t, json.Unmarshal(got, &response))
++			assert.NotEmpty(t, response.DeviceCode)
++			assert.Equal(t, 300, response.ExpiresIn)
++			assert.Equal(t, 5, response.Interval)
++			assert.NotEmpty(t, response.UserCode)
++			assert.Equal(t, "https://localhost:9998/device", response.VerificationURI)
++			assert.Equal(t, response.VerificationURI+"?user_code="+response.UserCode, response.VerificationURIComplete)
+ 		})
+ 	}
++	t.Run("client without device grant type is rejected", func(t *testing.T) {
++		storage.RegisterClients(storage.WebClient("web", "secret"))
++		provider := newDeviceTestProvider(testConfig)
++		for _, clientID := range []string{"web", "foobar"} {
++			t.Run(clientID, func(t *testing.T) {
++				req := &oidc.DeviceAuthorizationRequest{
++					Scopes:   []string{"foo", "bar"},
++					ClientID: clientID,
++				}
++				values := make(url.Values)
++				provider.Encoder().Encode(req, values)
++				body := strings.NewReader(values.Encode())
++
++				r := httptest.NewRequest(http.MethodPost, "/", body)
++				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++				r.SetBasicAuth(clientID, "secret")
++				r = r.WithContext(op.ContextWithIssuer(r.Context(), testIssuer))
++
++				w := httptest.NewRecorder()
++				op.DeviceAuthorizationHandler(provider)(w, r)
++
++				result := w.Result()
++				assert.GreaterOrEqual(t, result.StatusCode, http.StatusBadRequest)
++
++				got, err := io.ReadAll(result.Body)
++				require.NoError(t, err)
++				var response map[string]any
++				require.NoError(t, json.Unmarshal(got, &response))
++				assert.NotContains(t, response, "device_code")
++			})
++		}
++	})
+ }
+ 
+ func TestParseDeviceCodeRequest(t *testing.T) {
++	storage.RegisterClients(storage.WebClient("device", "secret"))
++	provider := newDeviceTestProvider(testConfig)
+ 	tests := []struct {
+ 		name    string
+ 		req     *oidc.DeviceAuthorizationRequest
+@@ -91,7 +180,7 @@ func TestParseDeviceCodeRequest(t *testing.T) {
+ 			name: "success",
+ 			req: &oidc.DeviceAuthorizationRequest{
+ 				Scopes:   oidc.SpaceDelimitedArray{"foo", "bar"},
+-				ClientID: "web",
++				ClientID: "device",
+ 			},
+ 		},
+ 	}
+@@ -107,12 +196,12 @@ func TestParseDeviceCodeRequest(t *testing.T) {
+ 			r := httptest.NewRequest(http.MethodPost, "/", body)
+ 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+ 
+-			got, err := op.ParseDeviceCodeRequest(r, testProvider)
++			got, err := op.ParseDeviceCodeRequest(r, provider)
+ 			if tt.wantErr {
+ 				require.Error(t, err)
+-			} else {
+-				require.NoError(t, err)
++				return
+ 			}
++			require.NoError(t, err)
+ 			assert.Equal(t, tt.req, got)
+ 		})
+ 	}

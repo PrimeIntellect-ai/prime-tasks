@@ -1,0 +1,287 @@
+diff --git a/crates/base_db/src/input.rs b/crates/base_db/src/input.rs
+index 9567bcc424..cda5e57dc7 100644
+--- a/crates/base_db/src/input.rs
++++ b/crates/base_db/src/input.rs
+@@ -6,12 +6,12 @@
+ //! actual IO. See `vfs` and `project_model` in the `rust-analyzer` crate for how
+ //! actual IO is done and lowered to input.
+ 
+-use std::{fmt, iter::FromIterator, ops, panic::RefUnwindSafe, str::FromStr, sync::Arc};
++use std::{fmt, iter::FromIterator, ops, str::FromStr, sync::Arc};
+ 
+ use cfg::CfgOptions;
+ use rustc_hash::{FxHashMap, FxHashSet};
+ use syntax::SmolStr;
+-use tt::{ExpansionError, Subtree};
++use tt::TokenExpander;
+ use vfs::{file_set::FileSet, FileId, VfsPath};
+ 
+ /// Files are grouped into source roots. A source root is a directory on the
+@@ -150,20 +150,11 @@ pub enum ProcMacroKind {
+     Attr,
+ }
+ 
+-pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe {
+-    fn expand(
+-        &self,
+-        subtree: &Subtree,
+-        attrs: Option<&Subtree>,
+-        env: &Env,
+-    ) -> Result<Subtree, ExpansionError>;
+-}
+-
+ #[derive(Debug, Clone)]
+ pub struct ProcMacro {
+     pub name: SmolStr,
+     pub kind: ProcMacroKind,
+-    pub expander: Arc<dyn ProcMacroExpander>,
++    pub expander: Arc<dyn TokenExpander>,
+ }
+ 
+ impl Eq for ProcMacro {}
+@@ -422,10 +413,6 @@ impl Env {
+     pub fn get(&self, env: &str) -> Option<String> {
+         self.entries.get(env).cloned()
+     }
+-
+-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+-        self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+-    }
+ }
+ 
+ #[derive(Debug)]
+diff --git a/crates/base_db/src/lib.rs b/crates/base_db/src/lib.rs
+index 5f77a0b1f0..595f28adae 100644
+--- a/crates/base_db/src/lib.rs
++++ b/crates/base_db/src/lib.rs
+@@ -14,7 +14,7 @@ pub use crate::{
+     change::Change,
+     input::{
+         CrateData, CrateDisplayName, CrateGraph, CrateId, CrateName, Dependency, Edition, Env,
+-        ProcMacro, ProcMacroExpander, ProcMacroId, ProcMacroKind, SourceRoot, SourceRootId,
++        ProcMacro, ProcMacroId, ProcMacroKind, SourceRoot, SourceRootId,
+     },
+ };
+ pub use salsa;
+diff --git a/crates/hir_expand/src/db.rs b/crates/hir_expand/src/db.rs
+index 06f0a3ed9c..077de37270 100644
+--- a/crates/hir_expand/src/db.rs
++++ b/crates/hir_expand/src/db.rs
+@@ -271,7 +271,7 @@ fn expand_proc_macro(
+         _ => unreachable!(),
+     };
+ 
+-    expander.expand(db, loc.krate, &macro_arg.0)
++    expander.expand(db, lazy_id, &macro_arg.0)
+ }
+ 
+ fn parse_or_expand(db: &dyn AstDatabase, file_id: HirFileId) -> Option<SyntaxNode> {
+diff --git a/crates/hir_expand/src/proc_macro.rs b/crates/hir_expand/src/proc_macro.rs
+index 7c77f6ce0a..38882d2b68 100644
+--- a/crates/hir_expand/src/proc_macro.rs
++++ b/crates/hir_expand/src/proc_macro.rs
+@@ -1,6 +1,6 @@
+ //! Proc Macro Expander stub
+ 
+-use crate::db::AstDatabase;
++use crate::{db::AstDatabase, LazyMacroId};
+ use base_db::{CrateId, ProcMacroId};
+ use tt::buffer::{Cursor, TokenBuffer};
+ 
+@@ -32,7 +32,7 @@ impl ProcMacroExpander {
+     pub fn expand(
+         self,
+         db: &dyn AstDatabase,
+-        calling_crate: CrateId,
++        _id: LazyMacroId,
+         tt: &tt::Subtree,
+     ) -> Result<tt::Subtree, mbe::ExpandError> {
+         match self.proc_macro_id {
+@@ -47,10 +47,7 @@ impl ProcMacroExpander {
+                 let tt = remove_derive_attrs(tt)
+                     .ok_or_else(|| err!("Fail to remove derive for custom derive"))?;
+ 
+-                // Proc macros have access to the environment variables of the invoking crate.
+-                let env = &krate_graph[calling_crate].env;
+-
+-                proc_macro.expander.expand(&tt, None, &env).map_err(mbe::ExpandError::from)
++                proc_macro.expander.expand(&tt, None).map_err(mbe::ExpandError::from)
+             }
+             None => Err(mbe::ExpandError::UnresolvedProcMacro),
+         }
+diff --git a/crates/mbe/src/mbe_expander/matcher.rs b/crates/mbe/src/mbe_expander/matcher.rs
+index 7aeef7be5c..44722c0f1a 100644
+--- a/crates/mbe/src/mbe_expander/matcher.rs
++++ b/crates/mbe/src/mbe_expander/matcher.rs
+@@ -240,26 +240,26 @@ impl<'a> TtIter<'a> {
+                 let tt3 = self.next().unwrap().clone();
+                 Ok(tt::Subtree { delimiter: None, token_trees: vec![tt, tt2, tt3] }.into())
+             }
+-            ('-', '=', None)
+-            | ('-', '>', None)
+-            | (':', ':', None)
+-            | ('!', '=', None)
+-            | ('.', '.', None)
+-            | ('*', '=', None)
+-            | ('/', '=', None)
+-            | ('&', '&', None)
+-            | ('&', '=', None)
+-            | ('%', '=', None)
+-            | ('^', '=', None)
+-            | ('+', '=', None)
+-            | ('<', '<', None)
+-            | ('<', '=', None)
+-            | ('=', '=', None)
+-            | ('=', '>', None)
+-            | ('>', '=', None)
+-            | ('>', '>', None)
+-            | ('|', '=', None)
+-            | ('|', '|', None) => {
++            ('-', '=', _)
++            | ('-', '>', _)
++            | (':', ':', _)
++            | ('!', '=', _)
++            | ('.', '.', _)
++            | ('*', '=', _)
++            | ('/', '=', _)
++            | ('&', '&', _)
++            | ('&', '=', _)
++            | ('%', '=', _)
++            | ('^', '=', _)
++            | ('+', '=', _)
++            | ('<', '<', _)
++            | ('<', '=', _)
++            | ('=', '=', _)
++            | ('=', '>', _)
++            | ('>', '=', _)
++            | ('>', '>', _)
++            | ('|', '=', _)
++            | ('|', '|', _) => {
+                 let tt2 = self.next().unwrap().clone();
+                 Ok(tt::Subtree { delimiter: None, token_trees: vec![tt, tt2] }.into())
+             }
+diff --git a/crates/proc_macro_api/src/lib.rs b/crates/proc_macro_api/src/lib.rs
+index 2ea456fb09..0d061fd536 100644
+--- a/crates/proc_macro_api/src/lib.rs
++++ b/crates/proc_macro_api/src/lib.rs
+@@ -16,7 +16,7 @@ use std::{
+     sync::Arc,
+ };
+ 
+-use base_db::{Env, ProcMacro};
++use base_db::ProcMacro;
+ use tt::{SmolStr, Subtree};
+ 
+ use crate::process::{ProcMacroProcessSrv, ProcMacroProcessThread};
+@@ -39,19 +39,17 @@ impl PartialEq for ProcMacroProcessExpander {
+     }
+ }
+ 
+-impl base_db::ProcMacroExpander for ProcMacroProcessExpander {
++impl tt::TokenExpander for ProcMacroProcessExpander {
+     fn expand(
+         &self,
+         subtree: &Subtree,
+         attr: Option<&Subtree>,
+-        env: &Env,
+     ) -> Result<Subtree, tt::ExpansionError> {
+         let task = ExpansionTask {
+             macro_body: subtree.clone(),
+             macro_name: self.name.to_string(),
+             attributes: attr.cloned(),
+             lib: self.dylib_path.to_path_buf(),
+-            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+         };
+ 
+         let result: ExpansionResult = self.process.send_task(msg::Request::ExpansionMacro(task))?;
+@@ -92,7 +90,7 @@ impl ProcMacroClient {
+                     ProcMacroKind::FuncLike => base_db::ProcMacroKind::FuncLike,
+                     ProcMacroKind::Attr => base_db::ProcMacroKind::Attr,
+                 };
+-                let expander = Arc::new(ProcMacroProcessExpander {
++                let expander: Arc<dyn tt::TokenExpander> = Arc::new(ProcMacroProcessExpander {
+                     process: self.process.clone(),
+                     name: name.clone(),
+                     dylib_path: dylib_path.into(),
+diff --git a/crates/proc_macro_api/src/rpc.rs b/crates/proc_macro_api/src/rpc.rs
+index cf830b59f1..b85f92eead 100644
+--- a/crates/proc_macro_api/src/rpc.rs
++++ b/crates/proc_macro_api/src/rpc.rs
+@@ -51,9 +51,6 @@ pub struct ExpansionTask {
+     pub attributes: Option<Subtree>,
+ 
+     pub lib: PathBuf,
+-
+-    /// Environment variables to set during macro expansion.
+-    pub env: Vec<(String, String)>,
+ }
+ 
+ #[derive(Clone, Eq, PartialEq, Debug, Default, Serialize, Deserialize)]
+@@ -254,7 +251,6 @@ mod tests {
+             macro_name: Default::default(),
+             attributes: None,
+             lib: Default::default(),
+-            env: Default::default(),
+         };
+ 
+         let json = serde_json::to_string(&task).unwrap();
+diff --git a/crates/proc_macro_srv/src/lib.rs b/crates/proc_macro_srv/src/lib.rs
+index d4f04ee069..9cca969944 100644
+--- a/crates/proc_macro_srv/src/lib.rs
++++ b/crates/proc_macro_srv/src/lib.rs
+@@ -24,7 +24,7 @@ use proc_macro::bridge::client::TokenStream;
+ use proc_macro_api::{ExpansionResult, ExpansionTask, ListMacrosResult, ListMacrosTask};
+ use std::{
+     collections::{hash_map::Entry, HashMap},
+-    env, fs,
++    fs,
+     path::{Path, PathBuf},
+     time::SystemTime,
+ };
+@@ -37,23 +37,7 @@ pub(crate) struct ProcMacroSrv {
+ impl ProcMacroSrv {
+     pub fn expand(&mut self, task: &ExpansionTask) -> Result<ExpansionResult, String> {
+         let expander = self.expander(&task.lib)?;
+-
+-        let mut prev_env = HashMap::new();
+-        for (k, v) in &task.env {
+-            prev_env.insert(k.as_str(), env::var_os(k));
+-            env::set_var(k, v);
+-        }
+-
+-        let result = expander.expand(&task.macro_name, &task.macro_body, task.attributes.as_ref());
+-
+-        for (k, _) in &task.env {
+-            match &prev_env[k.as_str()] {
+-                Some(v) => env::set_var(k, v),
+-                None => env::remove_var(k),
+-            }
+-        }
+-
+-        match result {
++        match expander.expand(&task.macro_name, &task.macro_body, task.attributes.as_ref()) {
+             Ok(expansion) => Ok(ExpansionResult { expansion }),
+             Err(msg) => {
+                 let msg = msg.as_str().unwrap_or("<unknown error>");
+diff --git a/crates/tt/src/lib.rs b/crates/tt/src/lib.rs
+index 8301dc28a0..6c1bf8d092 100644
+--- a/crates/tt/src/lib.rs
++++ b/crates/tt/src/lib.rs
+@@ -1,7 +1,7 @@
+ //! `tt` crate defines a `TokenTree` data structure: this is the interface (both
+ //! input and output) of macros. It closely mirrors `proc_macro` crate's
+ //! `TokenTree`.
+-use std::fmt;
++use std::{fmt, panic::RefUnwindSafe};
+ 
+ use stdx::impl_from;
+ 
+@@ -247,3 +247,8 @@ impl fmt::Display for ExpansionError {
+         }
+     }
+ }
++
++pub trait TokenExpander: fmt::Debug + Send + Sync + RefUnwindSafe {
++    fn expand(&self, subtree: &Subtree, attrs: Option<&Subtree>)
++        -> Result<Subtree, ExpansionError>;
++}

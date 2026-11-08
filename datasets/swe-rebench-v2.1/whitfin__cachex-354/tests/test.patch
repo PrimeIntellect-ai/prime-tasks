@@ -1,0 +1,195 @@
+diff --git a/test/cachex/actions/stream_test.exs b/test/cachex/actions/stream_test.exs
+index 8da28f8..0bab357 100644
+--- a/test/cachex/actions/stream_test.exs
++++ b/test/cachex/actions/stream_test.exs
+@@ -41,8 +41,8 @@ defmodule Cachex.Actions.StreamTest do
+     {:ok, true} = Cachex.put(cache, "key3", "value3")
+ 
+     # create two test queries
+-    query1 = Cachex.Query.create(true, {:key, :value})
+-    query2 = Cachex.Query.create(true, :key)
++    query1 = Cachex.Query.raw(true, {:key, :value})
++    query2 = Cachex.Query.raw(true, :key)
+ 
+     # create cache streams
+     {:ok, stream1} = Cachex.stream(cache, query1)
+@@ -88,4 +88,53 @@ defmodule Cachex.Actions.StreamTest do
+     # we shouldn't be able to stream a cache on multiple nodes
+     assert(Cachex.stream(cache) == {:error, :non_distributed})
+   end
++  # This test ensures that cache eviction does not depend on the current working
++  # directory being writable. The LRW policy must be able to evict entries even
++  # when the working directory is unavailable (for example, when it has been
++  # removed), rather than silently failing to enforce the cache bounds.
++  test "evicting when the current working directory is not writable" do
++    # define our cache limit
++    limit =
++      limit(
++        size: 1000,
++        policy: Cachex.Policy.LRW,
++        reclaim: 0.75,
++        options: [batch_size: 25, immediate: true]
++      )
++
++    # create a cache with a max size
++    cache = Helper.create_cache(limit: limit)
++
++    # use large keys so that the eviction has to consider a sizeable amount of
++    # data, which is what forces the unfixed implementation to spill to disk
++    key = fn x -> String.duplicate("k", 1000) <> Integer.to_string(x) end
++
++    # fill the cache up to the limit
++    for x <- 1..1000 do
++      {:ok, true} = Cachex.put(cache, key.(x), x)
++    end
++
++    # verify the cache is at the limit
++    assert(Cachex.size!(cache) == 1000)
++
++    # make the current working directory unavailable by removing it
++    original = File.cwd!()
++    dir = Path.join(System.tmp_dir!(), "cachex_evict_#{:erlang.unique_integer([:positive])}")
++    File.mkdir_p!(dir)
++
++    try do
++      File.cd!(dir)
++      File.rm_rf!(dir)
++
++      # add a new key to trigger evictions
++      {:ok, true} = Cachex.put(cache, key.(1001), 1001)
++
++      # verify eviction actually removes entries instead of silently failing
++      Helper.poll(2000, true, fn ->
++        Cachex.size!(cache) < 1000
++      end)
++    after
++      File.cd!(original)
++    end
++  end
+ end
+diff --git a/test/cachex/query_test.exs b/test/cachex/query_test.exs
+index 5ae2fde..c947fcf 100644
+--- a/test/cachex/query_test.exs
++++ b/test/cachex/query_test.exs
+@@ -1,77 +1,34 @@
+ defmodule Cachex.QueryTest do
+   use CachexCase
+ 
+-  # All queries are run through the basic query generation, so this test
+-  # will just validate the passing of query clauses through to the query
+-  # creation default, which will attach the checks for expirations.
+-  test "creating basic queries" do
+-    # create a query with a true filter
+-    query1 = Cachex.Query.create(true)
+-    query2 = Cachex.Query.create(true, :key)
+-
+-    # verify the mapping of both queries
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query1
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query2
+-
+-    # unpack clauses of both queries
+-    [{_, [{:andalso, c1, true}], _}] = query1
+-    [{_, [{:andalso, c2, true}], _}] = query2
+-
+-    # verify the queries of both queries
+-    assert {:orelse, {:==, :"$3", nil}, {:>, {:+, :"$2", :"$3"}, _now}} = c1
+-    assert {:orelse, {:==, :"$3", nil}, {:>, {:+, :"$2", :"$3"}, _now}} = c2
+-
+-    # verify the returns of both queries
+-    assert [{_, _, [:"$_"]}] = query1
+-    assert [{_, _, [:"$1"]}] = query2
+-  end
+-
+-  # The `expired()` function is just a wrapper to `create` whilst inverting
++  # The `expired()` function returns records whose expiration has passed,
+   # the expiration checks. This test just covers this behaviour.
+   test "creating expired queries" do
+     # create a couple of expired queries
+     query1 = Cachex.Query.expired()
+     query2 = Cachex.Query.expired(:key)
+ 
+-    # verify the mapping of both queries
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query1
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query2
+-
+-    # unpack clauses of both queries
+-    [{_, [{:not, c1}], _}] = query1
+-    [{_, [{:not, c2}], _}] = query2
++    # build a table containing an unexpired and an expired entry
++    table = query_table()
+ 
+-    # verify the queries of both queries
+-    assert {:orelse, {:==, :"$3", nil}, {:>, {:+, :"$2", :"$3"}, _now}} = c1
+-    assert {:orelse, {:==, :"$3", nil}, {:>, {:+, :"$2", :"$3"}, _now}} = c2
+-
+-    # verify the returns of both queries
+-    assert [{_, _, [:"$_"]}] = query1
+-    assert [{_, _, [:"$1"]}] = query2
++    # only the expired entry should be returned
++    assert [{:entry, "expired", _, _, _}] = :ets.select(table, query1)
++    assert ["expired"] = :ets.select(table, query2)
+   end
+ 
+-  # The `unexpired()` function is just a wrapper to `create` whilst without a
++  # The `unexpired()` function returns records that have not expired,
+   # secondary clause. This test just covers this behaviour.
+   test "creating unexpired queries" do
+     # create a couple of unexpired queries
+     query1 = Cachex.Query.unexpired()
+     query2 = Cachex.Query.unexpired(:key)
+ 
+-    # verify the mapping of both queries
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query1
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query2
+-
+-    # unpack clauses of both queries
+-    [{_, [c1], _}] = query1
+-    [{_, [c2], _}] = query2
++    # build a table containing an unexpired and an expired entry
++    table = query_table()
+ 
+-    # verify the queries of both queries
+-    assert {:orelse, {:==, :"$3", nil}, {:>, {:+, :"$2", :"$3"}, _now}} = c1
+-    assert {:orelse, {:==, :"$3", nil}, {:>, {:+, :"$2", :"$3"}, _now}} = c2
+-
+-    # verify the returns of both queries
+-    assert [{_, _, [:"$_"]}] = query1
+-    assert [{_, _, [:"$1"]}] = query2
++    # only the unexpired entry should be returned
++    assert [{:entry, "unexpired", _, _, _}] = :ets.select(table, query1)
++    assert ["unexpired"] = :ets.select(table, query2)
+   end
+ 
+   # This test just covers the default value checking when creating raw
+@@ -82,14 +39,23 @@ defmodule Cachex.QueryTest do
+     query1 = Cachex.Query.raw(true)
+     query2 = Cachex.Query.raw(true, :key)
+ 
+-    # verify the form of the first query
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query1
+-    assert [{_, [true], _}] = query1
+-    assert [{_, _, [:"$_"]}] = query1
++    # build a table containing an unexpired and an expired entry
++    table = query_table()
++
++    # raw queries should not filter anything out
++    assert length(:ets.select(table, query1)) == 2
++    assert Enum.sort(:ets.select(table, query2)) == ["expired", "unexpired"]
++  end
++
++  # Builds a table containing a single unexpired entry and a single expired
++  # entry, so that the expiration filtering of a query can be observed.
++  defp query_table do
++    table = :ets.new(:query_test, [:set, :private, keypos: 2])
++    now = :os.system_time(:millisecond)
++
++    :ets.insert(table, {:entry, "unexpired", now, nil, "value1"})
++    :ets.insert(table, {:entry, "expired", now - 10_000, 50, "value2"})
+ 
+-    # verify the form of the second query
+-    assert [{{:_, :"$1", :"$2", :"$3", :"$4"}, _, _}] = query2
+-    assert [{_, [true], _}] = query2
+-    assert [{_, _, [:"$1"]}] = query2
++    table
+   end
+ end

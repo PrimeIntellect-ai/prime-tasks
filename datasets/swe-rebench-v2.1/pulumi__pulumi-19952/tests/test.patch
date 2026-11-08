@@ -1,0 +1,127 @@
+diff --git a/pkg/engine/lifecycletest/views_test.go b/pkg/engine/lifecycletest/views_test.go
+index d7010985f..a88a64432 100644
+--- a/pkg/engine/lifecycletest/views_test.go
++++ b/pkg/engine/lifecycletest/views_test.go
+@@ -2395,3 +2395,122 @@ func TestViewsRefreshDriftDeleteCreate_RefreshProgram(t *testing.T) {
+ 		"result": resource.NewProperty("baz"),
+ 	}, snap.Resources[2].Outputs)
+ }
++
++// TestViewsDestroyPreviewSynthesizesChildViewDeletes ensures delete steps for child views appear in a destroy preview.
++func TestViewsDestroyPreviewSynthesizesChildViewDeletes(t *testing.T) {
++	t.Parallel()
++
++	loaders := []*deploytest.ProviderLoader{
++		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
++			return &deploytest.Provider{
++				CreateF: func(_ context.Context, req plugin.CreateRequest) (plugin.CreateResponse, error) {
++					rs, err := deploytest.NewResourceStatus(req.ResourceStatusAddress)
++					require.NoError(t, err)
++					defer rs.Close()
++
++					viewSteps := make([]deploytest.ViewStep, 0, 2)
++					for _, suffix := range []string{"child1", "child2"} {
++						viewSteps = append(viewSteps, deploytest.ViewStep{
++							Op: apitype.OpCreate, Status: resource.StatusOK,
++							New: &deploytest.ViewStepState{
++								Type:    tokens.Type("pkgA:m:typAView"),
++								Name:    req.URN.Name() + "-" + suffix,
++								Inputs:  resource.PropertyMap{"input": req.Properties["foo"]},
++								Outputs: resource.PropertyMap{"result": req.Properties["foo"]},
++							},
++						})
++					}
++					err = rs.PublishViewSteps(req.ResourceStatusToken, viewSteps)
++					require.NoError(t, err)
++					return plugin.CreateResponse{
++						ID: "new-id", Properties: req.Properties, Status: resource.StatusOK,
++						RefreshBeforeUpdate: req.URN.Name() == "resA",
++					}, nil
++				},
++				ReadF: func(_ context.Context, req plugin.ReadRequest) (plugin.ReadResponse, error) {
++					rs, err := deploytest.NewResourceStatus(req.ResourceStatusAddress)
++					require.NoError(t, err)
++					defer rs.Close()
++
++					viewSteps := make([]deploytest.ViewStep, 0, len(req.OldViews))
++					for _, view := range req.OldViews {
++						oldView := &deploytest.ViewStepState{
++							Type: view.Type, Name: view.Name, Inputs: view.Inputs, Outputs: view.Outputs,
++						}
++						newView := &deploytest.ViewStepState{
++							Type: view.Type, Name: view.Name, Inputs: view.Inputs, Outputs: view.Outputs,
++						}
++						viewSteps = append(viewSteps, deploytest.ViewStep{
++							Op: apitype.OpSame, Status: resource.StatusOK, Old: oldView, New: newView,
++						})
++					}
++					err = rs.PublishViewSteps(req.ResourceStatusToken, viewSteps)
++					require.NoError(t, err)
++					return plugin.ReadResponse{
++						ReadResult: plugin.ReadResult{
++							ID: req.ID, Inputs: req.Inputs, Outputs: req.State,
++							RefreshBeforeUpdate: req.URN.Name() == "resA",
++						},
++						Status: resource.StatusOK,
++					}, nil
++				},
++			}, nil
++		}, deploytest.WithoutGrpc),
++	}
++
++	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
++		for _, name := range []string{"resA", "resB"} {
++			_, err := monitor.RegisterResource("pkgA:m:typA", name, true, deploytest.ResourceOptions{
++				Inputs: resource.PropertyMap{"foo": resource.NewProperty("bar")},
++			})
++			if err != nil {
++				return err
++			}
++		}
++		return nil
++	})
++	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
++	p := &lt.TestPlan{Options: lt.TestUpdateOptions{T: t, HostF: hostF, SkipDisplayTests: true}}
++	project := p.GetProject()
++
++	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil, "0")
++	require.NoError(t, err)
++	require.NotNil(t, snap)
++	views := map[string]*resource.State{}
++	for _, state := range snap.Resources {
++		if state.ViewOf != "" {
++			views[state.URN.Name()] = state
++		}
++	}
++	expectedViews := map[string]bool{
++		"resA-child1": true, "resA-child2": true, "resB-child1": true, "resB-child2": true,
++	}
++	require.Len(t, views, len(expectedViews))
++	for name := range expectedViews {
++		view := views[name]
++		require.NotNil(t, view)
++	}
++
++	_, err = lt.TestOp(Destroy).RunStep(project, p.GetTarget(t, snap), p.Options, true, p.BackendClient,
++		func(_ workspace.Project, _ deploy.Target, _ JournalEntries, events []Event, _ error) error {
++			viewDeletes := map[string]bool{}
++			ownerRefreshFound := false
++			for _, e := range events {
++				//nolint:exhaustive // We intentionally do not handle all event types here.
++				switch e.Type {
++				case ResourcePreEvent:
++					payload := e.Payload().(ResourcePreEventPayload)
++					if payload.Metadata.Op == deploy.OpDelete && payload.Metadata.URN.Type() == tokens.Type("pkgA:m:typAView") {
++						viewDeletes[payload.Metadata.URN.Name()] = true
++					}
++					if payload.Metadata.Op == deploy.OpRefresh && payload.Metadata.URN.Name() == "resA" {
++						ownerRefreshFound = true
++					}
++				}
++			}
++			assert.Equal(t, expectedViews, viewDeletes)
++			assert.True(t, ownerRefreshFound, "refreshing owner has a refresh event")
++			return nil
++		}, "1")
++	require.NoError(t, err)
++}

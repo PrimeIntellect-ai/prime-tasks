@@ -1,0 +1,388 @@
+diff --git a/docs/built_in_transformers/standard_transformers/replace.md b/docs/built_in_transformers/standard_transformers/replace.md
+index f4579e6..2bf7dad 100644
+--- a/docs/built_in_transformers/standard_transformers/replace.md
++++ b/docs/built_in_transformers/standard_transformers/replace.md
+@@ -5,10 +5,21 @@ Replace an original value by the provided one.
+ | Name      | Description                                                                                                                    | Default | Required | Supported DB types |
+ |-----------|--------------------------------------------------------------------------------------------------------------------------------|---------|----------|--------------------|
+ | column    | The name of the column to be affected                                                                            |         | Yes      | any                |
+-| replace   | The value to replace                                                                                                           |         | Yes      | -                  |
++| value     | The value to replace                                                                                                           |         | Yes      | -                  |
+ | keep_null | Indicates whether NULL values should be replaced with transformed values or not                                                   | `true`  | No       | -                  |
+ | validate  | Performs a decoding procedure via the PostgreSQL driver using the column type to ensure that values have correct type | `true`  | No       | -                  |
+ 
++## Dynamic parameters
++
++| Parameter | Supported types |
++|-----------|-----------------|
++| value     | any             |
++
++!!! warning 
++
++    The `validate` parameter in dynamic mode validates each dynamic value by decoding it value via the PostgreSQL 
++    driver. In case there is type format violation the dump command will be terminated with an error message.
++
+ ## Description
+ 
+ The `Replace` transformer replace an original value from the specified column with the provided one. It can optionally run a validation check with the `validate` parameter to ensure that the values are of a correct type before starting transformation. The behaviour for NULL values can be configured using the `keep_null` parameter.
+@@ -37,3 +48,54 @@ remain `NULL`.
+ |-------------|-------------------------|-------------|
+ | jobtitle    | Chief Executive Officer | programmer  |
+ ```
++
++## Example: Set the same value from another column
++
++In this example, the `jobdescription` column value will be set the same as for the `jobtitle` column.  
++ 
++
++
++Create schema and insert data:
++```sql
++CREATE TABLE employee (
++    jobtitle varchar(50),
++    jobdescription varchar(50)
++);
++
++INSERT INTO employee (jobtitle, jobdescription) VALUES
++('CEO', 'Chief Executive Officer');
++```
++
++```yaml title="Replace transformer example"
++- schema: "public"
++  name: "employee"
++  transformers:
++    - name: "RandomChoice"
++      params:
++        column: "jobtitle"
++        values:
++          - "Programmer"
++          - "Analyst"
++          - "Manager"
++
++    - name: "Replace"
++      params:
++        column: "jobdescription"
++        validate: true
++      dynamic_params:
++        value:
++          column: "jobtitle"
++```
++
++Result:
++
++```Text
++        "public"."employee"
+++-----------+----------------+-------------------------+------------------+
++| %LineNum% | Column         | OriginalValue           | TransformedValue |
+++-----------+----------------+-------------------------+------------------+
++| 0         | jobtitle       | Chief Executive Officer | Manager          |
+++           +----------------+-------------------------+------------------+
++|           | jobdescription | Chief Executive Officer | Manager          |
+++-----------+----------------+-------------------------+------------------+
++```
+diff --git a/internal/db/postgres/transformers/random_date.go b/internal/db/postgres/transformers/random_date.go
+index 9329bf8..ddc496b 100644
+--- a/internal/db/postgres/transformers/random_date.go
++++ b/internal/db/postgres/transformers/random_date.go
+@@ -54,19 +54,16 @@ var timestampTransformerDefinition = utils.NewTransformerDefinition(
+ 		"min",
+ 		"min threshold date (and/or time) of value",
+ 	).SetRequired(true).
+-		SetSupportTemplate(true).
+ 		SetLinkParameter("column").
+ 		SetSupportTemplate(true).
+ 		SetDynamicMode(
+-			toolkit.NewDynamicModeProperties().
+-				SetCompatibleTypes("date", "timestamp", "timestamptz"),
++			toolkit.NewDynamicModeProperties(),
+ 		),
+ 
+ 	toolkit.MustNewParameterDefinition(
+ 		"max",
+ 		"max threshold date (and/or time) of value",
+ 	).SetRequired(true).
+-		SetSupportTemplate(true).
+ 		SetLinkParameter("column").
+ 		SetSupportTemplate(true).
+ 		SetDynamicMode(
+diff --git a/internal/db/postgres/transformers/replace.go b/internal/db/postgres/transformers/replace.go
+index 4d03add..0955837 100644
+--- a/internal/db/postgres/transformers/replace.go
++++ b/internal/db/postgres/transformers/replace.go
+@@ -37,14 +37,19 @@ var ReplaceTransformerDefinition = utils.NewTransformerDefinition(
+ 		"column",
+ 		"column name",
+ 	).SetIsColumn(toolkit.NewColumnProperties().
+-		SetAffected(true),
++		SetAffected(true).
++		SetNullable(true),
+ 	).SetRequired(true),
+ 
+ 	toolkit.MustNewParameterDefinition(
+ 		"value",
+ 		"value to replace",
+ 	).SetRequired(true).
+-		SetLinkParameter("column"),
++		SetSupportTemplate(true).
++		SetLinkParameter("column").
++		SetDynamicMode(
++			toolkit.NewDynamicModeProperties(),
++		),
+ 
+ 	toolkit.MustNewParameterDefinition(
+ 		"keep_null",
+@@ -57,13 +62,26 @@ var ReplaceTransformerDefinition = utils.NewTransformerDefinition(
+ 	).SetDefaultValue(toolkit.ParamsValue("true")),
+ )
+ 
++type transformFn func(ctx context.Context, r *toolkit.Record) (*toolkit.Record, error)
++
+ type ReplaceTransformer struct {
+-	columnName      string
+-	columnIdx       int
+-	keepNull        bool
+-	value           any
+-	rawValue        *toolkit.RawValue
+-	affectedColumns map[int]string
++	columnName          string
++	columnIdx           int
++	keepNull            bool
++	rawValue            *toolkit.RawValue
++	affectedColumns     map[int]string
++	validate            bool
++	columnOIDToValidate uint32
++
++	columnParam   toolkit.Parameterizer
++	valueParam    toolkit.Parameterizer
++	validateParam toolkit.Parameterizer
++	keepNullParam toolkit.Parameterizer
++
++	// transform function to be used for transforming the record.
++	//
++	// Depending on the value parameter type, it can be either static or dynamic.
++	transform transformFn
+ }
+ 
+ func NewReplaceTransformer(ctx context.Context, driver *toolkit.Driver, parameters map[string]toolkit.Parameterizer) (utils.Transformer, toolkit.ValidationWarnings, error) {
+@@ -71,8 +89,8 @@ func NewReplaceTransformer(ctx context.Context, driver *toolkit.Driver, paramete
+ 	var columnName string
+ 	var keepNull, validate bool
+ 
+-	p := parameters["column"]
+-	if err := p.Scan(&columnName); err != nil {
++	columnParam := parameters["column"]
++	if err := columnParam.Scan(&columnName); err != nil {
+ 		return nil, nil, fmt.Errorf(`unable to scan "column" param: %w`, err)
+ 	}
+ 
+@@ -83,44 +101,67 @@ func NewReplaceTransformer(ctx context.Context, driver *toolkit.Driver, paramete
+ 	affectedColumns := make(map[int]string)
+ 	affectedColumns[idx] = columnName
+ 
+-	p = parameters["validate"]
+-	if err := p.Scan(&validate); err != nil {
++	validateParam := parameters["validate"]
++	if err := validateParam.Scan(&validate); err != nil {
+ 		return nil, nil, fmt.Errorf(`unable to scan "validate" param: %w`, err)
+ 	}
+ 
+-	p = parameters["value"]
+-	value, err := p.RawValue()
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("error getting raw value from parameter \"%s\": %w", p.GetDefinition().Name, err)
+-	}
+-	if validate {
+-		_, err := driver.DecodeValueByTypeOid(uint32(c.TypeOid), value)
++	valueParam := parameters["value"]
++
++	columnOIDToValidate := uint32(c.TypeOid)
++	var rawValue *toolkit.RawValue
++	if !valueParam.IsDynamic() {
++		// Get value from parameter
++		value, err := valueParam.RawValue()
+ 		if err != nil {
+-			return nil, toolkit.ValidationWarnings{
+-				toolkit.NewValidationWarning().
+-					SetSeverity(toolkit.ErrorValidationSeverity).
+-					SetMsg("error decoding \"value\" parameter from raw string to type").
+-					AddMeta("TypeName", c.TypeName).
+-					AddMeta("ParameterName", "value").
+-					AddMeta("ParameterValue", string(value)).
+-					AddMeta("Error", err.Error()),
+-			}, nil
++			return nil, nil, fmt.Errorf(
++				"error getting raw value from parameter \"%s\": %w",
++				valueParam.GetDefinition().Name, err,
++			)
+ 		}
++		// Validate the value if requested
++		if validate {
++			_, err = driver.DecodeValueByTypeOid(uint32(c.TypeOid), value)
++			if err != nil {
++				return nil, toolkit.ValidationWarnings{
++					toolkit.NewValidationWarning().
++						SetSeverity(toolkit.ErrorValidationSeverity).
++						SetMsg("error decoding \"value\" parameter from raw string to type").
++						AddMeta("TypeName", c.TypeName).
++						AddMeta("ParameterName", "value").
++						AddMeta("ParameterValue", string(value)).
++						AddMeta("Error", err.Error()),
++				}, nil
++			}
++		}
++		rawValue = toolkit.NewRawValue(value, false)
+ 	}
+ 
+-	p = parameters["keep_null"]
+-	if err := p.Scan(&keepNull); err != nil {
++	keepNullParam := parameters["keep_null"]
++	if err := keepNullParam.Scan(&keepNull); err != nil {
+ 		return nil, nil, fmt.Errorf(`unable to scan "keep_null" param: %w`, err)
+ 	}
++	t := &ReplaceTransformer{
++		columnName:          columnName,
++		keepNull:            keepNull,
++		affectedColumns:     affectedColumns,
++		rawValue:            rawValue,
++		columnIdx:           idx,
++		validate:            validate,
++		columnOIDToValidate: columnOIDToValidate,
++
++		columnParam:   columnParam,
++		validateParam: validateParam,
++		valueParam:    valueParam,
++		keepNullParam: keepNullParam,
++	}
+ 
+-	return &ReplaceTransformer{
+-		columnName:      columnName,
+-		keepNull:        keepNull,
+-		value:           value,
+-		affectedColumns: affectedColumns,
+-		rawValue:        toolkit.NewRawValue(value, false),
+-		columnIdx:       idx,
+-	}, nil, nil
++	// Set the transform function based on the value parameter type.
++	t.transform = t.transformStatic
++	if valueParam.IsDynamic() {
++		t.transform = t.transformDynamic
++	}
++	return t, nil, nil
+ }
+ 
+ func (rt *ReplaceTransformer) GetAffectedColumns() map[int]string {
+@@ -135,7 +176,70 @@ func (rt *ReplaceTransformer) Done(ctx context.Context) error {
+ 	return nil
+ }
+ 
+-func (rt *ReplaceTransformer) Transform(ctx context.Context, r *toolkit.Record) (*toolkit.Record, error) {
++func (rt *ReplaceTransformer) getValueToReplace(d *toolkit.Driver) (*toolkit.RawValue, error) {
++	if !rt.valueParam.IsDynamic() {
++		return rt.rawValue, nil
++	}
++
++	// Check if the current dynamic value is empty (is null).
++	isEmpty, err := rt.valueParam.IsEmpty()
++	if err != nil {
++		return nil, fmt.Errorf("check if value is empty: %w", err)
++	}
++	if isEmpty {
++		// if empty then create the toolkit.RawValue with null value
++		// Note: we allow null values, though for dynamic values this may cause
++		// 		 constraint violation due to unexpected null values that
++		//       was got from the dynamic parameter.
++		return toolkit.NewRawValue(nil, true), nil
++	}
++	// If not empty just get the raw value from the parameter
++	v, err := rt.valueParam.RawValue()
++	if err != nil {
++		return nil, fmt.Errorf(
++			"get raw value from parameter \"%s\": %w",
++			rt.valueParam.GetDefinition().Name, err,
++		)
++	}
++	// Validate the value if requested
++	if rt.validate {
++		_, err = d.DecodeValueByTypeOid(rt.columnOIDToValidate, v)
++		if err != nil {
++			return nil, fmt.Errorf("dynamic value validation error: %w", err)
++		}
++	}
++
++	return toolkit.NewRawValue(v, false), nil
++}
++
++func (rt *ReplaceTransformer) transformDynamic(
++	ctx context.Context,
++	r *toolkit.Record,
++) (*toolkit.Record, error) {
++	val, err := r.GetRawColumnValueByIdx(rt.columnIdx)
++	if err != nil {
++		return nil, fmt.Errorf("unable to scan value: %w", err)
++	}
++
++	if val.IsNull && rt.keepNull {
++		return r, nil
++	}
++
++	newValue, err := rt.getValueToReplace(r.Driver)
++	if err != nil {
++		return nil, fmt.Errorf("get value to replace: %w", err)
++	}
++
++	if err := r.SetRawColumnValueByIdx(rt.columnIdx, newValue); err != nil {
++		return nil, fmt.Errorf("unable to set new value: %w", err)
++	}
++	return r, nil
++}
++
++func (rt *ReplaceTransformer) transformStatic(
++	ctx context.Context,
++	r *toolkit.Record,
++) (*toolkit.Record, error) {
+ 	val, err := r.GetRawColumnValueByIdx(rt.columnIdx)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("unable to scan value: %w", err)
+@@ -150,6 +254,13 @@ func (rt *ReplaceTransformer) Transform(ctx context.Context, r *toolkit.Record)
+ 	return r, nil
+ }
+ 
++func (rt *ReplaceTransformer) Transform(
++	ctx context.Context,
++	r *toolkit.Record,
++) (*toolkit.Record, error) {
++	return rt.transform(ctx, r)
++}
++
+ func init() {
+ 	utils.DefaultTransformerRegistry.MustRegister(ReplaceTransformerDefinition)
+ }
+diff --git a/pkg/toolkit/parameter_definition.go b/pkg/toolkit/parameter_definition.go
+index a862e3d..83b97dc 100644
+--- a/pkg/toolkit/parameter_definition.go
++++ b/pkg/toolkit/parameter_definition.go
+@@ -31,13 +31,13 @@ func DefaultDatabaseTypeUnmarshaler(driver *Driver, typeName string, v ParamsVal
+ 
+ // ColumnProperties - column-like parameter properties that would help to understand the affection on the consistency
+ type ColumnProperties struct {
+-	// Nullable - shows that transformer can produce NULL value for the column. Togather with Affected shows that
++	// Nullable - shows that transformer can produce NULL value for the column. Together with Affected shows that
+ 	// this parameter may generate null values and write it in this column. It only plays with Affected
+ 	Nullable bool `mapstructure:"nullable" json:"nullable,omitempty"`
+ 	// Unique - shows that transformer guarantee that every transformer call the value will be unique. It only plays
+ 	// with Affected
+ 	Unique bool `mapstructure:"unique" json:"unique,omitempty"`
+-	// Unique - defines max length of the value. It only plays with Affected. Togather with Affected shows
++	// Unique - defines max length of the value. It only plays with Affected. Together with Affected shows
+ 	// that values will not exceed the length of the column. It only plays with Affected
+ 	MaxLength int `mapstructure:"max_length" json:"max_length,omitempty"`
+ 	// Affected - shows assigned column name will be affected after the transformation
+@@ -100,6 +100,8 @@ func (cp *ColumnProperties) SetSkipOnNull(v bool) *ColumnProperties {
+ }
+ 
+ type DynamicModeProperties struct {
++	// SupportedTypes - list of supported types.
++	// If empty any type is supported.
+ 	SupportedTypes []string
+ 	Unmarshal      DatabaseTypeUnmarshaler `json:"-"`
+ }

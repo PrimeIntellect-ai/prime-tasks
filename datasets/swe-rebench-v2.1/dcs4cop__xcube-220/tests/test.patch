@@ -1,0 +1,252 @@
+diff --git a/test/core/test_chunk.py b/test/core/test_chunk.py
+index 9127a9b..3bed920 100644
+--- a/test/core/test_chunk.py
++++ b/test/core/test_chunk.py
+@@ -29,6 +29,32 @@ class ChunkDatasetTest(unittest.TestCase):
+         self.assertEqual({}, chunked_dataset.precipitation.encoding)
+         self.assertEqual({}, chunked_dataset.temperature.encoding)
+ 
++        dataset = dataset.chunk(dict(time=2, lat=10, lon=20))
++
++        chunked_dataset = chunk_dataset(dataset,
++                                        chunk_sizes={},
++                                        format_name="zarr")
++        self.assertEqual({'chunks': (2, 10, 20)}, chunked_dataset.precipitation.encoding)
++        self.assertEqual({'chunks': (2, 10, 20)}, chunked_dataset.temperature.encoding)
++
++        chunked_dataset = chunk_dataset(dataset,
++                                        chunk_sizes=dict(time=1),
++                                        format_name="zarr")
++        self.assertEqual({'chunks': (1, 10, 20)}, chunked_dataset.precipitation.encoding)
++        self.assertEqual({'chunks': (1, 10, 20)}, chunked_dataset.temperature.encoding)
++
++    def test_netcdf4_encoding_uses_existing_chunks_for_unspecified_dimensions(self):
++        dataset = new_test_dataset(["2010-01-01", "2010-01-02", "2010-01-03",
++                                    "2010-01-04", "2010-01-05"],
++                                   precipitation=0.4, temperature=275.2)
++        dataset = dataset.chunk(dict(time=2, lat=10, lon=20))
++
++        chunked_dataset = chunk_dataset(dataset, chunk_sizes=dict(time=1),
++                                        format_name="netcdf4")
++
++        self.assertEqual({'chunksizes': (1, 10, 20)},
++                         chunked_dataset.precipitation.encoding)
++
+     def test_unchunk_dataset(self):
+         dataset = new_test_dataset(["2010-01-01", "2010-01-02", "2010-01-03", "2010-01-04", "2010-01-05"],
+                                    precipitation=0.4, temperature=275.2)
+diff --git a/test/core/test_resample.py b/test/core/test_resample.py
+index ddbc343..cb831a3 100644
+--- a/test/core/test_resample.py
++++ b/test/core/test_resample.py
+@@ -1,50 +1,156 @@
++import os
++import tempfile
+ import unittest
+ 
+ import numpy as np
+ import pandas as pd
++import zarr
++import click.testing
+ 
+ from test.sampledata import new_test_dataset
++from xcube.core.chunk import chunk_dataset
++from xcube.core.dsio import write_cube
+ from xcube.core.resample import resample_in_time
++from xcube.core.schema import CubeSchema
++from xcube.cli.resample import resample
+ 
+ 
+-class GenerateL3CubeTest(unittest.TestCase):
++class ResampleInTimeTest(unittest.TestCase):
+ 
+-    def test_resample(self):
++    def setUp(self) -> None:
+         num_times = 30
+ 
+-        time, temperature, precipitation = zip(*[(('2017-07-0%s' if i < 9 else '2017-07-%s') % (i + 1),
+-                                                  272 + 0.1 * i,
+-                                                  120 - 0.2 * i) for i in range(num_times)])
+-
+-        ds1 = new_test_dataset(time, temperature=temperature, precipitation=precipitation)
+-
+-        ds2 = resample_in_time(ds1, '3D', ['min', 'max'])
+-        self.assertIsNot(ds2, ds1)
+-        self.assertIn('time', ds2)
+-        self.assertIn('temperature_min', ds2)
+-        self.assertIn('temperature_max', ds2)
+-        self.assertIn('precipitation_min', ds2)
+-        self.assertIn('precipitation_max', ds2)
+-        self.assertEqual(('time',), ds2.time.dims)
+-        self.assertEqual(('time', 'lat', 'lon'), ds2.temperature_min.dims)
+-        self.assertEqual(('time', 'lat', 'lon'), ds2.temperature_max.dims)
+-        self.assertEqual(('time', 'lat', 'lon'), ds2.precipitation_min.dims)
+-        self.assertEqual(('time', 'lat', 'lon'), ds2.precipitation_max.dims)
+-        self.assertEqual((num_times / 3,), ds2.time.shape)
+-        self.assertEqual((num_times / 3, 180, 360), ds2.temperature_min.shape)
+-        self.assertEqual((num_times / 3, 180, 360), ds2.temperature_max.shape)
+-        self.assertEqual((num_times / 3, 180, 360), ds2.precipitation_min.shape)
+-        self.assertEqual((num_times / 3, 180, 360), ds2.precipitation_max.shape)
+-        np.testing.assert_equal(ds2.time.values,
+-                                np.array(pd.to_datetime(
+-                                    ['2017-07-01', '2017-07-04', '2017-07-07', '2017-07-10',
+-                                     '2017-07-13', '2017-07-16', '2017-07-19', '2017-07-22',
+-                                     '2017-07-25', '2017-07-28'])))
+-        np.testing.assert_allclose(ds2.temperature_min.values[..., 0, 0],
+-                                   np.array([272., 272.3, 272.6, 272.9, 273.2, 273.5, 273.8, 274.1, 274.4, 274.7]))
+-        np.testing.assert_allclose(ds2.temperature_max.values[..., 0, 0],
+-                                   np.array([272.2, 272.5, 272.8, 273.1, 273.4, 273.7, 274., 274.3, 274.6, 274.9]))
+-        np.testing.assert_allclose(ds2.precipitation_min.values[..., 0, 0],
+-                                   np.array([119.6, 119., 118.4, 117.8, 117.2, 116.6, 116., 115.4, 114.8, 114.2]))
+-        np.testing.assert_allclose(ds2.precipitation_max.values[..., 0, 0],
+-                                   np.array([120., 119.4, 118.8, 118.2, 117.6, 117., 116.4, 115.8, 115.2, 114.6]))
++        time = []
++        periods = ['1D', '1D', '3D', '4D', '2D']
++        t = pd.to_datetime('2017-07-01T10:30:15Z', utc=True)
++        for i in range(num_times):
++            time.append(t.isoformat())
++            t += pd.to_timedelta(periods[i % len(periods)])
++
++        temperature, precipitation = zip(*[(272 + 0.1 * i, 120 - 0.2 * i) for i in range(num_times)])
++
++        input_cube = new_test_dataset(time, temperature=temperature, precipitation=precipitation)
++        input_cube = chunk_dataset(input_cube, chunk_sizes=dict(time=1, lat=90, lon=180))
++        self.input_cube = input_cube
++
++    def test_resample_in_time(self):
++        resampled_cube = resample_in_time(self.input_cube, '2W', ['min', 'max'])
++        self.assertIsNot(resampled_cube, self.input_cube)
++        self.assertIn('time', resampled_cube)
++        self.assertIn('temperature_min', resampled_cube)
++        self.assertIn('temperature_max', resampled_cube)
++        self.assertIn('precipitation_min', resampled_cube)
++        self.assertIn('precipitation_max', resampled_cube)
++        self.assertEqual(('time',), resampled_cube.time.dims)
++        self.assertEqual(('time', 'lat', 'lon'), resampled_cube.temperature_min.dims)
++        self.assertEqual(('time', 'lat', 'lon'), resampled_cube.temperature_max.dims)
++        self.assertEqual(('time', 'lat', 'lon'), resampled_cube.precipitation_min.dims)
++        self.assertEqual(('time', 'lat', 'lon'), resampled_cube.precipitation_max.dims)
++        self.assertEqual((6,), resampled_cube.time.shape)
++        self.assertEqual((6, 180, 360), resampled_cube.temperature_min.shape)
++        self.assertEqual((6, 180, 360), resampled_cube.temperature_max.shape)
++        self.assertEqual((6, 180, 360), resampled_cube.precipitation_min.shape)
++        self.assertEqual((6, 180, 360), resampled_cube.precipitation_max.shape)
++        np.testing.assert_equal(resampled_cube.time.values,
++                                np.array(
++                                    ['2017-06-25T00:00:00Z', '2017-07-09T00:00:00Z',
++                                     '2017-07-23T00:00:00Z', '2017-08-06T00:00:00Z',
++                                     '2017-08-20T00:00:00Z', '2017-09-03T00:00:00Z'], dtype=np.datetime64))
++        np.testing.assert_allclose(resampled_cube.temperature_min.values[..., 0, 0],
++                                   np.array([272.0, 272.4, 273.0, 273.8, 274.4, 274.9]))
++        np.testing.assert_allclose(resampled_cube.temperature_max.values[..., 0, 0],
++                                   np.array([272.3, 272.9, 273.7, 274.3, 274.8, 274.9]))
++        np.testing.assert_allclose(resampled_cube.precipitation_min.values[..., 0, 0],
++                                   np.array([119.4, 118.2, 116.6, 115.4, 114.4, 114.2]))
++        np.testing.assert_allclose(resampled_cube.precipitation_max.values[..., 0, 0],
++                                   np.array([120.0, 119.2, 118.0, 116.4, 115.2, 114.2]))
++
++        schema = CubeSchema.new(resampled_cube)
++        self.assertEqual(3, schema.ndim)
++        self.assertEqual(('time', 'lat', 'lon'), schema.dims)
++        self.assertEqual((6, 180, 360), schema.shape)
++        self.assertEqual((1, 90, 180), schema.chunks)
++
++    def test_resample_in_time_with_time_chunk_size(self):
++        resampled_cube = resample_in_time(self.input_cube, '2D', ['min', 'max'], time_chunk_size=5)
++        schema = CubeSchema.new(resampled_cube)
++        self.assertEqual(3, schema.ndim)
++        self.assertEqual(('time', 'lat', 'lon'), schema.dims)
++        self.assertEqual((33, 180, 360), schema.shape)
++        self.assertEqual((5, 90, 180), schema.chunks)
++
++    def test_resample_in_time_validates_cube(self):
++        invalid_cube = self.input_cube.assign_coords(lat=self.input_cube.lat + 1000.0)
++        with self.assertRaises(ValueError):
++            resample_in_time(invalid_cube, '2W', ['min'])
++        resampled_cube = resample_in_time(invalid_cube, '2W', ['min'], cube_asserted=True)
++        self.assertIn('temperature_min', resampled_cube)
++
++    def test_resample_in_time_with_var_names(self):
++        resampled_cube = resample_in_time(self.input_cube, '2W', ['min', 'max'],
++                                          var_names=['temperature'])
++        self.assertIn('temperature_min', resampled_cube)
++        self.assertIn('temperature_max', resampled_cube)
++        self.assertNotIn('precipitation_min', resampled_cube)
++        self.assertNotIn('precipitation_max', resampled_cube)
++
++    def test_resample_in_time_with_metadata(self):
++        resampled_cube = resample_in_time(self.input_cube, '2W', ['min'],
++                                          metadata={'title': 'My cube'})
++        self.assertEqual('My cube', resampled_cube.attrs.get('title'))
++
++    def test_resample_in_time_with_offset(self):
++        resampled_cube = resample_in_time(self.input_cube, '2W', ['min'])
++        offset_cube = resample_in_time(self.input_cube, '2W', ['min'], offset='1D')
++        np.testing.assert_equal(offset_cube.time.values,
++                                resampled_cube.time.values + np.timedelta64(1, 'D'))
++
++    def test_resample_in_time_with_base(self):
++        resampled_cube = resample_in_time(self.input_cube, '24H', ['min'], base=0)
++        base_cube = resample_in_time(self.input_cube, '24H', ['min'], base=12)
++        np.testing.assert_equal(base_cube.time.values,
++                                resampled_cube.time.values - np.timedelta64(12, 'h'))
++
++    def test_resample_in_time_with_tolerance(self):
++        resampled_cube = resample_in_time(self.input_cube, '1D', ['nearest'], tolerance='1D')
++        self.assertTrue(np.any(np.isnan(resampled_cube.temperature_nearest.values)))
++        resampled_cube = resample_in_time(self.input_cube, '1D', ['nearest'], tolerance='10D')
++        self.assertFalse(np.any(np.isnan(resampled_cube.temperature_nearest.values)))
++
++    def test_resample_in_time_with_interp_kind(self):
++        linear_cube = resample_in_time(self.input_cube, '1D', ['interpolate'], interp_kind='linear')
++        nearest_cube = resample_in_time(self.input_cube, '1D', ['interpolate'], interp_kind='nearest')
++        self.assertFalse(np.allclose(linear_cube.temperature_interpolate.values,
++                                     nearest_cube.temperature_interpolate.values))
++
++
++    def test_resample_cli_writes_zarr_output(self):
++        times = pd.date_range('2017-07-01', periods=30, freq='D')
++        input_cube = new_test_dataset(
++            times, height=2, temperature=np.arange(len(times), dtype=float))
++        input_cube = input_cube.chunk(dict(time=30, lat=1, lon=2))
++        input_cube.temperature.encoding['chunks'] = (30, 2, 4)
++
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            input_path = os.path.join(tmp_dir, 'input.mem')
++            output_path = os.path.join(tmp_dir, 'resampled.zarr')
++            write_cube(input_cube, input_path, 'mem', cube_asserted=True)
++
++            result = click.testing.CliRunner().invoke(
++                resample, [input_path, '--output', output_path,
++                          '--frequency', '2D', '--method', 'mean', '--format', 'zarr'])
++
++            self.assertEqual(0, result.exit_code, result.output)
++            output_cube = zarr.open(output_path, mode='r')
++            self.assertIn('temperature_mean', output_cube)
++            self.assertGreater(output_cube['time'].shape[0], 0)
++            self.assertEqual(1, output_cube['temperature_mean'].chunks[0])
++
++    def test_resample_in_time_to_zarr(self):
++        input_cube = self.input_cube.chunk(dict(time=5, lat=90, lon=180))
++        resampled_cube = resample_in_time(input_cube, '2W', ['min', 'max'])
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            output_path = os.path.join(tmp_dir, 'out.zarr')
++            write_cube(resampled_cube, output_path, 'zarr', cube_asserted=True)
++            store = zarr.open(output_path, mode='r')
++            self.assertEqual((5, 90, 180), store['temperature_min'].chunks)
+diff --git a/test/sampledata.py b/test/sampledata.py
+index db01020..8e6eea4 100644
+--- a/test/sampledata.py
++++ b/test/sampledata.py
+@@ -29,8 +29,10 @@ def new_test_dataset(time, height=180, **indexers):
+             raise ValueError()
+         data_vars[name] = (['time', 'lat', 'lon'],
+                            np.concatenate(tuple(np.full(shape, values[i]) for i in range(num_times))))
++    time = np.array(pd.to_datetime(time), dtype=np.datetime64)
+     return xr.Dataset(data_vars,
+-                      coords=dict(time=(['time'], pd.to_datetime(time)),
++                      coords=dict(time=(
++                      ['time'], time, dict(units='nanoseconds since 1970-01-01', calendar='proleptic_gregorian')),
+                                   lat=(['lat'], np.linspace(-90 + res, +90 - res, height)),
+                                   lon=(['lon'], np.linspace(-180 + res, +180 - res, width))))
+ 

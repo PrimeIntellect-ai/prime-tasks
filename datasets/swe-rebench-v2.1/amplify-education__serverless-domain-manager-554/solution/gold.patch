@@ -1,0 +1,320 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6c30e49..fb425ca 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
+ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
+ 
++## [6.4.0] - 2023-02-10
++
++### Added
++- Added support for the CloudFormation `Ref` intrinsic function.
++
+ ## [6.3.4] - 2023-02-10
+ 
+ ### Fixed
+diff --git a/README.md b/README.md
+index d576ec4..0a8d38c 100644
+--- a/README.md
++++ b/README.md
+@@ -32,6 +32,8 @@ apigateway:DELETE                      /domainnames*, /apis*, /restapis*
+ apigateway:POST                        /domainnames*, /apis*, /restapis*
+ apigateway:PATCH                       /domainnames*, /apis*, /restapis*
+ cloudformation:GET                     *
++cloudformation:ListStacks              *
++cloudformation:DescribeStacks          *
+ cloudfront:UpdateDistribution          *
+ route53:ListHostedZones                *
+ route53:ChangeResourceRecordSets       hostedzone/{HostedZoneId}
+diff --git a/package.json b/package.json
+index 9db5bd4..f7f1386 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "serverless-domain-manager",
+-  "version": "6.3.4",
++  "version": "6.4.0",
+   "engines": {
+     "node": ">=14"
+   },
+diff --git a/src/aws/cloud-formation-wrapper.ts b/src/aws/cloud-formation-wrapper.ts
+index b8a2964..cb12711 100644
+--- a/src/aws/cloud-formation-wrapper.ts
++++ b/src/aws/cloud-formation-wrapper.ts
+@@ -3,42 +3,103 @@
+  */
+ 
+ import {CloudFormation} from "aws-sdk";
+-import DomainConfig = require("../models/domain-config");
+ import Globals from "../globals";
+ import {getAWSPagedResults, throttledCall} from "../utils";
+ 
+ class CloudFormationWrapper {
+     public cloudFormation: CloudFormation;
++    public stackName: string;
+ 
+     constructor(credentials: any) {
+         this.cloudFormation = new CloudFormation(credentials);
++        this.stackName = Globals.serverless.service.provider.stackName ||
++            `${Globals.serverless.service.service}-${Globals.getBaseStage()}`;
++    }
++
++    /**
++     * Get an API id from the existing config or CloudFormation stack resources or outputs
++     */
++    public async findApiId(apiType: string): Promise<string> {
++        const configApiId = await this.getConfigId(apiType);
++        if (configApiId) {
++            return configApiId;
++        }
++
++        return await this.getStackApiId(apiType);
++    }
++
++    /**
++     * Get an API id from the existing config or CloudFormation stack based on provider.apiGateway params
++     */
++    public async getConfigId(apiType: string): Promise<string | null> {
++        const apiGateway = Globals.serverless.service.provider.apiGateway || {};
++        const apiIdKey = Globals.gatewayAPIIdKeys[apiType];
++        const apiGatewayValue = apiGateway[apiIdKey];
++
++        if (apiGatewayValue) {
++            if (typeof apiGatewayValue === "string") {
++                return apiGatewayValue;
++            }
++
++            return await this.getCloudformationId(apiGatewayValue, apiType)
++        }
++
++        return null;
++    }
++
++    public async getCloudformationId(apiGatewayValue: object, apiType: string): Promise<string | null> {
++        // in case object and Fn::ImportValue try to get API id from the CloudFormation outputs
++        const importName = apiGatewayValue[Globals.CFFuncNames.fnImport];
++        if (importName) {
++            const importValues = await this.getImportValues([importName]);
++            if (!importValues[importName]) {
++                Globals.logWarning(`CloudFormation ImportValue '${importName}' not found in the outputs`);
++            }
++            return importValues[importName];
++        }
++
++        const ref = apiGatewayValue[Globals.CFFuncNames.ref];
++        if (ref) {
++            try {
++                return await this.getStackApiId(apiType, ref);
++            } catch (error) {
++                Globals.logWarning(`Unable to get ref ${ref} value.\n ${error.message}`);
++                return null;
++            }
++        }
++
++        // log warning not supported restApiId
++        Globals.logWarning(`Unsupported apiGateway.${apiType} object`);
++
++        return null;
+     }
+ 
+     /**
+      * Gets rest API id from CloudFormation stack or nested stack
+      */
+-    public async getApiId(domain: DomainConfig, stackName: string): Promise<string> {
+-        const logicalResourceId = Globals.CFResourceIds[domain.apiType];
++    public async getStackApiId(apiType: string, logicalResourceId: string = null): Promise<string> {
++        if (!logicalResourceId) {
++            logicalResourceId = Globals.CFResourceIds[apiType];
++        }
++
+         let response;
+         try {
+             // trying to get information for specified stack name
+-            response = await this.getStack(logicalResourceId, stackName);
++            response = await this.getStack(logicalResourceId, this.stackName);
+         } catch {
+             // in case error trying to get information from some of nested stacks
+-            response = await this.getNestedStack(logicalResourceId, stackName);
++            response = await this.getNestedStack(logicalResourceId, this.stackName);
+         }
+ 
+         if (!response) {
+-            throw new Error(`Failed to find a stack ${stackName}\n`);
++            throw new Error(`Failed to find a stack ${this.stackName}\n`);
+         }
+ 
+         const apiId = response.StackResourceDetail.PhysicalResourceId;
+         if (!apiId) {
+-            throw new Error(`No ApiId associated with CloudFormation stack ${stackName}`);
++            throw new Error(`No ApiId associated with CloudFormation stack ${this.stackName}`);
+         }
+ 
+-        Globals.logInfo(`Found apiId: ${apiId} for ${domain.givenDomainName}`);
+-
+         return apiId;
+     }
+ 
+@@ -110,7 +171,7 @@ class CloudFormationWrapper {
+                 response = await this.getStack(logicalResourceId, name);
+                 break;
+             } catch (err) {
+-                Globals.logWarning(err);
++                Globals.logWarning(err.message);
+             }
+         }
+         return response;
+diff --git a/src/aws/route53-wrapper.ts b/src/aws/route53-wrapper.ts
+index ec75b03..75b9164 100644
+--- a/src/aws/route53-wrapper.ts
++++ b/src/aws/route53-wrapper.ts
+@@ -56,7 +56,7 @@ class Route53Wrapper {
+                 Weight: domain.route53Params.weight,
+                 SetIdentifier: domain.route53Params.setIdentifier ?? domainInfo.domainName,
+                 ...route53healthCheck,
+-            }
++            };
+         }
+ 
+         let hostedZoneIds: string[];
+diff --git a/src/globals.ts b/src/globals.ts
+index 30e44c1..7d8828b 100644
+--- a/src/globals.ts
++++ b/src/globals.ts
+@@ -39,6 +39,12 @@ export default class Globals {
+         [Globals.apiTypes.websocket]: "WebsocketsApi",
+     };
+ 
++    // https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/intrinsic-function-reference.html
++    public static CFFuncNames = {
++        fnImport: "Fn::ImportValue",
++        ref: "Ref"
++    }
++
+     /*eslint camelcase: ["error", {allow: ["^tls_"]}]*/
+     public static tlsVersions = {
+         tls_1_0: "TLS_1_0",
+@@ -51,6 +57,10 @@ export default class Globals {
+         weighted: "weighted",
+     };
+ 
++    public static getBaseStage() {
++        return Globals.options.stage || Globals.serverless.service.provider.stage;
++    }
++
+     public static cliLog(prefix: string, message: string): void {
+         Globals.serverless.cli.log(`${prefix} ${message}`, Globals.pluginName);
+     }
+@@ -113,5 +123,4 @@ export default class Globals {
+             });
+         }
+     }
+-
+ }
+diff --git a/src/index.ts b/src/index.ts
+index 461cc8e..4ef0c43 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -309,7 +309,7 @@ class ServerlessCustomDomain {
+      */
+     public async setupBasePathMappings(): Promise<void> {
+         await Promise.all(this.domains.map(async (domain) => {
+-            domain.apiId = await this.getApiId(domain);
++            domain.apiId = await this.cloudFormationWrapper.findApiId(domain.apiType);
+ 
+             const apiGateway = this.getApiGateway(domain);
+             const mappings = await apiGateway.getBasePathMappings(domain);
+@@ -340,7 +340,7 @@ class ServerlessCustomDomain {
+         await Promise.all(this.domains.map(async (domain) => {
+             let externalBasePathExists = false;
+             try {
+-                domain.apiId = await this.getApiId(domain);
++                domain.apiId = await this.cloudFormationWrapper.findApiId(domain.apiType);
+                 // Unable to find the corresponding API, manual clean up will be required
+                 if (!domain.apiId) {
+                     Globals.logInfo(`Unable to find corresponding API for '${domain.givenDomainName}',
+@@ -351,7 +351,7 @@ class ServerlessCustomDomain {
+                     const filteredMappings = mappings.filter((mapping) => {
+                         return mapping.apiId === domain.apiId || (
+                             mapping.basePath === domain.basePath && domain.allowPathMatching
+-                        )
++                        );
+                     });
+                     if (domain.preserveExternalPathMappings) {
+                         externalBasePathExists = mappings.length > filteredMappings.length;
+@@ -397,46 +397,6 @@ class ServerlessCustomDomain {
+ 
+     }
+ 
+-    /**
+-     * Gets rest API id from existing config or CloudFormation stack
+-     */
+-    public async getApiId(domain: DomainConfig): Promise<string> {
+-        const slsService = this.serverless.service;
+-        const apiGateway = slsService.provider.apiGateway || {};
+-        const apiIdKey = Globals.gatewayAPIIdKeys[domain.apiType];
+-        const apiId = apiGateway[apiIdKey];
+-        if (apiId) {
+-            // if string value exists return the value
+-            if (typeof apiId === "string") {
+-                Globals.logInfo(`Mapping custom domain to existing API '${apiId}'.`);
+-                return apiId;
+-            }
+-            // in case object and Fn::ImportValue try to get restApiId from the CloudFormation exports
+-            if (typeof apiId === "object" && apiId["Fn::ImportValue"]) {
+-                const importName = apiId["Fn::ImportValue"];
+-                let importValues;
+-                try {
+-                    importValues = await this.cloudFormationWrapper.getImportValues([importName]);
+-                } catch (err) {
+-                    throw new Error(`Failed to find CloudFormation ImportValue by '${importName}':\n${err.message}`);
+-                }
+-                if (!importValues[importName]) {
+-                    throw new Error(`CloudFormation ImportValue not found by '${importName}'`);
+-                }
+-                return importValues[importName];
+-            }
+-            // throw an exception in case not supported restApiId
+-            throw new Error("Unsupported apiGateway.restApiId object");
+-        }
+-
+-        const stackName = slsService.provider.stackName || `${slsService.service}-${domain.baseStage}`;
+-        try {
+-            return await this.cloudFormationWrapper.getApiId(domain, stackName);
+-        } catch (err) {
+-            throw new Error(`Failed to find CloudFormation resources for '${domain.givenDomainName}':\n${err.message}`);
+-        }
+-    }
+-
+     /**
+      *  Adds the domain name and distribution domain name to the CloudFormation outputs
+      */
+diff --git a/src/models/domain-config.ts b/src/models/domain-config.ts
+index 250729e..64c3e68 100644
+--- a/src/models/domain-config.ts
++++ b/src/models/domain-config.ts
+@@ -54,8 +54,8 @@ class DomainConfig {
+         this.autoDomainWaitFor = config.autoDomainWaitFor;
+         this.preserveExternalPathMappings = evaluateBoolean(config.preserveExternalPathMappings, false);
+         this.basePath = this._getBasePath(config.basePath);
+-        this.baseStage = Globals.options.stage || Globals.serverless.service.provider.stage;
+-        this.stage = config.stage || this.baseStage;
++        this.baseStage = Globals.getBaseStage();
++        this.stage = config.stage || Globals.getBaseStage();
+         this.endpointType = this._getEndpointType(config.endpointType);
+         this.apiType = this._getApiType(config.apiType);
+         this.tlsTruststoreUri = this._getTLSTruststoreUri(config.tlsTruststoreUri, this.endpointType);
+diff --git a/tsconfig.json b/tsconfig.json
+index 8cbb66b..c3a790a 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -16,6 +16,7 @@
+     "src/**/*.ts"
+   ],
+   "exclude": [
+-    "test/**/*.ts"
++    "test/**/*.ts",
++    "dist/**/*.ts",
+   ]
+ }

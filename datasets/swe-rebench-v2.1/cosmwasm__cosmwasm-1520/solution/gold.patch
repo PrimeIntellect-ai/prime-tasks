@@ -1,0 +1,274 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 34c3b1682..1d780adf8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -32,6 +32,15 @@ and this project adheres to
+ [#1406]: https://github.com/CosmWasm/cosmwasm/pull/1406
+ [#1508]: https://github.com/CosmWasm/cosmwasm/issues/1508
+ 
++### Fixed
++
++- cosmwasm-schema: Nested QueryMsg with generics is now supported by the
++  QueryResponses macro ([#1516]).
++- cosmwasm-schema: A nested QueryMsg no longer causes runtime errors if it
++  contains doc comments.
++
++[#1516]: https://github.com/CosmWasm/cosmwasm/issues/1516
++
+ ## [1.1.8] - 2022-11-22
+ 
+ ### Fixed
+diff --git a/Cargo.lock b/Cargo.lock
+index 0c1203379..815caa2d2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -288,6 +288,7 @@ version = "1.1.8"
+ dependencies = [
+  "anyhow",
+  "cosmwasm-schema-derive",
++ "cosmwasm-std",
+  "schemars",
+  "semver",
+  "serde",
+diff --git a/packages/schema-derive/src/query_responses.rs b/packages/schema-derive/src/query_responses.rs
+index 195bb93d7..f3d9b755d 100644
+--- a/packages/schema-derive/src/query_responses.rs
++++ b/packages/schema-derive/src/query_responses.rs
+@@ -1,6 +1,8 @@
+ mod context;
+ 
+-use syn::{parse_quote, Expr, ExprTuple, Generics, ItemEnum, ItemImpl, Type, Variant};
++use syn::{
++    parse_quote, Expr, ExprTuple, Generics, ItemEnum, ItemImpl, Type, TypeParamBound, Variant,
++};
+ 
+ use self::context::Context;
+ 
+@@ -13,7 +15,11 @@ pub fn query_responses_derive_impl(input: ItemEnum) -> ItemImpl {
+ 
+         // Handle generics if the type has any
+         let (_, type_generics, where_clause) = input.generics.split_for_impl();
+-        let impl_generics = impl_generics(&ctx, &input.generics);
++        let impl_generics = impl_generics(
++            &ctx,
++            &input.generics,
++            &[parse_quote! {::cosmwasm_schema::QueryResponses}],
++        );
+ 
+         let subquery_len = subquery_calls.len();
+         parse_quote! {
+@@ -24,7 +30,7 @@ pub fn query_responses_derive_impl(input: ItemEnum) -> ItemImpl {
+                     let subqueries = [
+                         #( #subquery_calls, )*
+                     ];
+-                    ::cosmwasm_schema::combine_subqueries::<#subquery_len, #ident>(subqueries)
++                    ::cosmwasm_schema::combine_subqueries::<#subquery_len, #ident #type_generics>(subqueries)
+                 }
+             }
+         }
+@@ -37,7 +43,7 @@ pub fn query_responses_derive_impl(input: ItemEnum) -> ItemImpl {
+ 
+         // Handle generics if the type has any
+         let (_, type_generics, where_clause) = input.generics.split_for_impl();
+-        let impl_generics = impl_generics(&ctx, &input.generics);
++        let impl_generics = impl_generics(&ctx, &input.generics, &[]);
+ 
+         parse_quote! {
+             #[automatically_derived]
+@@ -55,7 +61,7 @@ pub fn query_responses_derive_impl(input: ItemEnum) -> ItemImpl {
+ 
+ /// Takes a list of generics from the type definition and produces a list of generics
+ /// for the expanded `impl` block, adding trait bounds like `JsonSchema` as appropriate.
+-fn impl_generics(ctx: &Context, generics: &Generics) -> Generics {
++fn impl_generics(ctx: &Context, generics: &Generics, bounds: &[TypeParamBound]) -> Generics {
+     let mut impl_generics = generics.to_owned();
+     for param in impl_generics.type_params_mut() {
+         // remove the default type if present, as those are invalid in
+@@ -65,7 +71,8 @@ fn impl_generics(ctx: &Context, generics: &Generics) -> Generics {
+         if !ctx.no_bounds_for.contains(&param.ident) {
+             param
+                 .bounds
+-                .push(parse_quote! {::cosmwasm_schema::schemars::JsonSchema})
++                .push(parse_quote! {::cosmwasm_schema::schemars::JsonSchema});
++            param.bounds.extend(bounds.to_owned());
+         }
+     }
+ 
+diff --git a/packages/schema/Cargo.toml b/packages/schema/Cargo.toml
+index 543e9c460..4e06a667f 100644
+--- a/packages/schema/Cargo.toml
++++ b/packages/schema/Cargo.toml
+@@ -16,5 +16,6 @@ thiserror = "1.0.13"
+ 
+ [dev-dependencies]
+ anyhow = "1.0.57"
++cosmwasm-std = { version = "1.1.8", path = "../std" }
+ semver = "1"
+ tempfile = "3"
+diff --git a/packages/schema/src/query_response.rs b/packages/schema/src/query_response.rs
+index 20cf84e26..85ecc7f3b 100644
+--- a/packages/schema/src/query_response.rs
++++ b/packages/schema/src/query_response.rs
+@@ -1,9 +1,6 @@
+ use std::collections::{BTreeMap, BTreeSet};
+ 
+-use schemars::{
+-    schema::{InstanceType, RootSchema, SingleOrVec, SubschemaValidation},
+-    JsonSchema,
+-};
++use schemars::{schema::RootSchema, JsonSchema};
+ use thiserror::Error;
+ 
+ pub use cosmwasm_schema_derive::QueryResponses;
+@@ -69,10 +66,6 @@ pub trait QueryResponses: JsonSchema {
+     fn response_schemas() -> Result<BTreeMap<String, RootSchema>, IntegrityError> {
+         let response_schemas = Self::response_schemas_impl();
+ 
+-        let queries: BTreeSet<_> = response_schemas.keys().cloned().collect();
+-
+-        check_api_integrity::<Self>(queries)?;
+-
+         Ok(response_schemas)
+     }
+ 
+@@ -95,121 +88,6 @@ pub fn combine_subqueries<const N: usize, T>(
+     map
+ }
+ 
+-/// Returns possible enum variants from `one_of` analysis
+-fn enum_variants(
+-    subschemas: SubschemaValidation,
+-) -> Result<impl Iterator<Item = Result<String, IntegrityError>>, IntegrityError> {
+-    let iter = subschemas
+-        .one_of
+-        .ok_or(IntegrityError::InvalidQueryMsgSchema)?
+-        .into_iter()
+-        .map(|s| {
+-            let s = s.into_object();
+-
+-            if let Some(SingleOrVec::Single(ty)) = s.instance_type {
+-                match *ty {
+-                    // We'll have an object if the Rust enum variant was C-like or tuple-like
+-                    InstanceType::Object => s
+-                        .object
+-                        .ok_or(IntegrityError::InvalidQueryMsgSchema)?
+-                        .required
+-                        .into_iter()
+-                        .next()
+-                        .ok_or(IntegrityError::InvalidQueryMsgSchema),
+-                    // We might have a string here if the Rust enum variant was unit-like
+-                    InstanceType::String => {
+-                        let values = s.enum_values.ok_or(IntegrityError::InvalidQueryMsgSchema)?;
+-
+-                        if values.len() != 1 {
+-                            return Err(IntegrityError::InvalidQueryMsgSchema);
+-                        }
+-
+-                        values[0]
+-                            .as_str()
+-                            .map(String::from)
+-                            .ok_or(IntegrityError::InvalidQueryMsgSchema)
+-                    }
+-                    _ => Err(IntegrityError::InvalidQueryMsgSchema),
+-                }
+-            } else {
+-                Err(IntegrityError::InvalidQueryMsgSchema)
+-            }
+-        });
+-
+-    Ok(iter)
+-}
+-
+-fn verify_queries(
+-    query_msg: BTreeSet<String>,
+-    responses: BTreeSet<String>,
+-) -> Result<(), IntegrityError> {
+-    if query_msg != responses {
+-        return Err(IntegrityError::InconsistentQueries {
+-            query_msg,
+-            responses,
+-        });
+-    }
+-
+-    Ok(())
+-}
+-
+-/// `generated_queries` is expected to be a sorted slice here!
+-fn check_api_integrity<T: QueryResponses + ?Sized>(
+-    generated_queries: BTreeSet<String>,
+-) -> Result<(), IntegrityError> {
+-    let schema = crate::schema_for!(T);
+-
+-    let subschemas = if let Some(subschemas) = schema.schema.subschemas {
+-        subschemas
+-    } else {
+-        // No subschemas - no resposnes are expected
+-        return verify_queries(BTreeSet::new(), generated_queries);
+-    };
+-
+-    let schema_queries = if let Some(any_of) = subschemas.any_of {
+-        // If `any_of` exists, we assume schema is generated from untagged enum
+-        any_of
+-            .into_iter()
+-            .map(|schema| dbg!(schema.into_object()))
+-            .filter_map(|obj| {
+-                if let Some(reference) = obj.reference {
+-                    // Subschemas can be hidden behind references - we want to map them to proper
+-                    // subschemas in such case
+-
+-                    // Only references to definitions are supported
+-                    let reference = match reference.strip_prefix("#/definitions/") {
+-                        Some(reference) => reference,
+-                        None => {
+-                            return Some(Err(IntegrityError::ExternalReference {
+-                                reference: reference.to_owned(),
+-                            }))
+-                        }
+-                    };
+-
+-                    let schema = match schema.definitions.get(reference) {
+-                        Some(schema) => schema.clone(),
+-                        None => return Some(Err(IntegrityError::InvalidQueryMsgSchema)),
+-                    };
+-
+-                    Ok(schema.into_object().subschemas).transpose()
+-                } else {
+-                    Ok(obj.subschemas).transpose()
+-                }
+-            })
+-            .map(|subschema| enum_variants(*subschema?))
+-            .collect::<Result<Vec<_>, _>>()?
+-            .into_iter()
+-            .flatten()
+-            .collect::<Result<_, _>>()?
+-    } else {
+-        // If `any_of` is not present, there was no untagged enum on top, we expect normal enum at
+-        // this point
+-        enum_variants(*subschemas)?.collect::<Result<_, _>>()?
+-    };
+-
+-    verify_queries(schema_queries, generated_queries)
+-}
+-
+ #[derive(Debug, Error, PartialEq, Eq)]
+ pub enum IntegrityError {
+     #[error("the structure of the QueryMsg schema was unexpected")]
+@@ -299,18 +177,6 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn bad_msg_fails() {
+-        let err = BadMsg::response_schemas().unwrap_err();
+-        assert_eq!(
+-            err,
+-            IntegrityError::InconsistentQueries {
+-                query_msg: BTreeSet::from(["balance-for".to_string()]),
+-                responses: BTreeSet::from(["balance_for".to_string()])
+-            }
+-        );
+-    }
+-
+     #[derive(Debug, JsonSchema)]
+     #[serde(rename_all = "snake_case")]
+     #[allow(dead_code)]

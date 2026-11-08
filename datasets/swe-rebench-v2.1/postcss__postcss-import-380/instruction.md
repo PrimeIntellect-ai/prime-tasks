@@ -1,0 +1,2 @@
+postcss-import doesn't set plugin property to its dependency messages
+According to the postcss API document, [`plugin` is required property in Result#messages](http://api.postcss.org/Result.html#messages), but [`postcss-import` doesn't set it when it pushes dependency information to the messages](https://github.com/postcss/postcss-import/blob/f98dd1a5a6a987c8cf197db46644765a4d43d73a/index.js#L198-L205).

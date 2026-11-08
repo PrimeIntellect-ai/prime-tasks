@@ -1,0 +1,219 @@
+diff --git a/internal/aws/ec2.go b/internal/aws/ec2.go
+index ae69dd8b0..9684e6ef1 100644
+--- a/internal/aws/ec2.go
++++ b/internal/aws/ec2.go
+@@ -29,9 +29,6 @@ type EC2API interface {
+ 	// StatusEC2 validates EC2 connectivity
+ 	StatusEC2() func() error
+ 
+-	// IsNodeHealthy returns true if the node is ready
+-	IsNodeHealthy(string) (bool, error)
+-
+ 	// GetInstancesByIDs retrieves ec2 instances by slice of instanceID
+ 	GetInstancesByIDs([]string) ([]*ec2.Instance, error)
+ 
+@@ -326,29 +323,6 @@ func (c *Cloud) StatusEC2() func() error {
+ 	}
+ }
+ 
+-// IsNodeHealthy returns true if the node is ready
+-func (c *Cloud) IsNodeHealthy(instanceid string) (bool, error) {
+-	in := &ec2.DescribeInstanceStatusInput{
+-		InstanceIds: []*string{aws.String(instanceid)},
+-	}
+-	o, err := c.ec2.DescribeInstanceStatus(in)
+-	if err != nil {
+-		return false, fmt.Errorf("Unable to DescribeInstanceStatus on %v: %v", instanceid, err.Error())
+-	}
+-
+-	for _, instanceStatus := range o.InstanceStatuses {
+-		if *instanceStatus.InstanceId != instanceid {
+-			continue
+-		}
+-		if *instanceStatus.InstanceState.Code == 16 { // running
+-			return true, nil
+-		}
+-		return false, nil
+-	}
+-
+-	return false, nil
+-}
+-
+ // GetVpcWithContext returns the VPC for the configured VPC ID
+ func (c *Cloud) GetVpcWithContext(ctx context.Context) (*ec2.Vpc, error) {
+ 	o, err := c.ec2.DescribeVpcsWithContext(ctx, &ec2.DescribeVpcsInput{
+diff --git a/internal/ingress/annotations/class/main.go b/internal/ingress/annotations/class/main.go
+index 38c5f1fb9..f68d32f78 100644
+--- a/internal/ingress/annotations/class/main.go
++++ b/internal/ingress/annotations/class/main.go
+@@ -17,9 +17,6 @@ limitations under the License.
+ package class
+ 
+ import (
+-	"strings"
+-
+-	corev1 "k8s.io/api/core/v1"
+ 	extensions "k8s.io/api/extensions/v1beta1"
+ )
+ 
+@@ -39,20 +36,3 @@ func IsValidIngress(ingressClass string, ingress *extensions.Ingress) bool {
+ 	}
+ 	return actualIngressClass == ingressClass
+ }
+-
+-// TODO: change this to in-sync with https://github.com/kubernetes/kubernetes/blob/13705ac81e00f154434b5c66c1ad92ac84960d7f/pkg/controller/service/service_controller.go#L592(relies on node's ready condition instead of AWS API)
+-// IsValidNode returns true if the given Node has valid annotations
+-func IsValidNode(n *corev1.Node) bool {
+-	if s, ok := n.ObjectMeta.Labels["eks.amazonaws.com/compute-type"]; ok && s == "fargate" {
+-		return false
+-	}
+-	if _, ok := n.ObjectMeta.Labels["node-role.kubernetes.io/master"]; ok {
+-		return false
+-	}
+-	if s, ok := n.ObjectMeta.Labels["alpha.service-controller.kubernetes.io/exclude-balancer"]; ok {
+-		if strings.ToUpper(s) == "TRUE" {
+-			return false
+-		}
+-	}
+-	return true
+-}
+diff --git a/internal/ingress/backend/endpoint.go b/internal/ingress/backend/endpoint.go
+index f65c76eaf..3177858f4 100644
+--- a/internal/ingress/backend/endpoint.go
++++ b/internal/ingress/backend/endpoint.go
+@@ -30,6 +30,13 @@ import (
+ 	"k8s.io/apimachinery/pkg/util/intstr"
+ )
+ 
++const (
++	labelNodeRoleMaster               = "node-role.kubernetes.io/master"
++	labelNodeRoleExcludeBalancer      = "node.kubernetes.io/exclude-from-external-load-balancers"
++	labelAlphaNodeRoleExcludeBalancer = "alpha.service-controller.kubernetes.io/exclude-balancer"
++	labelEKSComputeType               = "eks.amazonaws.com/compute-type"
++)
++
+ // EndpointResolver resolves the endpoints for specific ingress backend
+ type EndpointResolver interface {
+ 	Resolve(*extensions.Ingress, *extensions.IngressBackend, string) ([]*elbv2.TargetDescription, error)
+@@ -112,13 +119,12 @@ func (resolver *endpointResolver) resolveInstance(ingress *extensions.Ingress, b
+ 
+ 	var result []*elbv2.TargetDescription
+ 	for _, node := range resolver.store.ListNodes() {
++		if !IsNodeSuitableAsTrafficProxy(node) {
++			continue
++		}
+ 		instanceID, err := resolver.store.GetNodeInstanceID(node)
+ 		if err != nil {
+ 			return nil, err
+-		} else if healthy, err := resolver.cloud.IsNodeHealthy(instanceID); err != nil {
+-			return nil, err
+-		} else if !healthy {
+-			continue
+ 		}
+ 		result = append(result, &elbv2.TargetDescription{
+ 			Id:   aws.String(instanceID),
+@@ -198,6 +204,28 @@ func (resolver *endpointResolver) resolveIP(ingress *extensions.Ingress, backend
+ 	return result, nil
+ }
+ 
++// IsNodeSuitableAsTrafficProxy check whether node is suitable as a traffic proxy.
++// mimic the logic of serviceController: https://github.com/kubernetes/kubernetes/blob/b6b494b4484b51df8dc6b692fab234573da30ab4/pkg/controller/service/controller.go#L605
++func IsNodeSuitableAsTrafficProxy(node *corev1.Node) bool {
++	if node.Spec.Unschedulable {
++		return false
++	}
++	if s, ok := node.ObjectMeta.Labels[labelEKSComputeType]; ok && s == "fargate" {
++		return false
++	}
++	for _, label := range []string{labelNodeRoleMaster, labelNodeRoleExcludeBalancer, labelAlphaNodeRoleExcludeBalancer} {
++		if _, hasLabel := node.ObjectMeta.Labels[label]; hasLabel {
++			return false
++		}
++	}
++	for _, cond := range node.Status.Conditions {
++		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
++			return true
++		}
++	}
++	return false
++}
++
+ // findServiceAndPort returns the service & servicePort by name
+ func findServiceAndPort(store store.Storer, namespace string, serviceName string, servicePort intstr.IntOrString) (*corev1.Service, *corev1.ServicePort, error) {
+ 	serviceKey := namespace + "/" + serviceName
+diff --git a/internal/ingress/controller/handlers/node.go b/internal/ingress/controller/handlers/node.go
+index b083b480b..f23a27f1e 100644
+--- a/internal/ingress/controller/handlers/node.go
++++ b/internal/ingress/controller/handlers/node.go
+@@ -3,6 +3,9 @@ package handlers
+ import (
+ 	"context"
+ 
++	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/ingress/backend"
++	corev1 "k8s.io/api/core/v1"
++
+ 	"github.com/golang/glog"
+ 	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/ingress/annotations/class"
+ 	extensions "k8s.io/api/extensions/v1beta1"
+@@ -24,23 +27,27 @@ type EnqueueRequestsForNodeEvent struct {
+ 
+ // Create is called in response to an create event - e.g. Pod Creation.
+ func (h *EnqueueRequestsForNodeEvent) Create(e event.CreateEvent, queue workqueue.RateLimitingInterface) {
+-	h.enqueueImpactedIngresses(queue)
++	node := e.Object.(*corev1.Node)
++	if backend.IsNodeSuitableAsTrafficProxy(node) {
++		h.enqueueImpactedIngresses(queue)
++	}
+ }
+ 
+ // Delete is called in response to a delete event - e.g. Pod Deleted.
+ func (h *EnqueueRequestsForNodeEvent) Delete(e event.DeleteEvent, queue workqueue.RateLimitingInterface) {
+-	h.enqueueImpactedIngresses(queue)
++	node := e.Object.(*corev1.Node)
++	if backend.IsNodeSuitableAsTrafficProxy(node) {
++		h.enqueueImpactedIngresses(queue)
++	}
+ }
+ 
+-// TODO: change this to only enqueue ingresses when available node set is changed.(rely on node's ready condition)
+-// We can store an copy of previous known valid nodeSet inside this class, and compare them when events occurs.
+-// Pending work:
+-//    1. rely on node's ready condition instead of aws.IsNodeHealth API
+-//    1. when modify/detach instance sg, rely on describeNetworkInterface API to get enis attached, to avoid edge cases like node turned into unhealthy or excluded by "alpha.service-controller.kubernetes.io/exclude-balancer"
+-
+ // Update is called in response to an update event -  e.g. Pod Updated.
+ func (h *EnqueueRequestsForNodeEvent) Update(e event.UpdateEvent, queue workqueue.RateLimitingInterface) {
+-	//h.enqueueImpactedIngresses(queue)
++	nodeOld := e.ObjectOld.(*corev1.Node)
++	nodeNew := e.ObjectNew.(*corev1.Node)
++	if backend.IsNodeSuitableAsTrafficProxy(nodeOld) != backend.IsNodeSuitableAsTrafficProxy(nodeNew) {
++		h.enqueueImpactedIngresses(queue)
++	}
+ }
+ 
+ // Generic is called in response to an event of an unknown type or a synthetic event triggered as a cron or
+diff --git a/internal/ingress/controller/store/store.go b/internal/ingress/controller/store/store.go
+index 621123fe1..d478a16f6 100644
+--- a/internal/ingress/controller/store/store.go
++++ b/internal/ingress/controller/store/store.go
+@@ -251,19 +251,13 @@ func (s k8sStore) GetService(key string) (*corev1.Service, error) {
+ 	return s.listers.Service.ByKey(key)
+ }
+ 
+-// ListNodes returns the list of Nodes
++// ListNodes returns a list of all Nodes in the store.
+ func (s k8sStore) ListNodes() []*corev1.Node {
+ 	var nodes []*corev1.Node
+ 	for _, item := range s.listers.Node.List() {
+ 		n := item.(*corev1.Node)
+-
+-		if !class.IsValidNode(n) {
+-			continue
+-		}
+-
+ 		nodes = append(nodes, n)
+ 	}
+-
+ 	return nodes
+ }
+ 

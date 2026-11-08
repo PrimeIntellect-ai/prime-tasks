@@ -1,0 +1,427 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index 76452c2..225e632 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -360,6 +360,9 @@ pub(crate) fn args(coloring: &mut Option<Coloring>) -> Result<Option<Args>> {
+     if no_dev_deps && remove_dev_deps {
+         bail!("--no-dev-deps may not be used together with --remove-dev-deps");
+     }
++    if each_feature && feature_powerset {
++        bail!("--each-feature may not be used together with --feature-powerset");
++    }
+ 
+     if subcommand.is_none() {
+         if leading.iter().any(|a| a == "--list") {
+diff --git a/src/main.rs b/src/main.rs
+index 1f6ce04..9acd5da 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,6 +10,7 @@ mod term;
+ mod cli;
+ mod manifest;
+ mod metadata;
++mod package;
+ mod process;
+ mod remove_dev_deps;
+ mod restore;
+@@ -21,7 +22,8 @@ use anyhow::{bail, Context, Error};
+ use crate::{
+     cli::{Args, Coloring},
+     manifest::{find_root_manifest_for_wd, Manifest},
+-    metadata::{Metadata, Package},
++    metadata::Metadata,
++    package::{Kind, Package},
+     process::ProcessBuilder,
+     restore::Restore,
+ };
+@@ -57,8 +59,9 @@ fn exec_on_workspace(args: &Args, current_manifest: &Manifest, metadata: &Metada
+         line.arg(color.as_str());
+     }
+ 
+-    if args.workspace {
+-        for spec in &args.exclude {
++    let mut total = 0;
++    let packages = if args.workspace {
++        args.exclude.iter().for_each(|spec| {
+             if !metadata.packages.iter().any(|package| package.name == *spec) {
+                 warn!(
+                     args.color,
+@@ -67,13 +70,11 @@ fn exec_on_workspace(args: &Args, current_manifest: &Manifest, metadata: &Metada
+                     metadata.workspace_root.display()
+                 );
+             }
+-        }
++        });
+ 
+-        for package in
+-            metadata.packages.iter().filter(|package| !args.exclude.contains(&package.name))
+-        {
+-            exec_on_package(args, package, &line, &restore)?;
+-        }
++        let packages =
++            metadata.packages.iter().filter(|package| !args.exclude.contains(&package.name));
++        Package::from_iter(args, &mut total, packages)?
+     } else if !args.package.is_empty() {
+         if let Some(spec) = args
+             .package
+@@ -83,34 +84,36 @@ fn exec_on_workspace(args: &Args, current_manifest: &Manifest, metadata: &Metada
+             bail!("package ID specification `{}` matched no packages", spec)
+         }
+ 
+-        for package in
+-            metadata.packages.iter().filter(|package| args.package.contains(&package.name))
+-        {
+-            exec_on_package(args, package, &line, &restore)?;
+-        }
++        let packages =
++            metadata.packages.iter().filter(|package| args.package.contains(&package.name));
++        Package::from_iter(args, &mut total, packages)?
+     } else if current_manifest.is_virtual() {
+-        for package in &metadata.packages {
+-            exec_on_package(args, package, &line, &restore)?;
+-        }
+-    } else if !current_manifest.is_virtual() {
++        Package::from_iter(args, &mut total, &metadata.packages)?
++    } else {
+         let current_package = current_manifest.package_name();
+-        let package =
+-            metadata.packages.iter().find(|package| package.name == *current_package).unwrap();
+-        exec_on_package(args, package, &line, &restore)?;
+-    }
++        let package = metadata.packages.iter().find(|package| package.name == *current_package);
++        Package::from_iter(args, &mut total, package)?
++    };
+ 
+-    Ok(())
++    let mut info = Info { total, count: 0 };
++    packages
++        .iter()
++        .try_for_each(|package| exec_on_package(args, package, &line, &restore, &mut info))
++}
++
++struct Info {
++    total: usize,
++    count: usize,
+ }
+ 
+ fn exec_on_package(
+     args: &Args,
+-    package: &Package,
++    package: &Package<'_>,
+     line: &ProcessBuilder,
+     restore: &Restore,
++    info: &mut Info,
+ ) -> Result<()> {
+-    let manifest = Manifest::new(&package.manifest_path)?;
+-
+-    if args.ignore_private && manifest.is_private() {
++    if let Kind::Skip = package.kind {
+         info!(args.color, "skipped running on {}", package.name_verbose(args));
+     } else if args.subcommand.is_some() || args.remove_dev_deps {
+         let mut line = line.clone();
+@@ -118,7 +121,7 @@ fn exec_on_package(
+         line.arg("--manifest-path");
+         line.arg(&package.manifest_path);
+ 
+-        no_dev_deps(args, package, &manifest, &line, restore)?;
++        no_dev_deps(args, package, &line, restore, info)?;
+     }
+ 
+     Ok(())
+@@ -126,99 +129,32 @@ fn exec_on_package(
+ 
+ fn no_dev_deps(
+     args: &Args,
+-    package: &Package,
+-    manifest: &Manifest,
++    package: &Package<'_>,
+     line: &ProcessBuilder,
+     restore: &Restore,
++    info: &mut Info,
+ ) -> Result<()> {
+     if args.no_dev_deps || args.remove_dev_deps {
+-        let new = manifest.remove_dev_deps();
+-        let mut handle = restore.set_manifest(&manifest);
++        let new = package.manifest.remove_dev_deps();
++        let mut handle = restore.set_manifest(&package.manifest);
+ 
+         fs::write(&package.manifest_path, new).with_context(|| {
+             format!("failed to update manifest file: {}", package.manifest_path.display())
+         })?;
+ 
+         if args.subcommand.is_some() {
+-            features(args, package, line)?;
++            package::features(args, package, line, info)?;
+         }
+ 
+         handle.done()?;
+     } else if args.subcommand.is_some() {
+-        features(args, package, line)?;
++        package::features(args, package, line, info)?;
+     }
+ 
+     Ok(())
+ }
+ 
+-fn features(args: &Args, package: &Package, line: &ProcessBuilder) -> Result<()> {
+-    // run with default features
+-    exec_cargo(args, package, line)?;
+-
+-    if (!args.each_feature && !args.feature_powerset) || package.features.is_empty() {
+-        return Ok(());
+-    }
+-
+-    let mut line = line.clone();
+-    line.arg("--no-default-features");
+-
+-    // run with no default features if the package has other features
+-    //
+-    // `default` is not skipped because `cfg(feature = "default")` is work
+-    // if `default` feature specified.
+-    exec_cargo(args, package, &line)?;
+-
+-    if args.each_feature {
+-        each_feature(args, package, &line)
+-    } else if args.feature_powerset {
+-        feature_powerset(args, package, &line)
+-    } else {
+-        Ok(())
+-    }
+-}
+-
+-fn each_feature(args: &Args, package: &Package, line: &ProcessBuilder) -> Result<()> {
+-    package
+-        .features
+-        .iter()
+-        .filter(|(k, _)| (*k != "default" && !args.skip.contains(k)))
+-        .try_for_each(|(feature, _)| {
+-            let mut line = line.clone();
+-            line.append_features(&[feature]);
+-            exec_cargo(args, package, &line)
+-        })
+-}
+-
+-fn feature_powerset(args: &Args, package: &Package, line: &ProcessBuilder) -> Result<()> {
+-    let features: Vec<&String> =
+-        package.features.keys().filter(|k| (*k != "default" && !args.skip.contains(k))).collect();
+-    let powerset = powerset(&features);
+-
+-    // The first element of a powerset is `[]` so it should be skipped.
+-    powerset.into_iter().skip(1).try_for_each(|features| {
+-        let mut line = line.clone();
+-        line.append_features(features);
+-        exec_cargo(args, package, &line)
+-    })
+-}
+-
+-fn exec_cargo(args: &Args, package: &Package, line: &ProcessBuilder) -> Result<()> {
+-    info!(args.color, "running {} on {}", line, package.name_verbose(args));
+-    line.exec()
+-}
+-
+ fn cargo_binary() -> OsString {
+     env::var_os("CARGO_HACK_CARGO_SRC")
+         .unwrap_or_else(|| env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")))
+ }
+-
+-fn powerset<T: Clone>(s: &[T]) -> Vec<Vec<T>> {
+-    s.iter().fold(vec![vec![]], |mut acc, elem| {
+-        let ext = acc.clone().into_iter().map(|mut curr| {
+-            curr.push(elem.clone());
+-            curr
+-        });
+-        acc.extend(ext);
+-        acc
+-    })
+-}
+diff --git a/src/package.rs b/src/package.rs
+new file mode 100644
+index 0000000..d605871
+--- /dev/null
++++ b/src/package.rs
+@@ -0,0 +1,163 @@
++use std::{fmt::Write, ops::Deref};
++
++use crate::*;
++
++pub(crate) fn features(
++    args: &Args,
++    package: &Package<'_>,
++    line: &ProcessBuilder,
++    info: &mut Info,
++) -> Result<()> {
++    Features { args, package, line: line.clone(), info }.exec()
++}
++
++pub(crate) struct Package<'a> {
++    package: &'a metadata::Package,
++    pub(crate) manifest: Manifest,
++    pub(crate) kind: Kind<'a>,
++}
++
++impl<'a> Package<'a> {
++    fn new(
++        args: &'a Args,
++        package: &'a metadata::Package,
++        total: &mut usize,
++    ) -> Result<Option<Self>> {
++        let manifest = Manifest::new(&package.manifest_path)?;
++
++        if args.ignore_private && manifest.is_private() {
++            Ok(Some(Self { package, manifest, kind: Kind::Skip }))
++        } else if args.subcommand.is_some() {
++            let (kind, count) = Kind::collect(args, package);
++            *total += count;
++            Ok(Some(Self { package, manifest, kind }))
++        } else {
++            Ok(None)
++        }
++    }
++
++    pub(crate) fn from_iter(
++        args: &'a Args,
++        total: &mut usize,
++        packages: impl IntoIterator<Item = &'a metadata::Package>,
++    ) -> Result<Vec<Self>> {
++        packages
++            .into_iter()
++            .filter_map(|package| Package::new(args, package, total).transpose())
++            .collect::<Result<Vec<_>>>()
++    }
++}
++
++impl Deref for Package<'_> {
++    type Target = metadata::Package;
++    fn deref(&self) -> &Self::Target {
++        self.package
++    }
++}
++
++pub(crate) enum Kind<'a> {
++    Skip,
++    Nomal { show_progress: bool },
++    Each { features: Vec<&'a String> },
++    Powerset { features: Vec<Vec<&'a String>> },
++}
++
++impl<'a> Kind<'a> {
++    fn collect(args: &'a Args, package: &'a metadata::Package) -> (Self, usize) {
++        if (!args.each_feature && !args.feature_powerset) || package.features.is_empty() {
++            return (Kind::Nomal { show_progress: args.each_feature || args.feature_powerset }, 1);
++        }
++
++        let features =
++            package.features.keys().filter(|k| (*k != "default" && !args.skip.contains(k)));
++        if args.each_feature {
++            let features: Vec<_> = features.collect();
++            // +1: default features
++            // +1: no default features
++            let total = features.len() + 2;
++            (Kind::Each { features }, total)
++        } else if args.feature_powerset {
++            let features = powerset(features);
++            // +1: default features
++            // +1: no default features
++            // -1: the first element of a powerset is `[]`
++            let total = features.len() + 1;
++            (Kind::Powerset { features }, total)
++        } else {
++            unreachable!()
++        }
++    }
++}
++
++struct Features<'a> {
++    args: &'a Args,
++    package: &'a Package<'a>,
++    line: ProcessBuilder,
++    info: &'a mut Info,
++}
++
++impl Features<'_> {
++    fn exec(&mut self) -> Result<()> {
++        if let Kind::Nomal { show_progress } = &self.package.kind {
++            // run with default features
++            return self.exec_cargo(None, *show_progress);
++        }
++
++        // run with default features
++        self.exec_cargo(None, true)?;
++
++        self.line.arg("--no-default-features");
++
++        // run with no default features if the package has other features
++        //
++        // `default` is not skipped because `cfg(feature = "default")` is work
++        // if `default` feature specified.
++        self.exec_cargo(None, true)?;
++
++        match &self.package.kind {
++            Kind::Each { features } => {
++                features.iter().try_for_each(|f| self.exec_cargo_with_features(Some(f)))
++            }
++            Kind::Powerset { features } => {
++                // The first element of a powerset is `[]` so it should be skipped.
++                features.iter().skip(1).try_for_each(|f| self.exec_cargo_with_features(f))
++            }
++            _ => unreachable!(),
++        }
++    }
++
++    fn exec_cargo_with_features(
++        &mut self,
++        features: impl IntoIterator<Item = impl AsRef<str>>,
++    ) -> Result<()> {
++        let mut line = self.line.clone();
++        line.append_features(features);
++        self.exec_cargo(Some(&line), true)
++    }
++
++    fn exec_cargo(&mut self, line: Option<&ProcessBuilder>, show_progress: bool) -> Result<()> {
++        let line = line.unwrap_or(&self.line);
++        self.info.count += 1;
++
++        // running `<command>` on <package> (<count>/<total>)
++        let mut msg = String::new();
++        write!(msg, "running {} on {}", line, &self.package.name).unwrap();
++        if show_progress {
++            write!(msg, " ({}/{})", self.info.count, self.info.total).unwrap();
++        }
++        info!(self.args.color, "{}", msg);
++
++        line.exec()
++    }
++}
++
++fn powerset<'a, T>(iter: impl IntoIterator<Item = &'a T>) -> Vec<Vec<&'a T>> {
++    iter.into_iter().fold(vec![vec![]], |mut acc, elem| {
++        let ext = acc.clone().into_iter().map(|mut curr| {
++            curr.push(elem);
++            curr
++        });
++        acc.extend(ext);
++        acc
++    })
++}
+diff --git a/src/process.rs b/src/process.rs
+index a21b054..fc610c0 100644
+--- a/src/process.rs
++++ b/src/process.rs
+@@ -9,7 +9,7 @@ use std::{
+ 
+ use anyhow::Context;
+ 
+-use crate::{Args, Package, Result};
++use crate::{metadata::Package, Args, Result};
+ 
+ // Based on https://github.com/rust-lang/cargo/blob/0.39.0/src/cargo/util/process_builder.rs
+ 
+@@ -74,7 +74,7 @@ impl ProcessBuilder {
+                     // ignored
+                     info!(
+                         args.color,
+-                        "skipped applying unknown `{}` feature to {}", f, package.name
++                        "skipped applying unknown `{}` feature to {}", f, package.name,
+                     );
+                     false
+                 }

@@ -1,0 +1,138 @@
+diff --git a/hypothesis-python/RELEASE.rst b/hypothesis-python/RELEASE.rst
+new file mode 100644
+index 000000000..0f6e317c1
+--- /dev/null
++++ b/hypothesis-python/RELEASE.rst
+@@ -0,0 +1,5 @@
++RELEASE_TYPE: patch
++
++This patch improves the performance of :func:`~hypothesis.strategies.from_type` with
++`pydantic.types.condate <https://docs.pydantic.dev/latest/api/types/#pydantic.types.condate>`__
++(:issue:`4000`).
+diff --git a/hypothesis-python/src/hypothesis/internal/filtering.py b/hypothesis-python/src/hypothesis/internal/filtering.py
+index 4d0435c51..f10ff8cfc 100644
+--- a/hypothesis-python/src/hypothesis/internal/filtering.py
++++ b/hypothesis-python/src/hypothesis/internal/filtering.py
+@@ -236,9 +236,9 @@ def get_numeric_predicate_bounds(predicate: Predicate) -> ConstructivePredicate:
+         options = {
+             # We're talking about op(arg, x) - the reverse of our usual intuition!
+             operator.lt: {"min_value": arg, "exclude_min": True},  # lambda x: arg < x
+-            operator.le: {"min_value": arg},  # lambda x: arg <= x
+-            operator.eq: {"min_value": arg, "max_value": arg},  # lambda x: arg == x
+-            operator.ge: {"max_value": arg},  # lambda x: arg >= x
++            operator.le: {"min_value": arg},  #                      lambda x: arg <= x
++            operator.eq: {"min_value": arg, "max_value": arg},  #    lambda x: arg == x
++            operator.ge: {"max_value": arg},  #                      lambda x: arg >= x
+             operator.gt: {"max_value": arg, "exclude_max": True},  # lambda x: arg > x
+             # Special-case our default predicates for length bounds
+             min_len: {"min_value": arg, "len": True},
+diff --git a/hypothesis-python/src/hypothesis/provisional.py b/hypothesis-python/src/hypothesis/provisional.py
+index d71757fa2..06e829f3c 100644
+--- a/hypothesis-python/src/hypothesis/provisional.py
++++ b/hypothesis-python/src/hypothesis/provisional.py
+@@ -19,6 +19,7 @@ definitions it links to.  If not, report the bug!
+ # https://tools.ietf.org/html/rfc3696
+ 
+ import string
++from functools import lru_cache
+ from importlib import resources
+ from typing import Optional
+ 
+@@ -31,15 +32,17 @@ URL_SAFE_CHARACTERS = frozenset(string.ascii_letters + string.digits + "$-_.+!*'
+ FRAGMENT_SAFE_CHARACTERS = URL_SAFE_CHARACTERS | {"?", "/"}
+ 
+ 
+-# This file is sourced from http://data.iana.org/TLD/tlds-alpha-by-domain.txt
+-# The file contains additional information about the date that it was last updated.
+-traversable = resources.files("hypothesis.vendor") / "tlds-alpha-by-domain.txt"
+-_comment, *_tlds = traversable.read_text(encoding="utf-8").splitlines()
+-assert _comment.startswith("#")
++@lru_cache(maxsize=1)
++def get_top_level_domains() -> tuple[str, ...]:
++    # This file is sourced from http://data.iana.org/TLD/tlds-alpha-by-domain.txt
++    # The file contains additional information about the date that it was last updated.
++    traversable = resources.files("hypothesis.vendor") / "tlds-alpha-by-domain.txt"
++    _comment, *_tlds = traversable.read_text(encoding="utf-8").splitlines()
++    assert _comment.startswith("#")
+ 
+-# Remove special-use domain names from the list. For more discussion
+-# see https://github.com/HypothesisWorks/hypothesis/pull/3572
+-TOP_LEVEL_DOMAINS = ["COM", *sorted((d for d in _tlds if d != "ARPA"), key=len)]
++    # Remove special-use domain names from the list. For more discussion
++    # see https://github.com/HypothesisWorks/hypothesis/pull/3572
++    return ("COM", *sorted((d for d in _tlds if d != "ARPA"), key=len))
+ 
+ 
+ class DomainNameStrategy(st.SearchStrategy):
+@@ -101,7 +104,7 @@ class DomainNameStrategy(st.SearchStrategy):
+         # prevent us from generating at least a 1 character subdomain.
+         # 3 - Randomize the TLD between upper and lower case characters.
+         domain = data.draw(
+-            st.sampled_from(TOP_LEVEL_DOMAINS)
++            st.sampled_from(get_top_level_domains())
+             .filter(lambda tld: len(tld) + 2 <= self.max_length)
+             .flatmap(
+                 lambda tld: st.tuples(
+diff --git a/hypothesis-python/src/hypothesis/strategies/_internal/datetime.py b/hypothesis-python/src/hypothesis/strategies/_internal/datetime.py
+index 581b3ac3c..12f5154ad 100644
+--- a/hypothesis-python/src/hypothesis/strategies/_internal/datetime.py
++++ b/hypothesis-python/src/hypothesis/strategies/_internal/datetime.py
+@@ -9,9 +9,10 @@
+ # obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ import datetime as dt
++import operator as op
+ import zoneinfo
+ from calendar import monthrange
+-from functools import lru_cache
++from functools import lru_cache, partial
+ from importlib import resources
+ from pathlib import Path
+ from typing import Optional
+@@ -19,7 +20,7 @@ from typing import Optional
+ from hypothesis.errors import InvalidArgument
+ from hypothesis.internal.validation import check_type, check_valid_interval
+ from hypothesis.strategies._internal.core import sampled_from
+-from hypothesis.strategies._internal.misc import just, none
++from hypothesis.strategies._internal.misc import just, none, nothing
+ from hypothesis.strategies._internal.strategies import SearchStrategy
+ from hypothesis.strategies._internal.utils import defines_strategy
+ 
+@@ -267,6 +268,37 @@ class DateStrategy(SearchStrategy):
+             **draw_capped_multipart(data, self.min_value, self.max_value, DATENAMES)
+         )
+ 
++    def filter(self, condition):
++        if (
++            isinstance(condition, partial)
++            and len(args := condition.args) == 1
++            and not condition.keywords
++            and isinstance(arg := args[0], dt.date)
++            and condition.func in (op.lt, op.le, op.eq, op.ge, op.gt)
++        ):
++            try:
++                arg += dt.timedelta(days={op.lt: 1, op.gt: -1}.get(condition.func, 0))
++            except OverflowError:  # gt date.max, or lt date.min
++                return nothing()
++            lo, hi = {
++                # We're talking about op(arg, x) - the reverse of our usual intuition!
++                op.lt: (arg, self.max_value),  # lambda x: arg < x
++                op.le: (arg, self.max_value),  # lambda x: arg <= x
++                op.eq: (arg, arg),  #            lambda x: arg == x
++                op.ge: (self.min_value, arg),  # lambda x: arg >= x
++                op.gt: (self.min_value, arg),  # lambda x: arg > x
++            }[condition.func]
++            lo = max(lo, self.min_value)
++            hi = min(hi, self.max_value)
++            print(lo, hi)
++            if hi < lo:
++                return nothing()
++            if lo <= self.min_value and self.max_value <= hi:
++                return self
++            return dates(lo, hi)
++
++        return super().filter(condition)
++
+ 
+ @defines_strategy(force_reusable_values=True)
+ def dates(

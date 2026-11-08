@@ -1,0 +1,781 @@
+diff --git a/README.md b/README.md
+index 904fcb5..68fbe0b 100644
+--- a/README.md
++++ b/README.md
+@@ -34,9 +34,9 @@ There are lots of things to do. Just list some as below.
+ | Catalog Maintain | Todo |
+ | Statistics Definition | Todo |
+ | Statistics Maintain | Todo |
+-| Optimizer Framework | Todo |
++| Optimizer Framework | In progress |
+ | Cost Model | Todo |
+-| Optimizer implementation | Todo |
++| Optimizer implementation | In progress |
+ | Plan Cache | Todo |
+ | Physical Plan Definition | Todo |
+ | Execution Framework | Todo |
+diff --git a/xngin-frontend/src/parser/mod.rs b/xngin-frontend/src/parser/mod.rs
+index 8a0f6a8..068f5f1 100644
+--- a/xngin-frontend/src/parser/mod.rs
++++ b/xngin-frontend/src/parser/mod.rs
+@@ -405,17 +405,6 @@ parse!(
+     }
+ );
+ 
+-// fn spcmt0x<'a, I: ParseInput<'a>, E: ParseError<I>>(i: I) -> () {
+-//     fold_many0(
+-//         alt((
+-//             value((), multispace1),
+-//             value((), comment),
+-//         )),
+-//         || (),
+-//         |_, _| (),
+-//     )(i)
+-// }
+-
+ parse!(
+     /// Parse at least one whitespace or comment.
+     fn spcmt1 -> () = {
+diff --git a/xngin-plan/src/error.rs b/xngin-plan/src/error.rs
+index 33ad67a..1845b6a 100644
+--- a/xngin-plan/src/error.rs
++++ b/xngin-plan/src/error.rs
+@@ -83,6 +83,8 @@ pub enum Error {
+     InvalidOpertorTransformation,
+     #[error("Invalid join condition")]
+     InvalidJoinCondition,
++    #[error("Join estimation not support")]
++    JoinEstimationNotSupport,
+     #[error("Cross join not supported")]
+     CrossJoinNotSupport,
+     #[error("Break")]
+diff --git a/xngin-plan/src/join/estimate.rs b/xngin-plan/src/join/estimate.rs
+new file mode 100644
+index 0000000..3305945
+--- /dev/null
++++ b/xngin-plan/src/join/estimate.rs
+@@ -0,0 +1,21 @@
++use crate::error::Result;
++use crate::join::graph::VertexSet;
++use crate::join::JoinKind;
++use xngin_expr::Expr;
++
++/// Estimates the row count of queries and joins.
++/// Query is represented by VertexSet and Join is represented
++/// by two VertexSet with join conditions and filter predicates.
++pub trait Estimate {
++    fn estimated_qry_rows(&mut self, vset: VertexSet) -> Result<f64>;
++
++    fn estimated_join_rows(
++        &mut self,
++        kind: JoinKind,
++        l_vset: VertexSet,
++        r_vset: VertexSet,
++        e_vset: VertexSet,
++        cond: &[Expr],
++        filt: &[Expr],
++    ) -> Result<f64>;
++}
+diff --git a/xngin-plan/src/join/graph.rs b/xngin-plan/src/join/graph.rs
+index 4062abb..17b0bc7 100644
+--- a/xngin-plan/src/join/graph.rs
++++ b/xngin-plan/src/join/graph.rs
+@@ -1,3 +1,4 @@
++use crate::error::{Error, Result};
+ use crate::join::JoinKind;
+ use crate::op::Op;
+ use indexmap::IndexMap;
+@@ -37,6 +38,51 @@ impl Graph {
+     }
+ }
+ 
++#[allow(dead_code)]
++#[inline]
++pub(crate) fn qid_to_vid(map: &HashMap<QueryID, VertexID>, qid: QueryID) -> Result<VertexID> {
++    map.get(&qid).cloned().ok_or(Error::QueryNotFound(qid))
++}
++
++#[inline]
++pub(crate) fn vid_to_qid(map: &HashMap<VertexID, QueryID>, vid: VertexID) -> Result<QueryID> {
++    map.get(&vid).cloned().ok_or(Error::InvalidJoinVertexSet)
++}
++
++#[inline]
++pub(crate) fn qids_to_vset<'a, I>(map: &HashMap<QueryID, VertexID>, qry_ids: I) -> Result<VertexSet>
++where
++    I: IntoIterator<Item = &'a QueryID>,
++{
++    let mut vset = VertexSet::default();
++    for qry_id in qry_ids {
++        if let Some(vid) = map.get(qry_id) {
++            vset |= *vid;
++        } else {
++            return Err(Error::QueryNotFound(*qry_id));
++        }
++    }
++    Ok(vset)
++}
++
++#[allow(dead_code)]
++#[inline]
++pub(crate) fn vset_to_qids<C>(map: &HashMap<VertexID, QueryID>, vset: VertexSet) -> Result<C>
++where
++    C: FromIterator<QueryID>,
++{
++    if let Some(vid) = vset.single() {
++        map.get(&vid)
++            .cloned()
++            .ok_or(Error::InvalidJoinVertexSet)
++            .map(|qid| std::iter::once(qid).collect::<C>())
++    } else {
++        vset.into_iter()
++            .map(|vid| map.get(&vid).cloned().ok_or(Error::InvalidJoinVertexSet))
++            .collect::<Result<C>>()
++    }
++}
++
+ /// Edge of join graph.
+ /// This is the "hyperedge" introduced in paper
+ /// "Dynamic Programming Strikes Back".
+@@ -64,7 +110,7 @@ pub struct Edge {
+     pub filt: Vec<Expr>,
+ }
+ 
+-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ pub struct VertexSet {
+     // Use bitmap to encode query id as vertexes in the graph
+     bits: u32,
+@@ -124,6 +170,24 @@ impl IntoIterator for VertexSet {
+     }
+ }
+ 
++impl FromIterator<VertexSet> for VertexSet {
++    #[inline]
++    fn from_iter<T: IntoIterator<Item = VertexSet>>(iter: T) -> Self {
++        let mut res = VertexSet::default();
++        for it in iter {
++            res |= it;
++        }
++        res
++    }
++}
++
++impl From<VertexID> for VertexSet {
++    #[inline]
++    fn from(src: VertexID) -> Self {
++        VertexSet { bits: src.0 }
++    }
++}
++
+ pub struct Iter {
+     bits: u32,
+     value: u32,
+@@ -192,5 +256,5 @@ impl BitAndAssign for VertexSet {
+     }
+ }
+ 
+-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ pub struct VertexID(pub(crate) u32);
+diff --git a/xngin-plan/src/join/mod.rs b/xngin-plan/src/join/mod.rs
+index 00a064c..a0dec13 100644
+--- a/xngin-plan/src/join/mod.rs
++++ b/xngin-plan/src/join/mod.rs
+@@ -1,4 +1,6 @@
++pub mod estimate;
+ pub mod graph;
++pub mod reorder;
+ 
+ use crate::error::{Error, Result};
+ use crate::op::Op;
+diff --git a/xngin-plan/src/join/reorder/greedy.rs b/xngin-plan/src/join/reorder/greedy.rs
+new file mode 100644
+index 0000000..ffe69b9
+--- /dev/null
++++ b/xngin-plan/src/join/reorder/greedy.rs
+@@ -0,0 +1,174 @@
++use crate::error::{Error, Result};
++use crate::join::estimate::Estimate;
++use crate::join::graph::{vid_to_qid, Edge, Graph, VertexSet};
++use crate::join::reorder::Reorder;
++use crate::join::{JoinKind, JoinOp};
++use crate::op::Op;
++use indexmap::IndexMap;
++use smallvec::{smallvec, SmallVec};
++use std::borrow::Cow;
++use std::collections::BTreeMap;
++use std::mem;
++
++/// Goo stands for Greedy Operator Ordering.
++/// It's a greedy algorithm to generate bushy tree.
++/// The core of this algorithm is greedily combine join trees
++/// such that intermediate result is minimal.
++pub struct Goo<E>(E);
++
++impl<E> Goo<E> {
++    #[inline]
++    pub fn new(est: E) -> Self {
++        Goo(est)
++    }
++}
++
++impl<E: Estimate> Reorder for Goo<E> {
++    #[inline]
++    fn reorder(mut self, graph: &Graph) -> Result<Op> {
++        let mut joined = BTreeMap::new();
++        let mut edges: IndexMap<VertexSet, Vec<&Edge>> = graph
++            .edges
++            .iter()
++            .map(|(vset, es)| (*vset, es.iter().collect()))
++            .collect();
++        // initialize single queries.
++        for vid in graph.vertexes {
++            // trigger estimation on single table
++            let _ = self.0.estimated_qry_rows(VertexSet::from(vid))?;
++            let qid = vid_to_qid(&graph.vmap, vid)?;
++            let op = Op::Query(qid);
++            joined.insert(VertexSet::from(vid), op);
++        }
++        // combine join sets until only one join left.
++        while joined.len() > 1 {
++            if edges.is_empty() {
++                return Err(Error::CrossJoinNotSupport);
++            }
++            let (e, pks) = min_res(&edges, &mut self.0, &joined)?;
++            for (k0, k1) in pks {
++                let es = edges.get_mut(&k0).unwrap();
++                if es.len() == 1 {
++                    edges.remove(&k0).unwrap();
++                } else {
++                    let pos = es.iter().position(|e| e.e_vset == k1).unwrap();
++                    es.remove(pos);
++                }
++            }
++            let vset = e.l_vset | e.r_vset;
++            let l = joined.remove(&e.l_vset).unwrap();
++            let r = joined.remove(&e.r_vset).unwrap();
++            let edge = e.edge.into_owned();
++            let op = Op::qualified_join(
++                edge.kind,
++                JoinOp::try_from(l)?,
++                JoinOp::try_from(r)?,
++                edge.cond,
++                edge.filt,
++            );
++            joined.insert(vset, op);
++        }
++        joined
++            .into_values()
++            .next()
++            .ok_or(Error::InvalidJoinTransformation)
++    }
++}
++
++fn min_res<'a, E: Estimate>(
++    edges: &IndexMap<VertexSet, Vec<&'a Edge>>,
++    est: &mut E,
++    join_map: &BTreeMap<VertexSet, Op>,
++) -> Result<(MinEdge<'a>, PurgeKeys)> {
++    let mut min_edge: Option<MinEdge> = None;
++    let mut min_purge: PurgeKeys = smallvec![];
++    let mut purge = smallvec![];
++    for vi in join_map.keys() {
++        for vj in join_map.keys().filter(|k| *k > vi) {
++            for (vset, es) in edges {
++                for new_edge in es {
++                    if (*vi | *vj).includes(new_edge.e_vset) {
++                        // pass join eligibility check
++                        // Identify the exact left side and right side.
++                        let (l_vset, r_vset) = {
++                            let l = new_edge.e_vset & new_edge.l_vset;
++                            let r = new_edge.e_vset & new_edge.r_vset;
++                            if vi.includes(l) && vj.includes(r) {
++                                (*vi, *vj)
++                            } else if vi.includes(r) && vj.includes(l) {
++                                (*vj, *vi)
++                            } else {
++                                return Err(Error::InvalidJoinTransformation);
++                            }
++                        };
++                        let key = (*vset, new_edge.e_vset);
++                        purge.push(key);
++                        let mut join_edge = Cow::Borrowed(*new_edge);
++                        // For inner join, there might be multiple edges that can join two sides.
++                        // Traverse all edges again to find if any other edge can be merged into current one.
++                        // e.g. "A JOIN B ON a1 = b1 JOIN C ON b1 = c1 AND a1 = c1"
++                        // Such that we have three edges: [{A<=>B}, {B<=>C}, {A<=>C}]
++                        // If we join A, B together first, then there are two edges can be merged in next join
++                        // because all three table are present in second join.
++                        if join_edge.kind == JoinKind::Inner {
++                            for (merge_vset, mes) in &*edges {
++                                for merge_edge in mes {
++                                    if merge_edge.kind == JoinKind::Inner
++                                        && (*merge_vset, merge_edge.e_vset) != key
++                                        && (l_vset | r_vset).includes(merge_edge.e_vset)
++                                    {
++                                        // merge this edge into join edge, only update join condition and eligibility set.
++                                        let je = join_edge.to_mut();
++                                        je.cond.extend_from_slice(&merge_edge.cond);
++                                        je.e_vset |= merge_edge.e_vset;
++                                        purge.push((*merge_vset, merge_edge.e_vset));
++                                    }
++                                }
++                            }
++                        }
++                        // now we can estimate join rows and choose the best plan
++                        let rows = est.estimated_join_rows(
++                            join_edge.kind,
++                            l_vset,
++                            r_vset,
++                            join_edge.e_vset,
++                            &join_edge.cond,
++                            &join_edge.filt,
++                        )?;
++                        if let Some(min_edge) = min_edge.as_mut() {
++                            if rows < min_edge.rows {
++                                min_edge.l_vset = l_vset;
++                                min_edge.r_vset = r_vset;
++                                min_edge.edge = join_edge;
++                                min_edge.rows = rows;
++                                mem::swap(&mut min_purge, &mut purge);
++                            }
++                        } else {
++                            min_edge = Some(MinEdge {
++                                l_vset,
++                                r_vset,
++                                edge: join_edge,
++                                rows,
++                            });
++                            mem::swap(&mut min_purge, &mut purge);
++                        }
++                        purge.clear();
++                    }
++                }
++            }
++        }
++    }
++    min_edge
++        .map(|e| (e, min_purge))
++        .ok_or(Error::InvalidJoinVertexSet)
++}
++
++type PurgeKey = (VertexSet, VertexSet);
++type PurgeKeys = SmallVec<[PurgeKey; 2]>;
++
++struct MinEdge<'a> {
++    l_vset: VertexSet,
++    r_vset: VertexSet,
++    edge: Cow<'a, Edge>,
++    rows: f64,
++}
+diff --git a/xngin-plan/src/join/reorder/mod.rs b/xngin-plan/src/join/reorder/mod.rs
+new file mode 100644
+index 0000000..913868c
+--- /dev/null
++++ b/xngin-plan/src/join/reorder/mod.rs
+@@ -0,0 +1,331 @@
++pub(crate) mod greedy;
++
++use crate::error::{Error, Result};
++use crate::join::graph::{vid_to_qid, Graph, VertexSet};
++use crate::join::{JoinKind, JoinOp};
++use crate::op::{Op, OpMutVisitor};
++use crate::query::{QueryPlan, QuerySet};
++use std::collections::HashMap;
++use std::mem;
++use xngin_expr::controlflow::{Branch, ControlFlow, Unbranch};
++use xngin_expr::QueryID;
++
++// Export GOO algorithm
++pub use greedy::Goo;
++
++/// Entry to perform join reorder.
++#[inline]
++pub fn join_reorder<R, F>(plan: &mut QueryPlan, mut f: F) -> Result<()>
++where
++    R: Reorder,
++    F: FnMut() -> R,
++{
++    for qid in &plan.attaches {
++        reorder_join(&mut plan.qry_set, *qid, &mut f)?
++    }
++    reorder_join(&mut plan.qry_set, plan.root, &mut f)
++}
++
++fn reorder_join<R, F>(qry_set: &mut QuerySet, qry_id: QueryID, f: &mut F) -> Result<()>
++where
++    R: Reorder,
++    F: FnMut() -> R,
++{
++    struct S<'a, F>(&'a mut QuerySet, &'a mut F);
++    impl<'a, R, F> OpMutVisitor for S<'a, F>
++    where
++        R: Reorder,
++        F: FnMut() -> R,
++    {
++        type Cont = ();
++        type Break = Error;
++        #[inline]
++        fn enter(&mut self, op: &mut Op) -> ControlFlow<Error> {
++            match op {
++                Op::Query(qry_id) => reorder_join(self.0, *qry_id, self.1).branch(),
++                Op::JoinGraph(_) => {
++                    let graph = mem::take(op);
++                    if let Op::JoinGraph(g) = graph {
++                        let r = (self.1)();
++                        let new = r.reorder(g.as_ref()).branch()?;
++                        *op = new;
++                        ControlFlow::Continue(())
++                    } else {
++                        unreachable!()
++                    }
++                }
++                _ => ControlFlow::Continue(()),
++            }
++        }
++    }
++    qry_set.transform_op(qry_id, |qry_set, _, op| {
++        let mut s = S(qry_set, f);
++        op.walk_mut(&mut s).unbranch()
++    })?
++}
++
++/// Reorder the join graph and reconstruct as operator tree.
++pub trait Reorder {
++    fn reorder(self, graph: &Graph) -> Result<Op>;
++}
++
++/// Sequential converts the join graph back to join tree
++/// in original order.
++pub struct Sequential;
++
++impl Reorder for Sequential {
++    fn reorder(self, graph: &Graph) -> Result<Op> {
++        // let mut vset = VertexSet::default();
++        let mut joined = HashMap::new();
++        // insert all vertexes back
++        for vid in graph.vertexes {
++            let qid = vid_to_qid(&graph.vmap, vid)?;
++            joined.insert(VertexSet::from(vid), Op::Query(qid));
++        }
++
++        for (vset, edges) in &graph.edges {
++            if edges.len() == 1 {
++                let edge = &edges[0];
++                let l = joined
++                    .remove(&edge.l_vset)
++                    .ok_or(Error::InvalidJoinVertexSet)?;
++                let r = joined
++                    .remove(&edge.r_vset)
++                    .ok_or(Error::InvalidJoinVertexSet)?;
++                let op = Op::qualified_join(
++                    edge.kind,
++                    JoinOp::try_from(l)?,
++                    JoinOp::try_from(r)?,
++                    edge.cond.clone(),
++                    edge.filt.clone(),
++                );
++                joined.insert(*vset, op);
++            } else {
++                // only inner join could have multiple join edges, we fold them into one.
++                // e.g. A JOIN B ON a1 = b1 JOIN C ON a1 = c1 AND b1 = c1
++                // In above case, we will have two edges to join A, B, C together.
++                // vset(ABC) => [ edge(A <=> C), edge(B <=> C) ]
++                // So we fold two edges into one, rebuild the join.
++                assert!(edges.iter().all(|e| e.kind == JoinKind::Inner));
++                let e1 = &edges[0];
++                // use first edge to retrieve both sides from joined list
++                let mut l_vset = VertexSet::default();
++                let mut r_vset = VertexSet::default();
++                for vset in joined.keys() {
++                    if vset.includes(e1.l_vset) {
++                        l_vset = *vset;
++                    } else if vset.includes(e1.r_vset) {
++                        r_vset = *vset;
++                    }
++                }
++                if l_vset.is_empty() || r_vset.is_empty() {
++                    return Err(Error::InvalidJoinVertexSet);
++                }
++                // check if all edges are included in two sides
++                assert!(edges.iter().all(|e| {
++                    (l_vset.includes(e.l_vset) && r_vset.includes(e.r_vset))
++                        || (l_vset.includes(e.r_vset) && r_vset.includes(e.l_vset))
++                }));
++                let l = joined.remove(&l_vset).ok_or(Error::InvalidJoinVertexSet)?;
++                let r = joined.remove(&r_vset).ok_or(Error::InvalidJoinVertexSet)?;
++                let cond: Vec<_> = edges.iter().flat_map(|e| e.cond.iter()).cloned().collect();
++                let op = Op::qualified_join(
++                    JoinKind::Inner,
++                    JoinOp::try_from(l)?,
++                    JoinOp::try_from(r)?,
++                    cond,
++                    vec![],
++                );
++                joined.insert(*vset, op);
++            }
++        }
++        // finally there should be only one single join operator and we retrieve it
++        assert_eq!(1, joined.len());
++        let op = joined.into_values().next().unwrap();
++        Ok(op)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::builder::tests::{
++        assert_j_plan1, extract_join_kinds, get_join_graph, get_tbl_id, j_catalog, print_plan,
++        table_map,
++    };
++    use crate::join::estimate::Estimate;
++    use crate::rule::joingraph_initialize;
++    use xngin_catalog::TableID;
++
++    #[test]
++    fn test_join_reorder_sequential() {
++        let cat = j_catalog();
++        for (s, jks) in vec![
++            ("select 1 from t1 join t2 on t1.c1 = t2.c1", vec!["inner"]),
++            ("select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t1.c1 = t3.c1", vec!["inner", "inner"]),
++            ("select 1 from t1 join t2 on t1.c1 = t2.c1 left join t3 on t1.c1 = t3.c1", vec!["left", "inner"]),
++            ("select 1 from t1 left join t2 on t1.c1 = t2.c1 join t3 on t1.c1 = t3.c1", vec!["inner", "left"]),
++            ("select 1 from t0 full join t1 on t0.c0 = t1.c0 join t2 on t1.c1 = t2.c1 left join t3 on t2.c2 = t3.c2", vec!["left", "inner", "full"]),
++            ("select 1 from t1 left join t2 on t1.c1 = t2.c1 join t3 on t1.c1 = t3.c1 and t2.c1 = t3.c1", vec!["inner", "left"]),
++        ] {
++            assert_j_plan1(&cat, s, |s, mut q| {
++                joingraph_initialize(&mut q.qry_set, q.root).unwrap();
++                join_reorder(&mut q, || Sequential).unwrap();
++                print_plan(s, &q);
++                let subq = q.root_query().unwrap();
++                assert_eq!(jks, extract_join_kinds(&subq.root))
++            })
++        }
++    }
++
++    #[test]
++    fn test_join_reorder_greedy() {
++        use crate::op::OpKind::*;
++        let cat = j_catalog();
++        let tbl_map = table_map(&*cat, "j", vec!["t0", "t1", "t2", "t3"]);
++        for (s, qrs, js, jss, shape) in vec![
++            (
++                "select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t2.c1 = t3.c1",
++                vec![("t1", 100.0), ("t2", 100.0), ("t3", 100.0)],
++                vec![("t1", "t2", 0.1), ("t2", "t3", 0.2)],
++                vec![],
++                vec![Proj, Join, Join, Proj, Table, Proj, Table, Proj, Table],
++            ),
++            (
++                "select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t2.c1 = t3.c1",
++                vec![("t1", 100.0), ("t2", 100.0), ("t3", 100.0)],
++                vec![("t1", "t2", 0.2), ("t2", "t3", 0.1)],
++                vec![],
++                vec![Proj, Join, Proj, Table, Join, Proj, Table, Proj, Table],
++            ),
++            (
++                "select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t2.c1 = t3.c1 and t1.c1 = t3.c1",
++                vec![("t1", 100.0), ("t2", 100.0), ("t3", 100.0)],
++                vec![("t1", "t2", 0.2), ("t2", "t3", 0.1), ("t1", "t3", 0.01)],
++                // suppost final result 0.02
++                vec![(vec!["t1"], vec!["t2", "t3"], 0.2), (vec!["t1", "t2"], vec!["t3"], 1.0), (vec!["t1", "t3"], vec!["t2"], 2.0)],
++                vec![Proj, Join, Join, Proj, Table, Proj, Table, Proj, Table],
++            ),
++        ] {
++            assert_j_plan1(&cat, s, |s, mut q| {
++                joingraph_initialize(&mut q.qry_set, q.root).unwrap();
++                let subq = q.root_query().unwrap();
++                let graph = get_join_graph(subq).unwrap();
++                let qmap = build_qry_map(&mut q.qry_set, &graph, &tbl_map);
++                let est = preset_estimator(qmap, qrs, js,jss);
++                join_reorder(&mut q, || Goo::new(est.clone())).unwrap();
++                print_plan(s, &q);
++                assert_eq!(shape, q.shape());
++            })
++        }
++    }
++
++    // Simple estimator with presettings based on query set.
++    // The join kind, condition and filter predicates are all ignored.
++    #[derive(Debug, Default, Clone)]
++    struct PresetEstimator {
++        // rows per query
++        qmap: HashMap<VertexSet, f64>,
++        // selectivity per join
++        jmap: HashMap<(VertexSet, VertexSet), f64>,
++    }
++
++    impl PresetEstimator {
++        fn add_qry(&mut self, vid: VertexSet, count: f64) {
++            self.qmap.insert(vid, count);
++        }
++
++        fn add_join(&mut self, l_vset: VertexSet, r_vset: VertexSet, count: f64) {
++            self.jmap.insert((l_vset, r_vset), count);
++            self.jmap.insert((r_vset, l_vset), count);
++        }
++    }
++
++    impl Estimate for PresetEstimator {
++        #[inline]
++        fn estimated_qry_rows(&mut self, vset: VertexSet) -> Result<f64> {
++            self.qmap
++                .get(&vset)
++                .cloned()
++                .ok_or(Error::JoinEstimationNotSupport)
++        }
++
++        #[inline]
++        fn estimated_join_rows(
++            &mut self,
++            _kind: JoinKind,
++            l_vset: VertexSet,
++            r_vset: VertexSet,
++            e_vset: VertexSet,
++            _cond: &[xngin_expr::Expr],
++            _filt: &[xngin_expr::Expr],
++        ) -> Result<f64> {
++            match (
++                self.qmap.get(&l_vset).cloned(),
++                self.qmap.get(&r_vset).cloned(),
++            ) {
++                (Some(l_rows), Some(r_rows)) => {
++                    if let Some(sel) = self.jmap.get(&(e_vset & l_vset, e_vset & r_vset)).cloned() {
++                        let rows = l_rows * r_rows * sel;
++                        self.qmap.insert(l_vset | r_vset, rows);
++                        Ok(rows)
++                    } else {
++                        Err(Error::JoinEstimationNotSupport)
++                    }
++                }
++                _ => Err(Error::JoinEstimationNotSupport),
++            }
++        }
++    }
++
++    fn build_qry_map(
++        qry_set: &mut QuerySet,
++        graph: &Graph,
++        tbl_map: &HashMap<&'static str, TableID>,
++    ) -> HashMap<&'static str, VertexSet> {
++        let mut t2v = HashMap::new();
++        for vid in graph.vertexes {
++            let qid = graph.vmap.get(&vid).cloned().unwrap();
++            let tbl_id = get_tbl_id(qry_set, qid).unwrap();
++            t2v.insert(tbl_id, VertexSet::from(vid));
++        }
++        let mut s2v = HashMap::new();
++        for (tn, tbl_id) in tbl_map.iter() {
++            if let Some(vset) = t2v.get(tbl_id) {
++                s2v.insert(*tn, *vset);
++            }
++        }
++        s2v
++    }
++
++    fn preset_estimator(
++        map: HashMap<&'static str, VertexSet>,
++        qry_rows: Vec<(&'static str, f64)>,
++        join_sels: Vec<(&'static str, &'static str, f64)>,
++        joinset_sels: Vec<(Vec<&'static str>, Vec<&'static str>, f64)>,
++    ) -> PresetEstimator {
++        let mut est = PresetEstimator::default();
++        for (q, rows) in qry_rows {
++            if let Some(vid) = map.get(q) {
++                est.add_qry(*vid, rows);
++            }
++        }
++        for (lq, rq, sel) in join_sels {
++            let l_vset = map.get(lq).unwrap();
++            let r_vset = map.get(rq).unwrap();
++            est.add_join(*l_vset, *r_vset, sel);
++        }
++        for (lqs, rqs, sel) in joinset_sels {
++            let l_vset: VertexSet = lqs
++                .into_iter()
++                .map(|q| map.get(q).cloned().unwrap())
++                .collect();
++            let r_vset: VertexSet = rqs
++                .into_iter()
++                .map(|q| map.get(q).cloned().unwrap())
++                .collect();
++            est.add_join(l_vset, r_vset, sel);
++        }
++        est
++    }
++}
+diff --git a/xngin-plan/src/rule/joingraph_initialize.rs b/xngin-plan/src/rule/joingraph_initialize.rs
+index 0cbe424..fb97abc 100644
+--- a/xngin-plan/src/rule/joingraph_initialize.rs
++++ b/xngin-plan/src/rule/joingraph_initialize.rs
+@@ -1,5 +1,5 @@
+ use crate::error::{Error, Result};
+-use crate::join::graph::{Edge, VertexID, VertexSet, MAX_JOIN_QUERIES};
++use crate::join::graph::{qids_to_vset, Edge, VertexID, VertexSet, MAX_JOIN_QUERIES};
+ use crate::join::{Join, JoinGraph, JoinKind, JoinOp, QualifiedJoin};
+ use crate::op::{Op, OpMutVisitor};
+ use crate::query::{Location, QuerySet};
+@@ -169,7 +169,7 @@ impl BuildGraph<'_> {
+                             // for inner join, there must be two tables involved in join condition,
+                             // otherwise, the predicate can be pushed down
+                             assert!(tmp_qset.len() > 1);
+-                            let e_vset = self.qids_to_vset(&tmp_qset)?;
++                            let e_vset = qids_to_vset(&self.rev_vmap, &tmp_qset)?;
+                             vset_conds.entry(e_vset).or_default().push(c);
+                         }
+                         for (e_vset, cond) in vset_conds {
+@@ -184,7 +184,7 @@ impl BuildGraph<'_> {
+                         for p in cond.iter().chain(filt.iter()) {
+                             p.collect_qry_ids(&mut tmp_qset);
+                         }
+-                        let e_vset = self.qids_to_vset(&tmp_qset)?;
++                        let e_vset = qids_to_vset(&self.rev_vmap, &tmp_qset)?;
+                         self.add_edge(*kind, l_vset, r_vset, e_vset, cond, filt);
+                     }
+                     _ => todo!(),
+@@ -317,43 +317,6 @@ impl BuildGraph<'_> {
+         self.queries.push(Op::Query(qry_id));
+         Ok(vid)
+     }
+-
+-    fn qids_to_vset<'a, I>(&self, qry_ids: I) -> Result<VertexSet>
+-    where
+-        I: IntoIterator<Item = &'a QueryID>,
+-    {
+-        let mut vset = VertexSet::default();
+-        for qry_id in qry_ids {
+-            if let Some(vid) = self.rev_vmap.get(qry_id) {
+-                vset |= *vid;
+-            } else {
+-                return Err(Error::QueryNotFound(*qry_id));
+-            }
+-        }
+-        Ok(vset)
+-    }
+-
+-    fn vset_to_qids<C>(&self, vset: VertexSet) -> Result<C>
+-    where
+-        C: FromIterator<QueryID>,
+-    {
+-        if let Some(vid) = vset.single() {
+-            self.vmap
+-                .get(&vid)
+-                .cloned()
+-                .ok_or(Error::InvalidJoinVertexSet)
+-                .map(|qid| std::iter::once(qid).collect::<C>())
+-        } else {
+-            vset.into_iter()
+-                .map(|vid| {
+-                    self.vmap
+-                        .get(&vid)
+-                        .cloned()
+-                        .ok_or(Error::InvalidJoinVertexSet)
+-                })
+-                .collect::<Result<C>>()
+-        }
+-    }
+ }
+ 
+ #[cfg(test)]

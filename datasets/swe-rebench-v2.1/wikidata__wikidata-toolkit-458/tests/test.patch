@@ -1,0 +1,201 @@
+diff --git a/wdtk-wikibaseapi/src/test/java/org/wikidata/wdtk/wikibaseapi/BasicApiConnectionTest.java b/wdtk-wikibaseapi/src/test/java/org/wikidata/wdtk/wikibaseapi/BasicApiConnectionTest.java
+index c9c395e5..7dc556b5 100644
+--- a/wdtk-wikibaseapi/src/test/java/org/wikidata/wdtk/wikibaseapi/BasicApiConnectionTest.java
++++ b/wdtk-wikibaseapi/src/test/java/org/wikidata/wdtk/wikibaseapi/BasicApiConnectionTest.java
+@@ -20,8 +20,14 @@ package org.wikidata.wdtk.wikibaseapi;
+  * #L%
+  */
+ 
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.net.HttpURLConnection;
++import java.net.InetSocketAddress;
+ import java.net.URL;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -31,6 +37,11 @@ import java.util.Map;
+ import java.util.Set;
+ import java.util.StringTokenizer;
+ import java.util.TreeSet;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++import com.sun.net.httpserver.HttpServer;
+ 
+ import org.junit.Assert;
+ import org.junit.Before;
+@@ -173,7 +184,11 @@ public class BasicApiConnectionTest {
+ 		String jsonSerialization = mapper.writeValueAsString(this.con);
+ 		JsonNode tree1 = mapper.readTree(LOGGED_IN_SERIALIZED_CONNECTION);
+ 		JsonNode tree2 = mapper.readTree(jsonSerialization);
+-		Assert.assertEquals(tree1, tree2);
++		// The serialized connection may carry additional settings (such as the
++		// configured timeouts); only the fields that are part of the established
++		// serialization contract are compared here.
++		tree1.fieldNames().forEachRemaining(field ->
++				Assert.assertEquals(tree1.get(field), tree2.get(field)));
+ 	}
+ 	
+ 	@Test
+@@ -338,6 +353,156 @@ public class BasicApiConnectionTest {
+ 		this.con.checkCredentials();
+ 	}
+ 
++	@Test
++	public void testNoTimeouts() throws Exception {
++		assertTrue(invokeGetConnectTimeout(this.con) < 0);
++		assertTrue(invokeGetReadTimeout(this.con) < 0);
++	}
++
++	@Test
++	public void testConnectTimeout() throws Exception {
++		invokeSetConnectTimeout(this.con, 1000);
++		assertEquals(1000, invokeGetConnectTimeout(this.con));
++	}
++
++	@Test
++	public void testReadTimeout() throws Exception {
++		invokeSetReadTimeout(this.con, 2000);
++		assertEquals(2000, invokeGetReadTimeout(this.con));
++	}
++
++	@Test
++	public void testNegativeConnectTimeoutDisablesTimeout() throws Exception {
++		invokeSetConnectTimeout(this.con, -5);
++		assertTrue(invokeGetConnectTimeout(this.con) < 0);
++	}
++
++	@Test
++	public void testNegativeReadTimeoutDisablesTimeout() throws Exception {
++		invokeSetReadTimeout(this.con, -5);
++		assertTrue(invokeGetReadTimeout(this.con) < 0);
++	}
++
++	@Test
++	public void testReadTimeoutIsThrownForApiCall() throws Exception {
++		CountDownLatch requestReceived = new CountDownLatch(1);
++		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++		server.createContext("/api", exchange -> {
++			requestReceived.countDown();
++			try {
++				Thread.sleep(700);
++			} catch (InterruptedException e) {
++				Thread.currentThread().interrupt();
++				return;
++			}
++			byte[] body = "{}".getBytes("UTF-8");
++			try {
++				exchange.sendResponseHeaders(200, body.length);
++				exchange.getResponseBody().write(body);
++			} catch (IOException ignored) {
++				// The client may already have disconnected after its timeout.
++			} finally {
++				exchange.close();
++			}
++		});
++		server.start();
++		try {
++			BasicApiConnection api = new BasicApiConnection(
++					"http://127.0.0.1:" + server.getAddress().getPort() + "/api");
++			invokeSetReadTimeout(api, 200);
++			Map<String, String> parameters = new HashMap<>();
++			parameters.put("action", "query");
++			parameters.put("format", "json");
++			boolean threw = false;
++			try (InputStream response = api.sendRequest("POST", parameters)) {
++				Assert.fail("An API call that exceeds its read timeout must throw an exception");
++			} catch (IOException expected) {
++				threw = true;
++			}
++			assertTrue("The delayed local server should receive the API call",
++					requestReceived.await(2, TimeUnit.SECONDS));
++			assertTrue("The API call should propagate the timeout as an exception", threw);
++		} finally {
++			server.stop(0);
++		}
++	}
++
++	@Test
++	public void testNegativeTimeoutsAllowDelayedApiResponse() throws Exception {
++		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++		server.createContext("/api", exchange -> {
++			try {
++				Thread.sleep(400);
++				byte[] body = "{}".getBytes("UTF-8");
++				exchange.sendResponseHeaders(200, body.length);
++				exchange.getResponseBody().write(body);
++			} catch (InterruptedException e) {
++				Thread.currentThread().interrupt();
++			} catch (IOException ignored) {
++			} finally {
++				exchange.close();
++			}
++		});
++		server.start();
++		try {
++			BasicApiConnection api = new BasicApiConnection(
++					"http://127.0.0.1:" + server.getAddress().getPort() + "/api");
++			invokeSetConnectTimeout(api, -5);
++			invokeSetReadTimeout(api, -5);
++			Map<String, String> parameters = new HashMap<>();
++			parameters.put("action", "query");
++			parameters.put("format", "json");
++			try (InputStream response = api.sendRequest("POST", parameters)) {
++				assertNotNull("A negative timeout should allow the delayed response", response);
++			}
++		} finally {
++			server.stop(0);
++		}
++	}
++
++	@Test
++	public void testConnectTimeoutFailsBlockedApiCall() throws Exception {
++		BasicApiConnection api = new BasicApiConnection("http://192.0.2.1:81/api");
++		invokeSetConnectTimeout(api, 500);
++		Map<String, String> parameters = new HashMap<>();
++		parameters.put("action", "query");
++		parameters.put("format", "json");
++		CountDownLatch finished = new CountDownLatch(1);
++		AtomicReference<IOException> failure = new AtomicReference<>();
++		Thread request = new Thread(() -> {
++			try (InputStream response = api.sendRequest("POST", parameters)) {
++				// A response is unexpected for this unreachable destination.
++			} catch (IOException e) {
++				failure.set(e);
++			} finally {
++				finished.countDown();
++			}
++		}, "connect-timeout-test");
++		request.setDaemon(true);
++		request.start();
++
++		assertTrue("The blocked API request should finish within a bounded time",
++				finished.await(5, TimeUnit.SECONDS));
++		assertNotNull("The unavailable network should cause the API call to fail",
++				failure.get());
++	}
++
++	private static void invokeSetConnectTimeout(ApiConnection con, int timeout) throws Exception {
++		ApiConnection.class.getMethod("setConnectTimeout", int.class).invoke(con, timeout);
++	}
++
++	private static int invokeGetConnectTimeout(ApiConnection con) throws Exception {
++		return (Integer) ApiConnection.class.getMethod("getConnectTimeout").invoke(con);
++	}
++
++	private static void invokeSetReadTimeout(ApiConnection con, int timeout) throws Exception {
++		ApiConnection.class.getMethod("setReadTimeout", int.class).invoke(con, timeout);
++	}
++
++	private static int invokeGetReadTimeout(ApiConnection con) throws Exception {
++		return (Integer) ApiConnection.class.getMethod("getReadTimeout").invoke(con);
++	}
++
+ 	private List<String> testCookieList() {
+ 		List<String> cookieList = new ArrayList<>();
+ 		cookieList

@@ -1,0 +1,171 @@
+diff --git a/pkg/clients/aws_test.go b/pkg/clients/aws_test.go
+index 511ad143..772ee0a7 100644
+--- a/pkg/clients/aws_test.go
++++ b/pkg/clients/aws_test.go
+@@ -17,9 +17,25 @@ limitations under the License.
+ package aws
+ 
+ import (
++	"bufio"
+ 	"context"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/json"
++	"encoding/pem"
+ 	"fmt"
++	"io"
++	"math/big"
++	stdhttp "net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/aws"
+ 	"github.com/aws/aws-sdk-go-v2/aws/transport/http"
+@@ -92,6 +108,140 @@ func TestUseProviderSecret(t *testing.T) {
+ 	g.Expect(config).NotTo(BeNil())
+ }
+ 
++func TestUseProviderSecretAssumeRoleWithDeprecatedARN(t *testing.T) {
++	profile := "default"
++	roleARN := "test-arn-deprecated"
++	credentials := []byte(fmt.Sprintf(awsCredentialsFileFormat, profile, "testID", "testSecret"))
++	pc := &v1beta1.ProviderConfig{Spec: v1beta1.ProviderConfigSpec{AssumeRoleARN: &roleARN}}
++
++	config, err := UseProviderSecretAssumeRole(context.Background(), credentials, profile, "us-west-2", pc)
++	if err != nil {
++		t.Fatalf("expected role assumption to accept the deprecated ARN configuration, got error: %v", err)
++	}
++	if config == nil || config.Credentials == nil {
++		t.Fatal("expected role assumption to produce AWS credentials")
++	}
++}
++
++func TestUseProviderSecretAssumeRoleIncludesSessionTags(t *testing.T) {
++	// The STS endpoint is HTTPS. A local CONNECT proxy lets this test inspect
++	// the AssumeRole query sent by the real AWS credentials provider without
++	// making a network request to AWS.
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatalf("generate test certificate key: %v", err)
++	}
++	certTemplate := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "sts.us-west-2.amazonaws.com"},
++		DNSNames:              []string{"sts.us-west-2.amazonaws.com", "sts.amazonaws.com"},
++		NotBefore:             time.Now().Add(-time.Minute),
++		NotAfter:              time.Now().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
++		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++		IsCA:                  true,
++		BasicConstraintsValid: true,
++	}
++	certDER, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, &key.PublicKey, key)
++	if err != nil {
++		t.Fatalf("create test certificate: %v", err)
++	}
++	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
++	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
++	serverCertificate, err := tls.X509KeyPair(certPEM, keyPEM)
++	if err != nil {
++		t.Fatalf("load test certificate: %v", err)
++	}
++	caBundle := filepath.Join(t.TempDir(), "ca.pem")
++	if err := os.WriteFile(caBundle, certPEM, 0600); err != nil {
++		t.Fatalf("write test CA bundle: %v", err)
++	}
++
++	requestValues := make(chan url.Values, 1)
++	proxy := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
++		if r.Method != stdhttp.MethodConnect {
++			stdhttp.Error(w, "expected HTTPS CONNECT", stdhttp.StatusMethodNotAllowed)
++			return
++		}
++		hijacker, ok := w.(stdhttp.Hijacker)
++		if !ok {
++			t.Error("test proxy does not support connection hijacking")
++			return
++		}
++		conn, rw, err := hijacker.Hijack()
++		if err != nil {
++			t.Errorf("hijack proxy connection: %v", err)
++			return
++		}
++		defer conn.Close()
++		if _, err := io.WriteString(rw, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
++			t.Errorf("establish proxy tunnel: %v", err)
++			return
++		}
++		if err := rw.Flush(); err != nil {
++			t.Errorf("flush proxy tunnel response: %v", err)
++			return
++		}
++		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{serverCertificate}})
++		defer tlsConn.Close()
++		if err := tlsConn.Handshake(); err != nil {
++			t.Errorf("complete test TLS handshake: %v", err)
++			return
++		}
++		request, err := stdhttp.ReadRequest(bufio.NewReader(tlsConn))
++		if err != nil {
++			t.Errorf("read STS request: %v", err)
++			return
++		}
++		body, err := io.ReadAll(request.Body)
++		if err != nil {
++			t.Errorf("read STS request body: %v", err)
++			return
++		}
++		values, err := url.ParseQuery(string(body))
++		if err != nil {
++			t.Errorf("parse STS request body: %v", err)
++			return
++		}
++		requestValues <- values
++		response := `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration></Credentials><AssumedRoleUser><AssumedRoleId>role:session</AssumedRoleId><Arn>arn:aws:sts::123456789012:assumed-role/example/session</Arn></AssumedRoleUser></AssumeRoleResult><ResponseMetadata><RequestId>request-id</RequestId></ResponseMetadata></AssumeRoleResponse>`
++		_, _ = fmt.Fprintf(tlsConn, "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(response), response)
++	}))
++	defer proxy.Close()
++	t.Setenv("HTTPS_PROXY", proxy.URL)
++	t.Setenv("https_proxy", proxy.URL)
++	t.Setenv("NO_PROXY", "")
++	t.Setenv("no_proxy", "")
++	t.Setenv("AWS_CA_BUNDLE", caBundle)
++
++	profile := "default"
++	roleARN := "arn:aws:iam::123456789012:role/example"
++	tagKey := "Project"
++	tagValue := "Crossplane"
++	credentials := []byte(fmt.Sprintf(awsCredentialsFileFormat, profile, "testID", "testSecret"))
++	pc := &v1beta1.ProviderConfig{}
++	providerConfigJSON := fmt.Sprintf(`{"spec":{"assumeRole":{"roleARN":%q,"tags":[{"key":%q,"value":%q}]},"assumeRoleARN":%q}}`, roleARN, tagKey, tagValue, roleARN)
++	if err := json.Unmarshal([]byte(providerConfigJSON), pc); err != nil {
++		t.Fatalf("parse provider configuration: %v", err)
++	}
++
++	config, err := UseProviderSecretAssumeRole(context.Background(), credentials, profile, "us-west-2", pc)
++	if err != nil {
++		t.Fatalf("configure role assumption: %v", err)
++	}
++	if _, err := config.Credentials.Retrieve(context.Background()); err != nil {
++		t.Fatalf("retrieve assumed role credentials: %v", err)
++	}
++
++	values := <-requestValues
++	if got := values.Get("Tags.member.1.Key"); got != tagKey {
++		t.Errorf("STS request tag key = %q, want %q", got, tagKey)
++	}
++	if got := values.Get("Tags.member.1.Value"); got != tagValue {
++		t.Errorf("STS request tag value = %q, want %q", got, tagValue)
++	}
++}
++
+ func TestDiffTags(t *testing.T) {
+ 	type args struct {
+ 		local  map[string]string

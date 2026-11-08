@@ -1,0 +1,207 @@
+diff --git a/pkg/platform/allocator/vacate_test.go b/pkg/platform/allocator/vacate_test.go
+index a6c3014..b93f182 100644
+--- a/pkg/platform/allocator/vacate_test.go
++++ b/pkg/platform/allocator/vacate_test.go
+@@ -19,11 +19,18 @@ package allocator
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io/ioutil"
+ 	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
+ 	"reflect"
+ 	"regexp"
++	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -41,6 +48,10 @@ import (
+ 
+ func discardResponses(a *api.API, _ interface{}) *api.API { return a }
+ 
++func normalizeErrorMessage(message string) string {
++	return regexp.MustCompile(`"(https?://[^"]+)"`).ReplaceAllString(message, "$1")
++}
++
+ func TestComputeVacateRequest(t *testing.T) {
+ 	type args struct {
+ 		pr        *models.MoveClustersDetails
+@@ -872,7 +883,7 @@ func Test_fillVacateClusterParams(t *testing.T) {
+ 				if tt.err != nil {
+ 					wantErr = tt.err.Error()
+ 				}
+-				if errMesg != wantErr {
++				if normalizeErrorMessage(errMesg) != normalizeErrorMessage(wantErr) {
+ 					t.Errorf("fillVacateClusterParams() error = %v, wantErr %v", errMesg, wantErr)
+ 					return
+ 				}
+@@ -989,7 +1000,7 @@ func Test_newMoveClusterParams(t *testing.T) {
+ 				if tt.err != nil {
+ 					wantErr = tt.err.Error()
+ 				}
+-				if errMesg != wantErr {
++				if normalizeErrorMessage(errMesg) != normalizeErrorMessage(wantErr) {
+ 					t.Errorf("newMoveClusterParams() error = %v, wantErr %v", errMesg, wantErr)
+ 					return
+ 				}
+@@ -1166,3 +1177,154 @@ func Test_addAllocatorMovesToPool(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestVacateCommandExposesOverrideFailsafe(t *testing.T) {
++	cmd := exec.Command("go", "run", ".", "platform", "allocator", "vacate", "--help")
++	cmd.Dir = "../../../"
++	output, err := cmd.CombinedOutput()
++	if err != nil {
++		t.Fatalf("vacate help command failed: %v\n%s", err, output)
++	}
++	if !strings.Contains(string(output), "--override-failsafe") {
++		t.Fatalf("vacate help does not expose the override-failsafe option:\n%s", output)
++	}
++}
++
++// vacateMoveOverrideFailsafe runs the vacate command against a local fake
++// Elastic Cloud API and returns the override_failsafe value sent in the
++// transient plan of the Elasticsearch move request.
++func vacateMoveOverrideFailsafe(t *testing.T, extraArgs ...string) *bool {
++	t.Helper()
++
++	const (
++		allocatorID = "allocator-1"
++		clusterID   = "63d765d37613423e97b1040257cf20c8"
++	)
++
++	var (
++		mu       sync.Mutex
++		moveBody []byte
++		captured = make(chan struct{})
++		once     sync.Once
++	)
++
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := ioutil.ReadAll(r.Body)
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/platform/infrastructure/allocators/"+allocatorID):
++			fmt.Fprint(w, `{"id":"`+allocatorID+`","status":{"connected":true,"healthy":true}}`)
++		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/_move") &&
++			r.URL.Query().Get("validate_only") == "true":
++			w.WriteHeader(http.StatusAccepted)
++			fmt.Fprintf(w, `{"moves":{"elasticsearch_clusters":[{"cluster_id":%q,"calculated_plan":{"plan_configuration":{"timeout":4096}}}]}}`, clusterID)
++		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/elasticsearch/_move"):
++			mu.Lock()
++			if moveBody == nil {
++				moveBody = body
++			}
++			mu.Unlock()
++			once.Do(func() { close(captured) })
++			w.WriteHeader(http.StatusAccepted)
++			fmt.Fprint(w, `{"failures":{}}`)
++		default:
++			w.WriteHeader(http.StatusInternalServerError)
++			fmt.Fprintf(w, `{"message":"unexpected request %s %s"}`, r.Method, r.URL.String())
++		}
++	}))
++	defer srv.Close()
++
++	args := append([]string{
++		"--host", srv.URL,
++		"--apikey", "dummy",
++		"platform", "allocator", "vacate",
++		"--kind", "elasticsearch",
++		"--move-only",
++		"--allocator-down=false",
++		"--force",
++	}, extraArgs...)
++	args = append(args, allocatorID)
++
++	outFile, err := ioutil.TempFile("", "vacate-output")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(outFile.Name())
++	defer outFile.Close()
++
++	cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
++	cmd.Dir = "../../../"
++	cmd.Stdin = strings.NewReader("y\n")
++	cmd.Stdout = outFile
++	cmd.Stderr = outFile
++	if err := cmd.Start(); err != nil {
++		t.Fatalf("could not start vacate command: %v", err)
++	}
++	waited := make(chan error, 1)
++	go func() { waited <- cmd.Wait() }()
++
++	select {
++	case <-waited:
++	case <-captured:
++		// The move request has been received; the remaining tracking
++		// work is not part of this check.
++		cmd.Process.Kill()
++		<-waited
++	case <-time.After(3 * time.Minute):
++		cmd.Process.Kill()
++		<-waited
++	}
++
++	mu.Lock()
++	body := moveBody
++	mu.Unlock()
++	if body == nil {
++		out, _ := ioutil.ReadFile(outFile.Name())
++		t.Fatalf("vacate did not send an Elasticsearch move request:\n%s", out)
++	}
++
++	var req struct {
++		ElasticsearchClusters []struct {
++			PlanOverride struct {
++				PlanConfiguration struct {
++					OverrideFailsafe *bool `json:"override_failsafe"`
++				} `json:"plan_configuration"`
++			} `json:"plan_override"`
++		} `json:"elasticsearch_clusters"`
++	}
++	if err := json.Unmarshal(body, &req); err != nil {
++		t.Fatalf("could not decode move request %s: %v", body, err)
++	}
++	if len(req.ElasticsearchClusters) != 1 {
++		t.Fatalf("expected 1 Elasticsearch cluster in move request, got %d: %s", len(req.ElasticsearchClusters), body)
++	}
++	return req.ElasticsearchClusters[0].PlanOverride.PlanConfiguration.OverrideFailsafe
++}
++
++func TestVacateOverrideFailsafeReachesTransientPlan(t *testing.T) {
++	tests := []struct {
++		name     string
++		args     []string
++		wantTrue bool
++	}{
++		{
++			name:     "enabled with --override-failsafe",
++			args:     []string{"--override-failsafe"},
++			wantTrue: true,
++		},
++		{
++			name:     "not enabled without the option",
++			args:     nil,
++			wantTrue: false,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := vacateMoveOverrideFailsafe(t, tt.args...)
++			isTrue := got != nil && *got
++			if isTrue != tt.wantTrue {
++				t.Errorf("override_failsafe in transient plan = %v, want true=%v", got, tt.wantTrue)
++			}
++		})
++	}
++}

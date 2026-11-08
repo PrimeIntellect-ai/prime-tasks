@@ -1,0 +1,194 @@
+diff --git a/safehttp/default_dispatcher.go b/safehttp/default_dispatcher.go
+index ba028e1..a2366b3 100644
+--- a/safehttp/default_dispatcher.go
++++ b/safehttp/default_dispatcher.go
+@@ -60,17 +60,28 @@ func (DefaultDispatcher) WriteJSON(rw http.ResponseWriter, resp JSONResponse) er
+ 	return json.NewEncoder(rw).Encode(resp.Data)
+ }
+ 
+-// ExecuteTemplate applies a parsed template to the provided data object if the
+-// template is a safe HTML template, writing the output to the  http.
+-// ResponseWriter.
++// ExecuteTemplate applies the parsed template to the provided data object, if
++// the template is a safe HTML template, writing the output to the  http.
++// ResponseWriter. If the funcMap is non-nil, its elements override the
++// existing names to functions mappings in the template. An attempt to define a
++// new name to function mapping that is not already in the template will result
++// in a panic.
+ //
+ // If an error occurs executing the template or writing its output,
+ // execution stops, but partial results may already have been written to
+ // the Response Writer.
+-func (DefaultDispatcher) ExecuteTemplate(rw http.ResponseWriter, t Template, data interface{}) error {
++func (DefaultDispatcher) ExecuteTemplate(rw http.ResponseWriter, resp TemplateResponse) error {
++	t := *resp.Template
+ 	x, ok := t.(*template.Template)
+ 	if !ok {
+-		return fmt.Errorf("%T is not a safe template and it cannot be parsed and written", t)
++		return fmt.Errorf("%T is not a safe template and it cannot be parsed and written", resp.Template)
+ 	}
+-	return x.Execute(rw, data)
++	if len(resp.FuncMap) == 0 {
++		return x.Execute(rw, resp.Data)
++	}
++	cloned, err := x.Clone()
++	if err != nil {
++		return err
++	}
++	return cloned.Funcs(resp.FuncMap).Execute(rw, resp.Data)
+ }
+diff --git a/safehttp/plugins/csp/csp.go b/safehttp/plugins/csp/csp.go
+index 3ca45c9..01d1bc4 100644
+--- a/safehttp/plugins/csp/csp.go
++++ b/safehttp/plugins/csp/csp.go
+@@ -215,7 +215,26 @@ func (it Interceptor) Before(w *safehttp.ResponseWriter, r *safehttp.IncomingReq
+ 	return safehttp.NotWritten()
+ }
+ 
+-// Commit is a no-op, required to satisfy the safehttp.Interceptor interface.
++// Commit adds the nonce to the safehttp.TemplateResponse which is going to be
++// injected as the value of the nonce attribute in <script> and <link> tags. The
++// nonce is going to be unique for each safehttp.IncomingRequest.
+ func (it Interceptor) Commit(w *safehttp.ResponseWriter, r *safehttp.IncomingRequest, resp safehttp.Response, cfg interface{}) safehttp.Result {
++	tmplResp, ok := resp.(safehttp.TemplateResponse)
++	if !ok {
++		return safehttp.NotWritten()
++	}
++
++	nonce, err := Nonce(r.Context())
++	if err != nil {
++		// The nonce should have been added in the Before stage and, if that is
++		// not the case, a server misconfiguration occured.
++		return w.WriteError(safehttp.StatusInternalServerError)
++	}
++
++	// TODO(maramihali@): Change the key when function names are exported by
++	// htmlinject
++	// TODO: What should happen if the CSPNonce is not present in the
++	// tr.FuncMap?
++	tmplResp.FuncMap["CSPNonce"] = func() string { return nonce }
+ 	return safehttp.NotWritten()
+ }
+diff --git a/safehttp/plugins/xsrf/xsrf.go b/safehttp/plugins/xsrf/xsrf.go
+index a2abe64..cbf8482 100644
+--- a/safehttp/plugins/xsrf/xsrf.go
++++ b/safehttp/plugins/xsrf/xsrf.go
+@@ -94,7 +94,7 @@ func addCookieID(w *safehttp.ResponseWriter) (*safehttp.Cookie, error) {
+ // In case of state changing requests (all except GET, HEAD and OPTIONS), the
+ // interceptor checks for the presence of the XSRF token in the request body
+ // (expected to have been injected) and validates it.
+-func (i *Interceptor) Before(w *safehttp.ResponseWriter, r *safehttp.IncomingRequest, cfg interface{}) safehttp.Result {
++func (it *Interceptor) Before(w *safehttp.ResponseWriter, r *safehttp.IncomingRequest, cfg interface{}) safehttp.Result {
+ 	needsValidation := !statePreservingMethods[r.Method()]
+ 	cookieID, err := r.Cookie(cookieIDKey)
+ 	if err != nil {
+@@ -128,17 +128,36 @@ func (i *Interceptor) Before(w *safehttp.ResponseWriter, r *safehttp.IncomingReq
+ 			return w.WriteError(safehttp.StatusUnauthorized)
+ 		}
+ 
+-		if ok := xsrftoken.Valid(tok, i.SecretAppKey, cookieID.Value(), actionID); !ok {
++		if ok := xsrftoken.Valid(tok, it.SecretAppKey, cookieID.Value(), actionID); !ok {
+ 			return w.WriteError(safehttp.StatusForbidden)
+ 		}
+ 	}
+ 
+-	tok := xsrftoken.Generate(i.SecretAppKey, cookieID.Value(), actionID)
++	tok := xsrftoken.Generate(it.SecretAppKey, cookieID.Value(), actionID)
+ 	r.SetContext(context.WithValue(r.Context(), tokenCtxKey{}, tok))
+ 	return safehttp.NotWritten()
+ }
+ 
+-// Commit is a no-op, required to satisfy the safehttp.Interceptor interface.
+-func (i *Interceptor) Commit(w *safehttp.ResponseWriter, r *safehttp.IncomingRequest, resp safehttp.Response, cfg interface{}) safehttp.Result {
++// Commit adds the XSRF token corresponding to the safehttp.TemplateResponse
++// with key "XSRFToken". The token corresponds to the user information found in
++// the request.
++func (it *Interceptor) Commit(w *safehttp.ResponseWriter, r *safehttp.IncomingRequest, resp safehttp.Response, cfg interface{}) safehttp.Result {
++	tmplResp, ok := resp.(safehttp.TemplateResponse)
++	if !ok {
++		return safehttp.NotWritten()
++	}
++
++	tok, err := Token(r)
++	if err != nil {
++		// The token should have been added in the Before stage and if that is
++		// not the case, a server misconfiguration occured.
++		return w.WriteError(safehttp.StatusInternalServerError)
++	}
++
++	// TODO(maramihali@): Change the key when function names are exported by
++	// htmlinject
++	// TODO: what should happen if the XSRFToken key is not present in the
++	// tr.FuncMap?
++	tmplResp.FuncMap["XSRFToken"] = func() string { return tok }
+ 	return safehttp.NotWritten()
+ }
+diff --git a/safehttp/response.go b/safehttp/response.go
+index c2e4980..d3ef1df 100644
+--- a/safehttp/response.go
++++ b/safehttp/response.go
+@@ -38,12 +38,12 @@ type Template interface {
+ 	Execute(wr io.Writer, data interface{}) error
+ }
+ 
+-// TemplateResponse bundles a Template with its data to be passed together to the
+-// commit phase. This will be passed when the commit phase is initiated from
+-// ResponseWriter.WriteTemplate.
++// TemplateResponse bundles a Template with its data and names to function
++// mappings to be passed together to the commit phase.
+ type TemplateResponse struct {
+ 	Template *Template
+ 	Data     *interface{}
++	FuncMap  map[string]interface{}
+ }
+ 
+ // NoContentResponse is sent to the commit phase when it's initiated from
+diff --git a/safehttp/response_writer.go b/safehttp/response_writer.go
+index 0669228..c2b493f 100644
+--- a/safehttp/response_writer.go
++++ b/safehttp/response_writer.go
+@@ -132,7 +132,8 @@ func (w *ResponseWriter) WriteTemplate(t Template, data interface{}) Result {
+ 	if w.written {
+ 		panic("ResponseWriter was already written to")
+ 	}
+-	w.handler.commitPhase(w, TemplateResponse{Template: &t, Data: &data})
++	resp := TemplateResponse{Template: &t, Data: &data, FuncMap: map[string]interface{}{}}
++	w.handler.commitPhase(w, resp)
+ 	if w.written {
+ 		return Result{}
+ 	}
+@@ -143,7 +144,7 @@ func (w *ResponseWriter) WriteTemplate(t Template, data interface{}) Result {
+ 	}
+ 	w.rw.Header().Set("Content-Type", ct)
+ 	w.rw.WriteHeader(int(StatusOK))
+-	if err := w.d.ExecuteTemplate(w.rw, t, data); err != nil {
++	if err := w.d.ExecuteTemplate(w.rw, resp); err != nil {
+ 		panic(err)
+ 	}
+ 	return Result{}
+@@ -224,16 +225,19 @@ type Dispatcher interface {
+ 
+ 	// WriteJSON serialises and writes a JSON object to the http.ResponseWriter.
+ 	//
+-	// This should return an error if the provided response is not a valid
++	// This should return an error if the provided response is not a safe
+ 	// JSONResponse  or if writing the object to the http.ResponseWriter fails.
+ 	WriteJSON(rw http.ResponseWriter, resp JSONResponse) error
+ 
+-	// ExecuteTemplate applies a parsed template to the provided data object
+-	// and writes the output to the http.ResponseWriter.
++	// ExecuteTemplate applies the response parsed template to its data object
++	// and writes the output to the http.ResponseWriter. If the response funcMap
++	// is non-nil, the Dispatcher will try to update the names to functions
++	// mappings of the template.
+ 	//
+-	// This should return an error if the provided Template response is not a
+-	// valid template or if an error occurs executing or writing the template.
+-	ExecuteTemplate(rw http.ResponseWriter, t Template, data interface{}) error
++	// This should return an error if the template contained by the
++	// TemplateResponse is not a safe template or if an error occurs executing
++	// or writing the template.
++	ExecuteTemplate(rw http.ResponseWriter, resp TemplateResponse) error
+ 
+ 	// Content-Type returns the Content-Type of the provided response if it is
+ 	// of a type supported by the Dispatcher and should return an error

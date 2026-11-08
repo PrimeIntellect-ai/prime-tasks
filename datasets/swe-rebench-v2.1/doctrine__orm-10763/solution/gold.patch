@@ -1,0 +1,283 @@
+diff --git a/docs/en/reference/association-mapping.rst b/docs/en/reference/association-mapping.rst
+index 1ff30d3df..6280eee06 100644
+--- a/docs/en/reference/association-mapping.rst
++++ b/docs/en/reference/association-mapping.rst
+@@ -881,6 +881,15 @@ Generated MySQL Schema:
+     replaced by one-to-many/many-to-one associations between the 3
+     participating classes.
+ 
++.. note::
++
++    For many-to-many associations, the ORM takes care of managing rows
++    in the join table connecting both sides. Due to the way it deals
++    with entity removals, database-level constraints may not work the
++    way one might intuitively assume. Thus, be sure not to miss the section
++    on :ref:`join table management <remove_object_many_to_many_join_tables>`.
++
++
+ Many-To-Many, Bidirectional
+ ---------------------------
+ 
+@@ -1019,6 +1028,15 @@ one is bidirectional.
+ The MySQL schema is exactly the same as for the Many-To-Many
+ uni-directional case above.
+ 
++.. note::
++
++    For many-to-many associations, the ORM takes care of managing rows
++    in the join table connecting both sides. Due to the way it deals
++    with entity removals, database-level constraints may not work the
++    way one might intuitively assume. Thus, be sure not to miss the section
++    on :ref:`join table management <remove_object_many_to_many_join_tables>`.
++
++
+ Owning and Inverse Side on a ManyToMany Association
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/docs/en/reference/working-with-objects.rst b/docs/en/reference/working-with-objects.rst
+index fb1cc1ae4..32d53212e 100644
+--- a/docs/en/reference/working-with-objects.rst
++++ b/docs/en/reference/working-with-objects.rst
+@@ -286,17 +286,53 @@ as follows:
+ After an entity has been removed, its in-memory state is the same as
+ before the removal, except for generated identifiers.
+ 
+-Removing an entity will also automatically delete any existing
+-records in many-to-many join tables that link this entity. The
+-action taken depends on the value of the ``@joinColumn`` mapping
+-attribute "onDelete". Either Doctrine issues a dedicated ``DELETE``
+-statement for records of each join table or it depends on the
+-foreign key semantics of onDelete="CASCADE".
++During the ``EntityManager#flush()`` operation, the removed entity
++will also be removed from all collections in entities currently
++loaded into memory.
++
++.. _remove_object_many_to_many_join_tables:
++
++Join-table management when removing from many-to-many collections
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Regarding existing rows in many-to-many join tables that refer to
++an entity being removed, the following applies.
++
++When the entity being removed does not declare the many-to-many association
++itself (that is, the many-to-many association is unidirectional and
++the entity is on the inverse side), the ORM has no reasonable way to
++detect associations targeting the entity's class. Thus, no ORM-level handling
++of join-table rows is attempted and database-level constraints apply.
++In case of database-level ``ON DELETE RESTRICT`` constraints, the
++``EntityManager#flush()`` operation may abort and a ``ConstraintViolationException``
++may be thrown. No in-memory collections will be modified in this case.
++With ``ON DELETE CASCADE``, the RDBMS will take care of removing rows
++from join tables.
++
++When the entity being removed is part of bi-directional many-to-many
++association, either as the owning or inverse side, the ORM will
++delete rows from join tables before removing the entity itself. That means
++database-level ``ON DELETE RESTRICT`` constraints on join tables are not
++effective, since the join table rows are removed first. Removal of join table
++rows happens through specialized methods in entity and collection persister
++classes and take one query per entity and join table. In case the association
++uses a ``@JoinColumn`` configuration with ``onDelete="CASCADE"``, instead
++of using a dedicated ``DELETE`` query the database-level operation will be
++relied upon.
++
++.. note::
++
++    In case you rely on database-level ``ON DELETE RESTRICT`` constraints,
++    be aware that by making many-to-many associations bidirectional the
++    assumed protection may be lost.
++
++
++Performance of different deletion strategies
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+ Deleting an object with all its associated objects can be achieved
+ in multiple ways with very different performance impacts.
+ 
+-
+ 1. If an association is marked as ``CASCADE=REMOVE`` Doctrine ORM
+    will fetch this association. If its a Single association it will
+    pass this entity to
+diff --git a/lib/Doctrine/ORM/Persisters/Entity/BasicEntityPersister.php b/lib/Doctrine/ORM/Persisters/Entity/BasicEntityPersister.php
+index 623c2cb61..1f6d3e512 100644
+--- a/lib/Doctrine/ORM/Persisters/Entity/BasicEntityPersister.php
++++ b/lib/Doctrine/ORM/Persisters/Entity/BasicEntityPersister.php
+@@ -538,7 +538,7 @@ class BasicEntityPersister implements EntityPersister
+     protected function deleteJoinTableRecords(array $identifier, array $types): void
+     {
+         foreach ($this->class->associationMappings as $mapping) {
+-            if ($mapping['type'] !== ClassMetadata::MANY_TO_MANY) {
++            if ($mapping['type'] !== ClassMetadata::MANY_TO_MANY || isset($mapping['isOnDeleteCascade'])) {
+                 continue;
+             }
+ 
+@@ -574,10 +574,6 @@ class BasicEntityPersister implements EntityPersister
+                 $otherKeys[] = $this->quoteStrategy->getJoinColumnName($joinColumn, $class, $this->platform);
+             }
+ 
+-            if (isset($mapping['isOnDeleteCascade'])) {
+-                continue;
+-            }
+-
+             $joinTableName = $this->quoteStrategy->getJoinTableName($association, $this->class, $this->platform);
+ 
+             $this->conn->delete($joinTableName, array_combine($keys, $identifier), $types);
+diff --git a/lib/Doctrine/ORM/UnitOfWork.php b/lib/Doctrine/ORM/UnitOfWork.php
+index bc8af25fb..ebb5f12a0 100644
+--- a/lib/Doctrine/ORM/UnitOfWork.php
++++ b/lib/Doctrine/ORM/UnitOfWork.php
+@@ -240,6 +240,17 @@ class UnitOfWork implements PropertyChangedListener
+      */
+     private $visitedCollections = [];
+ 
++    /**
++     * List of collections visited during the changeset calculation that contain to-be-removed
++     * entities and need to have keys removed post commit.
++     *
++     * Indexed by Collection object ID, which also serves as the key in self::$visitedCollections;
++     * values are the key names that need to be removed.
++     *
++     * @psalm-var array<int, array<array-key, true>>
++     */
++    private $pendingCollectionElementRemovals = [];
++
+     /**
+      * The EntityManager that "owns" this UnitOfWork instance.
+      *
+@@ -474,8 +485,15 @@ class UnitOfWork implements PropertyChangedListener
+ 
+         $this->afterTransactionComplete();
+ 
+-        // Take new snapshots from visited collections
+-        foreach ($this->visitedCollections as $coll) {
++        // Unset removed entities from collections, and take new snapshots from
++        // all visited collections.
++        foreach ($this->visitedCollections as $coid => $coll) {
++            if (isset($this->pendingCollectionElementRemovals[$coid])) {
++                foreach ($this->pendingCollectionElementRemovals[$coid] as $key => $valueIgnored) {
++                    unset($coll[$key]);
++                }
++            }
++
+             $coll->takeSnapshot();
+         }
+ 
+@@ -487,15 +505,16 @@ class UnitOfWork implements PropertyChangedListener
+     /** @param object|object[]|null $entity */
+     private function postCommitCleanup($entity): void
+     {
+-        $this->entityInsertions               =
+-        $this->entityUpdates                  =
+-        $this->entityDeletions                =
+-        $this->extraUpdates                   =
+-        $this->collectionUpdates              =
+-        $this->nonCascadedNewDetectedEntities =
+-        $this->collectionDeletions            =
+-        $this->visitedCollections             =
+-        $this->orphanRemovals                 = [];
++        $this->entityInsertions                 =
++        $this->entityUpdates                    =
++        $this->entityDeletions                  =
++        $this->extraUpdates                     =
++        $this->collectionUpdates                =
++        $this->nonCascadedNewDetectedEntities   =
++        $this->collectionDeletions              =
++        $this->pendingCollectionElementRemovals =
++        $this->visitedCollections               =
++        $this->orphanRemovals                   = [];
+ 
+         if ($entity === null) {
+             $this->entityChangeSets = $this->scheduledForSynchronization = [];
+@@ -916,6 +935,14 @@ class UnitOfWork implements PropertyChangedListener
+             return;
+         }
+ 
++        // If this collection is dirty, schedule it for updates
++        if ($value instanceof PersistentCollection && $value->isDirty()) {
++            $coid = spl_object_id($value);
++
++            $this->collectionUpdates[$coid]  = $value;
++            $this->visitedCollections[$coid] = $value;
++        }
++
+         // Look through the entities, and in any of their associations,
+         // for transient (new) entities, recursively. ("Persistence by reachability")
+         // Unwrap. Uninitialized collections will simply be empty.
+@@ -960,10 +987,18 @@ class UnitOfWork implements PropertyChangedListener
+                 case self::STATE_REMOVED:
+                     // Consume the $value as array (it's either an array or an ArrayAccess)
+                     // and remove the element from Collection.
+-                    if ($assoc['type'] & ClassMetadata::TO_MANY) {
+-                        unset($value[$key]);
++                    if (! ($assoc['type'] & ClassMetadata::TO_MANY)) {
++                        break;
+                     }
+ 
++                    $coid                            = spl_object_id($value);
++                    $this->visitedCollections[$coid] = $value;
++
++                    if (! isset($this->pendingCollectionElementRemovals[$coid])) {
++                        $this->pendingCollectionElementRemovals[$coid] = [];
++                    }
++
++                    $this->pendingCollectionElementRemovals[$coid][$key] = true;
+                     break;
+ 
+                 case self::STATE_DETACHED:
+@@ -976,13 +1011,6 @@ class UnitOfWork implements PropertyChangedListener
+                     // during changeset calculation anyway, since they are in the identity map.
+             }
+         }
+-
+-        if ($value instanceof PersistentCollection && $value->isDirty()) {
+-            $coid = spl_object_id($value);
+-
+-            $this->collectionUpdates[$coid]  = $value;
+-            $this->visitedCollections[$coid] = $value;
+-        }
+     }
+ 
+     /**
+@@ -2627,23 +2655,24 @@ class UnitOfWork implements PropertyChangedListener
+     public function clear($entityName = null)
+     {
+         if ($entityName === null) {
+-            $this->identityMap                    =
+-            $this->entityIdentifiers              =
+-            $this->originalEntityData             =
+-            $this->entityChangeSets               =
+-            $this->entityStates                   =
+-            $this->scheduledForSynchronization    =
+-            $this->entityInsertions               =
+-            $this->entityUpdates                  =
+-            $this->entityDeletions                =
+-            $this->nonCascadedNewDetectedEntities =
+-            $this->collectionDeletions            =
+-            $this->collectionUpdates              =
+-            $this->extraUpdates                   =
+-            $this->readOnlyObjects                =
+-            $this->visitedCollections             =
+-            $this->eagerLoadingEntities           =
+-            $this->orphanRemovals                 = [];
++            $this->identityMap                      =
++            $this->entityIdentifiers                =
++            $this->originalEntityData               =
++            $this->entityChangeSets                 =
++            $this->entityStates                     =
++            $this->scheduledForSynchronization      =
++            $this->entityInsertions                 =
++            $this->entityUpdates                    =
++            $this->entityDeletions                  =
++            $this->nonCascadedNewDetectedEntities   =
++            $this->collectionDeletions              =
++            $this->collectionUpdates                =
++            $this->extraUpdates                     =
++            $this->readOnlyObjects                  =
++            $this->pendingCollectionElementRemovals =
++            $this->visitedCollections               =
++            $this->eagerLoadingEntities             =
++            $this->orphanRemovals                   = [];
+         } else {
+             Deprecation::triggerIfCalledFromOutside(
+                 'doctrine/orm',

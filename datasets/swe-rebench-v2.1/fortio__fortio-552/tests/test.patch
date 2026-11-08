@@ -1,0 +1,323 @@
+diff --git a/Webtest.sh b/Webtest.sh
+index 2caaa32..43218b6 100755
+--- a/Webtest.sh
++++ b/Webtest.sh
+@@ -14,7 +14,9 @@
+ # limitations under the License.
+ set -x
+ # Check we can build the image
+-make docker-internal TAG=webtest || exit 1
++NATIVE_PLATFORM=$(docker buildx --builder default inspect | tail -1 | sed -e "s/Platforms: //" -e "s/,//g" | awk '{print $1}')
++echo "Building for $NATIVE_PLATFORM"
++make docker-internal TAG=webtest BUILDX_PLATFORMS="$NATIVE_PLATFORM" || exit 1
+ FORTIO_UI_PREFIX=/newprefix/ # test the non default prefix (not /fortio/)
+ FILE_LIMIT=25 # must be low to detect leaks, go 1.14 seems to need more than go1.8 (!)
+ LOGLEVEL=info # change to debug to debug
+diff --git a/fhttp/http_forwarder_test.go b/fhttp/http_forwarder_test.go
+index 484274f..19fe034 100644
+--- a/fhttp/http_forwarder_test.go
++++ b/fhttp/http_forwarder_test.go
+@@ -19,14 +19,8 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"testing"
+-
+-	"fortio.org/fortio/log"
+ )
+ 
+-func init() {
+-	log.SetLogLevel(log.Debug)
+-}
+-
+ func TestMultiProxy(t *testing.T) {
+ 	_, debugAddr := ServeTCP("0", "/debug")
+ 	urlBase := fmt.Sprintf("localhost:%d/", debugAddr.Port)
+diff --git a/fhttp/http_test.go b/fhttp/http_test.go
+index 2833355..030563c 100644
+--- a/fhttp/http_test.go
++++ b/fhttp/http_test.go
+@@ -36,7 +36,6 @@ import (
+ var uuids map[string]bool
+ 
+ func init() {
+-	log.SetLogLevel(log.Debug)
+ 	uuids = map[string]bool{}
+ }
+ 
+diff --git a/fhttp/httprunner_test.go b/fhttp/httprunner_test.go
+index bf14734..19894ba 100644
+--- a/fhttp/httprunner_test.go
++++ b/fhttp/httprunner_test.go
+@@ -16,10 +16,14 @@
+ package fhttp
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"compress/gzip"
+ 	"fmt"
+ 	"net/http"
++	"os"
++	"path"
++	"regexp"
+ 	"runtime"
+ 	"strings"
+ 	"testing"
+@@ -80,7 +84,8 @@ func testHTTPNotLeaking(t *testing.T, opts *HTTPRunnerOptions) {
+ 	t.Logf("Number go routine before test %d", ngBefore1)
+ 	mux, addr := DynamicHTTPServer(false)
+ 	mux.HandleFunc("/echo100", EchoHandler)
+-	url := fmt.Sprintf("http://localhost:%d/echo100", addr.Port)
++	// Avoid using localhost which can timeout with stdclient (thought this might fail on ipv6 only machines?)
++	url := fmt.Sprintf("http://127.0.0.1:%d/echo100", addr.Port)
+ 	numCalls := 100
+ 	opts.NumThreads = numCalls / 2 // make 2 calls per thread
+ 	opts.Exactly = int64(numCalls)
+@@ -247,6 +252,86 @@ func gUnzipData(t *testing.T, data []byte) (resData []byte) {
+ 	return
+ }
+ 
++// nolint: gocognit
++func TestAccessLog(t *testing.T) {
++	mux, addr := DynamicHTTPServer(false)
++	mux.HandleFunc("/echo-for-alog/", EchoHandler)
++	URL := fmt.Sprintf("http://localhost:%d/echo-for-alog/?status=555:50", addr.Port)
++	opts := HTTPRunnerOptions{}
++	opts.Init(URL)
++	opts.QPS = 10
++	numReq := int64(50) // can't do too many without running out of fds on mac
++	opts.Exactly = numReq
++	opts.NumThreads = 5
++	for _, format := range []string{"json", "influx"} {
++		dir := t.TempDir()
++		fname := path.Join(dir, "access.log")
++		err := opts.AddAccessLogger(fname, format)
++		if err != nil {
++			t.Errorf("unexpected error for log file %q %s: %v", fname, format, err)
++		}
++		res, err := RunHTTPTest(&opts)
++		if err != nil {
++			t.Fatal(err)
++		}
++		totalReq := res.DurationHistogram.Count
++		if totalReq != numReq {
++			t.Errorf("Mismatch between requests %d and expected %d", totalReq, numReq)
++		}
++		httpOk := res.RetCodes[http.StatusOK]
++		http555 := res.RetCodes[555]
++		if httpOk <= 1 || httpOk >= numReq-1 {
++			t.Errorf("Unexpected ok count %d should be ~ 50%% of %d", httpOk, numReq)
++		}
++		if http555 <= 1 || http555 >= numReq-1 {
++			t.Errorf("Unexpected 555 count %d should be ~ 50%% of %d", http555, numReq)
++		}
++		if totalReq != httpOk+http555 {
++			t.Errorf("Mismatch between requests %d and ok+555 %v", totalReq, res.RetCodes)
++		}
++		file, _ := os.Open(fname)
++		scanner := bufio.NewScanner(file)
++		lineCount := 0
++		linesOk := 0
++		linesNotOk := 0
++		lines200 := 0
++		lines555 := 0
++		re200 := regexp.MustCompile(`\b200\b`)
++		re555 := regexp.MustCompile(`\b555\b`)
++		for scanner.Scan() {
++			line := scanner.Text()
++			if strings.Contains(line, "true") {
++				linesOk++
++			}
++			if strings.Contains(line, "false") {
++				linesNotOk++
++			}
++			if re200.MatchString(line) {
++				lines200++
++			}
++			if re555.MatchString(line) {
++				lines555++
++			}
++			lineCount++
++		}
++		if lineCount != int(numReq) {
++			t.Errorf("unexpected number of lines in access log %s: %d", format, lineCount)
++		}
++		if linesOk != int(httpOk) {
++			t.Errorf("unexpected number of lines in access log %s: with ok: %d instead of %d", format, linesOk, httpOk)
++		}
++		if lines200 != int(httpOk) {
++			t.Errorf("unexpected number of lines in access log %s: with 200: %d instead of %d", format, lines200, httpOk)
++		}
++		if linesNotOk != int(http555) {
++			t.Errorf("unexpected number of lines in access log %s: with not ok: %d instead of %d", format, linesNotOk, http555)
++		}
++		if lines555 != int(http555) {
++			t.Errorf("unexpected number of lines in access log %s: with 555: %d instead of %d", format, lines555, http555)
++		}
++	}
++}
++
+ // need to be the last test as it installs Serve() which would make
+ // the error test for / url above fail:
+ 
+diff --git a/periodic/periodic_test.go b/periodic/periodic_test.go
+index b5a350f..ab85f06 100644
+--- a/periodic/periodic_test.go
++++ b/periodic/periodic_test.go
+@@ -15,8 +15,10 @@
+ package periodic
+ 
+ import (
++	"bufio"
+ 	"math"
+ 	"os"
++	"path"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -27,7 +29,8 @@ import (
+ 
+ type Noop struct{}
+ 
+-func (n *Noop) Run(t int) {
++func (n *Noop) Run(t int) (bool, string) {
++	return true, ""
+ }
+ 
+ // used for when we don't actually run periodic test/want to initialize
+@@ -75,11 +78,13 @@ type TestCount struct {
+ 	lock  *sync.Mutex
+ }
+ 
+-func (c *TestCount) Run(i int) {
++func (c *TestCount) Run(i int) (bool, string) {
+ 	c.lock.Lock()
+ 	(*c.count)++
++	status := (*c.count)%2 == 0
+ 	c.lock.Unlock()
+ 	time.Sleep(100 * time.Millisecond)
++	return status, ""
+ }
+ 
+ func TestStart(t *testing.T) {
+@@ -227,12 +232,16 @@ func TestExactlyMaxQps(t *testing.T) {
+ type testAccessLogger struct {
+ 	sync.Mutex
+ 	reports int64
++	success int64
+ }
+ 
+-func (t *testAccessLogger) Report(thread int, time int64, latency float64) {
++func (t *testAccessLogger) Report(thread int, time int64, latency float64, status bool, details string) {
+ 	t.Lock()
+ 	defer t.Unlock()
+ 	t.reports++
++	if status {
++		t.success++
++	}
+ }
+ 
+ func (t *testAccessLogger) Info() string {
+@@ -268,9 +277,77 @@ func TestAccessLogs(t *testing.T) {
+ 	if count != expected {
+ 		t.Errorf("Access logs executed unexpected number of times %d instead %d", count, expected)
+ 	}
++	if logger.success != expected/2 {
++		t.Errorf("Access logs status success unexpected number of times %d instead %d", logger.success, expected/2)
++	}
+ 	r.Options().ReleaseRunners()
+ }
+ 
++func TestAccessLogFile(t *testing.T) {
++	var count int64
++	var lock sync.Mutex
++
++	c := TestCount{&count, &lock}
++	expected := int64(10)
++	o := RunnerOptions{
++		QPS:        -1, // max qps
++		NumThreads: 4,
++		Exactly:    expected,
++	}
++
++	for _, format := range []string{"json", "influx"} {
++		dir := t.TempDir()
++		fname := path.Join(dir, "access.log")
++		err := o.AddAccessLogger(fname, format)
++		r := NewPeriodicRunner(&o)
++		r.Options().MakeRunners(&c)
++		count = 0
++		if err != nil {
++			t.Errorf("unexpected error for log file %q %s: %v", fname, format, err)
++		}
++		res := r.Run()
++		totalReq := res.DurationHistogram.Count
++		if totalReq != expected {
++			t.Errorf("Mismatch between requests %d and expected %d", totalReq, expected)
++		}
++		if count != expected {
++			t.Errorf("Mismatch between count %d and expected %d", count, expected)
++		}
++		numErr := res.ErrorsDurationHistogram.Count
++		if numErr <= 1 || numErr >= expected-1 {
++			t.Errorf("Unexpected non ok count %d should be ~ 50%% of %d", numErr, expected)
++		}
++		numOk := res.DurationHistogram.Count - numErr
++		if numOk <= 1 || numOk >= expected-1 {
++			t.Errorf("Unexpected ok count %d should be ~ 50%% of %d", numOk, expected)
++		}
++		file, _ := os.Open(fname)
++		scanner := bufio.NewScanner(file)
++		lineCount := 0
++		linesOk := 0
++		linesNotOk := 0
++		for scanner.Scan() {
++			line := scanner.Text()
++			if strings.Contains(line, "true") {
++				linesOk++
++			}
++			if strings.Contains(line, "false") {
++				linesNotOk++
++			}
++			lineCount++
++		}
++		if lineCount != int(expected) {
++			t.Errorf("unexpected number of lines in access log %s: %d", format, lineCount)
++		}
++		if linesOk != int(numOk) {
++			t.Errorf("unexpected number of lines in access log %s: with ok: %d instead of %d", format, linesOk, numOk)
++		}
++		if linesNotOk != int(numErr) {
++			t.Errorf("unexpected number of lines in access log %s: with not ok: %d instead of %d", format, linesNotOk, numErr)
++		}
++	}
++}
++
+ func TestUniformAndNoCatchUp(t *testing.T) {
+ 	var count int64
+ 	var lock sync.Mutex
+diff --git a/stats/stats_test.go b/stats/stats_test.go
+index 41269e5..5cb591e 100644
+--- a/stats/stats_test.go
++++ b/stats/stats_test.go
+@@ -34,7 +34,7 @@ func TestCounter(t *testing.T) {
+ 	var b bytes.Buffer
+ 	w := bufio.NewWriter(&b)
+ 	c.Counter.Print(w, "test1c")
+-	expected := "test1c : count 0 avg NaN +/- NaN min 0 max 0 sum 0\n"
++	expected := "test1c : count 0 avg 0 +/- 0 min 0 max 0 sum 0\n"
+ 	c.Print(w, "test1h", []float64{50.0})
+ 	expected += "test1h : no data\n"
+ 	*log.LogFileAndLine = false
+@@ -118,9 +118,9 @@ func TestTransferCounter(t *testing.T) {
+ 	expected := `c1 before merge : count 2 avg 15 +/- 5 min 10 max 20 sum 30
+ c2 before merge : count 2 avg 85 +/- 5 min 80 max 90 sum 170
+ mergedC1C2 : count 4 avg 50 +/- 35.36 min 10 max 90 sum 200
+-c2 after merge : count 0 avg NaN +/- NaN min 0 max 0 sum 0
++c2 after merge : count 0 avg 0 +/- 0 min 0 max 0 sum 0
+ mergedC2C1 : count 4 avg 50 +/- 35.36 min 10 max 90 sum 200
+-c1 should now be empty : count 0 avg NaN +/- NaN min 0 max 0 sum 0
++c1 should now be empty : count 0 avg 0 +/- 0 min 0 max 0 sum 0
+ c3 after merge - 1 : count 4 avg 50 +/- 35.36 min 10 max 90 sum 200
+ c3 after merge - 2 : count 4 avg 50 +/- 35.36 min 10 max 90 sum 200
+ `

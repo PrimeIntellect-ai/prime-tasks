@@ -1,0 +1,151 @@
+diff --git a/.github/workflows/stale-issues.yml b/.github/workflows/stale-issues.yml
+index de20973f4..16605d6b0 100644
+--- a/.github/workflows/stale-issues.yml
++++ b/.github/workflows/stale-issues.yml
+@@ -15,7 +15,7 @@ jobs:
+       - uses: actions/stale@v9
+         with:
+           repo-token: ${{ secrets.GITHUB_TOKEN }}
+-          stale-issue-message: 'If you would like us to look at this issue, please provide the requested information. If the information is not provided within the next 30 days this issue will be closed.'
++          stale-issue-message: 'If you would like us to look at this issue, please provide the requested information. If the information is not provided within the next 2 weeks this issue will be closed.'
+           stale-pr-message: 'Closing due to lack of requested feedback. If you would like us to look at this issue, please provide the requested information and we will re-open the issue.'
+           days-before-stale: 30
+           days-before-close: 14
+diff --git a/docs/user-guide/connecting-redis.md b/docs/user-guide/connecting-redis.md
+index 6de6e5534..9e2d2eed5 100644
+--- a/docs/user-guide/connecting-redis.md
++++ b/docs/user-guide/connecting-redis.md
+@@ -377,10 +377,11 @@ Microsoft Entra ID tokens have a limited lifetime. Lettuce provides a mechanism
+   RedisURI redisURI = RedisURI.builder()
+       .withHost(HOST)
+       .withPort(PORT)
++      .withSsl(true)
+       .withAuthentication(credentialsSP).build();
+ 
+   // RedisClient
+-  RedisClient redisClient = RedisClient.create(redisURI1);
++  RedisClient redisClient = RedisClient.create(redisURI);
+   redisClient.setOptions(clientOptions);
+   
+   try {
+@@ -394,4 +395,4 @@ Microsoft Entra ID tokens have a limited lifetime. Lettuce provides a mechanism
+       redisClient.shutdown();  // Shutdown Redis client and close connections
+       credentialsSP.close(); // Shutdown Entra ID Credentials provider
+   }
+-```
+\ No newline at end of file
++```
+diff --git a/pom.xml b/pom.xml
+index 068f30e9f..5c796ebab 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -64,7 +64,7 @@
+         <micrometer.version>1.14.2</micrometer.version>
+         <micrometer-tracing.version>1.2.4</micrometer-tracing.version>
+         <mockito.version>4.9.0</mockito.version>
+-        <netty.version>4.1.115.Final</netty.version>
++        <netty.version>4.1.118.Final</netty.version>
+         <openwebbeans.version>2.0.27</openwebbeans.version>
+         <reactor.version>3.6.6</reactor.version>
+         <rxjava.version>1.3.8</rxjava.version>
+diff --git a/src/main/java/io/lettuce/core/dynamic/SimpleBatcher.java b/src/main/java/io/lettuce/core/dynamic/SimpleBatcher.java
+index a2ecf4883..53e23fad6 100644
+--- a/src/main/java/io/lettuce/core/dynamic/SimpleBatcher.java
++++ b/src/main/java/io/lettuce/core/dynamic/SimpleBatcher.java
+@@ -40,6 +40,7 @@ import io.lettuce.core.protocol.RedisCommand;
+  *
+  * @author Mark Paluch
+  * @author Lucio Paiva
++ * @author Ivo Gaydajiev
+  */
+ class SimpleBatcher implements Batcher {
+ 
+@@ -51,6 +52,11 @@ class SimpleBatcher implements Batcher {
+ 
+     private final AtomicBoolean flushing = new AtomicBoolean();
+ 
++    // forceFlushRequested indicates that a flush was requested while there is already a flush in progress
++    // This flag is used to ensure we will flush again after the current flush is done
++    // to ensure that any commands added while dispatching the current flush are also dispatched
++    private final AtomicBoolean forceFlushRequested = new AtomicBoolean();
++
+     public SimpleBatcher(StatefulConnection<Object, Object> connection, int batchSize) {
+ 
+         LettuceAssert.isTrue(batchSize == -1 || batchSize > 1, "Batch size must be greater zero or -1");
+@@ -95,37 +101,56 @@ class SimpleBatcher implements Batcher {
+ 
+         List<RedisCommand<?, ?, ?>> commands = newDrainTarget();
+ 
+-        while (flushing.compareAndSet(false, true)) {
++        while (true) {
++            if (flushing.compareAndSet(false, true)) {
++                try {
+ 
+-            try {
++                    int consume = -1;
+ 
+-                int consume = -1;
++                    if (!forcedFlush) {
++                        long queuedItems = queue.size();
++                        if (queuedItems >= batchSize) {
++                            consume = batchSize;
++                            defaultFlush = true;
++                        }
++                    }
+ 
+-                if (!forcedFlush) {
+-                    long queuedItems = queue.size();
+-                    if (queuedItems >= batchSize) {
+-                        consume = batchSize;
+-                        defaultFlush = true;
++                    List<? extends RedisCommand<?, ?, ?>> batch = doFlush(forcedFlush, defaultFlush, consume);
++                    if (batch != null) {
++                        commands.addAll(batch);
+                     }
+-                }
+ 
+-                List<? extends RedisCommand<?, ?, ?>> batch = doFlush(forcedFlush, defaultFlush, consume);
+-                if (batch != null) {
+-                    commands.addAll(batch);
+-                }
++                    if (defaultFlush && !queue.isEmpty() && queue.size() > batchSize) {
++                        continue;
++                    }
++
++                    if (forceFlushRequested.compareAndSet(true, false)) {
++                        continue;
++                    }
+ 
+-                if (defaultFlush && !queue.isEmpty() && queue.size() > batchSize) {
+-                    continue;
++                    return new BatchTasks(commands);
++
++                } finally {
++                    flushing.set(false);
+                 }
+ 
+-                return new BatchTasks(commands);
++            } else {
++                // Another thread is already flushing
++                if (forcedFlush) {
++                    forceFlushRequested.set(true);
++                }
+ 
+-            } finally {
+-                flushing.set(false);
++                if (commands.isEmpty()) {
++                    return BatchTasks.EMPTY;
++                } else {
++                    // Scenario: A default flush is started in Thread T1.
++                    // If multiple default batches need processing, T1 will release `flushing` and try to reacquire it.
++                    // However, in the brief moment when T1 releases `flushing`, another thread (T2) might acquire it.
++                    // This lead to a state where T2 has taken over processing from T1 and T1 should return commands processed
++                    return new BatchTasks(commands);
++                }
+             }
+         }
+-
+-        return BatchTasks.EMPTY;
+     }
+ 
+     private List<? extends RedisCommand<?, ?, ?>> doFlush(boolean forcedFlush, boolean defaultFlush, int consume) {

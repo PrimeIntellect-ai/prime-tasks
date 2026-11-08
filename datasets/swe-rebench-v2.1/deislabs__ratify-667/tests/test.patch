@@ -1,0 +1,274 @@
+diff --git a/pkg/common/oras/authprovider/azure/azureworkloadidentity_test.go b/pkg/common/oras/authprovider/azure/azureworkloadidentity_test.go
+index 3b2c98c..1b6ef86 100644
+--- a/pkg/common/oras/authprovider/azure/azureworkloadidentity_test.go
++++ b/pkg/common/oras/authprovider/azure/azureworkloadidentity_test.go
+@@ -16,13 +16,30 @@ limitations under the License.
+ package azure
+ 
+ import (
++	"bytes"
+ 	"context"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
+ 	"fmt"
++	"io"
++	"math/big"
++	"net"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
++	"path/filepath"
++	"strings"
+ 	"testing"
++	"text/template"
++	"time"
+ 
+ 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/confidential"
+ 	"github.com/deislabs/ratify/pkg/common/oras/authprovider"
++	"gopkg.in/yaml.v3"
+ )
+ 
+ // Verifies that Enabled checks if tenantID is empty or AAD token is empty
+@@ -60,6 +77,9 @@ func TestAzureWIEnabled_ExpectedResults(t *testing.T) {
+ // Verifies that tenant id, client id, token file path, and authority host
+ // environment variables are properly set
+ func TestAzureWIValidation_EnvironmentVariables_ExpectedResults(t *testing.T) {
++	t.Setenv("AZURE_CLIENT_ID", "")
++	t.Setenv("AZURE_FEDERATED_TOKEN_FILE", "")
++	t.Setenv("AZURE_AUTHORITY_HOST", "")
+ 	authProviderConfig := map[string]interface{}{
+ 		"name": "azureWorkloadIdentity",
+ 	}
+@@ -81,6 +101,25 @@ func TestAzureWIValidation_EnvironmentVariables_ExpectedResults(t *testing.T) {
+ 		t.Fatal("failed to set env variable AZURE_TENANT_ID")
+ 	}
+ 
++	authProviderConfigWithClientID := map[string]interface{}{
++		"name":     "azureWorkloadIdentity",
++		"clientID": "client id from config",
++	}
++
++	_, err = authprovider.CreateAuthProviderFromConfig(authProviderConfigWithClientID)
++
++	expectedErr = fmt.Errorf("required environment variables not set, AZURE_FEDERATED_TOKEN_FILE: , AZURE_AUTHORITY_HOST: ")
++	if err == nil || err.Error() != expectedErr.Error() {
++		t.Fatalf("create auth provider should have failed: expected err %s, but got err %s", expectedErr, err)
++	}
++
++	_, err = authprovider.CreateAuthProviderFromConfig(authProviderConfig)
++
++	expectedErr = fmt.Errorf("no client ID provided and AZURE_CLIENT_ID environment variable is empty")
++	if err == nil || err.Error() != expectedErr.Error() {
++		t.Fatalf("create auth provider should have failed: expected err %s, but got err %s", expectedErr, err)
++	}
++
+ 	err = os.Setenv("AZURE_CLIENT_ID", "client id")
+ 	if err != nil {
+ 		t.Fatal("failed to set env variable AZURE_CLIENT_ID")
+@@ -96,3 +135,202 @@ func TestAzureWIValidation_EnvironmentVariables_ExpectedResults(t *testing.T) {
+ 		t.Fatalf("create auth provider should have failed: expected err %s, but got err %s", expectedErr, err)
+ 	}
+ }
++
++// Verifies that a configured client ID takes precedence over the environment ID
++// when the public auth-provider configuration creates a workload identity provider.
++func TestAzureWIConfiguredClientIDPrecedesEnvironment(t *testing.T) {
++	observedClientID := make(chan string, 1)
++	certificatePEM, certificate := azureAuthorityCertificate(t)
++	azureEndpoint := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.Contains(r.URL.Path, "/discovery/instance") {
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = io.WriteString(w, `{"tenant_discovery_endpoint":"https://login.microsoftonline.com/test-tenant/v2.0/.well-known/openid-configuration","metadata":[{"preferred_network":"login.microsoftonline.com","preferred_cache":"login.microsoftonline.com","aliases":["login.microsoftonline.com"]}]}`)
++			return
++		}
++		if r.Method == http.MethodGet {
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = io.WriteString(w, `{"issuer":"https://login.microsoftonline.com/test-tenant/v2.0","authorization_endpoint":"https://login.microsoftonline.com/test-tenant/oauth2/v2.0/authorize","token_endpoint":"https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token"}`)
++			return
++		}
++		if err := r.ParseForm(); err != nil {
++			http.Error(w, "invalid form", http.StatusBadRequest)
++			return
++		}
++		observedClientID <- r.PostForm.Get("client_id")
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusBadRequest)
++		_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"test token endpoint"}`)
++	}))
++	azureEndpoint.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}}
++	azureEndpoint.StartTLS()
++	defer azureEndpoint.Close()
++
++	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodConnect {
++			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
++			return
++		}
++		client, buffered, err := w.(http.Hijacker).Hijack()
++		if err != nil {
++			return
++		}
++		defer client.Close()
++		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
++		if err := buffered.Flush(); err != nil {
++			return
++		}
++		upstream, err := net.Dial("tcp", azureEndpoint.Listener.Addr().String())
++		if err != nil {
++			return
++		}
++		defer upstream.Close()
++		go func() { _, _ = io.Copy(upstream, client); _ = upstream.Close() }()
++		_, _ = io.Copy(client, upstream)
++	}))
++	defer proxy.Close()
++
++	certFile := filepath.Join(t.TempDir(), "authority.pem")
++	if err := os.WriteFile(certFile, certificatePEM, 0600); err != nil {
++		t.Fatalf("failed to write local authority certificate: %v", err)
++	}
++	t.Setenv("SSL_CERT_FILE", certFile)
++	t.Setenv("HTTPS_PROXY", proxy.URL)
++	t.Setenv("https_proxy", proxy.URL)
++	t.Setenv("NO_PROXY", "")
++	t.Setenv("no_proxy", "")
++	t.Setenv("AZURE_TENANT_ID", "test-tenant")
++	t.Setenv("AZURE_CLIENT_ID", "service-account-client")
++	t.Setenv("AZURE_FEDERATED_TOKEN_FILE", filepath.Join(t.TempDir(), "federated-token"))
++	if err := os.WriteFile(os.Getenv("AZURE_FEDERATED_TOKEN_FILE"), []byte("header.payload.signature"), 0600); err != nil {
++		t.Fatalf("failed to write federated token: %v", err)
++	}
++	t.Setenv("AZURE_AUTHORITY_HOST", "https://login.microsoftonline.com/")
++
++	workloadIdentityProvider, err := authprovider.CreateAuthProviderFromConfig(map[string]interface{}{
++		"name":     "azureWorkloadIdentity",
++		"clientID": "configured-client",
++	})
++	if err == nil {
++		// A provider may defer obtaining its token until credentials are requested.
++		_, _ = workloadIdentityProvider.Provide(context.Background(), "https://example.azurecr.io")
++	}
++
++	select {
++	case got := <-observedClientID:
++		if got != "configured-client" {
++			t.Fatalf("token exchange client ID = %q, want configured client ID", got)
++		}
++	default:
++		t.Fatal("workload-identity token request did not use the configured client ID")
++	}
++}
++
++func azureAuthorityCertificate(t *testing.T) ([]byte, tls.Certificate) {
++	t.Helper()
++	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatalf("failed to generate local authority key: %v", err)
++	}
++	now := time.Now()
++	template := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "login.microsoftonline.com"},
++		NotBefore:             now.Add(-time.Minute),
++		NotAfter:              now.Add(time.Hour),
++		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
++		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++		DNSNames:              []string{"login.microsoftonline.com"},
++	}
++	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
++	if err != nil {
++		t.Fatalf("failed to create local authority certificate: %v", err)
++	}
++	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
++	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
++	certificate, err := tls.X509KeyPair(certificatePEM, privateKeyPEM)
++	if err != nil {
++		t.Fatalf("failed to load local authority certificate: %v", err)
++	}
++	return certificatePEM, certificate
++}
++
++// Verifies that a Store's parameters.authProvider configuration carries the
++// workload identity client ID into the rendered Store custom resource.
++func TestStoreCRD_AuthProviderClientID(t *testing.T) {
++	root := repoRoot(t)
++	templatePath := filepath.Join(root, "charts", "ratify", "templates", "store.yaml")
++	templateBytes, err := os.ReadFile(templatePath)
++	if err != nil {
++		t.Fatalf("failed to read store template: %v", err)
++	}
++
++	funcs := template.FuncMap{
++		"include": func(name string, data interface{}) string { return "ratify-service-account" },
++	}
++	storeTemplate, err := template.New("store").Funcs(funcs).Parse(string(templateBytes))
++	if err != nil {
++		t.Fatalf("failed to parse store template: %v", err)
++	}
++
++	const clientID = "190d0258-5c9d-4ef2-890f-e12c163a2b3e"
++	values := map[string]interface{}{
++		"Values": map[string]interface{}{
++			"oras": map[string]interface{}{
++				"useHttp": false,
++				"authProviders": map[string]interface{}{
++					"azureWorkloadIdentityEnabled": true,
++				},
++				"cache": map[string]interface{}{"enabled": false},
++			},
++			"cosign":                map[string]interface{}{"enabled": false},
++			"azureWorkloadIdentity": map[string]interface{}{"clientId": clientID},
++			"azureManagedIdentity":  map[string]interface{}{"clientId": ""},
++		},
++	}
++
++	var rendered bytes.Buffer
++	if err := storeTemplate.Execute(&rendered, values); err != nil {
++		t.Fatalf("failed to render store template: %v", err)
++	}
++
++	var store map[string]interface{}
++	if err := yaml.Unmarshal(rendered.Bytes(), &store); err != nil {
++		t.Fatalf("failed to parse rendered store: %v", err)
++	}
++
++	spec, ok := store["spec"].(map[string]interface{})
++	if !ok {
++		t.Fatalf("rendered store has no spec: %v", store)
++	}
++	parameters, ok := spec["parameters"].(map[string]interface{})
++	if !ok {
++		t.Fatalf("rendered store has no spec.parameters: %v", spec)
++	}
++	authProvider, ok := parameters["authProvider"].(map[string]interface{})
++	if !ok {
++		t.Fatalf("rendered store has no spec.parameters.authProvider: %v", parameters)
++	}
++	if got := authProvider["clientID"]; got != clientID {
++		t.Fatalf("rendered store authProvider.clientID = %v, want %v", got, clientID)
++	}
++}
++
++func repoRoot(t *testing.T) string {
++	t.Helper()
++	dir, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("failed to get working directory: %v", err)
++	}
++	for {
++		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
++			return dir
++		}
++		parent := filepath.Dir(dir)
++		if parent == dir {
++			t.Fatal("failed to locate repository root")
++		}
++		dir = parent
++	}
++}

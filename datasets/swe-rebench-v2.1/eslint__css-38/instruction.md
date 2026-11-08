@@ -1,0 +1,64 @@
+Change Request: PostCSS syntax support
+### Environment
+
+ESLint version: Latest (Possible to include the version on the Code Explorer?)
+@eslint/css version: Latest (Possible to include the version on the Code Explorer?)
+Node version: N/A
+npm version: N/A
+Operating System: mac
+
+
+### What problem do you want to solve?
+
+PostCSS is an extremely popular enhancement over CSS. However, since this plugin only seems to support strict CSS syntax, it cannot be leveraged.
+
+For example, when using https://github.com/postcss/postcss-mixins, it yields a parsing error: [Code Explorer](https://explorer.eslint.org/#eslint-explorer=IntcInN0YXRlXCI6e1widG9vbFwiOlwiYXN0XCIsXCJjb2RlXCI6e1wiamF2YXNjcmlwdFwiOlwiLyoqXFxuICogVHlwZSBvciBwYXN0ZSBzb21lIEphdmFTY3JpcHQgaGVyZSB0byBsZWFybiBtb3JlIGFib3V0XFxuICogdGhlIHN0YXRpYyBhbmFseXNpcyB0aGF0IEVTTGludCBjYW4gZG8gZm9yIHlvdS5cXG4gKiBcXG4gKiBUaGUgdGhyZWUgdGFicyBhcmU6XFxuICogXFxuICogLSBBU1QgLSBUaGUgQWJzdHJhY3QgU3ludGF4IFRyZWUgb2YgdGhlIGNvZGUsIHdoaWNoIGNhblxcbiAqICAgYmUgdXNlZnVsIHRvIHVuZGVyc3RhbmQgdGhlIHN0cnVjdHVyZSBvZiB0aGUgY29kZS4gWW91XFxuICogICBjYW4gdmlldyB0aGlzIHN0cnVjdHVyZSBhcyBKU09OIG9yIGluIGEgdHJlZSBmb3JtYXQuXFxuICogLSBTY29wZSAtIFRoZSBzY29wZSBzdHJ1Y3R1cmUgb2YgdGhlIGNvZGUsIHdoaWNoIGNhbiBiZVxcbiAqICAgdXNlZnVsIHRvIHVuZGVyc3RhbmQgaG93IHZhcmlhYmxlcyBhcmUgZGVmaW5lZCBhbmRcXG4gKiAgIHdoZXJlIHRoZXkgYXJlIHVzZWQuXFxuICogLSBDb2RlIFBhdGggLSBUaGUgY29kZSBwYXRoIHN0cnVjdHVyZSBvZiB0aGUgY29kZSwgd2hpY2hcXG4gKiAgIGNhbiBiZSB1c2VmdWwgdG8gdW5kZXJzdGFuZCBob3cgdGhlIGNvZGUgaXMgZXhlY3V0ZWQuXFxuICogXFxuICogWW91IGNhbiBjaGFuZ2UgdGhlIHdheSB0aGF0IHRoZSBKYXZhU2NyaXB0IGNvZGUgaXMgaW50ZXJwcmV0ZWRcXG4gKiBieSBjbGlja2luZyBcXFwiSmF2YVNjcmlwdFxcXCIgaW4gdGhlIGhlYWRlciBhbmQgc2VsZWN0aW5nIGRpZmZlcmVudFxcbiAqIG9wdGlvbnMuXFxuICovXFxuXFxuaW1wb3J0IGpzIGZyb20gXFxcIkBlc2xpbnQvanNcXFwiO1xcblxcbmZ1bmN0aW9uIGdldENvbmZpZygpIHtcXG4gICAgcmV0dXJuIHtcXG4gICAgICAgIHJ1bGVzOiB7XFxuICAgICAgICAgICAgXFxcInByZWZlci1jb25zdFxcXCI6IFxcXCJ3YXJuXFxcIlxcbiAgICAgICAgfVxcbiAgICB9O1xcbn1cXG5cXG5leHBvcnQgZGVmYXVsdCBbXFxuICAgIC4uLmpzLmNvbmZpZ3MucmVjb21tZW5kZWQsXFxuICAgIGdldENvbmZpZygpXFxuXTtcIixcImpzb25cIjpcIi8qKlxcbiAqIFR5cGUgb3IgcGFzdGUgc29tZSBKU09OIGhlcmUgdG8gbGVhcm4gbW9yZSBhYm91dFxcbiAqIHRoZSBzdGF0aWMgYW5hbHlzaXMgdGhhdCBFU0xpbnQgY2FuIGRvIGZvciB5b3UuXFxuICpcXG4gKiBUaGUgdGFicyBhcmU6XFxuICpcXG4gKiAtIEFTVCAtIFRoZSBBYnN0cmFjdCBTeW50YXggVHJlZSBvZiB0aGUgY29kZSwgd2hpY2ggY2FuXFxuICogICBiZSB1c2VmdWwgdG8gdW5kZXJzdGFuZCB0aGUgc3RydWN0dXJlIG9mIHRoZSBjb2RlLiBZb3VcXG4gKiAgIGNhbiB2aWV3IHRoaXMgc3RydWN0dXJlIGFzIEpTT04gb3IgaW4gYSB0cmVlIGZvcm1hdC5cXG4gKlxcbiAqIFlvdSBjYW4gY2hhbmdlIHRoZSB3YXkgdGhhdCB0aGUgSlNPTiBjb2RlIGlzIGludGVycHJldGVkXFxuICogYnkgY2xpY2tpbmcgXFxcIkpTT05cXFwiIGluIHRoZSBoZWFkZXIgYW5kIHNlbGVjdGluZyBkaWZmZXJlbnRcXG4gKiBvcHRpb25zLlxcbiAqXFxuICogVGhpcyBleGFtcGxlIGlzIGluIEpTT05DIG1vZGUsIHdoaWNoIGFsbG93cyBjb21tZW50cy5cXG4gKi9cXG5cXG57XFxuICAgIFxcXCJrZXkxXFxcIjogW3RydWUsIGZhbHNlLCBudWxsXSxcXG4gICAgXFxcImtleTJcXFwiOiB7XFxuICAgICAgICBcXFwia2V5M1xcXCI6IFsxLCAyLCBcXFwiM1xcXCIsIDFlMTAsIDFlLTNdXFxuICAgIH1cXG59XCIsXCJtYXJrZG93blwiOlwiPCEtLVxcblR5cGUgb3IgcGFzdGUgc29tZSBNYXJrZG93biBoZXJlIHRvIGxlYXJuIG1vcmUgYWJvdXRcXG50aGUgc3RhdGljIGFuYWx5c2lzIHRoYXQgRVNMaW50IGNhbiBkbyBmb3IgeW91LlxcblxcblRoZSB0YWJzIGFyZTpcXG5cXG4tIEFTVCAtIFRoZSBBYnN0cmFjdCBTeW50YXggVHJlZSBvZiB0aGUgY29kZSwgd2hpY2ggY2FuXFxuYmUgdXNlZnVsIHRvIHVuZGVyc3RhbmQgdGhlIHN0cnVjdHVyZSBvZiB0aGUgY29kZS4gWW91XFxuY2FuIHZpZXcgdGhpcyBzdHJ1Y3R1cmUgYXMgSlNPTiBvciBpbiBhIHRyZWUgZm9ybWF0LlxcblxcbllvdSBjYW4gY2hhbmdlIHRoZSB3YXkgdGhhdCB0aGUgTWFya2Rvd24gY29kZSBpcyBpbnRlcnByZXRlZFxcbmJ5IGNsaWNraW5nIFxcXCJNYXJrZG93blxcXCIgaW4gdGhlIGhlYWRlciBhbmQgc2VsZWN0aW5nIGRpZmZlcmVudFxcbm9wdGlvbnMuXFxuXFxuVGhpcyBleGFtcGxlIGlzIGluIENvbW1vbk1hcmsgbW9kZS5cXG4tLT5cXG5cXG4jIEVTTGludCBNYXJrZG93biBFeGFtcGxlXFxuXFxuVGhpcyBpcyBhbiBleGFtcGxlIG9mIGEgTWFya2Rvd24gZmlsZSB0aGF0IGNhbiBiZSBwYXJzZWRcXG5ieSBFU0xpbnQuIE1hcmtkb3duIGlzIGEgc2ltcGxlIG1hcmt1cCBsYW5ndWFnZSB0aGF0IGlzXFxub2Z0ZW4gdXNlZCBmb3IgZG9jdW1lbnRhdGlvbi5cXG5cXG4jIyBGZWF0dXJlc1xcblxcbi0gTWFrZSB0aGluZ3MgKml0YWxpYyosICoqYm9sZCoqLCBvciBgY29kZWBcXG4tIENyZWF0ZSBbbGlua3NdKGh0dHBzOi8vZXNsaW50Lm9yZylcXG4tIFN1cHBvcnRzIEhUTUwgPHNwYW4gc3R5bGU9XFxcImNvbG9yOiByZWQ7XFxcIj5lbGVtZW50czwvc3Bhbj5cXG4tIExpc3RzXFxuICAtIE5lc3RlZCBsaXN0c1wiLFwiY3NzXCI6XCJAZGVmaW5lLW1peGluIGljb24gJG5ldHdvcmssICRjb2xvcjogYmx1ZSB7XFxuICAgIC5pY29uLmlzLSQobmV0d29yaykge1xcbiAgICAgICAgY29sb3I6ICRjb2xvcjtcXG4gICAgICAgIEBtaXhpbi1jb250ZW50O1xcbiAgICB9XFxuICAgIC5pY29uLmlzLSQobmV0d29yayk6aG92ZXIge1xcbiAgICAgICAgY29sb3I6IHdoaXRlO1xcbiAgICAgICAgYmFja2dyb3VuZDogJGNvbG9yO1xcbiAgICB9XFxufVxcblxcbkBtaXhpbiBpY29uIHR3aXR0ZXIge1xcbiAgICBiYWNrZ3JvdW5kOiB1cmwodHd0LnBuZyk7XFxufVxcbkBtaXhpbiBpY29uIHlvdXR1YmUsIHJlZCB7XFxuICAgIGJhY2tncm91bmQ6IHVybCh5b3V0dWJlLnBuZyk7XFxufVwifSxcImxhbmd1YWdlXCI6XCJjc3NcIixcImpzT3B0aW9uc1wiOntcInBhcnNlclwiOlwiZXNwcmVlXCIsXCJzb3VyY2VUeXBlXCI6XCJtb2R1bGVcIixcImVzVmVyc2lvblwiOlwibGF0ZXN0XCIsXCJpc0pTWFwiOnRydWV9LFwianNvbk9wdGlvbnNcIjp7XCJqc29uTW9kZVwiOlwianNvbmNcIn0sXCJjc3NPcHRpb25zXCI6e1wiY3NzTW9kZVwiOlwiY3NzXCJ9LFwibWFya2Rvd25PcHRpb25zXCI6e1wibWFya2Rvd25Nb2RlXCI6XCJjb21tb25tYXJrXCJ9LFwid3JhcFwiOnRydWUsXCJ2aWV3TW9kZXNcIjp7XCJhc3RWaWV3XCI6XCJ0cmVlXCIsXCJzY29wZVZpZXdcIjpcImZsYXRcIixcInBhdGhWaWV3XCI6XCJncmFwaFwifSxcInBhdGhJbmRleFwiOntcImluZGV4XCI6MCxcImluZGV4ZXNcIjoyfX0sXCJ2ZXJzaW9uXCI6MH0i)
+
+```css
+@define-mixin icon $network, $color: blue {
+    .icon.is-$(network) {
+        color: $color;
+        @mixin-content;
+    }
+    .icon.is-$(network):hover {
+        color: white;
+        background: $color;
+    }
+}
+
+@mixin icon twitter {
+    background: url(twt.png);
+}
+@mixin icon youtube, red {
+    background: url(youtube.png);
+}
+```
+
+This emits the error:
+```
+Error: Semicolon or block is expected(column 20)
+```
+
+### What do you think is the correct solution?
+
+Some ideas:
+- Looser syntax parsing, maybe behind an option?
+- PostCSS plugin
+
+### Participation
+
+- [ ] I am willing to submit a pull request for this change.
+
+### Additional comments
+
+_No response_
+
+### Additional contract requirements
+
+- The CSS language supports a boolean language option named `tolerant`, which defaults to `false`.
+- When `tolerant` is `true`, recoverable parsing errors are ignored: parsing succeeds and the parse result reports `ok: true` even though the same source reports parsing errors when `tolerant` is `false`.
+- With `tolerant` enabled, the PostCSS mixin syntax shown above (using `@define-mixin`, `@mixin`, and `@mixin-content`) parses without a parsing failure.
+- In an ESLint configuration the option is set through `languageOptions.tolerant`. When parsing directly, it is passed to the CSS language's `parse` method as `parse(file, { languageOptions: { tolerant: true } })`, where `parse` returns a result object with an `ok` boolean property.
+
+
+- When `tolerant` is undefined, linting the CSS source `a { foo; bar: 1! }` must report, in order, `Parsing error: Colon is expected` at line 1, column 8 and `Parsing error: Identifier is expected` at line 1, column 18.

@@ -1,0 +1,186 @@
+diff --git a/pkg/apk/apk_test.go b/pkg/apk/apk_test.go
+index cd81abc..e7b1445 100644
+--- a/pkg/apk/apk_test.go
++++ b/pkg/apk/apk_test.go
+@@ -12,21 +12,32 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-package apk
++package apk_test
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"io"
++	"net/http/httptest"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
+ 	"testing"
+ 
++	apkimpl "github.com/chainguard-dev/go-apk/pkg/apk"
+ 	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
+ 	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-containerregistry/pkg/name"
++	"github.com/google/go-containerregistry/pkg/registry"
++	"github.com/google/go-containerregistry/pkg/v1/remote"
+ 	"github.com/stretchr/testify/require"
+ 
++	"chainguard.dev/apko/internal/cli"
++	"chainguard.dev/apko/pkg/apk"
++	"chainguard.dev/apko/pkg/build"
++	"chainguard.dev/apko/pkg/build/types"
+ 	"chainguard.dev/apko/pkg/log"
+-	"chainguard.dev/apko/pkg/options"
+ )
+ 
+ func TestAdditionalTags(t *testing.T) {
+@@ -45,10 +56,10 @@ V:10.45.6-r5
+ A:bop
+ 
+ `
+-	if err := os.MkdirAll(filepath.Join(td, "lib/apk/db/"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(td, "lib/apk/db/"), 0o755); err != nil {
+ 		require.Error(t, err, "mkdir all dirs failed")
+ 	}
+-	if err := os.WriteFile(filepath.Join(td, "lib/apk/db/installed"), []byte(contents), 0755); err != nil {
++	if err := os.WriteFile(filepath.Join(td, "lib/apk/db/installed"), []byte(contents), 0o755); err != nil {
+ 		require.Error(t, err, "write file failed")
+ 	}
+ 	tests := []struct {
+@@ -57,6 +68,7 @@ A:bop
+ 		packageVersionTagStem   bool
+ 		packageVersionTagPrefix string
+ 		tags                    []string
++		tagSuffix               string
+ 		expectedTags            []string
+ 	}{
+ 		{
+@@ -77,6 +89,14 @@ A:bop
+ 			tags:                  []string{"gcr.io/myimage/boop:latest"},
+ 			expectedTags:          []string{"gcr.io/myimage/boop:10.45.6-r5"},
+ 		},
++		{
++			description:           "tag with boop (suffixed)",
++			packageVersionTag:     "boop",
++			packageVersionTagStem: false,
++			tagSuffix:             "-boom",
++			tags:                  []string{"gcr.io/myimage/boop:latest"},
++			expectedTags:          []string{"gcr.io/myimage/boop:10.45.6-r5-boom"},
++		},
+ 		{
+ 			description:           "tag with boop (stemmed)",
+ 			packageVersionTag:     "boop",
+@@ -102,19 +122,43 @@ A:bop
+ 				"gcr.io/myimage/boop:bam-10",
+ 			},
+ 		},
++		{
++			description:           "tag with boop (stemmed and suffixed)",
++			packageVersionTag:     "boop",
++			packageVersionTagStem: true,
++			tagSuffix:             "-boom",
++			tags:                  []string{"gcr.io/myimage/boop:latest"},
++			expectedTags: []string{
++				"gcr.io/myimage/boop:10.45.6-r5-boom",
++				"gcr.io/myimage/boop:10.45.6-boom",
++				"gcr.io/myimage/boop:10.45-boom",
++				"gcr.io/myimage/boop:10-boom",
++			},
++		},
++		{
++			description:             "tag with boop (stemmed, prefixed, and suffixed)",
++			packageVersionTag:       "boop",
++			packageVersionTagStem:   true,
++			packageVersionTagPrefix: "bam-",
++			tagSuffix:               "-boom",
++			tags:                    []string{"gcr.io/myimage/boop:latest"},
++			expectedTags: []string{
++				"gcr.io/myimage/boop:bam-10.45.6-r5-boom",
++				"gcr.io/myimage/boop:bam-10.45.6-boom",
++				"gcr.io/myimage/boop:bam-10.45-boom",
++				"gcr.io/myimage/boop:bam-10-boom",
++			},
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.description, func(tt *testing.T) {
+-			opts := options.Options{
+-				PackageVersionTag:       test.packageVersionTag,
+-				PackageVersionTagStem:   test.packageVersionTagStem,
+-				PackageVersionTagPrefix: test.packageVersionTagPrefix,
+-				Tags:                    test.tags,
+-				WorkDir:                 td,
+-				Log:                     &log.Adapter{Out: io.Discard},
+-			}
+ 			fsys := apkfs.DirFS(td)
+-			got, err := AdditionalTags(fsys, opts)
++			a, err := apkimpl.New(apkimpl.WithFS(fsys))
++			require.NoError(tt, err, "create new apk from filesystem failed")
++
++			pkgs, err := a.GetInstalled()
++			require.NoError(tt, err, "get installed packages failed")
++			got, err := apk.AdditionalTags(pkgs, &log.Adapter{Out: io.Discard}, test.tags, test.packageVersionTag, test.packageVersionTagPrefix, test.tagSuffix, test.packageVersionTagStem)
+ 			if err != nil {
+ 				require.NoError(tt, fmt.Errorf("additional tags failed: %w", err))
+ 			}
+@@ -124,3 +168,57 @@ A:bop
+ 		})
+ 	}
+ }
++
++// TestPublishPackageVersionTag verifies that publishing an image with a
++// package-version tag publishes additional image references derived from the
++// version of the selected installed package.
++func TestPublishPackageVersionTag(t *testing.T) {
++	ctx := context.Background()
++
++	r := registry.New()
++	s := httptest.NewServer(r)
++	defer s.Close()
++	u, err := url.Parse(s.URL)
++	require.NoError(t, err)
++
++	dst := fmt.Sprintf("%s/test/publish", u.Host)
++
++	// Locate the shared testdata used to build a small image.
++	_, thisFile, _, ok := runtime.Caller(0)
++	require.True(t, ok)
++	testdata := filepath.Join(filepath.Dir(thisFile), "..", "..", "internal", "cli", "testdata")
++	testdata, err = filepath.Abs(testdata)
++	require.NoError(t, err)
++
++	config := filepath.Join(t.TempDir(), "apko.yaml")
++	cfg := fmt.Sprintf(`contents:
++  keyring:
++    - %s
++  repositories:
++    - %s
++  packages:
++    - tzdata
++
++entrypoint:
++  command: /bin/sh -l
++
++archs:
++- x86_64
++- aarch64
++`, filepath.Join(testdata, "local-melange.rsa.pub"), filepath.Join(testdata, "packages"))
++	require.NoError(t, os.WriteFile(config, []byte(cfg), 0o644))
++
++	archs := types.ParseArchitectures([]string{"amd64", "arm64"})
++	ropt := []remote.Option{remote.WithTransport(s.Client().Transport)}
++	opts := []build.Option{build.WithConfig(config), build.WithTags(dst)}
++	publishOpts := []cli.PublishOption{cli.WithTags(dst), cli.WithPackageVersionTag("tzdata"), cli.WithLogger(&log.Adapter{Out: io.Discard})}
++
++	require.NoError(t, cli.PublishCmd(ctx, "", archs, ropt, opts, publishOpts))
++
++	// The tzdata package in the test repository is version 2023c-r0, so the
++	// published image must also be available under that version-derived tag.
++	ref, err := name.ParseReference(dst + ":2023c-r0")
++	require.NoError(t, err)
++	_, err = remote.Get(ref, ropt...)
++	require.NoError(t, err, "expected an additional tag derived from the package version to be published")
++}

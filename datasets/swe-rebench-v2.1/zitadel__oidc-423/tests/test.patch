@@ -1,0 +1,210 @@
+diff --git a/pkg/client/integration_test.go b/pkg/client/integration_test.go
+index d8b3f25..9a69f43 100644
+--- a/pkg/client/integration_test.go
++++ b/pkg/client/integration_test.go
+@@ -3,8 +3,8 @@ package client_test
+ import (
+ 	"bytes"
+ 	"context"
++	"fmt"
+ 	"io"
+-	"io/ioutil"
+ 	"math/rand"
+ 	"net/http"
+ 	"net/http/cookiejar"
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/zitadel/oidc/v3/pkg/client/tokenexchange"
+ 	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+ 	"github.com/zitadel/oidc/v3/pkg/oidc"
++	"golang.org/x/oauth2"
+ )
+ 
+ var CTX context.Context
+@@ -56,11 +57,11 @@ func TestRelyingPartySession(t *testing.T) {
+ 	clientID := t.Name() + "-" + strconv.FormatInt(seed.Int63(), 25)
+ 
+ 	t.Log("------- run authorization code flow ------")
+-	provider, _, refreshToken, idToken := RunAuthorizationCodeFlow(t, opServer, clientID, "secret")
++	provider, tokens := RunAuthorizationCodeFlow(t, opServer, clientID, "secret")
+ 
+ 	t.Log("------- refresh tokens  ------")
+ 
+-	newTokens, err := rp.RefreshAccessToken(CTX, provider, refreshToken, "", "")
++	newTokens, err := rp.RefreshTokens[*oidc.IDTokenClaims](CTX, provider, tokens.RefreshToken, "", "")
+ 	require.NoError(t, err, "refresh token")
+ 	assert.NotNil(t, newTokens, "access token")
+ 	t.Logf("new access token %s", newTokens.AccessToken)
+@@ -68,11 +69,13 @@ func TestRelyingPartySession(t *testing.T) {
+ 	t.Logf("new token type %s", newTokens.TokenType)
+ 	t.Logf("new expiry %s", newTokens.Expiry.Format(time.RFC3339))
+ 	require.NotEmpty(t, newTokens.AccessToken, "new accessToken")
+-	assert.NotEmpty(t, newTokens.Extra("id_token"), "new idToken")
++	assert.NotEmpty(t, newTokens.IDToken, "new idToken")
++	assert.NotNil(t, newTokens.IDTokenClaims)
++	assert.Equal(t, newTokens.IDTokenClaims.Subject, tokens.IDTokenClaims.Subject)
+ 
+ 	t.Log("------ end session (logout) ------")
+ 
+-	newLoc, err := rp.EndSession(CTX, provider, idToken, "", "")
++	newLoc, err := rp.EndSession(CTX, provider, tokens.IDToken, "", "")
+ 	require.NoError(t, err, "logout")
+ 	if newLoc != nil {
+ 		t.Logf("redirect to %s", newLoc)
+@@ -81,12 +84,12 @@ func TestRelyingPartySession(t *testing.T) {
+ 	}
+ 
+ 	t.Log("------ attempt refresh again (should fail) ------")
+-	t.Log("trying original refresh token", refreshToken)
+-	_, err = rp.RefreshAccessToken(CTX, provider, refreshToken, "", "")
++	t.Log("trying original refresh token", tokens.RefreshToken)
++	_, err = rp.RefreshTokens[*oidc.IDTokenClaims](CTX, provider, tokens.RefreshToken, "", "")
+ 	assert.Errorf(t, err, "refresh with original")
+ 	if newTokens.RefreshToken != "" {
+ 		t.Log("trying replacement refresh token", newTokens.RefreshToken)
+-		_, err = rp.RefreshAccessToken(CTX, provider, newTokens.RefreshToken, "", "")
++		_, err = rp.RefreshTokens[*oidc.IDTokenClaims](CTX, provider, newTokens.RefreshToken, "", "")
+ 		assert.Errorf(t, err, "refresh with replacement")
+ 	}
+ }
+@@ -106,7 +109,7 @@ func TestResourceServerTokenExchange(t *testing.T) {
+ 	clientSecret := "secret"
+ 
+ 	t.Log("------- run authorization code flow ------")
+-	provider, _, refreshToken, idToken := RunAuthorizationCodeFlow(t, opServer, clientID, clientSecret)
++	provider, tokens := RunAuthorizationCodeFlow(t, opServer, clientID, clientSecret)
+ 
+ 	resourceServer, err := rs.NewResourceServerClientCredentials(CTX, opServer.URL, clientID, clientSecret)
+ 	require.NoError(t, err, "new resource server")
+@@ -116,7 +119,7 @@ func TestResourceServerTokenExchange(t *testing.T) {
+ 	tokenExchangeResponse, err := tokenexchange.ExchangeToken(
+ 		CTX,
+ 		resourceServer,
+-		refreshToken,
++		tokens.RefreshToken,
+ 		oidc.RefreshTokenType,
+ 		"",
+ 		"",
+@@ -134,7 +137,7 @@ func TestResourceServerTokenExchange(t *testing.T) {
+ 
+ 	t.Log("------ end session (logout) ------")
+ 
+-	newLoc, err := rp.EndSession(CTX, provider, idToken, "", "")
++	newLoc, err := rp.EndSession(CTX, provider, tokens.IDToken, "", "")
+ 	require.NoError(t, err, "logout")
+ 	if newLoc != nil {
+ 		t.Logf("redirect to %s", newLoc)
+@@ -147,7 +150,7 @@ func TestResourceServerTokenExchange(t *testing.T) {
+ 	tokenExchangeResponse, err = tokenexchange.ExchangeToken(
+ 		CTX,
+ 		resourceServer,
+-		refreshToken,
++		tokens.RefreshToken,
+ 		oidc.RefreshTokenType,
+ 		"",
+ 		"",
+@@ -161,7 +164,58 @@ func TestResourceServerTokenExchange(t *testing.T) {
+ 	require.Nil(t, tokenExchangeResponse, "token exchange response")
+ }
+ 
+-func RunAuthorizationCodeFlow(t *testing.T, opServer *httptest.Server, clientID, clientSecret string) (provider rp.RelyingParty, accessToken, refreshToken, idToken string) {
++func TestRefreshTokens(t *testing.T) {
++	var tokenResponse string
++	mux := http.NewServeMux()
++	var server *httptest.Server
++	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprintf(w, `{"issuer":%q,"token_endpoint":%q,"jwks_uri":%q}`, server.URL, server.URL+"/token", server.URL+"/keys")
++	})
++	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		io.WriteString(w, tokenResponse)
++	})
++	server = httptest.NewServer(mux)
++	defer server.Close()
++
++	t.Run("oauth2 only", func(t *testing.T) {
++		provider, err := rp.NewRelyingPartyOAuth(&oauth2.Config{
++			ClientID:     "client",
++			ClientSecret: "secret",
++			Endpoint:     oauth2.Endpoint{TokenURL: server.URL + "/token"},
++		})
++		require.NoError(t, err, "new rp")
++		tokenResponse = `{"access_token":"access","token_type":"Bearer","refresh_token":"refresh","expires_in":3600}`
++		tokens, err := rp.RefreshTokens[*oidc.IDTokenClaims](context.Background(), provider, "refresh", "", "")
++		require.NoError(t, err, "refresh tokens")
++		require.NotNil(t, tokens, "tokens")
++		assert.Equal(t, "access", tokens.AccessToken)
++		assert.Empty(t, tokens.IDToken)
++	})
++
++	t.Run("no id_token", func(t *testing.T) {
++		provider, err := rp.NewRelyingPartyOIDC(context.Background(), server.URL, "client", "secret", "http://localhost/callback", []string{"openid"})
++		require.NoError(t, err, "new rp")
++		tokenResponse = `{"access_token":"access","token_type":"Bearer","refresh_token":"refresh","expires_in":3600}`
++		tokens, err := rp.RefreshTokens[*oidc.IDTokenClaims](context.Background(), provider, "refresh", "", "")
++		require.NoError(t, err, "refresh tokens")
++		require.NotNil(t, tokens, "tokens")
++		assert.Equal(t, "access", tokens.AccessToken)
++		assert.Empty(t, tokens.IDToken)
++	})
++
++	t.Run("malformed id_token", func(t *testing.T) {
++		provider, err := rp.NewRelyingPartyOIDC(context.Background(), server.URL, "client", "secret", "http://localhost/callback", []string{"openid"})
++		require.NoError(t, err, "new rp")
++		tokenResponse = `{"access_token":"access","token_type":"Bearer","expires_in":3600,"id_token":"foobar"}`
++		_, err = rp.RefreshTokens[*oidc.IDTokenClaims](context.Background(), provider, "refresh", "", "")
++		require.Error(t, err, "refresh tokens")
++		assert.ErrorIs(t, err, oidc.ErrParse)
++	})
++}
++
++func RunAuthorizationCodeFlow(t *testing.T, opServer *httptest.Server, clientID, clientSecret string) (provider rp.RelyingParty, tokens *oidc.Tokens[*oidc.IDTokenClaims]) {
+ 	targetURL := "http://local-site"
+ 	localURL, err := url.Parse(targetURL + "/login?requestID=1234")
+ 	require.NoError(t, err, "local url")
+@@ -258,7 +312,8 @@ func RunAuthorizationCodeFlow(t *testing.T, opServer *httptest.Server, clientID,
+ 	}
+ 
+ 	var email string
+-	redirect := func(w http.ResponseWriter, r *http.Request, tokens *oidc.Tokens[*oidc.IDTokenClaims], state string, rp rp.RelyingParty, info *oidc.UserInfo) {
++	redirect := func(w http.ResponseWriter, r *http.Request, newTokens *oidc.Tokens[*oidc.IDTokenClaims], state string, rp rp.RelyingParty, info *oidc.UserInfo) {
++		tokens = newTokens
+ 		require.NotNil(t, tokens, "tokens")
+ 		require.NotNil(t, info, "info")
+ 		t.Log("access token", tokens.AccessToken)
+@@ -266,9 +321,6 @@ func RunAuthorizationCodeFlow(t *testing.T, opServer *httptest.Server, clientID,
+ 		t.Log("id token", tokens.IDToken)
+ 		t.Log("email", info.Email)
+ 
+-		accessToken = tokens.AccessToken
+-		refreshToken = tokens.RefreshToken
+-		idToken = tokens.IDToken
+ 		email = info.Email
+ 		http.Redirect(w, r, targetURL, 302)
+ 	}
+@@ -290,12 +342,12 @@ func RunAuthorizationCodeFlow(t *testing.T, opServer *httptest.Server, clientID,
+ 	require.NoError(t, err, "get fully-authorizied redirect location")
+ 	require.Equal(t, targetURL, authorizedURL.String(), "fully-authorizied redirect location")
+ 
+-	require.NotEmpty(t, idToken, "id token")
+-	assert.NotEmpty(t, refreshToken, "refresh token")
+-	assert.NotEmpty(t, accessToken, "access token")
++	require.NotEmpty(t, tokens.IDToken, "id token")
++	assert.NotEmpty(t, tokens.RefreshToken, "refresh token")
++	assert.NotEmpty(t, tokens.AccessToken, "access token")
+ 	assert.NotEmpty(t, email, "email")
+ 
+-	return provider, accessToken, refreshToken, idToken
++	return provider, tokens
+ }
+ 
+ type deferredHandler struct {
+@@ -343,7 +395,7 @@ func getForm(t *testing.T, desc string, httpClient *http.Client, uri *url.URL) [
+ 
+ func fillForm(t *testing.T, desc string, httpClient *http.Client, body []byte, uri *url.URL, opts ...gosubmit.Option) *url.URL {
+ 	// TODO: switch to io.NopCloser when go1.15 support is dropped
+-	req := gosubmit.ParseWithURL(ioutil.NopCloser(bytes.NewReader(body)), uri.String()).FirstForm().Testing(t).NewTestRequest(
++	req := gosubmit.ParseWithURL(io.NopCloser(bytes.NewReader(body)), uri.String()).FirstForm().Testing(t).NewTestRequest(
+ 		append([]gosubmit.Option{gosubmit.AutoFill()}, opts...)...,
+ 	)
+ 	if req.URL.Scheme == "" {

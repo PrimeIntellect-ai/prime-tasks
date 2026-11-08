@@ -1,0 +1,337 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 29aad1688..3dbb7dea5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -44,6 +44,7 @@ migration](https://github.com/open-telemetry/semantic-conventions/blob/main/docs
+ 
+ - Add custom attribute to the span after execution of the SDK rather than before in `go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws`. (#6543)
+ - Support for the `OTEL_HTTP_CLIENT_COMPATIBILITY_MODE=http/dup` environment variable in `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` to emit attributes for both the v1.20.0 and v1.26.0 semantic conventions. (#6778)
++- Support `OTEL_SEMCONV_STABILITY_OPT_IN` to emit telemetry following both `go.opentelemetry.io/otel/semconv/v1.21.0` (default) and `go.opentelemetry.io/otel/semconv/v1.26.0` (opt-in) in `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo` per the [Database semantic convention stability migration guide](https://github.com/open-telemetry/semantic-conventions/blob/cb11bb9bac24f4b0e95ad0f61ce01813d8ceada8/docs/non-normative/db-migration.md#database-semantic-convention-stability-migration-guide). (#6172)
+ - The `code.function` attribute emitted by `go.opentelemetry.io/contrib/bridges/otelslog` now stores the package path-qualified function name instead of just the function name.
+   The `code.namespace` attribute is no longer added. (#6870)
+ - The `code.function` attribute emitted by `go.opentelemetry.io/contrib/bridges/otelzap` now stores the package path-qualified function name instead of just the function name.
+diff --git a/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/doc.go b/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/doc.go
+index f8d53a539..ffe982814 100644
+--- a/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/doc.go
++++ b/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/doc.go
+@@ -6,10 +6,18 @@
+ // This package is compatible with v0.2.0 of
+ // go.mongodb.org/mongo-driver/mongo.
+ //
+-// `NewMonitor` will return an event.CommandMonitor which is used to trace
++// NewMonitor will return an event.CommandMonitor which is used to trace
+ // requests.
+ //
+ // This code was originally based on the following:
+-// - https://github.com/DataDog/dd-trace-go/tree/02f0449efa3cb382d499fadc873957385dcb2192/contrib/go.mongodb.org/mongo-driver/mongo
+-// - https://github.com/DataDog/dd-trace-go/tree/v1.23.3/ddtrace/ext
++//   - https://github.com/DataDog/dd-trace-go/tree/02f0449efa3cb382d499fadc873957385dcb2192/contrib/go.mongodb.org/mongo-driver/mongo
++//   - https://github.com/DataDog/dd-trace-go/tree/v1.23.3/ddtrace/ext
++//
++// The "OTEL_SEMCONV_STABILITY_OPT_IN" environment variable can be used to opt
++// into semconv/v1.26.0:
++//   - "database": emit v1.26.0 semantic conventions
++//   - "": emit v1.21.0 (default) semantic conventions
++//   - "database/dup": emit v1.21.0 (default) and v1.26.0
++//
++// By default, otelmongo only emits v1.21.0.
+ package otelmongo // import "go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo"
+diff --git a/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/internal/semconv/event_monitor.go b/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/internal/semconv/event_monitor.go
+new file mode 100644
+index 000000000..fe1028d3a
+--- /dev/null
++++ b/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/internal/semconv/event_monitor.go
+@@ -0,0 +1,167 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package semconv // import "go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/internal/semconv"
++
++import (
++	"net"
++	"os"
++	"strconv"
++	"strings"
++
++	"go.mongodb.org/mongo-driver/bson"
++	"go.mongodb.org/mongo-driver/event"
++
++	"go.opentelemetry.io/otel/attribute"
++
++	semconv1210 "go.opentelemetry.io/otel/semconv/v1.21.0"
++	semconv1260 "go.opentelemetry.io/otel/semconv/v1.26.0"
++)
++
++// Constants for environment variable keys and versions.
++const (
++	semconvOptIn     = "OTEL_SEMCONV_STABILITY_OPT_IN"
++	semconvOptInDup  = "database/dup"
++	semconvOptIn1260 = "database"
++)
++
++// EventMonitor is responsible for monitoring events with a specified semantic
++// version.
++type EventMonitor struct {
++	version string
++}
++
++// NewEventMonitor creates an EventMonitor with the version set based on the
++// OTEL_SEMCONV_STABILITY_OPT_IN environment variable.
++func NewEventMonitor() EventMonitor {
++	return EventMonitor{
++		version: strings.ToLower(os.Getenv(semconvOptIn)),
++	}
++}
++
++// AttributeOptions represents options for tracing attributes.
++type AttributeOptions struct {
++	collectionName           string
++	commandAttributeDisabled bool
++}
++
++// AttributeOption is a function type that modifies AttributeOptions.
++type AttributeOption func(*AttributeOptions)
++
++// WithCollectionName is a functional option to set the collection name in
++// AttributeOptions.
++func WithCollectionName(collName string) AttributeOption {
++	return func(opts *AttributeOptions) {
++		opts.collectionName = collName
++	}
++}
++
++// WithCommandAttributeDisabled is a functional option to enable or disable
++// command attributes.
++func WithCommandAttributeDisabled(disabled bool) AttributeOption {
++	return func(opts *AttributeOptions) {
++		opts.commandAttributeDisabled = disabled
++	}
++}
++
++// CommandStartedTraceAttrs generates trace attributes for a CommandStartedEvent
++// based on the EventMonitor version.
++func (m EventMonitor) CommandStartedTraceAttrs(
++	evt *event.CommandStartedEvent,
++	opts ...AttributeOption,
++) []attribute.KeyValue {
++	switch m.version {
++	case semconvOptIn1260:
++		return commandStartedTraceAttrsV1260(evt, opts...)
++	case semconvOptInDup:
++		return append(commandStartedTraceAttrsV1260(evt, opts...), commandStartedTraceAttrsV1210(evt, opts...)...)
++	default:
++		return commandStartedTraceAttrsV1210(evt, opts...)
++	}
++}
++
++// peerInfo extracts the hostname and port from a CommandStartedEvent.
++func peerInfo(evt *event.CommandStartedEvent) (hostname string, port int) {
++	hostname = evt.ConnectionID
++	port = 27017 // Default MongoDB port
++
++	host, portStr, err := net.SplitHostPort(hostname)
++	if err != nil {
++		// If there's an error (likely because there's no port), assume default port
++		// and use ConnectionID as hostname
++		return hostname, port
++	}
++
++	if parsedPort, err := strconv.Atoi(portStr); err == nil {
++		port = parsedPort
++	}
++
++	return host, port
++}
++
++// sanitizeCommand converts a BSON command to a sanitized JSON string.
++// TODO: Sanitize values where possible.
++// TODO: Limit maximum size.
++func sanitizeCommand(command bson.Raw) string {
++	b, _ := bson.MarshalExtJSON(command, false, false)
++
++	return string(b)
++}
++
++// commandStartedTraceAttrsV1260 generates trace attributes for semantic version
++// 1.26.0.
++func commandStartedTraceAttrsV1260(evt *event.CommandStartedEvent, setters ...AttributeOption) []attribute.KeyValue {
++	opts := &AttributeOptions{}
++	for _, set := range setters {
++		set(opts)
++	}
++
++	attrs := []attribute.KeyValue{semconv1260.DBSystemMongoDB}
++
++	attrs = append(attrs, semconv1260.DBOperationName(evt.CommandName))
++	attrs = append(attrs, semconv1260.DBNamespace(evt.DatabaseName))
++	attrs = append(attrs, semconv1260.NetworkTransportTCP)
++
++	hostname, port := peerInfo(evt)
++	attrs = append(attrs, semconv1260.NetworkPeerPort(port))
++	attrs = append(attrs, semconv1260.NetworkPeerAddress(net.JoinHostPort(hostname, strconv.Itoa(port))))
++
++	if !opts.commandAttributeDisabled {
++		attrs = append(attrs, semconv1260.DBQueryText(sanitizeCommand(evt.Command)))
++	}
++
++	if opts.collectionName != "" {
++		attrs = append(attrs, semconv1260.DBCollectionName(opts.collectionName))
++	}
++
++	return attrs
++}
++
++// commandStartedTraceAttrsV1210 generates trace attributes for semantic version
++// 1.21.0.
++func commandStartedTraceAttrsV1210(evt *event.CommandStartedEvent, setters ...AttributeOption) []attribute.KeyValue {
++	opts := &AttributeOptions{}
++	for _, set := range setters {
++		set(opts)
++	}
++
++	attrs := []attribute.KeyValue{semconv1210.DBSystemMongoDB}
++
++	attrs = append(attrs, semconv1210.DBOperation(evt.CommandName))
++	attrs = append(attrs, semconv1210.DBName(evt.DatabaseName))
++	attrs = append(attrs, semconv1210.NetTransportTCP)
++
++	hostname, port := peerInfo(evt)
++	attrs = append(attrs, semconv1210.NetPeerPort(port))
++	attrs = append(attrs, semconv1210.NetPeerName(hostname))
++
++	if !opts.commandAttributeDisabled {
++		attrs = append(attrs, semconv1210.DBStatement(sanitizeCommand(evt.Command)))
++	}
++
++	if opts.collectionName != "" {
++		attrs = append(attrs, semconv1210.DBMongoDBCollection(opts.collectionName))
++	}
++
++	return attrs
++}
+diff --git a/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/mongo.go b/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/mongo.go
+index 746e2e2c5..b565620c7 100644
+--- a/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/mongo.go
++++ b/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/mongo.go
+@@ -7,17 +7,15 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"strconv"
+-	"strings"
+ 	"sync"
+ 
+-	"go.opentelemetry.io/otel/attribute"
+ 	"go.opentelemetry.io/otel/codes"
+-	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+ 	"go.opentelemetry.io/otel/trace"
+ 
+ 	"go.mongodb.org/mongo-driver/bson"
+ 	"go.mongodb.org/mongo-driver/event"
++
++	"go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo/internal/semconv"
+ )
+ 
+ type spanKey struct {
+@@ -27,34 +25,27 @@ type spanKey struct {
+ 
+ type monitor struct {
+ 	sync.Mutex
+-	spans map[spanKey]trace.Span
+-	cfg   config
++	spans   map[spanKey]trace.Span
++	cfg     config
++	semconv semconv.EventMonitor
+ }
+ 
+ func (m *monitor) Started(ctx context.Context, evt *event.CommandStartedEvent) {
+-	var spanName string
+-
+-	hostname, port := peerInfo(evt)
+-
+-	attrs := []attribute.KeyValue{
+-		semconv.DBSystemMongoDB,
+-		semconv.DBOperation(evt.CommandName),
+-		semconv.DBName(evt.DatabaseName),
+-		semconv.NetPeerName(hostname),
+-		semconv.NetPeerPort(port),
+-		semconv.NetTransportTCP,
+-	}
+-	if !m.cfg.CommandAttributeDisabled {
+-		attrs = append(attrs, semconv.DBStatement(sanitizeCommand(evt.Command)))
++	attrOptions := []semconv.AttributeOption{
++		semconv.WithCommandAttributeDisabled(m.cfg.CommandAttributeDisabled),
+ 	}
++
++	var spanName string
+ 	if collection, err := extractCollection(evt); err == nil && collection != "" {
+ 		spanName = collection + "."
+-		attrs = append(attrs, semconv.DBMongoDBCollection(collection))
++
++		attrOptions = append(attrOptions, semconv.WithCollectionName(collection))
+ 	}
++
+ 	spanName += evt.CommandName
+ 	opts := []trace.SpanStartOption{
+ 		trace.WithSpanKind(trace.SpanKindClient),
+-		trace.WithAttributes(attrs...),
++		trace.WithAttributes(m.semconv.CommandStartedTraceAttrs(evt, attrOptions...)...),
+ 	}
+ 	_, span := m.cfg.Tracer.Start(ctx, spanName, opts...)
+ 	key := spanKey{
+@@ -96,11 +87,19 @@ func (m *monitor) Finished(evt *event.CommandFinishedEvent, err error) {
+ 	span.End()
+ }
+ 
+-// TODO sanitize values where possible, then re-enable `db.statement` span attributes default.
+-// TODO limit maximum size.
+-func sanitizeCommand(command bson.Raw) string {
+-	b, _ := bson.MarshalExtJSON(command, false, false)
+-	return string(b)
++// NewMonitor creates a new mongodb event CommandMonitor.
++func NewMonitor(opts ...Option) *event.CommandMonitor {
++	cfg := newConfig(opts...)
++	m := &monitor{
++		spans:   make(map[spanKey]trace.Span),
++		cfg:     cfg,
++		semconv: semconv.NewEventMonitor(),
++	}
++	return &event.CommandMonitor{
++		Started:   m.Started,
++		Succeeded: m.Succeeded,
++		Failed:    m.Failed,
++	}
+ }
+ 
+ // extractCollection extracts the collection for the given mongodb command event.
+@@ -121,30 +120,3 @@ func extractCollection(evt *event.CommandStartedEvent) (string, error) {
+ 	}
+ 	return "", errors.New("collection name not found")
+ }
+-
+-// NewMonitor creates a new mongodb event CommandMonitor.
+-func NewMonitor(opts ...Option) *event.CommandMonitor {
+-	cfg := newConfig(opts...)
+-	m := &monitor{
+-		spans: make(map[spanKey]trace.Span),
+-		cfg:   cfg,
+-	}
+-	return &event.CommandMonitor{
+-		Started:   m.Started,
+-		Succeeded: m.Succeeded,
+-		Failed:    m.Failed,
+-	}
+-}
+-
+-func peerInfo(evt *event.CommandStartedEvent) (hostname string, port int) {
+-	hostname = evt.ConnectionID
+-	port = 27017
+-	if idx := strings.IndexByte(hostname, '['); idx >= 0 {
+-		hostname = hostname[:idx]
+-	}
+-	if idx := strings.IndexByte(hostname, ':'); idx >= 0 {
+-		port = func(p int, e error) int { return p }(strconv.Atoi(hostname[idx+1:]))
+-		hostname = hostname[:idx]
+-	}
+-	return hostname, port
+-}

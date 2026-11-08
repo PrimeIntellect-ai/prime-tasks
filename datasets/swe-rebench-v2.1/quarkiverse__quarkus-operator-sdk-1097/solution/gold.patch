@@ -1,0 +1,225 @@
+diff --git a/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneration.java b/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneration.java
+index 43416548..ef026e1d 100644
+--- a/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneration.java
++++ b/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneration.java
+@@ -11,7 +11,9 @@ import java.util.Set;
+ 
+ import org.jboss.logging.Logger;
+ 
++import io.fabric8.crdv2.generator.CRDPostProcessor;
+ import io.fabric8.kubernetes.client.CustomResource;
++import io.quarkiverse.operatorsdk.common.ClassLoadingUtils;
+ import io.quarkiverse.operatorsdk.common.CustomResourceAugmentedClassInfo;
+ import io.quarkiverse.operatorsdk.common.FileUtils;
+ import io.quarkiverse.operatorsdk.runtime.CRDConfiguration;
+@@ -25,12 +27,29 @@ class CRDGeneration {
+     private static final Logger log = Logger.getLogger(CRDGeneration.class.getName());
+     private final LaunchMode mode;
+     private final CRDConfiguration crdConfiguration;
+-    private CRDGenerator generator;
++    private final CRDGenerator generator;
+     private boolean needGeneration;
+ 
+     CRDGeneration(CRDConfiguration crdConfig, LaunchMode mode) {
+         this.crdConfiguration = crdConfig;
+         this.mode = mode;
++        // generator MUST be initialized before we start processing classes as initializing it
++        // will reset the types information held by the generator
++        final var useV1 = crdConfiguration.useV1CRDGenerator();
++        if (useV1) {
++            if (crdConfiguration.crdPostProcessorClass().isPresent()) {
++                log.warn(
++                        "CRD post processing is only available when using the v2 version of the CRD generation API. Specified processor will be ignored: "
++                                + crdConfiguration.crdPostProcessorClass());
++            }
++            generator = new CRDGeneratorV1(crdConfiguration.generateInParallel());
++        } else {
++            final var postProcessor = crdConfiguration.crdPostProcessorClass()
++                    .map(processorClassName -> ClassLoadingUtils.loadClass(processorClassName, CRDPostProcessor.class))
++                    .map(ClassLoadingUtils::instantiate)
++                    .orElse(CRDPostProcessor.nullProcessor);
++            generator = new CRDGeneratorV2(crdConfiguration.generateInParallel(), postProcessor);
++        }
+     }
+ 
+     static boolean shouldGenerate(Optional<Boolean> configuredGenerate, Optional<Boolean> configuredApply,
+@@ -137,12 +156,6 @@ class CRDGeneration {
+ 
+     void withCustomResource(Class<? extends CustomResource<?, ?>> crClass, String associatedControllerName) {
+         try {
+-            // generator MUST be initialized before we start processing classes as initializing it
+-            // will reset the types information held by the generator
+-            if (generator == null) {
+-                generator = crdConfiguration.useV1CRDGenerator() ? new CRDGeneratorV1(crdConfiguration.generateInParallel())
+-                        : new CRDGeneratorV2(crdConfiguration.generateInParallel());
+-            }
+             generator.scheduleForGeneration(crClass);
+             needGeneration = true;
+         } catch (Exception e) {
+diff --git a/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV1.java b/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV1.java
+index f183c688..60d2fb53 100644
+--- a/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV1.java
++++ b/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV1.java
+@@ -4,15 +4,13 @@ import java.io.File;
+ import java.util.List;
+ import java.util.Set;
+ 
+-import org.jboss.logging.Logger;
+-
+ import io.fabric8.crd.generator.CustomResourceInfo;
+ import io.fabric8.kubernetes.client.CustomResource;
+ import io.quarkiverse.operatorsdk.runtime.CRDInfo;
+ import io.quarkiverse.operatorsdk.runtime.CRDInfos;
++import io.quarkus.logging.Log;
+ 
+ class CRDGeneratorV1 implements CRDGenerator {
+-    private static final Logger log = Logger.getLogger(CRDGeneratorV1.class.getName());
+     private final io.fabric8.crd.generator.CRDGenerator generator;
+ 
+     public CRDGeneratorV1(boolean parallelGeneration) {
+@@ -25,13 +23,13 @@ class CRDGeneratorV1 implements CRDGenerator {
+         final var crdDetailsPerNameAndVersion = info.getCRDDetailsPerNameAndVersion();
+ 
+         crdDetailsPerNameAndVersion.forEach((crdName, initialVersionToCRDInfoMap) -> {
+-            log.infov("Generated {0} CRD:", crdName);
++            Log.infov("Generated {0} CRD:", crdName);
+             generated.add(crdName);
+ 
+             initialVersionToCRDInfoMap
+                     .forEach((crdSpecVersion, crdInfo) -> {
+                         final var filePath = crdInfo.getFilePath();
+-                        log.infov("  - {0} -> {1}", crdSpecVersion, filePath);
++                        Log.infov("  - {0} -> {1}", crdSpecVersion, filePath);
+                         converted.addCRDInfo(new CRDInfo(crdName,
+                                 crdSpecVersion, filePath, crdInfo.getDependentClassNames()));
+                     });
+diff --git a/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV2.java b/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV2.java
+index bdee1e4e..0fb4e42d 100644
+--- a/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV2.java
++++ b/core/deployment/src/main/java/io/quarkiverse/operatorsdk/deployment/CRDGeneratorV2.java
+@@ -4,19 +4,22 @@ import java.io.File;
+ import java.util.List;
+ import java.util.Set;
+ 
+-import org.jboss.logging.Logger;
+-
++import io.fabric8.crdv2.generator.CRDPostProcessor;
+ import io.fabric8.crdv2.generator.CustomResourceInfo;
+ import io.fabric8.kubernetes.client.CustomResource;
+ import io.quarkiverse.operatorsdk.runtime.CRDInfo;
+ import io.quarkiverse.operatorsdk.runtime.CRDInfos;
++import io.quarkus.logging.Log;
+ 
+ class CRDGeneratorV2 implements CRDGenerator {
+-    private static final Logger log = Logger.getLogger(CRDGeneratorV2.class.getName());
+     private final io.fabric8.crdv2.generator.CRDGenerator generator;
+ 
+-    public CRDGeneratorV2(boolean parallelGeneration) {
+-        this.generator = new io.fabric8.crdv2.generator.CRDGenerator().withParallelGenerationEnabled(parallelGeneration);
++    public CRDGeneratorV2(boolean parallelGeneration, CRDPostProcessor postProcessor) {
++        this.generator = new io.fabric8.crdv2.generator.CRDGenerator()
++                .withParallelGenerationEnabled(parallelGeneration);
++        if (postProcessor != null) {
++            generator.withPostProcessor(postProcessor);
++        }
+     }
+ 
+     @Override
+@@ -25,13 +28,13 @@ class CRDGeneratorV2 implements CRDGenerator {
+         final var crdDetailsPerNameAndVersion = info.getCRDDetailsPerNameAndVersion();
+ 
+         crdDetailsPerNameAndVersion.forEach((crdName, initialVersionToCRDInfoMap) -> {
+-            log.infov("Generated {0} CRD:", crdName);
++            Log.infov("Generated {0} CRD:", crdName);
+             generated.add(crdName);
+ 
+             initialVersionToCRDInfoMap
+                     .forEach((crdSpecVersion, crdInfo) -> {
+                         final var filePath = crdInfo.getFilePath();
+-                        log.infov("  - {0} -> {1}", crdSpecVersion, filePath);
++                        Log.infov("  - {0} -> {1}", crdSpecVersion, filePath);
+                         converted.addCRDInfo(new CRDInfo(crdName,
+                                 crdSpecVersion, filePath, crdInfo.getDependentClassNames()));
+                     });
+diff --git a/core/runtime/src/main/java/io/quarkiverse/operatorsdk/runtime/CRDConfiguration.java b/core/runtime/src/main/java/io/quarkiverse/operatorsdk/runtime/CRDConfiguration.java
+index b94ea6c9..4ef348c8 100644
+--- a/core/runtime/src/main/java/io/quarkiverse/operatorsdk/runtime/CRDConfiguration.java
++++ b/core/runtime/src/main/java/io/quarkiverse/operatorsdk/runtime/CRDConfiguration.java
+@@ -97,4 +97,13 @@ public interface CRDConfiguration {
+     @WithDefault(DEFAULT_USE_V1_CRD_GENERATOR)
+     @WithName("use-deprecated-v1-crd-generator")
+     Boolean useV1CRDGenerator();
++
++    /**
++     * The fully qualified name of a Fabric8 CRD generator v2 API {@code CRDPostProcessor} implementation, providing a public,
++     * no-arg constructor for instantiation
++     *
++     * @since 7.2.0
++     */
++    @WithName("post-processor")
++    Optional<String> crdPostProcessorClass();
+ }
+diff --git a/docs/modules/ROOT/pages/includes/quarkus-operator-sdk.adoc b/docs/modules/ROOT/pages/includes/quarkus-operator-sdk.adoc
+index cee71af2..61488a8b 100644
+--- a/docs/modules/ROOT/pages/includes/quarkus-operator-sdk.adoc
++++ b/docs/modules/ROOT/pages/includes/quarkus-operator-sdk.adoc
+@@ -200,6 +200,27 @@ endif::add-copy-button-to-env-var[]
+ |list of string
+ |
+ 
++a|icon:lock[title=Fixed at build time] [[quarkus-operator-sdk_quarkus-operator-sdk-crd-post-processor]] [.property-path]##link:#quarkus-operator-sdk_quarkus-operator-sdk-crd-post-processor[`quarkus.operator-sdk.crd.post-processor`]##
++ifdef::add-copy-button-to-config-props[]
++config_property_copy_button:+++quarkus.operator-sdk.crd.post-processor+++[]
++endif::add-copy-button-to-config-props[]
++
++
++[.description]
++--
++The fully qualified name of a Fabric8 CRD generator v2 API `CRDPostProcessor` implementation, providing a public, no-arg constructor for instantiation
++
++
++ifdef::add-copy-button-to-env-var[]
++Environment variable: env_var_with_copy_button:+++QUARKUS_OPERATOR_SDK_CRD_POST_PROCESSOR+++[]
++endif::add-copy-button-to-env-var[]
++ifndef::add-copy-button-to-env-var[]
++Environment variable: `+++QUARKUS_OPERATOR_SDK_CRD_POST_PROCESSOR+++`
++endif::add-copy-button-to-env-var[]
++--
++|string
++|
++
+ a|icon:lock[title=Fixed at build time] [[quarkus-operator-sdk_quarkus-operator-sdk-generation-aware]] [.property-path]##link:#quarkus-operator-sdk_quarkus-operator-sdk-generation-aware[`quarkus.operator-sdk.generation-aware`]##
+ ifdef::add-copy-button-to-config-props[]
+ config_property_copy_button:+++quarkus.operator-sdk.generation-aware+++[]
+diff --git a/docs/modules/ROOT/pages/includes/quarkus-operator-sdk_quarkus.operator-sdk.adoc b/docs/modules/ROOT/pages/includes/quarkus-operator-sdk_quarkus.operator-sdk.adoc
+index cee71af2..61488a8b 100644
+--- a/docs/modules/ROOT/pages/includes/quarkus-operator-sdk_quarkus.operator-sdk.adoc
++++ b/docs/modules/ROOT/pages/includes/quarkus-operator-sdk_quarkus.operator-sdk.adoc
+@@ -200,6 +200,27 @@ endif::add-copy-button-to-env-var[]
+ |list of string
+ |
+ 
++a|icon:lock[title=Fixed at build time] [[quarkus-operator-sdk_quarkus-operator-sdk-crd-post-processor]] [.property-path]##link:#quarkus-operator-sdk_quarkus-operator-sdk-crd-post-processor[`quarkus.operator-sdk.crd.post-processor`]##
++ifdef::add-copy-button-to-config-props[]
++config_property_copy_button:+++quarkus.operator-sdk.crd.post-processor+++[]
++endif::add-copy-button-to-config-props[]
++
++
++[.description]
++--
++The fully qualified name of a Fabric8 CRD generator v2 API `CRDPostProcessor` implementation, providing a public, no-arg constructor for instantiation
++
++
++ifdef::add-copy-button-to-env-var[]
++Environment variable: env_var_with_copy_button:+++QUARKUS_OPERATOR_SDK_CRD_POST_PROCESSOR+++[]
++endif::add-copy-button-to-env-var[]
++ifndef::add-copy-button-to-env-var[]
++Environment variable: `+++QUARKUS_OPERATOR_SDK_CRD_POST_PROCESSOR+++`
++endif::add-copy-button-to-env-var[]
++--
++|string
++|
++
+ a|icon:lock[title=Fixed at build time] [[quarkus-operator-sdk_quarkus-operator-sdk-generation-aware]] [.property-path]##link:#quarkus-operator-sdk_quarkus-operator-sdk-generation-aware[`quarkus.operator-sdk.generation-aware`]##
+ ifdef::add-copy-button-to-config-props[]
+ config_property_copy_button:+++quarkus.operator-sdk.generation-aware+++[]

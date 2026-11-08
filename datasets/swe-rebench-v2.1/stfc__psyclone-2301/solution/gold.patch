@@ -1,0 +1,547 @@
+diff --git a/changelog b/changelog
+index 667e2962f..f52c414c2 100644
+--- a/changelog
++++ b/changelog
+@@ -590,6 +590,8 @@
+ 	198) PR #2283 for #2282 and #2286. Adds a get_ubound_expression
+ 	method to ArrayMixin (analagous to get_lbound_expression).
+ 
++	199) PR #2293 for #2301. Add 'is_independent' property/query to Loop.
++
+ release 2.3.1 17th of June 2022
+ 
+ 	1) PR #1747 for #1720. Adds support for If blocks to PSyAD.
+diff --git a/doc/developer_guide/dependency.rst b/doc/developer_guide/dependency.rst
+index ee619e439..1bcad8bb8 100644
+--- a/doc/developer_guide/dependency.rst
++++ b/doc/developer_guide/dependency.rst
+@@ -1,7 +1,7 @@
+ .. -----------------------------------------------------------------------------
+    BSD 3-Clause License
+ 
+-   Copyright (c) 2021-2022, Science and Technology Facilities Council.
++   Copyright (c) 2021-2023, Science and Technology Facilities Council.
+    All rights reserved.
+ 
+    Redistribution and use in source and binary forms, with or without
+@@ -49,11 +49,12 @@
+     Config.get().api = "nemo"
+ 
+     code = '''subroutine sub()
+-    integer :: i, j, k, a(10, 10)
++    integer :: i, j, k, a(11, 11)
+     a(i,j) = 1
+     do i=1, 10
+        j = 3
+        a(i,i) = j + k
++       a(i,i) = a(i+1,i+1)
+     enddo
+     end subroutine sub
+     '''
+@@ -65,10 +66,10 @@
+     access_info = all_a_accesses[0]
+ 
+     # Take the loop node:
+-    loop = psyir.children[0][1]
++    loop = psyir.walk(Loop)[0]
+     loop_statements = [loop]
+     # One example uses code from an OMP directive to determine
+-    # private variables. But since all this example does is calling
++    # private variables. But since all this example does is call
+     # `reference_accesses`, we can just pass in the PSyIR node of
+     # the loop, which results in two private variables (to avoid
+     # creating an OMP Parallel etc)
+@@ -516,6 +517,7 @@ thread-private. Note that this code does not handle the usage of
+         do i=1, 10
+            j = 3
+            a(i,i) = j + k
++	   a(i-1,i) = a(i,i) + 1
+         enddo
+     It should therefore report that 'i' and 'j' should be private
+     variables, 'k' is not initialised and therefore assumed to be public.
+@@ -594,7 +596,7 @@ until we find accesses that would prevent parallelisation:
+ .. testoutput::
+     :hide:
+ 
+-    The first 2 statements can be parallelised.
++    The first 3 statements can be parallelised.
+ 
+ 
+ .. note:: There is a certain overlap in the dependency analysis code
+@@ -625,27 +627,20 @@ uses `SymPy` internally to compare expressions symbolically.
+           it will set the values of removed variables at the end of the loop,
+           which can prevent loop fusion etc to work as expected.
+ 
+-An example of how to use this class is shown below. It takes a list of statements
++An example of how to use this class is shown below. (Note that this is just
++for demonstration purposes: in reality the `validate` method of `OMPLoopTrans`
++will also use the dependence analysis to check that the transformation is
++safe.) It takes a list of statements
+ (i.e. nodes in the PSyIR), and adds 'OMP DO' directives around loops that
+ can be parallelised:
+ 
+ ..
+     The setup passes a single (not-nested) loop as `loop_statements`.
+-    This loop triggers the message that it is not a nested loop and
+-    is therefore not be parallelised by default.
+ 
+ .. testcode::
+ 
+    parallel_loop = OMPLoopTrans()
+-   # The loops in the Fortran functions that must be parallelised
+-   # are over the 'lat' domain. Note that the psyclone config
+-   # file specifies the mapping of loop variable to type, e.g.:
+-   #
+-   #   mapping-lat = var: jj, start: 1, stop: jpj
+-   #
+-   # This means any loop using the variable 'jj' is considered a
+-   # loop of type 'lat'
+-   dt = DependencyTools(["lat"])
++   dt = DependencyTools()
+ 
+    for statement in loop_statements:
+        if isinstance(statement, Loop):
+@@ -662,4 +657,4 @@ can be parallelised:
+ .. testoutput::
+     :hide:
+ 
+-    Info: Not a nested loop.
++    Error: The write access to 'a(i,i)' and to 'a(i + 1,i + 1)' are dependent and cannot be parallelised.
+diff --git a/examples/nemo/scripts/utils.py b/examples/nemo/scripts/utils.py
+index d60a38e3c..7b464827d 100755
+--- a/examples/nemo/scripts/utils.py
++++ b/examples/nemo/scripts/utils.py
+@@ -44,7 +44,6 @@ from psyclone.psyir.transformations import HoistLoopBoundExprTrans, \
+     HoistTrans, ProfileTrans, HoistLocalArraysTrans, Reference2ArrayRangeTrans
+ from psyclone.domain.nemo.transformations import NemoAllArrayRange2LoopTrans
+ from psyclone.transformations import TransformationError
+-from psyclone.psyir.tools import DependencyTools
+ 
+ 
+ # If routine names contain these substrings then we do not profile them
+@@ -218,9 +217,8 @@ def insert_explicit_loop_parallelism(
+         many nested loops as possible.
+     :param collapse: whether to insert directive on loops with Calls or \
+         CodeBlocks in their loop body.
+-    '''
+-    dep_tools = DependencyTools()
+ 
++    '''
+     # Add the parallel directives in each loop
+     for loop in schedule.walk(Loop):
+         if loop.ancestor(Directive):
+@@ -328,7 +326,7 @@ def insert_explicit_loop_parallelism(
+                     break
+ 
+                 # Check that the next loop has no loop-carried dependencies
+-                if not dep_tools.can_loop_be_parallelised(next_loop):
++                if not next_loop.independent_iterations():
+                     break
+ 
+             # Add collapse clause to the parent directive
+diff --git a/src/psyclone/dynamo0p3.py b/src/psyclone/dynamo0p3.py
+index 6bba02d9c..fa89afac6 100644
+--- a/src/psyclone/dynamo0p3.py
++++ b/src/psyclone/dynamo0p3.py
+@@ -7514,6 +7514,113 @@ class DynLoop(PSyLoop):
+                                    f"set_clean({halo_depth})")
+                     parent.add(call)
+ 
++    def independent_iterations(self,
++                               test_all_variables=False,
++                               signatures_to_ignore=None,
++                               dep_tools=None):
++        '''
++        This function is an LFRic-specific override of the default method
++        in the Loop class. It allows domain-specific rules to be applied when
++        determining whether or not loop iterations are independent.
++
++        :param bool test_all_variables: if True, it will test if all variable
++            accesses are independent, otherwise it will stop after the first
++            variable access is found that isn't.
++        :param signatures_to_ignore: list of signatures for which to skip
++            the access checks.
++        :type signatures_to_ignore: Optional[
++            List[:py:class:`psyclone.core.Signature`]]
++        :param dep_tools: an optional instance of DependencyTools so that the
++            caller can access any diagnostic messages detailing why the loop
++            iterations are not independent.
++        :type dep_tools: Optional[
++            :py:class:`psyclone.psyir.tools.DependencyTools]
++
++        :returns: True if the loop iterations are independent, False otherwise.
++        :rtype: bool
++
++        '''
++        # pylint: disable=import-outside-toplevel
++        from psyclone.psyir.tools import DependencyTools, DTCode
++        if not dep_tools:
++            dtools = DependencyTools()
++        else:
++            dtools = dep_tools
++
++        if self.loop_type in ["null", "colours"]:
++            # We know we can't parallelise these loops. ("null" means there
++            # is no actual loop and "colours" is the *outer* loop over the
++            # different colours used - it is the inner, "colour" loop over
++            # cells of a single colour which can be parallelised.)
++            return False
++
++        try:
++            stat = dtools.can_loop_be_parallelised(
++                self, test_all_variables=test_all_variables,
++                signatures_to_ignore=signatures_to_ignore)
++            if stat:
++                return True
++        except (InternalError, KeyError):
++            # LFRic still has symbols that don't exist in the symbol_table
++            # until the gen_code() step, so the dependency analysis raises
++            # errors in some cases.
++            # TODO #1648 - when a transformation colours a loop we must
++            # ensure "last_[halo]_cell_all_colours" is added to the symbol
++            # table.
++            return True
++
++        # The generic DA says that this loop cannot be parallelised. However,
++        # that is often because it wrongly identifies field/operator array
++        # accesses (e.g. fld_proxy%data) as being scalars that are written to.
++        if self.loop_type in ["colour", "dof"]:
++            # This loop is either over cells of a single colour or DoFs. So
++            # long as the symbols that the DA is complaining about are fields
++            # or operators then this is safe to parallelise.
++            table = self.scope.symbol_table
++            # Create the set of all LFRic field types.
++            all_fld_names = set(desc["type"] for desc in
++                                LFRicConstants().DATA_TYPE_MAP.values())
++
++            for msg in dtools.get_all_messages():
++                if msg.code != DTCode.WARN_SCALAR_WRITTEN_ONCE:
++                    # The DA is complaining about something other than writing
++                    # to (what it thinks is) a scalar.  Therefore the loop
++                    # cannot be parallelised.
++                    return False
++                # Currently the DA (wrongly) identifies things like
++                # 'fld_proxy%data' as being scalar accesses. We therefore need
++                # to check that the argument it says is a scalar is in fact a
++                # field. If it is, this is safe to parallelise (because an
++                # LFRic Kernel is constrained to write to dofs in the 'owned'
++                # column).
++                # TODO #2197 - when we change the PSy layer to pass field
++                # pointers to kernels, the DA will identify that they are
++                # arrays and this logic will need to be changed.
++                for name in msg.var_names:
++                    sym = table.lookup(name)
++                    # Ideally at this point we would compare sym.datatype with
++                    # LFRicTypes("RealFieldDataType") etc. but the LFRic PSy
++                    # layer doesn't use those types yet.
++                    if not (isinstance(sym.datatype, DataTypeSymbol) and
++                            sym.datatype.name in all_fld_names):
++                        # The Symbol is not a field or operator.
++                        return False
++            # All of the variables referred to in all of the messages are
++            # actually fields - it is safe to ignore this warning.
++            return True
++
++        if self.loop_type == "":
++            # We can parallelise a non-coloured loop if it only updates
++            # quantities on discontinuous function spaces. If an LFRic kernel
++            # updates quantities on a continuous function space then it must
++            # have at least one argument with GH_INC access. Therefore, we
++            # can simply check whether or not it has such an argument in order
++            # to infer the continuity of the space.
++            return not self.has_inc_arg()
++
++        raise InternalError(f"independent_iterations: loop of type "
++                            f"'{self.loop_type}' is not supported.")
++
+ 
+ class DynKern(CodedKern):
+     ''' Stores information about Dynamo Kernels as specified by the
+diff --git a/src/psyclone/gocean1p0.py b/src/psyclone/gocean1p0.py
+index d1abf1d8d..9d4a4c89b 100644
+--- a/src/psyclone/gocean1p0.py
++++ b/src/psyclone/gocean1p0.py
+@@ -511,6 +511,48 @@ class GOLoop(PSyLoop):
+         '''
+         return self._bounds_lookup
+ 
++    def independent_iterations(self,
++                               test_all_variables=False,
++                               signatures_to_ignore=None,
++                               dep_tools=None):
++        '''
++        This function is a GOcean-specific override of the default method
++        in the Loop class. It allows domain-specific rules to be applied when
++        determining whether or not loop iterations are independent.
++
++        :param bool test_all_variables: if True, it will test if all variable
++            accesses are independent, otherwise it will stop after the first
++            variable access is found that isn't.
++        :param signatures_to_ignore: list of signatures for which to skip
++            the access checks.
++        :type signatures_to_ignore: Optional[
++            List[:py:class:`psyclone.core.Signature`]]
++        :param dep_tools: an optional instance of DependencyTools so that the
++            caller can access any diagnostic messages detailing why the loop
++            iterations are not independent.
++        :type dep_tools: Optional[
++            :py:class:`psyclone.psyir.tools.DependencyTools]
++
++        :returns: True if the loop iterations are independent, False otherwise.
++        :rtype: bool
++
++        '''
++        if not dep_tools:
++            from psyclone.psyir.tools import DependencyTools
++            dtools = DependencyTools()
++        else:
++            dtools = dep_tools
++
++        try:
++            stat = dtools.can_loop_be_parallelised(
++                self, test_all_variables=test_all_variables,
++                signatures_to_ignore=signatures_to_ignore)
++            return stat
++        except InternalError:
++            # The dependence analysis in GOcean doesn't yet use PSyIR
++            # consistently and that causes failures - TODO #845.
++            return True
++
+     # -------------------------------------------------------------------------
+     def _halo_read_access(self, arg):
+         '''Determines whether the supplied argument has (or might have) its
+diff --git a/src/psyclone/psyir/nodes/loop.py b/src/psyclone/psyir/nodes/loop.py
+index e099fd393..6c3db9b18 100644
+--- a/src/psyclone/psyir/nodes/loop.py
++++ b/src/psyclone/psyir/nodes/loop.py
+@@ -294,8 +294,15 @@ class Loop(Statement):
+         :returns: Return the dag name for this loop
+         :rtype: string
+ 
++        :raises InternalError: if this Loop has no ancestor Routine.
++
+         '''
+-        _, position = self._find_position(self.ancestor(Routine))
++        routine = self.ancestor(Routine)
++        if not routine:
++            raise InternalError(f"Cannot generate DAG name for loop node "
++                                f"'{self}' because it is not contained within "
++                                f"a Routine.")
++        _, position = self._find_position(routine)
+ 
+         return "loop_" + str(position)
+ 
+@@ -379,6 +386,40 @@ class Loop(Statement):
+             child.reference_accesses(var_accesses)
+             var_accesses.next_location()
+ 
++    def independent_iterations(self,
++                               test_all_variables=False,
++                               signatures_to_ignore=None,
++                               dep_tools=None):
++        '''This function analyses a loop in the PSyIR to see whether
++        its iterations are independent.
++
++        :param bool test_all_variables: if True, it will test if all variable
++            accesses are independent, otherwise it will stop after the first
++            variable access is found that isn't.
++        :param signatures_to_ignore: list of signatures for which to skip
++            the access checks.
++        :type signatures_to_ignore: Optional[
++            List[:py:class:`psyclone.core.Signature`]]
++        :param dep_tools: an optional instance of DependencyTools so that the
++            caller can access any diagnostic messages detailing why the loop
++            iterations are not independent.
++        :type dep_tools: Optional[
++            :py:class:`psyclone.psyir.tools.DependencyTools]
++
++        :returns: True if the loop iterations are independent, False otherwise.
++        :rtype: bool
++
++        '''
++        if not dep_tools:
++            # pylint: disable=import-outside-toplevel
++            from psyclone.psyir.tools import DependencyTools
++            dtools = DependencyTools()
++        else:
++            dtools = dep_tools
++        return dtools.can_loop_be_parallelised(
++            self, test_all_variables=test_all_variables,
++            signatures_to_ignore=signatures_to_ignore)
++
+     def gen_code(self, parent):
+         '''
+         Generate the Fortran Loop and any associated code.
+diff --git a/src/psyclone/psyir/tools/dependency_tools.py b/src/psyclone/psyir/tools/dependency_tools.py
+index 761bea476..5294f8315 100644
+--- a/src/psyclone/psyir/tools/dependency_tools.py
++++ b/src/psyclone/psyir/tools/dependency_tools.py
+@@ -59,8 +59,6 @@ class DTCode(IntEnum):
+ 
+     '''
+     INFO_MIN = 1
+-    INFO_NOT_NESTED_LOOP = 2
+-    INFO_WRONG_LOOP_TYPE = 3
+     INFO_MAX = 99
+ 
+     WARN_MIN = 100
+@@ -195,39 +193,6 @@ class DependencyTools():
+         '''
+         return self._messages
+ 
+-    # -------------------------------------------------------------------------
+-    def _is_loop_suitable_for_parallel(self, loop, only_nested_loops=True):
+-        '''Simple first test to see if a loop should even be considered to
+-        be parallelised. The default implementation tests whether the loop
+-        has a certain type (e.g. 'latitude'), and optional tests for
+-        nested loops (to avoid parallelising single loops which will likely
+-        result in a slowdown due to thread synchronisation costs). This
+-        function is used by can_loop_be_parallelised() and can of course be
+-        overwritten by the user to implement different suitability criteria.
+-
+-        :param loop: the loop to test.
+-        :type loop: :py:class:`psyclone.psyir.nodes.Loop`
+-        :param bool only_nested_loops: true (default) if only nested loops\
+-                                        should be considered.
+-
+-        :returns: true if the loop fulfills the requirements.
+-        :rtype: bool
+-        '''
+-        if only_nested_loops:
+-            all_loops = loop.walk(Loop)
+-            if len(all_loops) == 1:
+-                self._add_message("Not a nested loop.",
+-                                  DTCode.INFO_NOT_NESTED_LOOP)
+-                return False
+-
+-        if self._loop_types_to_parallelise:
+-            if loop.loop_type not in self._loop_types_to_parallelise:
+-                self._add_message(f"Loop has wrong loop type '"
+-                                  f"{loop.loop_type}'.",
+-                                  DTCode.INFO_WRONG_LOOP_TYPE)
+-                return False
+-        return True
+-
+     # -------------------------------------------------------------------------
+     @staticmethod
+     def _partition(comp_ind1, comp_ind2, loop_variables):
+@@ -729,26 +694,23 @@ class DependencyTools():
+ 
+     # -------------------------------------------------------------------------
+     def can_loop_be_parallelised(self, loop,
+-                                 only_nested_loops=True,
+                                  test_all_variables=False,
+                                  signatures_to_ignore=None):
+         # pylint: disable=too-many-branches,too-many-locals
+         '''This function analyses a loop in the PsyIR to see if
+-        it can be safely parallelised over the specified variable.
++        it can be safely parallelised.
+ 
+         :param loop: the loop node to be analysed.
+         :type loop: :py:class:`psyclone.psyir.nodes.Loop`
+-        :param bool only_nested_loops: if True, a loop must have an inner\
+-                                       loop in order to be considered\
+-                                       parallelisable (default: True).
+-        :param bool test_all_variables: if True, it will test if all variable\
+-                                        accesses can be parallelised,\
+-                                        otherwise it will stop after the first\
+-                                        variable is found that can not be\
++        :param bool test_all_variables: if True, it will test if all variable
++                                        accesses can be parallelised,
++                                        otherwise it will stop after the first
++                                        variable is found that can not be
+                                         parallelised.
+-        :param signatures_to_ignore: list of signatures for which to skip \
++        :param signatures_to_ignore: list of signatures for which to skip
+                                      the access checks.
+-        :type signatures_to_ignore: list of :py:class:`psyclone.core.Signature`
++        :type signatures_to_ignore: Optional[
++            List[:py:class:`psyclone.core.Signature`]]
+ 
+         :returns: True if the loop can be parallelised.
+         :rtype: bool
+@@ -763,14 +725,6 @@ class DependencyTools():
+                             f"instance of class Loop but got "
+                             f"'{type(loop).__name__}'")
+ 
+-        # Check if the loop type should be parallelised, e.g. to avoid
+-        # parallelising inner loops which might not have enough work. This
+-        # is supposed to be a fast first check to avoid collecting variable
+-        # accesses in some unsuitable loops.
+-        if not self._is_loop_suitable_for_parallel(loop, only_nested_loops):
+-            # Appropriate messages will have been added already, so just exit
+-            return False
+-
+         var_accesses = VariablesAccessInfo(loop)
+         if not signatures_to_ignore:
+             signatures_to_ignore = []
+diff --git a/src/psyclone/psyir/transformations/parallel_loop_trans.py b/src/psyclone/psyir/transformations/parallel_loop_trans.py
+index fc91491cf..10f2c9bc6 100644
+--- a/src/psyclone/psyir/transformations/parallel_loop_trans.py
++++ b/src/psyclone/psyir/transformations/parallel_loop_trans.py
+@@ -1,7 +1,7 @@
+ # -----------------------------------------------------------------------------
+ # BSD 3-Clause License
+ #
+-# Copyright (c) 2017-2022, Science and Technology Facilities Council.
++# Copyright (c) 2017-2023, Science and Technology Facilities Council.
+ # All rights reserved.
+ #
+ # Redistribution and use in source and binary forms, with or without
+@@ -42,7 +42,6 @@ import abc
+ 
+ from psyclone import psyGen
+ from psyclone.domain.common.psylayer import PSyLoop
+-from psyclone.errors import InternalError
+ from psyclone.psyir import nodes
+ from psyclone.psyir.nodes import Loop
+ from psyclone.psyir.tools import DependencyTools, DTCode
+@@ -108,7 +107,6 @@ class ParallelLoopTrans(LoopTrans, metaclass=abc.ABCMeta):
+         super().validate(node, options=options)
+ 
+         # Check we are not a sequential loop
+-        # TODO add a list of loop types that are sequential
+         if isinstance(node, PSyLoop) and node.loop_type == 'colours':
+             raise TransformationError(f"Error in {self.name} transformation. "
+                                       f"The target loop is over colours and "
+@@ -148,28 +146,18 @@ class ParallelLoopTrans(LoopTrans, metaclass=abc.ABCMeta):
+ 
+         dep_tools = DependencyTools()
+ 
+-        try:
+-            if not dep_tools.can_loop_be_parallelised(node,
+-                                                      only_nested_loops=False):
+-                # The DependencyTools also returns False for things that are
+-                # not an issue, so we ignore specific messages.
+-                for message in dep_tools.get_all_messages():
+-                    if message.code == DTCode.WARN_SCALAR_WRITTEN_ONCE:
+-                        continue
+-                    all_msg_str = [str(message) for message in
+-                                   dep_tools.get_all_messages()]
+-                    messages = "\n".join(all_msg_str)
+-                    raise TransformationError(
+-                        f"Dependency analysis failed with the following "
+-                        f"messages:\n{messages}")
+-
+-        except (KeyError, InternalError):
+-            # LFRic still has symbols that don't exist in the symbol_table
+-            # until the gen_code() step, so the dependency analysis raises
+-            # KeyErrors in some cases.
+-            # Also, the dependence analysis doesn't yet use PSyIR consistently
+-            # and that causes failures - TOD0 #845.
+-            pass
++        if not node.independent_iterations(dep_tools=dep_tools):
++            # The DependencyTools also returns False for things that are
++            # not an issue, so we ignore specific messages.
++            for message in dep_tools.get_all_messages():
++                if message.code == DTCode.WARN_SCALAR_WRITTEN_ONCE:
++                    continue
++                all_msg_str = [str(message) for message in
++                               dep_tools.get_all_messages()]
++                messages = "\n".join(all_msg_str)
++                raise TransformationError(
++                    f"Dependency analysis failed with the following "
++                    f"messages:\n{messages}")
+ 
+     def apply(self, node, options=None):
+         '''

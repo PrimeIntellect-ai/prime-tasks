@@ -1,0 +1,202 @@
+diff --git a/tests/test_secretsmanager/__init__.py b/tests/test_secretsmanager/__init__.py
+index 08a1c1568..cc6729aa9 100644
+--- a/tests/test_secretsmanager/__init__.py
++++ b/tests/test_secretsmanager/__init__.py
+@@ -1 +1,43 @@
+-# This file is intentionally left blank.
++import os
++from functools import wraps
++from uuid import uuid4
++
++import boto3
++
++from moto import mock_aws
++
++
++def secretsmanager_aws_verified(func):
++    """
++    Function that is verified to work against AWS.
++    Can be run against AWS at any time by setting:
++      MOTO_TEST_ALLOW_AWS_REQUEST=true
++
++    If this environment variable is not set, the function runs in a `mock_aws` context.
++    """
++
++    @wraps(func)
++    def pagination_wrapper():
++        allow_aws_request = (
++            os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
++        )
++
++        if allow_aws_request:
++            return create_secret_and_execute(func)
++        else:
++            with mock_aws():
++                return create_secret_and_execute(func)
++
++    def create_secret_and_execute(func):
++        sm_client = boto3.client("secretsmanager", "us-east-1")
++
++        secret_arn = sm_client.create_secret(
++            Name=f"moto_secret_{str(uuid4())[0:6]}",
++            SecretString="old_secret",
++        )["ARN"]
++        try:
++            return func(secret_arn)
++        finally:
++            sm_client.delete_secret(SecretId=secret_arn)
++
++    return pagination_wrapper
+diff --git a/tests/test_secretsmanager/test_secretsmanager.py b/tests/test_secretsmanager/test_secretsmanager.py
+index bec994d1f..ced03e6a8 100644
+--- a/tests/test_secretsmanager/test_secretsmanager.py
++++ b/tests/test_secretsmanager/test_secretsmanager.py
+@@ -14,6 +14,8 @@ from freezegun import freeze_time
+ from moto import mock_aws, settings
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
+ 
++from . import secretsmanager_aws_verified
++
+ DEFAULT_SECRET_NAME = "test-secret7"
+ 
+ 
+@@ -1733,3 +1735,139 @@ def test_update_secret_with_client_request_token():
+         assert pve.value.response["Error"]["Message"] == (
+             "ClientRequestToken must be 32-64 characters long."
+         )
++
++
++@secretsmanager_aws_verified
++@pytest.mark.aws_verified
++def test_update_secret_version_stage_manually(secret_arn=None):
++    sm_client = boto3.client("secretsmanager", "us-east-1")
++    current_version = sm_client.put_secret_value(
++        SecretId=secret_arn,
++        SecretString="previous_secret",
++        VersionStages=["AWSCURRENT"],
++    )["VersionId"]
++
++    initial_secret = sm_client.get_secret_value(
++        SecretId=secret_arn, VersionStage="AWSCURRENT"
++    )
++    assert initial_secret["VersionStages"] == ["AWSCURRENT"]
++    assert initial_secret["SecretString"] == "previous_secret"
++
++    token = str(uuid4())
++    sm_client.put_secret_value(
++        SecretId=secret_arn,
++        ClientRequestToken=token,
++        SecretString="new_secret",
++        VersionStages=["AWSPENDING"],
++    )
++
++    pending_secret = sm_client.get_secret_value(
++        SecretId=secret_arn, VersionStage="AWSPENDING"
++    )
++    assert pending_secret["VersionStages"] == ["AWSPENDING"]
++    assert pending_secret["SecretString"] == "new_secret"
++
++    sm_client.update_secret_version_stage(
++        SecretId=secret_arn,
++        VersionStage="AWSCURRENT",
++        MoveToVersionId=token,
++        RemoveFromVersionId=current_version,
++    )
++
++    current_secret = sm_client.get_secret_value(
++        SecretId=secret_arn, VersionStage="AWSCURRENT"
++    )
++    assert list(sorted(current_secret["VersionStages"])) == ["AWSCURRENT", "AWSPENDING"]
++    assert current_secret["SecretString"] == "new_secret"
++
++    previous_secret = sm_client.get_secret_value(
++        SecretId=secret_arn, VersionStage="AWSPREVIOUS"
++    )
++    assert previous_secret["VersionStages"] == ["AWSPREVIOUS"]
++    assert previous_secret["SecretString"] == "previous_secret"
++
++
++@mock_aws
++def test_update_secret_version_stage_with_unknown_move_to_version_id():
++    sm_client = boto3.client("secretsmanager", "us-east-1")
++    sm_client.create_secret(Name="test-secret", SecretString="old_secret")
++
++    with pytest.raises(ClientError) as exc:
++        sm_client.update_secret_version_stage(
++            SecretId="test-secret",
++            VersionStage="AWSPENDING",
++            MoveToVersionId=str(uuid4()),
++        )
++    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
++
++
++@mock_aws
++def test_update_secret_version_stage_using_secret_name():
++    sm_client = boto3.client("secretsmanager", "us-east-1")
++    sm_client.create_secret(Name="test-secret-name", SecretString="old_secret")
++    current_version = sm_client.put_secret_value(
++        SecretId="test-secret-name",
++        SecretString="previous_secret",
++        VersionStages=["AWSCURRENT"],
++    )["VersionId"]
++
++    token = str(uuid4())
++    sm_client.put_secret_value(
++        SecretId="test-secret-name",
++        ClientRequestToken=token,
++        SecretString="new_secret",
++        VersionStages=["AWSPENDING"],
++    )
++
++    sm_client.update_secret_version_stage(
++        SecretId="test-secret-name",
++        VersionStage="AWSCURRENT",
++        MoveToVersionId=token,
++        RemoveFromVersionId=current_version,
++    )
++
++    previous_secret = sm_client.get_secret_value(
++        SecretId="test-secret-name", VersionStage="AWSPREVIOUS"
++    )
++    assert previous_secret["SecretString"] == "previous_secret"
++
++
++@mock_aws
++def test_update_secret_version_stage_moves_and_removes_non_current_stage():
++    sm_client = boto3.client("secretsmanager", "us-east-1")
++    sm_client.create_secret(Name="test-secret", SecretString="old_secret")
++    first_version = sm_client.put_secret_value(
++        SecretId="test-secret",
++        SecretString="previous_secret",
++        VersionStages=["AWSCURRENT"],
++    )["VersionId"]
++
++    token = str(uuid4())
++    sm_client.put_secret_value(
++        SecretId="test-secret",
++        ClientRequestToken=token,
++        SecretString="new_secret",
++        VersionStages=["AWSPENDING"],
++    )
++
++    # Move the AWSPENDING label from the pending version to the current version
++    sm_client.update_secret_version_stage(
++        SecretId="test-secret",
++        VersionStage="AWSPENDING",
++        MoveToVersionId=first_version,
++        RemoveFromVersionId=token,
++    )
++
++    pending = sm_client.get_secret_value(
++        SecretId="test-secret", VersionStage="AWSPENDING"
++    )
++    assert pending["SecretString"] == "previous_secret"
++
++    # Remove the AWSPENDING label entirely
++    sm_client.update_secret_version_stage(
++        SecretId="test-secret",
++        VersionStage="AWSPENDING",
++        RemoveFromVersionId=first_version,
++    )
++    version = sm_client.get_secret_value(SecretId="test-secret", VersionId=first_version)
++    assert "AWSPENDING" not in version["VersionStages"]

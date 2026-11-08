@@ -1,0 +1,339 @@
+diff --git a/breakpad-symbols/src/sym_file/parser.rs b/breakpad-symbols/src/sym_file/parser.rs
+index 31c1127..25eac34 100644
+--- a/breakpad-symbols/src/sym_file/parser.rs
++++ b/breakpad-symbols/src/sym_file/parser.rs
+@@ -62,7 +62,7 @@ named!(module_line<&[u8], ()>,
+     || {}
+ ));
+ 
+-// Matches an INFO LINE record.
++// Matches an INFO URL record.
+ named!(
+     info_url<&[u8], Info>,
+     chain!(
+diff --git a/minidump-processor/src/processor.rs b/minidump-processor/src/processor.rs
+index a202bbe..35f0b9b 100644
+--- a/minidump-processor/src/processor.rs
++++ b/minidump-processor/src/processor.rs
+@@ -197,7 +197,7 @@ where
+     let (crash_reason, crash_address, crashing_thread_id) = if let Some(exception) = exception_ref {
+         (
+             Some(exception.get_crash_reason(system_info.os, system_info.cpu)),
+-            Some(exception.get_crash_address(system_info.os)),
++            Some(exception.get_crash_address(system_info.os, system_info.cpu)),
+             Some(exception.get_crashing_thread_id()),
+         )
+     } else {
+diff --git a/minidump/README.md b/minidump/README.md
+index e510484..03891fd 100644
+--- a/minidump/README.md
++++ b/minidump/README.md
+@@ -9,16 +9,16 @@ If you want richer analysis of the minidump (such as stackwalking and symbolicat
+ 
+ # Usage
+ 
+-The primary API for this library is the [`Minidump`][] struct, which can be
+-instantiated by calling the [`Minidump::read`][] or [`Minidump::read_path`][] methods.
++The primary API for this library is the `Minidump` struct, which can be
++instantiated by calling the `Minidump::read` or `Minidump::read_path` methods.
+ 
+ Succesfully parsing a Minidump struct means the minidump has a minimally valid
+ header and stream directory. Individual streams are only parsed when they're
+ requested.
+ 
+ Although you may enumerate the streams in a minidump with methods like
+-[`Minidump::all_streams`][], this is only really useful for debugging. Instead
+-you should statically request streams with [`Minidump::get_stream`][].
++`Minidump::all_streams`, this is only really useful for debugging. Instead
++you should statically request streams with `Minidump::get_stream`.
+ 
+ Depending on what analysis you're trying to perform, you may:
+ 
+diff --git a/minidump/src/minidump.rs b/minidump/src/minidump.rs
+index ad84f52..4dc328d 100644
+--- a/minidump/src/minidump.rs
++++ b/minidump/src/minidump.rs
+@@ -3732,6 +3732,16 @@ impl<'a> MinidumpStream<'a> for MinidumpException<'a> {
+ }
+ 
+ impl<'a> MinidumpException<'a> {
++    /// Get the cpu context of the crashing (or otherwise minidump-requesting) thread.
++    ///
++    /// CPU contexts are a platform-specific format, so SystemInfo is required
++    /// to reliably parse them. We used to use heuristics to avoid this requirement,
++    /// but this made us too brittle to otherwise-backwards-compatible additions
++    /// to the format.
++    ///
++    /// MiscInfo can contain additional details on the cpu context's format, but
++    /// is optional because those details can be safely ignored (at the cost of
++    /// being unable to parse some very obscure cpu state).
+     pub fn context(
+         &self,
+         system_info: &MinidumpSystemInfo,
+@@ -3742,9 +3752,18 @@ impl<'a> MinidumpException<'a> {
+             .map(Cow::Owned)
+     }
+ 
+-    /// Get the crash address for an exception.
+-    pub fn get_crash_address(&self, os: Os) -> u64 {
+-        match (
++    /// Get the address that "caused" the crash.
++    ///
++    /// The meaning of this value depends on the kind of crash this was.
++    ///
++    /// By default, it's the instruction pointer at the time of the crash.
++    /// However, if the crash was caused by an illegal memory access, the
++    /// the address would be the memory address.
++    ///
++    /// So for instance, if you crashed from dereferencing a null pointer,
++    /// the crash_address will be 0 (or close to it, due to offsets).
++    pub fn get_crash_address(&self, os: Os, cpu: Cpu) -> u64 {
++        let addr = match (
+             os,
+             md::ExceptionCodeWindows::from_u32(self.raw.exception_record.exception_code),
+         ) {
+@@ -3755,14 +3774,33 @@ impl<'a> MinidumpException<'a> {
+                 self.raw.exception_record.exception_information[1]
+             }
+             _ => self.raw.exception_record.exception_address,
++        };
++
++        // Sometimes on 32-bit these values can be incorrectly sign-extended,
++        // so mask and zero-extend them here.
++        match cpu.pointer_width() {
++            Some(4) => addr as u32 as u64,
++            _ => addr,
+         }
+     }
+ 
+     /// Get the crash reason for an exception.
++    ///
++    /// The returned value reflects our best attempt to recover a
++    /// "native" error for the crashing system based on the OS and
++    /// things like raw error codes.
++    ///
++    /// This is an imperfect process, because OSes may have overlapping
++    /// error types (e.g. WinError and NTSTATUS overlap, so we have to
++    /// pick one arbirarily).
++    ///
++    /// The raw error codes can be extracted from [MinidumpException::raw][].
+     pub fn get_crash_reason(&self, os: Os, cpu: Cpu) -> CrashReason {
+         CrashReason::from_exception(&self.raw, os, cpu)
+     }
+ 
++    /// The id of the thread that caused the crash (or otherwise requested
++    /// the minidump, even if there wasn't actually a crash).
+     pub fn get_crashing_thread_id(&self) -> u32 {
+         self.thread_id
+     }
+@@ -4539,13 +4577,14 @@ fn stream_vendor(stream_type: u32) -> &'static str {
+ mod test {
+     use super::*;
+     use md::GUID;
++    use minidump_common::format::ProcessorArchitecture;
+     use std::mem;
+     use synth_minidump::{
+-        self, AnnotationValue, CrashpadInfo, DumpString, Memory, MemoryInfo as SynthMemoryInfo,
+-        MiscFieldsBuildString, MiscFieldsPowerInfo, MiscFieldsProcessTimes, MiscFieldsTimeZone,
+-        MiscInfo5Fields, MiscStream, Module as SynthModule, ModuleCrashpadInfo, SimpleStream,
+-        SynthMinidump, SystemInfo, Thread, ThreadName, UnloadedModule as SynthUnloadedModule,
+-        STOCK_VERSION_INFO,
++        self, AnnotationValue, CrashpadInfo, DumpString, Exception, Memory,
++        MemoryInfo as SynthMemoryInfo, MiscFieldsBuildString, MiscFieldsPowerInfo,
++        MiscFieldsProcessTimes, MiscFieldsTimeZone, MiscInfo5Fields, MiscStream,
++        Module as SynthModule, ModuleCrashpadInfo, SimpleStream, SynthMinidump, SystemInfo, Thread,
++        ThreadName, UnloadedModule as SynthUnloadedModule, STOCK_VERSION_INFO,
+     };
+     use test_assembler::*;
+ 
+@@ -5757,4 +5796,55 @@ c70206ca83eb2852-de0206ca83eb2852  -w-s  10bac9000 fd:05 1196511 /usr/lib64/libt
+             MinidumpAnnotation::Invalid
+         );
+     }
++
++    #[test]
++    fn test_exception_x86() {
++        // Defaults to x86
++        let system_info = SystemInfo::new(Endian::Little);
++
++        let mut exception = Exception::new(Endian::Little);
++
++        // Check that we clear the erroneous high bits for 32-bit
++        exception.exception_record.exception_address = 0xf0e1_d2c3_b4a5_9687;
++        // FIXME: test other fields too
++
++        let dump = SynthMinidump::with_endian(Endian::Little)
++            .add_system_info(system_info)
++            .add_exception(exception);
++
++        let dump = read_synth_dump(dump).unwrap();
++
++        let system_stream = dump.get_stream::<MinidumpSystemInfo>().unwrap();
++        let exception_stream = dump.get_stream::<MinidumpException>().unwrap();
++        assert_eq!(
++            exception_stream.get_crash_address(system_stream.os, system_stream.cpu),
++            0xb4a5_9687
++        );
++    }
++
++    #[test]
++    fn test_exception_x64() {
++        // Defaults to x86
++        let system_info = SystemInfo::new(Endian::Little)
++            .set_processor_architecture(ProcessorArchitecture::PROCESSOR_ARCHITECTURE_AMD64 as u16);
++
++        let mut exception = Exception::new(Endian::Little);
++
++        // Check that we don't truncate this on 64-bit
++        exception.exception_record.exception_address = 0xf0e1_d2c3_b4a5_9687;
++        // FIXME: test other fields too
++
++        let dump = SynthMinidump::with_endian(Endian::Little)
++            .add_system_info(system_info)
++            .add_exception(exception);
++
++        let dump = read_synth_dump(dump).unwrap();
++
++        let system_stream = dump.get_stream::<MinidumpSystemInfo>().unwrap();
++        let exception_stream = dump.get_stream::<MinidumpException>().unwrap();
++        assert_eq!(
++            exception_stream.get_crash_address(system_stream.os, system_stream.cpu),
++            0xf0e1_d2c3_b4a5_9687
++        );
++    }
+ }
+diff --git a/synth-minidump/src/lib.rs b/synth-minidump/src/lib.rs
+index 1f7f9ca..042a052 100644
+--- a/synth-minidump/src/lib.rs
++++ b/synth-minidump/src/lib.rs
+@@ -29,6 +29,8 @@ pub struct SynthMinidump {
+     stream_directory: Section,
+     /// System info (cpu arch, os, etc.)
+     system_info: Option<SystemInfo>,
++    /// High level crash info (error code, crash address, assertion, ...)
++    exception: Option<Exception>,
+     /// List of modules in this minidump.
+     module_list: Option<ListStream<Module>>,
+     /// List of unloaded modules in this minidump.
+@@ -170,6 +172,7 @@ impl SynthMinidump {
+             stream_directory_rva,
+             stream_directory: Section::with_endian(endian),
+             system_info: None,
++            exception: None,
+             module_list: Some(ListStream::new(
+                 md::MINIDUMP_STREAM_TYPE::ModuleListStream,
+                 endian,
+@@ -287,11 +290,18 @@ impl SynthMinidump {
+         self
+     }
+ 
++    /// Set the SystemInfo stream.
+     pub fn add_system_info(mut self, system_info: SystemInfo) -> Self {
+         self.system_info = Some(system_info);
+         self
+     }
+ 
++    /// Set the Exception stream.
++    pub fn add_exception(mut self, exception: Exception) -> Self {
++        self.exception = Some(exception);
++        self
++    }
++
+     /// Set the contents of the `LinuxMaps` stream.
+     pub fn set_linux_maps(mut self, maps: &[u8]) -> SynthMinidump {
+         self.linux_maps = Some(SimpleStream {
+@@ -397,6 +407,9 @@ impl SynthMinidump {
+         if let Some(stream) = self.system_info.take() {
+             self = self.add_stream(stream);
+         }
++        if let Some(stream) = self.exception.take() {
++            self = self.add_stream(stream);
++        }
+         if let Some(stream) = self.linux_maps.take() {
+             self = self.add_stream(stream);
+         }
+@@ -1650,6 +1663,7 @@ pub struct SystemInfo {
+ }
+ 
+ pub enum CpuInfo {
++    // Note, even if you're not on x86 this is a fine default.
+     X86CpuInfo {
+         vendor_id: [u32; 3],
+         version_information: u32,
+@@ -1732,6 +1746,76 @@ impl Stream for SystemInfo {
+     }
+ }
+ 
++pub struct Exception {
++    section: Section,
++    pub thread_id: u32,
++    // __align: u32,
++    pub exception_record: ExceptionRecord,
++    // TODO: implement this LOCATION_DESCRIPTOR properly
++    pub thread_context: (u32, u32),
++}
++
++pub struct ExceptionRecord {
++    pub exception_code: u32,
++    pub exception_flags: u32,
++    pub exception_record: u64,
++    pub exception_address: u64,
++    pub number_parameters: u32,
++    // __align: u32,
++    pub exception_information: [u64; 15],
++}
++
++impl Exception {
++    pub fn new(endian: Endian) -> Self {
++        Self {
++            section: Section::with_endian(endian),
++            thread_id: 0,
++            exception_record: ExceptionRecord {
++                exception_code: 0,
++                exception_flags: 0,
++                exception_record: 0,
++                exception_address: 0,
++                number_parameters: 0,
++                exception_information: [0; 15],
++            },
++            thread_context: (0, 0),
++        }
++    }
++}
++
++impl_dumpsection!(Exception);
++
++impl From<Exception> for Section {
++    fn from(info: Exception) -> Self {
++        let mut section = info
++            .section
++            .D32(info.thread_id)
++            .D32(0) // __align
++            .D32(info.exception_record.exception_code)
++            .D32(info.exception_record.exception_flags)
++            .D64(info.exception_record.exception_record)
++            .D64(info.exception_record.exception_address)
++            .D32(info.exception_record.number_parameters)
++            .D32(0); // __align
++
++        for &chunk in &info.exception_record.exception_information {
++            section = section.D64(chunk);
++        }
++
++        section = section
++            .D32(info.thread_context.0)
++            .D32(info.thread_context.1);
++
++        section
++    }
++}
++
++impl Stream for Exception {
++    fn stream_type(&self) -> u32 {
++        md::MINIDUMP_STREAM_TYPE::ExceptionStream.into()
++    }
++}
++
+ #[test]
+ fn test_dump_header() {
+     let dump = SynthMinidump::with_endian(Endian::Little).flags(0x9f738b33685cc84c);

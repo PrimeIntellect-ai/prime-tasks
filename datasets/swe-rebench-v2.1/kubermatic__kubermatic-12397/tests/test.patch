@@ -1,0 +1,288 @@
+diff --git a/pkg/resources/antiaffinity_test.go b/pkg/resources/antiaffinity_test.go
+new file mode 100644
+index 000000000..534d11d8a
+--- /dev/null
++++ b/pkg/resources/antiaffinity_test.go
+@@ -0,0 +1,282 @@
++/*
++Copyright 2020 The Kubermatic Kubernetes Platform contributors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resources_test
++
++import (
++	"reflect"
++	"sort"
++	"testing"
++
++	kubermaticv1 "k8c.io/kubermatic/v2/pkg/apis/kubermatic/v1"
++	"k8c.io/kubermatic/v2/pkg/resources"
++	"k8c.io/kubermatic/v2/pkg/resources/etcd"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++// fakeEtcdStatefulSetData is a minimal implementation of the data interface
++// consumed by the etcd StatefulSet reconciler. It only carries the cluster
++// settings that influence the pod anti-affinity configuration.
++type fakeEtcdStatefulSetData struct {
++	cluster                  *kubermaticv1.Cluster
++	supportsZoneAntiAffinity bool
++}
++
++func (f *fakeEtcdStatefulSetData) Cluster() *kubermaticv1.Cluster {
++	return f.cluster
++}
++
++func (f *fakeEtcdStatefulSetData) GetPodTemplateLabels(_ string, _ []corev1.Volume, baseLabels map[string]string) (map[string]string, error) {
++	return baseLabels, nil
++}
++
++func (f *fakeEtcdStatefulSetData) RewriteImage(image string) (string, error) {
++	return image, nil
++}
++
++func (f *fakeEtcdStatefulSetData) EtcdDiskSize() resource.Quantity {
++	return resource.MustParse("5Gi")
++}
++
++func (f *fakeEtcdStatefulSetData) EtcdLauncherImage() string {
++	return "etcd-launcher"
++}
++
++func (f *fakeEtcdStatefulSetData) EtcdLauncherTag() string {
++	return "v1"
++}
++
++func (f *fakeEtcdStatefulSetData) GetClusterRef() metav1.OwnerReference {
++	return metav1.OwnerReference{}
++}
++
++func (f *fakeEtcdStatefulSetData) SupportsFailureDomainZoneAntiAffinity() bool {
++	return f.supportsZoneAntiAffinity
++}
++
++func sortedStrings(in []string) []string {
++	out := append([]string(nil), in...)
++	sort.Strings(out)
++	return out
++}
++
++func requiredTopologyKeys(terms []corev1.PodAffinityTerm) []string {
++	keys := []string{}
++	for _, term := range terms {
++		keys = append(keys, term.TopologyKey)
++	}
++	return sortedStrings(keys)
++}
++
++func preferredTopologyKeys(terms []corev1.WeightedPodAffinityTerm) []string {
++	keys := []string{}
++	for _, term := range terms {
++		keys = append(keys, term.PodAffinityTerm.TopologyKey)
++	}
++	return sortedStrings(keys)
++}
++
++// TestEtcdStatefulSetAntiAffinityModes verifies that the etcd StatefulSet
++// reflects the configured host and zone anti-affinity modes. In particular it
++// pins down that the empty string and "preferred" behave identically (both
++// produce preferred anti-affinity) and that "required" produces required
++// anti-affinity, which is what keeps two etcd pods from being scheduled onto
++// the same node/zone.
++func TestEtcdStatefulSetAntiAffinityModes(t *testing.T) {
++	tests := []struct {
++		name             string
++		hostAntiAffinity kubermaticv1.AntiAffinityType
++		zoneAntiAffinity kubermaticv1.AntiAffinityType
++		wantRequired     []string
++		wantPreferred    []string
++	}{
++		{
++			name:             "empty values default to preferred anti-affinity",
++			hostAntiAffinity: "",
++			zoneAntiAffinity: "",
++			wantRequired:     []string{},
++			wantPreferred:    []string{resources.TopologyKeyHostname, resources.TopologyKeyZone},
++		},
++		{
++			name:             "explicit preferred matches the default behaviour",
++			hostAntiAffinity: kubermaticv1.AntiAffinityTypePreferred,
++			zoneAntiAffinity: kubermaticv1.AntiAffinityTypePreferred,
++			wantRequired:     []string{},
++			wantPreferred:    []string{resources.TopologyKeyHostname, resources.TopologyKeyZone},
++		},
++		{
++			name:             "required zone anti-affinity",
++			hostAntiAffinity: "",
++			zoneAntiAffinity: kubermaticv1.AntiAffinityTypeRequired,
++			wantRequired:     []string{resources.TopologyKeyZone},
++			wantPreferred:    []string{resources.TopologyKeyHostname},
++		},
++		{
++			name:             "required host anti-affinity",
++			hostAntiAffinity: kubermaticv1.AntiAffinityTypeRequired,
++			zoneAntiAffinity: "",
++			wantRequired:     []string{resources.TopologyKeyHostname},
++			wantPreferred:    []string{resources.TopologyKeyZone},
++		},
++		{
++			name:             "required host and zone anti-affinity",
++			hostAntiAffinity: kubermaticv1.AntiAffinityTypeRequired,
++			zoneAntiAffinity: kubermaticv1.AntiAffinityTypeRequired,
++			wantRequired:     []string{resources.TopologyKeyHostname, resources.TopologyKeyZone},
++			wantPreferred:    []string{},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			cluster := &kubermaticv1.Cluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
++				Spec: kubermaticv1.ClusterSpec{
++					ComponentsOverride: kubermaticv1.ComponentSettings{
++						Etcd: kubermaticv1.EtcdStatefulSetSettings{
++							HostAntiAffinity: test.hostAntiAffinity,
++							ZoneAntiAffinity: test.zoneAntiAffinity,
++						},
++					},
++				},
++			}
++			data := &fakeEtcdStatefulSetData{cluster: cluster, supportsZoneAntiAffinity: true}
++
++			_, reconciler := etcd.StatefulSetReconciler(data, false, false)()
++			set, err := reconciler(&appsv1.StatefulSet{})
++			if err != nil {
++				t.Fatalf("failed to reconcile etcd StatefulSet: %v", err)
++			}
++
++			affinity := set.Spec.Template.Spec.Affinity
++			if affinity == nil || affinity.PodAntiAffinity == nil {
++				t.Fatalf("expected pod anti-affinity to be configured, got %#v", affinity)
++			}
++
++			gotRequired := requiredTopologyKeys(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
++			gotPreferred := preferredTopologyKeys(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
++
++			if !reflect.DeepEqual(gotRequired, sortedStrings(test.wantRequired)) {
++				t.Errorf("required anti-affinity topology keys = %v, want %v", gotRequired, sortedStrings(test.wantRequired))
++			}
++			if !reflect.DeepEqual(gotPreferred, sortedStrings(test.wantPreferred)) {
++				t.Errorf("preferred anti-affinity topology keys = %v, want %v", gotPreferred, sortedStrings(test.wantPreferred))
++			}
++		})
++	}
++}
++
++// TestEtcdStatefulSetRequiredAntiAffinityPreventsCoLocation verifies that the
++// required anti-affinity terms select the etcd pods and use the hostname
++// topology key, which is what prevents two etcd pods from running on the same
++// node.
++func TestEtcdStatefulSetRequiredAntiAffinityPreventsCoLocation(t *testing.T) {
++	cluster := &kubermaticv1.Cluster{
++		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
++		Spec: kubermaticv1.ClusterSpec{
++			ComponentsOverride: kubermaticv1.ComponentSettings{
++				Etcd: kubermaticv1.EtcdStatefulSetSettings{
++					HostAntiAffinity: kubermaticv1.AntiAffinityTypeRequired,
++					ZoneAntiAffinity: kubermaticv1.AntiAffinityTypeRequired,
++				},
++			},
++		},
++	}
++	data := &fakeEtcdStatefulSetData{cluster: cluster, supportsZoneAntiAffinity: true}
++
++	_, reconciler := etcd.StatefulSetReconciler(data, false, false)()
++	set, err := reconciler(&appsv1.StatefulSet{})
++	if err != nil {
++		t.Fatalf("failed to reconcile etcd StatefulSet: %v", err)
++	}
++
++	affinity := set.Spec.Template.Spec.Affinity
++	if affinity == nil || affinity.PodAntiAffinity == nil {
++		t.Fatalf("expected pod anti-affinity to be configured, got %#v", affinity)
++	}
++
++	required := affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution
++	if len(required) == 0 {
++		t.Fatalf("expected required pod anti-affinity terms, got none")
++	}
++
++	foundHostname := false
++	for _, term := range required {
++		if term.LabelSelector == nil {
++			t.Errorf("required anti-affinity term has no label selector")
++			continue
++		}
++		if term.LabelSelector.MatchLabels[resources.AppLabelKey] != resources.EtcdStatefulSetName {
++			t.Errorf("required anti-affinity term selects app=%q, want %q", term.LabelSelector.MatchLabels[resources.AppLabelKey], resources.EtcdStatefulSetName)
++		}
++		if term.TopologyKey == resources.TopologyKeyHostname {
++			foundHostname = true
++		}
++	}
++	if !foundHostname {
++		t.Errorf("expected a required anti-affinity term with topology key %q to keep etcd pods off the same node", resources.TopologyKeyHostname)
++	}
++}
++
++// TestHostnameAntiAffinityModes verifies the host anti-affinity helper used by
++// the etcd StatefulSet: "required" yields a required term, everything else
++// yields a single preferred term of weight 100 selecting the given app.
++func TestHostnameAntiAffinityModes(t *testing.T) {
++	for _, mode := range []kubermaticv1.AntiAffinityType{"", kubermaticv1.AntiAffinityTypePreferred} {
++		affinity := resources.HostnameAntiAffinity("my-app", mode)
++		if affinity == nil || affinity.PodAntiAffinity == nil {
++			t.Fatalf("mode %q: expected pod anti-affinity, got %#v", mode, affinity)
++		}
++		if len(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 0 {
++			t.Errorf("mode %q: expected no required terms, got %d", mode, len(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution))
++		}
++		preferred := affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++		if len(preferred) != 1 {
++			t.Fatalf("mode %q: expected exactly one preferred term, got %d", mode, len(preferred))
++		}
++		if preferred[0].Weight != 100 {
++			t.Errorf("mode %q: expected preferred weight 100, got %d", mode, preferred[0].Weight)
++		}
++		if preferred[0].PodAffinityTerm.TopologyKey != resources.TopologyKeyHostname {
++			t.Errorf("mode %q: expected topology key %q, got %q", mode, resources.TopologyKeyHostname, preferred[0].PodAffinityTerm.TopologyKey)
++		}
++		if preferred[0].PodAffinityTerm.LabelSelector.MatchLabels[resources.AppLabelKey] != "my-app" {
++			t.Errorf("mode %q: expected app label %q, got %q", mode, "my-app", preferred[0].PodAffinityTerm.LabelSelector.MatchLabels[resources.AppLabelKey])
++		}
++	}
++
++	affinity := resources.HostnameAntiAffinity("my-app", kubermaticv1.AntiAffinityTypeRequired)
++	if affinity == nil || affinity.PodAntiAffinity == nil {
++		t.Fatalf("required: expected pod anti-affinity, got %#v", affinity)
++	}
++	if len(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 0 {
++		t.Errorf("required: expected no preferred terms, got %d", len(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution))
++	}
++	required := affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution
++	if len(required) != 1 {
++		t.Fatalf("required: expected exactly one required term, got %d", len(required))
++	}
++	if required[0].TopologyKey != resources.TopologyKeyHostname {
++		t.Errorf("required: expected topology key %q, got %q", resources.TopologyKeyHostname, required[0].TopologyKey)
++	}
++	if required[0].LabelSelector.MatchLabels[resources.AppLabelKey] != "my-app" {
++		t.Errorf("required: expected app label %q, got %q", "my-app", required[0].LabelSelector.MatchLabels[resources.AppLabelKey])
++	}
++}

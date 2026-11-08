@@ -1,0 +1,233 @@
+diff --git a/packages/ses/src/cauterize-property.js b/packages/ses/src/cauterize-property.js
+new file mode 100644
+index 000000000..b7bd4929a
+--- /dev/null
++++ b/packages/ses/src/cauterize-property.js
+@@ -0,0 +1,69 @@
++import { objectHasOwnProperty } from './commons.js';
++
++/**
++ * @import {Reporter} from './reporting-types.js'
++ */
++
++/**
++ * Delete `obj[prop]` or at least make it harmless.
++ *
++ * If the property was not expected, then emit a reporter-dependent warning
++ * to bring attention to this case, so someone can determine what to do with it.
++ *
++ * If the property to be deleted is a function's `.prototype` property, this
++ * will normally be because the function was supposed to be a
++ * - builtin method or non-constructor function
++ * - arrow function
++ * - concise method
++ *
++ * all of whom are not supposed to have a `.prototype` property. Nevertheless,
++ * on some platforms (like older versions of Hermes), or as a result of
++ * some shim-based mods to the primordials (like core-js?), some of these
++ * functions may accidentally be more like `function` functions with
++ * an undeletable `.prototype` property. In these cases, if we can
++ * set the value of that bogus `.prototype` property to `undefined`,
++ * we do so, issuing a warning, rather than failing to initialize ses.
++ *
++ * @param {object} obj
++ * @param {PropertyKey} prop
++ * @param {boolean} known If deletion is expected, don't warn
++ * @param {string} subPath Used for warning messages
++ * @param {Reporter} reporter Where to issue warning or error.
++ * @returns {void}
++ */
++export const cauterizeProperty = (
++  obj,
++  prop,
++  known,
++  subPath,
++  { warn, error },
++) => {
++  // Either the object lacks a permit or the object doesn't match the
++  // permit.
++  // If the permit is specifically false, not merely undefined,
++  // this is a property we expect to see because we know it exists in
++  // some environments and we have expressly decided to exclude it.
++  // Any other disallowed property is one we have not audited and we log
++  // that we are removing it so we know to look into it, as happens when
++  // the language evolves new features to existing intrinsics.
++  if (!known) {
++    warn(`Removing ${subPath}`);
++  }
++  try {
++    delete obj[prop];
++  } catch (err) {
++    if (objectHasOwnProperty(obj, prop)) {
++      if (typeof obj === 'function' && prop === 'prototype') {
++        obj.prototype = undefined;
++        if (obj.prototype === undefined) {
++          warn(`Tolerating undeletable ${subPath} === undefined`);
++          return;
++        }
++      }
++      error(`failed to delete ${subPath}`, err);
++    } else {
++      error(`deleting ${subPath} threw`, err);
++    }
++    throw err;
++  }
++};
+diff --git a/packages/ses/src/compartment-shim.js b/packages/ses/src/compartment-shim.js
+index 8ad47f504..ee3ddface 100644
+--- a/packages/ses/src/compartment-shim.js
++++ b/packages/ses/src/compartment-shim.js
+@@ -2,12 +2,18 @@ import { globalThis } from './commons.js';
+ import { makeCompartmentConstructor } from './compartment.js';
+ import { tameFunctionToString } from './tame-function-tostring.js';
+ import { getGlobalIntrinsics } from './intrinsics.js';
++import { chooseReporter } from './reporting.js';
+ 
+ const markVirtualizedNativeFunction = tameFunctionToString();
+ 
++const muteReporter = chooseReporter('none');
++
+ // @ts-ignore Compartment is definitely on globalThis.
+ globalThis.Compartment = makeCompartmentConstructor(
+   makeCompartmentConstructor,
+-  getGlobalIntrinsics(globalThis),
++  // Any reporting that would need to be done should have already been done
++  // during `lockdown()`.
++  // See https://github.com/endojs/endo/pull/2624#discussion_r1840979770
++  getGlobalIntrinsics(globalThis, muteReporter),
+   markVirtualizedNativeFunction,
+ );
+diff --git a/packages/ses/src/intrinsics.js b/packages/ses/src/intrinsics.js
+index 3393d6488..6dd17b58e 100644
+--- a/packages/ses/src/intrinsics.js
++++ b/packages/ses/src/intrinsics.js
+@@ -1,3 +1,4 @@
++import { cauterizeProperty } from './cauterize-property.js';
+ import {
+   TypeError,
+   WeakSet,
+@@ -23,6 +24,10 @@ import {
+   permitted,
+ } from './permits.js';
+ 
++/**
++ * @import {Reporter} from './reporting-types.js'
++ */
++
+ const isFunction = obj => typeof obj === 'function';
+ 
+ // Like defineProperty, but throws if it would modify an existing property.
+@@ -71,7 +76,10 @@ function sampleGlobals(globalObject, newPropertyNames) {
+   return newIntrinsics;
+ }
+ 
+-export const makeIntrinsicsCollector = () => {
++/**
++ * @param {Reporter} reporter
++ */
++export const makeIntrinsicsCollector = reporter => {
+   /** @type {Record<any, any>} */
+   const intrinsics = create(null);
+   let pseudoNatives;
+@@ -100,7 +108,15 @@ export const makeIntrinsicsCollector = () => {
+       }
+       const namePrototype = permit.prototype;
+       if (!namePrototype) {
+-        throw TypeError(`${name}.prototype property not permitted`);
++        cauterizeProperty(
++          intrinsic,
++          'prototype',
++          false,
++          `${name}.prototype`,
++          reporter,
++        );
++        // eslint-disable-next-line no-continue
++        continue;
+       }
+       if (
+         typeof namePrototype !== 'string' ||
+@@ -164,9 +180,11 @@ export const makeIntrinsicsCollector = () => {
+  * *original* unsafe (feral, untamed) bindings of these global variables.
+  *
+  * @param {object} globalObject
++ * @param {Reporter} reporter
+  */
+-export const getGlobalIntrinsics = globalObject => {
+-  const { addIntrinsics, finalIntrinsics } = makeIntrinsicsCollector();
++export const getGlobalIntrinsics = (globalObject, reporter) => {
++  // TODO pass a proper reporter to `makeIntrinsicsCollector`
++  const { addIntrinsics, finalIntrinsics } = makeIntrinsicsCollector(reporter);
+ 
+   addIntrinsics(sampleGlobals(globalObject, sharedGlobalPropertyNames));
+ 
+diff --git a/packages/ses/src/lockdown.js b/packages/ses/src/lockdown.js
+index 4150b3d54..97fdd84f9 100644
+--- a/packages/ses/src/lockdown.js
++++ b/packages/ses/src/lockdown.js
+@@ -281,7 +281,7 @@ export const repairIntrinsics = (options = {}) => {
+   const markVirtualizedNativeFunction = tameFunctionToString();
+ 
+   const { addIntrinsics, completePrototypes, finalIntrinsics } =
+-    makeIntrinsicsCollector();
++    makeIntrinsicsCollector(reporter);
+ 
+   // @ts-expect-error __hardenTaming__ could be any string
+   const tamedHarden = tameHarden(safeHarden, __hardenTaming__);
+diff --git a/packages/ses/src/permits-intrinsics.js b/packages/ses/src/permits-intrinsics.js
+index a629dae8e..fb0090476 100644
+--- a/packages/ses/src/permits-intrinsics.js
++++ b/packages/ses/src/permits-intrinsics.js
+@@ -61,6 +61,7 @@ import {
+   ownKeys,
+   symbolKeyFor,
+ } from './commons.js';
++import { cauterizeProperty } from './cauterize-property.js';
+ 
+ /**
+  * @import {Reporter} from './reporting-types.js'
+@@ -77,7 +78,7 @@ import {
+ export default function removeUnpermittedIntrinsics(
+   intrinsics,
+   markVirtualizedNativeFunction,
+-  { warn, error },
++  reporter,
+ ) {
+   // These primitives are allowed for permits.
+   const primitives = ['undefined', 'boolean', 'number', 'string', 'symbol'];
+@@ -279,35 +280,7 @@ export default function removeUnpermittedIntrinsics(
+       const subPermit = getSubPermit(obj, permit, propString);
+ 
+       if (!subPermit || !isAllowedProperty(subPath, obj, prop, subPermit)) {
+-        // Either the object lacks a permit or the object doesn't match the
+-        // permit.
+-        // If the permit is specifically false, not merely undefined,
+-        // this is a property we expect to see because we know it exists in
+-        // some environments and we have expressly decided to exclude it.
+-        // Any other disallowed property is one we have not audited and we log
+-        // that we are removing it so we know to look into it, as happens when
+-        // the language evolves new features to existing intrinsics.
+-        if (subPermit !== false) {
+-          warn(`Removing ${subPath}`);
+-        }
+-        try {
+-          delete obj[prop];
+-        } catch (err) {
+-          if (prop in obj) {
+-            if (typeof obj === 'function' && prop === 'prototype') {
+-              obj.prototype = undefined;
+-              if (obj.prototype === undefined) {
+-                warn(`Tolerating undeletable ${subPath} === undefined`);
+-                // eslint-disable-next-line no-continue
+-                continue;
+-              }
+-            }
+-            error(`failed to delete ${subPath}`, err);
+-          } else {
+-            error(`deleting ${subPath} threw`, err);
+-          }
+-          throw err;
+-        }
++        cauterizeProperty(obj, prop, subPermit === false, subPath, reporter);
+       }
+     }
+   }

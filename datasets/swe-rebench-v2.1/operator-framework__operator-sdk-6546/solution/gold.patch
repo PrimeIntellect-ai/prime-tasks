@@ -1,0 +1,213 @@
+diff --git a/changelog/fragments/helm-operator-rollback.yaml b/changelog/fragments/helm-operator-rollback.yaml
+new file mode 100644
+index 00000000..94bda486
+--- /dev/null
++++ b/changelog/fragments/helm-operator-rollback.yaml
+@@ -0,0 +1,33 @@
++# entries is a list of entries to include in
++# release notes and/or the migration guide
++entries:
++  - description: >
++      For Helm-based operators, whenever the operator encounters an 
++      error during reconcilliation, it would attempt to rollback the
++      changes with the `--force` option. This behavior could have 
++      undesired side effects in some scenario.
++
++      This change allows the users to change this behavior by adding the 
++      annotation, `helm.sdk.operatorframework.io/rollback-force: false`
++       to the custom resource.
++
++    # kind is one of:
++    # - addition
++    # - change
++    # - deprecation
++    # - removal
++    # - bugfix
++    kind: "addition"
++
++    # Is this a breaking change?
++    breaking: false
++
++    # NOTE: ONLY USE `pull_request_override` WHEN ADDING THIS
++    # FILE FOR A PREVIOUSLY MERGED PULL_REQUEST!
++    #
++    # The generator auto-detects the PR number from the commit
++    # message in which this file was originally added.
++    #
++    # What is the pull request number (without the "#")?
++    # pull_request_override: 0
++
+diff --git a/internal/helm/controller/reconcile.go b/internal/helm/controller/reconcile.go
+index e9f2f58b..a1310891 100644
+--- a/internal/helm/controller/reconcile.go
++++ b/internal/helm/controller/reconcile.go
+@@ -19,6 +19,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	rpb "helm.sh/helm/v3/pkg/release"
+@@ -63,6 +64,7 @@ const (
+ 	uninstallFinalizerLegacy = "uninstall-helm-release"
+ 
+ 	helmUpgradeForceAnnotation    = "helm.sdk.operatorframework.io/upgrade-force"
++	helmRollbackForceAnnotation   = "helm.sdk.operatorframework.io/rollback-force"
+ 	helmUninstallWaitAnnotation   = "helm.sdk.operatorframework.io/uninstall-wait"
+ 	helmReconcilePeriodAnnotation = "helm.sdk.operatorframework.io/reconcile-period"
+ )
+@@ -311,8 +313,18 @@ func (r HelmOperatorReconciler) Reconcile(ctx context.Context, request reconcile
+ 				"Chart value %q overridden to %q by operator's watches.yaml", k, v)
+ 		}
+ 		force := hasAnnotation(helmUpgradeForceAnnotation, o)
++
+ 		previousRelease, upgradedRelease, err := manager.UpgradeRelease(ctx, release.ForceUpgrade(force))
+ 		if err != nil {
++			if errors.Is(err, release.ErrUpgradeFailed) {
++				// the forceRollback variable takes the value of the annotation,
++				// "helm.sdk.operatorframework.io/rollback-force".
++				// The default value for the annotation is true
++				forceRollback := readBoolAnnotationWithDefault(o, helmRollbackForceAnnotation, true)
++				if err := manager.RollBack(ctx, release.ForceRollback(forceRollback)); err != nil {
++					log.Error(err, "Error rolling back release")
++				}
++			}
+ 			log.Error(err, "Release failed")
+ 			status.SetCondition(types.HelmAppCondition{
+ 				Type:    types.ConditionReleaseFailed,
+@@ -446,6 +458,21 @@ func hasAnnotation(anno string, o *unstructured.Unstructured) bool {
+ 	return value
+ }
+ 
++func readBoolAnnotationWithDefault(obj *unstructured.Unstructured, annotation string, fallback bool) bool {
++	val, ok := obj.GetAnnotations()[annotation]
++	if !ok {
++		return fallback
++	}
++	r, err := strconv.ParseBool(val)
++	if err != nil {
++		log.Error(
++			fmt.Errorf(strings.ToLower(err.Error())), "error parsing annotation", "annotation", annotation)
++		return fallback
++	}
++
++	return r
++}
++
+ func (r HelmOperatorReconciler) updateResource(ctx context.Context, o client.Object) error {
+ 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+ 		return r.Client.Update(ctx, o)
+diff --git a/internal/helm/release/manager.go b/internal/helm/release/manager.go
+index 07641ccc..1aa24e41 100644
+--- a/internal/helm/release/manager.go
++++ b/internal/helm/release/manager.go
+@@ -54,6 +54,7 @@ type Manager interface {
+ 	Sync(context.Context) error
+ 	InstallRelease(context.Context, ...InstallOption) (*rpb.Release, error)
+ 	UpgradeRelease(context.Context, ...UpgradeOption) (*rpb.Release, *rpb.Release, error)
++	RollBack(context.Context, ...RollBackOption) error
+ 	ReconcileRelease(context.Context) (*rpb.Release, error)
+ 	UninstallRelease(context.Context, ...UninstallOption) (*rpb.Release, error)
+ 	CleanupRelease(context.Context, string) (bool, error)
+@@ -79,6 +80,7 @@ type manager struct {
+ type InstallOption func(*action.Install) error
+ type UpgradeOption func(*action.Upgrade) error
+ type UninstallOption func(*action.Uninstall) error
++type RollBackOption func(*action.Rollback) error
+ 
+ // ReleaseName returns the name of the release.
+ func (m manager) ReleaseName() string {
+@@ -202,10 +204,13 @@ func ForceUpgrade(force bool) UpgradeOption {
+ 	}
+ }
+ 
++var ErrUpgradeFailed = errors.New("upgrade failed; rollback required")
++
+ // UpgradeRelease performs a Helm release upgrade.
+ func (m manager) UpgradeRelease(ctx context.Context, opts ...UpgradeOption) (*rpb.Release, *rpb.Release, error) {
+ 	upgrade := action.NewUpgrade(m.actionConfig)
+ 	upgrade.Namespace = m.namespace
++
+ 	for _, o := range opts {
+ 		if err := o(upgrade); err != nil {
+ 			return nil, nil, fmt.Errorf("failed to apply upgrade option: %w", err)
+@@ -216,24 +221,44 @@ func (m manager) UpgradeRelease(ctx context.Context, opts ...UpgradeOption) (*rp
+ 	if err != nil {
+ 		// Workaround for helm/helm#3338
+ 		if upgradedRelease != nil {
+-			rollback := action.NewRollback(m.actionConfig)
+-			rollback.Force = true
+-
+ 			// As of Helm 2.13, if UpgradeRelease returns a non-nil release, that
+ 			// means the release was also recorded in the release store.
+ 			// Therefore, we should perform the rollback when we have a non-nil
+ 			// release. Any rollback error here would be unexpected, so always
+ 			// log both the upgrade and rollback errors.
+-			rollbackErr := rollback.Run(m.releaseName)
+-			if rollbackErr != nil {
+-				return nil, nil, fmt.Errorf("failed upgrade (%s) and failed rollback: %w", err, rollbackErr)
+-			}
++			fmt.Printf("release upgrade failed; %v", err)
++
++			return nil, nil, ErrUpgradeFailed
+ 		}
+ 		return nil, nil, fmt.Errorf("failed to upgrade release: %w", err)
+ 	}
+ 	return m.deployedRelease, upgradedRelease, err
+ }
+ 
++func ForceRollback(force bool) RollBackOption {
++	return func(r *action.Rollback) error {
++		r.Force = force
++		return nil
++	}
++}
++
++// RollBack attempts to reverse any partially applied releases
++func (m manager) RollBack(ctx context.Context, opts ...RollBackOption) error {
++	rollback := action.NewRollback(m.actionConfig)
++
++	for _, fn := range opts {
++		if err := fn(rollback); err != nil {
++			return fmt.Errorf("failed to apply rollback option: %w", err)
++		}
++	}
++
++	if err := rollback.Run(m.releaseName); err != nil {
++		return fmt.Errorf("rollback failed: %w", err)
++	}
++
++	return nil
++}
++
+ // ReconcileRelease creates or patches resources as necessary to match the
+ // deployed release's manifest.
+ func (m manager) ReconcileRelease(ctx context.Context) (*rpb.Release, error) {
+diff --git a/website/content/en/docs/building-operators/helm/reference/advanced_features/annotations.md b/website/content/en/docs/building-operators/helm/reference/advanced_features/annotations.md
+index 2b8653d8..336f9949 100644
+--- a/website/content/en/docs/building-operators/helm/reference/advanced_features/annotations.md
++++ b/website/content/en/docs/building-operators/helm/reference/advanced_features/annotations.md
+@@ -166,4 +166,19 @@ metadata:
+ The value that is present under this key must be in the h/m/s format. For example, 1h2m4s, 3m0s, 4s are all valid values, but 1x3m9s is invalid. 
+ 
+ **NOTE**: This is just one way of specifying the reconcile period for Helm-based operators. There are two other ways: using the `--reconcile-period` command-line flag and under the 'reconcilePeriod' key in the watches.yaml file. If these three methods are used simultaneously to specify reconcile period (which they should not be), the order of precedence is as follows: 
+-Custom Resource Annotations > watches.yaml > command-line flag.
+\ No newline at end of file
++Custom Resource Annotations > watches.yaml > command-line flag.
++
++## `helm.sdk.operatorframework.io/rollback-force`
++
++Whenever a helm-based operator encounters an error during reconcilliation, by default, it would attempt to perform a rollback with the `--force` option. While this works as expected in most scenarios, there are a few edge cases where performing a rollback with `--force` could have undesired side effects.
++
++```sh
++...
++metadata:
++  name: nginx-sample
++  annotations:
++    helm.sdk.operatorframework.io/rollback-force: false
++...
++```
++
++Adding annotation to the custom resource, `helm.sdk.operatorframework.io/rollback-force: false` therefore allows a user, to change the default behavior of the helm-based operator whereby, rollbacks will be performed without the `--force` option whenever an error is encountered.
+\ No newline at end of file

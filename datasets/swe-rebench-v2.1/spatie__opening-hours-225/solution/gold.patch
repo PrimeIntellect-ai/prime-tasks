@@ -1,0 +1,247 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 68c44e7..ccf23ab 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,10 +2,37 @@
+ 
+ All notable changes to `opening-hours` will be documented in this file
+ 
+-## 3.0.0 - upcoming
++## 3.0.0 - 2023-11-12
+ 
+ - Add `Time::date()` method
+ - Add `DateTimeRange` class
++- Add ranges support via `to` or `-` separator
++- Deprecate `fill()` and `setData()`
++- Remove `setFilters()`
++
++## 2.41.0 - 2023-06-02
++
++- Cap holidays check to end date when calculating diff
++
++## 2.13.0 - 2022-08-07
++
++- Make comparison microsecond-precise
++
++## 2.12.0 - 2022-07-24
++
++- Apply timezone for all methods and both input/output
++
++## 2.11.3 - 2022-07-23
++
++- Copy non immutable dates to apply timezone
++
++## 2.11.2 - 2021-12-09
++
++- Add array-shape create() PHPDoc
++
++## 2.11.1 - 2021-12-04
++
++- Fix compatibility with PHP 8.1
+ 
+ ## 2.11.0 - 2021-10-16
+ 
+diff --git a/README.md b/README.md
+index e06537f..baa101a 100644
+--- a/README.md
++++ b/README.md
+@@ -92,7 +92,7 @@ $openingHours->forDate(new DateTime('2016-12-25'));
+ $openingHours->exceptions();
+ ```
+ 
+-On construction you can set a flag for overflowing times across days. For example, for a night club opens until 3am on Friday and Saturday:
++On construction, you can set a flag for overflowing times across days. For example, for a nightclub opens until 3am on Friday and Saturday:
+ 
+ ```php
+ $openingHours = \Spatie\OpeningHours\OpeningHours::create([
+@@ -102,7 +102,7 @@ $openingHours = \Spatie\OpeningHours\OpeningHours::create([
+ ], null);
+ ```
+ 
+-This allows the API to further at yesterdays data to check if the opening hours are open from yesterdays time range. 
++This allows the API to further at previous day's data to check if the opening hours are open from its time range. 
+ 
+ You can add data in definitions then retrieve them:
+ 
+@@ -163,6 +163,27 @@ $openingHours = OpeningHours::create([
+ ]);
+ ```
+ 
++You can use the separator `to` to specify multiple days at once, for the week or for exceptions:
++
++```php
++$openingHours = OpeningHours::create([
++    'monday to friday' => ['09:00-19:00'],
++    'saturday to sunday' => [],
++    'exceptions' => [
++        // Every year
++        '12-24 to 12-26' => [
++            'hours' => [],
++            'data'  => 'Holidays',
++        ],
++        // Only happening in 2024
++        '2024-06-25 to 2024-07-01' => [
++            'hours' => [],
++            'data'  => 'Closed for works',
++        ],
++    ],
++]);
++```
++
+ The last structure tool is the filter, it allows you to pass closures (or callable function/method reference) that take a date as a parameter and returns the settings for the given date.
+ 
+ ```php
+diff --git a/src/Exceptions/InvalidDateRange.php b/src/Exceptions/InvalidDateRange.php
+new file mode 100644
+index 0000000..f4453fc
+--- /dev/null
++++ b/src/Exceptions/InvalidDateRange.php
+@@ -0,0 +1,11 @@
++<?php
++
++namespace Spatie\OpeningHours\Exceptions;
++
++class InvalidDateRange extends Exception
++{
++    public static function invalidDateRange(string $entry, string $date): self
++    {
++        return new self("Unable to record `$entry` as it would override `$date`.");
++    }
++}
+diff --git a/src/OpeningHours.php b/src/OpeningHours.php
+index ebea6aa..599daab 100644
+--- a/src/OpeningHours.php
++++ b/src/OpeningHours.php
+@@ -2,6 +2,8 @@
+ 
+ namespace Spatie\OpeningHours;
+ 
++use DateInterval;
++use DatePeriod;
+ use DateTime;
+ use DateTimeImmutable;
+ use DateTimeInterface;
+@@ -9,6 +11,7 @@ use DateTimeZone;
+ use Generator;
+ use Spatie\OpeningHours\Exceptions\Exception;
+ use Spatie\OpeningHours\Exceptions\InvalidDate;
++use Spatie\OpeningHours\Exceptions\InvalidDateRange;
+ use Spatie\OpeningHours\Exceptions\InvalidDateTimeClass;
+ use Spatie\OpeningHours\Exceptions\InvalidDayName;
+ use Spatie\OpeningHours\Exceptions\InvalidTimezone;
+@@ -751,27 +754,108 @@ class OpeningHours
+     {
+         $dateTimeClass = Arr::pull($data, 'dateTimeClass', null);
+         $metaData = Arr::pull($data, 'data', null);
+-        $exceptions = [];
+-        $filters = Arr::pull($data, 'filters', []);
+         $overflow = (bool) Arr::pull($data, 'overflow', false);
++        [$exceptions, $filters] = $this->parseExceptions(
++            Arr::pull($data, 'exceptions', []),
++            Arr::pull($data, 'filters', []),
++        );
++        $openingHours = $this->parseDaysOfWeeks($data);
++
++        return [$openingHours, $exceptions, $metaData, $filters, $overflow, $dateTimeClass];
++    }
+ 
+-        foreach (Arr::pull($data, 'exceptions', []) as $key => $exception) {
++    protected function parseExceptions(array $data, array $filters): array
++    {
++        $exceptions = [];
++
++        foreach ($data as $key => $exception) {
+             if (is_callable($exception)) {
+                 $filters[] = $exception;
+ 
+                 continue;
+             }
+ 
+-            $exceptions[$key] = $exception;
++            foreach ($this->readDatesRange($key) as $date) {
++                if (isset($exceptions[$date])) {
++                    throw InvalidDateRange::invalidDateRange($key, $date);
++                }
++
++                $exceptions[$date] = $exception;
++            }
+         }
+ 
++        return [$exceptions, $filters];
++    }
++
++    protected function parseDaysOfWeeks(array $data): array
++    {
+         $openingHours = [];
+ 
+-        foreach ($data as $day => $openingHoursData) {
+-            $openingHours[$this->normalizeDayName($day)] = $openingHoursData;
++        foreach ($data as $dayKey => $openingHoursData) {
++            foreach ($this->readDatesRange($dayKey) as $rawDay) {
++                $day = $this->normalizeDayName($rawDay);
++
++                if (isset($openingHours[$day])) {
++                    throw InvalidDateRange::invalidDateRange($dayKey, $day);
++                }
++
++                $openingHours[$day] = $openingHoursData;
++            }
+         }
+ 
+-        return [$openingHours, $exceptions, $metaData, $filters, $overflow, $dateTimeClass];
++        return $openingHours;
++    }
++
++    protected function readDatesRange(string $key): iterable
++    {
++        $toChunks = preg_split('/\sto\s/', $key, 2);
++
++        if (count($toChunks) === 2) {
++            return $this->daysBetween(trim($toChunks[0]), trim($toChunks[1]));
++        }
++
++        $dashChunks = explode('-', $key);
++        $chunksCount = count($dashChunks);
++        $firstChunk = trim($dashChunks[0]);
++
++        if ($chunksCount === 2 && preg_match('/^[A-Za-z]+$/', $firstChunk)) {
++            return $this->daysBetween($firstChunk, trim($dashChunks[1]));
++        }
++
++        if ($chunksCount >= 4) {
++            $middle = ceil($chunksCount / 2);
++
++            return $this->daysBetween(
++                trim(implode('-', array_slice($dashChunks, 0, $middle))),
++                trim(implode('-', array_slice($dashChunks, $middle))),
++            );
++        }
++
++        return [$key];
++    }
++
++    /** @return Generator<string> */
++    protected function daysBetween(string $start, string $end): Generator
++    {
++        $count = count(explode('-', $start));
++
++        if ($count === 2) {
++            // Use an arbitrary leap year
++            $start = "2024-$start";
++            $end = "2024-$end";
++        }
++
++        $startDate = new DateTimeImmutable($start);
++        $endDate = $startDate->modify($end)->modify('+12 hours');
++
++        $format = [
++            2 => 'm-d',
++            3 => 'Y-m-d',
++        ][$count] ?? 'l';
++
++        foreach (new DatePeriod($startDate, new DateInterval('P1D'), $endDate) as $date) {
++            yield $date->format($format);
++        }
+     }
+ 
+     protected function setOpeningHoursFromStrings(string $day, array $openingHours): void

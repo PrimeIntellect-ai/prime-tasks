@@ -1,0 +1,372 @@
+diff --git a/earthkit/data/core/settings.py b/earthkit/data/core/settings.py
+index 7220c3e..64c0e26 100644
+--- a/earthkit/data/core/settings.py
++++ b/earthkit/data/core/settings.py
+@@ -19,13 +19,38 @@ import yaml
+ 
+ from earthkit.data import __version__ as VERSION
+ from earthkit.data.utils.html import css
+-from earthkit.data.utils.humanize import as_bytes, as_percent, as_seconds
++from earthkit.data.utils.humanize import (
++    as_bytes,
++    as_percent,
++    as_seconds,
++    interval_to_human,
++)
++from earthkit.data.utils.interval import Interval
+ 
+ LOG = logging.getLogger(__name__)
+ 
+ DOT_EARTHKIT_DATA = os.path.expanduser("~/.earthkit_data")
+ 
+ 
++class Validator:
++    def check(self, value):
++        raise NotImplementedError()
++
++    def explain(self):
++        return str()
++
++
++class IntervalValidator(Validator):
++    def __init__(self, interval):
++        self.interval = interval
++
++    def check(self, value):
++        return value in self.interval
++
++    def explain(self):
++        return f"Valid when {interval_to_human(self.interval)}."
++
++
+ class Setting:
+     def __init__(
+         self,
+@@ -35,6 +60,7 @@ class Setting:
+         none_ok=False,
+         kind=None,
+         docs_default=None,
++        validator=None,
+     ):
+         self.default = default
+         self.description = description
+@@ -42,6 +68,7 @@ class Setting:
+         self.none_ok = none_ok
+         self.kind = kind if kind is not None else type(default)
+         self.docs_default = docs_default if docs_default is not None else self.default
++        self.validator = validator
+ 
+     def kind(self):
+         return type(self.default)
+@@ -58,6 +85,15 @@ class Setting:
+             print(file=f)
+             yaml.dump({name: value}, f, default_flow_style=False)
+ 
++    @property
++    def docs_description(self):
++        d = self.description
++        if self.validator:
++            t = self.validator.explain()
++            if t:
++                return d + " " + t
++        return d
++
+ 
+ _ = Setting
+ 
+@@ -118,6 +154,11 @@ SETTINGS_AND_HELP = {
+         True,
+         "Use the standalone mars client when available instead of using the web API.",
+     ),
++    "reader-type-check-bytes": _(
++        64,
++        "Number of bytes read from the beginning of a source to identify its type.",
++        validator=IntervalValidator(Interval(8, 4096)),
++    ),
+ }
+ 
+ 
+@@ -258,6 +299,13 @@ class Settings:
+             if not isinstance(value, klass):
+                 raise TypeError("Setting '%s' must be of type '%s'" % (name, klass))
+ 
++        validator = SETTINGS_AND_HELP[name].validator
++        if validator is not None:
++            if not validator.check(value):
++                raise ValueError(
++                    f"Settings {name} cannot be set to {value}. {validator.explain()}"
++                )
++
+         self._settings[name] = value
+         self._changed()
+ 
+diff --git a/earthkit/data/readers/__init__.py b/earthkit/data/readers/__init__.py
+index 0c516ba..30fa545 100644
+--- a/earthkit/data/readers/__init__.py
++++ b/earthkit/data/readers/__init__.py
+@@ -13,6 +13,7 @@ import weakref
+ from importlib import import_module
+ 
+ from earthkit.data.core import Base
++from earthkit.data.core.settings import SETTINGS
+ from earthkit.data.decorators import locked
+ 
+ LOG = logging.getLogger(__name__)
+@@ -154,8 +155,9 @@ def reader(source, path):
+         return DirectoryReader(source, path).mutate()
+     LOG.debug("Reader for %s", path)
+ 
++    n_bytes = SETTINGS.get("reader-type-check-bytes")
+     with open(path, "rb") as f:
+-        magic = f.read(8)
++        magic = f.read(n_bytes)
+ 
+     LOG.debug("Looking for a reader for %s (%s)", path, magic)
+ 
+@@ -165,7 +167,8 @@ def reader(source, path):
+ def memory_reader(source, buf):
+     """Create a reader for data held in a memory buffer"""
+     assert isinstance(buf, (bytes, bytearray)), source
+-    magic = buf[:8] if len(buf) > 8 else None
++    n_bytes = SETTINGS.get("reader-type-check-bytes")
++    magic = buf[: min(n_bytes, len(buf) - 1)]
+     return _find_reader("memory_reader", source, buf, magic)
+ 
+ 
+@@ -174,9 +177,10 @@ def stream_reader(source, stream):
+     magic = None
+     if hasattr(stream, "peek") and callable(stream.peek):
+         try:
+-            magic = stream.peek(8)
+-            if len(magic) > 8:
+-                magic = magic[:8]
++            n_bytes = SETTINGS.get("reader-type-check-bytes")
++            magic = stream.peek(n_bytes)
++            if len(magic) > n_bytes:
++                magic = magic[:n_bytes]
+         except Exception:
+             pass
+ 
+diff --git a/earthkit/data/readers/bufr.py b/earthkit/data/readers/bufr.py
+index d305568..97cfad0 100644
+--- a/earthkit/data/readers/bufr.py
++++ b/earthkit/data/readers/bufr.py
+@@ -101,6 +101,16 @@ class BUFRReader(Reader):
+         return ls(_proc, BUFR_LS_KEYS, *args, **kwargs)
+ 
+ 
++def _match_magic(magic, deeper_check):
++    if magic is not None:
++        type_id = b"BUFR"
++        if not deeper_check:
++            return len(magic) >= 4 and magic[:4] == type_id
++        else:
++            return type_id in magic
++    return False
++
++
+ def reader(source, path, magic=None, deeper_check=False):
+-    if magic is None or magic[:4] == b"BUFR":
++    if _match_magic(magic, deeper_check):
+         return BUFRReader(source, path)
+diff --git a/earthkit/data/readers/grib/__init__.py b/earthkit/data/readers/grib/__init__.py
+index 35c560f..3e55667 100644
+--- a/earthkit/data/readers/grib/__init__.py
++++ b/earthkit/data/readers/grib/__init__.py
+@@ -11,26 +11,32 @@ import logging
+ LOG = logging.getLogger(__name__)
+ 
+ 
+-def _match_magic(magic):
+-    return magic is None or (len(magic) >= 4 and magic[:4] == b"GRIB")
++def _match_magic(magic, deeper_check):
++    if magic is not None:
++        type_id = b"GRIB"
++        if not deeper_check:
++            return len(magic) >= 4 and magic[:4] == type_id
++        else:
++            return type_id in magic
++    return False
+ 
+ 
+ def reader(source, path, magic=None, deeper_check=False):
+-    if _match_magic(magic):
++    if _match_magic(magic, deeper_check):
+         from .reader import GRIBReader
+ 
+         return GRIBReader(source, path)
+ 
+ 
+ def memory_reader(source, buf, magic=None, deeper_check=False):
+-    if _match_magic(magic):
++    if _match_magic(magic, deeper_check):
+         from .memory import FieldListInMemory, GribMessageMemoryReader
+ 
+         return FieldListInMemory(source, GribMessageMemoryReader(buf))
+ 
+ 
+ def stream_reader(source, stream, magic=None, deeper_check=False):
+-    if _match_magic(magic):
++    if _match_magic(magic, deeper_check):
+         from .memory import FieldListInMemory, GribStreamReader
+ 
+         r = GribStreamReader(stream)
+diff --git a/earthkit/data/readers/netcdf.py b/earthkit/data/readers/netcdf.py
+index 6c28621..b5d69cb 100644
+--- a/earthkit/data/readers/netcdf.py
++++ b/earthkit/data/readers/netcdf.py
+@@ -400,6 +400,13 @@ class NetCDFReader(Reader):
+         return [s.bounding_box() for s in self.get_fields()]
+ 
+ 
++def _match_magic(magic, deeper_check):
++    if magic is not None:
++        type_id = (b"\x89HDF", b"CDF\x01", b"CDF\x02")
++        return len(magic) >= 4 and magic[:4] in type_id
++    return False
++
++
+ def reader(source, path, magic=None, deeper_check=False):
+-    if magic is None or magic[:4] in (b"\x89HDF", b"CDF\x01", b"CDF\x02"):
++    if _match_magic(magic, deeper_check):
+         return NetCDFReader(source, path)
+diff --git a/earthkit/data/readers/odb.py b/earthkit/data/readers/odb.py
+index 42bbb38..3fd07e1 100644
+--- a/earthkit/data/readers/odb.py
++++ b/earthkit/data/readers/odb.py
+@@ -27,6 +27,16 @@ class ODBReader(Reader):
+         return odc.read_odb(self.path, single=True, **odc_read_odb_kwargs)
+ 
+ 
++def _match_magic(magic, deeper_check):
++    if magic is not None:
++        type_id = b"\xff\xffODA"
++        if not deeper_check:
++            return len(magic) >= 5 and magic[:5] == type_id
++        else:
++            return type_id in magic
++    return False
++
++
+ def reader(source, path, magic=None, deeper_check=False):
+-    if magic is None or magic[:5] == b"\xff\xffODA":
++    if _match_magic(magic, deeper_check):
+         return ODBReader(source, path)
+diff --git a/earthkit/data/sphinxext/generate_settings_rst.py b/earthkit/data/sphinxext/generate_settings_rst.py
+index 243caa9..8b30232 100644
+--- a/earthkit/data/sphinxext/generate_settings_rst.py
++++ b/earthkit/data/sphinxext/generate_settings_rst.py
+@@ -55,7 +55,7 @@ def execute(*args):
+ 
+         print("   * - ", k.replace("-", "\u2011"))  # Non-breaking hyphen
+         print("     - ", repr(tidy(v.docs_default)).replace("-", "\u2011"))
+-        print("     - ", v.description)
++        print("     - ", v.docs_description)
+     print()
+ 
+ 
+diff --git a/earthkit/data/utils/humanize.py b/earthkit/data/utils/humanize.py
+index a1c6b50..8fc1847 100644
+--- a/earthkit/data/utils/humanize.py
++++ b/earthkit/data/utils/humanize.py
+@@ -345,3 +345,19 @@ def rounded_datetime(d):
+         d = d + datetime.timedelta(seconds=1)
+     d = d.replace(microsecond=0)
+     return d
++
++
++def interval_to_human(v, value="x"):
++    if v.bounded:
++        if not v.bounded_left:
++            right_oper = "<=" if v.closed_right else "<"
++            return f"{value} {right_oper} {v.right}"
++        elif not v.bounded_right:
++            left_oper = ">=" if v.closed_left else ">"
++            return f"{value} {left_oper} {v.left}"
++        else:
++            left_oper = "<=" if v.closed_left else "<"
++            right_oper = "<=" if v.closed_right else "<"
++            return f"{v.left} {left_oper} {value} {right_oper} {v.right}"
++    else:
++        return ""
+diff --git a/earthkit/data/utils/interval.py b/earthkit/data/utils/interval.py
+new file mode 100644
+index 0000000..583bf59
+--- /dev/null
++++ b/earthkit/data/utils/interval.py
+@@ -0,0 +1,75 @@
++# (C) Copyright 2020 ECMWF.
++#
++# This software is licensed under the terms of the Apache Licence Version 2.0
++# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
++# In applying this licence, ECMWF does not waive the privileges and immunities
++# granted to it by virtue of its status as an intergovernmental organisation
++# nor does it submit to any jurisdiction.
++#
++
++import operator
++
++
++class Interval:
++    def __init__(self, left, right, closed="both"):
++        if left is not None and right is not None and left >= right:
++            raise ValueError(f"Invalid bounds, left={left} >= right={right}")
++        if closed not in ("both", "left", "right", "none"):
++            raise ValueError(f"Invalid closed={closed}")
++
++        self._left = left
++        self._right = right
++        self._closed = closed
++        self._left_oper = operator.lt if closed in ["both", "left"] else operator.le
++        self._right_oper = operator.gt if closed in ["both", "right"] else operator.ge
++
++    def __contains__(self, value):
++        if self.bounded:
++            if self._left is not None and self._left_oper(value, self._left):
++                return False
++            elif self._right is not None and self._right_oper(value, self._right):
++                return False
++        return True
++
++    def __repr__(self):
++        return f"{self.__class__.__name__}(left={self.left}, right={self.right}, closed={self.closed})"
++
++    @property
++    def left(self):
++        return self._left
++
++    @property
++    def right(self):
++        return self._right
++
++    @property
++    def closed(self):
++        return self._closed
++
++    @property
++    def closed_left(self):
++        return self._closed in ["both", "left"]
++
++    @property
++    def closed_right(self):
++        return self._closed in ["both", "right"]
++
++    @property
++    def open_left(self):
++        return not self.closed_left
++
++    @property
++    def open_right(self):
++        return not self.closed_right
++
++    @property
++    def bounded_left(self):
++        return self.left is not None
++
++    @property
++    def bounded_right(self):
++        return self.right is not None
++
++    @property
++    def bounded(self):
++        return self.bounded_left or self.bounded_right

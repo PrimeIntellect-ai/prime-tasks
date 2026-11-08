@@ -1,0 +1,148 @@
+diff --git a/tests/unit/test_relation_as_case_sensitive.py b/tests/unit/test_relation_as_case_sensitive.py
+new file mode 100644
+index 0000000..e491caa
+--- /dev/null
++++ b/tests/unit/test_relation_as_case_sensitive.py
+@@ -0,0 +1,142 @@
++from multiprocessing import get_context
++from unittest import mock
++
++import pytest
++
++from dbt.adapters.snowflake import Plugin as SnowflakePlugin
++from dbt.adapters.snowflake import SnowflakeAdapter
++from dbt.adapters.snowflake.relation import SnowflakeRelation
++from dbt.adapters.snowflake.relation_configs import SnowflakeQuotePolicy
++from dbt.context.providers import generate_runtime_macro_context
++from dbt.context.query_header import generate_query_header_context
++from dbt.contracts.files import FileHash
++from dbt.contracts.graph.manifest import ManifestStateCheck
++from snowflake import connector as snowflake_connector
++
++from .utils import (
++    config_from_parts_or_dicts,
++    inject_adapter,
++    load_internal_manifest_macros,
++)
++
++
++def test_relation_as_case_sensitive_quoting_true():
++    relation = SnowflakeRelation.create(
++        database="My_Db",
++        schema="My_ScHeMa",
++        identifier="My_TaBlE",
++        quote_policy=SnowflakeQuotePolicy(database=False, schema=True, identifier=False),
++    )
++
++    case_sensitive_relation = relation.as_case_sensitive()
++    case_sensitive_relation.render_limited()
++
++    assert case_sensitive_relation is not relation
++    assert relation.database == "My_Db"
++    assert relation.schema == "My_ScHeMa"
++    assert relation.identifier == "My_TaBlE"
++    assert case_sensitive_relation.database == "MY_DB"
++    assert case_sensitive_relation.schema == "My_ScHeMa"
++    assert case_sensitive_relation.identifier == "MY_TABLE"
++    assert case_sensitive_relation.render() == 'MY_DB."My_ScHeMa".MY_TABLE'
++
++
++@pytest.fixture
++def snowflake_adapter():
++    profile_cfg = {
++        "outputs": {
++            "test": {
++                "type": "snowflake",
++                "account": "test_account",
++                "user": "test_user",
++                "database": "test_database",
++                "warehouse": "test_warehouse",
++                "schema": "public",
++            },
++        },
++        "target": "test",
++    }
++
++    project_cfg = {
++        "name": "X",
++        "version": "0.1",
++        "profile": "test",
++        "project-root": "/tmp/dbt/does-not-exist",
++        "quoting": {
++            "identifier": False,
++            "schema": True,
++        },
++        "query-comment": "dbt",
++        "config-version": 2,
++    }
++    config = config_from_parts_or_dicts(project_cfg, profile_cfg)
++
++    @mock.patch("dbt.parser.manifest.ManifestLoader.build_manifest_state_check")
++    def _mock_state_check(self):
++        all_projects = self.all_projects
++        return ManifestStateCheck(
++            vars_hash=FileHash.from_contents("vars"),
++            project_hashes={name: FileHash.from_contents(name) for name in all_projects},
++            profile_hash=FileHash.from_contents("profile"),
++        )
++
++    load_state_check = mock.patch(
++        "dbt.parser.manifest.ManifestLoader.build_manifest_state_check"
++    )
++    mock_state_check = load_state_check.start()
++    mock_state_check.side_effect = _mock_state_check
++
++    handle = mock.MagicMock(spec=snowflake_connector.SnowflakeConnection)
++    cursor = handle.cursor.return_value
++    cursor.sfqid = "test_query_id"
++    mock_execute = cursor.execute
++    patcher = mock.patch("dbt.adapters.snowflake.connections.snowflake.connector.connect")
++    snowflake = patcher.start()
++    snowflake.return_value = handle
++
++    adapter = SnowflakeAdapter(config, get_context("spawn"))
++    adapter.set_macro_resolver(load_internal_manifest_macros(config))
++    adapter.set_macro_context_generator(generate_runtime_macro_context)
++    adapter.connections.set_query_header(
++        generate_query_header_context(config, adapter.get_macro_resolver())
++    )
++
++    qh_patch = mock.patch.object(adapter.connections.query_header, "add")
++    mock_query_header_add = qh_patch.start()
++    mock_query_header_add.side_effect = lambda q: "/* dbt */\n{}".format(q)
++
++    adapter.acquire_connection()
++    inject_adapter(adapter, SnowflakePlugin)
++
++    try:
++        yield adapter, mock_execute
++    finally:
++        adapter.cleanup_connections()
++        qh_patch.stop()
++        patcher.stop()
++        load_state_check.stop()
++
++
++def test_show_object_metadata_uses_starts_with(snowflake_adapter):
++    adapter, mock_execute = snowflake_adapter
++    relation = adapter.Relation.create(
++        database="My_Db",
++        schema="My_ScHeMa",
++        identifier="My_TaBlE",
++        quote_policy=SnowflakeQuotePolicy(database=False, schema=True, identifier=False),
++    )
++
++    adapter.get_catalog_for_single_relation(relation)
++
++    executed_sql = [call.args[0] for call in mock_execute.call_args_list]
++    metadata_sql = [sql for sql in executed_sql if "show objects" in sql.lower()]
++    assert metadata_sql, "expected a 'show objects' query to be executed"
++
++    sql = metadata_sql[0]
++    normalized_sql = sql.lower()
++    assert "starts with" in normalized_sql
++    assert "show objects like" not in normalized_sql
++    # Unquoted path parts are case-sensitive; the quoted schema keeps its spelling.
++    assert "MY_DB" in sql
++    assert '"My_ScHeMa"' in sql
++    assert "'MY_TABLE'" in sql

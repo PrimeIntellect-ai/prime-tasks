@@ -1,0 +1,116 @@
+cms: set invoice status returning empty author username
+The [docs for the set invoice status endpoint](https://github.com/decred/politeia/blob/master/politeiawww/api/cms/v1/api.md#set-invoice-status) says that the username of the author should be returned but it's returning an empty string instead.
+
+For example, rejecting the following proposal:
+
+```
+{
+         "status":2,
+         "timestamp":1584840878,
+         "userid":"772448f5-a262-49fb-a51d-a547fdf87049",
+         "username":"admin",
+         "publickey":"532601dde16cb3753bb7b72cfdc866fd423c8dde5c3f25f6b7911f5d36505e7b",
+         "signature":"ef4de7bc4ed549adf52edc931e2b41ea2b10da2eda71659bf971e9446a78883a46782341821dedc29d9d17a2632560e4b70a9d2796f030ba390e265f781da405",
+         "file":null,
+         "version":"1",
+         "input":{
+            "version":0,
+            "month":2,
+            "year":2020,
+            "exchangerate":2048,
+            "contractorname":"ABCDEEEeeeeeqweeeeeee123",
+            "contractorlocation":"Brazil",
+            "contractorcontact":"testsssseee",
+            "contractorrate":5000,
+            "paymentaddress":"Tsb9crAxEZdhkTAQ73afFzJ3HB45RDMJTrW",
+            "lineitems":[
+               {
+                  "type":1,
+                  "domain":"Development",
+                  "subdomain":"ddd",
+                  "description":"ddd",
+                  "proposaltoken":"",
+                  "subuserid":"",
+                  "subrate":0,
+                  "labor":2400,
+                  "expenses":0
+               }
+            ]
+         },
+         "payment":{
+            "token":"",
+            "address":"",
+            "txids":[
+               ""
+            ],
+            "timestarted":0,
+            "timelastupdated":0,
+            "amountneeded":0,
+            "amountreceived":0,
+            "status":0
+         },
+         "censorshiprecord":{
+            "token":"a0f499a00e35c54d90d8ef49b317b971282f31d618190c866a07b10aea3738fa",
+            "merkle":"",
+            "signature":""
+         }
+      }
+```
+
+Returns:
+
+```
+{
+   "invoice":{
+      "status":5,
+      "timestamp":1584840878,
+      "userid":"772448f5-a262-49fb-a51d-a547fdf87049",
+      "username":"",
+      "publickey":"532601dde16cb3753bb7b72cfdc866fd423c8dde5c3f25f6b7911f5d36505e7b",
+      "signature":"ef4de7bc4ed549adf52edc931e2b41ea2b10da2eda71659bf971e9446a78883a46782341821dedc29d9d17a2632560e4b70a9d2796f030ba390e265f781da405",
+      "file":null,
+      "version":"1",
+      "input":{
+         "version":0,
+         "month":2,
+         "year":2020,
+         "exchangerate":2048,
+         "contractorname":"ABCDEEEeeeeeqweeeeeee123",
+         "contractorlocation":"Brazil",
+         "contractorcontact":"testsssseee",
+         "contractorrate":5000,
+         "paymentaddress":"Tsb9crAxEZdhkTAQ73afFzJ3HB45RDMJTrW",
+         "lineitems":[
+            {
+               "type":1,
+               "domain":"Development",
+               "subdomain":"ddd",
+               "description":"ddd",
+               "proposaltoken":"",
+               "subuserid":"",
+               "subrate":0,
+               "labor":2400,
+               "expenses":0
+            }
+         ]
+      },
+      "payment":{
+         "token":"",
+         "address":"",
+         "txids":[
+            ""
+         ],
+         "timestarted":0,
+         "timelastupdated":0,
+         "amountneeded":0,
+         "amountreceived":0,
+         "status":0
+      },
+      "censorshiprecord":{
+         "token":"a0f499a00e35c54d90d8ef49b317b971282f31d618190c866a07b10aea3738fa",
+         "merkle":"",
+         "signature":""
+      }
+   }
+}
+```

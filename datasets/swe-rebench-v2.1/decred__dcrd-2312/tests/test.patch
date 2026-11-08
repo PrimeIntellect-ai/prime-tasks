@@ -1,0 +1,210 @@
+diff --git a/connmgr/connmanager_test.go b/connmgr/connmanager_test.go
+index db705c32..8f23bcb2 100644
+--- a/connmgr/connmanager_test.go
++++ b/connmgr/connmanager_test.go
+@@ -701,16 +701,18 @@ func TestCancelIgnoreDelayedConnection(t *testing.T) {
+ }
+ 
+ // TestDialTimeout ensure the Timeout configuration parameter works as intended
+-// by creating a dialer that blocks for twice the configured dial timeout before
+-// connecting and ensuring the connection fails as expected.
++// by creating a dialer that blocks for three times the configured dial timeout
++// before connecting and ensuring the connection fails as expected.
+ func TestDialTimeout(t *testing.T) {
+ 	// Create a connection manager instance with a dialer that blocks for twice
+ 	// the configured dial timeout before connecting.
+ 	const dialTimeout = time.Millisecond * 2
++	cancelled := make(chan struct{})
+ 	timeoutDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+ 		select {
+-		case <-time.After(dialTimeout * 2):
++		case <-time.After(dialTimeout * 3):
+ 		case <-ctx.Done():
++			close(cancelled)
+ 			return nil, ctx.Err()
+ 		}
+ 
+@@ -734,9 +736,14 @@ func TestDialTimeout(t *testing.T) {
+ 	}
+ 	go cmgr.Connect(context.Background(), cr)
+ 
+-	// Wait for the dial timeout to elapse and ensure the connection request is
++	// Wait to receive the signal that the dialer context was cancelled, which
++	// means the dial timeout was hit, and ensure the connection request is
+ 	// marked as failed after a short timeout to allow the transition to occur.
+-	time.Sleep(dialTimeout)
++	select {
++	case <-cancelled:
++	case <-time.After(dialTimeout * 10):
++		t.Fatal("timeout waiting for dial cancellation")
++	}
+ 	time.Sleep(10 * time.Millisecond)
+ 	assertConnReqState(t, cr, ConnFailed)
+ 
+diff --git a/internal/rpcserver/rpcserverhandlers_test.go b/internal/rpcserver/rpcserverhandlers_test.go
+index d00d9867..281c81ba 100644
+--- a/internal/rpcserver/rpcserverhandlers_test.go
++++ b/internal/rpcserver/rpcserverhandlers_test.go
+@@ -15,9 +15,11 @@ import (
+ 	"math/big"
+ 	"net"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"reflect"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -129,7 +131,6 @@ type testRPCChain struct {
+ 	estimateNextStakeDifficultyFn   func(newTickets int64, useMaxTickets bool) (diff int64, err error)
+ 	fetchUtxoEntry                  UtxoEntry
+ 	fetchUtxoStats                  *blockchain.UtxoStats
+-	filterByBlockHash               *gcs.FilterV2
+ 	getStakeVersions                []blockchain.StakeVersions
+ 	getStakeVersionsErr             error
+ 	getVoteCounts                   blockchain.VoteCounts
+@@ -256,10 +257,9 @@ func (c *testRPCChain) FetchUtxoStats() (*blockchain.UtxoStats, error) {
+ 	return c.fetchUtxoStats, nil
+ }
+ 
+-// FilterByBlockHash returns a mocked version 2 GCS filter for the given block
+-// hash when it exists.
++// FilterByBlockHash returns no mocked filter.
+ func (c *testRPCChain) FilterByBlockHash(hash *chainhash.Hash) (*gcs.FilterV2, error) {
+-	return c.filterByBlockHash, nil
++	return nil, nil
+ }
+ 
+ // GetStakeVersions returns a mocked cooked array of StakeVersions.
+@@ -450,7 +450,6 @@ type testSyncManager struct {
+ 	syncPeerID         int32
+ 	locateBlocks       []chainhash.Hash
+ 	existsAddrIndex    *indexers.ExistsAddrIndex
+-	cfIndex            *indexers.CFIndex
+ 	tipGeneration      []chainhash.Hash
+ 	syncHeight         int64
+ 	processTransaction []*dcrutil.Tx
+@@ -485,9 +484,9 @@ func (s *testSyncManager) ExistsAddrIndex() *indexers.ExistsAddrIndex {
+ 	return s.existsAddrIndex
+ }
+ 
+-// CFIndex returns a mocked committed filter (cf) by hash index.
++// CFIndex returns no mocked compact filter index.
+ func (s *testSyncManager) CFIndex() *indexers.CFIndex {
+-	return s.cfIndex
++	return nil
+ }
+ 
+ // TipGeneration returns a mocked entire generation of blocks stemming from the
+@@ -655,6 +654,12 @@ func (l *testLogManager) SupportedSubsystems() []string {
+ 	return l.supportedSubsystems
+ }
+ 
++// ParseAndSetDebugLevels provides a mock implementation for parsing the
++// specified debug level and setting the levels accordingly.
++func (l *testLogManager) ParseAndSetDebugLevels(debugLevel string) error {
++	return l.parseAndSetDebugLevelsErr
++}
++
+ // testSanityChecker provides a mock implementation that checks the sanity
+ // state of a block.
+ type testSanityChecker struct {
+@@ -666,12 +671,6 @@ func (s *testSanityChecker) CheckBlockSanity(block *dcrutil.Block) error {
+ 	return s.checkBlockSanityErr
+ }
+ 
+-// ParseAndSetDebugLevels provides a mock implementation for parsing the
+-// specified debug level and setting the levels accordingly.
+-func (l *testLogManager) ParseAndSetDebugLevels(debugLevel string) error {
+-	return l.parseAndSetDebugLevelsErr
+-}
+-
+ // mustParseHash converts the passed big-endian hex string into a
+ // chainhash.Hash and will panic if there is an error.  It only differs from the
+ // one available in chainhash in that it will panic so errors in the source code
+@@ -787,6 +786,8 @@ var defaultChainParams = func() *chaincfg.Params {
+ 	}
+ 	testChainParams.PowLimitBits = 0x1d00ffff
+ 	testChainParams.StakeDiffWindowSize = 144
++	testChainParams.GenesisHash = *mustParseHash("298e5cc3d985bfe7f81dc135f360ab" +
++		"e089edd4396b86d2de66b0cef42b21d980")
+ 	return testChainParams
+ }()
+ 
+@@ -802,7 +803,6 @@ func defaultMockRPCChain() *testRPCChain {
+ 	blkHash := blk.Hash()
+ 	blkHeight := blk.Height()
+ 	chainWork, _ := new(big.Int).SetString("0e805fb85284503581c57c", 16)
+-	filter, _ := gcs.FromBytesV2(20, 1<<20, nil)
+ 	return &testRPCChain{
+ 		bestSnapshot: &blockchain.BestState{
+ 			Hash:           *blkHash,
+@@ -860,7 +860,6 @@ func defaultMockRPCChain() *testRPCChain {
+ 			Total:          1154067750680149,
+ 			SerializedHash: *mustParseHash("fe7b32aa188800f07268b17f3bead5f3d8a1b6d18654182066436efce6effa86"),
+ 		},
+-		filterByBlockHash: filter,
+ 		getStakeVersions: []blockchain.StakeVersions{{
+ 			Hash:         *blkHash,
+ 			Height:       blkHeight,
+@@ -2546,6 +2545,58 @@ func TestHandleGetBestBlock(t *testing.T) {
+ 	}})
+ }
+ 
++func TestLegacyCFilterDeprecationDocumentation(t *testing.T) {
++	for _, method := range []string{"getcfilter", "getcfilterheader"} {
++		doc, err := os.ReadFile("../../docs/json_rpc_api.mediawiki")
++		if err != nil {
++			t.Fatalf("unable to read JSON API documentation: %v", err)
++		}
++		text := string(doc)
++		start := strings.Index(text, "===="+method+"====")
++		if start < 0 {
++			t.Fatalf("JSON API documentation has no %s entry", method)
++		}
++		section := text[start+len("===="+method+"===="):]
++		if end := strings.Index(section, "===="); end >= 0 {
++			section = section[:end]
++		}
++		if !strings.Contains(strings.ToLower(section), "deprecated") ||
++			!strings.Contains(section, "getcfilterv2") {
++			t.Errorf("JSON API documentation for %s must identify deprecation and refer to getcfilterv2", method)
++		}
++
++		help, err := newHelpCacher().rpcMethodHelp(types.Method(method))
++		if err != nil {
++			t.Fatalf("unable to generate RPC help for %s: %v", method, err)
++		}
++		if !strings.Contains(strings.ToLower(help), "deprecated") ||
++			!strings.Contains(strings.ToLower(help), "getcfilterv2") {
++			t.Errorf("RPC help for %s must identify deprecation and refer to the version 2 filter command", method)
++		}
++	}
++}
++
++func TestLegacyCFilterGoDocumentation(t *testing.T) {
++	for _, tc := range []struct {
++		packagePath string
++		symbol      string
++		v2Reference string
++	}{
++		{"github.com/decred/dcrd/blockchain/v3/indexers", "CFIndex.FilterByBlockHash", "FilterByBlockHash"},
++		{"github.com/decred/dcrd/blockchain/v3/indexers", "CFIndex.FilterHeaderByBlockHash", "FilterByBlockHash"},
++	} {
++		output, err := exec.Command("go", "doc", tc.packagePath, tc.symbol).CombinedOutput()
++		if err != nil {
++			t.Fatalf("unable to obtain Go documentation for %s: %v\n%s", tc.symbol, err, output)
++		}
++		doc := strings.ToLower(string(output))
++		if !strings.Contains(doc, "deprecated") ||
++			!strings.Contains(doc, strings.ToLower(tc.v2Reference)) {
++			t.Errorf("Go documentation for %s must identify deprecation and refer to its version 2 alternative", tc.symbol)
++		}
++	}
++}
++
+ func TestHandleGetBestBlockHash(t *testing.T) {
+ 	t.Parallel()
+ 

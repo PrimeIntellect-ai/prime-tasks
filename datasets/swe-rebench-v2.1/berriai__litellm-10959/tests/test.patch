@@ -1,0 +1,232 @@
+diff --git a/tests/guardrails_tests/test_guardrails_config.py b/tests/guardrails_tests/test_guardrails_config.py
+index c2a902204..4a61bf79b 100644
+--- a/tests/guardrails_tests/test_guardrails_config.py
++++ b/tests/guardrails_tests/test_guardrails_config.py
+@@ -93,21 +93,14 @@ def test_guardrail_list_of_event_hooks():
+ 
+ 
+ def test_guardrail_info_response():
+-    from litellm.types.guardrails import GuardrailInfoResponse, LitellmParams, GuardrailLiteLLMParamsResponse
++    from litellm.types.guardrails import GuardrailInfoResponse
+ 
+     guardrail_info = GuardrailInfoResponse(
+         guardrail_name="aporia-pre-guard",
+-        litellm_params=GuardrailLiteLLMParamsResponse(
+-            guardrail="aporia",
+-            mode="pre_call",
+-        ),
+-        guardrail_info={
+-            "guardrail_name": "aporia-pre-guard",
+-            "litellm_params": {
+-                "guardrail": "aporia",
+-                "mode": "always_on",
+-            },
+-        },
++        litellm_params={"guardrail": "aporia", "mode": "pre_call"},
++        guardrail_info={"description": "configured guardrail"},
+     )
+ 
+-    assert guardrail_info.litellm_params.default_on == False
++    assert guardrail_info.guardrail_name == "aporia-pre-guard"
++    assert guardrail_info.guardrail_info == {"description": "configured guardrail"}
++    assert guardrail_info.litellm_params.default_on is False
+diff --git a/tests/litellm/proxy/guardrails/test_guardrail_endpoints.py b/tests/litellm/proxy/guardrails/test_guardrail_endpoints.py
+new file mode 100644
+index 000000000..2663ac42a
+--- /dev/null
++++ b/tests/litellm/proxy/guardrails/test_guardrail_endpoints.py
+@@ -0,0 +1,194 @@
++import asyncio
++import os
++import sys
++import uuid
++from contextlib import contextmanager
++from datetime import datetime
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++from fastapi import HTTPException
++
++sys.path.insert(
++    0, os.path.abspath("../../..")
++)  # Adds the parent directory to the system path
++
++from litellm.proxy.guardrails.guardrail_endpoints import (
++    get_guardrail_info,
++    list_guardrails_v2,
++)
++
++# Mock data for testing
++MOCK_DB_GUARDRAIL = {
++    "guardrail_id": "test-db-guardrail",
++    "guardrail_name": "Test DB Guardrail",
++    "litellm_params": {
++        "guardrail": "test.guardrail",
++        "mode": "pre_call",
++    },
++    "guardrail_info": {"description": "Test guardrail from DB"},
++    "created_at": datetime.now(),
++    "updated_at": datetime.now(),
++}
++
++
++def _make_mock_prisma_client():
++    """Build a mock Prisma client exposing the guardrail table methods."""
++    mock_client = MagicMock()
++    mock_client.db = MagicMock()
++    mock_client.db.litellm_guardrailstable = MagicMock()
++    mock_client.db.litellm_guardrailstable.find_many = AsyncMock(
++        return_value=[MOCK_DB_GUARDRAIL]
++    )
++    mock_client.db.litellm_guardrailstable.find_unique = AsyncMock(
++        return_value=MOCK_DB_GUARDRAIL
++    )
++    return mock_client
++
++
++@contextmanager
++def _patch_prisma_client(mock_client):
++    """Supply the database dependency used by the public guardrail endpoints."""
++    with patch("litellm.proxy.proxy_server.prisma_client", mock_client):
++        yield
++
++
++def _initialize_config_guardrail(tmp_path, monkeypatch, guardrail_name):
++    """Initialize a custom guardrail from a config-style declaration."""
++    import litellm
++
++    from litellm.proxy.guardrails.init_guardrails import init_guardrails_v2
++
++    module_name = "configured_custom_guardrail"
++    class_name = "ConfiguredCustomGuardrail"
++    (tmp_path / f"{module_name}.py").write_text(
++        "from litellm.integrations.custom_guardrail import CustomGuardrail\n"
++        f"class {class_name}(CustomGuardrail):\n"
++        "    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):\n"
++        "        data['custom_guardrail_applied'] = True\n"
++        "        return None\n"
++    )
++    guardrail = {
++        "guardrail_id": f"{guardrail_name}-{uuid.uuid4()}",
++        "guardrail_name": guardrail_name,
++        "guardrail_info": {"description": f"{guardrail_name} configured in proxy"},
++        "litellm_params": {
++            "guardrail": f"{module_name}.{class_name}",
++            "mode": "pre_call",
++        },
++    }
++    # Avoid leaking newly registered callbacks to other tests.
++    monkeypatch.setattr(litellm, "callbacks", [])
++    init_guardrails_v2(
++        [guardrail], config_file_path=str(tmp_path / "proxy_config.yaml")
++    )
++    return guardrail
++
++
++def test_list_guardrails_v2_with_db_and_config(tmp_path, monkeypatch):
++    """Guardrails declared in config are included alongside database entries."""
++    mock_prisma_client = _make_mock_prisma_client()
++    config_guardrail = _initialize_config_guardrail(
++        tmp_path, monkeypatch, "test-config-guardrail"
++    )
++
++    with _patch_prisma_client(mock_prisma_client):
++        response = asyncio.run(list_guardrails_v2())
++
++    listed_ids = {guardrail.guardrail_id for guardrail in response.guardrails}
++    assert "test-db-guardrail" in listed_ids
++    assert config_guardrail["guardrail_id"] in listed_ids
++
++    db_guardrail = next(
++        g for g in response.guardrails if g.guardrail_id == "test-db-guardrail"
++    )
++    assert db_guardrail.guardrail_name == "Test DB Guardrail"
++
++    listed_config_guardrail = next(
++        g
++        for g in response.guardrails
++        if g.guardrail_id == config_guardrail["guardrail_id"]
++    )
++    assert listed_config_guardrail.guardrail_name == "test-config-guardrail"
++
++
++def test_list_guardrails_v2_config_only(tmp_path, monkeypatch):
++    """Config guardrails are listed even when the DB has no guardrails."""
++    mock_prisma_client = _make_mock_prisma_client()
++    mock_prisma_client.db.litellm_guardrailstable.find_many = AsyncMock(
++        return_value=[]
++    )
++    config_guardrail = _initialize_config_guardrail(
++        tmp_path, monkeypatch, "test-config-only-guardrail"
++    )
++
++    with _patch_prisma_client(mock_prisma_client):
++        response = asyncio.run(list_guardrails_v2())
++
++    assert config_guardrail["guardrail_id"] in {
++        guardrail.guardrail_id for guardrail in response.guardrails
++    }
++
++
++def test_get_guardrail_info_from_db():
++    """Test getting guardrail info from DB."""
++    mock_prisma_client = _make_mock_prisma_client()
++
++    with _patch_prisma_client(mock_prisma_client):
++        response = asyncio.run(get_guardrail_info("test-db-guardrail"))
++
++    assert response.guardrail_id == "test-db-guardrail"
++    assert response.guardrail_name == "Test DB Guardrail"
++    assert response.guardrail_info == {"description": "Test guardrail from DB"}
++
++
++def test_get_guardrail_info_from_config(tmp_path, monkeypatch):
++    """Guardrail info can be retrieved for a guardrail declared in config."""
++    mock_prisma_client = _make_mock_prisma_client()
++    mock_prisma_client.db.litellm_guardrailstable.find_unique = AsyncMock(
++        return_value=None
++    )
++    config_guardrail = _initialize_config_guardrail(
++        tmp_path, monkeypatch, "test-config-info-guardrail"
++    )
++
++    with _patch_prisma_client(mock_prisma_client):
++        response = asyncio.run(get_guardrail_info(config_guardrail["guardrail_id"]))
++
++    assert response.guardrail_id == config_guardrail["guardrail_id"]
++    assert response.guardrail_name == "test-config-info-guardrail"
++
++
++def test_get_guardrail_info_not_found():
++    """Test getting guardrail info when not found in either source."""
++    mock_prisma_client = _make_mock_prisma_client()
++    mock_prisma_client.db.litellm_guardrailstable.find_unique = AsyncMock(
++        return_value=None
++    )
++
++    with _patch_prisma_client(mock_prisma_client):
++        with pytest.raises(HTTPException) as exc_info:
++            asyncio.run(get_guardrail_info("non-existent-guardrail"))
++
++    assert exc_info.value.status_code == 404
++
++
++def test_configured_custom_guardrail_runs_on_matching_request(tmp_path, monkeypatch):
++    """A custom config guardrail's behavior runs for a matching request."""
++    from litellm.proxy.utils import ProxyLogging
++
++    guardrail = _initialize_config_guardrail(
++        tmp_path, monkeypatch, "test-custom-behavior-guardrail"
++    )
++    request_data = {
++        "metadata": {"guardrails": [guardrail["guardrail_name"]]},
++        "messages": [{"role": "user", "content": "hello"}],
++    }
++    proxy_logging = ProxyLogging(user_api_key_cache=MagicMock())
++    result = asyncio.run(
++        proxy_logging.pre_call_hook(
++            user_api_key_dict=MagicMock(), data=request_data, call_type="completion"
++        )
++    )
++
++    assert result["custom_guardrail_applied"] is True

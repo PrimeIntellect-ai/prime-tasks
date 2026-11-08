@@ -1,0 +1,187 @@
+diff --git a/internal/switchboard/selector_test.go b/internal/switchboard/selector_test.go
+index ef5369b..fbe5c5e 100644
+--- a/internal/switchboard/selector_test.go
++++ b/internal/switchboard/selector_test.go
+@@ -1,13 +1,28 @@
+-package switchboard
++package switchboard_test
+ 
+ import (
++	"context"
+ 	"testing"
+ 
++	configv1 "github.com/borchero/switchboard/internal/config/v1"
++	"github.com/borchero/switchboard/internal/controllers"
++	"github.com/borchero/switchboard/internal/k8tests"
++	"github.com/borchero/switchboard/internal/switchboard"
++	certmanager "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	traefik "github.com/traefik/traefik/v2/pkg/provider/kubernetes/crd/traefik/v1alpha1"
++	"go.uber.org/zap"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/external-dns/endpoint"
+ )
+ 
+ func TestMatchesNoIngressClass(t *testing.T) {
+-	selector := NewSelector(nil)
++	selector := switchboard.NewSelector(nil)
+ 	assert.True(t, selector.Matches(map[string]string{}))
+ 	assert.True(t, selector.Matches(map[string]string{
+ 		"kubernetes.io/ingress.class": "test",
+@@ -23,7 +38,7 @@ func TestMatchesNoIngressClass(t *testing.T) {
+ 
+ func TestMatchesIngressClass(t *testing.T) {
+ 	cls := "ingress"
+-	selector := NewSelector(&cls)
++	selector := switchboard.NewSelector(&cls)
+ 	assert.False(t, selector.Matches(map[string]string{}))
+ 	assert.False(t, selector.Matches(map[string]string{
+ 		"kubernetes.io/ingress.class": "test",
+@@ -43,3 +58,142 @@ func TestMatchesIngressClass(t *testing.T) {
+ 		"switchboard.borchero.com/ignore": "true",
+ 	}))
+ }
++
++func TestMatchesIntegration(t *testing.T) {
++	cls := "ingress"
++	selector := switchboard.NewSelector(&cls)
++
++	// With no ignore annotation, the integration remains eligible.
++	assert.True(t, matchesIntegration(t, selector, map[string]string{}, "external-dns"))
++
++	// Ignore all
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "true",
++	}, "external-dns"))
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "all",
++	}, "external-dns"))
++
++	// Ignore only one
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns",
++	}, "external-dns"))
++	assert.True(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "cert-manager",
++	}, "external-dns"))
++
++	// Ignore multiple
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns,cert-manager",
++	}, "external-dns"))
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns,cert-manager",
++	}, "cert-manager"))
++	assert.True(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns,cert-manager",
++	}, "unknown"))
++
++	// Ignore with space in between
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns, cert-manager",
++	}, "external-dns"))
++	assert.False(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns, cert-manager",
++	}, "cert-manager"))
++	assert.True(t, matchesIntegration(t, selector, map[string]string{
++		"switchboard.borchero.com/ignore": "external-dns, cert-manager",
++	}, "unknown"))
++}
++
++func TestReconcileSkipsIgnoredIntegrationAndRunsOther(t *testing.T) {
++	ctx := context.Background()
++	ingress := &traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "site",
++			Namespace: "default",
++			Annotations: map[string]string{
++				"switchboard.borchero.com/ignore": "external-dns",
++			},
++		},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind:  "Rule",
++				Match: "Host(`site.example.com`)",
++			}},
++			TLS: &traefik.TLS{SecretName: "site-tls"},
++		},
++	}
++	scheme := k8tests.NewScheme()
++	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ingress).Build()
++	reconciler, err := controllers.NewIngressRouteReconciler(kubeClient, zap.NewNop(), configv1.Config{
++		Integrations: configv1.IntegrationConfigs{
++			ExternalDNS: &configv1.ExternalDNSIntegrationConfig{TargetIPs: []string{"192.0.2.1"}},
++			CertManager: &configv1.CertManagerIntegrationConfig{Template: certmanager.Certificate{}},
++		},
++	})
++	require.NoError(t, err)
++
++	_, err = reconciler.Reconcile(ctx, structRequest("default", "site"))
++	require.NoError(t, err)
++
++	certificate := &certmanager.Certificate{}
++	require.NoError(t, kubeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "site-tls"}, certificate))
++	dnsEndpoint := &endpoint.DNSEndpoint{}
++	err = kubeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "site"}, dnsEndpoint)
++	assert.True(t, apierrors.IsNotFound(err), "an ignored integration must not create its resource")
++}
++
++func TestReconcileSkipsCertManagerAndRunsExternalDNS(t *testing.T) {
++	ctx := context.Background()
++	ingress := &traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "site",
++			Namespace: "default",
++			Annotations: map[string]string{
++				"switchboard.borchero.com/ignore": "cert-manager",
++			},
++		},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind:  "Rule",
++				Match: "Host(`site.example.com`)",
++			}},
++			TLS: &traefik.TLS{SecretName: "site-tls"},
++		},
++	}
++	scheme := k8tests.NewScheme()
++	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ingress).Build()
++	reconciler, err := controllers.NewIngressRouteReconciler(kubeClient, zap.NewNop(), configv1.Config{
++		Integrations: configv1.IntegrationConfigs{
++			ExternalDNS: &configv1.ExternalDNSIntegrationConfig{TargetIPs: []string{"192.0.2.1"}},
++			CertManager: &configv1.CertManagerIntegrationConfig{Template: certmanager.Certificate{}},
++		},
++	})
++	require.NoError(t, err)
++
++	_, err = reconciler.Reconcile(ctx, structRequest("default", "site"))
++	require.NoError(t, err)
++
++	certificate := &certmanager.Certificate{}
++	err = kubeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "site-tls"}, certificate)
++	assert.True(t, apierrors.IsNotFound(err), "an ignored integration must not create its resource")
++	dnsEndpoint := &endpoint.DNSEndpoint{}
++	err = kubeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "site"}, dnsEndpoint)
++	assert.NoError(t, err, "an integration not named in the ignore annotation should create its resource")
++}
++
++func structRequest(namespace, name string) ctrl.Request {
++	return ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}
++}
++
++func matchesIntegration(t *testing.T, selector switchboard.Selector, annotations map[string]string, integration string) bool {
++	t.Helper()
++	type integrationMatcher interface {
++		MatchesIntegration(map[string]string, string) bool
++	}
++	matcher, ok := interface{}(selector).(integrationMatcher)
++	if !assert.True(t, ok, "selector must support per-integration matching") {
++		return false
++	}
++	return matcher.MatchesIntegration(annotations, integration)
++}

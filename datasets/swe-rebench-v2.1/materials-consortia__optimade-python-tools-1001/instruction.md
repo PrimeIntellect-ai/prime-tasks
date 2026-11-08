@@ -1,0 +1,2 @@
+`chemical_formula_anonymous` validator accepts incorrect proportion order if started with 1
+As reported by @JPBergsma in https://github.com/Materials-Consortia/optimade-python-tools/pull/1001#issue-1059491669, the `chemical_formula_anonymous` validator has an edge case that allows the wrong order of elements for certain compositions (those with only two different proportions, e.g. 1 and 4), if the first element has proportion 1, e.g. `"AB4"` does not raise an error as it should.

@@ -1,0 +1,112 @@
+diff --git a/tests/all/func.rs b/tests/all/func.rs
+index b33405689..951bcc7ad 100644
+--- a/tests/all/func.rs
++++ b/tests/all/func.rs
+@@ -1,5 +1,6 @@
+ use anyhow::Result;
+-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
++use std::sync::Arc;
+ use wasmtime::*;
+ 
+ #[test]
+@@ -578,3 +579,99 @@ fn typed_multiple_results() -> anyhow::Result<()> {
+     );
+     Ok(())
+ }
++
++#[test]
++fn trap_doesnt_leak() -> anyhow::Result<()> {
++    // The closure passed to `Func::wrap` must satisfy the public contract's
++    // `'static + Send` bound, so the canary it captures must be `Send` too.
++    struct Canary(Arc<AtomicBool>);
++
++    impl Drop for Canary {
++        fn drop(&mut self) {
++            self.0.store(true, SeqCst);
++        }
++    }
++
++    let store = Store::default();
++
++    // test that `Func::wrap` is correct
++    let canary1 = Canary(Arc::new(AtomicBool::new(false)));
++    let dtor1_run = canary1.0.clone();
++    let f1 = Func::wrap(&store, move || -> Result<(), Trap> {
++        drop(&canary1);
++        Err(Trap::new(""))
++    });
++    assert!(f1.typed::<(), ()>()?.call(()).is_err());
++    assert!(f1.call(&[]).is_err());
++
++    // test that `Func::new` is correct
++    let canary2 = Canary(Arc::new(AtomicBool::new(false)));
++    let dtor2_run = canary2.0.clone();
++    let f2 = Func::new(&store, FuncType::new(None, None), move |_, _, _| {
++        drop(&canary2);
++        Err(Trap::new(""))
++    });
++    assert!(f2.typed::<(), ()>()?.call(()).is_err());
++    assert!(f2.call(&[]).is_err());
++
++    // drop everything and ensure dtors are run
++    drop((store, f1, f2));
++    assert!(dtor1_run.load(SeqCst));
++    assert!(dtor2_run.load(SeqCst));
++    Ok(())
++}
++
++#[test]
++fn trap_doesnt_leak_instances() -> anyhow::Result<()> {
++    // Reproduces the scenario from the issue: a host function that traps is
++    // called from Wasm, and each iteration creates a fresh `Store`/instance
++    // with a grown memory. If the trap leaks the store (and therefore the
++    // host function's captured state), the canary is never dropped.
++    struct Canary(Arc<AtomicBool>);
++
++    impl Drop for Canary {
++        fn drop(&mut self) {
++            self.0.store(true, SeqCst);
++        }
++    }
++
++    let wat = r#"
++        (module
++            (import "" "" (func $host_hello))
++            (memory (export "memory") 0)
++            (func (export "hello") call $host_hello)
++        )
++    "#;
++
++    let mut canaries = Vec::new();
++    for _ in 0..4 {
++        let store = Store::default();
++        let module = Module::new(store.engine(), wat)?;
++
++        let canary = Canary(Arc::new(AtomicBool::new(false)));
++        let dtor_run = canary.0.clone();
++        let host_hello = Func::wrap(&store, move || -> Result<(), Trap> {
++            drop(&canary);
++            Err(Trap::new("it's a trap"))
++        });
++
++        let instance = Instance::new(&store, &module, &[host_hello.into()])?;
++
++        // Grow the memory so that any leaked per-instance allocation is
++        // meaningful, mirroring the original reproducer.
++        let mem = instance.get_memory("memory").unwrap();
++        mem.grow(10)?;
++
++        let hello = instance.get_typed_func::<(), ()>("hello")?;
++        assert!(hello.call(()).is_err());
++
++        // Dropping the store must release the host function's captured state.
++        drop((store, module, instance));
++        canaries.push(dtor_run);
++    }
++
++    for dtor_run in canaries {
++        assert!(dtor_run.load(SeqCst));
++    }
++    Ok(())
++}

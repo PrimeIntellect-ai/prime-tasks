@@ -1,0 +1,164 @@
+diff --git a/sql/analyzer/process_test.go b/sql/analyzer/process_test.go
+index 7a866b5..e53b3e3 100644
+--- a/sql/analyzer/process_test.go
++++ b/sql/analyzer/process_test.go
+@@ -2,6 +2,8 @@ package analyzer
+ 
+ import (
+ 	"context"
++	"fmt"
++	"io"
+ 	"testing"
+ 	"time"
+ 
+@@ -19,7 +21,7 @@ func TestTrackProcess(t *testing.T) {
+ 	a := NewDefault(catalog)
+ 
+ 	node := plan.NewInnerJoin(
+-		plan.NewResolvedTable(mem.NewPartitionedTable("foo", nil, 2)),
++		plan.NewResolvedTable(&table{mem.NewPartitionedTable("foo", nil, 2)}),
+ 		plan.NewResolvedTable(mem.NewPartitionedTable("bar", nil, 4)),
+ 		expression.NewLiteral(int64(1), sql.Int64),
+ 	)
+@@ -43,17 +45,7 @@ func TestTrackProcess(t *testing.T) {
+ 	proc, ok := result.(*plan.QueryProcess)
+ 	require.True(ok)
+ 
+-	join, ok := proc.Child.(*plan.InnerJoin)
+-	require.True(ok)
+-
+-	lhs, ok := join.Left.(*plan.ResolvedTable)
+-	require.True(ok)
+-	_, ok = lhs.Table.(*plan.ProcessTable)
+-	require.True(ok)
+-
+-	rhs, ok := join.Right.(*plan.ResolvedTable)
+-	require.True(ok)
+-	_, ok = rhs.Table.(*plan.ProcessTable)
++	_, ok = proc.Child.(*plan.InnerJoin)
+ 	require.True(ok)
+ 
+ 	iter, err := proc.RowIter(ctx)
+@@ -75,3 +67,122 @@ func withoutProcessTracking(a *Analyzer) *Analyzer {
+ 	afterAll.Rules = afterAll.Rules[1:]
+ 	return a
+ }
++
++// wrapper around sql.Table to make it not indexable
++type table struct {
++	sql.Table
++}
++
++var _ sql.PartitionCounter = (*table)(nil)
++
++func (t *table) PartitionCount(ctx *sql.Context) (int64, error) {
++	return t.Table.(sql.PartitionCounter).PartitionCount(ctx)
++}
++
++// progressIndex is a minimal sql.Index used by progressDriver.
++type progressIndex struct {
++	db, table, id string
++	exprs         []string
++}
++
++var _ sql.Index = (*progressIndex)(nil)
++
++func (i *progressIndex) ID() string            { return i.id }
++func (i *progressIndex) Database() string      { return i.db }
++func (i *progressIndex) Table() string         { return i.table }
++func (i *progressIndex) Expressions() []string { return i.exprs }
++func (i *progressIndex) Driver() string        { return "progress" }
++func (i *progressIndex) Get(...interface{}) (sql.IndexLookup, error) {
++	return nil, fmt.Errorf("not implemented")
++}
++func (i *progressIndex) Has(sql.Partition, ...interface{}) (bool, error) {
++	return false, fmt.Errorf("not implemented")
++}
++
++// progressDriver consumes every partition of an index being created and
++// calls onPartition each time one of them has been fully processed.
++type progressDriver struct {
++	onPartition func()
++}
++
++var _ sql.IndexDriver = (*progressDriver)(nil)
++
++func (*progressDriver) ID() string { return "progress" }
++func (*progressDriver) Create(db, table, id string, exprs []sql.Expression, config map[string]string) (sql.Index, error) {
++	names := make([]string, len(exprs))
++	for i, e := range exprs {
++		names[i] = e.String()
++	}
++	return &progressIndex{db, table, id, names}, nil
++}
++func (*progressDriver) LoadAll(db, table string) ([]sql.Index, error) {
++	return nil, nil
++}
++func (d *progressDriver) Save(ctx *sql.Context, index sql.Index, iter sql.PartitionIndexKeyValueIter) error {
++	defer iter.Close()
++	for {
++		_, keyValues, err := iter.Next()
++		if err == io.EOF {
++			return nil
++		}
++		if err != nil {
++			return err
++		}
++		for {
++			_, _, err := keyValues.Next()
++			if err == io.EOF {
++				break
++			}
++			if err != nil {
++				return err
++			}
++		}
++		d.onPartition()
++	}
++}
++func (*progressDriver) Delete(sql.Index, sql.PartitionIter) error {
++	return nil
++}
++
++func TestProcessTrackCreateIndexProgress(t *testing.T) {
++	require := require.New(t)
++	catalog := sql.NewCatalog()
++	analyzer := NewDefault(catalog)
++	table := mem.NewPartitionedTable("foo", sql.Schema{
++		{Name: "a", Type: sql.Int64, Source: "foo"},
++	}, 2)
++
++	ctx := sql.NewContext(context.Background(), sql.WithPid(1))
++	ctx, err := catalog.AddProcess(ctx, sql.CreateIndexProcess, "CREATE INDEX idx ON foo (a)")
++	require.NoError(err)
++	require.NoError(table.Insert(ctx, sql.NewRow(int64(1))))
++	require.NoError(table.Insert(ctx, sql.NewRow(int64(2))))
++
++	processed := 0
++	showProgress := func() {
++		processed++
++		show := plan.NewShowProcessList()
++		show.ProcessList = catalog.ProcessList
++		processIter, err := show.RowIter(ctx)
++		require.NoError(err)
++		rows, err := sql.RowIterToRows(processIter)
++		require.NoError(err)
++		require.Len(rows, 1)
++		require.Contains(rows[0][6].(string), fmt.Sprintf("foo(%d/2)", processed))
++	}
++
++	catalog.RegisterIndexDriver(&progressDriver{onPartition: showProgress})
++
++	createIndex := plan.NewCreateIndex("idx", plan.NewResolvedTable(table), []sql.Expression{
++		expression.NewGetFieldWithTable(0, sql.Int64, "foo", "a", true),
++	}, "progress", map[string]string{"async": "false"})
++	createIndex.Catalog = catalog
++	createIndex.CurrentDatabase = "foo"
++
++	tracked, err := getRuleFrom(OnceAfterAll, "track_process").Apply(ctx, analyzer, createIndex)
++	require.NoError(err)
++
++	_, err = tracked.RowIter(ctx)
++	require.NoError(err)
++	require.Equal(2, processed)
++}

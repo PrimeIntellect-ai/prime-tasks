@@ -1,0 +1,168 @@
+diff --git a/test/stub_account_info.py b/test/stub_account_info.py
+index e8b2347..0d469b2 100644
+--- a/test/stub_account_info.py
++++ b/test/stub_account_info.py
+@@ -34,6 +34,7 @@ class StubAccountInfo(AbstractAccountInfo):
+         self.download_url = None
+         self.minimum_part_size = None
+         self.realm = None
++        self.account_id_or_app_key_id = None
+         self._large_file_uploads = collections.defaultdict(list)
+         self._large_file_uploads_lock = threading.Lock()
+ 
+@@ -51,6 +52,7 @@ class StubAccountInfo(AbstractAccountInfo):
+         application_key,
+         realm,
+         allowed,
++        account_id_or_app_key_id,
+     ):
+         self.account_id = account_id
+         self.auth_token = auth_token
+@@ -60,6 +62,7 @@ class StubAccountInfo(AbstractAccountInfo):
+         self.application_key = application_key
+         self.realm = realm
+         self.allowed = allowed
++        self.account_id_or_app_key_id = account_id_or_app_key_id
+ 
+     def refresh_entire_bucket_name_cache(self, name_id_iterable):
+         self.buckets = {}
+@@ -82,6 +85,9 @@ class StubAccountInfo(AbstractAccountInfo):
+     def get_account_id(self):
+         return self.account_id
+ 
++    def get_account_id_or_app_key_id(self):
++        return self.account_id_or_app_key_id
++
+     def get_account_auth_token(self):
+         return self.auth_token
+ 
+diff --git a/test/test_account_info.py b/test/test_account_info.py
+index 923269c..90af9c9 100644
+--- a/test/test_account_info.py
++++ b/test/test_account_info.py
+@@ -24,6 +24,9 @@ from b2.account_info.abstract import AbstractAccountInfo
+ from b2.account_info.upload_url_pool import UploadUrlPool
+ from b2.account_info.exception import CorruptAccountInfo, MissingAccountData
+ from b2.account_info import InMemoryAccountInfo
++from b2.api import B2Api
++from b2.cache import DummyCache
++from b2.raw_simulator import RawSimulator
+ 
+ if not platform.system().lower().startswith('java'):
+     # in Jython 2.7.1b3 there is no sqlite3
+@@ -178,6 +181,20 @@ class AccountInfoBase(object):
+                 self._make_info().get_bucket_id_or_none_from_bucket_name('a')
+             )
+ 
++    def test_account_id_or_app_key_id(self):
++        account_info = self._make_info()
++        raw_api = RawSimulator()
++        api = B2Api(account_info, DummyCache(), raw_api)
++        account_id, master_key = raw_api.create_account()
++        api.authorize_account('production', account_id, master_key)
++        self.assertEqual(account_id, account_info.get_account_id_or_app_key_id())
++
++        key = api.create_key(['listBuckets'], 'key1')
++        api.authorize_account('production', key['applicationKeyId'], key['applicationKey'])
++        self.assertEqual(
++            key['applicationKeyId'], account_info.get_account_id_or_app_key_id()
++        )
++
+     def _test_account_info(self, check_persistence):
+         account_info = self._make_info()
+         account_info.set_auth_data(
+@@ -261,11 +278,48 @@ class TestSqliteAccountInfo(AccountInfoBase, TestBase):
+         account_info = self._make_info()
+         self.assertEqual('auth_token', account_info.get_account_auth_token())
+ 
++    def test_upgrade_1_preserves_account_id(self):
++        """
++        Authentication data written in the original schema remains readable after upgrade.
++        """
++        old_account_info = self._make_sqlite_account_info(last_upgrade_to_run=0)
++        old_account_info.set_auth_data_with_schema_0_for_test(
++            'account_id',
++            'auth_token',
++            'api_url',
++            'dowload_url',
++            100,  # minimum part size
++            'application_key',
++            'realm',
++        )
++        new_account_info = self._make_info()
++        self.assertEqual('account_id', new_account_info.get_account_id())
++
++    def test_upgrade_2_default_app_key(self):
++        """
++        The 'account_id_or_app_key_id' field should default to the account id.
++        """
++        old_account_info = self._make_sqlite_account_info(last_upgrade_to_run=0)
++        old_account_info.set_auth_data_with_schema_0_for_test(
++            'account_id',
++            'auth_token',
++            'api_url',
++            'dowload_url',
++            100,  # minimum part size
++            'application_key',
++            'realm',
++        )
++        new_account_info = self._make_info()
++        self.assertEqual('account_id', new_account_info.get_account_id_or_app_key_id())
++
+     def _make_info(self):
++        return self._make_sqlite_account_info()
++
++    def _make_sqlite_account_info(self, last_upgrade_to_run=None):
+         """
+         Returns a new StoredAccountInfo that has just read the data from the file.
+         """
+-        return SqliteAccountInfo(file_name=self.db_path)
++        return SqliteAccountInfo(file_name=self.db_path, last_upgrade_to_run=last_upgrade_to_run)
+ 
+     def test_account_info_persistence(self):
+         self._test_account_info(check_persistence=True)
+diff --git a/test/test_api.py b/test/test_api.py
+index f72c336..73cf226 100644
+--- a/test/test_api.py
++++ b/test/test_api.py
+@@ -12,7 +12,7 @@ from .test_base import TestBase
+ from b2.account_info import InMemoryAccountInfo
+ from b2.api import B2Api
+ from b2.cache import DummyCache
+-from b2.exception import RestrictedBucket
++from b2.exception import InvalidAuthToken, RestrictedBucket
+ from b2.raw_simulator import RawSimulator
+ 
+ 
+@@ -42,6 +42,31 @@ class TestApi(TestBase):
+             [b.name for b in self.api.list_buckets(bucket_name='bucket1')],
+         )
+ 
++    def test_reauthorize_with_app_key(self):
++        # authorize and create a key
++        self._authorize_account()
++        key = self.api.create_key(['listBuckets'], 'key1')
++
++        # authorize with the key
++        self.api.authorize_account('production', key['applicationKeyId'], key['applicationKey'])
++
++        # Expiry is observable on an operation that uses the issued token.
++        auth_token = self.account_info.get_account_auth_token()
++        self.raw_api.expire_auth_token(auth_token)
++        try:
++            self.raw_api.list_buckets(
++                self.account_info.get_api_url(),
++                auth_token,
++                self.account_info.get_account_id(),
++            )
++        except InvalidAuthToken as error:
++            self.assertEqual('auth_token_expired', error.code)
++        else:
++            self.fail('an expired authorization token must be rejected')
++
++        # The API client should reauthorize with the application key and continue.
++        self.api.list_buckets()
++
+     def test_list_buckets_with_restriction(self):
+         self._authorize_account()
+         bucket1 = self.api.create_bucket('bucket1', 'allPrivate')

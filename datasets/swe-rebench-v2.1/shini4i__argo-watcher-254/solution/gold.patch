@@ -1,0 +1,247 @@
+diff --git a/docs/git-integration.md b/docs/git-integration.md
+index b5c24b2..a6b4e35 100644
+--- a/docs/git-integration.md
++++ b/docs/git-integration.md
+@@ -58,6 +58,23 @@ argo-watcher/managed-images: "app=registry.example.com/group-name/project-name"
+ argo-watcher/app.helm.image-tag: "app.image.tag"
+ ```
+ 
++### Multi source Applications
++
++As ArgoCD now supports an array of sources, Argo-Watcher can also work with them. But in less dynamic way. You need to add more annotations to the application:
++
++```yaml
++argo-watcher/write-back-repo: "git@github.com:example/gitops.git"
++argo-watcher/write-back-branch: "main"
++argo-watcher/write-back-path: "sandbox/charts/demo"
++```
++
++Assuming that our application name is `Demo`, argo-watcher will create/update the following override file:
++```bash
++sandbox/charts/demo/.argocd-source-demo.yaml
++```
++
++> This is not an ideal solution, but so far it is the only way to reliably determine the correct override file to update.
++
+ ### Additional information
+ 
+ - The `app` alias is intended to correspond with an alias specified in the `argo-watcher/ALIAS.helm.image-tag` annotation.
+diff --git a/internal/models/argo.go b/internal/models/argo.go
+index f65aa3f..6830333 100644
+--- a/internal/models/argo.go
++++ b/internal/models/argo.go
+@@ -21,6 +21,9 @@ const (
+ 	managedAnnotation       = "argo-watcher/managed"
+ 	managedImagesAnnotation = "argo-watcher/managed-images"
+ 	managedImageTagPattern  = "argo-watcher/%s.helm.image-tag"
++	managedGitRepo          = "argo-watcher/write-back-repo"
++	managedGitBranch        = "argo-watcher/write-back-branch"
++	managedGitPath          = "argo-watcher/write-back-path"
+ )
+ 
+ type ApplicationOperationResource struct {
+@@ -45,36 +48,47 @@ type ApplicationResource struct {
+ }
+ 
+ type Application struct {
+-	Metadata struct {
+-		Name        string            `json:"name"`
+-		Annotations map[string]string `json:"annotations"`
++	Metadata ApplicationMetadata `json:"metadata"`
++	Spec     ApplicationSpec     `json:"spec"`
++	Status   ApplicationStatus   `json:"status"`
++}
++
++type ApplicationStatus struct {
++	Health struct {
++		Status string `json:"status"`
+ 	}
+-	Spec struct {
+-		Source struct {
+-			RepoURL        string `json:"repoURL"`
+-			TargetRevision string `json:"targetRevision"`
+-			Path           string `json:"path"`
+-		}
++	OperationState ApplicationStatusOperationState `json:"operationState"`
++	Resources      []ApplicationResource           `json:"resources"`
++	Summary        struct {
++		Images []string `json:"images"`
++	}
++	Sync struct {
++		Status string `json:"status"`
+ 	}
+-	Status struct {
+-		Health struct {
+-			Status string `json:"status"`
+-		}
+-		OperationState struct {
+-			Phase      string `json:"phase"`
+-			Message    string `json:"message"`
+-			SyncResult struct {
+-				Resources []ApplicationOperationResource `json:"resources"`
+-			} `json:"syncResult"`
+-		} `json:"operationState"`
+-		Resources []ApplicationResource `json:"resources"`
+-		Summary   struct {
+-			Images []string `json:"images"`
+-		}
+-		Sync struct {
+-			Status string `json:"status"`
+-		}
+-	} `json:"status"`
++}
++
++type ApplicationStatusOperationState struct {
++	Phase      string `json:"phase"`
++	Message    string `json:"message"`
++	SyncResult struct {
++		Resources []ApplicationOperationResource `json:"resources"`
++	} `json:"syncResult"`
++}
++
++type ApplicationMetadata struct {
++	Name        string            `json:"name"`
++	Annotations map[string]string `json:"annotations"`
++}
++
++type ApplicationSpec struct {
++	Source  ApplicationSource   `json:"source"`
++	Sources []ApplicationSource `json:"sources"`
++}
++
++type ApplicationSource struct {
++	RepoURL        string `json:"repoURL"`
++	TargetRevision string `json:"targetRevision"`
++	Path           string `json:"path"`
+ }
+ 
+ // GetRolloutStatus calculates application rollout status depending on the expected images and proxy configuration.
+@@ -203,7 +217,7 @@ func (app *Application) IsManagedByWatcher() bool {
+ 	return app.Metadata.Annotations[managedAnnotation] == "true"
+ }
+ 
+-func (app *Application) processAppAnnotations(annotations map[string]string, task *Task) (*updater.ArgoOverrideFile, error) {
++func (app *Application) generateOverrideFileContent(annotations map[string]string, task *Task) (*updater.ArgoOverrideFile, error) {
+ 	overrideFileContent := updater.ArgoOverrideFile{}
+ 	managedImages, err := extractManagedImages(annotations)
+ 	if err != nil {
+@@ -235,13 +249,18 @@ func (app *Application) processAppAnnotations(annotations map[string]string, tas
+ }
+ 
+ func (app *Application) UpdateGitImageTag(task *Task) error {
+-	if app.Spec.Source.Path == "" {
++	gitopsRepo, err := NewGitopsRepo(app)
++	if err != nil {
++		return err
++	}
++
++	if gitopsRepo.Path == "" {
+ 		log.Warn().Str("id", task.Id).Msgf("No path found for app %s, unsupported Application configuration", app.Metadata.Name)
+ 		// technically, unsupported Application configuration is not an error (or is it?)
+ 		return nil
+ 	}
+ 
+-	releaseOverrides, err := app.processAppAnnotations(app.Metadata.Annotations, task)
++	releaseOverrides, err := app.generateOverrideFileContent(app.Metadata.Annotations, task)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -252,9 +271,9 @@ func (app *Application) UpdateGitImageTag(task *Task) error {
+ 	}
+ 
+ 	git := updater.GitRepo{
+-		RepoURL:    app.Spec.Source.RepoURL,
+-		BranchName: app.Spec.Source.TargetRevision,
+-		Path:       app.Spec.Source.Path,
++		RepoURL:    gitopsRepo.RepoUrl,
++		BranchName: gitopsRepo.BranchName,
++		Path:       gitopsRepo.Path,
+ 
+ 		GitHandler: updater.GitClient{},
+ 	}
+diff --git a/internal/models/gitops.go b/internal/models/gitops.go
+new file mode 100644
+index 0000000..7ee356c
+--- /dev/null
++++ b/internal/models/gitops.go
+@@ -0,0 +1,46 @@
++package models
++
++import (
++	"fmt"
++
++	"github.com/go-playground/validator/v10"
++)
++
++type GitopsRepo struct {
++	RepoUrl    string `validate:"required"`
++	BranchName string `validate:"required"`
++	Path       string `validate:"required"`
++}
++
++func NewGitopsRepo(app *Application) (GitopsRepo, error) {
++	if app.Spec.Sources != nil {
++		return extractGitOverrides(app.Metadata.Annotations)
++	}
++	return GitopsRepo{
++		RepoUrl:    app.Spec.Source.RepoURL,
++		BranchName: app.Spec.Source.TargetRevision,
++		Path:       app.Spec.Source.Path,
++	}, nil
++}
++
++func extractGitOverrides(annotations map[string]string) (GitopsRepo, error) {
++	var gr GitopsRepo
++	fields := map[string]*string{
++		managedGitRepo:   &gr.RepoUrl,
++		managedGitBranch: &gr.BranchName,
++		managedGitPath:   &gr.Path,
++	}
++
++	for key, value := range annotations {
++		if field, ok := fields[key]; ok {
++			*field = value
++		}
++	}
++
++	validate := validator.New()
++	if err := validate.Struct(gr); err != nil {
++		return gr, fmt.Errorf("invalid gitops repo: %w", err)
++	}
++
++	return gr, nil
++}
+diff --git a/pkg/updater/interfaces.go b/pkg/updater/interfaces.go
+index 3283fc2..a62fb67 100644
+--- a/pkg/updater/interfaces.go
++++ b/pkg/updater/interfaces.go
+@@ -9,7 +9,7 @@ import (
+ 
+ type GitHandler interface {
+ 	Clone(s storage.Storer, worktree billy.Filesystem, o *git.CloneOptions) (*git.Repository, error)
+-	NewPublicKeysFromFile(user, path, passphrase string) (*ssh.PublicKeys, error)
++	AddSSHKey(user, path, passphrase string) (*ssh.PublicKeys, error)
+ }
+ 
+ type GitClient struct{}
+@@ -18,6 +18,6 @@ func (GitClient) Clone(s storage.Storer, worktree billy.Filesystem, o *git.Clone
+ 	return git.Clone(s, worktree, o)
+ }
+ 
+-func (GitClient) NewPublicKeysFromFile(user, path, passphrase string) (*ssh.PublicKeys, error) {
++func (GitClient) AddSSHKey(user, path, passphrase string) (*ssh.PublicKeys, error) {
+ 	return ssh.NewPublicKeysFromFile(user, path, passphrase)
+ }
+diff --git a/pkg/updater/updater.go b/pkg/updater/updater.go
+index 0d8751f..96b9070 100644
+--- a/pkg/updater/updater.go
++++ b/pkg/updater/updater.go
+@@ -52,7 +52,7 @@ func (repo *GitRepo) Clone() error {
+ 
+ 	repo.fs = memfs.New()
+ 
+-	if repo.sshAuth, err = repo.GitHandler.NewPublicKeysFromFile("git", sshKeyPath, sshKeyPass); err != nil {
++	if repo.sshAuth, err = repo.GitHandler.AddSSHKey("git", sshKeyPath, sshKeyPass); err != nil {
+ 		return err
+ 	}
+ 

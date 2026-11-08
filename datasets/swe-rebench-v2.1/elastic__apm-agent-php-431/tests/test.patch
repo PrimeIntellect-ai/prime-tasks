@@ -1,0 +1,289 @@
+diff --git a/tests/ElasticApmTests/UnitTests/DistributedTracingTest.php b/tests/ElasticApmTests/UnitTests/DistributedTracingTest.php
+index c096cd6..be4a388 100644
+--- a/tests/ElasticApmTests/UnitTests/DistributedTracingTest.php
++++ b/tests/ElasticApmTests/UnitTests/DistributedTracingTest.php
+@@ -27,8 +27,10 @@ namespace ElasticApmTests\UnitTests;
+ 
+ use Elastic\Apm\ElasticApm;
+ use Elastic\Apm\Impl\GlobalTracerHolder;
++use Elastic\Apm\TransactionInterface;
+ use ElasticApmTests\UnitTests\Util\MockEventSink;
+ use ElasticApmTests\UnitTests\Util\TracerUnitTestCaseBase;
++use ElasticApmTests\Util\ValidationUtil;
+ 
+ class DistributedTracingTest extends TracerUnitTestCaseBase
+ {
+@@ -85,10 +87,12 @@ class DistributedTracingTest extends TracerUnitTestCaseBase
+ 
+         // Assert
+ 
+-        $idToTx = $this->mockEventSink->idToTransaction();
++        $actualTxIds = array_keys($this->mockEventSink->idToTransaction());
++        self::assertTrue(sort(/* ref */ $actualTxIds));
++        self::assertCount(2, $actualTxIds);
+         $expectedTxIds = [$senderTransaction->getId(), $receiverTransaction->getId()];
+-        self::assertCount(2, $idToTx);
+-        self::assertEqualsCanonicalizing($expectedTxIds, array_keys($idToTx));
++        self::assertTrue(sort(/* ref */ $expectedTxIds));
++        self::assertEqualsCanonicalizing($expectedTxIds, $actualTxIds);
+         $idToSpan = $this->mockEventSink->idToSpan();
+         self::assertCount($isSentFromSpan ? 1 : 0, $idToSpan);
+         $expectedParentId = $isSentFromSpan ? $senderSpan->getId() : $senderTransaction->getId();
+@@ -203,4 +207,101 @@ class DistributedTracingTest extends TracerUnitTestCaseBase
+             self::assertEmpty($receiverEventSink->idToSpan());
+         }
+     }
++
++    public function testEnsureParentId(): void
++    {
++        foreach ([true, false] as $isTracerEnabled) {
++            foreach ([false, true] as $doesTxHaveParentAlready) {
++                $this->implEnsureParentId(
++                    $isTracerEnabled,
++                    $doesTxHaveParentAlready
++                );
++            }
++        }
++    }
++
++    public function implEnsureParentId(bool $isTracerEnabled, bool $doesTxHaveParentAlready): void
++    {
++        // Arrange
++
++        $webFrontEventSink = new MockEventSink();
++        $webFrontTracer = self::buildTracerForTests($webFrontEventSink)->withEnabled($isTracerEnabled)->build();
++        $backendServiceEventSink = new MockEventSink();
++        $backendServiceTracer = self::buildTracerForTests($backendServiceEventSink)
++                                    ->withEnabled($isTracerEnabled)
++                                    ->build();
++
++        // Act
++
++        /** @var ?TransactionInterface */
++        $webFrontTx = null;
++
++        /** @var ?string */
++        $distTracingData = null;
++
++        if ($doesTxHaveParentAlready) {
++            GlobalTracerHolder::set($webFrontTracer);
++            $webFrontTx = ElasticApm::beginCurrentTransaction('web front end TX', 'web front end TX type');
++            $distTracingData = ElasticApm::getSerializedCurrentDistributedTracingData();
++        }
++
++        GlobalTracerHolder::set($backendServiceTracer);
++        $backendServiceTx = ElasticApm::beginCurrentTransaction(
++            'backend service TX',
++            'backend service TX type',
++            /* timestamp: */ null,
++            $distTracingData
++        );
++        $backendServiceTx->ensureParentId();
++        $parentIdBeforeSecondCall = $backendServiceTx->getParentId();
++        $backendServiceTx->ensureParentId();
++        self::assertSame($parentIdBeforeSecondCall, $backendServiceTx->getParentId());
++        $backendServiceTx->end();
++
++        if ($webFrontTx !== null) {
++            GlobalTracerHolder::set($webFrontTracer);
++            $webFrontTx->end();
++        }
++
++        // Assert
++
++        self::assertEmpty($this->mockEventSink->idToTransaction());
++        self::assertEmpty($this->mockEventSink->idToSpan());
++
++        self::assertEmpty($webFrontEventSink->idToSpan());
++        self::assertEmpty($backendServiceEventSink->idToSpan());
++
++        if (!$isTracerEnabled) {
++            self::assertEmpty($webFrontEventSink->idToTransaction());
++            self::assertEmpty($backendServiceEventSink->idToTransaction());
++            return;
++        }
++
++        self::assertCount(1, $backendServiceEventSink->idToTransaction());
++        self::assertSame($backendServiceTx->getId(), $backendServiceEventSink->singleTransaction()->id);
++
++        self::assertSame(
++            $backendServiceTx->getParentId(),
++            $backendServiceEventSink->singleTransaction()->parentId
++        );
++
++        if ($doesTxHaveParentAlready) {
++            self::assertCount(1, $webFrontEventSink->idToTransaction());
++            self::assertNotNull($webFrontTx);
++            self::assertSame($webFrontTx->getId(), $webFrontEventSink->singleTransaction()->id);
++
++            self::assertSame(
++                $webFrontEventSink->singleTransaction()->id,
++                $backendServiceEventSink->singleTransaction()->parentId
++            );
++
++            self::assertSame($webFrontTx->getId(), $backendServiceTx->getParentId());
++        } else {
++            self::assertEmpty($webFrontEventSink->idToTransaction());
++
++            $generatedParentId = $backendServiceTx->getParentId();
++            self::assertNotNull($generatedParentId);
++            ValidationUtil::assertValidExecutionSegmentId($generatedParentId);
++        }
++    }
+ }
+diff --git a/tests/ElasticApmTests/UnitTests/Util/MockLogSink.php b/tests/ElasticApmTests/UnitTests/Util/MockLogSink.php
+new file mode 100644
+index 0000000..3f7b9cc
+--- /dev/null
++++ b/tests/ElasticApmTests/UnitTests/Util/MockLogSink.php
+@@ -0,0 +1,57 @@
++<?php
++
++/*
++ * Licensed to Elasticsearch B.V. under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch B.V. licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++declare(strict_types=1);
++
++namespace ElasticApmTests\UnitTests\Util;
++
++use Elastic\Apm\Impl\Log\SinkInterface;
++
++class MockLogSink implements SinkInterface
++{
++    /** @var MockLogSinkStatement[] */
++    public $consumed = [];
++
++    /** @inheritDoc */
++    public function consume(
++        int $statementLevel,
++        string $message,
++        array $contextsStack,
++        string $category,
++        string $srcCodeFile,
++        int $srcCodeLine,
++        string $srcCodeFunc,
++        ?bool $includeStacktrace,
++        int $numberOfStackFramesToSkip
++    ): void {
++        $this->consumed[] = new MockLogSinkStatement(
++            $statementLevel,
++            $message,
++            $contextsStack,
++            $category,
++            $srcCodeFile,
++            $srcCodeLine,
++            $srcCodeFunc,
++            $includeStacktrace,
++            $numberOfStackFramesToSkip
++        );
++    }
++}
+diff --git a/tests/ElasticApmTests/UnitTests/Util/MockLogSinkStatement.php b/tests/ElasticApmTests/UnitTests/Util/MockLogSinkStatement.php
+new file mode 100644
+index 0000000..3b147ba
+--- /dev/null
++++ b/tests/ElasticApmTests/UnitTests/Util/MockLogSinkStatement.php
+@@ -0,0 +1,87 @@
++<?php
++
++/*
++ * Licensed to Elasticsearch B.V. under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch B.V. licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++declare(strict_types=1);
++
++namespace ElasticApmTests\UnitTests\Util;
++
++class MockLogSinkStatement
++{
++    /** @var int */
++    public $statementLevel;
++
++    /** @var string */
++    public $message;
++
++    /** @var array<string, mixed>[] */
++    public $contextsStack;
++
++    /** @var string */
++    public $category;
++
++    /** @var string */
++    public $srcCodeFile;
++
++    /** @var int */
++    public $srcCodeLine;
++
++    /** @var string */
++    public $srcCodeFunc;
++
++    /** @var ?bool */
++    public $includeStacktrace;
++
++    /** @var int */
++    public $numberOfStackFramesToSkip;
++
++    /**
++     * @param int                    $statementLevel
++     * @param string                 $message
++     * @param array<string, mixed>[] $contextsStack
++     * @param string                 $category
++     * @param string                 $srcCodeFile
++     * @param int                    $srcCodeLine
++     * @param string                 $srcCodeFunc
++     * @param bool|null              $includeStacktrace
++     * @param int                    $numberOfStackFramesToSkip
++     */
++    public function __construct(
++        int $statementLevel,
++        string $message,
++        array $contextsStack,
++        string $category,
++        string $srcCodeFile,
++        int $srcCodeLine,
++        string $srcCodeFunc,
++        ?bool $includeStacktrace,
++        int $numberOfStackFramesToSkip
++    ) {
++        $this->statementLevel = $statementLevel;
++        $this->message = $message;
++        $this->contextsStack = $contextsStack;
++        $this->category = $category;
++        $this->srcCodeFile = $srcCodeFile;
++        $this->srcCodeLine = $srcCodeLine;
++        $this->srcCodeFunc = $srcCodeFunc;
++        $this->includeStacktrace = $includeStacktrace;
++        $this->numberOfStackFramesToSkip = $numberOfStackFramesToSkip;
++    }
++}

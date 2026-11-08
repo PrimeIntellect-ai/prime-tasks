@@ -1,0 +1,501 @@
+diff --git a/numbat/src/ast.rs b/numbat/src/ast.rs
+index a30baaa..fb52e87 100644
+--- a/numbat/src/ast.rs
++++ b/numbat/src/ast.rs
+@@ -70,6 +70,7 @@ pub enum Expression {
+     Scalar(Span, Number),
+     Identifier(Span, String),
+     UnitIdentifier(Span, Prefix, String, String),
++    TypedHole(Span),
+     UnaryOperator {
+         op: UnaryOperator,
+         expr: Box<Expression>,
+@@ -127,6 +128,7 @@ impl Expression {
+             Expression::InstantiateStruct { full_span, .. } => *full_span,
+             Expression::AccessField(full_span, _ident_span, _, _) => *full_span,
+             Expression::List(span, _) => *span,
++            Expression::TypedHole(span) => *span,
+         }
+     }
+ }
+@@ -567,6 +569,7 @@ impl ReplaceSpans for Expression {
+                 Span::dummy(),
+                 elements.iter().map(|e| e.replace_spans()).collect(),
+             ),
++            Expression::TypedHole(_) => Expression::TypedHole(Span::dummy()),
+         }
+     }
+ }
+diff --git a/numbat/src/bytecode_interpreter.rs b/numbat/src/bytecode_interpreter.rs
+index 22b044c..aa7b11d 100644
+--- a/numbat/src/bytecode_interpreter.rs
++++ b/numbat/src/bytecode_interpreter.rs
+@@ -260,6 +260,9 @@ impl BytecodeInterpreter {
+ 
+                 self.vm.add_op1(Op::BuildList, elements.len() as u16);
+             }
++            Expression::TypedHole(_, _) => {
++                unreachable!("Typed holes cause type inference errors")
++            }
+         };
+ 
+         Ok(())
+@@ -285,6 +288,7 @@ impl BytecodeInterpreter {
+             Expression::BinaryOperator(..) | Expression::BinaryOperatorForDate(..) => {
+                 self.vm.add_op(Op::FullSimplify);
+             }
++            Expression::TypedHole(_, _) => unreachable!("Typed holes cause type inference errors"),
+         }
+ 
+         Ok(())
+diff --git a/numbat/src/diagnostic.rs b/numbat/src/diagnostic.rs
+index 65d03b5..6e0fbb9 100644
+--- a/numbat/src/diagnostic.rs
++++ b/numbat/src/diagnostic.rs
+@@ -337,10 +337,10 @@ impl ErrorDiagnostic for TypeCheckError {
+             | TypeCheckError::ExpectedBool(span)
+             | TypeCheckError::NoFunctionReferenceToGenericFunction(span)
+             | TypeCheckError::OnlyFunctionsAndReferencesCanBeCalled(span)
+-            | TypeCheckError::DerivedUnitDefinitionMustNotBeGeneric(span) => d
+-                .with_labels(vec![span
+-                    .diagnostic_label(LabelStyle::Primary)
+-                    .with_message(inner_error)]),
++            | TypeCheckError::DerivedUnitDefinitionMustNotBeGeneric(span)
++            | TypeCheckError::MultipleTypedHoles(span) => d.with_labels(vec![span
++                .diagnostic_label(LabelStyle::Primary)
++                .with_message(inner_error)]),
+             TypeCheckError::MissingDimension(span, dim) => d
+                 .with_labels(vec![span
+                     .diagnostic_label(LabelStyle::Primary)
+@@ -473,6 +473,15 @@ impl ErrorDiagnostic for TypeCheckError {
+             TypeCheckError::ExponentiationNeedsTypeAnnotation(span) => d.with_labels(vec![span
+                 .diagnostic_label(LabelStyle::Primary)
+                 .with_message(inner_error)]),
++            TypeCheckError::TypedHoleInStatement(span, type_, statement) => d
++                .with_labels(vec![span
++                    .diagnostic_label(LabelStyle::Primary)
++                    .with_message(type_)])
++                .with_message("Found typed hole")
++                .with_notes(vec![
++                    format!("Found a hole of type '{type_}' in the statement:"),
++                    format!("  {statement}"),
++                ]),
+         };
+         vec![d]
+     }
+diff --git a/numbat/src/parser.rs b/numbat/src/parser.rs
+index 1e9c5b4..470f6d1 100644
+--- a/numbat/src/parser.rs
++++ b/numbat/src/parser.rs
+@@ -41,7 +41,7 @@
+ //! unicode_power   ::=   call ( "⁻" ? ( "¹" | "²" | "³" | "⁴" | "⁵" | "⁶" | "⁷" | "⁸" | "⁹" ) ) ?
+ //! call            ::=   primary ( ( "(" arguments? ")" ) | "." identifier ) *
+ //! arguments       ::=   expression ( "," expression ) *
+-//! primary         ::=   boolean | string | hex_number | oct_number | bin_number | number | identifier ( struct_expr ? ) | list_expr | "(" expression ")"
++//! primary         ::=   boolean | string | hex_number | oct_number | bin_number | number | identifier ( struct_expr ? ) | typed_hole | list_expr | "(" expression ")"
+ //! struct_expr     ::=   "{" ( identifier ":" type_annotation "," )* ( identifier ":" expression "," ? ) ? "}"
+ //! list_expr       ::=   "[]" | "[" expression ( "," expression ) * "]"
+ //!
+@@ -53,6 +53,7 @@
+ //! identifier      ::=   identifier_s identifier_c*
+ //! identifier_s    ::=   Unicode_XID_Start | Unicode_Currency | "%" | "°" | "_"
+ //! identifier_c    ::=   Unicode_XID_Continue | Unicode_Currency  | "%"
++//! typed_hole      ::=   "?"
+ //! boolean         ::=   "true" | "false"
+ //! plus            ::=   "+"
+ //! minus           ::=   "-"
+@@ -1199,7 +1200,7 @@ impl<'a> Parser<'a> {
+     }
+ 
+     fn primary(&mut self) -> Result<Expression> {
+-        // This function needs to be kept in sync with `next_token_could_start_primary` below.
++        // This function needs to be kept in sync with `next_token_could_start_power_expression` below.
+ 
+         let overflow_error = |span| {
+             Err(ParseError::new(
+@@ -1241,13 +1242,13 @@ impl<'a> Parser<'a> {
+                         .or_else(|_| overflow_error(span))? as f64, // TODO: i128 limits our precision here
+                 ),
+             ))
+-        } else if let Some(_) = self.match_exact(TokenKind::NaN) {
++        } else if self.match_exact(TokenKind::NaN).is_some() {
+             let span = self.last().unwrap().span;
+             Ok(Expression::Scalar(span, Number::from_f64(f64::NAN)))
+-        } else if let Some(_) = self.match_exact(TokenKind::Inf) {
++        } else if self.match_exact(TokenKind::Inf).is_some() {
+             let span = self.last().unwrap().span;
+             Ok(Expression::Scalar(span, Number::from_f64(f64::INFINITY)))
+-        } else if let Some(_) = self.match_exact(TokenKind::LeftBracket) {
++        } else if self.match_exact(TokenKind::LeftBracket).is_some() {
+             let span = self.last().unwrap().span;
+ 
+             let mut elements = vec![];
+@@ -1267,6 +1268,9 @@ impl<'a> Parser<'a> {
+             }
+ 
+             Ok(Expression::List(span, elements))
++        } else if self.match_exact(TokenKind::QuestionMark).is_some() {
++            let span = self.last().unwrap().span;
++            Ok(Expression::TypedHole(span))
+         } else if let Some(identifier) = self.match_exact(TokenKind::Identifier) {
+             let span = self.last().unwrap().span;
+ 
+@@ -1422,7 +1426,10 @@ impl<'a> Parser<'a> {
+ 
+         matches!(
+             self.peek().kind,
+-            TokenKind::Number | TokenKind::Identifier | TokenKind::LeftParen
++            TokenKind::Number
++                | TokenKind::Identifier
++                | TokenKind::LeftParen
++                | TokenKind::QuestionMark
+         )
+     }
+ 
+diff --git a/numbat/src/prefix_transformer.rs b/numbat/src/prefix_transformer.rs
+index 5d8a92f..c7b4ea1 100644
+--- a/numbat/src/prefix_transformer.rs
++++ b/numbat/src/prefix_transformer.rs
+@@ -124,6 +124,7 @@ impl Transformer {
+                     .map(|e| self.transform_expression(e))
+                     .collect(),
+             ),
++            hole @ Expression::TypedHole(_) => hole,
+         }
+     }
+ 
+diff --git a/numbat/src/tokenizer.rs b/numbat/src/tokenizer.rs
+index 677cfbe..d8f4e49 100644
+--- a/numbat/src/tokenizer.rs
++++ b/numbat/src/tokenizer.rs
+@@ -82,6 +82,7 @@ pub enum TokenKind {
+     LogicalAnd,
+     LogicalOr,
+     Period,
++    QuestionMark,
+ 
+     // Keywords
+     Per,
+@@ -420,6 +421,7 @@ impl Tokenizer {
+             '≥' => TokenKind::GreaterOrEqual,
+             '>' if self.match_char('=') => TokenKind::GreaterOrEqual,
+             '>' => TokenKind::GreaterThan,
++            '?' => TokenKind::QuestionMark,
+             '0' if self
+                 .peek()
+                 .map(|c| c == 'x' || c == 'o' || c == 'b')
+diff --git a/numbat/src/traversal.rs b/numbat/src/traversal.rs
+index 401b9f2..313d31c 100644
+--- a/numbat/src/traversal.rs
++++ b/numbat/src/traversal.rs
+@@ -68,6 +68,9 @@ impl ForAllTypeSchemes for Expression {
+                 }
+                 f(type_);
+             }
++            Expression::TypedHole(_, type_) => {
++                f(type_);
++            }
+         }
+     }
+ }
+@@ -103,3 +106,82 @@ impl ForAllTypeSchemes for Statement {
+         }
+     }
+ }
++
++pub trait ForAllExpressions {
++    fn for_all_expressions(&self, f: &mut dyn FnMut(&Expression));
++}
++
++impl ForAllExpressions for Statement {
++    fn for_all_expressions(&self, f: &mut dyn FnMut(&Expression)) {
++        match self {
++            Statement::Expression(expr) => expr.for_all_expressions(f),
++            Statement::DefineVariable(_, _, expr, _, _) => expr.for_all_expressions(f),
++            Statement::DefineFunction(_, _, _, _, body, _) => {
++                if let Some(body) = body {
++                    body.for_all_expressions(f);
++                }
++            }
++            Statement::DefineDimension(_, _) => {}
++            Statement::DefineBaseUnit(_, _, _, _) => {}
++            Statement::DefineDerivedUnit(_, expr, _, _, _) => expr.for_all_expressions(f),
++            Statement::ProcedureCall(_, args) => {
++                for arg in args {
++                    arg.for_all_expressions(f);
++                }
++            }
++            Statement::DefineStruct(_) => {}
++        }
++    }
++}
++
++impl ForAllExpressions for Expression {
++    fn for_all_expressions(&self, f: &mut dyn FnMut(&Expression)) {
++        f(self);
++        match self {
++            Expression::Scalar(_, _, _) => {}
++            Expression::Identifier(_, _, _) => {}
++            Expression::UnitIdentifier(_, _, _, _, _) => {}
++            Expression::UnaryOperator(_, _, expr, _) => expr.for_all_expressions(f),
++            Expression::BinaryOperator(_, _, lhs, rhs, _) => {
++                lhs.for_all_expressions(f);
++                rhs.for_all_expressions(f);
++            }
++            Expression::BinaryOperatorForDate(_, _, lhs, rhs, _) => {
++                lhs.for_all_expressions(f);
++                rhs.for_all_expressions(f);
++            }
++            Expression::FunctionCall(_, _, _, args, _) => {
++                for arg in args {
++                    arg.for_all_expressions(f);
++                }
++            }
++            Expression::CallableCall(_, callable, args, _) => {
++                callable.for_all_expressions(f);
++                for arg in args {
++                    arg.for_all_expressions(f);
++                }
++            }
++            Expression::Boolean(_, _) => {}
++            Expression::Condition(_, if_, then_, else_) => {
++                if_.for_all_expressions(f);
++                then_.for_all_expressions(f);
++                else_.for_all_expressions(f);
++            }
++            Expression::String(_, _) => {}
++            Expression::InstantiateStruct(_, initializers, _) => {
++                for (_, expr) in initializers {
++                    expr.for_all_expressions(f);
++                }
++            }
++            Expression::AccessField(_, _, expr, _, _, _) => {
++                expr.for_all_expressions(f);
++            }
++            Expression::List(_, elements, _) => {
++                for element in elements {
++                    element.for_all_expressions(f);
++                }
++            }
++            Expression::TypedHole(_, _) => {}
++        }
++    }
++}
+diff --git a/numbat/src/typechecker/const_evaluation.rs b/numbat/src/typechecker/const_evaluation.rs
+index 37d8bb4..e57a49c 100644
+--- a/numbat/src/typechecker/const_evaluation.rs
++++ b/numbat/src/typechecker/const_evaluation.rs
+@@ -122,5 +122,8 @@ pub fn evaluate_const_expr(expr: &typed_ast::Expression) -> Result<Exponent> {
+         e @ typed_ast::Expression::List(_, _, _) => Err(
+             TypeCheckError::UnsupportedConstEvalExpression(e.full_span(), "lists"),
+         ),
++        e @ typed_ast::Expression::TypedHole(_, _) => Err(
++            TypeCheckError::UnsupportedConstEvalExpression(e.full_span(), "typed hole"),
++        ),
+     }
+ }
+diff --git a/numbat/src/typechecker/error.rs b/numbat/src/typechecker/error.rs
+index 59ed888..e49918e 100644
+--- a/numbat/src/typechecker/error.rs
++++ b/numbat/src/typechecker/error.rs
+@@ -148,6 +148,12 @@ pub enum TypeCheckError {
+ 
+     #[error("Derived unit definitions may not contain generic types. Use a variable instead")]
+     DerivedUnitDefinitionMustNotBeGeneric(Span),
++
++    #[error("Typed hole")]
++    TypedHoleInStatement(Span, String, String),
++
++    #[error("Multiple typed holes in statement")]
++    MultipleTypedHoles(Span),
+ }
+ 
+ pub type Result<T> = std::result::Result<T, TypeCheckError>;
+diff --git a/numbat/src/typechecker/mod.rs b/numbat/src/typechecker/mod.rs
+index 8aa39d5..9d4da92 100644
+--- a/numbat/src/typechecker/mod.rs
++++ b/numbat/src/typechecker/mod.rs
+@@ -1043,6 +1043,10 @@ impl TypeChecker {
+                     TypeScheme::concrete(result_element_type),
+                 )
+             }
++            ast::Expression::TypedHole(span) => {
++                let type_ = self.fresh_type_variable();
++                typed_ast::Expression::TypedHole(*span, TypeScheme::concrete(type_))
++            }
+         })
+     }
+ 
+@@ -1657,8 +1661,8 @@ impl TypeChecker {
+         self.registry.introduced_type_parameters.clear();
+ 
+         // Elaborate the program/statement: turn the AST into a typed AST, possibly
+-        // with "holes" inside, i.e. type variables that will only later be filled
+-        // in (after constraint solving).
++        // with unification variables, i.e. type variables that will only later be
++        // filled in after the constraints have been solved.
+         let mut elaborated_statement = self.elaborate_statement(&statement)?;
+ 
+         // Solve constraints
+@@ -1740,6 +1744,15 @@ impl TypeChecker {
+         elaborated_statement.generalize_types(&dtype_variables);
+         self.env.generalize_types(&dtype_variables);
+ 
++        // Check if there is a typed hole in the statement
++        if let Some((span, type_of_hole)) = elaborated_statement.find_typed_hole()? {
++            return Err(TypeCheckError::TypedHoleInStatement(
++                span,
++                type_of_hole.to_readable_type(&self.registry).to_string(),
++                elaborated_statement.pretty_print().to_string(),
++            ));
++        }
++
+         Ok(elaborated_statement)
+     }
+ 
+diff --git a/numbat/src/typechecker/qualified_type.rs b/numbat/src/typechecker/qualified_type.rs
+index 8125fe9..6fbca36 100644
+--- a/numbat/src/typechecker/qualified_type.rs
++++ b/numbat/src/typechecker/qualified_type.rs
+@@ -6,12 +6,12 @@ use super::{
+ };
+ 
+ /// A predicate on type variables.
+-#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum Bound {
+     IsDim(Type),
+ }
+ 
+-#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct Bounds(Vec<Bound>);
+ 
+ impl Bounds {
+@@ -57,7 +57,7 @@ impl FromIterator<Bound> for Bounds {
+ /// For example, the type of the square-function (D -> D^2), needs an
+ /// additional `D: Dim` bound, as arbitrary types (like Bool) can not
+ /// be squared.
+-#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct QualifiedType {
+     pub inner: Type,
+     pub bounds: Bounds,
+diff --git a/numbat/src/typechecker/substitutions.rs b/numbat/src/typechecker/substitutions.rs
+index ed5d67e..4e4db48 100644
+--- a/numbat/src/typechecker/substitutions.rs
++++ b/numbat/src/typechecker/substitutions.rs
+@@ -205,6 +205,7 @@ impl ApplySubstitution for Expression {
+                 }
+                 element_type.apply(s)
+             }
++            Expression::TypedHole(_, type_) => type_.apply(s),
+         }
+     }
+ }
+diff --git a/numbat/src/typechecker/type_scheme.rs b/numbat/src/typechecker/type_scheme.rs
+index c084e2e..f579e49 100644
+--- a/numbat/src/typechecker/type_scheme.rs
++++ b/numbat/src/typechecker/type_scheme.rs
+@@ -15,7 +15,7 @@ use crate::typed_ast::Type;
+ ///
+ /// Type schemes can be created by calling .quantify() on a qualified
+ /// type.
+-#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum TypeScheme {
+     Concrete(Type),
+     Quantified(usize, QualifiedType),
+diff --git a/numbat/src/typed_ast.rs b/numbat/src/typed_ast.rs
+index 6cd2678..890ee25 100644
+--- a/numbat/src/typed_ast.rs
++++ b/numbat/src/typed_ast.rs
+@@ -5,9 +5,10 @@ use crate::arithmetic::Exponent;
+ pub use crate::ast::{BinaryOperator, TypeExpression, UnaryOperator};
+ use crate::ast::{ProcedureKind, TypeAnnotation, TypeParameterBound};
+ use crate::dimension::DimensionRegistry;
+-use crate::traversal::ForAllTypeSchemes;
++use crate::traversal::{ForAllExpressions, ForAllTypeSchemes};
+ use crate::type_variable::TypeVariable;
+ use crate::typechecker::type_scheme::TypeScheme;
++use crate::typechecker::TypeCheckError;
+ use crate::{
+     decorator::Decorator, markup::Markup, number::Number, prefix::Prefix,
+     prefix_parser::AcceptsPrefix, pretty_print::PrettyPrint, span::Span,
+@@ -519,6 +520,7 @@ pub enum Expression {
+     InstantiateStruct(Span, Vec<(String, Expression)>, StructInfo),
+     AccessField(Span, Span, Box<Expression>, String, StructInfo, TypeScheme),
+     List(Span, Vec<Expression>, TypeScheme),
++    TypedHole(Span, TypeScheme),
+ }
+ 
+ impl Expression {
+@@ -552,6 +554,7 @@ impl Expression {
+             Expression::InstantiateStruct(span, _, _) => *span,
+             Expression::AccessField(_span, full_span, _, _, _, _) => *full_span,
+             Expression::List(full_span, _, _) => *full_span,
++            Expression::TypedHole(span, _) => *span,
+         }
+     }
+ }
+@@ -621,6 +624,26 @@ impl Statement {
+         );
+         exponents
+     }
++
++    pub(crate) fn find_typed_hole(&self) -> Result<Option<(Span, TypeScheme)>, TypeCheckError> {
++        let mut hole = None;
++        let mut found_multiple_holes = false;
++        self.for_all_expressions(&mut |expr| match expr {
++            Expression::TypedHole(span, type_) => {
++                if hole.is_some() {
++                    found_multiple_holes = true;
++                }
++                hole = Some((*span, type_.clone()))
++            }
++            _ => {}
++        });
++
++        if found_multiple_holes {
++            return Err(TypeCheckError::MultipleTypedHoles(hole.unwrap().0));
++        } else {
++            Ok(hole)
++        }
++    }
+ }
+ 
+ impl Expression {
+@@ -642,6 +665,7 @@ impl Expression {
+             Expression::List(_, _, element_type) => {
+                 Type::List(Box::new(element_type.unsafe_as_concrete()))
+             }
++            Expression::TypedHole(_, type_) => type_.unsafe_as_concrete(),
+         }
+     }
+ 
+@@ -672,6 +696,7 @@ impl Expression {
+                     },
+                 ),
+             },
++            Expression::TypedHole(_, type_) => type_.clone(),
+         }
+     }
+ }
+@@ -924,7 +949,8 @@ fn with_parens(expr: &Expression) -> Markup {
+         | Expression::String(..)
+         | Expression::InstantiateStruct(..)
+         | Expression::AccessField(..)
+-        | Expression::List(..) => expr.pretty_print(),
++        | Expression::List(..)
++        | Expression::TypedHole(_, _) => expr.pretty_print(),
+         Expression::UnaryOperator { .. }
+         | Expression::BinaryOperator { .. }
+         | Expression::BinaryOperatorForDate { .. }
+@@ -1137,6 +1163,7 @@ impl PrettyPrint for Expression {
+                     .sum()
+                     + m::operator("]")
+             }
++            TypedHole(_, _) => m::operator("?"),
+         }
+     }
+ }

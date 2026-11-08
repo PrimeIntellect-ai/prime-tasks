@@ -1,0 +1,106 @@
+diff --git a/pkg/networking/security_group_reconciler_test.go b/pkg/networking/security_group_reconciler_test.go
+new file mode 100644
+index 0000000..7518355
+--- /dev/null
++++ b/pkg/networking/security_group_reconciler_test.go
+@@ -0,0 +1,100 @@
++package networking
++
++import (
++	"context"
++	"testing"
++
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/awserr"
++	ec2sdk "github.com/aws/aws-sdk-go/service/ec2"
++	"github.com/golang/mock/gomock"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	mock_services "sigs.k8s.io/aws-load-balancer-controller/mocks/aws/services"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++)
++
++func Test_defaultSecurityGroupReconciler_ReconcileIngress_ruleAlreadyPresent(t *testing.T) {
++	const sgID = "sg-1"
++	ctx := context.Background()
++	newRule := func() ec2sdk.IpPermission {
++		return ec2sdk.IpPermission{
++			IpProtocol: aws.String("tcp"),
++			FromPort:   aws.Int64(8080),
++			ToPort:     aws.Int64(8080),
++			IpRanges:   []*ec2sdk.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
++		}
++	}
++
++	t.Run("rule added out-of-band after the security group info was cached", func(t *testing.T) {
++		// awsRules models the rules that currently exist on the security group in AWS.
++		var awsRules []*ec2sdk.IpPermission
++		ruleExists := func(rule *ec2sdk.IpPermission) bool {
++			for _, existing := range awsRules {
++				if aws.StringValue(existing.IpProtocol) == aws.StringValue(rule.IpProtocol) &&
++					aws.Int64Value(existing.FromPort) == aws.Int64Value(rule.FromPort) &&
++					aws.Int64Value(existing.ToPort) == aws.Int64Value(rule.ToPort) &&
++					len(existing.IpRanges) == 1 && len(rule.IpRanges) == 1 &&
++					aws.StringValue(existing.IpRanges[0].CidrIp) == aws.StringValue(rule.IpRanges[0].CidrIp) {
++					return true
++				}
++			}
++			return false
++		}
++
++		ctrl := gomock.NewController(t)
++		defer ctrl.Finish()
++		ec2Client := mock_services.NewMockEC2(ctrl)
++		ec2Client.EXPECT().DescribeSecurityGroupsAsList(gomock.Any(), gomock.Any()).DoAndReturn(
++			func(_ context.Context, _ *ec2sdk.DescribeSecurityGroupsInput) ([]*ec2sdk.SecurityGroup, error) {
++				var permissions []*ec2sdk.IpPermission
++				for _, p := range awsRules {
++					copied := *p
++					permissions = append(permissions, &copied)
++				}
++				return []*ec2sdk.SecurityGroup{{GroupId: aws.String(sgID), IpPermissions: permissions}}, nil
++			}).AnyTimes()
++		ec2Client.EXPECT().AuthorizeSecurityGroupIngressWithContext(gomock.Any(), gomock.Any()).DoAndReturn(
++			func(_ context.Context, input *ec2sdk.AuthorizeSecurityGroupIngressInput) (*ec2sdk.AuthorizeSecurityGroupIngressOutput, error) {
++				for _, p := range input.IpPermissions {
++					if ruleExists(p) {
++						return nil, awserr.New("InvalidPermission.Duplicate", "the specified rule already exists", nil)
++					}
++					awsRules = append(awsRules, p)
++				}
++				return &ec2sdk.AuthorizeSecurityGroupIngressOutput{}, nil
++			}).AnyTimes()
++
++		sgManager := NewDefaultSecurityGroupManager(ec2Client, log.Log)
++		reconciler := NewDefaultSecurityGroupReconciler(sgManager, log.Log)
++		// reconcile with nothing desired so that the security group info is loaded (and cached) while it has no rules
++		err := reconciler.ReconcileIngress(ctx, sgID, nil)
++		require.NoError(t, err)
++
++		// the rule now appears on the security group without the controller knowing about it
++		rule := newRule()
++		awsRules = append(awsRules, &rule)
++
++		desired := []IPPermissionInfo{NewRawIPPermission(newRule())}
++		err = reconciler.ReconcileIngress(ctx, sgID, desired)
++		assert.NoError(t, err)
++		assert.Len(t, awsRules, 1)
++	})
++
++	t.Run("other authorize errors are still returned", func(t *testing.T) {
++		ctrl := gomock.NewController(t)
++		defer ctrl.Finish()
++		ec2Client := mock_services.NewMockEC2(ctrl)
++		ec2Client.EXPECT().DescribeSecurityGroupsAsList(gomock.Any(), gomock.Any()).DoAndReturn(
++			func(_ context.Context, _ *ec2sdk.DescribeSecurityGroupsInput) ([]*ec2sdk.SecurityGroup, error) {
++				return []*ec2sdk.SecurityGroup{{GroupId: aws.String(sgID)}}, nil
++			}).AnyTimes()
++		ec2Client.EXPECT().AuthorizeSecurityGroupIngressWithContext(gomock.Any(), gomock.Any()).Return(
++			nil, awserr.New("UnauthorizedOperation", "not allowed", nil)).AnyTimes()
++
++		reconciler := NewDefaultSecurityGroupReconciler(NewDefaultSecurityGroupManager(ec2Client, log.Log), log.Log)
++		desired := []IPPermissionInfo{NewRawIPPermission(newRule())}
++		err := reconciler.ReconcileIngress(ctx, sgID, desired)
++		assert.Error(t, err)
++	})
++}

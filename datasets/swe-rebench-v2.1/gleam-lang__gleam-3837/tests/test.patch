@@ -1,0 +1,213 @@
+diff --git a/compiler-core/src/language_server/tests.rs b/compiler-core/src/language_server/tests.rs
+index e2341958c..d19a38579 100644
+--- a/compiler-core/src/language_server/tests.rs
++++ b/compiler-core/src/language_server/tests.rs
+@@ -29,6 +29,7 @@ use crate::{
+         engine::LanguageServerEngine, files::FileSystemProxy, progress::ProgressReporter,
+         DownloadDependencies, LockGuard, Locker, MakeLocker,
+     },
++    line_numbers::LineNumbers,
+     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
+     paths::ProjectPaths,
+     requirement::Requirement,
+@@ -733,3 +734,26 @@ fn byte_index_to_position(src: &str, byte_index: usize) -> Position {
+ 
+     Position::new(line, col)
+ }
++
++/// This function replicates how the text editor applies TextEdit.
++///
++pub fn apply_code_edit(src: &str, mut change: Vec<lsp_types::TextEdit>) -> String {
++    let mut result = src.to_string();
++    let line_numbers = LineNumbers::new(src);
++    let mut offset = 0;
++
++    change.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
++    for edit in change {
++        let start = line_numbers.byte_index(edit.range.start.line, edit.range.start.character)
++            as i32
++            - offset;
++        let end =
++            line_numbers.byte_index(edit.range.end.line, edit.range.end.character) as i32 - offset;
++        let range = (start as usize)..(end as usize);
++        offset += end - start;
++        offset -= edit.new_text.len() as i32;
++        result.replace_range(range, &edit.new_text);
++    }
++
++    result
++}
+diff --git a/compiler-core/src/language_server/tests/action.rs b/compiler-core/src/language_server/tests/action.rs
+index 84a54cf3f..c3e919408 100644
+--- a/compiler-core/src/language_server/tests/action.rs
++++ b/compiler-core/src/language_server/tests/action.rs
+@@ -1,4 +1,3 @@
+-use crate::line_numbers::LineNumbers;
+ use itertools::Itertools;
+ use lsp_types::{
+     CodeActionContext, CodeActionParams, PartialResultParams, Position, Range, Url,
+@@ -50,27 +49,12 @@ fn apply_code_action(title: &str, tester: TestProject<'_>, range: Range) -> Stri
+     apply_code_edit(src, changes)
+ }
+ 
+-/// This function replicates how the text editor applies TextEdit.
+-///
+ fn apply_code_edit(src: &str, changes: HashMap<Url, Vec<lsp_types::TextEdit>>) -> String {
+     let mut result = src.to_string();
+-    let line_numbers = LineNumbers::new(src);
+-    let mut offset = 0;
+-    for (_, mut change) in changes {
+-        change.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+-        for edit in change {
+-            let start = line_numbers.byte_index(edit.range.start.line, edit.range.start.character)
+-                as i32
+-                - offset;
+-            let end = line_numbers.byte_index(edit.range.end.line, edit.range.end.character) as i32
+-                - offset;
+-            let range = (start as usize)..(end as usize);
+-            offset += end - start;
+-            offset -= edit.new_text.len() as i32;
+-            result.replace_range(range, &edit.new_text);
+-        }
++    for (_, change) in changes {
++        result = super::apply_code_edit(result.as_str(), change);
+     }
+-    result
++    result.to_string()
+ }
+ 
+ const REMOVE_UNUSED_IMPORTS: &str = "Remove unused imports";
+diff --git a/compiler-core/src/language_server/tests/completion.rs b/compiler-core/src/language_server/tests/completion.rs
+index 507a28a84..32016e2f9 100644
+--- a/compiler-core/src/language_server/tests/completion.rs
++++ b/compiler-core/src/language_server/tests/completion.rs
+@@ -22,6 +22,40 @@ pub fn show_complete(code: &str, position: Position) -> String {
+     str
+ }
+ 
++fn apply_conversion(src: &str, completions: Vec<CompletionItem>, value: &str) -> String {
++    let completion = completions
++        .iter()
++        .find(|c| c.label == value.to_string())
++        .expect(&format!("no completion with value `{value}`"));
++
++    let mut edits = vec![];
++    match &completion.text_edit {
++        Some(lsp_types::CompletionTextEdit::Edit(edit)) => edits.push(edit.clone()),
++        Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
++            edits.push(lsp_types::TextEdit {
++                range: edit.replace,
++                new_text: edit.new_text.clone(),
++            });
++        }
++        None => {}
++    }
++    apply_code_edit(src, edits)
++}
++
++#[macro_export]
++macro_rules! assert_apply_completion {
++    ($project:expr, $name:literal, $position:expr) => {
++        let src = $project.src;
++        let completions = completion($project, $position);
++        let output = format!(
++            "{}\n\n----- After applying completion -----\n{}",
++            show_complete(src, $position),
++            apply_conversion(src, completions, $name)
++        );
++        insta::assert_snapshot!(insta::internals::AutoName, output, src);
++    };
++}
++
+ #[macro_export]
+ macro_rules! assert_completion {
+     ($project:expr) => {
+@@ -1788,3 +1822,44 @@ pub fn main(x: Int) {
+ 
+     assert_completion!(TestProject::for_source(code), Position::new(3, 0));
+ }
++
++// https://github.com/gleam-lang/gleam/issues/3833
++#[test]
++fn autocomplete_doesnt_delete_the_piece_of_code_that_comes_after() {
++    let code = "
++import list
++pub fn main(x: Int) {
++  list.list.filter([1, 2, 3], todo)
++}
++";
++    let list = "
++pub fn filter(_, _) { [] }
++pub fn map(_, _) { [] }
++";
++
++    assert_apply_completion!(
++        TestProject::for_source(code).add_dep_module("list", list),
++        "list.map",
++        Position::new(3, 7)
++    );
++}
++
++#[test]
++fn autocomplete_doesnt_delete_the_piece_of_code_that_comes_after_2() {
++    let code = "
++import list
++pub fn main(x: Int) {
++  list.mlist.filter([1, 2, 3], todo)
++}
++";
++    let list = "
++pub fn filter(_, _) { [] }
++pub fn map(_, _) { [] }
++";
++
++    assert_apply_completion!(
++        TestProject::for_source(code).add_dep_module("list", list),
++        "list.map",
++        Position::new(3, 8)
++    );
++}
+diff --git a/compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__completion__autocomplete_doesnt_delete_the_piece_of_code_that_comes_after.snap b/compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__completion__autocomplete_doesnt_delete_the_piece_of_code_that_comes_after.snap
+new file mode 100644
+index 000000000..dee667966
+--- /dev/null
++++ b/compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__completion__autocomplete_doesnt_delete_the_piece_of_code_that_comes_after.snap
+@@ -0,0 +1,16 @@
++---
++source: compiler-core/src/language_server/tests/completion.rs
++expression: "\nimport list\npub fn main(x: Int) {\n  list.list.filter([1, 2, 3], todo)\n}\n"
++---
++import list
++pub fn main(x: Int) {
++  list.|list.filter([1, 2, 3], todo)
++}
++
++
++----- After applying completion -----
++
++import list
++pub fn main(x: Int) {
++  list.maplist.filter([1, 2, 3], todo)
++}
+diff --git a/compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__completion__autocomplete_doesnt_delete_the_piece_of_code_that_comes_after_2.snap b/compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__completion__autocomplete_doesnt_delete_the_piece_of_code_that_comes_after_2.snap
+new file mode 100644
+index 000000000..677db8b54
+--- /dev/null
++++ b/compiler-core/src/language_server/tests/snapshots/gleam_core__language_server__tests__completion__autocomplete_doesnt_delete_the_piece_of_code_that_comes_after_2.snap
+@@ -0,0 +1,16 @@
++---
++source: compiler-core/src/language_server/tests/completion.rs
++expression: "\nimport list\npub fn main(x: Int) {\n  list.mlist.filter([1, 2, 3], todo)\n}\n"
++---
++import list
++pub fn main(x: Int) {
++  list.m|list.filter([1, 2, 3], todo)
++}
++
++
++----- After applying completion -----
++
++import list
++pub fn main(x: Int) {
++  list.maplist.filter([1, 2, 3], todo)
++}

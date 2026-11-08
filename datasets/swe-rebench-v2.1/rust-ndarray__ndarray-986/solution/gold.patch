@@ -1,0 +1,701 @@
+diff --git a/src/data_repr.rs b/src/data_repr.rs
+index 8a52f64c..7047f201 100644
+--- a/src/data_repr.rs
++++ b/src/data_repr.rs
+@@ -53,6 +53,10 @@ impl<A> OwnedRepr<A> {
+         self.ptr.as_ptr()
+     }
+ 
++    pub(crate) fn as_ptr_mut(&self) -> *mut A {
++        self.ptr.as_ptr()
++    }
++
+     pub(crate) fn as_nonnull_mut(&mut self) -> NonNull<A> {
+         self.ptr
+     }
+@@ -88,6 +92,13 @@ impl<A> OwnedRepr<A> {
+         self.len = new_len;
+     }
+ 
++    /// Return the length (number of elements in total)
++    pub(crate) fn release_all_elements(&mut self) -> usize {
++        let ret = self.len;
++        self.len = 0;
++        ret
++    }
++
+     /// Cast self into equivalent repr of other element type
+     ///
+     /// ## Safety
+diff --git a/src/impl_constructors.rs b/src/impl_constructors.rs
+index d082a5ce..3336ec33 100644
+--- a/src/impl_constructors.rs
++++ b/src/impl_constructors.rs
+@@ -29,6 +29,7 @@ use crate::indices;
+ #[cfg(feature = "std")]
+ use crate::iterators::to_vec;
+ use crate::iterators::to_vec_mapped;
++use crate::iterators::TrustedIterator;
+ use crate::StrideShape;
+ #[cfg(feature = "std")]
+ use crate::{geomspace, linspace, logspace};
+@@ -495,6 +496,27 @@ where
+         ArrayBase::from_data_ptr(DataOwned::new(v), ptr).with_strides_dim(strides, dim)
+     }
+ 
++    /// Creates an array from an iterator, mapped by `map` and interpret it according to the
++    /// provided shape and strides.
++    ///
++    /// # Safety
++    ///
++    /// See from_shape_vec_unchecked
++    pub(crate) unsafe fn from_shape_trusted_iter_unchecked<Sh, I, F>(shape: Sh, iter: I, map: F)
++        -> Self
++    where
++        Sh: Into<StrideShape<D>>,
++        I: TrustedIterator + ExactSizeIterator,
++        F: FnMut(I::Item) -> A,
++    {
++        let shape = shape.into();
++        let dim = shape.dim;
++        let strides = shape.strides.strides_for_dim(&dim);
++        let v = to_vec_mapped(iter, map);
++        Self::from_vec_dim_stride_unchecked(dim, strides, v)
++    }
++
++
+     /// Create an array with uninitalized elements, shape `shape`.
+     ///
+     /// The uninitialized elements of type `A` are represented by the type `MaybeUninit<A>`,
+diff --git a/src/impl_methods.rs b/src/impl_methods.rs
+index fccce317..9ef4277d 100644
+--- a/src/impl_methods.rs
++++ b/src/impl_methods.rs
+@@ -498,6 +498,7 @@ where
+     ///
+     /// **Panics** if an index is out of bounds or step size is zero.<br>
+     /// **Panics** if `axis` is out of bounds.
++    #[must_use = "slice_axis returns an array view with the sliced result"]
+     pub fn slice_axis(&self, axis: Axis, indices: Slice) -> ArrayView<'_, A, D>
+     where
+         S: Data,
+@@ -511,6 +512,7 @@ where
+     ///
+     /// **Panics** if an index is out of bounds or step size is zero.<br>
+     /// **Panics** if `axis` is out of bounds.
++    #[must_use = "slice_axis_mut returns an array view with the sliced result"]
+     pub fn slice_axis_mut(&mut self, axis: Axis, indices: Slice) -> ArrayViewMut<'_, A, D>
+     where
+         S: DataMut,
+@@ -2224,17 +2226,14 @@ where
+         A: 'a,
+         S: Data,
+     {
+-        if let Some(slc) = self.as_slice_memory_order() {
+-            let v = crate::iterators::to_vec_mapped(slc.iter(), f);
+-            unsafe {
+-                ArrayBase::from_shape_vec_unchecked(
++        unsafe {
++            if let Some(slc) = self.as_slice_memory_order() {
++                ArrayBase::from_shape_trusted_iter_unchecked(
+                     self.dim.clone().strides(self.strides.clone()),
+-                    v,
+-                )
++                    slc.iter(), f)
++            } else {
++                ArrayBase::from_shape_trusted_iter_unchecked(self.dim.clone(), self.iter(), f)
+             }
+-        } else {
+-            let v = crate::iterators::to_vec_mapped(self.iter(), f);
+-            unsafe { ArrayBase::from_shape_vec_unchecked(self.dim.clone(), v) }
+         }
+     }
+ 
+@@ -2254,11 +2253,10 @@ where
+         if self.is_contiguous() {
+             let strides = self.strides.clone();
+             let slc = self.as_slice_memory_order_mut().unwrap();
+-            let v = crate::iterators::to_vec_mapped(slc.iter_mut(), f);
+-            unsafe { ArrayBase::from_shape_vec_unchecked(dim.strides(strides), v) }
++            unsafe { ArrayBase::from_shape_trusted_iter_unchecked(dim.strides(strides),
++                        slc.iter_mut(), f) }
+         } else {
+-            let v = crate::iterators::to_vec_mapped(self.iter_mut(), f);
+-            unsafe { ArrayBase::from_shape_vec_unchecked(dim, v) }
++            unsafe { ArrayBase::from_shape_trusted_iter_unchecked(dim, self.iter_mut(), f) }
+         }
+     }
+ 
+diff --git a/src/impl_owned_array.rs b/src/impl_owned_array.rs
+index a795a354..8d8963c1 100644
+--- a/src/impl_owned_array.rs
++++ b/src/impl_owned_array.rs
+@@ -223,89 +223,18 @@ impl<A, D> Array<A, D>
+     fn drop_unreachable_elements_slow(mut self) -> OwnedRepr<A> {
+         // "deconstruct" self; the owned repr releases ownership of all elements and we
+         // carry on with raw view methods
+-        let self_len = self.len();
+         let data_len = self.data.len();
+         let data_ptr = self.data.as_nonnull_mut().as_ptr();
+ 
+-        let mut self_;
+-
+         unsafe {
+             // Safety: self.data releases ownership of the elements. Any panics below this point
+             // will result in leaking elements instead of double drops.
+-            self_ = self.raw_view_mut();
++            let self_ = self.raw_view_mut();
+             self.data.set_len(0);
+-        }
+ 
+-
+-        // uninvert axes where needed, so that stride > 0
+-        for i in 0..self_.ndim() {
+-            if self_.stride_of(Axis(i)) < 0 {
+-                self_.invert_axis(Axis(i));
+-            }
++            drop_unreachable_raw(self_, data_ptr, data_len);
+         }
+ 
+-        // Sort axes to standard order, Axis(0) has biggest stride and Axis(n - 1) least stride
+-        // Note that self_ has holes, so self_ is not C-contiguous
+-        sort_axes_in_default_order(&mut self_);
+-
+-        unsafe {
+-            // with uninverted axes this is now the element with lowest address
+-            let array_memory_head_ptr = self_.ptr.as_ptr();
+-            let data_end_ptr = data_ptr.add(data_len);
+-            debug_assert!(data_ptr <= array_memory_head_ptr);
+-            debug_assert!(array_memory_head_ptr <= data_end_ptr);
+-
+-            // The idea is simply this: the iterator will yield the elements of self_ in
+-            // increasing address order.
+-            //
+-            // The pointers produced by the iterator are those that we *do not* touch.
+-            // The pointers *not mentioned* by the iterator are those we have to drop.
+-            //
+-            // We have to drop elements in the range from `data_ptr` until (not including)
+-            // `data_end_ptr`, except those that are produced by `iter`.
+-
+-            // As an optimization, the innermost axis is removed if it has stride 1, because
+-            // we then have a long stretch of contiguous elements we can skip as one.
+-            let inner_lane_len;
+-            if self_.ndim() > 1 && self_.strides.last_elem() == 1 {
+-                self_.dim.slice_mut().rotate_right(1);
+-                self_.strides.slice_mut().rotate_right(1);
+-                inner_lane_len = self_.dim[0];
+-                self_.dim[0] = 1;
+-                self_.strides[0] = 1;
+-            } else {
+-                inner_lane_len = 1;
+-            }
+-
+-            // iter is a raw pointer iterator traversing the array in memory order now with the
+-            // sorted axes.
+-            let mut iter = Baseiter::new(self_.ptr.as_ptr(), self_.dim, self_.strides);
+-            let mut dropped_elements = 0;
+-
+-            let mut last_ptr = data_ptr;
+-
+-            while let Some(elem_ptr) = iter.next() {
+-                // The interval from last_ptr up until (not including) elem_ptr
+-                // should now be dropped. This interval may be empty, then we just skip this loop.
+-                while last_ptr != elem_ptr {
+-                    debug_assert!(last_ptr < data_end_ptr);
+-                    std::ptr::drop_in_place(last_ptr);
+-                    last_ptr = last_ptr.add(1);
+-                    dropped_elements += 1;
+-                }
+-                // Next interval will continue one past the current lane
+-                last_ptr = elem_ptr.add(inner_lane_len);
+-            }
+-
+-            while last_ptr < data_end_ptr {
+-                std::ptr::drop_in_place(last_ptr);
+-                last_ptr = last_ptr.add(1);
+-                dropped_elements += 1;
+-            }
+-
+-            assert_eq!(data_len, dropped_elements + self_len,
+-                       "Internal error: inconsistency in move_into");
+-        }
+         self.data
+     }
+ 
+@@ -594,6 +523,82 @@ impl<A, D> Array<A, D>
+     }
+ }
+ 
++/// This drops all "unreachable" elements in `self_` given the data pointer and data length.
++///
++/// # Safety
++///
++/// This is an internal function for use by move_into and IntoIter only, safety invariants may need
++/// to be upheld across the calls from those implementations.
++pub(crate) unsafe fn drop_unreachable_raw<A, D>(mut self_: RawArrayViewMut<A, D>, data_ptr: *mut A, data_len: usize)
++where
++    D: Dimension,
++{
++    let self_len = self_.len();
++
++    for i in 0..self_.ndim() {
++        if self_.stride_of(Axis(i)) < 0 {
++            self_.invert_axis(Axis(i));
++        }
++    }
++    sort_axes_in_default_order(&mut self_);
++    // with uninverted axes this is now the element with lowest address
++    let array_memory_head_ptr = self_.ptr.as_ptr();
++    let data_end_ptr = data_ptr.add(data_len);
++    debug_assert!(data_ptr <= array_memory_head_ptr);
++    debug_assert!(array_memory_head_ptr <= data_end_ptr);
++
++    // The idea is simply this: the iterator will yield the elements of self_ in
++    // increasing address order.
++    //
++    // The pointers produced by the iterator are those that we *do not* touch.
++    // The pointers *not mentioned* by the iterator are those we have to drop.
++    //
++    // We have to drop elements in the range from `data_ptr` until (not including)
++    // `data_end_ptr`, except those that are produced by `iter`.
++
++    // As an optimization, the innermost axis is removed if it has stride 1, because
++    // we then have a long stretch of contiguous elements we can skip as one.
++    let inner_lane_len;
++    if self_.ndim() > 1 && self_.strides.last_elem() == 1 {
++        self_.dim.slice_mut().rotate_right(1);
++        self_.strides.slice_mut().rotate_right(1);
++        inner_lane_len = self_.dim[0];
++        self_.dim[0] = 1;
++        self_.strides[0] = 1;
++    } else {
++        inner_lane_len = 1;
++    }
++
++    // iter is a raw pointer iterator traversing the array in memory order now with the
++    // sorted axes.
++    let mut iter = Baseiter::new(self_.ptr.as_ptr(), self_.dim, self_.strides);
++    let mut dropped_elements = 0;
++
++    let mut last_ptr = data_ptr;
++
++    while let Some(elem_ptr) = iter.next() {
++        // The interval from last_ptr up until (not including) elem_ptr
++        // should now be dropped. This interval may be empty, then we just skip this loop.
++        while last_ptr != elem_ptr {
++            debug_assert!(last_ptr < data_end_ptr);
++            std::ptr::drop_in_place(last_ptr);
++            last_ptr = last_ptr.add(1);
++            dropped_elements += 1;
++        }
++        // Next interval will continue one past the current lane
++        last_ptr = elem_ptr.add(inner_lane_len);
++    }
++
++    while last_ptr < data_end_ptr {
++        std::ptr::drop_in_place(last_ptr);
++        last_ptr = last_ptr.add(1);
++        dropped_elements += 1;
++    }
++
++    assert_eq!(data_len, dropped_elements + self_len,
++               "Internal error: inconsistency in move_into");
++}
++
+ /// Sort axes to standard order, i.e Axis(0) has biggest stride and Axis(n - 1) least stride
+ ///
+ /// The axes should have stride >= 0 before calling this method.
+diff --git a/src/iterators/into_iter.rs b/src/iterators/into_iter.rs
+new file mode 100644
+index 00000000..cfa48299
+--- /dev/null
++++ b/src/iterators/into_iter.rs
+@@ -0,0 +1,136 @@
++// Copyright 2020-2021 bluss and ndarray developers.
++//
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use std::mem;
++use std::ptr::NonNull;
++
++use crate::imp_prelude::*;
++use crate::OwnedRepr;
++
++use super::Baseiter;
++use crate::impl_owned_array::drop_unreachable_raw;
++
++
++/// By-value iterator for an array
++pub struct IntoIter<A, D>
++where
++    D: Dimension,
++{
++    array_data: OwnedRepr<A>,
++    inner: Baseiter<A, D>,
++    data_len: usize,
++    /// first memory address of an array element
++    array_head_ptr: NonNull<A>,
++    // if true, the array owns elements that are not reachable by indexing
++    // through all the indices of the dimension.
++    has_unreachable_elements: bool,
++}
++
++impl<A, D> IntoIter<A, D> 
++where
++    D: Dimension,
++{
++    /// Create a new by-value iterator that consumes `array`
++    pub(crate) fn new(mut array: Array<A, D>) -> Self {
++        unsafe {
++            let array_head_ptr = array.ptr;
++            let ptr = array.as_mut_ptr();
++            let mut array_data = array.data;
++            let data_len = array_data.release_all_elements();
++            debug_assert!(data_len >= array.dim.size());
++            let has_unreachable_elements = array.dim.size() != data_len;
++            let inner = Baseiter::new(ptr, array.dim, array.strides);
++
++            IntoIter {
++                array_data,
++                inner,
++                data_len,
++                array_head_ptr,
++                has_unreachable_elements,
++            }
++        }
++    }
++}
++
++impl<A, D: Dimension> Iterator for IntoIter<A, D> {
++    type Item = A;
++
++    #[inline]
++    fn next(&mut self) -> Option<A> {
++        self.inner.next().map(|p| unsafe { p.read() })
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        self.inner.size_hint()
++    }
++}
++
++impl<A, D: Dimension> ExactSizeIterator for IntoIter<A, D> {
++    fn len(&self) -> usize { self.inner.len() }
++}
++
++impl<A, D> Drop for IntoIter<A, D>
++where
++    D: Dimension
++{
++    fn drop(&mut self) {
++        if !self.has_unreachable_elements || mem::size_of::<A>() == 0 || !mem::needs_drop::<A>() {
++            return;
++        }
++
++        // iterate til the end
++        while let Some(_) = self.next() { }
++
++        unsafe {
++            let data_ptr = self.array_data.as_ptr_mut();
++            let view = RawArrayViewMut::new(self.array_head_ptr, self.inner.dim.clone(),
++                                            self.inner.strides.clone());
++            debug_assert!(self.inner.dim.size() < self.data_len, "data_len {} and dim size {}",
++                          self.data_len, self.inner.dim.size());
++            drop_unreachable_raw(view, data_ptr, self.data_len);
++        }
++    }
++}
++
++impl<A, D> IntoIterator for Array<A, D>
++where
++    D: Dimension
++{
++    type Item = A;
++    type IntoIter = IntoIter<A, D>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        IntoIter::new(self)
++    }
++}
++
++impl<A, D> IntoIterator for ArcArray<A, D>
++where
++    D: Dimension,
++    A: Clone,
++{
++    type Item = A;
++    type IntoIter = IntoIter<A, D>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        IntoIter::new(self.into_owned())
++    }
++}
++
++impl<A, D> IntoIterator for CowArray<'_, A, D>
++where
++    D: Dimension,
++    A: Clone,
++{
++    type Item = A;
++    type IntoIter = IntoIter<A, D>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        IntoIter::new(self.into_owned())
++    }
++}
+diff --git a/src/iterators/mod.rs b/src/iterators/mod.rs
+index 595f0897..bb618e5b 100644
+--- a/src/iterators/mod.rs
++++ b/src/iterators/mod.rs
+@@ -9,6 +9,7 @@
+ #[macro_use]
+ mod macros;
+ mod chunks;
++mod into_iter;
+ pub mod iter;
+ mod lanes;
+ mod windows;
+@@ -26,6 +27,7 @@ use super::{Dimension, Ix, Ixs};
+ pub use self::chunks::{ExactChunks, ExactChunksIter, ExactChunksIterMut, ExactChunksMut};
+ pub use self::lanes::{Lanes, LanesMut};
+ pub use self::windows::Windows;
++pub use self::into_iter::IntoIter;
+ 
+ use std::slice::{self, Iter as SliceIter, IterMut as SliceIterMut};
+ 
+@@ -1465,6 +1467,7 @@ unsafe impl TrustedIterator for ::std::ops::Range<usize> {}
+ // FIXME: These indices iter are dubious -- size needs to be checked up front.
+ unsafe impl<D> TrustedIterator for IndicesIter<D> where D: Dimension {}
+ unsafe impl<D> TrustedIterator for IndicesIterF<D> where D: Dimension {}
++unsafe impl<A, D> TrustedIterator for IntoIter<A, D> where D: Dimension {}
+ 
+ /// Like Iterator::collect, but only for trusted length iterators
+ pub fn to_vec<I>(iter: I) -> Vec<I::Item>
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index e7434fbc..9eecf016 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -9,6 +9,11 @@ mod layoutfmt;
+ pub struct Layout(u32);
+ 
+ impl Layout {
++    pub(crate) const CORDER: u32 = 0b01;
++    pub(crate) const FORDER: u32 = 0b10;
++    pub(crate) const CPREFER: u32 = 0b0100;
++    pub(crate) const FPREFER: u32 = 0b1000;
++
+     #[inline(always)]
+     pub(crate) fn is(self, flag: u32) -> bool {
+         self.0 & flag != 0
+@@ -33,22 +38,22 @@ impl Layout {
+ 
+     #[inline(always)]
+     pub(crate) fn c() -> Layout {
+-        Layout(CORDER | CPREFER)
++        Layout(Layout::CORDER | Layout::CPREFER)
+     }
+ 
+     #[inline(always)]
+     pub(crate) fn f() -> Layout {
+-        Layout(FORDER | FPREFER)
++        Layout(Layout::FORDER | Layout::FPREFER)
+     }
+ 
+     #[inline(always)]
+     pub(crate) fn cpref() -> Layout {
+-        Layout(CPREFER)
++        Layout(Layout::CPREFER)
+     }
+ 
+     #[inline(always)]
+     pub(crate) fn fpref() -> Layout {
+-        Layout(FPREFER)
++        Layout(Layout::FPREFER)
+     }
+ 
+     #[inline(always)]
+@@ -60,17 +65,12 @@ impl Layout {
+     /// Subject to change when we can describe other layouts
+     #[inline]
+     pub(crate) fn tendency(self) -> i32 {
+-        (self.is(CORDER) as i32 - self.is(FORDER) as i32) +
+-        (self.is(CPREFER) as i32 - self.is(FPREFER) as i32)
++        (self.is(Layout::CORDER) as i32 - self.is(Layout::FORDER) as i32) +
++        (self.is(Layout::CPREFER) as i32 - self.is(Layout::FPREFER) as i32)
+ 
+     }
+ }
+ 
+-pub const CORDER: u32 = 0b01;
+-pub const FORDER: u32 = 0b10;
+-pub const CPREFER: u32 = 0b0100;
+-pub const FPREFER: u32 = 0b1000;
+-
+ 
+ #[cfg(test)]
+ mod tests {
+@@ -83,10 +83,11 @@ mod tests {
+     type M0 = Array0<f32>;
+ 
+     macro_rules! assert_layouts {
+-        ($mat:expr, $($layout:expr),*) => {{
++        ($mat:expr, $($layout:ident),*) => {{
+             let layout = $mat.view().layout();
+             $(
+-            assert!(layout.is($layout), "Assertion failed: array {:?} is not layout {}",
++            assert!(layout.is(Layout::$layout),
++                "Assertion failed: array {:?} is not layout {}",
+                 $mat,
+                 stringify!($layout));
+             )*
+@@ -94,10 +95,11 @@ mod tests {
+     }
+ 
+     macro_rules! assert_not_layouts {
+-        ($mat:expr, $($layout:expr),*) => {{
++        ($mat:expr, $($layout:ident),*) => {{
+             let layout = $mat.view().layout();
+             $(
+-            assert!(!layout.is($layout), "Assertion failed: array {:?} show not have layout {}",
++            assert!(!layout.is(Layout::$layout),
++                "Assertion failed: array {:?} show not have layout {}",
+                 $mat,
+                 stringify!($layout));
+             )*
+@@ -110,10 +112,10 @@ mod tests {
+         let b = M::zeros((5, 5).f());
+         let ac = a.view().layout();
+         let af = b.view().layout();
+-        assert!(ac.is(CORDER) && ac.is(CPREFER));
+-        assert!(!ac.is(FORDER) && !ac.is(FPREFER));
+-        assert!(!af.is(CORDER) && !af.is(CPREFER));
+-        assert!(af.is(FORDER) && af.is(FPREFER));
++        assert!(ac.is(Layout::CORDER) && ac.is(Layout::CPREFER));
++        assert!(!ac.is(Layout::FORDER) && !ac.is(Layout::FPREFER));
++        assert!(!af.is(Layout::CORDER) && !af.is(Layout::CPREFER));
++        assert!(af.is(Layout::FORDER) && af.is(Layout::FPREFER));
+     }
+ 
+     #[test]
+@@ -152,10 +154,10 @@ mod tests {
+             let v1 = a.slice(s![1.., ..]).layout();
+             let v2 = a.slice(s![.., 1..]).layout();
+ 
+-            assert!(v1.is(CORDER) && v1.is(CPREFER));
+-            assert!(!v1.is(FORDER) && !v1.is(FPREFER));
+-            assert!(!v2.is(CORDER) && v2.is(CPREFER));
+-            assert!(!v2.is(FORDER) && !v2.is(FPREFER));
++            assert!(v1.is(Layout::CORDER) && v1.is(Layout::CPREFER));
++            assert!(!v1.is(Layout::FORDER) && !v1.is(Layout::FPREFER));
++            assert!(!v2.is(Layout::CORDER) && v2.is(Layout::CPREFER));
++            assert!(!v2.is(Layout::FORDER) && !v2.is(Layout::FPREFER));
+         }
+ 
+         let b = M::zeros((5, 5).f());
+@@ -164,10 +166,10 @@ mod tests {
+             let v1 = b.slice(s![1.., ..]).layout();
+             let v2 = b.slice(s![.., 1..]).layout();
+ 
+-            assert!(!v1.is(CORDER) && !v1.is(CPREFER));
+-            assert!(!v1.is(FORDER) && v1.is(FPREFER));
+-            assert!(!v2.is(CORDER) && !v2.is(CPREFER));
+-            assert!(v2.is(FORDER) && v2.is(FPREFER));
++            assert!(!v1.is(Layout::CORDER) && !v1.is(Layout::CPREFER));
++            assert!(!v1.is(Layout::FORDER) && v1.is(Layout::FPREFER));
++            assert!(!v2.is(Layout::CORDER) && !v2.is(Layout::CPREFER));
++            assert!(v2.is(Layout::FORDER) && v2.is(Layout::FPREFER));
+         }
+     }
+ 
+@@ -206,10 +208,10 @@ mod tests {
+             let v1 = a.slice(s![..;2, ..]).layout();
+             let v2 = a.slice(s![.., ..;2]).layout();
+ 
+-            assert!(!v1.is(CORDER) && v1.is(CPREFER));
+-            assert!(!v1.is(FORDER) && !v1.is(FPREFER));
+-            assert!(!v2.is(CORDER) && !v2.is(CPREFER));
+-            assert!(!v2.is(FORDER) && !v2.is(FPREFER));
++            assert!(!v1.is(Layout::CORDER) && v1.is(Layout::CPREFER));
++            assert!(!v1.is(Layout::FORDER) && !v1.is(Layout::FPREFER));
++            assert!(!v2.is(Layout::CORDER) && !v2.is(Layout::CPREFER));
++            assert!(!v2.is(Layout::FORDER) && !v2.is(Layout::FPREFER));
+         }
+ 
+         let b = M::zeros((5, 5).f());
+@@ -217,10 +219,10 @@ mod tests {
+             let v1 = b.slice(s![..;2, ..]).layout();
+             let v2 = b.slice(s![.., ..;2]).layout();
+ 
+-            assert!(!v1.is(CORDER) && !v1.is(CPREFER));
+-            assert!(!v1.is(FORDER) && !v1.is(FPREFER));
+-            assert!(!v2.is(CORDER) && !v2.is(CPREFER));
+-            assert!(!v2.is(FORDER) && v2.is(FPREFER));
++            assert!(!v1.is(Layout::CORDER) && !v1.is(Layout::CPREFER));
++            assert!(!v1.is(Layout::FORDER) && !v1.is(Layout::FPREFER));
++            assert!(!v2.is(Layout::CORDER) && !v2.is(Layout::CPREFER));
++            assert!(!v2.is(Layout::FORDER) && v2.is(Layout::FPREFER));
+         }
+     }
+ }
+diff --git a/src/zip/mod.rs b/src/zip/mod.rs
+index 18d07ddf..07fcbb06 100644
+--- a/src/zip/mod.rs
++++ b/src/zip/mod.rs
+@@ -20,7 +20,6 @@ use crate::Layout;
+ use crate::partial::Partial;
+ 
+ use crate::indexes::{indices, Indices};
+-use crate::layout::{CORDER, FORDER};
+ use crate::split_at::{SplitPreference, SplitAt};
+ 
+ pub use self::ndproducer::{NdProducer, IntoNdProducer, Offset};
+@@ -272,7 +271,8 @@ where
+     }
+ 
+     fn prefer_f(&self) -> bool {
+-        !self.layout.is(CORDER) && (self.layout.is(FORDER) || self.layout_tendency < 0)
++        !self.layout.is(Layout::CORDER) &&
++            (self.layout.is(Layout::FORDER) || self.layout_tendency < 0)
+     }
+ 
+     /// Return an *approximation* to the max stride axis; if
+@@ -310,7 +310,7 @@ where
+     {
+         if self.dimension.ndim() == 0 {
+             function(acc, unsafe { self.parts.as_ref(self.parts.as_ptr()) })
+-        } else if self.layout.is(CORDER | FORDER) {
++        } else if self.layout.is(Layout::CORDER | Layout::FORDER) {
+             self.for_each_core_contiguous(acc, function)
+         } else {
+             self.for_each_core_strided(acc, function)
+@@ -322,7 +322,7 @@ where
+         F: FnMut(Acc, P::Item) -> FoldWhile<Acc>,
+         P: ZippableTuple<Dim = D>,
+     {
+-        debug_assert!(self.layout.is(CORDER | FORDER));
++        debug_assert!(self.layout.is(Layout::CORDER | Layout::FORDER));
+         let size = self.dimension.size();
+         let ptrs = self.parts.as_ptr();
+         let inner_strides = self.parts.contiguous_stride();
+@@ -440,7 +440,7 @@ where
+     // Method placement: only used for binary Zip at the moment.
+     #[inline]
+     pub(crate) fn debug_assert_c_order(self) -> Self {
+-        debug_assert!(self.layout.is(CORDER) || self.layout_tendency >= 0 ||
++        debug_assert!(self.layout.is(Layout::CORDER) || self.layout_tendency >= 0 ||
+                       self.dimension.slice().iter().filter(|&&d| d > 1).count() <= 1,
+                       "Assertion failed: traversal is not c-order or 1D for \
+                       layout {:?}, tendency {}, dimension {:?}",
+@@ -839,7 +839,7 @@ macro_rules! map_impl {
+                     // debug assert that the output is contiguous in the memory layout we need
+                     if cfg!(debug_assertions) {
+                         let out_layout = output.layout();
+-                        assert!(out_layout.is(CORDER | FORDER));
++                        assert!(out_layout.is(Layout::CORDER | Layout::FORDER));
+                         assert!(
+                             (self.layout_tendency <= 0 && out_layout.tendency() <= 0) ||
+                             (self.layout_tendency >= 0 && out_layout.tendency() >= 0),

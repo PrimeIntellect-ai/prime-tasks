@@ -1,0 +1,110 @@
+diff --git a/api/writeAPIBlocking_test.go b/api/writeAPIBlocking_test.go
+index fd46a8e..a574a6a 100644
+--- a/api/writeAPIBlocking_test.go
++++ b/api/writeAPIBlocking_test.go
+@@ -6,6 +6,7 @@ package api
+ 
+ import (
+ 	"context"
++	"io"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -72,3 +73,97 @@ func TestWriteContextCancel(t *testing.T) {
+ 	require.Equal(t, context.Canceled, err)
+ 	assert.Len(t, service.Lines(), 0)
+ }
++
++func TestWriteParallel(t *testing.T) {
++	service := test.NewTestService(t, "http://localhost:8888")
++	writeAPI := NewWriteAPIBlocking("my-org", "my-bucket", service, write.DefaultOptions().SetBatchSize(5))
++	lines := genRecords(1000)
++
++	chanLine := make(chan string)
++	var wg sync.WaitGroup
++	for i := 0; i < 10; i++ {
++		wg.Add(1)
++		go func() {
++			for l := range chanLine {
++				err := writeAPI.WriteRecord(context.Background(), l)
++				assert.Nil(t, err)
++			}
++			wg.Done()
++		}()
++	}
++	for _, l := range lines {
++		chanLine <- l
++	}
++	close(chanLine)
++	wg.Wait()
++	assert.Len(t, service.Lines(), len(lines))
++
++	service.Close()
++}
++
++type writePointConcurrencyService struct {
++	http2.Service
++	entered chan struct{}
++	release <-chan struct{}
++	mu      sync.Mutex
++	active  int
++	max     int
++}
++
++func (s *writePointConcurrencyService) DoPostRequest(ctx context.Context, url string, body io.Reader, requestCallback http2.RequestCallback, responseCallback http2.ResponseCallback) *http2.Error {
++	s.mu.Lock()
++	s.active++
++	if s.active > s.max {
++		s.max = s.active
++	}
++	s.mu.Unlock()
++	s.entered <- struct{}{}
++	<-s.release
++	s.mu.Lock()
++	s.active--
++	s.mu.Unlock()
++	return nil
++}
++
++func TestWritePointParallelCallsDoNotOverlap(t *testing.T) {
++	const calls = 8
++	baseService := test.NewTestService(t, "http://localhost:8888")
++	release := make(chan struct{})
++	service := &writePointConcurrencyService{
++		Service: baseService,
++		entered: make(chan struct{}, calls),
++		release: release,
++	}
++	writeAPI := NewWriteAPIBlocking("my-org", "my-bucket", service, write.DefaultOptions())
++	points := genPoints(calls)
++	start := make(chan struct{})
++	var wg sync.WaitGroup
++	for i := range points {
++		wg.Add(1)
++		go func(point *write.Point) {
++			defer wg.Done()
++			<-start
++			assert.NoError(t, writeAPI.WritePoint(context.Background(), point))
++		}(points[i])
++	}
++	close(start)
++
++	// Keep each underlying request in progress while the other calls begin.
++	// An unsynchronized implementation will enter the service more than once.
++	select {
++	case <-service.entered:
++	case <-time.After(time.Second):
++		t.Fatal("no write request reached the service")
++	}
++	select {
++	case <-service.entered:
++	case <-time.After(100 * time.Millisecond):
++	}
++	close(release)
++	wg.Wait()
++
++	service.mu.Lock()
++	maxConcurrent := service.max
++	service.mu.Unlock()
++	assert.LessOrEqual(t, maxConcurrent, 1, "underlying write requests must not overlap")
++}

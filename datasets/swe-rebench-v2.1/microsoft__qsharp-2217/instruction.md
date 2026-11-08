@@ -1,0 +1,10 @@
+Name resolution from a project's Main.qs in Python or Circuits does not work
+If you follow the Python or Jupyter instructions from the documentation [Running a Program](https://learn.microsoft.com/en-us/azure/quantum/how-to-work-with-qsharp-projects?tabs=tabid-qsharp%2Ctabid-notebook-run#running-the-programs), the code will actually fail to run. For some reason, callables from Main.qs do not end up accessible either by their short names or their fully qualified names in `%%qsharp` magic cells or in `qsharp.eval`. Note that they DO show up and work as expected in the newer style Python interop, where they can be run like `qsharp.code.Main.Main()`.
+
+My best guess at starting place for investigation: we do some extra tricks to make items from Main.qs available without an additional qualifying namespace when loading those projects as dependencies. But we also do some special tricks to make the loaded project from a `qsharp.init` call show up not as a dependency of the notebook/Python but as a code defined in the current context. I think somehow these two special cases are working against each other and causing thins from Main.qs to not show up at all. The other Python interop mechanism, exposing namespaces and callables through `qsharp.code`, uses an entirely different execution mechanism, so that could explain why it is unaffected.
+
+UPDATE: Turns out this affects circuits as well... if you are in a project that has a Main.qs, generating circuits for any operation in that Main.qs fail with the same name resolution error.
+
+### Additional contract requirements
+
+In the Python/Jupyter evaluation workflow, a callable from a project's `Main.qs` must be invocable by its fully qualified name (for example, `Main.Foo()`). It must also be possible to import that callable by its fully qualified name and then invoke it by its short name (for example, `import Main.Foo;` followed by `Foo()`). This requirement does not prescribe whether the short name is available before an import. Generating a circuit for an operation defined in a project's `Main.qs` must succeed.

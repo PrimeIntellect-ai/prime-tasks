@@ -1,0 +1,163 @@
+diff --git a/consul/consul_test.go b/consul/consul_test.go
+index f6ce778..da438c5 100644
+--- a/consul/consul_test.go
++++ b/consul/consul_test.go
+@@ -1,7 +1,14 @@
+ package consul
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"sort"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -671,6 +678,116 @@ func TestAddAgentsFromApp(t *testing.T) {
+ 	assert.NoError(t, err)
+ }
+ 
++func registeredHealthCheckTypes(t *testing.T, ignored string, healthChecks []apps.HealthCheck) [][]string {
++	t.Helper()
++	var mu sync.Mutex
++	var registrations []*consulapi.AgentServiceRegistration
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPut || r.URL.Path != "/v1/agent/service/register" {
++			http.NotFound(w, r)
++			return
++		}
++		var registration consulapi.AgentServiceRegistration
++		if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		mu.Lock()
++		registrations = append(registrations, &registration)
++		mu.Unlock()
++		w.WriteHeader(http.StatusOK)
++	}))
++	t.Cleanup(server.Close)
++
++	host, port, err := net.SplitHostPort(server.Listener.Addr().String())
++	assert.NoError(t, err)
++	config := Config{Port: port, Tag: "marathon"}
++	ignoredHealthChecks := reflect.ValueOf(&config).Elem().FieldByName("IgnoredHealthChecks")
++	if !ignoredHealthChecks.IsValid() || !ignoredHealthChecks.CanSet() {
++		t.Fatalf("Config must expose a public IgnoredHealthChecks field")
++	}
++	ignoredHealthChecks.SetString(ignored)
++	consul := New(config)
++	assert.NoError(t, consul.AddAgent(host))
++	app := &apps.App{
++		ID:           "someApp",
++		HealthChecks: healthChecks,
++		Labels:       map[string]string{"consul": "true"},
++	}
++	task := &apps.Task{ID: "someTask", AppID: app.ID, Host: host, Ports: []int{8090, 8443}}
++	assert.NoError(t, consul.Register(task, app))
++
++	mu.Lock()
++	defer mu.Unlock()
++	registeredTypes := make([][]string, 0, len(registrations))
++	for _, registration := range registrations {
++		var types []string
++		for _, check := range registration.Checks {
++			switch {
++			case check.HTTP != "":
++				types = append(types, "HTTP")
++			case check.TCP != "":
++				types = append(types, "TCP")
++			case check.Script != "":
++				types = append(types, "COMMAND")
++			}
++		}
++		registeredTypes = append(registeredTypes, types)
++	}
++	return registeredTypes
++}
++
++func assertRegisteredHealthCheckTypes(t *testing.T, expected []string, registrations [][]string) {
++	t.Helper()
++	assert.NotEmpty(t, registrations)
++	expected = append([]string(nil), expected...)
++	sort.Strings(expected)
++	for _, types := range registrations {
++		sort.Strings(types)
++		assert.Equal(t, expected, types)
++	}
++}
++
++func TestMarathonTaskToConsulServiceMapping_IgnoredHealthcheckTypesParsing(t *testing.T) {
++	t.Parallel()
++
++	healthChecks := []apps.HealthCheck{
++		{Path: "/api/health", Protocol: "HTTP", PortIndex: 0, IntervalSeconds: 60, TimeoutSeconds: 20},
++		{Protocol: "TCP", PortIndex: 1, IntervalSeconds: 40, TimeoutSeconds: 20},
++		{
++			Protocol: "COMMAND",
++			Command: struct {
++				Value string `json:"value"`
++			}{Value: "echo 1"},
++			IntervalSeconds: 30,
++			TimeoutSeconds:  20,
++		},
++	}
++
++	testCases := []struct {
++		name     string
++		ignored  string
++		expected []string
++	}{
++		{"empty configuration ignores nothing", "", []string{"HTTP", "TCP", "COMMAND"}},
++		{"commas and whitespace only ignore nothing", " , ", []string{"HTTP", "TCP", "COMMAND"}},
++		{"lowercase type is ignored", "command", []string{"HTTP", "TCP"}},
++		{"uppercase type is ignored", "COMMAND", []string{"HTTP", "TCP"}},
++		{"mixed case type is ignored", "Command", []string{"HTTP", "TCP"}},
++		{"surrounding whitespace is trimmed", " command , tcp ", []string{"HTTP"}},
++		{"multiple types are ignored", "command,tcp", []string{"HTTP"}},
++	}
++
++	for _, testCase := range testCases {
++		testCase := testCase
++		t.Run(testCase.name, func(t *testing.T) {
++			t.Parallel()
++			registrations := registeredHealthCheckTypes(t, testCase.ignored, healthChecks)
++			assertRegisteredHealthCheckTypes(t, testCase.expected, registrations)
++		})
++	}
++}
++
+ func TestMarathonTaskToConsulServiceMapping(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -788,6 +905,26 @@ func TestMarathonTaskToConsulServiceMapping(t *testing.T) {
+ 	}, service.Checks)
+ }
+ 
++func TestMarathonTaskToConsulServiceMapping_IgnoredHealthcheckTypes(t *testing.T) {
++	t.Parallel()
++
++	healthChecks := []apps.HealthCheck{
++		{Path: "/api/health", Protocol: "HTTP", PortIndex: 0, IntervalSeconds: 60, TimeoutSeconds: 20},
++		{Protocol: "TCP", PortIndex: 1, IntervalSeconds: 40, TimeoutSeconds: 20},
++		{
++			Protocol: "COMMAND",
++			Command: struct {
++				Value string `json:"value"`
++			}{Value: "echo 1"},
++			IntervalSeconds: 30,
++			TimeoutSeconds:  20,
++		},
++	}
++
++	registrations := registeredHealthCheckTypes(t, "command,tcp", healthChecks)
++	assertRegisteredHealthCheckTypes(t, []string{"HTTP"}, registrations)
++}
++
+ func TestMarathonTaskToConsulServiceMapping_NotResolvableTaskHost(t *testing.T) {
+ 	t.Parallel()
+ 

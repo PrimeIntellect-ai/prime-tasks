@@ -1,0 +1,558 @@
+diff --git a/controllers/ingress/group_controller.go b/controllers/ingress/group_controller.go
+index 94f53a6a0..2796d694b 100644
+--- a/controllers/ingress/group_controller.go
++++ b/controllers/ingress/group_controller.go
+@@ -29,8 +29,11 @@ func NewGroupReconciler(cloud aws.Cloud, k8sClient client.Client, eventRecorder
+ 	annotationParser := annotations.NewSuffixAnnotationParser("alb.ingress.kubernetes.io")
+ 	authConfigBuilder := ingress.NewDefaultAuthConfigBuilder(annotationParser)
+ 	enhancedBackendBuilder := ingress.NewDefaultEnhancedBackendBuilder(annotationParser)
+-	modelBuilder := ingress.NewDefaultModelBuilder(k8sClient, eventRecorder, cloud.EC2(), cloud.VpcID(), clusterName, annotationParser, subnetsResolver,
+-		authConfigBuilder, enhancedBackendBuilder)
++	modelBuilder := ingress.NewDefaultModelBuilder(k8sClient, eventRecorder,
++		cloud.EC2(), cloud.ACM(),
++		annotationParser, subnetsResolver,
++		authConfigBuilder, enhancedBackendBuilder,
++		cloud.VpcID(), clusterName, logger)
+ 	stackMarshaller := deploy.NewDefaultStackMarshaller()
+ 	stackDeployer := deploy.NewDefaultStackDeployer(cloud, k8sClient, networkingSGManager, networkingSGReconciler, clusterName, "ingress.k8s.aws", logger)
+ 	groupLoader := ingress.NewDefaultGroupLoader(k8sClient, annotationParser, "alb")
+diff --git a/pkg/aws/cloud.go b/pkg/aws/cloud.go
+index 585eaa891..5ec513c79 100644
+--- a/pkg/aws/cloud.go
++++ b/pkg/aws/cloud.go
+@@ -18,6 +18,9 @@ type Cloud interface {
+ 	// ELBV2 provides API to AWS ELBV2
+ 	ELBV2() services.ELBV2
+ 
++	// ACM provides API to AWS ACM
++	ACM() services.ACM
++
+ 	// WAFv2 provides API to AWS WAFv2
+ 	WAFv2() services.WAFv2
+ 
+@@ -73,6 +76,7 @@ func NewCloud(cfg CloudConfig, metricsRegisterer prometheus.Registerer) (Cloud,
+ 		cfg:         cfg,
+ 		ec2:         services.NewEC2(sess),
+ 		elbv2:       services.NewELBV2(sess),
++		acm:         services.NewACM(sess),
+ 		wafv2:       services.NewWAFv2(sess),
+ 		wafRegional: services.NewWAFRegional(sess, cfg.Region),
+ 		shield:      services.NewShield(sess),
+@@ -87,6 +91,7 @@ type defaultCloud struct {
+ 	ec2   services.EC2
+ 	elbv2 services.ELBV2
+ 
++	acm         services.ACM
+ 	wafv2       services.WAFv2
+ 	wafRegional services.WAFRegional
+ 	shield      services.Shield
+@@ -100,6 +105,10 @@ func (c *defaultCloud) ELBV2() services.ELBV2 {
+ 	return c.elbv2
+ }
+ 
++func (c *defaultCloud) ACM() services.ACM {
++	return c.acm
++}
++
+ func (c *defaultCloud) WAFv2() services.WAFv2 {
+ 	return c.wafv2
+ }
+diff --git a/pkg/deploy/ec2/security_group_manager.go b/pkg/deploy/ec2/security_group_manager.go
+index 706c98b43..672a333e1 100644
+--- a/pkg/deploy/ec2/security_group_manager.go
++++ b/pkg/deploy/ec2/security_group_manager.go
+@@ -195,7 +195,7 @@ func buildIPPermissionInfo(permission ec2model.IPPermission) (networking.IPPermi
+ 	}
+ 	if len(permission.IPv6Range) == 1 {
+ 		labels := networking.NewIPPermissionLabelsForRawDescription(permission.IPv6Range[0].Description)
+-		return networking.NewCIDRIPPermission(protocol, permission.FromPort, permission.ToPort, permission.IPv6Range[0].CIDRIPv6, labels), nil
++		return networking.NewCIDRv6IPPermission(protocol, permission.FromPort, permission.ToPort, permission.IPv6Range[0].CIDRIPv6, labels), nil
+ 	}
+ 	if len(permission.UserIDGroupPairs) == 1 {
+ 		labels := networking.NewIPPermissionLabelsForRawDescription(permission.UserIDGroupPairs[0].Description)
+diff --git a/pkg/ingress/cert_discovery.go b/pkg/ingress/cert_discovery.go
+new file mode 100644
+index 000000000..b11ae0d58
+--- /dev/null
++++ b/pkg/ingress/cert_discovery.go
+@@ -0,0 +1,169 @@
++package ingress
++
++import (
++	"context"
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/service/acm"
++	"github.com/go-logr/logr"
++	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
++	"github.com/pkg/errors"
++	"k8s.io/apimachinery/pkg/util/cache"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	certARNsCacheKey = "certARNs"
++	// the certARNs in AWS account will be cached for 1 minute.
++	defaultCertARNsCacheTTL = 1 * time.Minute
++	// the domain names for imported certificates will be cached for 5 minute.
++	defaultImportedCertDomainsCacheTTL = 5 * time.Minute
++	// the domain names for private certificates won't change, cache for a longer time.
++	defaultPrivateCertDomainsCacheTTL = 10 * time.Hour
++)
++
++// CertDiscovery is responsible for auto-discover TLS certificates for tls hosts.
++type CertDiscovery interface {
++	// Discover will try to find valid certificateARNs for each tlsHost.
++	Discover(ctx context.Context, tlsHosts []string) ([]string, error)
++}
++
++// NewACMCertDiscovery constructs new acmCertDiscovery
++func NewACMCertDiscovery(acmClient services.ACM, logger logr.Logger) *acmCertDiscovery {
++	return &acmCertDiscovery{
++		acmClient: acmClient,
++		logger:    logger,
++
++		loadDomainsByCertARNMutex:   sync.Mutex{},
++		certARNsCache:               cache.NewExpiring(),
++		certARNsCacheTTL:            defaultCertARNsCacheTTL,
++		certDomainsCache:            cache.NewExpiring(),
++		importedCertDomainsCacheTTL: defaultImportedCertDomainsCacheTTL,
++		privateCertDomainsCacheTTL:  defaultPrivateCertDomainsCacheTTL,
++	}
++}
++
++var _ CertDiscovery = &acmCertDiscovery{}
++
++// CertDiscovery implementation for ACM certificates.
++type acmCertDiscovery struct {
++	acmClient services.ACM
++	logger    logr.Logger
++
++	// mutex to serialize the call to loadDomainsForAllCertificates
++	loadDomainsByCertARNMutex   sync.Mutex
++	certARNsCache               *cache.Expiring
++	certARNsCacheTTL            time.Duration
++	certDomainsCache            *cache.Expiring
++	importedCertDomainsCacheTTL time.Duration
++	privateCertDomainsCacheTTL  time.Duration
++}
++
++func (d *acmCertDiscovery) Discover(ctx context.Context, tlsHosts []string) ([]string, error) {
++	domainsByCertARN, err := d.loadDomainsForAllCertificates(ctx)
++	if err != nil {
++		return nil, err
++	}
++	certARNs := sets.NewString()
++	for _, host := range tlsHosts {
++		var certARNsForHost []string
++		for certARN, domains := range domainsByCertARN {
++			for domain := range domains {
++				if d.domainMatchesHost(domain, host) {
++					certARNsForHost = append(certARNsForHost, certARN)
++					break
++				}
++			}
++		}
++
++		if len(certARNsForHost) > 1 {
++			return nil, errors.Errorf("multiple certificate found for host: %s, certARNs: %v", host, certARNsForHost)
++		}
++		if len(certARNsForHost) == 0 {
++			return nil, errors.Errorf("none certificate found for host: %s", host)
++		}
++		certARNs.Insert(certARNsForHost...)
++	}
++	return certARNs.List(), nil
++}
++
++func (d *acmCertDiscovery) loadDomainsForAllCertificates(ctx context.Context) (map[string]sets.String, error) {
++	d.loadDomainsByCertARNMutex.Lock()
++	defer d.loadDomainsByCertARNMutex.Unlock()
++
++	certARNs, err := d.loadAllCertificateARNs(ctx)
++	if err != nil {
++		return nil, err
++	}
++	domainsByCertARN := make(map[string]sets.String, len(certARNs))
++	for _, certARN := range certARNs {
++		certDomains, err := d.loadDomainsForCertificate(ctx, certARN)
++		if err != nil {
++			return nil, err
++		}
++		domainsByCertARN[certARN] = certDomains
++	}
++	return domainsByCertARN, nil
++}
++
++func (d *acmCertDiscovery) loadAllCertificateARNs(ctx context.Context) ([]string, error) {
++	if rawCacheItem, ok := d.certARNsCache.Get(certARNsCacheKey); ok {
++		return rawCacheItem.([]string), nil
++	}
++	req := &acm.ListCertificatesInput{
++		CertificateStatuses: aws.StringSlice([]string{acm.CertificateStatusIssued}),
++	}
++	certSummaries, err := d.acmClient.ListCertificatesAsList(ctx, req)
++	if err != nil {
++		return nil, err
++	}
++
++	var certARNs []string
++	for _, certSummary := range certSummaries {
++		certARN := aws.StringValue(certSummary.CertificateArn)
++		certARNs = append(certARNs, certARN)
++	}
++	d.certARNsCache.Set(certARNsCacheKey, certARNs, d.certARNsCacheTTL)
++	return certARNs, nil
++}
++
++func (d *acmCertDiscovery) loadDomainsForCertificate(ctx context.Context, certARN string) (sets.String, error) {
++	if rawCacheItem, ok := d.certDomainsCache.Get(certARN); ok {
++		return rawCacheItem.(sets.String), nil
++	}
++	req := &acm.DescribeCertificateInput{
++		CertificateArn: aws.String(certARN),
++	}
++	resp, err := d.acmClient.DescribeCertificateWithContext(ctx, req)
++	if err != nil {
++		return nil, err
++	}
++	certDetail := resp.Certificate
++	domains := sets.NewString(aws.StringValueSlice(certDetail.SubjectAlternativeNames)...)
++	switch aws.StringValue(certDetail.Type) {
++	case acm.CertificateTypeImported:
++		d.certDomainsCache.Set(certARN, domains, d.importedCertDomainsCacheTTL)
++	case acm.CertificateTypeAmazonIssued, acm.CertificateTypePrivate:
++		d.certDomainsCache.Set(certARN, domains, d.privateCertDomainsCacheTTL)
++	}
++	return domains, nil
++}
++
++func (d *acmCertDiscovery) domainMatchesHost(domainName string, tlsHost string) bool {
++	if strings.HasPrefix(domainName, "*.") {
++		ds := strings.Split(domainName, ".")
++		hs := strings.Split(tlsHost, ".")
++
++		if len(ds) != len(hs) {
++			return false
++		}
++
++		return cmp.Equal(ds[1:], hs[1:], cmpopts.EquateEmpty())
++	}
++
++	return domainName == tlsHost
++}
+diff --git a/pkg/ingress/model_build_listener.go b/pkg/ingress/model_build_listener.go
+index 1b5eadd52..39dc5bd9f 100644
+--- a/pkg/ingress/model_build_listener.go
++++ b/pkg/ingress/model_build_listener.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/pkg/errors"
+ 	networking "k8s.io/api/networking/v1beta1"
+ 	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"net"
+ 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
+ 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
+@@ -95,6 +96,21 @@ func (t *defaultModelBuildTask) computeIngressListenPortConfigByPort(ctx context
+ 		return nil, err
+ 	}
+ 
++	containsHTTPSPort := false
++	for _, protocol := range listenPorts {
++		if protocol == elbv2model.ProtocolHTTPS {
++			containsHTTPSPort = true
++			break
++		}
++	}
++	var inferredTLSCertARNs []string
++	if containsHTTPSPort && len(explicitTLSCertARNs) == 0 {
++		inferredTLSCertARNs, err = t.computeIngressInferredTLSCertARNs(ctx, ing)
++		if err != nil {
++			return nil, err
++		}
++	}
++
+ 	listenPortConfigByPort := make(map[int64]listenPortConfig, len(listenPorts))
+ 	for port, protocol := range listenPorts {
+ 		cfg := listenPortConfig{
+@@ -103,11 +119,16 @@ func (t *defaultModelBuildTask) computeIngressListenPortConfigByPort(ctx context
+ 			inboundCIDRv6s: inboundCIDRV6s,
+ 		}
+ 		if protocol == elbv2model.ProtocolHTTPS {
+-			cfg.tlsCerts = explicitTLSCertARNs
++			if len(explicitTLSCertARNs) == 0 {
++				cfg.tlsCerts = inferredTLSCertARNs
++			} else {
++				cfg.tlsCerts = explicitTLSCertARNs
++			}
+ 			cfg.sslPolicy = explicitSSLPolicy
+ 		}
+ 		listenPortConfigByPort[port] = cfg
+ 	}
++
+ 	return listenPortConfigByPort, nil
+ }
+ 
+@@ -117,6 +138,19 @@ func (t *defaultModelBuildTask) computeIngressExplicitTLSCertARNs(_ context.Cont
+ 	return rawTLSCertARNs
+ }
+ 
++func (t *defaultModelBuildTask) computeIngressInferredTLSCertARNs(ctx context.Context, ing *networking.Ingress) ([]string, error) {
++	hosts := sets.NewString()
++	for _, r := range ing.Spec.Rules {
++		if len(r.Host) != 0 {
++			hosts.Insert(r.Host)
++		}
++	}
++	for _, t := range ing.Spec.TLS {
++		hosts.Insert(t.Hosts...)
++	}
++	return t.certDiscovery.Discover(ctx, hosts.List())
++}
++
+ func (t *defaultModelBuildTask) computeIngressListenPorts(_ context.Context, ing *networking.Ingress, preferTLS bool) (map[int64]elbv2model.Protocol, error) {
+ 	rawListenPorts := ""
+ 	if exists := t.annotationParser.ParseStringAnnotation(annotations.IngressSuffixListenPorts, &rawListenPorts, ing.Annotations); !exists {
+diff --git a/pkg/ingress/model_builder.go b/pkg/ingress/model_builder.go
+index f7e5426c5..6226a8634 100644
+--- a/pkg/ingress/model_builder.go
++++ b/pkg/ingress/model_builder.go
+@@ -3,9 +3,11 @@ package ingress
+ import (
+ 	"context"
+ 	awssdk "github.com/aws/aws-sdk-go/aws"
++	"github.com/go-logr/logr"
+ 	"github.com/pkg/errors"
+ 	networking "k8s.io/api/networking/v1beta1"
+ 	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/client-go/tools/record"
+ 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
+ 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
+@@ -28,9 +30,12 @@ type ModelBuilder interface {
+ }
+ 
+ // NewDefaultModelBuilder constructs new defaultModelBuilder.
+-func NewDefaultModelBuilder(k8sClient client.Client, eventRecorder record.EventRecorder, ec2Client services.EC2, vpcID string, clusterName string,
++func NewDefaultModelBuilder(k8sClient client.Client, eventRecorder record.EventRecorder,
++	ec2Client services.EC2, acmClient services.ACM,
+ 	annotationParser annotations.Parser, subnetsResolver networkingpkg.SubnetsResolver,
+-	authConfigBuilder AuthConfigBuilder, enhancedBackendBuilder EnhancedBackendBuilder) *defaultModelBuilder {
++	authConfigBuilder AuthConfigBuilder, enhancedBackendBuilder EnhancedBackendBuilder,
++	vpcID string, clusterName string, logger logr.Logger) *defaultModelBuilder {
++	certDiscovery := NewACMCertDiscovery(acmClient, logger)
+ 	return &defaultModelBuilder{
+ 		k8sClient:              k8sClient,
+ 		eventRecorder:          eventRecorder,
+@@ -39,6 +44,7 @@ func NewDefaultModelBuilder(k8sClient client.Client, eventRecorder record.EventR
+ 		clusterName:            clusterName,
+ 		annotationParser:       annotationParser,
+ 		subnetsResolver:        subnetsResolver,
++		certDiscovery:          certDiscovery,
+ 		authConfigBuilder:      authConfigBuilder,
+ 		enhancedBackendBuilder: enhancedBackendBuilder,
+ 	}
+@@ -57,6 +63,7 @@ type defaultModelBuilder struct {
+ 
+ 	annotationParser       annotations.Parser
+ 	subnetsResolver        networkingpkg.SubnetsResolver
++	certDiscovery          CertDiscovery
+ 	authConfigBuilder      AuthConfigBuilder
+ 	enhancedBackendBuilder EnhancedBackendBuilder
+ }
+@@ -72,6 +79,7 @@ func (b *defaultModelBuilder) Build(ctx context.Context, ingGroup Group) (core.S
+ 		clusterName:            b.clusterName,
+ 		annotationParser:       b.annotationParser,
+ 		subnetsResolver:        b.subnetsResolver,
++		certDiscovery:          b.certDiscovery,
+ 		authConfigBuilder:      b.authConfigBuilder,
+ 		enhancedBackendBuilder: b.enhancedBackendBuilder,
+ 
+@@ -108,6 +116,7 @@ type defaultModelBuildTask struct {
+ 	clusterName            string
+ 	annotationParser       annotations.Parser
+ 	subnetsResolver        networkingpkg.SubnetsResolver
++	certDiscovery          CertDiscovery
+ 	authConfigBuilder      AuthConfigBuilder
+ 	enhancedBackendBuilder EnhancedBackendBuilder
+ 
+@@ -190,7 +199,7 @@ func (t *defaultModelBuildTask) mergeListenPortConfigs(_ context.Context, listen
+ 	var mergedInboundCIDRsProvider types.NamespacedName
+ 	var mergedSSLPolicy *string
+ 	var mergedSSLPolicyProvider types.NamespacedName
+-	var mergedTLSCerts []string
++	mergedTLSCerts := sets.NewString()
+ 
+ 	for ingKey, cfg := range listenPortConfigByIngress {
+ 		if mergedProtocol == nil {
+@@ -223,7 +232,7 @@ func (t *defaultModelBuildTask) mergeListenPortConfigs(_ context.Context, listen
+ 					mergedSSLPolicyProvider, awssdk.StringValue(mergedSSLPolicy), ingKey, awssdk.StringValue(cfg.sslPolicy))
+ 			}
+ 		}
+-		mergedTLSCerts = append(mergedTLSCerts, cfg.tlsCerts...)
++		mergedTLSCerts.Insert(cfg.tlsCerts...)
+ 	}
+ 
+ 	if mergedProtocol == nil {
+@@ -243,6 +252,6 @@ func (t *defaultModelBuildTask) mergeListenPortConfigs(_ context.Context, listen
+ 		inboundCIDRv4s: mergedInboundCIDRv4s,
+ 		inboundCIDRv6s: mergedInboundCIDRv6s,
+ 		sslPolicy:      mergedSSLPolicy,
+-		tlsCerts:       mergedTLSCerts,
++		tlsCerts:       mergedTLSCerts.List(),
+ 	}, nil
+ }
+diff --git a/pkg/networking/security_group_manager.go b/pkg/networking/security_group_manager.go
+index df21d5d2a..8cbae59fe 100644
+--- a/pkg/networking/security_group_manager.go
++++ b/pkg/networking/security_group_manager.go
+@@ -18,10 +18,31 @@ const (
+ 	defaultSGInfoCacheTTL = 10 * time.Minute
+ )
+ 
++type FetchSGInfoOptions struct {
++	// whether to ignore cache and reload SecurityGroup Info from AWS directly.
++	ReloadIgnoringCache bool
++}
++
++// Apply FetchSGInfoOption options
++func (opts *FetchSGInfoOptions) ApplyOptions(options ...FetchSGInfoOption) {
++	for _, option := range options {
++		option(opts)
++	}
++}
++
++type FetchSGInfoOption func(opts *FetchSGInfoOptions)
++
++// WithReloadIgnoringCache is a option that sets the ReloadIgnoringCache to true.
++func WithReloadIgnoringCache() FetchSGInfoOption {
++	return func(opts *FetchSGInfoOptions) {
++		opts.ReloadIgnoringCache = true
++	}
++}
++
+ // SecurityGroupManager is an abstraction around EC2's SecurityGroup API.
+ type SecurityGroupManager interface {
+ 	// FetchSGInfosByID will fetch SecurityGroupInfo with SecurityGroup IDs.
+-	FetchSGInfosByID(ctx context.Context, sgIDs ...string) (map[string]SecurityGroupInfo, error)
++	FetchSGInfosByID(ctx context.Context, sgIDs []string, opts ...FetchSGInfoOption) (map[string]SecurityGroupInfo, error)
+ 
+ 	// FetchSGInfosByRequest will fetch SecurityGroupInfo with raw DescribeSecurityGroupsInput request.
+ 	FetchSGInfosByRequest(ctx context.Context, req *ec2sdk.DescribeSecurityGroupsInput) (map[string]SecurityGroupInfo, error)
+@@ -57,8 +78,20 @@ type defaultSecurityGroupManager struct {
+ 	sgInfoCacheTTL   time.Duration
+ }
+ 
+-func (m *defaultSecurityGroupManager) FetchSGInfosByID(ctx context.Context, sgIDs ...string) (map[string]SecurityGroupInfo, error) {
+-	sgInfoByID := m.fetchSGInfosFromCache(sgIDs)
++func (m *defaultSecurityGroupManager) FetchSGInfosByID(ctx context.Context, sgIDs []string, opts ...FetchSGInfoOption) (map[string]SecurityGroupInfo, error) {
++	fetchOpts := FetchSGInfoOptions{
++		ReloadIgnoringCache: false,
++	}
++	fetchOpts.ApplyOptions(opts...)
++
++	sgInfoByID := make(map[string]SecurityGroupInfo, len(sgIDs))
++	if !fetchOpts.ReloadIgnoringCache {
++		sgInfoByIDFromCache := m.fetchSGInfosFromCache(sgIDs)
++		for sgID, sgInfo := range sgInfoByIDFromCache {
++			sgInfoByID[sgID] = sgInfo
++		}
++	}
++
+ 	sgIDsSet := sets.NewString(sgIDs...)
+ 	fetchedSGIDsSet := sets.StringKeySet(sgInfoByID)
+ 	unFetchedSGIDs := sgIDsSet.Difference(fetchedSGIDsSet).List()
+diff --git a/pkg/networking/security_group_reconciler.go b/pkg/networking/security_group_reconciler.go
+index 5c7274626..dffd4ed59 100644
+--- a/pkg/networking/security_group_reconciler.go
++++ b/pkg/networking/security_group_reconciler.go
+@@ -2,9 +2,11 @@ package networking
+ 
+ import (
+ 	"context"
++	"github.com/aws/aws-sdk-go/aws/awserr"
+ 	"github.com/go-logr/logr"
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
++	"github.com/pkg/errors"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	ec2equality "sigs.k8s.io/aws-load-balancer-controller/pkg/equality/ec2"
+ )
+@@ -72,12 +74,28 @@ func (r *defaultSecurityGroupReconciler) ReconcileIngress(ctx context.Context, s
+ 	}
+ 	reconcileOpts.ApplyOptions(opts...)
+ 
+-	sgInfoByID, err := r.sgManager.FetchSGInfosByID(ctx, sgID)
++	sgInfoByID, err := r.sgManager.FetchSGInfosByID(ctx, []string{sgID})
+ 	if err != nil {
+ 		return err
+ 	}
+ 	sgInfo := sgInfoByID[sgID]
++	if err := r.reconcileIngressWithSGInfo(ctx, sgInfo, desiredPermissions, reconcileOpts); err != nil {
++		if !r.shouldRetryWithoutCache(err) {
++			return err
++		}
++		sgInfoByID, err := r.sgManager.FetchSGInfosByID(ctx, []string{sgID}, WithReloadIgnoringCache())
++		if err != nil {
++			return err
++		}
++		sgInfo := sgInfoByID[sgID]
++		if err := r.reconcileIngressWithSGInfo(ctx, sgInfo, desiredPermissions, reconcileOpts); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+ 
++func (r *defaultSecurityGroupReconciler) reconcileIngressWithSGInfo(ctx context.Context, sgInfo SecurityGroupInfo, desiredPermissions []IPPermissionInfo, reconcileOpts SecurityGroupReconcileOptions) error {
+ 	extraPermissions := diffIPPermissionInfos(sgInfo.Ingress, desiredPermissions)
+ 	permissionsToRevoke := make([]IPPermissionInfo, 0, len(extraPermissions))
+ 	for _, permission := range extraPermissions {
+@@ -87,19 +105,27 @@ func (r *defaultSecurityGroupReconciler) ReconcileIngress(ctx context.Context, s
+ 	}
+ 	permissionsToGrant := diffIPPermissionInfos(desiredPermissions, sgInfo.Ingress)
+ 	if len(permissionsToRevoke) > 0 && !reconcileOpts.AuthorizeOnly {
+-		if err := r.sgManager.RevokeSGIngress(ctx, sgID, permissionsToRevoke); err != nil {
++		if err := r.sgManager.RevokeSGIngress(ctx, sgInfo.SecurityGroupID, permissionsToRevoke); err != nil {
+ 			return err
+ 		}
+ 	}
+ 	if len(permissionsToGrant) > 0 {
+-		if err := r.sgManager.AuthorizeSGIngress(ctx, sgID, permissionsToGrant); err != nil {
++		if err := r.sgManager.AuthorizeSGIngress(ctx, sgInfo.SecurityGroupID, permissionsToGrant); err != nil {
+ 			return err
+ 		}
+ 	}
+-
+ 	return nil
+ }
+ 
++// shouldRetryWithoutCache tests whether we should retry SecurityGroup rules reconcile without cache.
++func (r *defaultSecurityGroupReconciler) shouldRetryWithoutCache(err error) bool {
++	var awsErr awserr.Error
++	if errors.As(err, &awsErr) {
++		return awsErr.Code() == "InvalidPermission.Duplicate" || awsErr.Code() == "InvalidPermission.NotFound"
++	}
++	return false
++}
++
+ // diffIPPermissionInfos calculates set_difference as source - target
+ func diffIPPermissionInfos(source []IPPermissionInfo, target []IPPermissionInfo) []IPPermissionInfo {
+ 	opts := cmp.Options{
+diff --git a/pkg/targetgroupbinding/networking_manager.go b/pkg/targetgroupbinding/networking_manager.go
+index bb9a6b4f7..17b848d74 100644
+--- a/pkg/targetgroupbinding/networking_manager.go
++++ b/pkg/targetgroupbinding/networking_manager.go
+@@ -427,7 +427,7 @@ func (m *defaultNetworkingManager) resolveEndpointSGForENI(ctx context.Context,
+ 		return sgIDs[0], nil
+ 	}
+ 
+-	sgInfoByID, err := m.sgManager.FetchSGInfosByID(ctx, sgIDs...)
++	sgInfoByID, err := m.sgManager.FetchSGInfosByID(ctx, sgIDs)
+ 	if err != nil {
+ 		return "", err
+ 	}

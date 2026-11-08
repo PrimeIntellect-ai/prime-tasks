@@ -1,0 +1,240 @@
+diff --git a/openapi3filter/req_resp_decoder_test.go b/openapi3filter/req_resp_decoder_test.go
+index de93547..84e12ad 100644
+--- a/openapi3filter/req_resp_decoder_test.go
++++ b/openapi3filter/req_resp_decoder_test.go
+@@ -1280,7 +1280,7 @@ func TestDecodeBody(t *testing.T) {
+ 				}
+ 				return tc.encoding[name]
+ 			}
+-			got, err := decodeBody(tc.body, h, schemaRef, encFn)
++			_, got, err := decodeBody(tc.body, h, schemaRef, encFn)
+ 
+ 			if tc.wantErr != nil {
+ 				require.Error(t, err)
+@@ -1350,7 +1350,7 @@ func TestRegisterAndUnregisterBodyDecoder(t *testing.T) {
+ 	body := strings.NewReader("foo,bar")
+ 	schema := openapi3.NewArraySchema().WithItems(openapi3.NewStringSchema()).NewRef()
+ 	encFn := func(string) *openapi3.Encoding { return nil }
+-	got, err := decodeBody(body, h, schema, encFn)
++	_, got, err := decodeBody(body, h, schema, encFn)
+ 
+ 	require.NoError(t, err)
+ 	require.Equal(t, []string{"foo", "bar"}, got)
+@@ -1360,7 +1360,7 @@ func TestRegisterAndUnregisterBodyDecoder(t *testing.T) {
+ 	originalDecoder = RegisteredBodyDecoder(contentType)
+ 	require.Nil(t, originalDecoder)
+ 
+-	_, err = decodeBody(body, h, schema, encFn)
++	_, _, err = decodeBody(body, h, schema, encFn)
+ 	require.Equal(t, &ParseError{
+ 		Kind:   KindUnsupportedFormat,
+ 		Reason: prefixUnsupportedCT + ` "text/csv"`,
+@@ -1390,3 +1390,31 @@ func matchParseError(got, want error) bool {
+ 	}
+ 	return true
+ }
++
++func TestDecodeBodyMediaType(t *testing.T) {
++	encFn := func(string) *openapi3.Encoding { return nil }
++
++	t.Run("supported content type", func(t *testing.T) {
++		h := make(http.Header)
++		h.Set(headerCT, "application/json")
++		mediaType, _, err := decodeBody(strings.NewReader(`"foo"`), h, nil, encFn)
++		require.NoError(t, err)
++		require.Equal(t, "application/json", mediaType)
++	})
++
++	t.Run("content type parameters are normalized away", func(t *testing.T) {
++		h := make(http.Header)
++		h.Set(headerCT, "application/json; charset=utf-8")
++		mediaType, _, err := decodeBody(strings.NewReader(`"foo"`), h, nil, encFn)
++		require.NoError(t, err)
++		require.Equal(t, "application/json", mediaType)
++	})
++
++	t.Run("unsupported content type", func(t *testing.T) {
++		h := make(http.Header)
++		h.Set(headerCT, "application/xml")
++		mediaType, _, err := decodeBody(strings.NewReader("<foo/>"), h, nil, encFn)
++		require.Error(t, err)
++		require.Equal(t, "", mediaType)
++	})
++}
+diff --git a/openapi3filter/validate_set_default_test.go b/openapi3filter/validate_set_default_test.go
+new file mode 100644
+index 0000000..34beef2
+--- /dev/null
++++ b/openapi3filter/validate_set_default_test.go
+@@ -0,0 +1,171 @@
++package openapi3filter
++
++import (
++	"bytes"
++	"encoding/json"
++	"io/ioutil"
++	"net/http"
++	"testing"
++
++	"github.com/getkin/kin-openapi/openapi3"
++	legacyrouter "github.com/getkin/kin-openapi/routers/legacy"
++	"github.com/stretchr/testify/require"
++)
++
++func TestValidateRequestBodyAndSetDefault(t *testing.T) {
++	const spec = `{
++  "openapi": "3.0.3",
++  "info": {
++    "version": "1.0.0",
++    "title": "title",
++    "description": "desc",
++    "contact": {
++      "email": "email"
++    }
++  },
++  "paths": {
++    "/accounts": {
++      "post": {
++        "description": "Create a new account",
++        "requestBody": {
++          "required": true,
++          "content": {
++            "application/json": {
++              "schema": {
++                "type": "object",
++                "required": ["id"],
++                "properties": {
++                  "id": {
++                    "type": "string",
++                    "pattern": "[0-9a-v]+$",
++                    "minLength": 20,
++                    "maxLength": 20
++                  },
++                  "name": {
++                    "type": "string",
++                    "default": "default"
++                  },
++                  "code": {
++                    "type": "integer",
++                    "default": 123
++                  },
++                  "all": {
++                    "type": "boolean",
++                    "default": false
++                  },
++                }
++              }
++            }
++          }
++        },
++        "responses": {
++          "201": {
++            "description": "Successfully created a new account"
++          },
++          "400": {
++            "description": "The server could not understand the request due to invalid syntax",
++          }
++        }
++      }
++    }
++  }
++}`
++	sl := openapi3.NewLoader()
++	doc, err := sl.LoadFromData([]byte(spec))
++	require.NoError(t, err)
++	err = doc.Validate(sl.Context)
++	require.NoError(t, err)
++	router, err := legacyrouter.NewRouter(doc)
++	require.NoError(t, err)
++
++	type page struct {
++		Num   int    `json:"num,omitempty"`
++		Size  int    `json:"size,omitempty"`
++		Order string `json:"order,omitempty"`
++	}
++	type filter struct {
++		Field string `json:"field,omitempty"`
++		OP    string `json:"op,omitempty"`
++		Value int    `json:"value,omitempty"`
++	}
++	type body struct {
++		ID      string   `json:"id,omitempty"`
++		Name    string   `json:"name,omitempty"`
++		Code    int      `json:"code,omitempty"`
++		All     bool     `json:"all,omitempty"`
++		Page    *page    `json:"page,omitempty"`
++		Filters []filter `json:"filters,omitempty"`
++	}
++
++	testCases := []struct {
++		name          string
++		body          body
++		bodyAssertion func(t *testing.T, body string)
++	}{
++		{
++			name: "only id",
++			body: body{
++				ID: "bt6kdc3d0cvp6u8u3ft0",
++			},
++			bodyAssertion: func(t *testing.T, body string) {
++				require.JSONEq(t, `{"id":"bt6kdc3d0cvp6u8u3ft0", "name": "default", "code": 123, "all": false}`, body)
++			},
++		},
++		{
++			name: "id & name",
++			body: body{
++				ID:   "bt6kdc3d0cvp6u8u3ft0",
++				Name: "non-default",
++			},
++			bodyAssertion: func(t *testing.T, body string) {
++				require.JSONEq(t, `{"id":"bt6kdc3d0cvp6u8u3ft0", "name": "non-default", "code": 123, "all": false}`, body)
++			},
++		},
++		{
++			name: "id & name & code",
++			body: body{
++				ID:   "bt6kdc3d0cvp6u8u3ft0",
++				Name: "non-default",
++				Code: 456,
++			},
++			bodyAssertion: func(t *testing.T, body string) {
++				require.JSONEq(t, `{"id":"bt6kdc3d0cvp6u8u3ft0", "name": "non-default", "code": 456, "all": false}`, body)
++			},
++		},
++		{
++			name: "id & name & code & all",
++			body: body{
++				ID:   "bt6kdc3d0cvp6u8u3ft0",
++				Name: "non-default",
++				Code: 456,
++				All:  true,
++			},
++			bodyAssertion: func(t *testing.T, body string) {
++				require.JSONEq(t, `{"id":"bt6kdc3d0cvp6u8u3ft0", "name": "non-default", "code": 456, "all": true}`, body)
++			},
++		},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			b, err := json.Marshal(tc.body)
++			require.NoError(t, err)
++			httpReq, err := http.NewRequest(http.MethodPost, "/accounts", bytes.NewReader(b))
++			require.NoError(t, err)
++			httpReq.Header.Add(headerCT, "application/json")
++
++			route, pathParams, err := router.FindRoute(httpReq)
++			require.NoError(t, err)
++
++			err = ValidateRequest(sl.Context, &RequestValidationInput{
++				Request:    httpReq,
++				PathParams: pathParams,
++				Route:      route,
++			})
++			require.NoError(t, err)
++
++			validatedReqBody, err := ioutil.ReadAll(httpReq.Body)
++			require.NoError(t, err)
++			tc.bodyAssertion(t, string(validatedReqBody))
++		})
++	}
++}

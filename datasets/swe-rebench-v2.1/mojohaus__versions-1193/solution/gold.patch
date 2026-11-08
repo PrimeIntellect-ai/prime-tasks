@@ -1,0 +1,402 @@
+diff --git a/versions-common/src/main/java/org/codehaus/mojo/versions/utils/MavenProjectUtils.java b/versions-common/src/main/java/org/codehaus/mojo/versions/utils/MavenProjectUtils.java
+index 81d7519a..e54df949 100644
+--- a/versions-common/src/main/java/org/codehaus/mojo/versions/utils/MavenProjectUtils.java
++++ b/versions-common/src/main/java/org/codehaus/mojo/versions/utils/MavenProjectUtils.java
+@@ -18,14 +18,18 @@ package org.codehaus.mojo.versions.utils;
+  * under the License.
+  */
+ 
+-import java.util.List;
++import java.util.Collection;
++import java.util.Objects;
++import java.util.Optional;
+ import java.util.Set;
+ import java.util.TreeSet;
++import java.util.stream.Stream;
+ 
+ import org.apache.maven.model.Build;
+ import org.apache.maven.model.Dependency;
+ import org.apache.maven.model.DependencyManagement;
+ import org.apache.maven.model.PluginManagement;
++import org.apache.maven.model.Profile;
+ import org.apache.maven.plugin.logging.Log;
+ import org.apache.maven.project.MavenProject;
+ import org.codehaus.mojo.versions.api.VersionRetrievalException;
+@@ -45,7 +49,7 @@ public class MavenProjectUtils {
+      *
+      * @param project {@link MavenProject} instance
+      * @return set of {@link Dependency} objects
+-     * or an empty set if none have been retrieveddependencies or an empty set if none have been retrieved
++     *         or an empty set if none have been retrieveddependencies or an empty set if none have been retrieved
+      */
+     public static Set<Dependency> extractPluginDependenciesFromPluginsInPluginManagement(MavenProject project) {
+         return ofNullable(project.getBuild())
+@@ -89,48 +93,72 @@ public class MavenProjectUtils {
+     public static Set<Dependency> extractDependenciesFromDependencyManagement(
+             MavenProject project, boolean processDependencyManagementTransitive, Log log)
+             throws VersionRetrievalException {
+-        Set<Dependency> dependencyManagement = new TreeSet<>(DependencyComparator.INSTANCE);
+-        DependencyManagement projectDependencyManagement = processDependencyManagementTransitive
+-                ? project.getDependencyManagement()
+-                : project.getOriginalModel().getDependencyManagement();
+-        if (projectDependencyManagement != null) {
++        Stream<Dependency> dependencies = processDependencyManagementTransitive
++                ? ofNullable(project.getDependencyManagement())
++                        .map(DependencyManagement::getDependencies)
++                        .map(Collection::stream)
++                        .orElse(Stream.empty())
++                : Stream.concat(
++                        ofNullable(project.getOriginalModel().getDependencyManagement())
++                                .map(DependencyManagement::getDependencies)
++                                .map(Collection::stream)
++                                .orElse(Stream.empty()),
++                        ofNullable(project.getOriginalModel().getProfiles())
++                                .flatMap(profiles -> profiles.stream()
++                                        .map(Profile::getDependencyManagement)
++                                        .filter(Objects::nonNull)
++                                        .map(DependencyManagement::getDependencies)
++                                        .map(Collection::stream)
++                                        .reduce(Stream::concat))
++                                .orElse(Stream.empty()));
++
++        // log and try to correct versions where they don't appear in the original pom.xml
++        try {
++            return dependencies
++                    .peek(dependency -> log.debug("dependency from pom: "
++                            + dependency.getGroupId() + ":" + dependency.getArtifactId() + ":" + dependency.getVersion()
++                            + ":" + dependency.getScope()))
++                    .map(dependency -> dependency.getVersion() != null
++                            ? interpolateVersion(dependency, project)
++                            : getVersionFromParent(dependency, project, processDependencyManagementTransitive, log)
++                                    .orElse(dependency))
++                    .collect(() -> new TreeSet<>(DependencyComparator.INSTANCE), Set::add, Set::addAll);
++        } catch (IllegalArgumentException e) {
++            throw new VersionRetrievalException(e.getMessage());
++        }
++    }
+ 
+-            List<Dependency> dependenciesFromPom = projectDependencyManagement.getDependencies();
+-            for (Dependency dependency : dependenciesFromPom) {
+-                log.debug("dependency from pom: " + dependency.getGroupId() + ":" + dependency.getArtifactId() + ":"
+-                        + dependency.getVersion() + ":" + dependency.getScope());
+-                if (dependency.getVersion() == null) {
+-                    // getModel parent and getModel the information from there.
+-                    if (project.hasParent()) {
+-                        log.debug("Reading parent dependencyManagement information");
+-                        DependencyManagement parentProjectDependencyManagement = processDependencyManagementTransitive
+-                                ? project.getParent().getDependencyManagement()
+-                                : project.getParent().getOriginalModel().getDependencyManagement();
+-                        if (parentProjectDependencyManagement != null) {
+-                            List<Dependency> parentDeps = parentProjectDependencyManagement.getDependencies();
+-                            for (Dependency parentDep : parentDeps) {
+-                                // only groupId && artifactId needed cause version is null
+-                                if (dependency.getGroupId().equals(parentDep.getGroupId())
+-                                        && dependency.getArtifactId().equals(parentDep.getArtifactId())
+-                                        && dependency.getType().equals(parentDep.getType())) {
+-                                    dependencyManagement.add(parentDep);
+-                                }
+-                            }
+-                        }
+-                    } else {
+-                        String message = "We can't getModel the version for the dependency " + dependency.getGroupId()
+-                                + ":" + dependency.getArtifactId() + " because there does not exist a parent.";
+-                        log.error(message);
+-                        // Throw error because we will not able to getModel a version for a dependency.
+-                        throw new VersionRetrievalException(message);
+-                    }
+-                } else {
+-                    dependencyManagement.remove(dependency);
+-                    dependencyManagement.add(interpolateVersion(dependency, project));
+-                }
+-            }
++    /**
++     * Tries to retrieve dependency version from parent
++     * @param dependency                            {@link Dependency} for which we're trying to retrieve version
++     * @param project                               {@link MavenProject} instance
++     * @param processDependencyManagementTransitive if {@code true}, the original model will be considered
++     *                                              instead of the interpolated model, which does not contain
++     *                                              imported dependencies
++     * @param log                                   {@link Log} instance (may not be null)
++     * @return a {@link Optional} object containing a dependency from parent containing version filled in,
++     * if that could be retrieved or {@link Optional#empty()}
++     */
++    private static Optional<Dependency> getVersionFromParent(
++            Dependency dependency, MavenProject project, boolean processDependencyManagementTransitive, Log log) {
++        if (project.hasParent()) {
++            log.debug("Reading parent dependencyManagement information");
++            return ofNullable(
++                            processDependencyManagementTransitive
++                                    ? project.getParent().getDependencyManagement()
++                                    : project.getParent().getOriginalModel().getDependencyManagement())
++                    .map(DependencyManagement::getDependencies)
++                    .map(Collection::stream)
++                    .flatMap(s -> s.filter(d -> dependency.getGroupId().equals(d.getGroupId()))
++                            .filter(d -> dependency.getArtifactId().equals(d.getArtifactId()))
++                            .filter(d -> dependency.getType().equals(d.getType()))
++                            .findAny());
+         }
+-        return dependencyManagement;
++
++        String message = "We can't getModel the version for the dependency " + dependency.getGroupId() + ":"
++                + dependency.getArtifactId() + " because there does not exist a parent.";
++        log.warn(message);
++        return Optional.empty();
+     }
+ 
+     /**
+diff --git a/versions-maven-plugin/src/it/it-changerecord-update-parent-001/verify.groovy b/versions-maven-plugin/src/it/it-changerecord-update-parent-001/verify.groovy
+index 7561bb5c..986173c1 100644
+--- a/versions-maven-plugin/src/it/it-changerecord-update-parent-001/verify.groovy
++++ b/versions-maven-plugin/src/it/it-changerecord-update-parent-001/verify.groovy
+@@ -1,8 +1,8 @@
+ import groovy.xml.XmlSlurper
+ 
+ def changes = new XmlSlurper().parse( new File( basedir, 'target/versions-changes.xml' ) )
+-assert changes.dependencyUpdate.find { node -> node.@kind == 'parent-update'
++assert !(changes.dependencyUpdate.find { node -> node.@kind == 'parent-update'
+     && node.@groupId == 'localhost'
+     && node.@artifactId == 'dummy-parent'
+     && node.@oldVersion == '1.0'
+-    && node.@newVersion == '3.0' } != null
++    && node.@newVersion == '3.0' }.isEmpty())
+diff --git a/versions-maven-plugin/src/it/it-changerecord-update-properties-001/verify.groovy b/versions-maven-plugin/src/it/it-changerecord-update-properties-001/verify.groovy
+index e78e957e..d1734b1c 100644
+--- a/versions-maven-plugin/src/it/it-changerecord-update-properties-001/verify.groovy
++++ b/versions-maven-plugin/src/it/it-changerecord-update-properties-001/verify.groovy
+@@ -1,11 +1,11 @@
+ import groovy.xml.XmlSlurper
+ 
+ def changes = new XmlSlurper().parse( new File( basedir, 'target/versions-changes.xml' ) )
+-assert changes.dependencyUpdate.find { node -> node.@kind == 'property-update'
++assert !(changes.dependencyUpdate.find { node -> node.@kind == 'property-update'
+         && node.@groupId == 'localhost'
+         && node.@artifactId == 'dummy-api'
+         && node.@oldVersion == '1.0'
+-        && node.@newVersion == '3.0' } != null
+-assert changes.propertyUpdate.find { node -> node.@property == 'api'
++        && node.@newVersion == '3.0' }.isEmpty())
++assert !(changes.propertyUpdate.find { node -> node.@property == 'api'
+         && node.@oldValue == '1.0'
+-        && node.@newValue == '3.0' } != null
++        && node.@newValue == '3.0' }.isEmpty())
+diff --git a/versions-maven-plugin/src/it/it-changerecord-use-next-versions-001/verify.groovy b/versions-maven-plugin/src/it/it-changerecord-use-next-versions-001/verify.groovy
+index 88d03acd..8e68c183 100644
+--- a/versions-maven-plugin/src/it/it-changerecord-use-next-versions-001/verify.groovy
++++ b/versions-maven-plugin/src/it/it-changerecord-use-next-versions-001/verify.groovy
+@@ -1,8 +1,8 @@
+ import groovy.xml.XmlSlurper
+ 
+ def changes = new XmlSlurper().parse( new File( basedir, 'target/versions-changes.xml' ) )
+-assert changes.dependencyUpdate.find { node -> node.@kind == 'dependency-update'
++assert !(changes.dependencyUpdate.find { node -> node.@kind == 'dependency-update'
+         && node.@groupId == 'localhost'
+         && node.@artifactId == 'dummy-api'
+         && node.@oldVersion == '1.1.1-2'
+-        && node.@newVersion == '1.1.2' } != null
++        && node.@newVersion == '1.1.2' }.isEmpty())
+diff --git a/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/invoker.properties b/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/invoker.properties
+new file mode 100644
+index 00000000..fc1f0790
+--- /dev/null
++++ b/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/invoker.properties
+@@ -0,0 +1,2 @@
++invoker.goals = ${project.groupId}:${project.artifactId}:${project.version}:dependency-updates-report
++invoker.mavenOpts = -DdependencyUpdatesReportFormats=xml -DprocessDependencyManagementTransitive=false
+diff --git a/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/pom.xml b/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/pom.xml
+new file mode 100644
+index 00000000..7ad6986f
+--- /dev/null
++++ b/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/pom.xml
+@@ -0,0 +1,29 @@
++<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
++  <modelVersion>4.0.0</modelVersion>
++  <groupId>localhost</groupId>
++  <artifactId>issue-1191</artifactId>
++  <version>1.0</version>
++
++  <description>display-dependency-updates should consider dependencyManagement in enabled profiles</description>
++
++  <profiles>
++    <profile>
++      <id>test-profile</id>
++      <activation>
++        <activeByDefault>true</activeByDefault>
++      </activation>
++
++      <dependencyManagement>
++        <dependencies>
++          <dependency>
++            <groupId>localhost</groupId>
++            <artifactId>dummy-api</artifactId>
++            <version>1.0</version>
++          </dependency>
++        </dependencies>
++      </dependencyManagement>
++    </profile>
++  </profiles>
++
++</project>
+diff --git a/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/verify.groovy b/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/verify.groovy
+new file mode 100644
+index 00000000..5957357e
+--- /dev/null
++++ b/versions-maven-plugin/src/it/it-dependency-updates-report-issue-1191/verify.groovy
+@@ -0,0 +1,8 @@
++import groovy.xml.XmlSlurper
++
++def report = new XmlSlurper().parse(new File(basedir, "target/dependency-updates-report.xml"))
++assert !(report
++        .dependencyManagements
++        .dependencyManagement
++        .find { node -> node.artifactId == 'dummy-api' }.isEmpty())
++
+diff --git a/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/AbstractDependencyUpdatesReport.java b/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/AbstractDependencyUpdatesReport.java
+index 65f258a8..5c60bee5 100644
+--- a/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/AbstractDependencyUpdatesReport.java
++++ b/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/AbstractDependencyUpdatesReport.java
+@@ -33,7 +33,6 @@ import org.apache.maven.artifact.handler.manager.ArtifactHandlerManager;
+ import org.apache.maven.artifact.versioning.ArtifactVersion;
+ import org.apache.maven.doxia.sink.Sink;
+ import org.apache.maven.model.Dependency;
+-import org.apache.maven.model.DependencyManagement;
+ import org.apache.maven.plugins.annotations.Parameter;
+ import org.apache.maven.project.MavenProject;
+ import org.apache.maven.reporting.MavenReportException;
+@@ -49,8 +48,6 @@ import org.codehaus.plexus.i18n.I18N;
+ import org.eclipse.aether.RepositorySystem;
+ 
+ import static java.util.Collections.emptyMap;
+-import static java.util.Optional.ofNullable;
+-import static org.codehaus.mojo.versions.utils.MavenProjectUtils.interpolateVersion;
+ import static org.codehaus.mojo.versions.utils.MiscUtils.filter;
+ 
+ /**
+@@ -206,31 +203,11 @@ public abstract class AbstractDependencyUpdatesReport extends AbstractVersionsRe
+ 
+     protected void handleDependencyManagementTransitive(
+             MavenProject project, Set<Dependency> dependencyManagementCollector) {
+-        if (processDependencyManagementTransitive) {
+-            if (hasDependencyManagement(project)) {
+-                if (getLog().isDebugEnabled()) {
+-                    project.getDependencyManagement().getDependencies().forEach(dep -> getLog().debug(
+-                                    "Dpmg: " + dep.getGroupId() + ":" + dep.getArtifactId() + ":" + dep.getVersion()
+-                                            + ":" + dep.getType() + ":" + dep.getScope()));
+-                }
+-                dependencyManagementCollector.addAll(
+-                        project.getDependencyManagement().getDependencies());
+-            }
+-        } else {
+-            // Using the original model to getModel the original dependencyManagement entries and
+-            // not the interpolated model.
+-            // TODO: I'm not 100% sure if this will work correctly in all cases.
+-            ofNullable(project.getOriginalModel().getDependencyManagement())
+-                    .map(DependencyManagement::getDependencies)
+-                    .ifPresent(list -> list.stream()
+-                            .map(dep -> interpolateVersion(dep, project))
+-                            .peek(dep -> {
+-                                if (getLog().isDebugEnabled()) {
+-                                    getLog().debug("Original Dpmg: " + dep.getGroupId() + ":" + dep.getArtifactId()
+-                                            + ":" + dep.getVersion() + ":" + dep.getType() + ":" + dep.getScope());
+-                                }
+-                            })
+-                            .forEach(dependencyManagementCollector::add));
++        try {
++            dependencyManagementCollector.addAll(MavenProjectUtils.extractDependenciesFromDependencyManagement(
++                    project, processDependencyManagementTransitive, getLog()));
++        } catch (VersionRetrievalException e) {
++            throw new RuntimeException(e);
+         }
+     }
+ 
+diff --git a/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/DisplayDependencyUpdatesMojo.java b/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/DisplayDependencyUpdatesMojo.java
+index 818930f5..9cf5be21 100644
+--- a/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/DisplayDependencyUpdatesMojo.java
++++ b/versions-maven-plugin/src/main/java/org/codehaus/mojo/versions/DisplayDependencyUpdatesMojo.java
+@@ -346,26 +346,6 @@ public class DisplayDependencyUpdatesMojo extends AbstractVersionsDisplayMojo {
+                 || Objects.equals(managedDependency.getVersion(), dependency.getVersion());
+     }
+ 
+-    public boolean isProcessingDependencyManagement() {
+-        return processDependencyManagement;
+-    }
+-
+-    public boolean isProcessingDependencies() {
+-        return processDependencies;
+-    }
+-
+-    public boolean isProcessingPluginDependencies() {
+-        return processPluginDependencies;
+-    }
+-
+-    public boolean isProcessPluginDependenciesInDependencyManagement() {
+-        return processPluginDependenciesInPluginManagement;
+-    }
+-
+-    public boolean isVerbose() {
+-        return verbose;
+-    }
+-
+     // ------------------------ INTERFACE METHODS ------------------------
+ 
+     // --------------------- Interface Mojo ---------------------
+@@ -381,10 +361,9 @@ public class DisplayDependencyUpdatesMojo extends AbstractVersionsDisplayMojo {
+         logInit();
+         validateInput();
+ 
+-        Set<Dependency> dependencyManagement = emptySet();
+-
++        Set<Dependency> dependencyManagement;
+         try {
+-            if (isProcessingDependencyManagement()) {
++            if (processDependencyManagement) {
+                 dependencyManagement = filterDependencies(
+                         extractDependenciesFromDependencyManagement(
+                                 getProject(), processDependencyManagementTransitive, getLog()),
+@@ -400,15 +379,16 @@ public class DisplayDependencyUpdatesMojo extends AbstractVersionsDisplayMojo {
+                                         false,
+                                         allowSnapshots),
+                         "Dependency Management");
++            } else {
++                dependencyManagement = emptySet();
+             }
+-            if (isProcessingDependencies()) {
+-                Set<Dependency> finalDependencyManagement = dependencyManagement;
++            if (processDependencies) {
+                 logUpdates(
+                         getHelper()
+                                 .lookupDependenciesUpdates(
+                                         filterDependencies(
+                                                         getProject().getDependencies().stream()
+-                                                                .filter(dep -> finalDependencyManagement.stream()
++                                                                .filter(dep -> dependencyManagement.stream()
+                                                                         .noneMatch(depMan ->
+                                                                                 dependenciesMatch(dep, depMan)))
+                                                                 .filter(dep -> showVersionless
+@@ -429,7 +409,7 @@ public class DisplayDependencyUpdatesMojo extends AbstractVersionsDisplayMojo {
+                                         allowSnapshots),
+                         "Dependencies");
+             }
+-            if (isProcessPluginDependenciesInDependencyManagement()) {
++            if (processPluginDependenciesInPluginManagement) {
+                 logUpdates(
+                         getHelper()
+                                 .lookupDependenciesUpdates(
+@@ -446,7 +426,7 @@ public class DisplayDependencyUpdatesMojo extends AbstractVersionsDisplayMojo {
+                                         allowSnapshots),
+                         "pluginManagement of plugins");
+             }
+-            if (isProcessingPluginDependencies()) {
++            if (processPluginDependencies) {
+                 logUpdates(
+                         getHelper()
+                                 .lookupDependenciesUpdates(
+@@ -505,7 +485,7 @@ public class DisplayDependencyUpdatesMojo extends AbstractVersionsDisplayMojo {
+                 INFO_PAD_SIZE + getOutputLineWidthOffset(),
+                 verbose);
+ 
+-        if (isVerbose()) {
++        if (verbose) {
+             if (updates.getUsingLatest().isEmpty()) {
+                 if (!updates.getWithUpdates().isEmpty()) {
+                     logLine(false, "No dependencies in " + section + " are using the newest version.");

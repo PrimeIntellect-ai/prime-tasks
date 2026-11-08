@@ -1,0 +1,296 @@
+diff --git a/safehttp/default_dispatcher.go b/safehttp/default_dispatcher.go
+index a2366b3..099f4c5 100644
+--- a/safehttp/default_dispatcher.go
++++ b/safehttp/default_dispatcher.go
+@@ -26,11 +26,17 @@ import (
+ // DefaultDispatcher is responsible for writing safe responses.
+ type DefaultDispatcher struct{}
+ 
+-// ContentType returns the Content-Type of a safe response if it's of a
+-// safe-type and an error otherwise.
++// ContentType returns the Content-Type of a response if it's deemed safe and
++// an error otherwise.
+ func (DefaultDispatcher) ContentType(resp Response) (string, error) {
+-	switch resp.(type) {
+-	case safehtml.HTML, *template.Template:
++	switch x := resp.(type) {
++	case safehtml.HTML:
++		return "text/html; charset=utf-8", nil
++	case TemplateResponse:
++		_, ok := (x.Template).(*template.Template)
++		if !ok {
++			return "", fmt.Errorf("%T is not a safe response type, a Content-Type cannot be provided", resp)
++		}
+ 		return "text/html; charset=utf-8", nil
+ 	case JSONResponse:
+ 		return "application/json; charset=utf-8", nil
+@@ -39,49 +45,39 @@ func (DefaultDispatcher) ContentType(resp Response) (string, error) {
+ 	}
+ }
+ 
+-// Write writes the response to the Response Writer if it's safe HTML. It
+-// returns a non-nil error if the response is not safe HTML or if writing the
+-// response fails.
+-func (DefaultDispatcher) Write(rw http.ResponseWriter, resp Response) error {
+-	x, ok := resp.(safehtml.HTML)
+-	if !ok {
+-		return fmt.Errorf("%T is not a safe response type and it cannot be written", resp)
+-	}
+-	_, err := io.WriteString(rw, x.String())
+-	return err
+-
+-}
+-
+-// WriteJSON serialises and writes a JSON to the underlying http.ResponseWriter.
+-// If the provided response is not valid JSON or writing the response fails, the
+-// method will return an error.
+-func (DefaultDispatcher) WriteJSON(rw http.ResponseWriter, resp JSONResponse) error {
+-	io.WriteString(rw, ")]}',\n") // Break parsing of JavaScript in order to prevent XSSI.
+-	return json.NewEncoder(rw).Encode(resp.Data)
+-}
+-
+-// ExecuteTemplate applies the parsed template to the provided data object, if
+-// the template is a safe HTML template, writing the output to the  http.
+-// ResponseWriter. If the funcMap is non-nil, its elements override the
+-// existing names to functions mappings in the template. An attempt to define a
+-// new name to function mapping that is not already in the template will result
+-// in a panic.
++// Write writes the response to the http.ResponseWriter if it's deemed safe. It
++// returns a non-nil error if the response is deemed unsafe or if the writing
++// operation fails.
+ //
+-// If an error occurs executing the template or writing its output,
+-// execution stops, but partial results may already have been written to
+-// the Response Writer.
+-func (DefaultDispatcher) ExecuteTemplate(rw http.ResponseWriter, resp TemplateResponse) error {
+-	t := *resp.Template
+-	x, ok := t.(*template.Template)
+-	if !ok {
+-		return fmt.Errorf("%T is not a safe template and it cannot be parsed and written", resp.Template)
+-	}
+-	if len(resp.FuncMap) == 0 {
+-		return x.Execute(rw, resp.Data)
+-	}
+-	cloned, err := x.Clone()
+-	if err != nil {
++// For JSONResponses, the underlying object is serialised and written if it's a
++// valid JSON.
++//
++// For TemplateResponses, the parsed template is applied to the provided data
++// object. If the funcMap is non-nil, its elements override the  existing names
++// to functions mappings in the template. An attempt to define a new name to
++// function mapping that is not already in the template will result  in a panic.
++func (DefaultDispatcher) Write(rw http.ResponseWriter, resp Response) error {
++	switch x := resp.(type) {
++	case JSONResponse:
++		io.WriteString(rw, ")]}',\n") // Break parsing of JavaScript in order to prevent XSSI.
++		return json.NewEncoder(rw).Encode(x.Data)
++	case TemplateResponse:
++		t, ok := (x.Template).(*template.Template)
++		if !ok {
++			return fmt.Errorf("%T is not a safe template and it cannot be parsed and written", t)
++		}
++		if len(x.FuncMap) == 0 {
++			return t.Execute(rw, x.Data)
++		}
++		cloned, err := t.Clone()
++		if err != nil {
++			return err
++		}
++		return cloned.Funcs(x.FuncMap).Execute(rw, x.Data)
++	case safehtml.HTML:
++		_, err := io.WriteString(rw, x.String())
+ 		return err
++	default:
++		return fmt.Errorf("%T is not a safe response type and it cannot be written", resp)
+ 	}
+-	return cloned.Funcs(resp.FuncMap).Execute(rw, resp.Data)
+ }
+diff --git a/safehttp/response.go b/safehttp/response.go
+index 7ebb2d2..2c7719b 100644
+--- a/safehttp/response.go
++++ b/safehttp/response.go
+@@ -29,6 +29,13 @@ type JSONResponse struct {
+ 	Data interface{}
+ }
+ 
++// WriteJSON creates a JSONResponse from the data object and calls the Write
++// function of the ResponseWriter, passing the response. The data object should
++// be valid JSON, otherwise an error will occur.
++func WriteJSON(w *ResponseWriter, data interface{}) Result {
++	return w.Write(JSONResponse{data})
++}
++
+ // Template implements a template.
+ type Template interface {
+ 	// Execute applies data to the template and then writes the result to
+@@ -43,11 +50,25 @@ type Template interface {
+ // TemplateResponse bundles a Template with its data and names to function
+ // mappings to be passed together to the commit phase.
+ type TemplateResponse struct {
+-	Template *Template
+-	Data     *interface{}
++	Template Template
++	Data     interface{}
+ 	FuncMap  map[string]interface{}
+ }
+ 
++// ExecuteTemplate creates a TemplateResponse from the provided Template and its
++// data and calls the Write function of the ResponseWriter, passing the
++// response.
++func ExecuteTemplate(w *ResponseWriter, t Template, data interface{}) Result {
++	return w.Write(TemplateResponse{t, data, nil})
++}
++
++// ExecuteTemplateWithFuncs creates a TemplateResponse from the provided
++// Template, its data and the name to function mappings and calls the Write
++// function of the ResponseWriter, passing the response.
++func ExecuteTemplateWithFuncs(w *ResponseWriter, t Template, data interface{}, fm map[string]interface{}) Result {
++	return w.Write(TemplateResponse{t, data, fm})
++}
++
+ // NoContentResponse is sent to the commit phase when it's initiated from
+ // ResponseWriter.NoContent.
+ type NoContentResponse struct{}
+diff --git a/safehttp/response_writer.go b/safehttp/response_writer.go
+index 73324ce..6ac4a62 100644
+--- a/safehttp/response_writer.go
++++ b/safehttp/response_writer.go
+@@ -66,12 +66,10 @@ func NotWritten() Result {
+ 	return Result{}
+ }
+ 
+-// Write dispatches the response to the Dispatcher, setting the Content-Type and
+-// response status if the provided response is a safe response. The
+-// Dispatcher will then write the response to the underlying Response Writer.
++// Write dispatches the response to the Dispatcher. This will be written to the
++// underlying http.ResponseWriter if the Dispatcher decides it's safe to do so.
+ //
+-// TODO: replace panics with proper error handling when getting the response
+-// Content-Type or writing the response fails.
++// TODO: replace panics with proper error handling when writing the response fails.
+ func (w *ResponseWriter) Write(resp Response) Result {
+ 	if w.written {
+ 		panic("ResponseWriter was already written to")
+@@ -80,71 +78,17 @@ func (w *ResponseWriter) Write(resp Response) Result {
+ 	if w.written {
+ 		return Result{}
+ 	}
+-	w.markWritten()
+-	ct, err := w.d.ContentType(resp)
+-	if err != nil {
+-		panic(err)
+-	}
+-	w.rw.Header().Set("Content-Type", ct)
+-	w.rw.WriteHeader(int(StatusOK))
+-	if err := w.d.Write(w.rw, resp); err != nil {
+-		panic(err)
+-	}
+-	return Result{}
+-}
+ 
+-// WriteJSON encapsulates data into a JSON response and dispatches it to the
+-// Dispatcher, to be serialised and written to the ResponseWriter. It will also
+-// set the Content-Type and response status will be set.
+-//
+-// TODO: replace panics with proper error handling when getting the response
+-// Content-Type or writing the response fails.
+-func (w *ResponseWriter) WriteJSON(data interface{}) Result {
+-	if w.written {
+-		panic("ResponseWriter was already written to")
+-	}
+-	w.handler.commitPhase(w, JSONResponse{Data: data})
+-	if w.written {
+-		return Result{}
+-	}
+ 	w.markWritten()
+-	resp := JSONResponse{Data: data}
++
+ 	ct, err := w.d.ContentType(resp)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+ 	w.rw.Header().Set("Content-Type", ct)
+ 	w.rw.WriteHeader(int(StatusOK))
+-	if err := w.d.WriteJSON(w.rw, resp); err != nil {
+-		panic(err)
+-	}
+-	return Result{}
+-}
+ 
+-// WriteTemplate dispatches a parsed template and a data object to the
+-// Dispatcher to be executed and written to the underlying Response Writer, in
+-// case the template is a safe HTML template. If it is a safe HTML Template, the
+-// Content-Type  and response status will also be set.
+-//
+-// TODO: replace panics with proper error handling when getting the response
+-// Content-Type or writing the response fails.
+-func (w *ResponseWriter) WriteTemplate(t Template, data interface{}) Result {
+-	if w.written {
+-		panic("ResponseWriter was already written to")
+-	}
+-	resp := TemplateResponse{Template: &t, Data: &data, FuncMap: map[string]interface{}{}}
+-	w.handler.commitPhase(w, resp)
+-	if w.written {
+-		return Result{}
+-	}
+-	w.markWritten()
+-	ct, err := w.d.ContentType(t)
+-	if err != nil {
+-		panic(err)
+-	}
+-	w.rw.Header().Set("Content-Type", ct)
+-	w.rw.WriteHeader(int(StatusOK))
+-	if err := w.d.ExecuteTemplate(w.rw, resp); err != nil {
++	if err := w.d.Write(w.rw, resp); err != nil {
+ 		panic(err)
+ 	}
+ 	return Result{}
+@@ -219,36 +163,21 @@ func (w *ResponseWriter) SetCookie(c *Cookie) error {
+ // The implementation of a custom Dispatcher should be thoroughly reviewed by
+ // the security team to avoid introducing vulnerabilities.
+ type Dispatcher interface {
+-	// Write writes a Response to the http.ResponseWriter.
+-	//
+-	// It should return an error if the writing operation fails or if the
+-	// provided Response should not be written to the http.ResponseWriter
+-	Write(rw http.ResponseWriter, resp Response) error
+-
+-	// WriteJSON serialises and writes a JSON object to the http.ResponseWriter.
+-	//
+-	// This should return an error if the provided response is not a safe
+-	// JSONResponse  or if writing the object to the http.ResponseWriter fails.
+-	WriteJSON(rw http.ResponseWriter, resp JSONResponse) error
+-
+-	// ExecuteTemplate applies the response parsed template to its data object
+-	// and writes the output to the http.ResponseWriter. If the response funcMap
+-	// is non-nil, the Dispatcher will try to update the names to functions
+-	// mappings of the template.
+-	//
+-	// This should return an error if the template contained by the
+-	// TemplateResponse is not a safe template or if an error occurs executing
+-	// or writing the template.
+-	ExecuteTemplate(rw http.ResponseWriter, resp TemplateResponse) error
+-
+ 	// Content-Type returns the Content-Type of the provided response if it is
+-	// of a type supported by the Dispatcher and should return an error
++	// of a safe type, supported by the Dispatcher, and should return an error
+ 	// otherwise.
+ 	//
+ 	// Sending a response to the http.ResponseWriter without properly setting
+ 	// CT is error-prone and could introduce vulnerabilities. Therefore, this
+-	// method should be used to set the Content-Type header before calling any
+-	// of the writing methods in the Dispatcher. Writing should not proceed
+-	// if ContentType returns an error.
++	// method should be used to set the Content-Type header before calling
++	// Dispatcher.Write. Writing should not proceed if ContentType returns an
++	// error.
+ 	ContentType(resp Response) (string, error)
++
++	// Write writes a Response to the underlying http.ResponseWriter.
++	//
++	// It should return an error if the writing operation fails or if the
++	// provided Response should not be written to the http.ResponseWriter
++	// because it's unsafe.
++	Write(rw http.ResponseWriter, resp Response) error
+ }

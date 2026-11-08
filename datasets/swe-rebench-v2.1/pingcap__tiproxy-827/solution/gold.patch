@@ -1,0 +1,131 @@
+diff --git a/pkg/balance/factor/factor.go b/pkg/balance/factor/factor.go
+index 5f22313..cf95a96 100644
+--- a/pkg/balance/factor/factor.go
++++ b/pkg/balance/factor/factor.go
+@@ -15,7 +15,7 @@ const (
+ 	AdviceNeutral BalanceAdvice = iota
+ 	// AdviceNegtive indicates don't balance these 2 backends, even for the rest factors.
+ 	AdviceNegtive
+-	// AdvicePositive indicates balancing these 2 backends now.
++	// AdvicePositive indicates balancing these 2 backends now. It only works when the source score is greater.
+ 	AdvicePositive
+ )
+ 
+@@ -27,7 +27,7 @@ type Factor interface {
+ 	// ScoreBitNum returns the bit number of the score.
+ 	ScoreBitNum() int
+ 	// BalanceCount returns the count of connections to balance per second.
+-	// 0 indicates the factor is already balanced.
++	// The caller ensures that the score of from is greater or equal to the score of to.
+ 	BalanceCount(from, to scoredBackend) (BalanceAdvice, float64, []zap.Field)
+ 	SetConfig(cfg *config.Config)
+ 	// CanBeRouted returns whether a connection can be routed or migrated to the backend with the score.
+diff --git a/pkg/balance/factor/factor_balance.go b/pkg/balance/factor/factor_balance.go
+index 7463aa6..8a41bf7 100644
+--- a/pkg/balance/factor/factor_balance.go
++++ b/pkg/balance/factor/factor_balance.go
+@@ -271,33 +271,34 @@ func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (
+ 			continue
+ 		}
+ 		leftBitNum := fbb.totalBitNum
++		logFields = logFields[:0]
+ 		for _, factor := range fbb.factors {
+ 			bitNum := factor.ScoreBitNum()
+ 			score1 := scoredBackends[i].scoreBits << (maxBitNum - leftBitNum) >> (maxBitNum - bitNum)
+ 			score2 := scoredBackends[0].scoreBits << (maxBitNum - leftBitNum) >> (maxBitNum - bitNum)
+-			if score1 > score2 {
++			if score1 >= score2 {
+ 				// The factors with higher priorities are ordered, so this factor shouldn't violate them.
+ 				// E.g. if the CPU usage of A is higher than B, don't migrate from B to A even if A is preferred in location.
+-				var fields []zap.Field
+ 				var advice BalanceAdvice
++				var fields []zap.Field
+ 				advice, balanceCount, fields = factor.BalanceCount(scoredBackends[i], scoredBackends[0])
+ 				if advice == AdviceNegtive {
+ 					// If the factor will be unbalanced after migration, skip the rest factors.
+ 					// E.g. if the CPU usage of A will be much higher than B after migration,
+ 					// don't migrate from B to A even if A is preferred in location.
+ 					break
+-				} else if advice == AdvicePositive {
+-					if balanceCount > 0.0001 {
+-						from, to = scoredBackends[i].BackendCtx, scoredBackends[0].BackendCtx
+-						reason = factor.Name()
+-						logFields = append(fields, zap.String("factor", reason),
+-							zap.String("from_total_score", strconv.FormatUint(scoredBackends[i].scoreBits, 16)),
+-							zap.String("to_total_score", strconv.FormatUint(scoredBackends[0].scoreBits, 16)),
+-							zap.Uint64("from_factor_score", score1),
+-							zap.Uint64("to_factor_score", score2),
+-							zap.Float64("balance_count", balanceCount))
+-						return
+-					}
++				}
++				logFields = append(logFields, fields...)
++				if score1 > score2 && advice == AdvicePositive && balanceCount > 0.0001 {
++					from, to = scoredBackends[i].BackendCtx, scoredBackends[0].BackendCtx
++					reason = factor.Name()
++					logFields = append(logFields, zap.String("factor", reason),
++						zap.String("from_total_score", strconv.FormatUint(scoredBackends[i].scoreBits, 16)),
++						zap.String("to_total_score", strconv.FormatUint(scoredBackends[0].scoreBits, 16)),
++						zap.Uint64("from_factor_score", score1),
++						zap.Uint64("to_factor_score", score2),
++						zap.Float64("balance_count", balanceCount))
++					return
+ 				}
+ 			} else if score1 < score2 {
+ 				// Stop it once a factor is in the opposite order, otherwise a subsequent factor may violate this one.
+diff --git a/pkg/balance/factor/factor_cpu.go b/pkg/balance/factor/factor_cpu.go
+index bcf6228..adc0ede 100644
+--- a/pkg/balance/factor/factor_cpu.go
++++ b/pkg/balance/factor/factor_cpu.go
+@@ -270,7 +270,7 @@ func (fc *FactorCPU) BalanceCount(from, to scoredBackend) (BalanceAdvice, float6
+ 	// E.g. 10% vs 25% don't need rebalance, but 80% vs 95% need rebalance.
+ 	// Use the average usage to avoid thrash when CPU jitters too much and use the latest usage to avoid migrate too many connections.
+ 	if 1.3-toAvgUsage < (1.3-fromAvgUsage)*cpuBalancedRatio || 1.3-toLatestUsage < (1.3-fromLatestUsage)*cpuBalancedRatio {
+-		return AdviceNeutral, 0, nil
++		return AdviceNeutral, 0, fields
+ 	}
+ 	return AdvicePositive, 1 / fc.usagePerConn / balanceRatio4Cpu, fields
+ }
+diff --git a/pkg/balance/factor/factor_health.go b/pkg/balance/factor/factor_health.go
+index 570e4cd..f2637fa 100644
+--- a/pkg/balance/factor/factor_health.go
++++ b/pkg/balance/factor/factor_health.go
+@@ -353,13 +353,13 @@ func (fh *FactorHealth) BalanceCount(from, to scoredBackend) (BalanceAdvice, flo
+ 	// Only migrate connections when one is valueRangeNormal and the other is valueRangeAbnormal.
+ 	fromScore := fh.caclErrScore(from.Addr())
+ 	toScore := fh.caclErrScore(to.Addr())
+-	if fromScore-toScore <= 1 {
+-		return AdviceNeutral, 0, nil
+-	}
+ 	snapshot := fh.snapshot[from.Addr()]
+ 	fields := []zap.Field{
+ 		zap.String("indicator", snapshot.indicator),
+ 		zap.Int("value", snapshot.value)}
++	if fromScore-toScore <= 1 {
++		return AdviceNeutral, 0, fields
++	}
+ 	return AdvicePositive, snapshot.balanceCount, fields
+ }
+ 
+diff --git a/pkg/balance/factor/factor_memory.go b/pkg/balance/factor/factor_memory.go
+index 96ec5a7..95257ea 100644
+--- a/pkg/balance/factor/factor_memory.go
++++ b/pkg/balance/factor/factor_memory.go
+@@ -274,14 +274,14 @@ func (fm *FactorMemory) BalanceCount(from, to scoredBackend) (BalanceAdvice, flo
+ 	// So we only rebalance when the difference of risk levels of 2 backends is big enough.
+ 	fromSnapshot := fm.snapshot[from.Addr()]
+ 	toSnapshot := fm.snapshot[to.Addr()]
+-	if fromSnapshot.riskLevel-toSnapshot.riskLevel <= 1 {
+-		return AdviceNeutral, 0, nil
+-	}
+ 	fields := []zap.Field{
+ 		zap.Duration("from_time_to_oom", fromSnapshot.timeToOOM),
+ 		zap.Float64("from_mem_usage", fromSnapshot.memUsage),
+ 		zap.Duration("to_time_to_oom", toSnapshot.timeToOOM),
+ 		zap.Float64("to_mem_usage", toSnapshot.memUsage)}
++	if fromSnapshot.riskLevel-toSnapshot.riskLevel <= 1 {
++		return AdviceNeutral, 0, fields
++	}
+ 	return AdvicePositive, fromSnapshot.balanceCount, fields
+ }
+ 

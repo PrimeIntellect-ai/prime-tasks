@@ -1,0 +1,290 @@
+diff --git a/b2/download_dest.py b/b2/download_dest.py
+index a323ba4..7045e4d 100644
+--- a/b2/download_dest.py
++++ b/b2/download_dest.py
+@@ -10,6 +10,7 @@
+ 
+ import os
+ from abc import abstractmethod
++from contextlib import contextmanager
+ 
+ import six
+ 
+@@ -30,7 +31,7 @@ class AbstractDownloadDestination(object):
+     @limit_trace_arguments(skip=[
+         'content_sha1',
+     ])
+-    def open(
++    def make_file_context(
+         self,
+         file_id,
+         file_name,
+@@ -42,8 +43,8 @@ class AbstractDownloadDestination(object):
+         range_=None
+     ):
+         """
+-        Returns a binary file-like object to use for writing the contents of
+-        the file.
++        Returns a context manager that yields a binary file-like object to use for
++        writing the contents of the file.
+ 
+         :param file_id: the B2 file ID from the headers
+         :param file_name: the B2 file name from the headers
+@@ -57,34 +58,6 @@ class AbstractDownloadDestination(object):
+         """
+ 
+ 
+-class OpenLocalFileForWriting(object):
+-    """
+-    Context manager that opens a local file for writing,
+-    and sets the modification time when it's done.
+-
+-    Takes care of opening/closing the file.
+-    """
+-
+-    def __init__(self, local_path_name, mod_time_millis):
+-        self.local_path_name = local_path_name
+-        self.mod_time_millis = mod_time_millis
+-
+-    def __enter__(self):
+-        self.file = open(self.local_path_name, 'wb')
+-        return self.file.__enter__()
+-
+-    def __exit__(self, exc_type, exc_val, exc_tb):
+-        result = self.file.__exit__(exc_type, exc_val, exc_tb)
+-        mod_time = self.mod_time_millis / 1000.0
+-
+-        # This is an ugly hack to make the tests work.  I can't think
+-        # of any other cases where os.utime might fail.
+-        if self.local_path_name != '/dev/null':
+-            os.utime(self.local_path_name, (mod_time, mod_time))
+-
+-        return result
+-
+-
+ class DownloadDestLocalFile(AbstractDownloadDestination):
+     """
+     Stores a downloaded file into a local file and sets its modification time.
+@@ -93,7 +66,7 @@ class DownloadDestLocalFile(AbstractDownloadDestination):
+     def __init__(self, local_file_path):
+         self.local_file_path = local_file_path
+ 
+-    def open(
++    def make_file_context(
+         self,
+         file_id,
+         file_name,
+@@ -111,23 +84,20 @@ class DownloadDestLocalFile(AbstractDownloadDestination):
+         self.content_sha1 = content_sha1
+         self.file_info = file_info
+         self.range_ = range_
++        return self.write_to_local_file_context(mod_time_millis)
+ 
+-        return OpenLocalFileForWriting(self.local_file_path, mod_time_millis)
+-
+-
+-class BytesCapture(six.BytesIO):
+-    """
+-    The BytesIO class discards the data on close().  We don't want to do that.
+-    """
+-
+-    def close(self):
+-        pass
++    @contextmanager
++    def write_to_local_file_context(self, mod_time_millis):
++        # Open the file and let the caller write it.
++        with open(self.local_file_path, 'wb') as f:
++            yield f
+ 
+-    def __enter__(self):
+-        return self
+-
+-    def __exit__(self, exc_type, exc_val, exc_tb):
+-        pass
++        # After it's closed, set the mod time.
++        # This is an ugly hack to make the tests work.  I can't think
++        # of any other cases where os.utime might fail.
++        if self.local_file_path != '/dev/null':
++            mod_time = mod_time_millis / 1000.0
++            os.utime(self.local_file_path, (mod_time, mod_time))
+ 
+ 
+ class DownloadDestBytes(AbstractDownloadDestination):
+@@ -135,7 +105,10 @@ class DownloadDestBytes(AbstractDownloadDestination):
+     Stores a downloaded file into bytes in memory.
+     """
+ 
+-    def open(
++    def __init__(self):
++        self.bytes_written = None
++
++    def make_file_context(
+         self,
+         file_id,
+         file_name,
+@@ -153,17 +126,41 @@ class DownloadDestBytes(AbstractDownloadDestination):
+         self.content_sha1 = content_sha1
+         self.file_info = file_info
+         self.mod_time_millis = mod_time_millis
+-        self.bytes_io = BytesCapture()
+         self.range_ = range_
+-        return self.bytes_io
++        return self.capture_bytes_context()
++
++    @contextmanager
++    def capture_bytes_context(self):
++        """
++        Remembers the bytes written in self.bytes_written
++        """
++        # Make a place to store the data written
++        bytes_io = six.BytesIO()
++
++        # Let the caller write it
++        yield bytes_io
++
++        # Capture the result.  The BytesIO object won't let you grab
++        # the data after it's closed
++        self.bytes_written = bytes_io.getvalue()
++        bytes_io.close()
++
++    def get_bytes_written(self):
++        if self.bytes_written is None:
++            raise Exception('data not written yet')
++        return self.bytes_written
+ 
+ 
+ class DownloadDestProgressWrapper(AbstractDownloadDestination):
++    """
++    Wraps a DownloadDestination, and reports progress to a ProgressListener.
++    """
++
+     def __init__(self, download_dest, progress_listener):
+         self.download_dest = download_dest
+         self.progress_listener = progress_listener
+ 
+-    def open(
++    def make_file_context(
+         self,
+         file_id,
+         file_name,
+@@ -174,12 +171,22 @@ class DownloadDestProgressWrapper(AbstractDownloadDestination):
+         mod_time_millis,
+         range_=None
+     ):
+-        total_bytes = content_length
+-        if range_ is not None:
+-            total_bytes = range_[1] - range_[0]
+-        self.progress_listener.set_total_bytes(total_bytes)
+-        stream = self.download_dest.open(
++        return self.write_file_and_report_progress_context(
+             file_id, file_name, content_length, content_type, content_sha1, file_info,
+             mod_time_millis, range_
+         )
+-        return StreamWithProgress(stream.__enter__(), self.progress_listener)
++
++    @contextmanager
++    def write_file_and_report_progress_context(
++        self, file_id, file_name, content_length, content_type, content_sha1, file_info,
++        mod_time_millis, range_
++    ):
++        with self.download_dest.make_file_context(
++            file_id, file_name, content_length, content_type, content_sha1, file_info,
++            mod_time_millis, range_
++        ) as file_:
++            total_bytes = content_length
++            if range_ is not None:
++                total_bytes = range_[1] - range_[0]
++            self.progress_listener.set_total_bytes(total_bytes)
++            yield StreamWithProgress(file_, self.progress_listener)
+diff --git a/b2/progress.py b/b2/progress.py
+index da2cee3..02bf54e 100644
+--- a/b2/progress.py
++++ b/b2/progress.py
+@@ -144,6 +144,27 @@ class DoNothingProgressListener(AbstractProgressListener):
+         pass
+ 
+ 
++class ProgressListenerForTest(AbstractProgressListener):
++    """
++    Captures all of the calls so they can be checked.
++    """
++
++    def __init__(self):
++        self.calls = []
++
++    def set_total_bytes(self, total_byte_count):
++        self.calls.append('set_total_bytes(%d)' % (total_byte_count,))
++
++    def bytes_completed(self, byte_count):
++        self.calls.append('bytes_completed(%d)' % (byte_count,))
++
++    def close(self):
++        self.calls.append('close()')
++
++    def get_calls(self):
++        return self.calls
++
++
+ def make_progress_listener(description, quiet):
+     if quiet:
+         return DoNothingProgressListener()
+diff --git a/b2/raw_api.py b/b2/raw_api.py
+index 1d96460..cb6ea28 100644
+--- a/b2/raw_api.py
++++ b/b2/raw_api.py
+@@ -251,7 +251,7 @@ class B2RawApi(AbstractRawApi):
+             digest = hashlib.sha1()
+             bytes_read = 0
+ 
+-            with download_dest.open(
++            with download_dest.make_file_context(
+                 file_id,
+                 file_name,
+                 content_length,
+diff --git a/b2/raw_simulator.py b/b2/raw_simulator.py
+index 61bdaf7..29edf73 100644
+--- a/b2/raw_simulator.py
++++ b/b2/raw_simulator.py
+@@ -166,6 +166,8 @@ class FileSimulator(object):
+         return dict(parts=parts, nextPartNumber=next_part_number)
+ 
+     def mod_time_millis(self):
++        if 'src_last_modified_millis' in self.file_info:
++            return int(self.file_info['src_last_modified_millis'])
+         return 0
+ 
+ 
+@@ -247,7 +249,7 @@ class BucketSimulator(object):
+         self._download_file_sim(download_dest, file_sim, range_=range_)
+ 
+     def _download_file_sim(self, download_dest, file_sim, range_=None):
+-        with download_dest.open(
++        with download_dest.make_file_context(
+             file_sim.file_id, file_sim.name, file_sim.content_length, file_sim.content_type,
+             file_sim.content_sha1, file_sim.file_info, file_sim.mod_time_millis(), range_
+         ) as f:
+diff --git a/pre-commit.sh b/pre-commit.sh
+index 78d3fc8..e2c2d2c 100755
+--- a/pre-commit.sh
++++ b/pre-commit.sh
+@@ -68,6 +68,20 @@ else
+     fi
+ fi
+ 
++header Check Licenses
++
++missing="$(
++    (
++        grep -l 'All Rights Reserved' $(git ls-files | grep .py)
++        git ls-files | grep .py
++    ) | sort | uniq -c | sort -n | awk '$1 == 1 && $2 !~ ".*/__init__.py"'
++)"
++if [ -n "$missing" ]; then
++    echo 'license is missing from:' >&2
++    echo "$missing" >&2
++    exit 1
++fi
++
+ header Pyflakes
+ 
+ for d in b2 test *.py

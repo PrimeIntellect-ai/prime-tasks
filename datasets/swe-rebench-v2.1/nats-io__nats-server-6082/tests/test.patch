@@ -1,0 +1,212 @@
+diff --git a/server/jetstream_consumer_test.go b/server/jetstream_consumer_test.go
+index 0e97cff0..bbaf9b33 100644
+--- a/server/jetstream_consumer_test.go
++++ b/server/jetstream_consumer_test.go
+@@ -1858,85 +1858,6 @@ func TestJetStreamConsumerUnpinPickDifferentRequest(t *testing.T) {
+ 	require_NotEqual(t, msg.Header.Get("Nats-Pin-Id"), "")
+ }
+ 
+-func TestJetStreamPinnedTTL(t *testing.T) {
+-	s := RunBasicJetStreamServer(t)
+-	defer s.Shutdown()
+-
+-	nc, _ := jsClientConnect(t, s)
+-	defer nc.Close()
+-
+-	acc := s.GlobalAccount()
+-
+-	mset, err := acc.addStream(&StreamConfig{
+-		Name:      "TEST",
+-		Subjects:  []string{"foo"},
+-		Retention: LimitsPolicy,
+-	})
+-	require_NoError(t, err)
+-
+-	_, err = mset.addConsumer(&ConsumerConfig{
+-		Durable:        "C",
+-		FilterSubject:  "foo",
+-		PriorityGroups: []string{"A"},
+-		PriorityPolicy: PriorityPinnedClient,
+-		AckPolicy:      AckExplicit,
+-		PinnedTTL:      3 * time.Second,
+-	})
+-	require_NoError(t, err)
+-
+-	for i := 0; i < 10; i++ {
+-		sendStreamMsg(t, nc, "foo", "data")
+-	}
+-
+-	req := JSApiConsumerGetNextRequest{Batch: 1, Expires: 10 * time.Second, PriorityGroup: PriorityGroup{
+-		Group: "A",
+-	}}
+-
+-	reqBytes, err := json.Marshal(req)
+-	require_NoError(t, err)
+-
+-	firstInbox := "FIRST"
+-	firstReplies, err := nc.SubscribeSync(firstInbox)
+-	require_NoError(t, err)
+-	nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.C", firstInbox, reqBytes)
+-
+-	msg, err := firstReplies.NextMsg(1 * time.Second)
+-	require_NoError(t, err)
+-	pinId := msg.Header.Get("Nats-Pin-Id")
+-	require_NotEqual(t, pinId, "")
+-
+-	secondInbox := "SECOND"
+-	secondReplies, err := nc.SubscribeSync(secondInbox)
+-	require_NoError(t, err)
+-	nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.C", secondInbox, reqBytes)
+-
+-	// Expect error, as first request should be still pinned.
+-	_, err = secondReplies.NextMsg(1 * time.Second)
+-	require_Error(t, err)
+-
+-	// During the 5 second window, the first Pin should time out and this request
+-	// should become the pinned one and get the message.
+-	msg, err = secondReplies.NextMsg(5 * time.Second)
+-	require_NoError(t, err)
+-	newPinId := msg.Header.Get("Nats-Pin-Id")
+-	require_NotEqual(t, newPinId, pinId)
+-	require_NotEqual(t, newPinId, "")
+-
+-	thirdInbox := "THIRD"
+-	thirdReplies, err := nc.SubscribeSync(thirdInbox)
+-	require_NoError(t, err)
+-	nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.C", thirdInbox, reqBytes)
+-
+-	// The same process as above, but tests different codepath - one where Pin
+-	// is set on existing waiting request.
+-	msg, err = thirdReplies.NextMsg(5 * time.Second)
+-	require_NoError(t, err)
+-	require_NotEqual(t, msg.Header.Get("Nats-Pin-Id"), pinId)
+-	require_NotEqual(t, msg.Header.Get("Nats-Pin-Id"), newPinId)
+-	require_NotEqual(t, newPinId, "")
+-
+-}
+-
+ func TestJetStreamConsumerUnpin(t *testing.T) {
+ 	single := RunBasicJetStreamServer(t)
+ 	defer single.Shutdown()
+@@ -2315,7 +2236,121 @@ func TestJetStreamConsumerOverflow(t *testing.T) {
+ 	msg, err = maxAckPending50.NextMsg(time.Second)
+ 	require_NoError(t, err)
+ 	require_NotNil(t, msg)
++}
+ 
++func TestJetStreamConsumerMultipleFitersWithStartDate(t *testing.T) {
++	s := RunBasicJetStreamServer(t)
++	defer s.Shutdown()
++
++	nc, js := jsClientConnect(t, s)
++	defer nc.Close()
++
++	past := time.Now().Add(-90 * time.Second)
++
++	_, err := js.AddStream(&nats.StreamConfig{
++		Name:     "TEST",
++		Subjects: []string{"events.>"},
++	})
++	require_NoError(t, err)
++
++	sendStreamMsg(t, nc, "events.foo", "msg-1")
++	sendStreamMsg(t, nc, "events.bar", "msg-2")
++	sendStreamMsg(t, nc, "events.baz", "msg-3")
++	sendStreamMsg(t, nc, "events.biz", "msg-4")
++	sendStreamMsg(t, nc, "events.faz", "msg-5")
++	sendStreamMsg(t, nc, "events.foo", "msg-6")
++	sendStreamMsg(t, nc, "events.biz", "msg-7")
++
++	for _, test := range []struct {
++		name             string
++		filterSubjects   []string
++		startTime        time.Time
++		expectedMessages uint64
++		expectedBodies   []string
++	}{
++		{"Single-Filter-first-sequence", []string{"events.foo"}, past, 2, []string{"msg-1", "msg-6"}},
++		{"Multiple-Filter-first-sequence", []string{"events.foo", "events.bar", "events.baz"}, past, 4, []string{"msg-1", "msg-2", "msg-3", "msg-6"}},
++		{"Multiple-Filters-second-subject", []string{"events.bar", "events.baz"}, past, 2, []string{"msg-2", "msg-3"}},
++		{"Multiple-Filters-first-last-subject", []string{"events.foo", "events.biz"}, past, 4, []string{"msg-1", "msg-4", "msg-6", "msg-7"}},
++		{"Multiple-Filters-in-future", []string{"events.foo", "events.biz"}, time.Now().Add(1 * time.Minute), 0, nil},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			info, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
++				Durable:        test.name,
++				FilterSubjects: test.filterSubjects,
++				DeliverPolicy:  nats.DeliverByStartTimePolicy,
++				OptStartTime:   &test.startTime,
++			})
++			require_NoError(t, err)
++			require_Equal(t, test.expectedMessages, info.NumPending)
++
++			if test.expectedMessages > 0 {
++				consumer, err := js.PullSubscribe("", test.name, nats.Bind("TEST", test.name))
++				require_NoError(t, err)
++				messages, err := consumer.Fetch(int(test.expectedMessages), nats.MaxWait(2*time.Second))
++				require_NoError(t, err)
++				require_Equal(t, test.expectedMessages, uint64(len(messages)))
++
++				gotBodies := make([]string, 0, len(messages))
++				for _, msg := range messages {
++					gotBodies = append(gotBodies, string(msg.Data))
++				}
++				slices.Sort(gotBodies)
++				expectedBodies := append([]string(nil), test.expectedBodies...)
++				slices.Sort(expectedBodies)
++				require_Equal(t, strings.Join(expectedBodies, ","), strings.Join(gotBodies, ","))
++			}
++		})
++	}
++
++	// A cutoff between stored messages must exclude older matching messages while
++	// retaining every matching message stored afterward.
++	sendStreamMsg(t, nc, "events.interior.foo", "before-cutoff")
++	cutoff := time.Now().UTC()
++	time.Sleep(100 * time.Millisecond)
++	sendStreamMsg(t, nc, "events.interior.bar", "after-cutoff-1")
++	sendStreamMsg(t, nc, "events.interior.foo", "after-cutoff-2")
++	info, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
++		Durable:        "Interior-Cutoff",
++		FilterSubjects: []string{"events.interior.foo", "events.interior.bar"},
++		DeliverPolicy:  nats.DeliverByStartTimePolicy,
++		OptStartTime:   &cutoff,
++	})
++	require_NoError(t, err)
++	require_Equal(t, uint64(2), info.NumPending)
++	consumer, err := js.PullSubscribe("", "Interior-Cutoff", nats.Bind("TEST", "Interior-Cutoff"))
++	require_NoError(t, err)
++	messages, err := consumer.Fetch(2, nats.MaxWait(2*time.Second))
++	require_NoError(t, err)
++	gotBodies := make([]string, 0, len(messages))
++	for _, msg := range messages {
++		gotBodies = append(gotBodies, string(msg.Data))
++	}
++	slices.Sort(gotBodies)
++	require_Equal(t, "after-cutoff-1,after-cutoff-2", strings.Join(gotBodies, ","))
++
++	// If overlapping filters are accepted, a message matching both must still
++	// contribute only once to the pending count and delivery.
++	overlapInfo, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
++		Durable:        "Overlapping-Filters",
++		FilterSubjects: []string{"events.>", "events.foo"},
++		DeliverPolicy:  nats.DeliverByStartTimePolicy,
++		OptStartTime:   &past,
++	})
++	if err == nil {
++		require_Equal(t, uint64(10), overlapInfo.NumPending)
++		overlapConsumer, err := js.PullSubscribe("", "Overlapping-Filters", nats.Bind("TEST", "Overlapping-Filters"))
++		require_NoError(t, err)
++		overlapMessages, err := overlapConsumer.Fetch(10, nats.MaxWait(2*time.Second))
++		require_NoError(t, err)
++		require_Equal(t, 10, len(overlapMessages))
++		overlapBodies := make([]string, 0, len(overlapMessages))
++		for _, msg := range overlapMessages {
++			overlapBodies = append(overlapBodies, string(msg.Data))
++		}
++		slices.Sort(overlapBodies)
++		require_Equal(t, "after-cutoff-1,after-cutoff-2,before-cutoff,msg-1,msg-2,msg-3,msg-4,msg-5,msg-6,msg-7", strings.Join(overlapBodies, ","))
++	}
+ }
+ 
+ func sendRequest(t *testing.T, nc *nats.Conn, reply string, req JSApiConsumerGetNextRequest) *nats.Subscription {

@@ -1,0 +1,309 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cc825a05..54bc9326 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ - @chrstnbrn improved error messages for when the AST can't be built. That should help you understand what went wrong when things don't work 👍
+ - Convert to Arrow Function will only prompt a quick fix if your cursor is on the function declaration, not its body. This will reduce the noise when working with large functions.
++- Extract Variable will re-use existing destructured declaration. So for this code:
++
++```ts
++function test(obj) {
++  return obj.x + obj.y * obj.x + obj.y;
++}
++```
++
++After extracting `x` and `y` (and choosing to "destructure" it) the end result will now be:
++
++```ts
++function test(obj) {
++  const { x, y } = obj;
++  return x + y * x + y;
++}
++```
++
++### Fixed
++
++- Extracting multiple variables on the same line will correctly position the cursor to trigger a rename. That was an annoying edge-case, not anymore!
+ 
+ ## [5.0.1] - 2021-03-08
+ 
+diff --git a/src/array.ts b/src/array.ts
+index 999ac109..1a65a93e 100644
+--- a/src/array.ts
++++ b/src/array.ts
+@@ -1,4 +1,8 @@
+-export { last, allButLast, isLast };
++export { first, last, allButLast, isLast };
++
++function first<T>(array: T[] | ReadonlyArray<T>): T | undefined {
++  return array[0];
++}
+ 
+ function last<T>(array: T[] | ReadonlyArray<T>): T | undefined {
+   return array[array.length - 1];
+diff --git a/src/ast/scope.ts b/src/ast/scope.ts
+index 67d8d231..d8f177ca 100644
+--- a/src/ast/scope.ts
++++ b/src/ast/scope.ts
+@@ -1,5 +1,6 @@
+ import { NodePath, Binding } from "@babel/traverse";
+ import * as t from "@babel/types";
++import { first } from "../array";
+ import { getImportDeclarations } from "./domain";
+ 
+ import { areEquivalent } from "./identity";
+@@ -10,6 +11,7 @@ export {
+   findParentIfPath,
+   getFunctionScopePath,
+   isShadowIn,
++  findFirstExistingDeclaration,
+   findCommonAncestorToDeclareVariable,
+   findAncestorThatCanHaveVariableDeclaration,
+   bindingNamesInScope,
+@@ -82,6 +84,27 @@ function isShadowIn(
+   }
+ }
+ 
++function findFirstExistingDeclaration(expressionPath: NodePath<t.Expression>) {
++  const existingDeclarations: NodePath<
++    DestructuredVariableDeclarator
++  >[] = Object.values(expressionPath.scope.getAllBindings())
++    .map(({ path }) => path)
++    .filter(
++      (path): path is NodePath<DestructuredVariableDeclarator> =>
++        path.isVariableDeclarator() &&
++        path.get("id").isObjectPattern() &&
++        path.get("init").isIdentifier()
++    )
++    .filter((path) => areEquivalent(expressionPath.node, path.node.init));
++
++  return first(existingDeclarations);
++}
++
++type DestructuredVariableDeclarator = t.VariableDeclarator & {
++  id: t.ObjectPattern;
++  init: t.Identifier;
++};
++
+ function findCommonAncestorToDeclareVariable(
+   path: NodePath,
+   otherPaths: NodePath[]
+diff --git a/src/editor/adapters/in-memory-editor.ts b/src/editor/adapters/in-memory-editor.ts
+index 9e96cc48..216b0f74 100644
+--- a/src/editor/adapters/in-memory-editor.ts
++++ b/src/editor/adapters/in-memory-editor.ts
+@@ -91,28 +91,23 @@ class InMemoryEditor implements Editor {
+       readCodeMatrix.push(this.codeMatrix[end.line].slice(0, end.character));
+     }
+ 
+-    // Since we insert updates progressively as new elements, keep track
+-    // of them so we can indent properly.
+-    const previousUpdatesOnLine: { [key: number]: number } = {};
+-    getModifications(this.read(readCodeMatrix)).forEach(
+-      ({ code, selection }) => {
++    getModifications(this.read(readCodeMatrix))
++      // Start with right-most modifications so selection isn't messed up.
++      .sort((a, b) => (a.selection.startsBefore(b.selection) ? 1 : -1))
++      .forEach(({ code, selection }) => {
+         const { start, end } = selection;
+ 
+-        if (!previousUpdatesOnLine[start.line]) {
+-          previousUpdatesOnLine[start.line] = 0;
+-        }
+-
+         if (start.line === end.line) {
+           // Replace selected code with updated code.
+           this.codeMatrix[start.line].splice(
+-            start.character + previousUpdatesOnLine[start.line],
++            start.character,
+             end.character - start.character,
+             code
+           );
+         } else if (end.line > start.line) {
+           // Replace selected code with updated code.
+           this.codeMatrix[start.line].splice(
+-            start.character + previousUpdatesOnLine[start.line],
++            start.character,
+             this.codeMatrix[start.line].length - start.character,
+             code
+           );
+@@ -127,10 +122,7 @@ class InMemoryEditor implements Editor {
+             this.codeMatrix[i] = [DELETED_LINE];
+           }
+         }
+-
+-        previousUpdatesOnLine[start.line] += 1;
+-      }
+-    );
++      });
+ 
+     return Promise.resolve();
+   }
+diff --git a/src/editor/position.ts b/src/editor/position.ts
+index e8f2196a..3da5b8a5 100644
+--- a/src/editor/position.ts
++++ b/src/editor/position.ts
+@@ -83,6 +83,10 @@ class Position {
+     return new Position(this.line, this.character + characters);
+   }
+ 
++  removeCharacters(characters: number): Position {
++    return new Position(this.line, this.character - characters);
++  }
++
+   putAtSameCharacter(position: Position): Position {
+     return new Position(this.line, position.character);
+   }
+diff --git a/src/editor/selection.ts b/src/editor/selection.ts
+index 3f3e19db..07ca49c7 100644
+--- a/src/editor/selection.ts
++++ b/src/editor/selection.ts
+@@ -61,6 +61,15 @@ class Selection {
+     return this.end.line - this.start.line;
+   }
+ 
++  get width(): number {
++    // Maybe this only make sense for single-line selections though…
++    return this.end.character - this.start.character;
++  }
++
++  get isCursorAtTopOfDocument(): boolean {
++    return this.isEqualTo(Selection.cursorAt(0, 0));
++  }
++
+   isEmpty(): boolean {
+     return this.start.isEqualTo(this.end);
+   }
+diff --git a/src/refactorings/extract/extract-variable/extract-variable.ts b/src/refactorings/extract/extract-variable/extract-variable.ts
+index 22deefba..9a9e8c4e 100644
+--- a/src/refactorings/extract/extract-variable/extract-variable.ts
++++ b/src/refactorings/extract/extract-variable/extract-variable.ts
+@@ -46,7 +46,7 @@ async function extractVariable(editor: Editor) {
+       // Replace extracted code with new variable.
+       ...extractedOccurrences.map((occurrence) => occurrence.modification)
+     ],
+-    selectedOccurrence.positionOnExtractedId
++    selectedOccurrence.cursorOnIdentifier(otherOccurrences)
+   );
+ 
+   // Extracted symbol is located at `selection` => just trigger a rename.
+diff --git a/src/refactorings/extract/extract-variable/occurrence.ts b/src/refactorings/extract/extract-variable/occurrence.ts
+index 116af2bf..d58687f2 100644
+--- a/src/refactorings/extract/extract-variable/occurrence.ts
++++ b/src/refactorings/extract/extract-variable/occurrence.ts
+@@ -13,8 +13,10 @@ import { Parts } from "./parts";
+ import { DestructureStrategy } from "./destructure-strategy";
+ import {
+   DeclarationOnCommonAncestor,
++  MergeDestructuredDeclaration,
+   VariableDeclarationModification
+ } from "./variable-declaration-modification";
++import { last } from "../../../array";
+ 
+ export { createOccurrence, Occurrence };
+ 
+@@ -81,7 +83,20 @@ class Occurrence<T extends t.Node = t.Node> {
+     };
+   }
+ 
+-  get positionOnExtractedId(): Position {
++  cursorOnIdentifier(otherOccurrences: Occurrence[]): Position {
++    const offset = otherOccurrences
++      .map(({ modification }) => modification)
++      .filter(({ selection }) => selection.isOneLine)
++      .filter(({ selection }) =>
++        selection.startsBefore(this.modification.selection)
++      )
++      .map(({ code, selection }) => selection.width - code.length)
++      .reduce((a, b) => a + b, 0);
++
++    return this.positionOnExtractedId.removeCharacters(offset);
++  }
++
++  protected get positionOnExtractedId(): Position {
+     return new Position(
+       this.selection.start.line + this.selection.height + 1,
+       this.selection.start.character + this.variable.length
+@@ -163,6 +178,20 @@ class MemberExpressionOccurrence extends Occurrence<t.MemberExpression> {
+       return super.toVariableDeclaration(extractedCode, allOccurrences);
+     }
+ 
++    const existingDeclaration = t.findFirstExistingDeclaration(
++      this.path.get("object")
++    );
++
++    if (existingDeclaration) {
++      const lastProperty = last(existingDeclaration.node.id.properties);
++      if (lastProperty && t.isSelectableNode(lastProperty)) {
++        return new MergeDestructuredDeclaration(
++          this.variable.name,
++          lastProperty
++        );
++      }
++    }
++
+     const name = `{ ${this.variable.name} }`;
+     const value = this.parentObject;
+     const useTabs = t.isUsingTabs(this.path.node);
+@@ -204,6 +233,21 @@ class MemberExpressionOccurrence extends Occurrence<t.MemberExpression> {
+   private get parentObject(): Code {
+     return t.generate(this.path.node.object);
+   }
++
++  get positionOnExtractedId(): Position {
++    if (this.destructureStrategy === DestructureStrategy.Preserve) {
++      return super.positionOnExtractedId;
++    }
++
++    const existingDeclaration = t.findFirstExistingDeclaration(
++      this.path.get("object")
++    );
++    if (existingDeclaration) {
++      return super.positionOnExtractedId.removeLines(1);
++    }
++
++    return super.positionOnExtractedId;
++  }
+ }
+ 
+ class PartialTemplateLiteralOccurrence extends Occurrence<t.TemplateLiteral> {
+diff --git a/src/refactorings/extract/extract-variable/variable-declaration-modification.ts b/src/refactorings/extract/extract-variable/variable-declaration-modification.ts
+index 0f242623..c036fed7 100644
+--- a/src/refactorings/extract/extract-variable/variable-declaration-modification.ts
++++ b/src/refactorings/extract/extract-variable/variable-declaration-modification.ts
+@@ -6,7 +6,11 @@ import { assert } from "../../../assert";
+ 
+ import { Occurrence } from "./occurrence";
+ 
+-export { VariableDeclarationModification, DeclarationOnCommonAncestor };
++export {
++  VariableDeclarationModification,
++  DeclarationOnCommonAncestor,
++  MergeDestructuredDeclaration
++};
+ 
+ class VariableDeclarationModification implements Modification {
+   constructor(
+@@ -68,3 +72,20 @@ class DeclarationOnCommonAncestor extends VariableDeclarationModification {
+ function topToBottom(a: Occurrence, b: Occurrence): number {
+   return a.selection.startsBefore(b.selection) ? -1 : 1;
+ }
++
++class MergeDestructuredDeclaration implements Modification {
++  constructor(
++    private name: string,
++    private lastDestructuredProperty: t.SelectableNode
++  ) {}
++
++  get code(): Code {
++    return `, ${this.name}`;
++  }
++
++  get selection(): Selection {
++    return Selection.cursorAtPosition(
++      Position.fromAST(this.lastDestructuredProperty.loc.end)
++    );
++  }
++}

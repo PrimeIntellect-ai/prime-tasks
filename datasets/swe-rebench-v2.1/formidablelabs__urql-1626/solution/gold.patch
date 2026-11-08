@@ -1,0 +1,321 @@
+diff --git a/.changeset/new-dingos-clean.md b/.changeset/new-dingos-clean.md
+new file mode 100644
+index 00000000..d65f7097
+--- /dev/null
++++ b/.changeset/new-dingos-clean.md
+@@ -0,0 +1,5 @@
++---
++'@urql/core': patch
++---
++
++Fix a regression in `@urql/core@2.1.1` that prevented concurrent operations from being dispatched with differing request policies, which for instance prevented the explicit `executeQuery` calls on bindings to fail.
+diff --git a/packages/core/src/client.ts b/packages/core/src/client.ts
+index 74af03ab..d278bed0 100755
+--- a/packages/core/src/client.ts
++++ b/packages/core/src/client.ts
+@@ -4,6 +4,7 @@ import {
+   filter,
+   makeSubject,
+   onEnd,
++  onPush,
+   onStart,
+   pipe,
+   share,
+@@ -41,7 +42,6 @@ import {
+ import {
+   createRequest,
+   withPromise,
+-  replayOnStart,
+   maskTypename,
+   noop,
+   makeOperation,
+@@ -69,6 +69,11 @@ export interface ClientOptions {
+ 
+ export const createClient = (opts: ClientOptions) => new Client(opts);
+ 
++interface ActiveOperation {
++  source: Source<OperationResult>;
++  replay: OperationResult | null;
++}
++
+ /** The URQL application-wide client library. Each execute method starts a GraphQL request and returns a stream of results. */
+ export class Client {
+   /** Start an operation from an exchange */
+@@ -90,7 +95,7 @@ export class Client {
+   dispatchOperation: (operation?: Operation | void) => void;
+   operations$: Source<Operation>;
+   results$: Source<OperationResult>;
+-  activeOperations: Map<number, Source<OperationResult>> = new Map();
++  activeOperations: Map<number, ActiveOperation> = new Map();
+   queue: Operation[] = [];
+ 
+   constructor(opts: ClientOptions) {
+@@ -198,96 +203,113 @@ export class Client {
+   executeRequestOperation<Data = any, Variables = object>(
+     operation: Operation<Data, Variables>
+   ): Source<OperationResult<Data, Variables>> {
+-    let active = this.activeOperations.get(operation.key);
+-    if (active) return active;
+-
+-    let result$ = pipe(
+-      this.results$,
+-      filter((res: OperationResult) => res.operation.key === operation.key)
+-    ) as Source<OperationResult<Data, Variables>>;
+-    if (this.maskTypename) {
+-      result$ = pipe(
+-        result$,
+-        map(res => ({ ...res, data: maskTypename(res.data) }))
++    let activeOperation = this.activeOperations.get(operation.key);
++    if (!activeOperation) {
++      let result$ = pipe(
++        this.results$,
++        filter(
++          (res: OperationResult) =>
++            res.operation.kind === operation.kind &&
++            res.operation.key === operation.key
++        )
+       );
+-    }
+ 
+-    // A mutation is always limited to just a single result and is never shared
+-    if (operation.kind === 'mutation') {
+-      return pipe(
+-        result$,
+-        onStart<OperationResult>(() => this.dispatchOperation(operation)),
+-        take(1)
+-      );
+-    }
+-
+-    const teardown$ = pipe(
+-      this.operations$,
+-      filter(
+-        (op: Operation) => op.kind === 'teardown' && op.key === operation.key
+-      )
+-    );
++      // Mask typename properties if the option for it is turned on
++      if (this.maskTypename) {
++        result$ = pipe(
++          result$,
++          map(res => ({ ...res, data: maskTypename(res.data) }))
++        );
++      }
+ 
+-    const refetch$ = pipe(
+-      this.operations$,
+-      filter(
+-        (op: Operation) =>
+-          op.kind === operation.kind &&
+-          op.key === operation.key &&
+-          (op.context.requestPolicy === 'network-only' ||
+-            op.context.requestPolicy === 'cache-and-network')
+-      ),
+-      take(1)
+-    );
++      // A mutation is always limited to just a single result and is never shared
++      if (operation.kind === 'mutation') {
++        return pipe(
++          result$,
++          onStart(() => this.dispatchOperation(operation)),
++          take(1)
++        );
++      }
+ 
+-    result$ = pipe(
+-      result$,
+-      takeUntil(teardown$),
+-      switchMap(result => {
+-        if (result.stale) return fromValue(result);
+-        return merge([
+-          fromValue(result),
+-          pipe(
+-            refetch$,
+-            map(() => ({ ...result, stale: true }))
++      activeOperation = {
++        source: pipe(
++          result$,
++          // End the results stream when an active teardown event is sent
++          takeUntil(
++            pipe(
++              this.operations$,
++              filter(op => op.kind === 'teardown' && op.key === operation.key)
++            )
+           ),
+-        ]);
+-      }),
+-      onEnd<OperationResult>(() => {
+-        this.activeOperations.delete(operation.key);
+-        for (let i = this.queue.length - 1; i >= 0; i--)
+-          if (this.queue[i].key === operation.key) this.queue.splice(i, 1);
+-        this.dispatchOperation(
+-          makeOperation('teardown', operation, operation.context)
+-        );
+-      })
+-    );
++          switchMap(result => {
++            if (result.stale) {
++              return fromValue(result);
++            }
++
++            return merge([
++              fromValue(result),
++              // Mark a result as stale when a new operation is sent for it
++              pipe(
++                this.operations$,
++                filter(op => {
++                  return (
++                    op.kind === operation.kind &&
++                    op.key === operation.key &&
++                    (op.context.requestPolicy === 'network-only' ||
++                      op.context.requestPolicy === 'cache-and-network')
++                  );
++                }),
++                take(1),
++                map(() => ({ ...result, stale: true }))
++              ),
++            ]);
++          }),
++          onPush(result => {
++            activeOperation!.replay = result;
++          }),
++          onEnd(() => {
++            // Delete the active operation handle
++            activeOperation!.replay = null;
++            this.activeOperations.delete(operation.key);
++            // Delete all queued up operations of the same key on end
++            for (let i = this.queue.length - 1; i >= 0; i--)
++              if (this.queue[i].key === operation.key) this.queue.splice(i, 1);
++            // Dispatch a teardown signal for the stopped operation
++            this.dispatchOperation(
++              makeOperation('teardown', operation, operation.context)
++            );
++          }),
++          share
++        ),
++        replay: null,
++      };
++    }
+ 
+-    if (operation.kind === 'subscription') {
+-      active = pipe(
+-        result$,
+-        onStart(() => {
+-          this.activeOperations.set(operation.key, active!);
++    const prevReplay = activeOperation.replay;
++    const subject = makeSubject<OperationResult>();
++    const isNetworkOperation =
++      operation.context.requestPolicy === 'cache-and-network' ||
++      operation.context.requestPolicy === 'network-only';
++
++    return pipe(
++      merge([subject.source, activeOperation.source]),
++      onStart(() => {
++        this.activeOperations.set(operation.key, activeOperation!);
++        if (operation.kind === 'subscription') {
++          return this.dispatchOperation(operation);
++        } else if (isNetworkOperation) {
+           this.dispatchOperation(operation);
+-        }),
+-        share
+-      );
+-    } else {
+-      const mode =
+-        operation.context.requestPolicy === 'cache-and-network' ||
+-        operation.context.requestPolicy === 'network-only'
+-          ? 'pre'
+-          : 'post';
+-      active = pipe(
+-        result$,
+-        replayOnStart(mode, () => {
+-          this.activeOperations.set(operation.key, active!);
+-          this.dispatchOperation(operation);
+-        })
+-      );
+-    }
++        }
+ 
+-    return active;
++        if (prevReplay != null && prevReplay === activeOperation!.replay) {
++          subject.next(
++            isNetworkOperation ? { ...prevReplay, stale: true } : prevReplay
++          );
++        } else if (!isNetworkOperation) {
++          this.dispatchOperation(operation);
++        }
++      })
++    );
+   }
+ 
+   query<Data = any, Variables extends object = {}>(
+diff --git a/packages/core/src/utils/streamUtils.ts b/packages/core/src/utils/streamUtils.ts
+index 148d0a4b..33f1d36e 100644
+--- a/packages/core/src/utils/streamUtils.ts
++++ b/packages/core/src/utils/streamUtils.ts
+@@ -1,66 +1,9 @@
+-import {
+-  Operator,
+-  Source,
+-  pipe,
+-  toPromise,
+-  take,
+-  share,
+-  onPush,
+-  onStart,
+-  onEnd,
+-  subscribe,
+-  make,
+-} from 'wonka';
++import { Source, pipe, toPromise, take } from 'wonka';
+ 
+-import { OperationResult, PromisifiedSource } from '../types';
++import { PromisifiedSource } from '../types';
+ 
+ export function withPromise<T>(source$: Source<T>): PromisifiedSource<T> {
+   (source$ as PromisifiedSource<T>).toPromise = () =>
+     pipe(source$, take(1), toPromise);
+   return source$ as PromisifiedSource<T>;
+ }
+-
+-export type ReplayMode = 'pre' | 'post';
+-
+-export function replayOnStart<T extends OperationResult>(
+-  mode: ReplayMode,
+-  start: () => void
+-): Operator<T, T> {
+-  return source$ => {
+-    let replay: T | void;
+-
+-    const shared$ = pipe(
+-      source$,
+-      onEnd(() => {
+-        replay = undefined;
+-      }),
+-      onPush(value => {
+-        replay = value;
+-      }),
+-      share
+-    );
+-
+-    return make<T>(observer => {
+-      const prevReplay = replay;
+-
+-      return pipe(
+-        shared$,
+-        onEnd(observer.complete),
+-        onStart(() => {
+-          if (mode === 'pre') {
+-            start();
+-          }
+-
+-          if (prevReplay !== undefined && prevReplay === replay) {
+-            observer.next(
+-              mode === 'pre' ? { ...prevReplay, stale: true } : prevReplay
+-            );
+-          } else if (mode === 'post') {
+-            start();
+-          }
+-        }),
+-        subscribe(observer.next)
+-      ).unsubscribe;
+-    });
+-  };
+-}

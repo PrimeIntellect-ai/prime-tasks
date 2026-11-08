@@ -1,0 +1,216 @@
+diff --git a/src/client/transport/local.ts b/src/client/transport/local.ts
+index 40412c7..44a8049 100644
+--- a/src/client/transport/local.ts
++++ b/src/client/transport/local.ts
+@@ -148,16 +148,8 @@ export class LocalTransport extends Transport {
+    * @param {string} gameName - The game type (the `name` field in `Game`).
+    * @param {string} numPlayers - The number of players.
+    */
+-  constructor({
+-    master,
+-    store,
+-    matchID,
+-    playerID,
+-    credentials,
+-    gameName,
+-    numPlayers,
+-  }: LocalTransportOpts) {
+-    super({ store, gameName, playerID, matchID, credentials, numPlayers });
++  constructor({ master, ...opts }: LocalTransportOpts) {
++    super(opts);
+     this.master = master;
+     this.isConnected = true;
+   }
+diff --git a/src/client/transport/socketio.ts b/src/client/transport/socketio.ts
+index 7862300..5944123 100644
+--- a/src/client/transport/socketio.ts
++++ b/src/client/transport/socketio.ts
+@@ -63,15 +63,10 @@ export class SocketIOTransport extends Transport {
+   constructor({
+     socket,
+     socketOpts,
+-    store,
+-    matchID,
+-    playerID,
+-    credentials,
+-    gameName,
+-    numPlayers,
+     server,
++    ...opts
+   }: SocketIOTransportOpts = {}) {
+-    super({ store, gameName, playerID, matchID, credentials, numPlayers });
++    super(opts);
+ 
+     this.server = server;
+     this.socket = socket;
+diff --git a/src/master/master.ts b/src/master/master.ts
+index d17d482..2bcbfe6 100644
+--- a/src/master/master.ts
++++ b/src/master/master.ts
+@@ -6,7 +6,6 @@
+  * https://opensource.org/licenses/MIT.
+  */
+ 
+-import { InitializeGame } from '../core/initialize';
+ import { CreateGameReducer } from '../core/reducer';
+ import { ProcessGameConfig, IsLongFormMove } from '../core/game';
+ import { UNDO, REDO, MAKE_MOVE } from '../core/action-types';
+@@ -25,7 +24,7 @@ import type {
+   PlayerID,
+   ChatMessage,
+ } from '../types';
+-import { createMetadata } from '../server/util';
++import { createMatch } from '../server/util';
+ import type { Auth } from '../server/auth';
+ import * as StorageAPI from '../server/db/base';
+ 
+@@ -350,13 +349,20 @@ export class Master {
+     // If the game doesn't exist, then create one on demand.
+     // TODO: Move this out of the sync call.
+     if (state === undefined) {
+-      initialState = state = InitializeGame({ game: this.game, numPlayers });
+-      metadata = createMetadata({
++      const match = createMatch({
+         game: this.game,
+         unlisted: true,
+         numPlayers,
++        setupData: undefined,
+       });
+ 
++      if ('setupDataError' in match) {
++        return { error: 'game requires setupData' };
++      }
++
++      initialState = state = match.initialState;
++      metadata = match.metadata;
++
+       this.subscribeCallback({ state, matchID });
+ 
+       if (StorageAPI.isSynchronous(this.storageAPI)) {
+diff --git a/src/server/api.ts b/src/server/api.ts
+index 9656a3c..3559aed 100644
+--- a/src/server/api.ts
++++ b/src/server/api.ts
+@@ -11,11 +11,9 @@ import Router from 'koa-router';
+ import koaBody from 'koa-body';
+ import { nanoid } from 'nanoid';
+ import cors from '@koa/cors';
+-
+-import { InitializeGame } from '../core/initialize';
++import { createMatch } from './util';
+ import type { Auth } from './auth';
+ import type { Server, LobbyAPI, Game, StorageAPI } from '../types';
+-import { createMetadata } from './util';
+ 
+ /**
+  * Creates a new match.
+@@ -28,30 +26,25 @@ import { createMetadata } from './util';
+  * @param {object } lobbyConfig - Configuration options for the lobby.
+  * @param {boolean} unlisted - Whether the match should be excluded from public listing.
+  */
+-export const CreateMatch = async ({
++const CreateMatch = async ({
++  ctx,
+   db,
+-  game,
+-  numPlayers,
+-  setupData,
+   uuid,
+-  unlisted,
++  ...opts
+ }: {
+   db: StorageAPI.Sync | StorageAPI.Async;
+-  game: Game;
+-  numPlayers: number;
+-  setupData: any;
++  ctx: Koa.BaseContext;
+   uuid: () => string;
+-  unlisted: boolean;
+-}) => {
+-  if (!numPlayers || typeof numPlayers !== 'number') numPlayers = 2;
+-
+-  const metadata = createMetadata({ game, numPlayers, setupData, unlisted });
++} & Parameters<typeof createMatch>[0]): Promise<string> => {
+   const matchID = uuid();
+-  const initialState = InitializeGame({ game, numPlayers, setupData });
+-
+-  await db.createMatch(matchID, { metadata, initialState });
+-
+-  return matchID;
++  const match = createMatch(opts);
++
++  if ('setupDataError' in match) {
++    ctx.throw(400, match.setupDataError);
++  } else {
++    await db.createMatch(matchID, match);
++    return matchID;
++  }
+ };
+ 
+ /**
+@@ -122,11 +115,8 @@ export const createRouter = ({
+     const game = games.find((g) => g.name === gameName);
+     if (!game) ctx.throw(404, 'Game ' + gameName + ' not found');
+ 
+-    const setupDataError =
+-      game.validateSetupData && game.validateSetupData(setupData, numPlayers);
+-    if (setupDataError !== undefined) ctx.throw(400, setupDataError);
+-
+     const matchID = await CreateMatch({
++      ctx,
+       db,
+       game,
+       numPlayers,
+@@ -362,6 +352,7 @@ export const createRouter = ({
+ 
+     const game = games.find((g) => g.name === gameName);
+     const nextMatchID = await CreateMatch({
++      ctx,
+       db,
+       game,
+       numPlayers,
+diff --git a/src/server/util.ts b/src/server/util.ts
+index 1a11f64..227944d 100644
+--- a/src/server/util.ts
++++ b/src/server/util.ts
+@@ -1,4 +1,5 @@
+-import type { Server, Game } from '../types';
++import { InitializeGame } from '../core/initialize';
++import type { Server, State, Game } from '../types';
+ 
+ /**
+  * Creates a new match metadata object.
+@@ -30,3 +31,33 @@ export const createMetadata = ({
+ 
+   return metadata;
+ };
++
++/**
++ * Creates matchID, initial state and metadata for a new match.
++ * If the provided `setupData` doesn’t pass the game’s validation,
++ * an error object is returned instead.
++ */
++export const createMatch = ({
++  game,
++  numPlayers,
++  setupData,
++  unlisted,
++}: {
++  game: Game;
++  numPlayers: number;
++  setupData: any;
++  unlisted: boolean;
++}):
++  | { metadata: Server.MatchData; initialState: State }
++  | { setupDataError: string } => {
++  if (!numPlayers || typeof numPlayers !== 'number') numPlayers = 2;
++
++  const setupDataError =
++    game.validateSetupData && game.validateSetupData(setupData, numPlayers);
++  if (setupDataError !== undefined) return { setupDataError };
++
++  const metadata = createMetadata({ game, numPlayers, setupData, unlisted });
++  const initialState = InitializeGame({ game, numPlayers, setupData });
++
++  return { metadata, initialState };
++};

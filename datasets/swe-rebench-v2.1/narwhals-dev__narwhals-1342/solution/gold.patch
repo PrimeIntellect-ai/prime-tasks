@@ -1,0 +1,417 @@
+diff --git a/docs/api-reference/expr.md b/docs/api-reference/expr.md
+index 299ab2d..e0f7b65 100644
+--- a/docs/api-reference/expr.md
++++ b/docs/api-reference/expr.md
+@@ -47,6 +47,7 @@
+         - over
+         - pipe
+         - quantile
++        - rank
+         - replace_strict
+         - rolling_mean
+         - rolling_std
+diff --git a/docs/api-reference/series.md b/docs/api-reference/series.md
+index c2e35a3..0aea494 100644
+--- a/docs/api-reference/series.md
++++ b/docs/api-reference/series.md
+@@ -54,6 +54,7 @@
+         - null_count
+         - pipe
+         - quantile
++        - rank
+         - rename
+         - replace_strict
+         - rolling_mean
+diff --git a/narwhals/_arrow/expr.py b/narwhals/_arrow/expr.py
+index e511f40..5ae6ce6 100644
+--- a/narwhals/_arrow/expr.py
++++ b/narwhals/_arrow/expr.py
+@@ -527,6 +527,16 @@ class ArrowExpr(CompliantExpr[ArrowSeries]):
+             ddof=ddof,
+         )
+ 
++    def rank(
++        self: Self,
++        method: Literal["average", "min", "max", "dense", "ordinal"],
++        *,
++        descending: bool,
++    ) -> Self:
++        return reuse_series_implementation(
++            self, "rank", method=method, descending=descending
++        )
++
+     @property
+     def dt(self: Self) -> ArrowExprDateTimeNamespace:
+         return ArrowExprDateTimeNamespace(self)
+diff --git a/narwhals/_arrow/series.py b/narwhals/_arrow/series.py
+index 046e26e..1e8d098 100644
+--- a/narwhals/_arrow/series.py
++++ b/narwhals/_arrow/series.py
+@@ -1097,6 +1097,36 @@ class ArrowSeries(CompliantSeries):
+             ** 0.5
+         )
+ 
++    def rank(
++        self: Self,
++        method: Literal["average", "min", "max", "dense", "ordinal"],
++        *,
++        descending: bool,
++    ) -> Self:
++        if method == "average":
++            msg = (
++                "`rank` with `method='average' is not supported for pyarrow backend. "
++                "The available methods are {'min', 'max', 'dense', 'ordinal'}."
++            )
++            raise ValueError(msg)
++
++        import pyarrow as pa  # ignore-banned-import
++        import pyarrow.compute as pc  # ignore-banned-import
++
++        sort_keys = "descending" if descending else "ascending"
++        tiebreaker = "first" if method == "ordinal" else method
++
++        native_series = self._native_series
++        if self._backend_version < (14, 0, 0):  # pragma: no cover
++            native_series = native_series.combine_chunks()
++
++        null_mask = pc.is_null(native_series)
++
++        rank = pc.rank(native_series, sort_keys=sort_keys, tiebreaker=tiebreaker)
++
++        result = pc.if_else(null_mask, pa.scalar(None), rank)
++        return self._from_native_series(result)
++
+     def __iter__(self: Self) -> Iterator[Any]:
+         yield from (
+             maybe_extract_py_scalar(x, return_py_scalar=True)
+diff --git a/narwhals/_pandas_like/expr.py b/narwhals/_pandas_like/expr.py
+index c681fc4..fac9a2e 100644
+--- a/narwhals/_pandas_like/expr.py
++++ b/narwhals/_pandas_like/expr.py
+@@ -34,6 +34,7 @@ MANY_TO_MANY_AGG_FUNCTIONS_TO_PANDAS_EQUIVALENT = {
+     # So, instead of using "cumcount" we use "cumsum" on notna() to get the same result
+     "col->cum_count": "cumsum",
+     "col->shift": "shift",
++    "col->rank": "rank",
+ }
+ 
+ 
+@@ -383,7 +384,7 @@ class PandasLikeExpr(CompliantExpr[PandasLikeSeries]):
+             kwargs={**self._kwargs, "name": name},
+         )
+ 
+-    def over(self, keys: list[str]) -> Self:
++    def over(self: Self, keys: list[str]) -> Self:
+         if self._function_name in MANY_TO_MANY_AGG_FUNCTIONS_TO_PANDAS_EQUIVALENT:
+ 
+             def func(df: PandasLikeDataFrame) -> list[PandasLikeSeries]:
+@@ -412,8 +413,15 @@ class PandasLikeExpr(CompliantExpr[PandasLikeSeries]):
+ 
+                 if self._function_name == "col->shift":
+                     kwargs = {"periods": self._kwargs.get("n", 1)}
+-                else:
+-                    # Cumulative operation
++                elif self._function_name == "col->rank":
++                    _method = self._kwargs.get("method", "average")
++                    kwargs = {
++                        "method": "first" if _method == "ordinal" else _method,
++                        "ascending": not self._kwargs.get("descending", False),
++                        "na_option": "keep",
++                        "pct": False,
++                    }
++                else:  # Cumulative operation
+                     kwargs = {"skipna": True}
+ 
+                 res_native = getattr(
+@@ -617,6 +625,16 @@ class PandasLikeExpr(CompliantExpr[PandasLikeSeries]):
+             ddof=ddof,
+         )
+ 
++    def rank(
++        self: Self,
++        method: Literal["average", "min", "max", "dense", "ordinal"],
++        *,
++        descending: bool,
++    ) -> Self:
++        return reuse_series_implementation(
++            self, "rank", method=method, descending=descending
++        )
++
+     @property
+     def str(self: Self) -> PandasLikeExprStringNamespace:
+         return PandasLikeExprStringNamespace(self)
+diff --git a/narwhals/_pandas_like/series.py b/narwhals/_pandas_like/series.py
+index 60918fd..e5c5e77 100644
+--- a/narwhals/_pandas_like/series.py
++++ b/narwhals/_pandas_like/series.py
+@@ -1119,6 +1119,56 @@ class PandasLikeSeries(CompliantSeries):
+         s = self._native_series
+         return self._from_native_series((s > float("-inf")) & (s < float("inf")))
+ 
++    def rank(
++        self: Self,
++        method: Literal["average", "min", "max", "dense", "ordinal"],
++        *,
++        descending: bool,
++    ) -> Self:
++        pd_method = "first" if method == "ordinal" else method
++        native_series = self._native_series
++        dtypes = import_dtypes_module(self._version)
++        if (
++            self._implementation is Implementation.PANDAS
++            and self._backend_version < (3,)
++            and self.dtype
++            in {
++                dtypes.Int64,
++                dtypes.Int32,
++                dtypes.Int16,
++                dtypes.Int8,
++                dtypes.UInt64,
++                dtypes.UInt32,
++                dtypes.UInt16,
++                dtypes.UInt8,
++            }
++            and (null_mask := native_series.isna()).any()
++        ):
++            # crazy workaround for the case of `na_option="keep"` and nullable
++            # integer dtypes. This should be supported in pandas > 3.0
++            # https://github.com/pandas-dev/pandas/issues/56976
++            ranked_series = (
++                native_series.to_frame()
++                .assign(**{f"{native_series.name}_is_null": null_mask})
++                .groupby(f"{native_series.name}_is_null")
++                .rank(
++                    method=pd_method,
++                    na_option="keep",
++                    ascending=not descending,
++                    pct=False,
++                )[native_series.name]
++            )
++
++        else:
++            ranked_series = native_series.rank(
++                method=pd_method,
++                na_option="keep",
++                ascending=not descending,
++                pct=False,
++            )
++
++        return self._from_native_series(ranked_series)
++
+     @property
+     def str(self) -> PandasLikeSeriesStringNamespace:
+         return PandasLikeSeriesStringNamespace(self)
+diff --git a/narwhals/expr.py b/narwhals/expr.py
+index 3e45798..809f76e 100644
+--- a/narwhals/expr.py
++++ b/narwhals/expr.py
+@@ -4114,6 +4114,103 @@ class Expr:
+             )
+         )
+ 
++    def rank(
++        self: Self,
++        method: Literal["average", "min", "max", "dense", "ordinal"] = "average",
++        *,
++        descending: bool = False,
++    ) -> Self:
++        """Assign ranks to data, dealing with ties appropriately.
++
++        Notes:
++            The resulting dtype may differ between backends.
++
++        Arguments:
++            method: The method used to assign ranks to tied elements.
++                The following methods are available (default is 'average'):
++
++                - 'average' : The average of the ranks that would have been assigned to
++                  all the tied values is assigned to each value.
++                - 'min' : The minimum of the ranks that would have been assigned to all
++                    the tied values is assigned to each value. (This is also referred to
++                    as "competition" ranking.)
++                - 'max' : The maximum of the ranks that would have been assigned to all
++                    the tied values is assigned to each value.
++                - 'dense' : Like 'min', but the rank of the next highest element is
++                   assigned the rank immediately after those assigned to the tied
++                   elements.
++                - 'ordinal' : All values are given a distinct rank, corresponding to the
++                    order that the values occur in the Series.
++
++            descending: Rank in descending order.
++
++        Returns:
++            A new expression with rank data.
++
++        Examples:
++            >>> import pandas as pd
++            >>> import polars as pl
++            >>> import pyarrow as pa
++            >>> import narwhals as nw
++            >>> from narwhals.typing import IntoFrameT
++            >>>
++            >>> data = {"a": [3, 6, 1, 1, 6]}
++
++            We define a dataframe-agnostic function that computes the dense rank for
++            the data:
++
++            >>> def agnostic_dense_rank(df_native: IntoFrameT) -> IntoFrameT:
++            ...     df = nw.from_native(df_native)
++            ...     result = df.with_columns(rnk=nw.col("a").rank(method="dense"))
++            ...     return result.to_native()
++
++            We can then pass any supported library such as pandas, Polars, or
++            PyArrow to `agnostic_dense_rank`:
++
++            >>> agnostic_dense_rank(pd.DataFrame(data))
++               a  rnk
++            0  3  2.0
++            1  6  3.0
++            2  1  1.0
++            3  1  1.0
++            4  6  3.0
++
++            >>> agnostic_dense_rank(pl.DataFrame(data))
++            shape: (5, 2)
++            ┌─────┬─────┐
++            │ a   ┆ rnk │
++            │ --- ┆ --- │
++            │ i64 ┆ u32 │
++            ╞═════╪═════╡
++            │ 3   ┆ 2   │
++            │ 6   ┆ 3   │
++            │ 1   ┆ 1   │
++            │ 1   ┆ 1   │
++            │ 6   ┆ 3   │
++            └─────┴─────┘
++
++            >>> agnostic_dense_rank(pa.table(data))
++            pyarrow.Table
++            a: int64
++            rnk: uint64
++            ----
++            a: [[3,6,1,1,6]]
++            rnk: [[2,3,1,1,3]]
++        """
++        supported_rank_methods = {"average", "min", "max", "dense", "ordinal"}
++        if method not in supported_rank_methods:
++            msg = (
++                "Ranking method must be one of {'average', 'min', 'max', 'dense', 'ordinal'}. "
++                f"Found '{method}'"
++            )
++            raise ValueError(msg)
++
++        return self.__class__(
++            lambda plx: self._to_compliant_expr(plx).rank(
++                method=method, descending=descending
++            )
++        )
++
+     @property
+     def str(self: Self) -> ExprStringNamespace[Self]:
+         return ExprStringNamespace(self)
+diff --git a/narwhals/series.py b/narwhals/series.py
+index c3e6f18..7b4cfbf 100644
+--- a/narwhals/series.py
++++ b/narwhals/series.py
+@@ -4738,6 +4738,101 @@ class Series(Generic[IntoSeriesT]):
+     def __contains__(self: Self, other: Any) -> bool:
+         return self._compliant_series.__contains__(other)  # type: ignore[no-any-return]
+ 
++    def rank(
++        self: Self,
++        method: Literal["average", "min", "max", "dense", "ordinal"] = "average",
++        *,
++        descending: bool = False,
++    ) -> Self:
++        """Assign ranks to data, dealing with ties appropriately.
++
++        Notes:
++            The resulting dtype may differ between backends.
++
++        Arguments:
++            method: The method used to assign ranks to tied elements.
++                The following methods are available (default is 'average'):
++
++                - 'average' : The average of the ranks that would have been assigned to
++                  all the tied values is assigned to each value.
++                - 'min' : The minimum of the ranks that would have been assigned to all
++                    the tied values is assigned to each value. (This is also referred to
++                    as "competition" ranking.)
++                - 'max' : The maximum of the ranks that would have been assigned to all
++                    the tied values is assigned to each value.
++                - 'dense' : Like 'min', but the rank of the next highest element is
++                   assigned the rank immediately after those assigned to the tied
++                   elements.
++                - 'ordinal' : All values are given a distinct rank, corresponding to the
++                    order that the values occur in the Series.
++
++            descending: Rank in descending order.
++
++        Returns:
++            A new series with rank data as values.
++
++        Examples:
++            >>> import pandas as pd
++            >>> import polars as pl
++            >>> import pyarrow as pa
++            >>> import narwhals as nw
++            >>> from narwhals.typing import IntoSeriesT
++            >>>
++            >>> data = [3, 6, 1, 1, 6]
++
++            We define a dataframe-agnostic function that computes the dense rank for
++            the data:
++
++            >>> def agnostic_dense_rank(s_native: IntoSeriesT) -> IntoSeriesT:
++            ...     s = nw.from_native(s_native, series_only=True)
++            ...     return s.rank(method="dense").to_native()
++
++            We can then pass any supported library such as pandas, Polars, or
++            PyArrow to `agnostic_dense_rank`:
++
++            >>> agnostic_dense_rank(pd.Series(data))
++            0    2.0
++            1    3.0
++            2    1.0
++            3    1.0
++            4    3.0
++            dtype: float64
++
++            >>> agnostic_dense_rank(pl.Series(data))  # doctest:+NORMALIZE_WHITESPACE
++            shape: (5,)
++            Series: '' [u32]
++            [
++               2
++               3
++               1
++               1
++               3
++            ]
++
++            >>> agnostic_dense_rank(pa.chunked_array([data]))  # doctest:+ELLIPSIS
++            <pyarrow.lib.ChunkedArray object at ...>
++            [
++              [
++                2,
++                3,
++                1,
++                1,
++                3
++              ]
++            ]
++        """
++        supported_rank_methods = {"average", "min", "max", "dense", "ordinal"}
++        if method not in supported_rank_methods:
++            msg = (
++                "Ranking method must be one of {'average', 'min', 'max', 'dense', 'ordinal'}. "
++                f"Found '{method}'"
++            )
++            raise ValueError(msg)
++
++        return self._from_compliant_series(
++            self._compliant_series.rank(method=method, descending=descending)
++        )
++
+     @property
+     def str(self: Self) -> SeriesStringNamespace[Self]:
+         return SeriesStringNamespace(self)

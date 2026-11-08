@@ -1,0 +1,169 @@
+diff --git a/docs/misc/prune-example.txt b/docs/misc/prune-example.txt
+index bc6bb209..af749e16 100644
+--- a/docs/misc/prune-example.txt
++++ b/docs/misc/prune-example.txt
+@@ -100,3 +100,27 @@ example simple. They all work in basically the same way.
+ 
+ The weekly rule is easy to understand roughly, but hard to understand in all
+ details. If interested, read "ISO 8601:2000 standard week-based year".
++
++The 13weekly and 3monthly rules are two different strategies for keeping one
++every quarter of a year. There are `multiple ways` to define a quarter-year;
++borg prune recognizes two:
++
++* --keep-13weekly keeps one backup every 13 weeks using ISO 8601:2000's
++  definition of the week-based year. January 4th is always included in the
++  first week of a year, and January 1st to 3rd may be in week 52 or 53 of the
++  previous year. Week 53 is also in the fourth quarter of the year.
++* --keep-3monthly keeps one backup every 3 months. January 1st to
++  March 31, April 1st to June 30th, July 1st to September 30th, and October 1st
++  to December 31st form the quarters.
++
++If the subtleties of the definition of a quarter year don't matter to you, a
++short summary of behavior is:
++
++* --keep-13weekly favors keeping backups at the beginning of Jan, Apr, July,
++  and Oct.
++* --keep-3monthly favors keeping backups at the end of Dec, Mar, Jun, and Sept.
++* Both strategies will have some overlap in which backups are kept.
++* The differences are negligible unless backups considered for deletion were
++  created weekly or more frequently.
++
++.. _multiple ways: https://en.wikipedia.org/wiki/Calendar_year#Quarter_year
+diff --git a/src/borg/archiver.py b/src/borg/archiver.py
+index 68cf0e2f..7c9cedcd 100644
+--- a/src/borg/archiver.py
++++ b/src/borg/archiver.py
+@@ -1518,10 +1518,12 @@ class Archiver:
+     def do_prune(self, args, repository, manifest, key):
+         """Prune repository archives according to specified rules"""
+         if not any((args.secondly, args.minutely, args.hourly, args.daily,
+-                    args.weekly, args.monthly, args.yearly, args.within)):
++                    args.weekly, args.monthly, args.quarterly_13weekly,
++                    args.quarterly_3monthly, args.yearly, args.within)):
+             raise CommandError('At least one of the "keep-within", "keep-last", '
+                                '"keep-secondly", "keep-minutely", "keep-hourly", "keep-daily", '
+-                               '"keep-weekly", "keep-monthly" or "keep-yearly" settings must be specified.')
++                               '"keep-weekly", "keep-monthly", "keep-13weekly", "keep-3monthly", '
++                               'or "keep-yearly" settings must be specified.')
+         if args.prefix is not None:
+             args.glob_archives = args.prefix + '*'
+         checkpoint_re = r'\.checkpoint(\.\d+)?'
+@@ -4673,9 +4675,13 @@ class Archiver:
+         the local timezone, and weeks go from Monday to Sunday. Specifying a
+         negative number of archives to keep means that there is no limit. As of borg
+         1.2.0, borg will retain the oldest archive if any of the secondly, minutely,
+-        hourly, daily, weekly, monthly, or yearly rules was not otherwise able to meet
+-        its retention target. This enables the first chronological archive to continue
+-        aging until it is replaced by a newer archive that meets the retention criteria.
++        hourly, daily, weekly, monthly, quarterly, or yearly rules was not otherwise
++        able to meet its retention target. This enables the first chronological archive
++        to continue aging until it is replaced by a newer archive that meets the
++        retention criteria.
++
++        The ``--keep-13weekly`` and ``--keep-3monthly`` rules are two different
++        strategies for keeping archives every quarter year.
+ 
+         The ``--keep-last N`` option is doing the same as ``--keep-secondly N`` (and it will
+         keep the last N archives under the assumption that you do not create more than one
+@@ -4715,6 +4721,11 @@ class Archiver:
+                                help='number of weekly archives to keep')
+         subparser.add_argument('-m', '--keep-monthly', dest='monthly', type=int, default=0,
+                                help='number of monthly archives to keep')
++        quarterly_group = subparser.add_mutually_exclusive_group()
++        quarterly_group.add_argument('--keep-13weekly', dest='quarterly_13weekly', type=int, default=0,
++                                     help='number of quarterly archives to keep (13 week strategy)')
++        quarterly_group.add_argument('--keep-3monthly', dest='quarterly_3monthly', type=int, default=0,
++                                     help='number of quarterly archives to keep (3 month strategy)')
+         subparser.add_argument('-y', '--keep-yearly', dest='yearly', type=int, default=0,
+                                help='number of yearly archives to keep')
+         define_archive_filters_group(subparser, sort_by=False, first_last=False)
+diff --git a/src/borg/helpers/misc.py b/src/borg/helpers/misc.py
+index b62e066b..9dbd4e54 100644
+--- a/src/borg/helpers/misc.py
++++ b/src/borg/helpers/misc.py
+@@ -31,21 +31,67 @@ def prune_within(archives, hours, kept_because):
+     return result
+ 
+ 
++def default_period_func(pattern):
++    def inner(a):
++        return to_localtime(a.ts).strftime(pattern)
++
++    return inner
++
++
++def quarterly_13weekly_period_func(a):
++    (year, week, _) = to_localtime(a.ts).isocalendar()
++    if week <= 13:
++        # Weeks containing Jan 4th to Mar 28th (leap year) or 29th- 91 (13*7)
++        # days later.
++        return (year, 1)
++    elif 14 <= week <= 26:
++        # Weeks containing Apr 4th (leap year) or 5th to Jun 27th or 28th- 91
++        # days later.
++        return (year, 2)
++    elif 27 <= week <= 39:
++        # Weeks containing Jul 4th (leap year) or 5th to Sep 26th or 27th-
++        # at least 91 days later.
++        return (year, 3)
++    else:
++        # Everything else, Oct 3rd (leap year) or 4th onward, will always
++        # include week of Dec 26th (leap year) or Dec 27th, may also include
++        # up to possibly Jan 3rd of next year.
++        return (year, 4)
++
++
++def quarterly_3monthly_period_func(a):
++    lt = to_localtime(a.ts)
++    if lt.month <= 3:
++        # 1-1 to 3-31
++        return (lt.year, 1)
++    elif 4 <= lt.month <= 6:
++        # 4-1 to 6-30
++        return (lt.year, 2)
++    elif 7 <= lt.month <= 9:
++        # 7-1 to 9-30
++        return (lt.year, 3)
++    else:
++        # 10-1 to 12-31
++        return (lt.year, 4)
++
++
+ PRUNING_PATTERNS = OrderedDict([
+-    ("secondly", '%Y-%m-%d %H:%M:%S'),
+-    ("minutely", '%Y-%m-%d %H:%M'),
+-    ("hourly", '%Y-%m-%d %H'),
+-    ("daily", '%Y-%m-%d'),
+-    ("weekly", '%G-%V'),
+-    ("monthly", '%Y-%m'),
+-    ("yearly", '%Y'),
++    ("secondly", default_period_func('%Y-%m-%d %H:%M:%S')),
++    ("minutely", default_period_func('%Y-%m-%d %H:%M')),
++    ("hourly", default_period_func('%Y-%m-%d %H')),
++    ("daily", default_period_func('%Y-%m-%d')),
++    ("weekly", default_period_func('%G-%V')),
++    ("monthly", default_period_func('%Y-%m')),
++    ("quarterly_13weekly", quarterly_13weekly_period_func),
++    ("quarterly_3monthly", quarterly_3monthly_period_func),
++    ("yearly", default_period_func('%Y')),
+ ])
+ 
+ 
+ def prune_split(archives, rule, n, kept_because=None):
+     last = None
+     keep = []
+-    pattern = PRUNING_PATTERNS[rule]
++    period_func = PRUNING_PATTERNS[rule]
+     if kept_because is None:
+         kept_because = {}
+     if n == 0:
+@@ -53,7 +99,7 @@ def prune_split(archives, rule, n, kept_because=None):
+ 
+     a = None
+     for a in sorted(archives, key=attrgetter('ts'), reverse=True):
+-        period = to_localtime(a.ts).strftime(pattern)
++        period = period_func(a)
+         if period != last:
+             last = period
+             if a.id not in kept_because:

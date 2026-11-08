@@ -1,0 +1,303 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index 56cc8d2..aef89cd 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -9,6 +9,8 @@ use super::QualFilter;
+ pub const DEFAULT_KMER: usize = 17;
+ /// Default single strand (which is equivalent to !rc)
+ pub const DEFAULT_STRAND: bool = false;
++/// Default repeat masking behaviour
++pub const DEFAULT_REPEATMASK: bool = false;
+ /// Default minimum k-mer count for FASTQ files
+ pub const DEFAULT_MINCOUNT: u16 = 10;
+ /// Default minimum base quality (PHRED score) for FASTQ files
+@@ -189,6 +191,10 @@ pub enum Commands {
+         #[arg(short, long, value_enum, default_value_t = FileType::Aln)]
+         format: FileType,
+ 
++        /// Mask any repeats in the alignment with 'N'
++        #[arg(long, default_value_t = DEFAULT_REPEATMASK)]
++        repeat_mask: bool,
++
+         /// Number of CPU threads
+         #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
+         threads: usize,
+diff --git a/src/generic_modes.rs b/src/generic_modes.rs
+index 9793280..2853a16 100644
+--- a/src/generic_modes.rs
++++ b/src/generic_modes.rs
+@@ -189,7 +189,7 @@ pub fn weed<IntT: for<'a> UInt<'a>>(
+             ska_array.kmer_len(),
+             ska_array.rc()
+         );
+-        let ska_weed = RefSka::new(ska_array.kmer_len(), weed_fasta, ska_array.rc());
++        let ska_weed = RefSka::new(ska_array.kmer_len(), weed_fasta, ska_array.rc(), false);
+ 
+         if !reverse {
+             log::info!("Removing weed k-mers");
+diff --git a/src/lib.rs b/src/lib.rs
+index c48bb1d..179418f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -154,6 +154,7 @@
+ //! ```bash
+ //! ska map ref.fa seqs.skf -o ref_mapped.aln
+ //! ```
++//! Add `--repeat-mask` to mask any repeated split k-mers in the reference with 'N'.
+ //!
+ //! You can also get a VCF as output, which has rows as variants, and only has the
+ //! variable sites (but will include unmapped bases as missing).
+@@ -488,6 +489,7 @@ pub fn main() {
+             input,
+             output,
+             format,
++            repeat_mask,
+             threads,
+         } => {
+             check_threads(*threads);
+@@ -498,8 +500,12 @@ pub fn main() {
+                     ska_array.kmer_len(),
+                     ska_array.rc()
+                 );
+-                let mut ska_ref =
+-                    RefSka::<u64>::new(ska_array.kmer_len(), reference, ska_array.rc());
++                let mut ska_ref = RefSka::<u64>::new(
++                    ska_array.kmer_len(),
++                    reference,
++                    ska_array.rc(),
++                    *repeat_mask,
++                );
+                 map(&mut ska_array, &mut ska_ref, output, format, *threads);
+             } else if let Ok(mut ska_array) = load_array::<u128>(input, *threads) {
+                 log::info!(
+@@ -507,8 +513,12 @@ pub fn main() {
+                     ska_array.kmer_len(),
+                     ska_array.rc()
+                 );
+-                let mut ska_ref =
+-                    RefSka::<u128>::new(ska_array.kmer_len(), reference, ska_array.rc());
++                let mut ska_ref = RefSka::<u128>::new(
++                    ska_array.kmer_len(),
++                    reference,
++                    ska_array.rc(),
++                    *repeat_mask,
++                );
+                 map(&mut ska_array, &mut ska_ref, output, format, *threads);
+             } else {
+                 panic!("Could not read input file(s): {input:?}");
+diff --git a/src/merge_ska_array.rs b/src/merge_ska_array.rs
+index d02e67f..c31feff 100644
+--- a/src/merge_ska_array.rs
++++ b/src/merge_ska_array.rs
+@@ -63,7 +63,8 @@ use crate::cli::FilterType;
+ /// ska_array.delete_samples(&[&"test_1"]);
+ ///
+ /// // Delete k-mers
+-/// let ska_weed = RefSka::new(ska_array.kmer_len(), &"tests/test_files_in/weed.fa", ska_array.rc());
++/// let mask_repeats = false;
++/// let ska_weed = RefSka::new(ska_array.kmer_len(), &"tests/test_files_in/weed.fa", ska_array.rc(), mask_repeats);
+ /// let reverse = false;
+ /// ska_array.weed(&ska_weed, reverse);
+ /// ```
+diff --git a/src/ska_ref.rs b/src/ska_ref.rs
+index 4d4ac50..b057cbd 100644
+--- a/src/ska_ref.rs
++++ b/src/ska_ref.rs
+@@ -20,7 +20,8 @@
+ //! let ska_dict = load_array::<u64>(&["tests/test_files_in/merge.skf".to_string()], threads).unwrap().to_dict();
+ //!
+ //! // Index a reference sequence
+-//! let mut ref_kmers = RefSka::new(ska_dict.kmer_len(), &"tests/test_files_in/test_ref.fa", ska_dict.rc());
++//! let mask_repeats = false;
++//! let mut ref_kmers = RefSka::new(ska_dict.kmer_len(), &"tests/test_files_in/test_ref.fa", ska_dict.rc(), mask_repeats);
+ //!
+ //! // Run mapping, output an alignment to stdout
+ //! ref_kmers.map(&ska_dict);
+@@ -31,6 +32,8 @@
+ use std::io::Write;
+ use std::str;
+ 
++use hashbrown::hash_set::Entry::*;
++use hashbrown::HashSet;
+ use rayon::prelude::*;
+ 
+ use noodles_vcf::{
+@@ -102,6 +105,8 @@ where
+     chrom_names: Vec<String>,
+     /// Sequence, indexed by chromosome, then position
+     seq: Vec<Vec<u8>>,
++    /// Where repeats should be masked with 'N'
++    repeat_coors: Vec<usize>,
+ 
+     /// Mapping information
+ 
+@@ -153,7 +158,7 @@ where
+     /// - File doesn't exist or can't be opened.
+     /// - File cannot be parsed as FASTA (FASTQ is not supported).
+     /// - If there are no valid split k-mers.
+-    pub fn new(k: usize, filename: &str, rc: bool) -> Self {
++    pub fn new(k: usize, filename: &str, rc: bool, repeat_mask: bool) -> Self {
+         if !(5..=63).contains(&k) || k % 2 == 0 {
+             panic!("Invalid k-mer length");
+         }
+@@ -161,6 +166,8 @@ where
+         let mut split_kmer_pos = Vec::new();
+         let mut seq = Vec::new();
+         let mut chrom_names = Vec::new();
++        let mut singles = HashSet::new();
++        let mut repeats = HashSet::new();
+ 
+         let mut reader =
+             parse_fastx_file(filename).unwrap_or_else(|_| panic!("Invalid path/file: {filename}",));
+@@ -193,6 +200,9 @@ where
+                     chrom,
+                     rc,
+                 });
++                if repeat_mask {
++                    Self::track_repeats(kmer, &mut singles, &mut repeats);
++                }
+                 while let Some((kmer, base, rc)) = kmer_it.get_next_kmer() {
+                     pos = kmer_it.get_middle_pos();
+                     split_kmer_pos.push(RefKmer {
+@@ -202,6 +212,9 @@ where
+                         chrom,
+                         rc,
+                     });
++                    if repeat_mask {
++                        Self::track_repeats(kmer, &mut singles, &mut repeats);
++                    }
+                 }
+             }
+             chrom += 1;
+@@ -211,17 +224,68 @@ where
+             panic!("{filename} has no valid sequence");
+         }
+ 
++        // Find the repeat ranges, and intersect them
++        let mut repeat_coors = Vec::new();
++        if repeat_mask {
++            let half_split_len = (k - 1) / 2;
++            let mut last_chrom = 0;
++            let mut last_end = 0;
++            let mut chrom_offset = 0;
++            for sk in &split_kmer_pos {
++                if sk.chrom > last_chrom {
++                    chrom_offset += seq[last_chrom].len();
++                    last_chrom = sk.chrom;
++                }
++                if repeats.contains(&sk.kmer) {
++                    let start = sk.pos - half_split_len + chrom_offset;
++                    let end = sk.pos + half_split_len + chrom_offset;
++                    let range = if start > last_end || start == 0 {
++                        std::ops::Range {
++                            start,
++                            end: end + 1,
++                        }
++                    } else {
++                        std::ops::Range {
++                            start: last_end + 1,
++                            end: end + 1,
++                        }
++                    };
++                    for pos in range {
++                        repeat_coors.push(pos);
++                    }
++                    last_chrom = sk.chrom;
++                    last_end = end;
++                }
++            }
++            log::info!("Masking {} unique split k-mer repeats spanning {} bases", repeats.len(), repeat_coors.len());
++        }
++
+         Self {
+             k,
+             seq,
+             chrom_names,
+             split_kmer_pos,
++            repeat_coors,
+             mapped_pos: Vec::new(),
+             mapped_variants: Array2::zeros((0, 0)),
+             mapped_names: Vec::new(),
+         }
+     }
+ 
++    // Keeps track of split k-mers in the ref, any found before are moved
++    // to the repeats set
++    fn track_repeats(kmer: IntT, singles: &mut HashSet<IntT>, repeats: &mut HashSet<IntT>) {
++        if let Vacant(rep_kmer) = repeats.entry(kmer) {
++            match singles.entry(kmer) {
++                Vacant(single_entry) => single_entry.insert(),
++                Occupied(single_entry) => {
++                    single_entry.remove();
++                    rep_kmer.insert();
++                }
++            }
++        }
++    }
++
+     /// Map split k-mers in a [`MergeSkaDict`] against the refrence sequence.
+     ///
+     /// Iterates through the referecne list and searches for split k-mers in
+@@ -276,7 +340,8 @@ where
+             panic!("No split k-mers mapped to reference");
+         }
+ 
+-        let mut seq_writers = vec![AlnWriter::new(&self.seq, self.k); self.mapped_names.len()];
++        let mut seq_writers =
++            vec![AlnWriter::new(&self.seq, self.k, &self.repeat_coors); self.mapped_names.len()];
+         rayon::ThreadPoolBuilder::new()
+             .num_threads(threads)
+             .build_global()
+@@ -318,7 +383,7 @@ where
+         threads: usize,
+     ) -> Result<(), needletail::errors::ParseError> {
+         if self.chrom_names.len() > 1 {
+-            eprintln!("WARNING: Reference contained multiple contigs, in the output they will be concatenated");
++            log::warn!("Reference contained multiple contigs, in the output they will be concatenated");
+         }
+ 
+         let alignments = self.pseudoalignment(threads);
+diff --git a/src/ska_ref/aln_writer.rs b/src/ska_ref/aln_writer.rs
+index 853425a..fb94efb 100644
+--- a/src/ska_ref/aln_writer.rs
++++ b/src/ska_ref/aln_writer.rs
+@@ -37,14 +37,16 @@ pub struct AlnWriter<'a> {
+     /// Whether the finalise function has been run, filling to the end of the
+     /// final contig.
+     finalised: bool,
+-    /// Buffer for amibguous bases, which are written in at the end.
++    /// Repeats to mask, which happens at finalisation
++    repeat_regions: &'a Vec<usize>,
++    /// Buffer for amibguous bases, which are written at finalisation.
+     _ambig_out: Vec<(u8, usize)>,
+ }
+ 
+ impl<'a> AlnWriter<'a> {
+     /// Create a new [`AlnWriter`] taking the reference sequence mapped against
+     /// and the k-mer size used for the mapping
+-    pub fn new(ref_seq: &'a Vec<Vec<u8>>, k: usize) -> Self {
++    pub fn new(ref_seq: &'a Vec<Vec<u8>>, k: usize, repeat_regions: &'a Vec<usize>) -> Self {
+         let total_size = ref_seq.iter().map(|x| x.len()).sum();
+         let half_split_len = (k - 1) / 2;
+         Self {
+@@ -57,6 +59,7 @@ impl<'a> AlnWriter<'a> {
+             seq_out: vec![b'-'; total_size],
+             half_split_len,
+             finalised: false,
++            repeat_regions,
+             _ambig_out: Vec::new(),
+         }
+     }
+@@ -153,6 +156,12 @@ impl<'a> AlnWriter<'a> {
+             for (ambig_base, ambig_pos) in &self._ambig_out {
+                 self.seq_out[*ambig_pos] = *ambig_base;
+             }
++            // Mask repeats
++            for repeat_idx in self.repeat_regions {
++                if self.seq_out[*repeat_idx] != b'-' {
++                    self.seq_out[*repeat_idx] = b'N';
++                }
++            }
+             self.finalised = true;
+         }
+     }

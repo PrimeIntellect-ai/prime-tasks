@@ -1,0 +1,252 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 97988cc..32afed4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,12 +15,12 @@
+ - [](https://github.com/vegaprotocol/vegawallet/pull/) -
+ 
+ ### 🐛 Fixes
+-- [](https://github.com/vegaprotocol/vegawallet/pull/) -
++- [548](https://github.com/vegaprotocol/vegawallet/pull/548) - Printer utility shouldn't write in service response
+ 
+ ## 0.14.2
+ 
+ ### 🛠  Improvements
+-- [544](https://github.com/vegaprotocol/vegawallet/issues/544) - Display transaction hash after sending transaction
++- [544](https://github.com/vegaprotocol/vegagwallet/issues/544) - Display transaction hash after sending transaction
+ 
+ ## 0.14.1
+ 
+diff --git a/cmd/service_run.go b/cmd/service_run.go
+index a7d250b..4de954e 100644
+--- a/cmd/service_run.go
++++ b/cmd/service_run.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"os/signal"
++	"strings"
+ 	"syscall"
+ 
+ 	vgterm "code.vegaprotocol.io/shared/libs/term"
+@@ -209,6 +210,7 @@ func RunService(w io.Writer, rf *RootFlags, f *RunServiceFlags) error {
+ 	}
+ 
+ 	pendingConsents := make(chan service.ConsentRequest, 1)
++	sentTxs := make(chan service.SentTransaction)
+ 
+ 	cliLog, cliLogPath, err := BuildJSONLogger(cfg.Level.String(), vegaPaths, paths.WalletCLILogsHome)
+ 	if err != nil {
+@@ -226,7 +228,7 @@ func RunService(w io.Writer, rf *RootFlags, f *RunServiceFlags) error {
+ 			policy = service.NewAutomaticConsentPolicy()
+ 		} else {
+ 			cliLog.Info("Explicit consent enabled")
+-			policy = service.NewExplicitConsentPolicy(pendingConsents)
++			policy = service.NewExplicitConsentPolicy(pendingConsents, sentTxs)
+ 		}
+ 	} else {
+ 		cliLog.Info("No TTY detected")
+@@ -294,7 +296,7 @@ func RunService(w io.Writer, rf *RootFlags, f *RunServiceFlags) error {
+ 		p.NextLine()
+ 	}
+ 
+-	waitSig(ctx, cancel, cliLog, pendingConsents, p)
++	waitSig(ctx, cancel, cliLog, pendingConsents, sentTxs, p)
+ 
+ 	return nil
+ }
+@@ -364,7 +366,7 @@ func startTokenDApp(log *zap.Logger, f *RunServiceFlags, cfg *network.Network, c
+ }
+ 
+ // waitSig will wait for a sigterm or sigint interrupt.
+-func waitSig(ctx context.Context, cfunc func(), log *zap.Logger, pendingSigRequests chan service.ConsentRequest, p *printer.InteractivePrinter) {
++func waitSig(ctx context.Context, cfunc func(), log *zap.Logger, pendingSigRequests chan service.ConsentRequest, sentTxs chan service.SentTransaction, p *printer.InteractivePrinter) {
+ 	gracefulStop := make(chan os.Signal, 1)
+ 
+ 	signal.Notify(gracefulStop, syscall.SIGTERM)
+@@ -393,7 +395,17 @@ func waitSig(ctx context.Context, cfunc func(), log *zap.Logger, pendingSigReque
+ 			if flags.DoYouApproveTx() {
+ 				log.Info("user approved the signing of the transaction", zap.Any("transaction", txStr))
+ 				signRequest.Confirmations <- service.ConsentConfirmation{Decision: true, TxStr: txStr}
+-				p.CheckMark().SuccessText("Transaction approved").NextSection()
++				p.CheckMark().SuccessText("Transaction approved").NextLine()
++
++				sentTx := <-sentTxs
++				if sentTx.Error != nil {
++					p.BangMark().DangerText("Transaction failed! ").NextLine()
++					p.BangMark().DangerText("Error: ").DangerText(sentTx.Error.Error()).NextLine()
++					p.BangMark().DangerText("Details: ").DangerText(strings.Join(sentTx.ErrorDetails, " ,")).NextSection()
++				} else {
++					p.CheckMark().SuccessText("Transaction sent! ").NextLine()
++					p.CheckMark().Text("Transaction hash: ").SuccessText(sentTx.TxHash).NextSection()
++				}
+ 			} else {
+ 				log.Info("user rejected the signing of the transaction", zap.Any("transaction", txStr))
+ 				signRequest.Confirmations <- service.ConsentConfirmation{Decision: false, TxStr: txStr}
+diff --git a/cmd/tx_send.go b/cmd/tx_send.go
+index e505c08..21c8060 100644
+--- a/cmd/tx_send.go
++++ b/cmd/tx_send.go
+@@ -205,7 +205,7 @@ func SendTx(w io.Writer, rf *RootFlags, req *SendTxRequest) error {
+ 
+ 	log.Info("transaction successfully sent", zap.String("hash", txHash))
+ 	if rf.Output == flags.InteractiveOutput {
+-		p.CheckMark().InfoText("Transaction sent:").SuccessText(txHash).NextLine()
++		p.NextLine().CheckMark().Text("Transaction sent: ").SuccessText(txHash).NextLine()
+ 	}
+ 
+ 	return nil
+diff --git a/service/mocks/policies_mock.go b/service/mocks/policies_mock.go
+index 924e988..ccff0b2 100644
+--- a/service/mocks/policies_mock.go
++++ b/service/mocks/policies_mock.go
+@@ -7,11 +7,17 @@ import (
+ 
+ type MockConsentPolicy struct {
+ 	pendingEvents chan service.ConsentRequest
++	sentTxs       chan service.SentTransaction
+ }
+ 
+-func NewMockConsentPolicy(pending chan service.ConsentRequest) service.Policy {
++func (p *MockConsentPolicy) Report(tx service.SentTransaction) {
++	p.sentTxs <- tx
++}
++
++func NewMockConsentPolicy(pending chan service.ConsentRequest, sentTxs chan service.SentTransaction) *MockConsentPolicy {
+ 	return &MockConsentPolicy{
+ 		pendingEvents: pending,
++		sentTxs:       sentTxs,
+ 	}
+ }
+ 
+diff --git a/service/policies.go b/service/policies.go
+index 5a47d7a..a4d8d2b 100644
+--- a/service/policies.go
++++ b/service/policies.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"time"
+ 
++	commandspb "code.vegaprotocol.io/protos/vega/commands/v1"
+ 	v1 "code.vegaprotocol.io/protos/vega/wallet/v1"
+ 	"github.com/golang/protobuf/jsonpb"
+ )
+@@ -34,8 +35,16 @@ func (r *ConsentRequest) GetTxID() string {
+ 	return fmt.Sprintf("%x", h.Sum(nil))
+ }
+ 
++type SentTransaction struct {
++	TxHash       string
++	Tx           *commandspb.Transaction
++	Error        error
++	ErrorDetails []string
++}
++
+ type Policy interface {
+ 	Ask(tx *v1.SubmitTransactionRequest) (bool, error)
++	Report(tx SentTransaction)
+ 	NeedsInteractiveOutput() bool
+ }
+ 
+@@ -49,17 +58,23 @@ func (p *AutomaticConsentPolicy) Ask(_ *v1.SubmitTransactionRequest) (bool, erro
+ 	return true, nil
+ }
+ 
++func (p *AutomaticConsentPolicy) Report(_ SentTransaction) {
++	// Nothing to report as we expect this policy to be non-interactive.
++}
++
+ func (p *AutomaticConsentPolicy) NeedsInteractiveOutput() bool {
+ 	return false
+ }
+ 
+ type ExplicitConsentPolicy struct {
+ 	pendingEvents chan ConsentRequest
++	sentTxs       chan SentTransaction
+ }
+ 
+-func NewExplicitConsentPolicy(pending chan ConsentRequest) Policy {
++func NewExplicitConsentPolicy(pending chan ConsentRequest, sentTxs chan SentTransaction) Policy {
+ 	return &ExplicitConsentPolicy{
+ 		pendingEvents: pending,
++		sentTxs:       sentTxs,
+ 	}
+ }
+ 
+@@ -73,6 +88,10 @@ func (p *ExplicitConsentPolicy) Ask(tx *v1.SubmitTransactionRequest) (bool, erro
+ 	return c.Decision, nil
+ }
+ 
++func (p *ExplicitConsentPolicy) Report(tx SentTransaction) {
++	p.sentTxs <- tx
++}
++
+ func (p *ExplicitConsentPolicy) NeedsInteractiveOutput() bool {
+ 	return true
+ }
+diff --git a/service/service.go b/service/service.go
+index 45ff7fc..4ee1f46 100644
+--- a/service/service.go
++++ b/service/service.go
+@@ -16,7 +16,6 @@ import (
+ 	commandspb "code.vegaprotocol.io/protos/vega/commands/v1"
+ 	walletpb "code.vegaprotocol.io/protos/vega/wallet/v1"
+ 	vgcrypto "code.vegaprotocol.io/shared/libs/crypto"
+-	"code.vegaprotocol.io/vegawallet/cmd/printer"
+ 	wcommands "code.vegaprotocol.io/vegawallet/commands"
+ 	"code.vegaprotocol.io/vegawallet/network"
+ 	"code.vegaprotocol.io/vegawallet/version"
+@@ -325,7 +324,9 @@ func ParseVerifyAnyRequest(r *http.Request) (*VerifyAnyRequest, commands.Errors)
+ func ParseSubmitTransactionRequest(r *http.Request) (*walletpb.SubmitTransactionRequest, commands.Errors) {
+ 	errs := commands.NewErrors()
+ 
+-	req := &walletpb.SubmitTransactionRequest{}
++	req := &walletpb.SubmitTransactionRequest{
++		Propagate: true,
++	}
+ 	if err := jsonpb.Unmarshal(r.Body, req); err != nil {
+ 		return nil, errs.FinalAdd(err)
+ 	}
+@@ -759,11 +760,6 @@ func (s *Service) signTx(token string, w http.ResponseWriter, r *http.Request, _
+ 		return
+ 	}
+ 
+-	if !req.Propagate {
+-		s.writeSuccess(w, nil)
+-		return
+-	}
+-
+ 	// generate proof of work for the transaction
+ 	tid := vgcrypto.RandomHash()
+ 	powNonce, _, err := vgcrypto.PoW(blockData.Hash, tid, uint(blockData.SpamPowDifficulty), vgcrypto.Sha3)
+@@ -787,17 +783,26 @@ func (s *Service) signTx(token string, w http.ResponseWriter, r *http.Request, _
+ 				}
+ 				details = append(details, v.Message)
+ 			}
++			s.policy.Report(SentTransaction{
++				Tx:           tx,
++				Error:        err,
++				ErrorDetails: details,
++			})
+ 			s.writeError(w, newErrorWithDetails(err.Error(), details), http.StatusInternalServerError)
+ 		} else {
++			s.policy.Report(SentTransaction{
++				Tx:    tx,
++				Error: err,
++			})
+ 			s.writeInternalError(w, err)
+ 		}
+ 		return
+ 	}
+ 
+-	if s.policy.NeedsInteractiveOutput() {
+-		p := printer.NewInteractivePrinter(w)
+-		p.CheckMark().InfoText("Transaction sent:").SuccessText(txHash).NextLine()
+-	}
++	s.policy.Report(SentTransaction{
++		TxHash: txHash,
++		Tx:     tx,
++	})
+ 
+ 	s.writeSuccess(w, struct {
+ 		TxHash string                  `json:"txHash"`

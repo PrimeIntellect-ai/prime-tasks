@@ -1,0 +1,155 @@
+diff --git a/doc/source/fork.rst b/doc/source/fork.rst
+new file mode 100644
+index 0000000..91b3c98
+--- /dev/null
++++ b/doc/source/fork.rst
+@@ -0,0 +1,30 @@
++fork() without execve()
++=======================
++
++``fork()`` is a way to make a clone of a process.
++Most subprocesses replace the child process with a new executable, wiping out all memory from the parent process.
++A ``fork()ed`` subprocess can choose not to do this, and preserve data from the parent process.
++(Technically this is ``fork()`` without ``execve()``.)
++
++This is a terrible idea, as it can cause deadlocks, memory corruption, and crashes.
++
++For backwards compatibility, Eventlet *tries* to work in this case, but this is very much not guaranteed and your program may suffer from deadlocks, memory corruption, and crashes.
++This is even more so when using the ``asyncio`` hub, as that requires even more questionable interventions to "work".
++
++This is not a problem with Eventlet.
++It's a fundamental problem with ``fork()`` applicable to pretty much every Python program.
++
++Below are some common reasons you might be using ``fork()`` without knowing it, and what you can do about it.
++
++``multiprocessing``
++------------------
++
++On Linux, on Python 3.13 earlier, the standard library ``multiprocessing`` library uses ``fork()`` by default.
++To fix this, switch to the ``"spawn"`` method (the default in Python 3.14 and later) as `documented here <https://docs.python.org/3.13/library/multiprocessing.html#contexts-and-start-methods>`.
++
++
++``oslo.service``
++----------------
++
++There are alternative ways of running services that do not use ``fork()``.
++See the documentation.
+diff --git a/doc/source/index.rst b/doc/source/index.rst
+index 96b4de9..923d7e6 100644
+--- a/doc/source/index.rst
++++ b/doc/source/index.rst
+@@ -93,6 +93,7 @@ Concepts & References
+    zeromq
+    hubs
+    environment
++   fork
+    modules
+ 
+ Want to contribute?
+diff --git a/eventlet/__init__.py b/eventlet/__init__.py
+index 318ee0d..01773c5 100644
+--- a/eventlet/__init__.py
++++ b/eventlet/__init__.py
+@@ -76,4 +76,13 @@ TimeoutError, exc_after, call_after_global = (
+         ('call_after_global', 'greenthread.call_after_global', greenthread.call_after_global),
+     ))
+ 
+-os
++
++if hasattr(os, "register_at_fork"):
++    def _warn_on_fork():
++        import warnings
++        warnings.warn(
++            "Using fork() is a bad idea, and there is no guarantee eventlet will work." +
++            " See https://eventlet.readthedocs.io/en/latest/fork.html for more details.",
++            DeprecationWarning
++        )
++    os.register_at_fork(before=_warn_on_fork)
+diff --git a/eventlet/green/threading.py b/eventlet/green/threading.py
+index 4be7766..ae01a5b 100644
+--- a/eventlet/green/threading.py
++++ b/eventlet/green/threading.py
+@@ -4,10 +4,11 @@ from eventlet.green import thread
+ from eventlet.green import time
+ from eventlet.support import greenlets as greenlet
+ 
+-__patched__ = ['Lock', '_after_fork', '_allocate_lock', '_get_main_thread_ident',
++__patched__ = ['Lock', '_allocate_lock', '_get_main_thread_ident',
+                '_make_thread_handle', '_shutdown', '_sleep',
+                '_start_joinable_thread', '_start_new_thread', '_ThreadHandle',
+-               'currentThread', 'current_thread', 'local', 'stack_size']
++               'currentThread', 'current_thread', 'local', 'stack_size',
++               "_active", "_limbo"]
+ 
+ __patched__ += ['get_ident', '_set_sentinel']
+ 
+diff --git a/eventlet/hubs/asyncio.py b/eventlet/hubs/asyncio.py
+index 501fdf6..2b9b7e5 100644
+--- a/eventlet/hubs/asyncio.py
++++ b/eventlet/hubs/asyncio.py
+@@ -44,6 +44,19 @@ class Hub(hub.BaseHub):
+         asyncio.set_event_loop(self.loop)
+         self.sleep_event = asyncio.Event()
+ 
++        import asyncio.events
++        if hasattr(asyncio.events, "on_fork"):
++            # Allow post-fork() child to continue using the same event loop.
++            # This is a terrible idea.
++            asyncio.events.on_fork.__code__ = (lambda: None).__code__
++        else:
++            # On Python 3.9-3.11, there's a thread local we need to reset.
++            # Also a terrible idea.
++            def re_register_loop(loop=self.loop):
++                asyncio.events._set_running_loop(loop)
++
++            os.register_at_fork(after_in_child=re_register_loop)
++
+     def add_timer(self, timer):
+         """
+         Register a ``Timer``.
+diff --git a/eventlet/patcher.py b/eventlet/patcher.py
+index c3c4a8f..b390133 100644
+--- a/eventlet/patcher.py
++++ b/eventlet/patcher.py
+@@ -432,27 +432,21 @@ def monkey_patch(**on):
+                 if hasattr(orig_mod, attr_name):
+                     delattr(orig_mod, attr_name)
+ 
+-            # https://github.com/eventlet/eventlet/issues/592
+             if name == "threading" and register_at_fork:
+-
+-                def fix_threading_active(
+-                    _global_dict=_threading.current_thread.__globals__,
+-                    # alias orig_mod as patched to reflect its new state
+-                    # https://github.com/eventlet/eventlet/pull/661#discussion_r509877481
+-                    _patched=orig_mod,
+-                ):
+-                    _prefork_active = [None]
+-
+-                    def before_fork():
+-                        _prefork_active[0] = _global_dict["_active"]
+-                        _global_dict["_active"] = _patched._active
+-
+-                    def after_fork():
+-                        _global_dict["_active"] = _prefork_active[0]
+-
+-                    register_at_fork(before=before_fork, after_in_parent=after_fork)
+-
+-                fix_threading_active()
++                # The whole post-fork processing in stdlib threading.py,
++                # implemented in threading._after_fork(), is based on the
++                # assumption that threads don't survive fork(). However, green
++                # threads do survive fork, and that's what threading.py is
++                # tracking when using eventlet, so there's no need to do any
++                # post-fork cleanup in this case.
++                #
++                # So, we wipe out _after_fork()'s code so it does nothing. We
++                # can't just override it because it has already been registered
++                # with os.register_after_fork().
++                def noop():
++                    pass
++                orig_mod._after_fork.__code__ = noop.__code__
++                inject("threading", {})._after_fork.__code__ = noop.__code__
+     finally:
+         imp.release_lock()
+ 

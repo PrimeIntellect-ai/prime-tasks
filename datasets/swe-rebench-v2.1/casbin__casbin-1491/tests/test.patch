@@ -1,0 +1,141 @@
+diff --git a/rbac/default-role-manager/role_manager_test.go b/rbac/default-role-manager/role_manager_test.go
+index 5af35c6..142f1eb 100644
+--- a/rbac/default-role-manager/role_manager_test.go
++++ b/rbac/default-role-manager/role_manager_test.go
+@@ -16,6 +16,8 @@ package defaultrolemanager
+ 
+ import (
+ 	"fmt"
++	"sync"
++	"sync/atomic"
+ 	"testing"
+ 
+ 	"github.com/casbin/casbin/v2/rbac"
+@@ -386,3 +388,46 @@ func TestMaxHierarchyLevel(t *testing.T) {
+ 	testRole(t, rm, "level1", "level2", true)
+ 	testRole(t, rm, "level1", "level3", true)
+ }
++
++// TestConcurrentHasLink tests concurrent HasLink calls for race conditions.
++// This test verifies that concurrent HasLink calls with matching functions
++// don't produce inconsistent results due to temporary role creation/deletion races.
++// Regression test for issue #1318.
++func TestConcurrentHasLink(t *testing.T) {
++	rm := NewRoleManager(10)
++	rm.AddMatchingFunc("keyMatch2", util.KeyMatch2)
++
++	_ = rm.AddLink("alice", "admin")
++	_ = rm.AddLink("admin", "/data/*")
++
++	expected, _ := rm.HasLink("alice", "/data/123")
++
++	const numGoroutines = 20
++	const numIterations = 100
++
++	var inconsistencies int64
++	var wg sync.WaitGroup
++
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for j := 0; j < numIterations; j++ {
++				result, err := rm.HasLink("alice", "/data/123")
++				if err != nil {
++					t.Errorf("HasLink failed: %v", err)
++					return
++				} else if result != expected {
++					atomic.AddInt64(&inconsistencies, 1)
++				}
++			}
++		}()
++	}
++
++	wg.Wait()
++
++	if inconsistencies > 0 {
++		t.Errorf("Found %d inconsistencies in %d total operations",
++			inconsistencies, numGoroutines*numIterations)
++	}
++}
+diff --git a/role_manager_b_test.go b/role_manager_b_test.go
+index 32da7f1..d1ad417 100644
+--- a/role_manager_b_test.go
++++ b/role_manager_b_test.go
+@@ -2,6 +2,8 @@ package casbin
+ 
+ import (
+ 	"fmt"
++	"sync"
++	"sync/atomic"
+ 	"testing"
+ 
+ 	"github.com/casbin/casbin/v2/util"
+@@ -178,3 +180,67 @@ func BenchmarkHasLinkWithPatternAndDomainPatternLarge(b *testing.B) {
+ 		_, _ = rm.HasLink("staffUser1001", "staff001", "/orgs/1/sites/site001")
+ 	}
+ }
++
++// BenchmarkConcurrentHasLinkWithMatching benchmarks concurrent HasLink performance with matching functions.
++// Performance test for concurrent access with temporary role creation.
++func BenchmarkConcurrentHasLinkWithMatching(b *testing.B) {
++	e, _ := NewEnforcer("examples/rbac_with_pattern_model.conf", "examples/rbac_with_pattern_policy.csv")
++	e.AddNamedMatchingFunc("g2", "keyMatch2", util.KeyMatch2)
++	rm := e.GetRoleManager()
++
++	b.ResetTimer()
++	b.RunParallel(func(pb *testing.PB) {
++		for pb.Next() {
++			_, _ = rm.HasLink("alice", "/book/123")
++		}
++	})
++}
++
++// TestConcurrentEnforceWithMatching verifies patterned-role authorization stays valid
++// during concurrent requests and on later requests with the same parameters.
++func TestConcurrentEnforceWithMatching(t *testing.T) {
++	e, err := NewEnforcer("examples/rbac_with_pattern_model.conf", "examples/rbac_with_pattern_policy.csv")
++	if err != nil {
++		t.Fatal(err)
++	}
++	e.AddNamedMatchingFunc("g2", "keyMatch2", util.KeyMatch2)
++
++	const numGoroutines = 20
++	const numIterations = 100
++	var denied int64
++	var wg sync.WaitGroup
++	start := make(chan struct{})
++
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			<-start
++			for j := 0; j < numIterations; j++ {
++				allowed, err := e.Enforce("alice", "/book/123", "GET")
++				if err != nil {
++					t.Errorf("Enforce failed: %v", err)
++					return
++				}
++				if !allowed {
++					atomic.AddInt64(&denied, 1)
++				}
++			}
++		}()
++	}
++	close(start)
++	wg.Wait()
++
++	if denied != 0 {
++		t.Errorf("%d of %d concurrent authorized requests were denied", denied, numGoroutines*numIterations)
++	}
++	for i := 0; i < numIterations; i++ {
++		allowed, err := e.Enforce("alice", "/book/123", "GET")
++		if err != nil {
++			t.Fatalf("Enforce after concurrent requests failed: %v", err)
++		}
++		if !allowed {
++			t.Fatalf("authorized request was denied after concurrent Enforce calls")
++		}
++	}
++}

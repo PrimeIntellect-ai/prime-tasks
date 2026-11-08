@@ -1,0 +1,216 @@
+diff --git a/install_test_deps.sh b/install_test_deps.sh
+index 77fac8d..1484ac4 100755
+--- a/install_test_deps.sh
++++ b/install_test_deps.sh
+@@ -8,9 +8,3 @@ git clone https://github.com/pcmanus/ccm.git
+ pushd ccm
+ ./setup.py install --user
+ popd
+-
+-if [ "$1" != "gocql/gocql" ]; then
+-    USER=$(echo $1 | cut -f1 -d'/')
+-    cd ../..
+-    mv ${USER} gocql
+-fi
+diff --git a/integration_test.go b/integration_test.go
+index 046a593..dcc50d6 100644
+--- a/integration_test.go
++++ b/integration_test.go
+@@ -49,7 +49,8 @@ func TestGetHosts(t *testing.T) {
+ 	assertTrue(t, "len(partitioner) != 0", len(partitioner) != 0)
+ }
+ 
+-//TestRingDiscovery makes sure that you can autodiscover other cluster members when you seed a cluster config with just one node
++// TestRingDiscovery makes sure that you can autodiscover other cluster members
++// when you seed a cluster config with just one node
+ func TestRingDiscovery(t *testing.T) {
+ 	clusterHosts := getClusterHosts()
+ 	cluster := createCluster()
+@@ -76,6 +77,30 @@ func TestRingDiscovery(t *testing.T) {
+ 	}
+ }
+ 
++// TestHostFilter ensures that host filtering works even when we discover hosts
++func TestHostFilter(t *testing.T) {
++	clusterHosts := getClusterHosts()
++	if len(clusterHosts) < 2 {
++		t.Skip("skipping because we don't have 2 or more hosts")
++	}
++	cluster := createCluster()
++	rr := RoundRobinHostPolicy().(*roundRobinHostPolicy)
++	cluster.PoolConfig.HostSelectionPolicy = rr
++	// we'll filter out the second host
++	filtered := clusterHosts[1]
++	cluster.Hosts = clusterHosts[:1]
++	cluster.HostFilter = HostFilterFunc(func(host *HostInfo) bool {
++		if host.ConnectAddress().String() == filtered {
++			return false
++		}
++		return true
++	})
++	session := createSessionFromCluster(cluster, t)
++	defer session.Close()
++
++	assertEqual(t, "len(rr.hosts.get()) != 0", len(clusterHosts)-1, len(rr.hosts.get()))
++}
++
+ func TestWriteFailure(t *testing.T) {
+ 	cluster := createCluster()
+ 	createKeyspace(t, cluster, "test")
+diff --git a/session_unit_test.go b/session_unit_test.go
+new file mode 100644
+index 0000000..585e64a
+--- /dev/null
++++ b/session_unit_test.go
+@@ -0,0 +1,151 @@
++//go:build all || unit
++// +build all unit
++
++package gocql
++
++import (
++	"context"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestAsyncSessionInit(t *testing.T) {
++	// Build a 3 node cluster to test host metric mapping
++	var addresses = []string{
++		"127.0.0.1",
++		"127.0.0.2",
++		"127.0.0.3",
++	}
++	// only build 1 of the servers so that we can test not connecting to the last
++	// one
++	srv := NewTestServerWithAddress(addresses[0]+":0", t, defaultProto, context.Background())
++	defer srv.Stop()
++
++	// just choose any port
++	cluster := testCluster(defaultProto, srv.Address, addresses[1]+":9999", addresses[2]+":9999")
++	cluster.PoolConfig.HostSelectionPolicy = SingleHostReadyPolicy(RoundRobinHostPolicy())
++	db, err := cluster.CreateSession()
++	if err != nil {
++		t.Fatalf("NewCluster: %v", err)
++	}
++	defer db.Close()
++
++	// make sure the session works
++	if err := db.Query("void").Exec(); err != nil {
++		t.Fatalf("unexpected error from void")
++	}
++}
++
++// connectRecorder records the hosts that the session attempts to connect to.
++type connectRecorder struct {
++	mu       sync.Mutex
++	attempts map[string]int
++}
++
++func newConnectRecorder() *connectRecorder {
++	return &connectRecorder{attempts: make(map[string]int)}
++}
++
++func (r *connectRecorder) ObserveConnect(obs ObservedConnect) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.attempts[obs.Host.ConnectAddress().String()]++
++}
++
++func (r *connectRecorder) attempted(addr string) bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.attempts[addr] > 0
++}
++
++// TestAsyncSessionInitConnectsToPeers verifies that creating a session with a
++// single ready host returns without waiting for the remaining peers, while the
++// session still initiates connections to those peers in the background.
++func TestAsyncSessionInitConnectsToPeers(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	// The seed host responds normally.
++	seed := NewTestServerWithAddress("127.0.0.1:0", t, defaultProto, ctx)
++	defer seed.Stop()
++
++	// This peer accepts the connection but never completes the startup
++	// handshake, so connecting to it blocks until the connection timeout.
++	slowPeer := NewTestServerWithAddress("127.0.0.2:0", t, defaultProto, ctx)
++	defer slowPeer.Stop()
++	atomic.StoreInt32(&slowPeer.TimeoutOnStartup, 1)
++
++	// This peer is not listening at all.
++	downPeer := "127.0.0.3:9999"
++
++	rec := newConnectRecorder()
++	cluster := testCluster(defaultProto, seed.Address, slowPeer.Address, downPeer)
++	cluster.ConnectObserver = rec
++	cluster.PoolConfig.HostSelectionPolicy = SingleHostReadyPolicy(RoundRobinHostPolicy())
++
++	start := time.Now()
++	db, err := cluster.CreateSession()
++	elapsed := time.Since(start)
++	if err != nil {
++		t.Fatalf("CreateSession: %v", err)
++	}
++	defer db.Close()
++
++	// Session creation must not wait for the peers that are not reachable.
++	if elapsed > 3*time.Second {
++		t.Fatalf("CreateSession waited for all peers: took %v", elapsed)
++	}
++
++	// The session must still attempt to connect to the other peers.
++	slowIP, _, _ := net.SplitHostPort(slowPeer.Address)
++	downIP, _, _ := net.SplitHostPort(downPeer)
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		if rec.attempted(slowIP) && rec.attempted(downIP) {
++			break
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	if !rec.attempted(slowIP) {
++		t.Fatalf("session did not attempt to connect to peer %s", slowIP)
++	}
++	if !rec.attempted(downIP) {
++		t.Fatalf("session did not attempt to connect to peer %s", downIP)
++	}
++}
++
++type readyOnlyPolicy struct{}
++
++func (readyOnlyPolicy) Ready() bool { return true }
++
++type hostUpRecordingPolicy struct {
++	HostSelectionPolicy
++	hostUp bool
++}
++
++func (p *hostUpRecordingPolicy) HostUp(host *HostInfo) {
++	p.hostUp = true
++	p.HostSelectionPolicy.HostUp(host)
++}
++
++func TestAsyncSessionInitReadyPolicy(t *testing.T) {
++	var _ ReadyPolicy = readyOnlyPolicy{}
++	underlying := &hostUpRecordingPolicy{HostSelectionPolicy: RoundRobinHostPolicy()}
++	wrapped := SingleHostReadyPolicy(underlying)
++
++	var readyPolicy ReadyPolicy = wrapped
++	if readyPolicy.Ready() {
++		t.Fatal("policy reported ready before any host was marked up")
++	}
++
++	wrapped.HostUp(&HostInfo{})
++	if !readyPolicy.Ready() {
++		t.Fatal("policy did not report ready after a host was marked up")
++	}
++	if !underlying.hostUp {
++		t.Fatal("host-up event was not forwarded to the wrapped policy")
++	}
++}

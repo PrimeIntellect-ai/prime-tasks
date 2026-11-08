@@ -1,0 +1,172 @@
+diff --git a/pkg/client/iam_test.go b/pkg/client/iam_test.go
+index 46465ec..7b705a1 100644
+--- a/pkg/client/iam_test.go
++++ b/pkg/client/iam_test.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/aws/aws-sdk-go-v2/config"
+ 	"github.com/aws/aws-sdk-go-v2/service/iam"
+ 	"github.com/aws/aws-sdk-go-v2/service/iam/types"
++	"github.com/aws/smithy-go"
+ 	"github.com/aws/smithy-go/middleware"
+ )
+ 
+@@ -30,6 +31,34 @@ func getNextMarkerForIamInitialize(
+ 	return next.HandleInitialize(ctx, in)
+ }
+ 
++func callListAttachedRolePolicies(client interface{}, ctx context.Context, roleName *string) ([]types.AttachedPolicy, error) {
++	if c, ok := client.(interface {
++		ListAttachedRolePolicies(context.Context, *string) ([]types.AttachedPolicy, error)
++	}); ok {
++		return c.ListAttachedRolePolicies(ctx, roleName)
++	}
++	if c, ok := client.(interface {
++		ListAttachedRolePolicies(context.Context, *string, int) ([]types.AttachedPolicy, error)
++	}); ok {
++		return c.ListAttachedRolePolicies(ctx, roleName, 0)
++	}
++	panic("IAM client does not provide ListAttachedRolePolicies")
++}
++
++func callCheckRoleExists(client interface{}, ctx context.Context, roleName *string) (bool, error) {
++	if c, ok := client.(interface {
++		CheckRoleExists(context.Context, *string) (bool, error)
++	}); ok {
++		return c.CheckRoleExists(ctx, roleName)
++	}
++	if c, ok := client.(interface {
++		CheckRoleExists(context.Context, *string, int) (bool, error)
++	}); ok {
++		return c.CheckRoleExists(ctx, roleName, 0)
++	}
++	panic("IAM client does not provide CheckRoleExists")
++}
++
+ /*
+ 	Test Cases
+ */
+@@ -256,6 +285,31 @@ func TestIam_ListAttachedRolePolicies(t *testing.T) {
+ 			},
+ 			wantErr: true,
+ 		},
++		{
++			name: "list attached role policies retries throttling error",
++			args: args{
++				ctx: context.Background(), roleName: aws.String("test"),
++				withAPIOptionsFunc: func() func(*middleware.Stack) error {
++					attempt := 0
++					return func(stack *middleware.Stack) error {
++						return stack.Finalize.Add(middleware.FinalizeMiddlewareFunc(
++							"ListAttachedRolePoliciesTransientThrottleMock",
++							func(context.Context, middleware.FinalizeInput, middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
++								attempt++
++								if attempt == 1 {
++									return middleware.FinalizeOutput{Result: &iam.ListAttachedRolePoliciesOutput{}}, middleware.Metadata{}, &smithy.GenericAPIError{Code: "Throttling", Message: "Rate exceeded", Fault: smithy.FaultClient}
++								}
++								return middleware.FinalizeOutput{Result: &iam.ListAttachedRolePoliciesOutput{
++									AttachedPolicies: []types.AttachedPolicy{{PolicyArn: aws.String("PolicyArn1"), PolicyName: aws.String("PolicyName1")}},
++								}}, middleware.Metadata{}, nil
++							},
++						), middleware.Before)
++					}
++				}(),
++			},
++			want:    want{output: []types.AttachedPolicy{{PolicyArn: aws.String("PolicyArn1"), PolicyName: aws.String("PolicyName1")}}},
++			wantErr: false,
++		},
+ 		{
+ 			name: "list attached role policies with next marker successfully",
+ 			args: args{
+@@ -406,6 +460,44 @@ func TestIam_ListAttachedRolePolicies(t *testing.T) {
+ 			},
+ 			wantErr: true,
+ 		},
++		{
++			name: "list attached role policies retries throttling error on later page",
++			args: args{
++				ctx: context.Background(), roleName: aws.String("test"),
++				withAPIOptionsFunc: func() func(*middleware.Stack) error {
++					attemptsOnNextPage := 0
++					return func(stack *middleware.Stack) error {
++						if err := stack.Initialize.Add(middleware.InitializeMiddlewareFunc("GetNextMarker", getNextMarkerForIamInitialize), middleware.Before); err != nil {
++							return err
++						}
++						return stack.Finalize.Add(middleware.FinalizeMiddlewareFunc(
++							"ListAttachedRolePoliciesLaterPageThrottleMock",
++							func(ctx context.Context, input middleware.FinalizeInput, handler middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
++								marker := middleware.GetStackValue(ctx, markerKeyForIam{}).(*string)
++								if marker == nil {
++									return middleware.FinalizeOutput{Result: &iam.ListAttachedRolePoliciesOutput{
++										Marker:           aws.String("NextMarker"),
++										AttachedPolicies: []types.AttachedPolicy{{PolicyArn: aws.String("PolicyArn1"), PolicyName: aws.String("PolicyName1")}},
++									}}, middleware.Metadata{}, nil
++								}
++								attemptsOnNextPage++
++								if attemptsOnNextPage == 1 {
++									return middleware.FinalizeOutput{Result: &iam.ListAttachedRolePoliciesOutput{}}, middleware.Metadata{}, &smithy.GenericAPIError{Code: "Throttling", Message: "Rate exceeded", Fault: smithy.FaultClient}
++								}
++								return middleware.FinalizeOutput{Result: &iam.ListAttachedRolePoliciesOutput{
++									AttachedPolicies: []types.AttachedPolicy{{PolicyArn: aws.String("PolicyArn2"), PolicyName: aws.String("PolicyName2")}},
++								}}, middleware.Metadata{}, nil
++							},
++						), middleware.Before)
++					}
++				}(),
++			},
++			want: want{output: []types.AttachedPolicy{
++				{PolicyArn: aws.String("PolicyArn1"), PolicyName: aws.String("PolicyName1")},
++				{PolicyArn: aws.String("PolicyArn2"), PolicyName: aws.String("PolicyName2")},
++			}},
++			wantErr: false,
++		},
+ 	}
+ 
+ 	for _, tt := range cases {
+@@ -422,7 +514,7 @@ func TestIam_ListAttachedRolePolicies(t *testing.T) {
+ 			client := iam.NewFromConfig(cfg)
+ 			iamClient := NewIam(client)
+ 
+-			output, err := iamClient.ListAttachedRolePolicies(tt.args.ctx, tt.args.roleName)
++			output, err := callListAttachedRolePolicies(iamClient, tt.args.ctx, tt.args.roleName)
+ 			if (err != nil) != tt.wantErr {
+ 				t.Errorf("error = %#v, wantErr %#v", err.Error(), tt.wantErr)
+ 				return
+@@ -807,6 +899,29 @@ func TestIam_CheckRoleExists(t *testing.T) {
+ 			},
+ 			wantErr: true,
+ 		},
++		{
++			name: "check role exists retries throttling error",
++			args: args{
++				ctx: context.Background(), roleName: aws.String("test"),
++				withAPIOptionsFunc: func() func(*middleware.Stack) error {
++					attempt := 0
++					return func(stack *middleware.Stack) error {
++						return stack.Finalize.Add(middleware.FinalizeMiddlewareFunc(
++							"GetRoleTransientThrottleMock",
++							func(context.Context, middleware.FinalizeInput, middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
++								attempt++
++								if attempt == 1 {
++									return middleware.FinalizeOutput{Result: &iam.GetRoleOutput{}}, middleware.Metadata{}, &smithy.GenericAPIError{Code: "Throttling", Message: "Rate exceeded", Fault: smithy.FaultClient}
++								}
++								return middleware.FinalizeOutput{Result: &iam.GetRoleOutput{}}, middleware.Metadata{}, nil
++							},
++						), middleware.Before)
++					}
++				}(),
++			},
++			want:    want{exists: true},
++			wantErr: false,
++		},
+ 	}
+ 
+ 	for _, tt := range cases {
+@@ -823,7 +938,7 @@ func TestIam_CheckRoleExists(t *testing.T) {
+ 			client := iam.NewFromConfig(cfg)
+ 			iamClient := NewIam(client)
+ 
+-			output, err := iamClient.CheckRoleExists(tt.args.ctx, tt.args.roleName)
++			output, err := callCheckRoleExists(iamClient, tt.args.ctx, tt.args.roleName)
+ 			if (err != nil) != tt.wantErr {
+ 				t.Errorf("error = %#v, wantErr %#v", err.Error(), tt.wantErr)
+ 				return

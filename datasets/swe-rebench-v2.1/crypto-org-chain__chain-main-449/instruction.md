@@ -1,0 +1,3 @@
+Problem: error ambiguity in BitSet.Test
+> This function conflates errors and legitimate bit testing results. Once the function returns false, there’s no way for the caller to know whether the passed index was out of bounds or the bit was not set. It is assumed that the development process took a shortcut in this case,since currently the `BitSet.Test` function is only invoked in `CompiledCronSpec.Roundup` and the parameter cannot be greater than 64. It would make sense to rewrite this function to avoid any potential mistakes in future code iterations.
+> Recommendation: Rewrite the function to return a boolean and an error. If the supplied argument is out ofbounds, set the error.

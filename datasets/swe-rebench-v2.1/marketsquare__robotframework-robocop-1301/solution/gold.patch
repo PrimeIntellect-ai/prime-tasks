@@ -1,0 +1,342 @@
+diff --git a/docs/releasenotes/6.0.0a1.rst b/docs/releasenotes/6.0.0a1.rst
+index 1d974ba..b54741f 100644
+--- a/docs/releasenotes/6.0.0a1.rst
++++ b/docs/releasenotes/6.0.0a1.rst
+@@ -30,7 +30,10 @@ The basic usage is::
+     robocop check
+     robocop format
+ 
+-See detailed description for command changes.
++There are several breaking changes to the configurations. You can migrate old toml configuration files with the
++following command::
++
++    robocop migrate <config_path>
+ 
+ .. contents::
+    :depth: 2
+diff --git a/src/robocop/cli.py b/src/robocop/cli.py
+index 004ece3..7df27cd 100644
+--- a/src/robocop/cli.py
++++ b/src/robocop/cli.py
+@@ -9,6 +9,7 @@ from rich.console import Console
+ from robocop import __version__, config
+ from robocop.formatter.runner import RobocopFormatter
+ from robocop.formatter.skip import SkipConfig
++from robocop.linter.diagnostics import Diagnostic
+ from robocop.linter.reports import load_reports, print_reports
+ from robocop.linter.rules import RuleFilter, RuleSeverity, filter_rules_by_category, filter_rules_by_pattern
+ from robocop.linter.runner import RobocopLinter
+@@ -110,6 +111,24 @@ verbose_option = Annotated[
+         rich_help_panel="Other",
+     ),
+ ]
++separator_help = """
++Token separator to use in the outputs:
++
++- [bold]space[/bold]:   use --space-count spaces to separate tokens
++
++- tab:     use a single tabulation to separate tokens
++"""
++line_ending_help = """
++Line separator to use in the outputs:
++
++    - [bold]native[/bold]:  use operating system's native line endings
++
++    - windows: use Windows line endings (CRLF)
++
++    - unix:    use Unix line endings (LF)
++
++    - auto:    maintain existing line endings (uses what's used in the first line)
++"""
+ 
+ 
+ @app.command(name="check")
+@@ -211,9 +230,16 @@ def check_files(
+             rich_help_panel="Other",
+         ),
+     ] = None,
++    return_result: Annotated[
++        bool,
++        typer.Option(
++            help="Return check results as list of Diagnostic messages instead of exiting from the application.",
++            hidden=True,
++        ),
++    ] = False,
+     root: project_root_option = None,
+     verbose: verbose_option = None,
+-) -> None:
++) -> list[Diagnostic]:
+     """Lint Robot Framework files."""
+     linter_config = config.LinterConfig(
+         configure=configure,
+@@ -226,6 +252,7 @@ def check_files(
+         persistent=persistent,
+         compare=compare,
+         exit_zero=exit_zero,
++        return_result=return_result,
+     )
+     file_filters = config.FileFiltersOptions(
+         include=include, default_include=default_include, exclude=exclude, default_exclude=default_exclude
+@@ -248,7 +275,7 @@ def check_files(
+         overwrite_config=overwrite_config,
+     )
+     runner = RobocopLinter(config_manager)
+-    runner.run()
++    return runner.run()
+ 
+ 
+ @app.command(name="format")
+@@ -330,10 +357,10 @@ def format_files(
+         typer.Option(show_default="120", help="Number of spaces between cells", rich_help_panel="Formatting settings"),
+     ] = None,
+     separator: Annotated[
+-        str, typer.Option(show_default="space", help="# TODO", rich_help_panel="Formatting settings")
++        str, typer.Option(show_default="space", help=separator_help, rich_help_panel="Formatting settings")
+     ] = None,
+     line_ending: Annotated[
+-        str, typer.Option(show_default="native", help="# TODO", rich_help_panel="Formatting settings")
++        str, typer.Option(show_default="native", help=line_ending_help, rich_help_panel="Formatting settings")
+     ] = None,
+     start_line: Annotated[
+         int,
+@@ -620,8 +647,16 @@ def migrate_config(
+         Path, typer.Argument(help="Path to the configuration file to be migrated.", show_default=False)
+     ],
+ ) -> None:
+-    """Migrate Robocop and Robotidy old configuration files to new format."""
+-    # TODO: ask user to proceed, list warning with possible issues
++    """
++    Migrate Robocop and Robotidy old configuration files to the new format supported by the Robocop 6.0.
++
++    All the comments and formatting is not preserved. Robocop will take original file and create new, with the suffix
++    ``_migrated``. Original configuration file should have ``tool.robocop`` or/and ``tool.robotidy`` section.
++    If there are both sections, and they contain common option (such as include/exclude paths), option from
++    ``tool.robocop`` section will take precedence.
++
++    If you have separate configuration files for Robocop and Robotidy, run the command twice and merge it manually.
++    """
+     migrate_deprecated_configs(config_path)
+ 
+ 
+diff --git a/src/robocop/config.py b/src/robocop/config.py
+index a68bcd1..75c7a3b 100644
+--- a/src/robocop/config.py
++++ b/src/robocop/config.py
+@@ -187,6 +187,8 @@ class LinterConfig:
+     persistent: bool | None = False
+     compare: bool | None = False
+     exit_zero: bool | None = False
++    return_result: bool = False
++    config_source: str = field(default="cli", compare=False)
+     _checkers: list[BaseChecker] | None = field(default=None, compare=False)
+     _rules: dict[str, Rule] | None = field(default=None, compare=False)
+ 
+@@ -210,15 +212,16 @@ class LinterConfig:
+         """Load rules, checkers and their configuration."""
+         self.split_inclusions_exclusions_into_patterns()
+         self.load_checkers()
+-        self.configure_checkers_or_reports()
++        self.configure_rules()
+         self.check_for_disabled_rules()
++        self.validate_any_rule_enabled()
+ 
+     def load_checkers(self) -> None:
+         """
+         Initialize checkers and rules containers and start rules discovery.
+ 
+         Instance of this class is passed over since it will be used to populate checkers/rules containers.
+-        Additionally rules can also refer to instance of this class to access config class.
++        Additionally, rules can also refer to instance of this class to access config class.
+         """
+         self._checkers = []
+         self._rules = {}
+@@ -236,7 +239,8 @@ class LinterConfig:
+             if not self.any_rule_enabled(checker, rule_matcher):
+                 checker.disabled = True
+ 
+-    def any_rule_enabled(self, checker: type[BaseChecker], rule_matcher: RuleMatcher) -> bool:
++    @staticmethod
++    def any_rule_enabled(checker: type[BaseChecker], rule_matcher: RuleMatcher) -> bool:
+         any_enabled = False
+         for rule in checker.rules.values():
+             rule.enabled = rule_matcher.is_rule_enabled(rule)
+@@ -244,7 +248,15 @@ class LinterConfig:
+                 any_enabled = True
+         return any_enabled
+ 
+-    def configure_checkers_or_reports(self) -> None:
++    def validate_any_rule_enabled(self) -> None:
++        """Validate and print warning if no rule is selected."""
++        if not any(not checker.disabled for checker in self._checkers):
++            print(
++                f"No rule selected with the existing configuration from the {self.config_source} . "
++                f"Please check if all rules from --select exist and there is no conflicting filter option."
++            )
++
++    def configure_rules(self) -> None:
+         """
+         Iterate over configuration for rules and reports and apply it.
+ 
+@@ -291,7 +303,7 @@ class LinterConfig:
+     #                 print(rule_def.deprecation_warning)
+ 
+     @classmethod
+-    def from_toml(cls, config: dict, config_parent: Path) -> LinterConfig:
++    def from_toml(cls, config: dict, config_path: Path) -> LinterConfig:
+         config_fields = {config_field.name for config_field in fields(cls) if config_field.compare}
+         # TODO assert type (list vs list etc)
+         if unknown_fields := {param: value for param, value in config.items() if param not in config_fields}:
+@@ -302,8 +314,9 @@ class LinterConfig:
+             override["threshold"] = parse_rule_severity(config["threshold"])
+         if "custom_rules" in config:
+             override["custom_rules"] = [
+-                resolve_relative_path(path, config_parent, ensure_exists=True) for path in config["custom_rules"]
++                resolve_relative_path(path, config_path.parent, ensure_exists=True) for path in config["custom_rules"]
+             ]
++        override["config_source"] = str(config_path)
+         return cls(**override)
+ 
+ 
+@@ -481,13 +494,13 @@ class FileFiltersOptions(ConfigContainer):
+ @dataclass
+ class Config:
+     sources: list[str] | None = field(default_factory=lambda: ["."])
+-    file_filters: FileFiltersOptions = field(default_factory=FileFiltersOptions)
+-    linter: LinterConfig = field(default_factory=LinterConfig)
+-    formatter: FormatterConfig = field(default_factory=FormatterConfig)
++    file_filters: FileFiltersOptions | None = field(default_factory=FileFiltersOptions)
++    linter: LinterConfig | None = field(default_factory=LinterConfig)
++    formatter: FormatterConfig | None = field(default_factory=FormatterConfig)
+     language: list[str] | None = field(default_factory=list)
+     verbose: bool | None = field(default_factory=bool)
+     target_version: int | str | None = misc.ROBOT_VERSION.major
+-    config_source: str = "default configuration"
++    config_source: str = "cli"
+ 
+     def __post_init__(self) -> None:
+         self.target_version = validate_target_version(self.target_version)
+@@ -505,11 +518,13 @@ class Config:
+         """
+         # TODO: validate all key and types
+         Config.validate_config(config, config_path)
+-        parsed_config = {"config_source": str(config_path)}
+-        parsed_config["linter"] = LinterConfig.from_toml(config.pop("lint", {}), config_path.parent)
+-        parsed_config["file_filters"] = FileFiltersOptions.from_toml(config)
+-        parsed_config["language"] = config.pop("language", [])
+-        parsed_config["verbose"] = config.pop("verbose", False)
++        parsed_config = {
++            "config_source": str(config_path),
++            "linter": LinterConfig.from_toml(config.pop("lint", {}), config_path),
++            "file_filters": FileFiltersOptions.from_toml(config),
++            "language": config.pop("language", []),
++            "verbose": config.pop("verbose", False),
++        }
+         if "target_version" in config:
+             parsed_config["target_version"] = validate_target_version(config["target_version"])
+         parsed_config["formatter"] = FormatterConfig.from_toml(config.pop("format", {}), config_path.parent)
+@@ -563,16 +578,20 @@ class Config:
+                 "formatter",
+                 "file_filters",
+                 "config_source",
+-            ):  # TODO Use field metadata maybe
++            ):  # TODO Use field metadata
+                 continue
+             value = getattr(overwrite_config, config_field.name)
+             if value:
+                 setattr(self, config_field.name, value)
+         if overwrite_config.linter:
+             for config_field in fields(overwrite_config.linter):
++                if config_field.name == "config_source":
++                    continue
+                 value = getattr(overwrite_config.linter, config_field.name)
+                 if value:
+                     setattr(self.linter, config_field.name, value)
++                    if config_field.name in {"select", "ignore"}:
++                        self.linter.config_source = "cli"
+         if overwrite_config.formatter:
+             for config_field in fields(overwrite_config.formatter):
+                 if config_field.name in ("whitespace_config", "skip_config") or config_field.name.startswith("_"):
+@@ -797,13 +816,13 @@ class ConfigManager:
+             else:
+                 source_gitignore = gitignores
+             config = self.get_config_for_source_file(source)
+-            if self.gitignore_resolver.path_excluded(source, source_gitignore):
+-                continue
+             if not ignore_file_filters:
+                 if config.file_filters.path_excluded(source):
+                     continue
+                 if source.is_file() and not config.file_filters.path_included(source):
+                     continue
++            if self.gitignore_resolver.path_excluded(source, source_gitignore):
++                continue
+             if source.is_dir():
+                 self.resolve_paths(source.iterdir(), gitignores)
+             elif source.is_file():
+diff --git a/src/robocop/linter/rules/__init__.py b/src/robocop/linter/rules/__init__.py
+index 189841e..cb00c0e 100644
+--- a/src/robocop/linter/rules/__init__.py
++++ b/src/robocop/linter/rules/__init__.py
+@@ -159,7 +159,7 @@ class RuleFilter(str, Enum):
+     DEPRECATED = "DEPRECATED"
+ 
+ 
+-def filter_rules_by_pattern(rules: dict[str, Rule], pattern: str) -> list[Rule]:
++def filter_rules_by_pattern(rules: dict[str, Rule], pattern: Pattern) -> list[Rule]:
+     """Return sorted list of Rules from rules dictionary, filtered out by pattern."""
+     return rules_sorted_by_id(
+         {rule.rule_id: rule for rule in rules.values() if rule.matches_pattern(pattern) and not rule.deprecated}
+diff --git a/src/robocop/linter/runner.py b/src/robocop/linter/runner.py
+index 7e161c6..36e3728 100644
+--- a/src/robocop/linter/runner.py
++++ b/src/robocop/linter/runner.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, NoReturn
+ 
+ import typer
+ from robot.api import get_init_model, get_model, get_resource_model
+@@ -26,6 +26,7 @@ class RobocopLinter:
+         self.config: Config = self.config_manager.default_config
+         self.current_model: File = None
+         self.reports: dict[str, reports.Report] = reports.get_reports(self.config)
++        self.diagnostics: list[Diagnostic] = []
+         self.configure_reports()
+ 
+     def get_model_for_file_type(self, source: Path) -> File:
+@@ -38,7 +39,7 @@ class RobocopLinter:
+             return get_resource_model(source)
+         return get_model(source)
+ 
+-    def run(self) -> None:
++    def run(self) -> list[Diagnostic]:
+         issues_no = 0
+         files = 0
+         for source, config in self.config_manager.paths:
+@@ -57,10 +58,15 @@ class RobocopLinter:
+             issues_no += len(diagnostics)
+             for diagnostic in diagnostics:
+                 self.report(diagnostic)
++            self.diagnostics.extend(diagnostics)
++        if not files:
++            print("No Robot files were found with the existing configuration.")
+         if "file_stats" in self.reports:
+             self.reports["file_stats"].files_count = files
+         self.make_reports()
+-        self.return_with_exit_code(issues_no)
++        if self.config_manager.default_config.linter.return_result:
++            return self.diagnostics
++        return self.return_with_exit_code(issues_no)
+ 
+     def run_check(self, filename: str, source: str | None = None) -> list[Diagnostic]:
+         disablers = DisablersFinder(self.current_model)
+@@ -78,7 +84,7 @@ class RobocopLinter:
+             ]
+         return found_diagnostics
+ 
+-    def return_with_exit_code(self, issues_count: int) -> None:
++    def return_with_exit_code(self, issues_count: int) -> NoReturn:
+         """
+         Exit the Robocop with exit code.
+ 

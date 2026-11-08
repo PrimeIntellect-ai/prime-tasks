@@ -1,0 +1,54 @@
+Followup: one specific standalone updater is still broken
+In reviewing shell installers produced after #1444, which was the fix for #1443, I'm still seeing the updater missing for one platform. Reviewing the actual data we're working off of, `archive.updater` is `None` for this one platform; it's assigned properly for every other platform. Here's an example from a generated shell installer produced from git HEAD.
+
+```sh
+    case "$_artifact_name" in
+        "axolotlsay-aarch64-apple-darwin.tar.xz")
+            _arch="aarch64-apple-darwin"
+            _zip_ext=".tar.xz"
+            _bins="axolotlsay"
+            _bins_js_array='"axolotlsay"'
+            _libs=""
+            _libs_js_array=""
+            _staticlibs=""
+            _staticlibs_js_array=""
+            _updater_name=""
+            _updater_bin=""
+            ;;
+        "axolotlsay-x86_64-apple-darwin.tar.xz")
+            _arch="x86_64-apple-darwin"
+            _zip_ext=".tar.xz"
+            _bins="axolotlsay"
+            _bins_js_array='"axolotlsay"'
+            _libs=""
+            _libs_js_array=""
+            _staticlibs=""
+            _staticlibs_js_array=""
+            _updater_name="axolotlsay-x86_64-apple-darwin-update"
+            _updater_bin="axolotlsay-x86_64-apple-darwin-update"
+            ;;
+        "axolotlsay-x86_64-pc-windows-msvc.zip")
+            _arch="x86_64-pc-windows-msvc"
+            _zip_ext=".zip"
+            _bins="axolotlsay.exe"
+            _bins_js_array='"axolotlsay.exe"'
+            _libs=""
+            _libs_js_array=""
+            _staticlibs=""
+            _staticlibs_js_array=""
+            _updater_name="axolotlsay-x86_64-pc-windows-msvc-update"
+            _updater_bin="axolotlsay-x86_64-pc-windows-msvc-update"
+            ;;
+        "axolotlsay-x86_64-unknown-linux-gnu.tar.xz")
+            _arch="x86_64-unknown-linux-gnu"
+            _zip_ext=".tar.xz"
+            _bins="axolotlsay"
+            _bins_js_array='"axolotlsay"'
+            _libs=""
+            _libs_js_array=""
+            _staticlibs=""
+            _staticlibs_js_array=""
+            _updater_name="axolotlsay-x86_64-unknown-linux-gnu-update"
+            _updater_bin="axolotlsay-x86_64-unknown-linux-gnu-update"
+            ;;
+```

@@ -1,0 +1,162 @@
+diff --git a/google-http-client/src/test/java/com/google/api/client/http/HttpResponseTest.java b/google-http-client/src/test/java/com/google/api/client/http/HttpResponseTest.java
+index bfc09b6d..e2ddb067 100644
+--- a/google-http-client/src/test/java/com/google/api/client/http/HttpResponseTest.java
++++ b/google-http-client/src/test/java/com/google/api/client/http/HttpResponseTest.java
+@@ -20,16 +20,21 @@ import com.google.api.client.testing.http.MockHttpTransport;
+ import com.google.api.client.testing.http.MockLowLevelHttpRequest;
+ import com.google.api.client.testing.http.MockLowLevelHttpResponse;
+ import com.google.api.client.testing.util.LogRecordingHandler;
++import com.google.api.client.testing.util.MockSleeper;
+ import com.google.api.client.testing.util.TestableByteArrayInputStream;
++import com.google.api.client.util.ExponentialBackOff;
+ import com.google.api.client.util.Key;
++import com.google.common.io.ByteStreams;
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.lang.reflect.Type;
+ import java.nio.charset.StandardCharsets;
+ import java.text.NumberFormat;
+ import java.util.Arrays;
+ import java.util.Locale;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.logging.Level;
+ import java.util.zip.GZIPInputStream;
+ import java.util.zip.GZIPOutputStream;
+@@ -59,6 +64,8 @@ public class HttpResponseTest extends TestCase {
+   private static final String SAMPLE = "123\u05D9\u05e0\u05D9\u05D1";
+   private static final String SAMPLE2 = "123abc";
+   private static final String JSON_SAMPLE = "{\"foo\": \"ßar\"}";
++  private static final String ERROR_SAMPLE =
++      "{domain:'global',reason:'domainPolicy',message:'msg'}";
+   private static final String VALID_CONTENT_TYPE = "text/plain";
+   private static final String VALID_CONTENT_TYPE_WITH_PARAMS =
+       "application/vnd.com.google.datastore.entity+json; charset=utf-8; version=v1; q=0.9";
+@@ -665,4 +672,126 @@ public class HttpResponseTest extends TestCase {
+     HttpResponse response = request.execute();
+     assertEquals("abcd", response.parseAsString());
+   }
++
++  public void testUnsuccessfulResponseHandlerCanInspectContentWithoutLosingErrorBody()
++      throws IOException {
++    HttpTransport transport =
++        new MockHttpTransport() {
++          @Override
++          public LowLevelHttpRequest buildRequest(String method, String url) throws IOException {
++            return new MockLowLevelHttpRequest() {
++              @Override
++              public LowLevelHttpResponse execute() throws IOException {
++                byte[] dataToCompress = ERROR_SAMPLE.getBytes(StandardCharsets.UTF_8);
++                ByteArrayOutputStream content = new ByteArrayOutputStream(dataToCompress.length);
++                try (GZIPOutputStream zipStream = new GZIPOutputStream(content)) {
++                  zipStream.write(dataToCompress);
++                }
++
++                MockLowLevelHttpResponse result = new MockLowLevelHttpResponse();
++                result.setStatusCode(403);
++                result.setContentType(JSON_CONTENT_TYPE);
++                result.setContentEncoding("gzip");
++                result.setContent(content.toByteArray());
++                return result;
++              }
++            };
++          }
++        };
++    HttpRequest request =
++        transport.createRequestFactory().buildGetRequest(HttpTesting.SIMPLE_GENERIC_URL);
++    request.setUnsuccessfulResponseHandler(
++        new HttpUnsuccessfulResponseHandler() {
++          @Override
++          public boolean handleResponse(
++              HttpRequest request, HttpResponse response, boolean supportsRetry)
++              throws IOException {
++            InputStream content = response.getContent();
++            if (content.markSupported()) {
++              content.mark(8192);
++            }
++            byte[] bytes = ByteStreams.toByteArray(content);
++            assertEquals(ERROR_SAMPLE, new String(bytes, response.getContentCharset()));
++            if (content.markSupported()) {
++              content.reset();
++            }
++            return false;
++          }
++        });
++
++    try {
++      request.execute();
++      fail("Expected an exception for the unsuccessful response");
++    } catch (HttpResponseException exception) {
++      assertEquals(ERROR_SAMPLE, exception.getContent());
++    }
++  }
++
++  public void testUnsuccessfulResponseHandlerCanInspectContentAndTriggerBackOffRetry()
++      throws IOException {
++    final AtomicInteger calls = new AtomicInteger();
++    HttpTransport transport =
++        new MockHttpTransport() {
++          @Override
++          public LowLevelHttpRequest buildRequest(String method, String url) throws IOException {
++            return new MockLowLevelHttpRequest() {
++              @Override
++              public LowLevelHttpResponse execute() throws IOException {
++                MockLowLevelHttpResponse result = new MockLowLevelHttpResponse();
++                if (calls.getAndIncrement() == 0) {
++                  result.setStatusCode(403);
++                  result.setContent(ERROR_SAMPLE);
++                } else {
++                  result.setStatusCode(200);
++                  result.setContent("ok");
++                }
++                return result;
++              }
++            };
++          }
++        };
++    final MockSleeper sleeper = new MockSleeper();
++    final HttpBackOffUnsuccessfulResponseHandler backOffHandler =
++        new HttpBackOffUnsuccessfulResponseHandler(new ExponentialBackOff())
++            .setSleeper(sleeper)
++            .setBackOffRequired(HttpBackOffUnsuccessfulResponseHandler.BackOffRequired.ALWAYS);
++    HttpRequest request =
++        transport.createRequestFactory().buildGetRequest(HttpTesting.SIMPLE_GENERIC_URL);
++    request.setUnsuccessfulResponseHandler(
++        new HttpUnsuccessfulResponseHandler() {
++          @Override
++          public boolean handleResponse(
++              HttpRequest request, HttpResponse response, boolean supportsRetry)
++              throws IOException {
++            InputStream content = response.getContent();
++            if (content.markSupported()) {
++              content.mark(8192);
++            }
++            String body = new String(ByteStreams.toByteArray(content), StandardCharsets.UTF_8);
++            if (content.markSupported()) {
++              content.reset();
++            }
++            if (!body.contains("domainPolicy")) {
++              return false;
++            }
++            return backOffHandler.handleResponse(request, response, supportsRetry);
++          }
++        });
++
++    HttpResponse response = request.execute();
++    assertEquals(200, response.getStatusCode());
++    assertEquals("ok", response.parseAsString());
++    assertEquals(2, calls.get());
++    assertEquals(1, sleeper.getCount());
++  }
++
++  public void testGetContent_noContent() throws IOException {
++    HttpResponse response =
++        new MockHttpTransport()
++            .createRequestFactory()
++            .buildGetRequest(HttpTesting.SIMPLE_GENERIC_URL)
++            .execute();
++
++    assertNull(response.getContent());
++  }
+ }

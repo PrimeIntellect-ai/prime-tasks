@@ -1,0 +1,395 @@
+diff --git a/module_test.go b/module_test.go
+index 13be8be..5c965a7 100644
+--- a/module_test.go
++++ b/module_test.go
+@@ -21,6 +21,7 @@
+ package fx_test
+ 
+ import (
++	"bytes"
+ 	"errors"
+ 	"testing"
+ 	"time"
+@@ -31,8 +32,41 @@ import (
+ 	"go.uber.org/fx/fxevent"
+ 	"go.uber.org/fx/fxtest"
+ 	"go.uber.org/fx/internal/fxlog"
++	"go.uber.org/zap"
+ )
+ 
++func hasEventForModule(spy *fxlog.Spy, module string) bool {
++	for _, event := range spy.Events() {
++		switch event := event.(type) {
++		case *fxevent.Provided:
++			if event.ModuleName == module {
++				return true
++			}
++		case *fxevent.Supplied:
++			if event.ModuleName == module {
++				return true
++			}
++		case *fxevent.Replaced:
++			if event.ModuleName == module {
++				return true
++			}
++		case *fxevent.Decorated:
++			if event.ModuleName == module {
++				return true
++			}
++		case *fxevent.Invoking:
++			if event.ModuleName == module {
++				return true
++			}
++		case *fxevent.Invoked:
++			if event.ModuleName == module {
++				return true
++			}
++		}
++	}
++	return false
++}
++
+ func TestModuleSuccess(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -40,6 +74,10 @@ func TestModuleSuccess(t *testing.T) {
+ 		Name string
+ 	}
+ 
++	type Foo struct {
++		Name string
++	}
++
+ 	t.Run("provide a dependency from a submodule", func(t *testing.T) {
+ 		t.Parallel()
+ 
+@@ -241,6 +279,226 @@ func TestModuleSuccess(t *testing.T) {
+ 		)
+ 		require.NoError(t, app.Err())
+ 	})
++
++	t.Run("custom logger for module", func(t *testing.T) {
++		t.Parallel()
++
++		tests := []struct {
++			desc           string
++			giveWithLogger fx.Option
++		}{
++			{
++				desc:           "custom logger for module",
++				giveWithLogger: fx.NopLogger,
++			},
++			{
++				desc:           "Not using a custom logger for module defaults to app logger",
++				giveWithLogger: fx.Options(),
++			},
++		}
++
++		for _, tt := range tests {
++			tt := tt
++			t.Run(tt.desc, func(t *testing.T) {
++				t.Parallel()
++				var spy fxlog.Spy
++
++				redis := fx.Module("redis",
++					fx.Provide(func() *Foo {
++						return &Foo{Name: "redis"}
++					}),
++					fx.Invoke(func(r *Foo) {
++						assert.Equal(t, "redis", r.Name)
++					}),
++					tt.giveWithLogger,
++				)
++
++				app := fxtest.New(t,
++					redis,
++					fx.Supply(&spy),
++					fx.WithLogger(func(spy *fxlog.Spy) fxevent.Logger {
++						return spy
++					}),
++					fx.Invoke(func(r *Foo) {
++						assert.Equal(t, "redis", r.Name)
++					}),
++				)
++
++				// A module without its own logger inherits the app logger; a module
++				// with its own logger keeps its events out of the app logger.
++				if tt.desc == "Not using a custom logger for module defaults to app logger" {
++					assert.True(t, hasEventForModule(&spy, "redis"))
++				} else {
++					assert.False(t, hasEventForModule(&spy, "redis"))
++				}
++
++				spy.Reset()
++				app.RequireStart().RequireStop()
++
++				require.NoError(t, app.Err())
++
++				assert.Contains(t, spy.EventTypes(), "Started")
++				assert.Contains(t, spy.EventTypes(), "Stopped")
++			})
++		}
++	})
++
++	t.Run("custom logger for module with error-returning constructor", func(t *testing.T) {
++		t.Parallel()
++
++		var moduleSpy fxlog.Spy
++		var appSpy fxlog.Spy
++
++		redis := fx.Module("redis",
++			fx.Provide(func() *Foo {
++				return &Foo{Name: "redis"}
++			}),
++			fx.WithLogger(func() (fxevent.Logger, error) {
++				return &moduleSpy, nil
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "redis", r.Name)
++			}),
++		)
++
++		app := fxtest.New(t,
++			redis,
++			fx.Supply(&appSpy),
++			fx.WithLogger(func(spy *fxlog.Spy) fxevent.Logger {
++				return spy
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "redis", r.Name)
++			}),
++		)
++
++		require.NoError(t, app.Err())
++
++		// The module's custom logger, built from a constructor that returns a
++		// logger and a nil error, is used for the module's scope.
++		var moduleInvoked bool
++		for _, ev := range moduleSpy.Events() {
++			if inv, ok := ev.(*fxevent.Invoked); ok && inv.ModuleName == "redis" {
++				moduleInvoked = true
++			}
++		}
++		assert.True(t, moduleInvoked, "module logger must receive the module's events")
++
++		// The app logger must not receive the module's events.
++		for _, ev := range appSpy.Events() {
++			if inv, ok := ev.(*fxevent.Invoked); ok {
++				assert.NotEqual(t, "redis", inv.ModuleName,
++					"module events must not be logged by the app logger")
++			}
++		}
++	})
++	type NamedSpy struct {
++		fxlog.Spy
++		name string
++	}
++
++	t.Run("decorator on module logger does not affect app logger", func(t *testing.T) {
++		t.Parallel()
++
++		appSpy := NamedSpy{name: "app"}
++		moduleSpy := NamedSpy{name: "redis"}
++
++		redis := fx.Module("redis",
++			fx.Provide(func() *Foo {
++				return &Foo{Name: "redis"}
++			}),
++			fx.Supply(&appSpy),
++			fx.Replace(&moduleSpy),
++			fx.WithLogger(func(spy *NamedSpy) fxevent.Logger {
++				assert.Equal(t, "redis", spy.name)
++				return spy
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "redis", r.Name)
++			}),
++		)
++
++		app := fxtest.New(t,
++			redis,
++			fx.WithLogger(func(spy *NamedSpy) fxevent.Logger {
++				assert.Equal(t, "app", spy.name)
++				return spy
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "redis", r.Name)
++			}),
++		)
++
++		assert.True(t, hasEventForModule(&moduleSpy.Spy, "redis"), "module logger receives module events")
++		assert.False(t, hasEventForModule(&appSpy.Spy, "redis"), "module events stay out of the app logger")
++
++		appSpy.Reset()
++		moduleSpy.Reset()
++
++		app.RequireStart().RequireStop()
++
++		require.NoError(t, app.Err())
++
++		assert.Contains(t, appSpy.EventTypes(), "Started")
++		assert.Contains(t, appSpy.EventTypes(), "Stopped")
++		assert.NotContains(t, moduleSpy.EventTypes(), "Started")
++		assert.NotContains(t, moduleSpy.EventTypes(), "Stopped")
++	})
++
++	t.Run("module uses parent module's logger to log events", func(t *testing.T) {
++		t.Parallel()
++
++		appSpy := NamedSpy{name: "app"}
++		childSpy := NamedSpy{name: "child"}
++
++		grandchild := fx.Module("grandchild",
++			fx.Provide(func() *Foo {
++				return &Foo{Name: "grandchild"}
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "grandchild", r.Name)
++			}),
++		)
++
++		child := fx.Module("child",
++			grandchild,
++			fx.Supply(&appSpy),
++			fx.Replace(&childSpy),
++			fx.WithLogger(func(spy *NamedSpy) fxevent.Logger {
++				assert.Equal(t, "child", spy.name)
++				return spy
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "grandchild", r.Name)
++			}),
++		)
++
++		app := fxtest.New(t,
++			child,
++			fx.WithLogger(func(spy *NamedSpy) fxevent.Logger {
++				assert.Equal(t, "app", spy.name)
++				return spy
++			}),
++			fx.Invoke(func(r *Foo) {
++				assert.Equal(t, "grandchild", r.Name)
++			}),
++		)
++
++		assert.True(t, hasEventForModule(&childSpy.Spy, "child"), "child logger receives child events")
++		assert.False(t, hasEventForModule(&appSpy.Spy, "child"), "child events stay out of app logger")
++
++		appSpy.Reset()
++		childSpy.Reset()
++
++		app.RequireStart().RequireStop()
++
++		require.NoError(t, app.Err())
++
++		assert.Contains(t, appSpy.EventTypes(), "Started")
++		assert.Contains(t, appSpy.EventTypes(), "Stopped")
++		assert.NotContains(t, childSpy.EventTypes(), "Started")
++		assert.NotContains(t, childSpy.EventTypes(), "Stopped")
++	})
+ }
+ 
+ func TestModuleFailures(t *testing.T) {
+@@ -400,10 +658,6 @@ func TestModuleFailures(t *testing.T) {
+ 				desc: "StopTimeout Option",
+ 				opt:  fx.StopTimeout(time.Second),
+ 			},
+-			{
+-				desc: "WithLogger Option",
+-				opt:  fx.WithLogger(func() fxevent.Logger { return new(fxlog.Spy) }),
+-			},
+ 		}
+ 
+ 		for _, tt := range tests {
+@@ -420,4 +674,91 @@ func TestModuleFailures(t *testing.T) {
+ 			})
+ 		}
+ 	})
++
++	t.Run("invalid WithLogger in Module", func(t *testing.T) {
++		t.Parallel()
++
++		var spy fxlog.Spy
++
++		spyAsLogger := fx.Options(
++			fx.Supply(&spy),
++			fx.WithLogger(func(spy *fxlog.Spy) fxevent.Logger {
++				return spy
++			}),
++		)
++
++		defaultModuleOpts := fx.Options(
++			fx.Provide(func() string {
++				return "redis"
++			}),
++			fx.Invoke(func(s string) {
++				assert.Fail(t, "this should never run")
++			}),
++		)
++
++		tests := []struct {
++			desc            string
++			giveModuleOpts  fx.Option
++			giveAppOpts     fx.Option
++			wantErrContains []string
++		}{
++			{
++				desc:            "error in Provide shows logs in module",
++				giveModuleOpts:  fx.Options(spyAsLogger, fx.Provide(&bytes.Buffer{})), // not passing in a constructor
++				giveAppOpts:     fx.Options(),
++				wantErrContains: []string{},
++			},
++			{
++				desc: "logger in module failed to build",
++				giveModuleOpts: fx.WithLogger(func() (fxevent.Logger, error) {
++					return nil, errors.New("error building logger")
++				}),
++				giveAppOpts:     spyAsLogger,
++				wantErrContains: []string{},
++			},
++			{
++				desc: "logger dependency in module failed to build",
++				giveModuleOpts: fx.Options(
++					fx.Provide(func() (*zap.Logger, error) {
++						return nil, errors.New("error building logger dependency")
++					}),
++					fx.WithLogger(func(log *zap.Logger) fxevent.Logger {
++						t.Errorf("WithLogger must not be called")
++						panic("must not be called")
++					}),
++				),
++				giveAppOpts:     spyAsLogger,
++				wantErrContains: []string{},
++			},
++			{
++				desc:            "Invalid input for WithLogger",
++				giveModuleOpts:  fx.WithLogger(&fxlog.Spy{}), // not passing in a constructor for WithLogger
++				giveAppOpts:     spyAsLogger,
++				wantErrContains: []string{},
++			},
++		}
++		for _, tt := range tests {
++			spy.Reset()
++			t.Run(tt.desc, func(t *testing.T) {
++				redis := fx.Module("redis",
++					tt.giveModuleOpts,
++					defaultModuleOpts,
++				)
++
++				app := fx.New(
++					tt.giveAppOpts,
++					redis,
++					fx.Invoke(func(s string) {
++						assert.Fail(t, "this should never run")
++					}),
++				)
++				err := app.Err()
++				require.Error(t, err)
++				for _, contains := range tt.wantErrContains {
++					assert.Contains(t, err.Error(), contains)
++				}
++
++			})
++		}
++	})
+ }

@@ -1,0 +1,205 @@
+diff --git a/docs/changelog.rst b/docs/changelog.rst
+index 9618c1d..ee407d1 100644
+--- a/docs/changelog.rst
++++ b/docs/changelog.rst
+@@ -31,6 +31,11 @@ Also:
+   :meth:`~protocol.WebSocketCommonProtocol.pong` support bytes-like types
+   :class:`bytearray` and :class:`memoryview` in addition to :class:`bytes`.
+ 
++* Added :exc:`~exceptions.ConnectionClosedOK` and
++  :exc:`~exceptions.ConnectionClosedError` subclasses of
++  :exc:`~exceptions.ConnectionClosed` to tell apart normal connection
++  termination from errors.
++
+ * :func:`~client.connect()` handles redirects from the server during the
+   handshake.
+ 
+diff --git a/src/websockets/exceptions.py b/src/websockets/exceptions.py
+index 73eb8bb..7fdc971 100644
+--- a/src/websockets/exceptions.py
++++ b/src/websockets/exceptions.py
+@@ -7,6 +7,8 @@ from .http import Headers, HeadersLike
+ __all__ = [
+     "AbortHandshake",
+     "ConnectionClosed",
++    "ConnectionClosedError",
++    "ConnectionClosedOK",
+     "DuplicateParameter",
+     "InvalidHandshake",
+     "InvalidHeader",
+@@ -203,7 +205,6 @@ def format_close(code: int, reason: str) -> str:
+     """
+     Display a human-readable version of the close code and reason.
+ 
+-
+     """
+     if 3000 <= code < 4000:
+         explanation = "registered"
+@@ -238,6 +239,32 @@ class ConnectionClosed(InvalidState):
+         super().__init__(message)
+ 
+ 
++class ConnectionClosedError(ConnectionClosed):
++    """
++    Like :exc:`ConnectionClosed`, when the connection terminated with an error.
++
++    This means the close code is different from 1000 (OK) and 1001 (going away).
++
++    """
++
++    def __init__(self, code: int, reason: str) -> None:
++        assert code != 1000 and code != 1001
++        super().__init__(code, reason)
++
++
++class ConnectionClosedOK(ConnectionClosed):
++    """
++    Like :exc:`ConnectionClosed`, when the connection terminated properly.
++
++    This means the close code is 1000 (OK) or 1001 (going away).
++
++    """
++
++    def __init__(self, code: int, reason: str) -> None:
++        assert code == 1000 or code == 1001
++        super().__init__(code, reason)
++
++
+ class InvalidURI(Exception):
+     """
+     Exception raised when an URI isn't a valid websocket URI.
+diff --git a/src/websockets/protocol.py b/src/websockets/protocol.py
+index b0fff8f..c07aef9 100644
+--- a/src/websockets/protocol.py
++++ b/src/websockets/protocol.py
+@@ -30,6 +30,8 @@ from typing import (
+ 
+ from .exceptions import (
+     ConnectionClosed,
++    ConnectionClosedError,
++    ConnectionClosedOK,
+     InvalidState,
+     PayloadTooBig,
+     WebSocketProtocolError,
+@@ -78,8 +80,8 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+ 
+     The iterator yields incoming messages. It exits normally when the
+     connection is closed with the close code 1000 (OK) or 1001 (going away).
+-    It raises a :exc:`~websockets.exceptions.ConnectionClosed` exception when
+-    the connection is closed with any other status code.
++    It raises a :exc:`~websockets.exceptions.ConnectionClosedError` exception
++    when the connection is closed with any other status code.
+ 
+     The ``host``, ``port`` and ``secure`` parameters are simply stored as
+     attributes for handlers that need them.
+@@ -114,8 +116,8 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+     The ``max_size`` parameter enforces the maximum size for incoming messages
+     in bytes. The default value is 1 MiB. ``None`` disables the limit. If a
+     message larger than the maximum size is received, :meth:`recv()` will
+-    raise :exc:`~websockets.exceptions.ConnectionClosed` and the connection
+-    will be closed with status code 1009.
++    raise :exc:`~websockets.exceptions.ConnectionClosedError` and the
++    connection will be closed with status code 1009.
+ 
+     The ``max_queue`` parameter sets the maximum length of the queue that
+     holds incoming messages. The default value is ``32``. ``None`` disables
+@@ -382,11 +384,8 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+         try:
+             while True:
+                 yield await self.recv()
+-        except ConnectionClosed as exc:
+-            if exc.code == 1000 or exc.code == 1001:
+-                return
+-            else:
+-                raise
++        except ConnectionClosedOK:
++            return
+ 
+     async def recv(self) -> Data:
+         """
+@@ -396,8 +395,11 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+         binary frame.
+ 
+         When the end of the message stream is reached, :meth:`recv` raises
+-        :exc:`~websockets.exceptions.ConnectionClosed`. This can happen after
+-        a normal connection closure, a protocol error or a network failure.
++        :exc:`~websockets.exceptions.ConnectionClosed`. Specifically, it
++        raises :exc:`~websockets.exceptions.ConnectionClosedOK` after a normal
++        connection closure and
++        :exc:`~websockets.exceptions.ConnectionClosedError`after a protocol
++        error or a network failure.
+ 
+         .. versionchanged:: 3.0
+ 
+@@ -659,6 +661,16 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+ 
+     # Private methods - no guarantees.
+ 
++    def connection_closed_exc(self) -> ConnectionClosed:
++        exception: ConnectionClosed
++        if self.close_code == 1000 or self.close_code == 1001:
++            exception = ConnectionClosedOK(self.close_code, self.close_reason)
++        else:
++            exception = ConnectionClosedError(self.close_code, self.close_reason)
++        # Chain to the exception that terminated data transfer, if any.
++        exception.__cause__ = self.transfer_data_exc
++        return exception
++
+     async def ensure_open(self) -> None:
+         """
+         Check that the WebSocket connection is open.
+@@ -673,16 +685,12 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+             # from OPEN to CLOSED.
+             if self.transfer_data_task.done():
+                 await asyncio.shield(self.close_connection_task)
+-                raise ConnectionClosed(
+-                    self.close_code, self.close_reason
+-                ) from self.transfer_data_exc
++                raise self.connection_closed_exc()
+             else:
+                 return
+ 
+         if self.state is State.CLOSED:
+-            raise ConnectionClosed(
+-                self.close_code, self.close_reason
+-            ) from self.transfer_data_exc
++            raise self.connection_closed_exc()
+ 
+         if self.state is State.CLOSING:
+             # If we started the closing handshake, wait for its completion to
+@@ -691,9 +699,7 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+             # CLOSING state also occurs when failing the connection. In that
+             # case self.close_connection_task will complete even faster.
+             await asyncio.shield(self.close_connection_task)
+-            raise ConnectionClosed(
+-                self.close_code, self.close_reason
+-            ) from self.transfer_data_exc
++            raise self.connection_closed_exc()
+ 
+         # Control may only reach this point in buggy third-party subclasses.
+         assert self.state is State.CONNECTING
+@@ -1163,8 +1169,7 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
+ 
+         """
+         assert self.state is State.CLOSED
+-        exc = ConnectionClosed(self.close_code, self.close_reason)
+-        exc.__cause__ = self.transfer_data_exc  # emulate raise ... from ...
++        exc = self.connection_closed_exc()
+ 
+         for ping in self.pings.values():
+             ping.set_exception(exc)
+diff --git a/src/websockets/server.py b/src/websockets/server.py
+index fca6c2c..e202ea2 100644
+--- a/src/websockets/server.py
++++ b/src/websockets/server.py
+@@ -782,8 +782,8 @@ class Serve:
+     When a server is closed with :meth:`~WebSocketServer.close`, it closes all
+     connections with close code 1001 (going away). WebSocket handlers — which
+     are running the coroutine passed in the ``ws_handler`` — will receive a
+-    :exc:`~websockets.exceptions.ConnectionClosed` exception on their current
+-    or next interaction with the WebSocket connection.
++    :exc:`~websockets.exceptions.ConnectionClosedOK` exception on their
++    current or next interaction with the WebSocket connection.
+ 
+     Since there's no useful way to propagate exceptions triggered in handlers,
+     they're sent to the ``'websockets.server'`` logger instead. Debugging is

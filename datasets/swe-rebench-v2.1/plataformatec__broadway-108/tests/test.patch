@@ -1,0 +1,202 @@
+diff --git a/test/broadway_test.exs b/test/broadway_test.exs
+index 87c19a9..1f3f60e 100644
+--- a/test/broadway_test.exs
++++ b/test/broadway_test.exs
+@@ -424,7 +424,7 @@ defmodule BroadwayTest do
+       assert capture_log(fn ->
+                Broadway.push_messages(broadway, [one, raise, four])
+                assert_receive {:ack, _, [%{data: 1}, %{data: 4}], []}
+-             end) =~ "[error] ** (UndefinedFunctionError) function Unknown.ack/3 is undefined"
++             end) =~ "(UndefinedFunctionError)"
+ 
+       refute_received {:EXIT, _, ^processor}
+     end
+@@ -489,6 +489,10 @@ defmodule BroadwayTest do
+ 
+     test "shutting down broadway waits until all events are processed",
+          %{broadway: broadway, producer: producer} do
++      # The test process is linked to Broadway, so trap exits to observe the
++      # shutdown instead of being terminated by it.
++      Process.flag(:trap_exit, true)
++
+       # We suspend the producer to make sure that it doesn't process the messages early on
+       :sys.suspend(producer)
+       async_push_messages(producer, [1, 2, 3, 4])
+@@ -682,6 +686,135 @@ defmodule BroadwayTest do
+     end
+   end
+ 
++  describe "ack_immediately" do
++    test "acks a single message" do
++      broadway_name = new_unique_name()
++      test_pid = self()
++
++      handle_message = fn message, _ ->
++        message = Message.ack_immediately(message)
++        send(test_pid, :manually_acked)
++        message
++      end
++
++      {:ok, broadway} =
++        Broadway.start_link(CustomHandlers,
++          name: broadway_name,
++          context: %{handle_message: handle_message},
++          producers: [
++            default: [module: {ManualProducer, []}]
++          ],
++          processors: [default: []]
++        )
++
++      ref = Broadway.test_messages(broadway, [1])
++
++      assert_receive :manually_acked
++      {successful, failed} = collect_acks(ref, 1)
++      assert Enum.map(successful, & &1.data) == [1]
++      assert failed == []
++      refute_receive {:ack, ^ref, _successful, _failed}
++    end
++
++    test "acks multiple messages" do
++      broadway_name = new_unique_name()
++      test_pid = self()
++
++      handle_message = fn message, _ ->
++        Message.put_batcher(message, :default)
++      end
++
++      handle_batch = fn :default, batch, _batch_info, _ ->
++        batch =
++          Enum.map(batch, fn
++            %Message{data: :ok} = message -> message
++            %Message{data: :fail} = message -> Message.failed(message, :manually_failed)
++          end)
++
++        batch = Message.ack_immediately(batch)
++        send(test_pid, :manually_acked)
++        batch
++      end
++
++      {:ok, broadway} =
++        Broadway.start_link(CustomHandlers,
++          name: broadway_name,
++          context: %{handle_message: handle_message, handle_batch: handle_batch},
++          producers: [
++            default: [module: {ManualProducer, []}]
++          ],
++          processors: [default: []],
++          batchers: [default: [batch_size: 4, batch_timeout: 1000]]
++        )
++
++      ref = Broadway.test_messages(broadway, [:ok, :ok, :fail, :ok], batch_mode: :bulk)
++
++      assert_receive :manually_acked
++
++      # The contract only requires that the underlying acknowledger is invoked
++      # for every message (with the :ok ones as successful and the failed ones
++      # as failed). It does not require a single combined acknowledgment call,
++      # so we collect every acknowledgment event regardless of how they are
++      # grouped.
++      {successful, failed} = collect_acks(ref, 4)
++      assert length(successful) + length(failed) == 4
++      assert Enum.sort(Enum.map(successful, & &1.data)) == [:ok, :ok, :ok]
++      assert Enum.map(failed, & &1.data) == [:fail]
++      refute_receive {:ack, ^ref, _successful, _failed}
++    end
++
++    test "ack_immediately/1 acknowledges a single message and replaces its acknowledger" do
++      message = %Message{data: 1, acknowledger: {Acker, :ack_ref, %{test_pid: self()}}}
++
++      acked = Message.ack_immediately(message)
++
++      assert %Message{data: 1, acknowledger: {Broadway.NoopAcknowledger, nil, nil}} = acked
++      assert_receive {:ack, [%Message{data: 1}], []}
++    end
++
++    test "ack_immediately/1 acknowledges a single message with a failed status" do
++      message = %Message{
++        data: 1,
++        status: {:failed, :oops},
++        acknowledger: {Acker, :ack_ref, %{test_pid: self()}}
++      }
++
++      acked = Message.ack_immediately(message)
++
++      assert %Message{data: 1, acknowledger: {Broadway.NoopAcknowledger, nil, nil}} = acked
++      assert_receive {:ack, [], [%Message{data: 1}]}
++    end
++
++    test "ack_immediately/1 acknowledges a list of messages and replaces their acknowledgers" do
++      ref = make_ref()
++      ack = {CallerAcknowledger, {self(), ref}, :ok}
++      ok1 = %Message{data: 1, acknowledger: ack}
++      ok2 = %Message{data: 2, acknowledger: ack}
++
++      failed = %Message{
++        data: 3,
++        status: {:failed, :oops},
++        acknowledger: ack
++      }
++
++      acked = Message.ack_immediately([ok1, ok2, failed])
++
++      assert Enum.map(acked, & &1.acknowledger) == [
++               {Broadway.NoopAcknowledger, nil, nil},
++               {Broadway.NoopAcknowledger, nil, nil},
++               {Broadway.NoopAcknowledger, nil, nil}
++             ]
++
++      # The contract requires the underlying acknowledger to be invoked for
++      # every message, but it does not require a single combined call. Collect
++      # every acknowledgment event so implementations that ack each message
++      # individually are accepted too.
++      {successful, failed_msgs} = collect_acks(ref, 3)
++      assert Enum.sort(Enum.map(successful, & &1.data)) == [1, 2]
++      assert Enum.map(failed_msgs, & &1.data) == [3]
++    end
++  end
++
+   describe "transformer" do
+     setup tags do
+       broadway_name = new_unique_name()
+@@ -1112,7 +1245,7 @@ defmodule BroadwayTest do
+                Broadway.push_messages(broadway, [one, two, raise, three])
+                ref = Broadway.test_messages(broadway, [1, 2, 3, 4], batch_mode: :bulk)
+                assert_receive {:ack, ^ref, [%{data: 1}, %{data: 2}, %{data: 3}, %{data: 4}], []}
+-             end) =~ "[error] ** (UndefinedFunctionError) function Unknown.ack/3 is undefined"
++             end) =~ "(UndefinedFunctionError)"
+ 
+       refute_received {:EXIT, _, ^consumer}
+     end
+@@ -1259,4 +1392,32 @@ defmodule BroadwayTest do
+     ack = {CallerAcknowledger, {self(), make_ref()}, :ok}
+     Enum.map(list, &%Message{data: &1, acknowledger: ack})
+   end
++
++  # Collects acknowledgment events for `ref` until `expected_count` messages
++  # have been acknowledged. This is tolerant to how the acknowledger groups
++  # the messages (one combined call or one call per message).
++  defp collect_acks(ref, expected_count) do
++    collect_acks(ref, expected_count, [], [])
++  end
++
++  defp collect_acks(_ref, remaining, successful, failed) when remaining <= 0 do
++    {Enum.reverse(successful), Enum.reverse(failed)}
++  end
++
++  defp collect_acks(ref, remaining, successful, failed) do
++    receive do
++      {:ack, ^ref, new_successful, new_failed} ->
++        collect_acks(
++          ref,
++          remaining - length(new_successful) - length(new_failed),
++          Enum.reverse(new_successful) ++ successful,
++          Enum.reverse(new_failed) ++ failed
++        )
++    after
++      1000 ->
++        flunk(
++          "expected #{remaining} more acked message(s), but the acknowledger was not invoked for all of them"
++        )
++    end
++  end
+ end

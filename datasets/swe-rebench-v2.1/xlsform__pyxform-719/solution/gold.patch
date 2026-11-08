@@ -1,0 +1,168 @@
+diff --git a/pyxform/constants.py b/pyxform/constants.py
+index 74adefb..bd569af 100644
+--- a/pyxform/constants.py
++++ b/pyxform/constants.py
+@@ -114,7 +114,8 @@ CURRENT_XFORMS_VERSION = "1.0.0"
+ 
+ # The ODK entities spec version that generated forms comply to
+ ENTITIES_CREATE_VERSION = "2022.1.0"
+-CURRENT_ENTITIES_VERSION = "2023.1.0"
++ENTITIES_UPDATE_VERSION = "2023.1.0"
++ENTITIES_OFFLINE_VERSION = "2024.1.0"
+ ENTITY = "entity"
+ ENTITY_FEATURES = "entity_features"
+ ENTITIES_RESERVED_PREFIX = "__"
+@@ -126,6 +127,7 @@ class EntityColumns(StrEnum):
+     CREATE_IF = "create_if"
+     UPDATE_IF = "update_if"
+     LABEL = "label"
++    OFFLINE = "offline"
+ 
+ 
+ DEPRECATED_DEVICE_ID_METADATA_FIELDS = ["subscriberid", "simserial"]
+diff --git a/pyxform/entities/entities_parsing.py b/pyxform/entities/entities_parsing.py
+index 51f21bc..017b675 100644
+--- a/pyxform/entities/entities_parsing.py
++++ b/pyxform/entities/entities_parsing.py
+@@ -1,6 +1,7 @@
+ from typing import Any
+ 
+ from pyxform import constants as const
++from pyxform.aliases import yes_no
+ from pyxform.errors import PyXFormError
+ from pyxform.xlsparseutils import find_sheet_misspellings, is_valid_xml_tag
+ 
+@@ -28,6 +29,7 @@ def get_entity_declaration(
+     create_condition = entity_row.get(EC.CREATE_IF, None)
+     update_condition = entity_row.get(EC.UPDATE_IF, None)
+     entity_label = entity_row.get(EC.LABEL, None)
++    offline = yes_no.get(entity_row.get(EC.OFFLINE, None), None)
+ 
+     if update_condition and not entity_id:
+         raise PyXFormError(
+@@ -53,6 +55,7 @@ def get_entity_declaration(
+             EC.CREATE_IF: create_condition,
+             EC.UPDATE_IF: update_condition,
+             EC.LABEL: entity_label,
++            EC.OFFLINE: offline,
+         },
+     }
+ 
+diff --git a/pyxform/entities/entity_declaration.py b/pyxform/entities/entity_declaration.py
+index cd85991..b34950a 100644
+--- a/pyxform/entities/entity_declaration.py
++++ b/pyxform/entities/entity_declaration.py
+@@ -24,23 +24,28 @@ class EntityDeclaration(SurveyElement):
+     """
+ 
+     def xml_instance(self, **kwargs):
++        parameters = self.get(const.PARAMETERS, {})
++
+         attributes = {
+-            EC.DATASET.value: self.get(const.PARAMETERS, {}).get(EC.DATASET, ""),
++            EC.DATASET.value: parameters.get(EC.DATASET, ""),
+             "id": "",
+         }
+ 
+-        entity_id_expression = self.get(const.PARAMETERS, {}).get(EC.ENTITY_ID, None)
+-        create_condition = self.get(const.PARAMETERS, {}).get(EC.CREATE_IF, None)
+-        update_condition = self.get(const.PARAMETERS, {}).get(EC.UPDATE_IF, None)
++        entity_id_expression = parameters.get(EC.ENTITY_ID, None)
++        create_condition = parameters.get(EC.CREATE_IF, None)
++        update_condition = parameters.get(EC.UPDATE_IF, None)
+ 
+         if entity_id_expression:
+             attributes["update"] = "1"
+             attributes["baseVersion"] = ""
++            if parameters.get(EC.OFFLINE, None):
++                attributes["trunkVersion"] = ""
++                attributes["branchId"] = ""
+ 
+         if create_condition or (not update_condition and not entity_id_expression):
+             attributes["create"] = "1"
+ 
+-        if self.get(const.PARAMETERS, {}).get(EC.LABEL, None):
++        if parameters.get(EC.LABEL, None):
+             return node(const.ENTITY, node(const.LABEL), **attributes)
+         else:
+             return node(const.ENTITY, **attributes)
+@@ -50,10 +55,11 @@ class EntityDeclaration(SurveyElement):
+         See the class comment for an explanation of the logic for generating bindings.
+         """
+         survey = self.get_root()
+-        entity_id_expression = self.get(const.PARAMETERS, {}).get(EC.ENTITY_ID, None)
+-        create_condition = self.get(const.PARAMETERS, {}).get(EC.CREATE_IF, None)
+-        update_condition = self.get(const.PARAMETERS, {}).get(EC.UPDATE_IF, None)
+-        label_expression = self.get(const.PARAMETERS, {}).get(EC.LABEL, None)
++        parameters = self.get(const.PARAMETERS, {})
++        entity_id_expression = parameters.get(EC.ENTITY_ID, None)
++        create_condition = parameters.get(EC.CREATE_IF, None)
++        update_condition = parameters.get(EC.UPDATE_IF, None)
++        label_expression = parameters.get(EC.LABEL, None)
+ 
+         bind_nodes = []
+ 
+@@ -69,11 +75,20 @@ class EntityDeclaration(SurveyElement):
+             bind_nodes.append(self._get_bind_node(survey, update_condition, "/@update"))
+ 
+         if entity_id_expression:
+-            dataset_name = self.get(const.PARAMETERS, {}).get(EC.DATASET, "")
+-            base_version_expression = f"instance('{dataset_name}')/root/item[name={entity_id_expression}]/__version"
++            dataset_name = parameters.get(EC.DATASET, "")
++            entity = f"instance('{dataset_name}')/root/item[name={entity_id_expression}]"
+             bind_nodes.append(
+-                self._get_bind_node(survey, base_version_expression, "/@baseVersion")
++                self._get_bind_node(survey, f"{entity}/__version", "/@baseVersion")
+             )
++            if parameters.get(EC.OFFLINE, None):
++                bind_nodes.append(
++                    self._get_bind_node(
++                        survey, f"{entity}/__trunkVersion", "/@trunkVersion"
++                    )
++                )
++                bind_nodes.append(
++                    self._get_bind_node(survey, f"{entity}/__branchId", "/@branchId")
++                )
+ 
+         if label_expression:
+             bind_nodes.append(self._get_bind_node(survey, label_expression, "/label"))
+diff --git a/pyxform/survey.py b/pyxform/survey.py
+index d5337b6..8f1a69c 100644
+--- a/pyxform/survey.py
++++ b/pyxform/survey.py
+@@ -586,9 +586,13 @@ class Survey(Section):
+ 
+         entity_features = getattr(self, constants.ENTITY_FEATURES, [])
+         if len(entity_features) > 0:
+-            if "update" in entity_features:
++            if "offline" in entity_features:
+                 model_kwargs["entities:entities-version"] = (
+-                    constants.CURRENT_ENTITIES_VERSION
++                    constants.ENTITIES_OFFLINE_VERSION
++                )
++            elif "update" in entity_features:
++                model_kwargs["entities:entities-version"] = (
++                    constants.ENTITIES_UPDATE_VERSION
+                 )
+             else:
+                 model_kwargs["entities:entities-version"] = (
+diff --git a/pyxform/xls2json.py b/pyxform/xls2json.py
+index 6bc7dab..2d19fda 100644
+--- a/pyxform/xls2json.py
++++ b/pyxform/xls2json.py
+@@ -1538,10 +1538,14 @@ def workbook_to_json(
+ 
+     if len(entity_declaration) > 0:
+         json_dict[constants.ENTITY_FEATURES] = ["create"]
++        entity_parameters = entity_declaration.get(constants.PARAMETERS, {})
+ 
+-        if entity_declaration.get("parameters", {}).get("entity_id", None):
++        if entity_parameters.get(constants.EntityColumns.ENTITY_ID, None):
+             json_dict[constants.ENTITY_FEATURES].append("update")
+ 
++        if entity_parameters.get(constants.EntityColumns.OFFLINE, None):
++            json_dict[constants.ENTITY_FEATURES].append("offline")
++
+         meta_children.append(entity_declaration)
+ 
+     if len(meta_children) > 0:

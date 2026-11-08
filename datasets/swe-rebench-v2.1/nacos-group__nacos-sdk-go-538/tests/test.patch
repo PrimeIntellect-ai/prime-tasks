@@ -1,0 +1,243 @@
+diff --git a/common/nacos_server/nacos_server_test.go b/common/nacos_server/nacos_server_test.go
+index 6ca6fc7..b022f87 100644
+--- a/common/nacos_server/nacos_server_test.go
++++ b/common/nacos_server/nacos_server_test.go
+@@ -17,9 +17,24 @@
+ package nacos_server
+ 
+ import (
++	"context"
++	"crypto/hmac"
++	"crypto/sha1"
++	"encoding/base64"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"reflect"
++	"strconv"
++	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
++	"github.com/nacos-group/nacos-sdk-go/v2/common/http_agent"
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+@@ -46,3 +61,213 @@ func Test_getAddressWithoutScheme(t *testing.T) {
+ 	assert.Equal(t, "https://console.nacos.io:80", getAddress(serverConfigTest))
+ 
+ }
++
++func buildNacosServer(clientConfig constant.ClientConfig) (*NacosServer, error) {
++	return NewNacosServer(context.Background(),
++		[]constant.ServerConfig{*constant.NewServerConfig("http://console.nacos.io", 80)},
++		clientConfig,
++		&http_agent.HttpAgent{},
++		1000,
++		"")
++}
++
++func callInjectSignForNamingHttp(t *testing.T, server *NacosServer, param map[string]string, config constant.ClientConfig) {
++	t.Helper()
++	method := reflect.ValueOf(server).MethodByName("InjectSignForNamingHttp")
++	if !assert.True(t, method.IsValid(), "NacosServer must expose InjectSignForNamingHttp") {
++		return
++	}
++	method.Call([]reflect.Value{reflect.ValueOf(param), reflect.ValueOf(config)})
++}
++
++func callReqApiWithClientConfig(t *testing.T, server *NacosServer, api string, params map[string]string, methodName string, config constant.ClientConfig) (string, error) {
++	t.Helper()
++	method := reflect.ValueOf(server).MethodByName("ReqApi")
++	if !assert.True(t, method.IsValid(), "NacosServer must expose ReqApi") {
++		return "", fmt.Errorf("ReqApi is unavailable")
++	}
++	args := []reflect.Value{reflect.ValueOf(api), reflect.ValueOf(params), reflect.ValueOf(methodName)}
++	if method.Type().NumIn() == 4 {
++		args = append(args, reflect.ValueOf(config))
++	} else if method.Type().NumIn() != 3 {
++		assert.Fail(t, "ReqApi must accept its request arguments")
++		return "", fmt.Errorf("unsupported ReqApi signature")
++	}
++	results := method.Call(args)
++	if results[1].IsNil() {
++		return results[0].String(), nil
++	}
++	return results[0].String(), results[1].Interface().(error)
++}
++
++func TestNacosServer_InjectSignForNamingHttp_NoAk(t *testing.T) {
++	clientConfig := constant.ClientConfig{
++		AccessKey: "123",
++		SecretKey: "321",
++	}
++	server, err := buildNacosServer(clientConfig)
++	if err != nil {
++		t.FailNow()
++	}
++
++	param := map[string]string{
++		"serviceName": "s-0",
++		"groupName":   "g-0",
++		"ak":          "existing-ak",
++		"data":        "existing-data",
++		"signature":   "existing-signature",
++	}
++	before := make(map[string]string, len(param))
++	for key, value := range param {
++		before[key] = value
++	}
++	callInjectSignForNamingHttp(t, server, param, constant.ClientConfig{})
++	assert.Equal(t, before, param)
++}
++
++func expectedNamingSignature(data, secretKey string) string {
++	mac := hmac.New(sha1.New, []byte(secretKey))
++	mac.Write([]byte(data))
++	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
++}
++
++func assertRecentNamingTimestamp(t *testing.T, signData string) {
++	t.Helper()
++	timestampText := strings.SplitN(signData, "@@", 2)[0]
++	timestamp, err := strconv.ParseInt(timestampText, 10, 64)
++	if !assert.NoError(t, err) {
++		return
++	}
++	assert.InDelta(t, time.Now().UnixMilli(), timestamp, float64(5000))
++}
++
++func TestNacosServer_InjectSignForNamingHttp_MissingSecretKey(t *testing.T) {
++	clientConfig := constant.ClientConfig{
++		AccessKey: "123",
++		SecretKey: "321",
++	}
++	server, err := buildNacosServer(clientConfig)
++	if err != nil {
++		t.FailNow()
++	}
++
++	param := map[string]string{
++		"serviceName": "s-0",
++		"groupName":   "g-0",
++		"ak":          "existing-ak",
++		"data":        "existing-data",
++		"signature":   "existing-signature",
++	}
++	before := make(map[string]string, len(param))
++	for key, value := range param {
++		before[key] = value
++	}
++	callInjectSignForNamingHttp(t, server, param, constant.ClientConfig{AccessKey: "123"})
++	assert.Equal(t, before, param)
++}
++
++func TestNacosServer_InjectSignForNamingHttp_WithGroup(t *testing.T) {
++	clientConfig := constant.ClientConfig{
++		AccessKey: "123",
++		SecretKey: "321",
++	}
++	server, err := buildNacosServer(clientConfig)
++	if err != nil {
++		t.FailNow()
++	}
++
++	param := make(map[string]string)
++	param["serviceName"] = "s-0"
++	param["groupName"] = "g-0"
++	callInjectSignForNamingHttp(t, server, param, clientConfig)
++	assert.Equal(t, "123", param["ak"])
++	assert.Regexp(t, `^\d+@@g-0@@s-0$`, param["data"])
++	assert.Equal(t, expectedNamingSignature(param["data"], "321"), param["signature"])
++	assertRecentNamingTimestamp(t, param["data"])
++}
++
++func TestNacosServer_InjectSignForNamingHttp_WithoutGroup(t *testing.T) {
++	clientConfig := constant.ClientConfig{
++		AccessKey: "123",
++		SecretKey: "321",
++	}
++	server, err := buildNacosServer(clientConfig)
++	if err != nil {
++		t.FailNow()
++	}
++
++	param := make(map[string]string)
++	param["serviceName"] = "s-0"
++	callInjectSignForNamingHttp(t, server, param, clientConfig)
++	assert.Equal(t, "123", param["ak"])
++	assert.Regexp(t, `^\d+@@s-0$`, param["data"])
++	assert.Equal(t, expectedNamingSignature(param["data"], "321"), param["signature"])
++	assertRecentNamingTimestamp(t, param["data"])
++}
++
++func TestNacosServer_InjectSignForNamingHttp_WithoutServiceName(t *testing.T) {
++	clientConfig := constant.ClientConfig{
++		AccessKey: "123",
++		SecretKey: "321",
++	}
++	server, err := buildNacosServer(clientConfig)
++	if err != nil {
++		t.FailNow()
++	}
++
++	param := make(map[string]string)
++	param["groupName"] = "g-0"
++	callInjectSignForNamingHttp(t, server, param, clientConfig)
++	assert.Equal(t, "123", param["ak"])
++	assert.Contains(t, param, "data")
++	assert.Equal(t, expectedNamingSignature(param["data"], "321"), param["signature"])
++}
++
++func TestNacosServer_InjectSignForNamingHttp_WithoutServiceNameAndGroup(t *testing.T) {
++	clientConfig := constant.ClientConfig{
++		AccessKey: "123",
++		SecretKey: "321",
++	}
++	server, err := buildNacosServer(clientConfig)
++	if err != nil {
++		t.FailNow()
++	}
++
++	param := make(map[string]string)
++	callInjectSignForNamingHttp(t, server, param, clientConfig)
++	assert.Equal(t, "123", param["ak"])
++	assert.Contains(t, param, "data")
++	assert.Equal(t, expectedNamingSignature(param["data"], "321"), param["signature"])
++}
++
++func TestNacosServer_ReqApiSignsNamingHttpRequest(t *testing.T) {
++	var received url.Values
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assert.NoError(t, r.ParseForm())
++		received = r.Form
++		_, _ = io.WriteString(w, "ok")
++	}))
++	defer ts.Close()
++
++	parsedURL, err := url.Parse(ts.URL)
++	assert.NoError(t, err)
++	host, portText, err := net.SplitHostPort(parsedURL.Host)
++	assert.NoError(t, err)
++	port, err := strconv.Atoi(portText)
++	assert.NoError(t, err)
++
++	clientConfig := constant.ClientConfig{AccessKey: "request-ak", SecretKey: "request-secret"}
++	server, err := NewNacosServer(context.Background(), []constant.ServerConfig{{
++		IpAddr: host, Port: uint64(port), Scheme: "http", ContextPath: "/nacos",
++	}}, clientConfig, &http_agent.HttpAgent{}, 1000, "")
++	assert.NoError(t, err)
++
++	params := map[string]string{"serviceName": "g-0@@s-0", "groupName": "g-0"}
++	result, err := callReqApiWithClientConfig(t, server, "/v1/ns/instance", params, http.MethodPost, clientConfig)
++	assert.NoError(t, err)
++	assert.Equal(t, "ok", result)
++	assert.Equal(t, "request-ak", received.Get("ak"))
++	assert.Regexp(t, `^\d+@@g-0@@(?:g-0@@)?s-0$`, received.Get("data"))
++	assert.Equal(t, expectedNamingSignature(received.Get("data"), clientConfig.SecretKey), received.Get("signature"))
++	assertRecentNamingTimestamp(t, received.Get("data"))
++}

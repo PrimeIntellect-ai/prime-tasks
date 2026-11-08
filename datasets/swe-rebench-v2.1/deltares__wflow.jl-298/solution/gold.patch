@@ -1,0 +1,192 @@
+diff --git a/docs/src/changelog.md b/docs/src/changelog.md
+index e8e7de35a..eb5646271 100644
+--- a/docs/src/changelog.md
++++ b/docs/src/changelog.md
+@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++
++## [unreleased]
++
++### Changed
++- For cyclic parameters different cyclic time inputs are supported (only one common cyclic
++  time (for example daily or monthly) was allowed).
++
+ ## v0.7.2 - 2023-09-27
+ 
+ ### Fixed
+diff --git a/docs/src/user_guide/step2_settings_file.md b/docs/src/user_guide/step2_settings_file.md
+index 52e35ca79..705233f7b 100644
+--- a/docs/src/user_guide/step2_settings_file.md
++++ b/docs/src/user_guide/step2_settings_file.md
+@@ -113,10 +113,13 @@ The `input` section of the TOML file contains information about the input forcin
+ parameters files (netCDF format). Forcing is applied to the vertical component of the model,
+ and needs to be mapped to the external netCDF variable name. `forcing` lists the internal
+ model forcing parameters, and these are mapped to the external netCDF variables listed under
+-the section `[input.vertical]`. It is possible to provide cyclic parameters to the model. In
+-the example below this is done for the internal `vertical.leaf_area_index` model parameter,
+-that is linked to the external netCDF variable "LAI" variable. If a model parameter is not
+-mapped, a default value will be used if available.
++the section `[input.vertical]`. It is possible to provide cyclic parameters to the model
++(minimum time step of 1 day). In the example below this is done for the internal
++`vertical.leaf_area_index` model parameter, that is linked to the external netCDF variable
++"LAI" variable. Cyclic time inputs of parameters can be different (for example daily and
++monthly). The `time` dimension name of these cylic input parameters in the model parameter
++netCDF file should start with "time". If a model parameter is not mapped, a default value
++will be used if available.
+ 
+ ```toml
+ [input]
+diff --git a/src/io.jl b/src/io.jl
+index 8d5d20182..44e842675 100644
+--- a/src/io.jl
++++ b/src/io.jl
+@@ -338,13 +338,14 @@ function update_cyclic!(model)
+     month_day = monthday(clock.time - clock.Δt)
+ 
+     is_first_timestep = clock.iteration == 1
+-    if is_first_timestep || (month_day in cyclic_times)
+-        # time for an update of the cyclic forcing
+-        i = findlast(t -> monthday_passed(month_day, t), cyclic_times)
+-        isnothing(i) && error("Could not find applicable cyclic timestep for $month_day")
+ 
+-        # load from NetCDF into the model according to the mapping
+-        for (par, ncvar) in cyclic_parameters
++    for (par, ncvar) in cyclic_parameters
++        if is_first_timestep || (month_day in cyclic_times[par])
++            # time for an update of the cyclic forcing
++            i = findlast(t -> monthday_passed(month_day, t), cyclic_times[par])
++            isnothing(i) &&
++                error("Could not find applicable cyclic timestep for $month_day")
++            # load from NetCDF into the model according to the mapping
+             data = get_at(cyclic_dataset, ncvar.name, i)
+             param_vector = param(model, par)
+             sel = active_indices(network, par)
+@@ -623,7 +624,7 @@ struct NCReader{T}
+     dataset::CFDataset
+     dataset_times::Vector{T}
+     cyclic_dataset::Union{NCDataset,Nothing}
+-    cyclic_times::Vector{Tuple{Int,Int}}
++    cyclic_times::Dict{Tuple{Symbol,Vararg{Symbol}},Vector{Tuple{Int,Int}}}
+     forcing_parameters::Dict{Tuple{Symbol,Vararg{Symbol}},NamedTuple}
+     cyclic_parameters::Dict{Tuple{Symbol,Vararg{Symbol}},NamedTuple}
+ end
+@@ -638,7 +639,7 @@ struct Writer
+     state_dataset::Union{NCDataset,Nothing}     # dataset with model states (NetCDF)
+     state_parameters::Dict{String,Any}          # mapping of NetCDF variable names to model states (arrays)
+     state_nc_path::Union{String,Nothing}        # path NetCDF file with states
+-    dataset_scalar::Union{NCDataset,Nothing}    # dataset(NetCDF) for scalar data
++    dataset_scalar::Union{NCDataset,Nothing}    # dataset (NetCDF) for scalar data
+     nc_scalar::Vector                           # model parameter (arrays) and associated reducer function for NetCDF scalar output
+     ncvars_dims::Vector                         # model parameter (String) and associated NetCDF variable, location dimension and location name for scalar data
+     nc_scalar_path::Union{String,Nothing}       # path NetCDF file (scalar data)
+@@ -693,17 +694,6 @@ function prepare_reader(config)
+     # check for cyclic parameters
+     do_cyclic = haskey(config.input, "cyclic")
+ 
+-    # TODO:include leaf_area_index climatology in update() vertical SBM model
+-    # we currently assume the same dimension ordering as the forcing
+-    if do_cyclic == true
+-        cyclic_dataset = NCDataset(cyclic_path)
+-        cyclic_nc_times = collect(cyclic_dataset["time"])
+-        cyclic_times = timecycles(cyclic_nc_times)
+-    else
+-        cyclic_dataset = nothing
+-        cyclic_times = Tuple{Int,Int}[]
+-    end
+-
+     # create map from internal location to NetCDF variable name for forcing parameters
+     forcing_parameters = Dict{Tuple{Symbol,Vararg{Symbol}},NamedTuple}()
+     for par in config.input.forcing
+@@ -715,19 +705,30 @@ function prepare_reader(config)
+         @info "Set `$par` using NetCDF variable `$ncname` as forcing parameter."
+     end
+ 
+-    # create map from internal location to NetCDF variable name for cyclic parameters
++    # create map from internal location to NetCDF variable name for cyclic parameters and
++    # store cyclic times for each internal location (duplicate cyclic times are possible
++    # this way, however it seems not worth to keep track of unique cyclic times for now
++    # (memory usage))
+     if do_cyclic == true
++        cyclic_dataset = NCDataset(cyclic_path)
+         cyclic_parameters = Dict{Tuple{Symbol,Vararg{Symbol}},NamedTuple}()
++        cyclic_times = Dict{Tuple{Symbol,Vararg{Symbol}},Vector{Tuple{Int,Int}}}()
+         for par in config.input.cyclic
+             fields = symbols(par)
+             ncname, mod = ncvar_name_modifier(param(config.input, fields))
++            i = findfirst(x -> startswith(x, "time"), dimnames(cyclic_dataset[ncname]))
++            dimname = dimnames(cyclic_dataset[ncname])[i]
++            cyclic_nc_times = collect(cyclic_dataset[dimname])
++            cyclic_times[fields] = timecycles(cyclic_nc_times)
+             cyclic_parameters[fields] =
+                 (name = ncname, scale = mod.scale, offset = mod.offset)
+ 
+-            @info "Set `$par` using NetCDF variable `$ncname` as cyclic parameter."
++            @info "Set `$par` using NetCDF variable `$ncname` as cyclic parameter, with `$(length(cyclic_nc_times))` timesteps."
+         end
+     else
+         cyclic_parameters = Dict{Tuple{Symbol,Vararg{Symbol}},NamedTuple}()
++        cyclic_dataset = nothing
++        cyclic_times = Dict{Tuple{Symbol,Vararg{Symbol}},Vector{Tuple{Int,Int}}}()
+     end
+ 
+     # check if there is overlap
+@@ -1144,7 +1145,7 @@ Given a vector of times, return a tuple of (month, day) for each time entry, to
+ cyclic time series that repeats every year. By using `monthday` rather than `dayofyear`,
+ leap year offsets are avoided.
+ 
+-It can generate such a series from eiher TimeTypes given that the year is constant, or
++It can generate such a series from either TimeTypes given that the year is constant, or
+ it will interpret integers as either months or days of year if possible.
+ """
+ function timecycles(times)
+@@ -1154,8 +1155,14 @@ function timecycles(times)
+         if !all(==(year1), year.(times))
+             error("unsupported cyclic timeseries")
+         end
+-        # returns a (month, day) tuple for each date
+-        return monthday.(times)
++        # sub-daily time steps are not allowed
++        min_tstep = Second(minimum(diff(times)))
++        if min_tstep < Second(Day(1))
++            error("unsupported cyclic timeseries")
++        else
++            # returns a (month, day) tuple for each date
++            return monthday.(times)
++        end
+     elseif eltype(times) <: Integer
+         if length(times) == 12
+             months = Date(2000, 1, 1):Month(1):Date(2000, 12, 31)
+@@ -1432,6 +1439,8 @@ function internal_dim_name(name::Symbol)
+         return :y
+     elseif name in (:time, :layer, :flood_depth, :classes)
+         return name
++    elseif startswith(string(name), "time")
++        return :time
+     else
+         error("Unknown dimension $name")
+     end
+diff --git a/src/reservoir_lake.jl b/src/reservoir_lake.jl
+index 303c98d14..d599573ee 100644
+--- a/src/reservoir_lake.jl
++++ b/src/reservoir_lake.jl
+@@ -376,14 +376,16 @@ function initialize_lake(config, nc, inds_riv, nriv, pits, Δt)
+         if lake_storfunc[i] == 2
+             csv_path = joinpath(path, "lake_sh_$lakeloc.csv")
+             @info(
+-                "read a storage curve from CSV file $csv_path, for lake location $lakeloc"
++                "Read a storage curve from CSV file `$csv_path`, for lake location `$lakeloc`"
+             )
+             sh[i] = read_sh_csv(csv_path)
+         end
+ 
+         if lake_outflowfunc[i] == 1
+             csv_path = joinpath(path, "lake_hq_$lakeloc.csv")
+-            @info("read a rating curve from CSV file $csv_path, for lake location $lakeloc")
++            @info(
++                "Read a rating curve from CSV file `$csv_path`, for lake location `$lakeloc`"
++            )
+             hq[i] = read_hq_csv(csv_path)
+         end
+ 

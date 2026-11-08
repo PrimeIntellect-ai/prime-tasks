@@ -1,0 +1,528 @@
+diff --git a/cloud/linode/loadbalancers_test.go b/cloud/linode/loadbalancers_test.go
+index 75f76b4..4d53347 100644
+--- a/cloud/linode/loadbalancers_test.go
++++ b/cloud/linode/loadbalancers_test.go
+@@ -101,6 +101,10 @@ o/aoxqmE0mN1lyCPOa9UP//LlsREkWVKI3+Wld/xERtzf66hjcH+ilsXDxxpMEXo
+ bSiPJQsGIKtQvyCaZY2szyOoeUGgOId+He7ITlezxKrjdj+1pLMESvAxKeo=
+ -----END RSA PRIVATE KEY-----`
+ 
++// annLinodeDefaultProxyProtocolKey is the annotation that configures the default
++// Proxy Protocol setting for a NodeBalancer.
++const annLinodeDefaultProxyProtocolKey = "service.beta.kubernetes.io/linode-loadbalancer-default-proxy-protocol"
++
+ func TestCCMLoadBalancers(t *testing.T) {
+ 	testCases := []struct {
+ 		name string
+@@ -134,6 +138,10 @@ func TestCCMLoadBalancers(t *testing.T) {
+ 			name: "Update Load Balancer - Proxy Protocol",
+ 			f:    testUpdateLoadBalancerAddProxyProtocol,
+ 		},
++		{
++			name: "Update Load Balancer - Proxy Protocol Per Port",
++			f:    testUpdateLoadBalancerAddProxyProtocolPerPort,
++		},
+ 		{
+ 			name: "Build Load Balancer Request",
+ 			f:    testBuildLoadBalancerRequest,
+@@ -573,17 +581,15 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
+ 
+ 			svc.Status.LoadBalancer = *makeLoadBalancerStatus(nodeBalancer)
+ 			svc.ObjectMeta.SetAnnotations(map[string]string{
+-				annLinodeProxyProtocol: string(tc.proxyProtocolConfig),
++				annLinodeDefaultProxyProtocolKey: string(tc.proxyProtocolConfig),
+ 			})
+ 
+ 			stubService(fakeClientset, svc)
+ 			if err = lb.UpdateLoadBalancer(context.TODO(), "lnodelb", svc, nodes); err != nil {
+-				expectedErrMessage := fmt.Sprintf("invalid NodeBalancer proxy protocol value '%s'", tc.proxyProtocolConfig)
+-				if tc.invalidErr && err.Error() == expectedErrMessage {
++				if tc.invalidErr {
+ 					return
+ 				}
+ 				t.Fatalf("UpdateLoadBalancer returned an unexpected error while updated annotations: %s", err)
+-				return
+ 			}
+ 			if tc.invalidErr {
+ 				t.Fatal("expected UpdateLoadBalancer to return an error")
+@@ -604,6 +610,142 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
+ 	}
+ }
+ 
++func testUpdateLoadBalancerAddProxyProtocolPerPort(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
++	nodes := []*v1.Node{
++		{
++			Status: v1.NodeStatus{
++				Addresses: []v1.NodeAddress{
++					{
++						Type:    v1.NodeInternalIP,
++						Address: "127.0.0.1",
++					},
++				},
++			},
++		},
++	}
++
++	lb := &loadbalancers{client, "us-west", nil}
++	fakeClientset := fake.NewSimpleClientset()
++	lb.kubeClient = fakeClientset
++
++	svc := &v1.Service{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:        randString(10),
++			UID:         "foobar123",
++			Annotations: map[string]string{},
++		},
++		Spec: v1.ServiceSpec{
++			Ports: []v1.ServicePort{
++				{
++					Name:     randString(10),
++					Protocol: "tcp",
++					Port:     int32(80),
++					NodePort: int32(30000),
++				},
++				{
++					Name:     randString(10),
++					Protocol: "tcp",
++					Port:     int32(8080),
++					NodePort: int32(30001),
++				},
++				{
++					Name:     randString(10),
++					Protocol: "tcp",
++					Port:     int32(8081),
++					NodePort: int32(30002),
++				},
++			},
++		},
++	}
++
++	defer lb.EnsureLoadBalancerDeleted(context.TODO(), "lnodelb", svc)
++	nodeBalancer, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{
++		Region: lb.zone,
++	})
++	if err != nil {
++		t.Fatalf("failed to create NodeBalancer: %s", err)
++	}
++
++	svc.Status.LoadBalancer = *makeLoadBalancerStatus(nodeBalancer)
++	svc.ObjectMeta.SetAnnotations(map[string]string{
++		annLinodeDefaultProxyProtocolKey:   string(linodego.ProxyProtocolV2),
++		annLinodePortConfigPrefix + "8080": fmt.Sprintf(`{"proxy-protocol": "%s"}`, linodego.ProxyProtocolV1),
++		annLinodePortConfigPrefix + "8081": `{"proxy-protocol": "none"}`,
++	})
++
++	stubService(fakeClientset, svc)
++	if err = lb.UpdateLoadBalancer(context.TODO(), "lnodelb", svc, nodes); err != nil {
++		t.Fatalf("UpdateLoadBalancer returned an unexpected error: %s", err)
++	}
++
++	nodeBalancerConfigs, err := client.ListNodeBalancerConfigs(context.TODO(), nodeBalancer.ID, nil)
++	if err != nil {
++		t.Fatalf("failed to get NodeBalancer configs: %s", err)
++	}
++
++	expected := map[int]linodego.ConfigProxyProtocol{
++		80:   linodego.ProxyProtocolV2,
++		8080: linodego.ProxyProtocolV1,
++		8081: linodego.ProxyProtocolNone,
++	}
++	for _, config := range nodeBalancerConfigs {
++		want, ok := expected[int(config.Port)]
++		if !ok {
++			continue
++		}
++		if config.ProxyProtocol != want {
++			t.Errorf("port %d: expected ProxyProtocol %s; got %s", config.Port, want, config.ProxyProtocol)
++		}
++		delete(expected, int(config.Port))
++	}
++	if len(expected) != 0 {
++		t.Errorf("missing NodeBalancer configs for ports: %v", expected)
++	}
++	t.Run("port-specific value without a default", func(t *testing.T) {
++		svcWithoutDefault := &v1.Service{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:        randString(10),
++				UID:         "foobar456",
++				Annotations: map[string]string{annLinodePortConfigPrefix + "8082": `{"proxy-protocol": "v1"}`},
++			},
++			Spec: v1.ServiceSpec{
++				Ports: []v1.ServicePort{{
++					Name:     randString(10),
++					Protocol: "tcp",
++					Port:     int32(8082),
++					NodePort: int32(30003),
++				}},
++			},
++		}
++
++		nodeBalancerWithoutDefault, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{Region: lb.zone})
++		if err != nil {
++			t.Fatalf("failed to create NodeBalancer: %s", err)
++		}
++		defer lb.EnsureLoadBalancerDeleted(context.TODO(), "lnodelb", svcWithoutDefault)
++		svcWithoutDefault.Status.LoadBalancer = *makeLoadBalancerStatus(nodeBalancerWithoutDefault)
++		stubService(fakeClientset, svcWithoutDefault)
++		if err := lb.UpdateLoadBalancer(context.TODO(), "lnodelb", svcWithoutDefault, nodes); err != nil {
++			t.Fatalf("UpdateLoadBalancer returned an unexpected error: %s", err)
++		}
++
++		configs, err := client.ListNodeBalancerConfigs(context.TODO(), nodeBalancerWithoutDefault.ID, nil)
++		if err != nil {
++			t.Fatalf("failed to get NodeBalancer configs: %s", err)
++		}
++		for _, config := range configs {
++			if config.Port == 8082 {
++				if config.ProxyProtocol != linodego.ProxyProtocolV1 {
++					t.Errorf("port 8082: expected ProxyProtocol %s; got %s", linodego.ProxyProtocolV1, config.ProxyProtocol)
++				}
++				return
++			}
++		}
++		t.Error("NodeBalancer config for port 8082 was not found")
++	})
++
++}
++
+ func testUpdateLoadBalancerAddNodeBalancerID(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+ 	svc := &v1.Service{
+ 		ObjectMeta: metav1.ObjectMeta{
+@@ -764,132 +906,6 @@ func Test_getConnectionThrottle(t *testing.T) {
+ 	}
+ }
+ 
+-func Test_getPortConfig(t *testing.T) {
+-	testcases := []struct {
+-		name               string
+-		service            *v1.Service
+-		expectedPortConfig portConfig
+-		err                error
+-	}{
+-		{
+-			"default no protocol specified",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-				},
+-			},
+-			portConfig{Port: 443, Protocol: "tcp"},
+-
+-			nil,
+-		},
+-		{
+-			"default tcp protocol specified",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-					Annotations: map[string]string{
+-						annLinodeDefaultProtocol: "tcp",
+-					},
+-				},
+-			},
+-			portConfig{Port: 443, Protocol: "tcp"},
+-			nil,
+-		},
+-		{
+-			"default capitalized protocol specified",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-					Annotations: map[string]string{
+-						annLinodeDefaultProtocol: "HTTP",
+-					},
+-				},
+-			},
+-			portConfig{Port: 443, Protocol: "http"},
+-			nil,
+-		},
+-		{
+-			"default invalid protocol",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-					Annotations: map[string]string{
+-						annLinodeDefaultProtocol: "invalid",
+-					},
+-				},
+-			},
+-			portConfig{},
+-			fmt.Errorf("invalid protocol: %q specified", "invalid"),
+-		},
+-		{
+-			"port config falls back to default",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-					Annotations: map[string]string{
+-						annLinodeDefaultProtocol:          "http",
+-						annLinodePortConfigPrefix + "443": `{}`,
+-					},
+-				},
+-			},
+-			portConfig{Port: 443, Protocol: "http"},
+-			nil,
+-		},
+-		{
+-			"port config capitalized protocol",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-					Annotations: map[string]string{
+-						annLinodePortConfigPrefix + "443": `{ "protocol": "HTTp" }`,
+-					},
+-				},
+-			},
+-			portConfig{Port: 443, Protocol: "http"},
+-			nil,
+-		},
+-		{
+-			"port config invalid protocol",
+-			&v1.Service{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: randString(10),
+-					UID:  "abc123",
+-					Annotations: map[string]string{
+-						annLinodePortConfigPrefix + "443": `{ "protocol": "invalid" }`,
+-					},
+-				},
+-			},
+-			portConfig{},
+-			fmt.Errorf("invalid protocol: %q specified", "invalid"),
+-		},
+-	}
+-
+-	for _, test := range testcases {
+-		t.Run(test.name, func(t *testing.T) {
+-			testPort := 443
+-			portConfig, err := getPortConfig(test.service, testPort)
+-
+-			if !reflect.DeepEqual(portConfig, test.expectedPortConfig) {
+-				t.Error("unexpected port config")
+-				t.Logf("expected: %q", test.expectedPortConfig)
+-				t.Logf("actual: %q", portConfig)
+-			}
+-
+-			if !reflect.DeepEqual(err, test.err) {
+-				t.Error("unexpected error")
+-				t.Logf("expected: %q", test.err)
+-				t.Logf("actual: %q", err)
+-			}
+-		})
+-	}
+-}
+-
+ func Test_getHealthCheckType(t *testing.T) {
+ 	testcases := []struct {
+ 		name       string
+diff --git a/e2e/test/ccm_e2e_test.go b/e2e/test/ccm_e2e_test.go
+index c96b0eb..fde805e 100644
+--- a/e2e/test/ccm_e2e_test.go
++++ b/e2e/test/ccm_e2e_test.go
+@@ -3,6 +3,7 @@ package test
+ import (
+ 	"context"
+ 	"e2e_test/test/framework"
++	"fmt"
+ 	"io/ioutil"
+ 	"log"
+ 	"net/http"
+@@ -27,6 +28,7 @@ var _ = Describe("e2e tests", func() {
+ 
+ 	const (
+ 		annLinodeProxyProtocol        = "service.beta.kubernetes.io/linode-loadbalancer-proxy-protocol"
++		annLinodeDefaultProxyProtocol = "service.beta.kubernetes.io/linode-loadbalancer-default-proxy-protocol"
+ 		annLinodeDefaultProtocol      = "service.beta.kubernetes.io/linode-loadbalancer-default-protocol"
+ 		annLinodePortConfigPrefix     = "service.beta.kubernetes.io/linode-loadbalancer-port-"
+ 		annLinodeLoadBalancerPreserve = "service.beta.kubernetes.io/linode-loadbalancer-preserve"
+@@ -172,9 +174,9 @@ var _ = Describe("e2e tests", func() {
+ 		Expect(err).NotTo(HaveOccurred())
+ 	}
+ 
+-	var checkNodeBalancerConfig = func(args checkArgs) {
+-		By("Getting NodeBalancer Configuration")
+-		nbConfig, err := f.LoadBalancer.GetNodeBalancerConfig(framework.TestServerResourceName)
++	var checkNodeBalancerConfigForPort = func(port int, args checkArgs) {
++		By("Getting NodeBalancer Configuration for port " + strconv.Itoa(port))
++		nbConfig, err := f.LoadBalancer.GetNodeBalancerConfigForPort(framework.TestServerResourceName, port)
+ 		Expect(err).NotTo(HaveOccurred())
+ 
+ 		if args.checkType != "" {
+@@ -410,13 +412,19 @@ var _ = Describe("e2e tests", func() {
+ 					labels       map[string]string
+ 					servicePorts []core.ServicePort
+ 
+-					annotations = map[string]string{}
++					proxyProtocolV1   = string(linodego.ProxyProtocolV1)
++					proxyProtocolV2   = string(linodego.ProxyProtocolV2)
++					proxyProtocolNone = string(linodego.ProxyProtocolNone)
+ 				)
+ 				BeforeEach(func() {
+ 					pods = []string{"test-pod-1"}
+ 					ports := []core.ContainerPort{
+ 						{
+ 							Name:          "http-1",
++							ContainerPort: 80,
++						},
++						{
++							Name:          "http-2",
+ 							ContainerPort: 8080,
+ 						},
+ 					}
+@@ -424,6 +432,12 @@ var _ = Describe("e2e tests", func() {
+ 						{
+ 							Name:       "http-1",
+ 							Port:       80,
++							TargetPort: intstr.FromInt(80),
++							Protocol:   "TCP",
++						},
++						{
++							Name:       "http-2",
++							Port:       8080,
+ 							TargetPort: intstr.FromInt(8080),
+ 							Protocol:   "TCP",
+ 						},
+@@ -437,7 +451,7 @@ var _ = Describe("e2e tests", func() {
+ 					createPodWithLabel(pods, ports, framework.TestServerImage, labels, false)
+ 
+ 					By("Creating Service")
+-					createServiceWithAnnotations(labels, annotations, servicePorts, false)
++					createServiceWithAnnotations(labels, map[string]string{}, servicePorts, false)
+ 				})
+ 
+ 				AfterEach(func() {
+@@ -448,15 +462,58 @@ var _ = Describe("e2e tests", func() {
+ 					deleteService()
+ 				})
+ 
+-				It("should update the NodeBalancer to use ProxyProtocol v2", func() {
+-					proxyProtocolV2 := string(linodego.ProxyProtocolV2)
++				It("can set proxy-protocol on each port", func() {
++					By("Annotating port 80 with v1 and 8080 with v2")
++					updateServiceWithAnnotations(labels, map[string]string{
++						annLinodePortConfigPrefix + "80":   fmt.Sprintf(`{"proxy-protocol": "%s"}`, proxyProtocolV1),
++						annLinodePortConfigPrefix + "8080": fmt.Sprintf(`{"proxy-protocol": "%s"}`, proxyProtocolV2),
++					}, servicePorts, false)
++
++					By("Checking NodeBalancerConfig for port 80 should have ProxyProtocol v1")
++					checkNodeBalancerConfigForPort(80, checkArgs{proxyProtocol: proxyProtocolV1})
++
++					By("Checking NodeBalancerConfig for port 8080 should have ProxyProtocol v2")
++					checkNodeBalancerConfigForPort(8080, checkArgs{proxyProtocol: proxyProtocolV2})
++				})
++
++				It("should override default proxy-protocol annotation when a port configuration is specified", func() {
++					By("Annotating a default version of ProxyProtocol v2 and v1 for port 8080")
++					updateServiceWithAnnotations(labels, map[string]string{
++						annLinodeDefaultProxyProtocol:      proxyProtocolV2,
++						annLinodePortConfigPrefix + "8080": fmt.Sprintf(`{"proxy-protocol": "%s"}`, proxyProtocolV1),
++					}, servicePorts, false)
++
++					By("Checking NodeBalancerConfig for port 80 should have the default ProxyProtocol v2")
++					checkNodeBalancerConfigForPort(80, checkArgs{proxyProtocol: proxyProtocolV2})
++
++					By("Checking NodeBalancerConfig for port 8080 should have ProxyProtocol v1")
++					checkNodeBalancerConfigForPort(8080, checkArgs{proxyProtocol: proxyProtocolV1})
++				})
++
++				It("port specific configuration should not effect other ports", func() {
++					By("Annotating ProxyProtocol v2 on port 8080")
++					updateServiceWithAnnotations(labels, map[string]string{
++						annLinodePortConfigPrefix + "8080": fmt.Sprintf(`{"proxy-protocol": "%s"}`, proxyProtocolV2),
++					}, servicePorts, false)
++
++					By("Checking NodeBalancerConfig for port 8080 should have ProxyProtocolv2")
++					checkNodeBalancerConfigForPort(8080, checkArgs{proxyProtocol: proxyProtocolV2})
++
++					By("Checking NodeBalancerConfig for port 80 should not have ProxyProtocol enabled")
++					checkNodeBalancerConfigForPort(80, checkArgs{proxyProtocol: proxyProtocolNone})
++				})
++
++				It("default annotations can be used to apply ProxyProtocol to all NodeBalancerConfigs", func() {
++					annotations := make(map[string]string)
+ 
+-					By("Annotating ProxyProtocol v2")
+-					annotations[annLinodeProxyProtocol] = proxyProtocolV2
++					By("specifying ProxyProtocol v1 using the annotation " + annLinodeDefaultProtocol)
++					annotations[annLinodeDefaultProxyProtocol] = proxyProtocolV1
+ 					updateServiceWithAnnotations(labels, annotations, servicePorts, false)
+ 
+-					By("Checking NodeBalancerConfig")
+-					checkNodeBalancerConfig(checkArgs{proxyProtocol: proxyProtocolV2})
++					By("Checking NodeBalancerConfig for port 80 should have default ProxyProtocol v1")
++					checkNodeBalancerConfigForPort(80, checkArgs{proxyProtocol: proxyProtocolV1})
++					By("Checking NodeBalancerConfig for port 8080 should have ProxyProtocol v1")
++					checkNodeBalancerConfigForPort(8080, checkArgs{proxyProtocol: proxyProtocolV1})
+ 				})
+ 			})
+ 
+@@ -767,7 +824,7 @@ var _ = Describe("e2e tests", func() {
+ 
+ 				It("should successfully check the health of 2 nodes", func() {
+ 					By("Checking NodeBalancer Configurations")
+-					checkNodeBalancerConfig(checkArgs{
++					checkNodeBalancerConfigForPort(80, checkArgs{
+ 						checkType:  checkType,
+ 						path:       path,
+ 						body:       body,
+@@ -1119,7 +1176,7 @@ var _ = Describe("e2e tests", func() {
+ 
+ 				It("should successfully check the health of 2 nodes", func() {
+ 					By("Checking NodeBalancer Configurations")
+-					checkNodeBalancerConfig(checkArgs{
++					checkNodeBalancerConfigForPort(80, checkArgs{
+ 						checkType:  checkType,
+ 						interval:   interval,
+ 						timeout:    timeout,
+@@ -1181,7 +1238,7 @@ var _ = Describe("e2e tests", func() {
+ 
+ 				It("should successfully check the health of 2 nodes", func() {
+ 					By("Checking NodeBalancer Configurations")
+-					checkNodeBalancerConfig(checkArgs{
++					checkNodeBalancerConfigForPort(80, checkArgs{
+ 						checkType:    checkType,
+ 						checkPassive: checkPassive,
+ 						checkNodes:   true,
+@@ -1241,7 +1298,7 @@ var _ = Describe("e2e tests", func() {
+ 
+ 				It("should successfully check the health of 2 nodes", func() {
+ 					By("Checking NodeBalancer Configurations")
+-					checkNodeBalancerConfig(checkArgs{
++					checkNodeBalancerConfigForPort(80, checkArgs{
+ 						checkType:  checkType,
+ 						path:       path,
+ 						checkNodes: true,
+diff --git a/e2e/test/framework/loadbalancer_suite.go b/e2e/test/framework/loadbalancer_suite.go
+index e63f463..63e3351 100644
+--- a/e2e/test/framework/loadbalancer_suite.go
++++ b/e2e/test/framework/loadbalancer_suite.go
+@@ -56,6 +56,24 @@ func (i *lbInvocation) GetNodeBalancerConfig(svcName string) (*linodego.NodeBala
+ 	return &nbcList[0], nil
+ }
+ 
++func (i *lbInvocation) GetNodeBalancerConfigForPort(svcName string, port int) (*linodego.NodeBalancerConfig, error) {
++	id, err := i.GetNodeBalancerID(svcName)
++	if err != nil {
++		return nil, err
++	}
++	nbConfigs, err := i.linodeClient.ListNodeBalancerConfigs(context.Background(), id, nil)
++	if err != nil {
++		return nil, err
++	}
++
++	for _, config := range nbConfigs {
++		if config.Port == port {
++			return &config, nil
++		}
++	}
++	return nil, fmt.Errorf("NodeBalancerConfig for port %d was not found", port)
++}
++
+ func (i *lbInvocation) waitForLoadBalancerIP(svcName string) (string, error) {
+ 	var ip string
+ 	err := wait.PollImmediate(RetryInterval, RetryTimeout, func() (bool, error) {

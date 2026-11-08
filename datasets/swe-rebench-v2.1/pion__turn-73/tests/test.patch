@@ -1,0 +1,324 @@
+diff --git a/client_test.go b/client_test.go
+index 3f4fa10..db5946d 100644
+--- a/client_test.go
++++ b/client_test.go
+@@ -1,8 +1,17 @@
+ package turn
+ 
+ import (
++	"context"
+ 	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
+ 	"testing"
++	"time"
++
++	"github.com/pion/stun"
++	"github.com/stretchr/testify/assert"
+ 
+ 	"github.com/pion/logging"
+ )
+@@ -10,7 +19,34 @@ import (
+ func TestClient(t *testing.T) {
+ 	loggerFactory := logging.NewDefaultLoggerFactory()
+ 
++	// startLocalServer starts a TURN server bound to the loopback interface so
++	// that the client tests do not depend on external network connectivity.
++	startLocalServer := func(t *testing.T) *Server {
++		t.Helper()
++		server := NewServer(&ServerConfig{
++			AuthHandler: func(username string, srcAddr net.Addr) (password string, ok bool) {
++				return "", false
++			},
++			Realm:         "pion.ly",
++			LoggerFactory: loggerFactory,
++		})
++		if err := server.AddListeningIPAddr("127.0.0.1"); err != nil {
++			t.Fatal(err)
++		}
++		if err := server.Start(); err != nil {
++			t.Fatal(err)
++		}
++		// make sure the server is listening before running the client.
++		time.Sleep(100 * time.Microsecond)
++		return server
++	}
++
+ 	t.Run("SendSTUNRequest Parallel", func(t *testing.T) {
++		server := startLocalServer(t)
++		defer func() {
++			assert.NoError(t, server.Close(), "should succeed")
++		}()
++
+ 		c, err := NewClient(&ClientConfig{
+ 			ListeningAddress: "0.0.0.0:0",
+ 			LoggerFactory:    loggerFactory,
+@@ -25,10 +61,9 @@ func TestClient(t *testing.T) {
+ 		var err1 error
+ 		var resp1 interface{}
+ 
+-		// stun1.l.google.com:19302, more at https://gist.github.com/zziuni/3741933#file-stuns-L5
+ 		go func() {
+ 			close(started)
+-			resp1, err1 = c.SendSTUNRequest(net.IPv4(74, 125, 143, 127), 19302)
++			resp1, err1 = c.SendSTUNRequest(net.IPv4(127, 0, 0, 1), 3478)
+ 			close(finished)
+ 		}()
+ 
+@@ -36,16 +71,16 @@ func TestClient(t *testing.T) {
+ 
+ 		<-started
+ 
+-		resp2, err2 := c.SendSTUNRequest(net.IPv4(74, 125, 143, 127), 19302)
++		resp2, err2 := c.SendSTUNRequest(net.IPv4(127, 0, 0, 1), 3478)
+ 		if err2 != nil {
+-			t.Fatal(err)
++			t.Fatal(err2)
+ 		} else {
+ 			t.Log(resp2)
+ 		}
+ 
+ 		<-finished
+ 		if err1 != nil {
+-			t.Fatal(err)
++			t.Fatal(err1)
+ 		} else {
+ 			t.Log(resp1)
+ 		}
+@@ -61,17 +96,97 @@ func TestClient(t *testing.T) {
+ 		}
+ 	})
+ 
+-	/*
+-		// Unable to perform this test atm because there is no timeout and the test may run infinitely
+-		t.Run("SendSTUNRequest timeout", func(t *testing.T) {
+-			c, err := NewClient("0.0.0.0:0")
++	t.Run("SendSTUNRequest sends configured SOFTWARE attribute", func(t *testing.T) {
++		const testSoftware = "CLIENT_SOFTWARE"
++
++		// Build the client command and run it against a fake STUN server.
++		// Reading the command source makes the cached test result depend on it,
++		// because the command is built in a child process.
++		if _, err := os.ReadFile(filepath.Join("cmd", "client", "main.go")); err != nil {
++			t.Fatal(err)
++		}
++		clientBin := filepath.Join(t.TempDir(), "client")
++		if output, err := exec.Command("go", "build", "-o", clientBin, "./cmd/client").CombinedOutput(); err != nil {
++			t.Fatalf("failed to build client command: %v\n%s", err, output)
++		}
++
++		serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer func() {
++			assert.NoError(t, serverConn.Close(), "should succeed")
++		}()
++		if err := serverConn.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
++			t.Fatal(err)
++		}
++		port := serverConn.LocalAddr().(*net.UDPAddr).Port
++
++		type received struct {
++			software string
++			found    bool
++			err      error
++		}
++		recvCh := make(chan received, 1)
++		go func() {
++			buf := make([]byte, 1500)
++			n, addr, err := serverConn.ReadFrom(buf)
+ 			if err != nil {
+-				t.Fatal(err)
++				recvCh <- received{err: err}
++				return
++			}
++			req := &stun.Message{Raw: append([]byte{}, buf[:n]...)}
++			if err := req.Decode(); err != nil {
++				recvCh <- received{err: err}
++				return
+ 			}
+-			_, err = c.SendSTUNRequest(net.IPv4(255, 255, 255, 255), 65535)
++			var software stun.Software
++			found := software.GetFrom(req) == nil
++
++			udpAddr := addr.(*net.UDPAddr)
++			resp, err := stun.Build(
++				&stun.Message{TransactionID: req.TransactionID},
++				stun.BindingSuccess,
++				&stun.XORMappedAddress{IP: udpAddr.IP, Port: udpAddr.Port},
++				stun.Fingerprint,
++			)
+ 			if err == nil {
+-				t.Fatal("request to 255.255.255.255:65535 should fail")
++				_, err = serverConn.WriteTo(resp.Raw, addr)
+ 			}
+-		})
++			recvCh <- received{software: software.String(), found: found, err: err}
++		}()
++
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		output, err := exec.CommandContext(ctx, clientBin,
++			"-host", "127.0.0.1",
++			"-port", strconv.Itoa(port),
++			"-software", testSoftware,
++		).CombinedOutput()
++		if err != nil {
++			t.Fatalf("client command failed: %v\n%s", err, output)
++		}
++
++		r := <-recvCh
++		if r.err != nil {
++			t.Fatalf("fake STUN server failed: %v", r.err)
++		}
++		if !r.found {
++			t.Fatal("binding request should carry a SOFTWARE attribute")
++		}
++		assert.Equal(t, testSoftware, r.software)
++	})
++	/*
++	   // Unable to perform this test atm because there is no timeout and the test may run infinitely
++	   t.Run("SendSTUNRequest timeout", func(t *testing.T) {
++	   c, err := NewClient("0.0.0.0:0")
++	   if err != nil {
++	   t.Fatal(err)
++	   }
++	   _, err = c.SendSTUNRequest(net.IPv4(255, 255, 255, 255), 65535)
++	   if err == nil {
++	   t.Fatal("request to 255.255.255.255:65535 should fail")
++	   }
++	   })
+ 	*/
+ }
+diff --git a/server_test.go b/server_test.go
+index e265f26..8abfc02 100644
+--- a/server_test.go
++++ b/server_test.go
+@@ -1,12 +1,19 @@
+ package turn
+ 
+ import (
++	"bytes"
++	"context"
+ 	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/gortc/turn"
+ 	"github.com/pion/logging"
++	"github.com/pion/stun"
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+@@ -136,4 +143,104 @@ func TestServer(t *testing.T) {
+ 		err = server.Close()
+ 		assert.NoError(t, err, "should succeed")
+ 	})
++
++	t.Run("Adds SOFTWARE attribute to response", func(t *testing.T) {
++		const testSoftware = "SERVER_SOFTWARE"
++
++		// Build the simple TURN server command and run it with SOFTWARE set.
++		// Reading the command source makes the cached test result depend on it,
++		// because the command is built in a child process.
++		if _, err := os.ReadFile(filepath.Join("cmd", "simple-turn", "main.go")); err != nil {
++			t.Fatal(err)
++		}
++		serverBin := filepath.Join(t.TempDir(), "simple-turn")
++		if output, err := exec.Command("go", "build", "-o", serverBin, "./cmd/simple-turn").CombinedOutput(); err != nil {
++			t.Fatalf("failed to build server command: %v\n%s", err, output)
++		}
++
++		// The server command listens on the system's non-loopback IPv4 addresses.
++		var serverIP net.IP
++		addrs, err := net.InterfaceAddrs()
++		if err != nil {
++			t.Fatal(err)
++		}
++		for _, addr := range addrs {
++			if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
++				serverIP = ipNet.IP.To4()
++				break
++			}
++		}
++		if serverIP == nil {
++			t.Skip("no non-loopback IPv4 address available")
++		}
++
++		probe, err := net.ListenPacket("udp4", net.JoinHostPort(serverIP.String(), "0"))
++		if err != nil {
++			t.Fatal(err)
++		}
++		port := probe.LocalAddr().(*net.UDPAddr).Port
++		assert.NoError(t, probe.Close(), "should succeed")
++
++		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++		defer cancel()
++		var serverOutput bytes.Buffer
++		cmd := exec.CommandContext(ctx, serverBin)
++		cmd.Env = append(os.Environ(),
++			"USERS=user=pass",
++			"REALM=pion.ly",
++			"UDP_PORT="+strconv.Itoa(port),
++			"SOFTWARE="+testSoftware,
++		)
++		cmd.Stdout = &serverOutput
++		cmd.Stderr = &serverOutput
++		if err := cmd.Start(); err != nil {
++			t.Fatal(err)
++		}
++		defer func() {
++			_ = cmd.Process.Kill()
++			_ = cmd.Wait()
++		}()
++
++		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer func() {
++			assert.NoError(t, conn.Close(), "should succeed")
++		}()
++
++		req, err := stun.Build(stun.TransactionID, stun.BindingRequest)
++		if err != nil {
++			t.Fatal(err)
++		}
++		serverAddr := &net.UDPAddr{IP: serverIP, Port: port}
++
++		// Retry the binding request until the server command is listening.
++		deadline := time.Now().Add(30 * time.Second)
++		for {
++			if _, err := conn.WriteTo(req.Raw, serverAddr); err != nil {
++				t.Fatal(err)
++			}
++			if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
++				t.Fatal(err)
++			}
++			buf := make([]byte, 1500)
++			n, _, readErr := conn.ReadFrom(buf)
++			if readErr == nil {
++				resp := &stun.Message{Raw: append([]byte{}, buf[:n]...)}
++				if err := resp.Decode(); err != nil {
++					t.Fatalf("failed to decode binding response: %v", err)
++				}
++				var software stun.Software
++				if err := software.GetFrom(resp); err != nil {
++					t.Fatalf("binding response should carry a SOFTWARE attribute: %v\n%s", err, serverOutput.String())
++				}
++				assert.Equal(t, testSoftware, software.String())
++				return
++			}
++			if time.Now().After(deadline) {
++				t.Fatalf("server did not answer binding request: %v\n%s", readErr, serverOutput.String())
++			}
++		}
++	})
+ }

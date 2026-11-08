@@ -1,0 +1,391 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index 29e0371..9780e98 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -363,6 +363,12 @@ pub struct Opt {
+     #[structopt(long = "list-syntax-themes")]
+     pub list_syntax_themes: bool,
+ 
++    /// The regular expression used to decide what a word is for the within-line highlight
++    /// algorithm. For less fine-grained matching than the default try --word-diff-regex="\S+"
++    /// --max-line-distance=1.0 (this is more similar to `git --word-diff`).
++    #[structopt(long = "word-diff-regex", default_value = r"\w+")]
++    pub tokenization_regex: String,
++
+     /// The maximum distance between two lines for them to be inferred to be homologous. Homologous
+     /// line pairs are highlighted according to the deletion and insertion operations transforming
+     /// one into the other.
+diff --git a/src/config.rs b/src/config.rs
+index f851328..d10f0dc 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -4,6 +4,7 @@ use std::process;
+ 
+ use console::Term;
+ use git2;
++use regex::Regex;
+ use structopt::{clap, StructOpt};
+ use syntect::highlighting::Style as SyntectStyle;
+ use syntect::highlighting::Theme as SyntaxTheme;
+@@ -68,6 +69,7 @@ pub struct Config<'a> {
+     pub syntax_theme_name: String,
+     pub tab_width: usize,
+     pub true_color: bool,
++    pub tokenization_regex: Regex,
+     pub zero_style: Style,
+ }
+ 
+@@ -248,6 +250,16 @@ impl<'a> From<cli::Opt> for Config<'a> {
+                 .map(|s| s.parse::<f64>().unwrap_or(0.0))
+                 .unwrap_or(0.0);
+ 
++        let tokenization_regex = Regex::new(&opt.tokenization_regex).unwrap_or_else(|_| {
++            eprintln!(
++                "Invalid word-diff-regex: {}. \
++                 The value must be a valid Rust regular expression. \
++                 See https://docs.rs/regex.",
++                opt.tokenization_regex
++            );
++            process::exit(1);
++        });
++
+         Self {
+             background_color_extends_to_terminal_width,
+             commit_style,
+@@ -291,6 +303,7 @@ impl<'a> From<cli::Opt> for Config<'a> {
+             syntax_theme,
+             syntax_theme_name,
+             tab_width: opt.tab_width,
++            tokenization_regex,
+             true_color,
+             zero_style,
+         }
+diff --git a/src/edits.rs b/src/edits.rs
+index 7b6e467..d8f1837 100644
+--- a/src/edits.rs
++++ b/src/edits.rs
+@@ -1,6 +1,6 @@
+ use regex::Regex;
+ 
+-use lazy_static::lazy_static;
++use unicode_segmentation::UnicodeSegmentation;
+ use unicode_width::UnicodeWidthStr;
+ 
+ use crate::align;
+@@ -16,6 +16,7 @@ pub fn infer_edits<'a, EditOperation>(
+     deletion: EditOperation,
+     noop_insertion: EditOperation,
+     insertion: EditOperation,
++    tokenization_regex: &Regex,
+     max_line_distance: f64,
+     max_line_distance_for_naively_paired_lines: f64,
+ ) -> (
+@@ -34,7 +35,10 @@ where
+     'minus_lines_loop: for minus_line in minus_lines {
+         let mut considered = 0; // plus lines considered so far as match for minus_line
+         for plus_line in &plus_lines[emitted..] {
+-            let alignment = align::Alignment::new(tokenize(minus_line), tokenize(plus_line));
++            let alignment = align::Alignment::new(
++                tokenize(minus_line, tokenization_regex),
++                tokenize(plus_line, tokenization_regex),
++            );
+             let (annotated_minus_line, annotated_plus_line, distance) = annotate(
+                 alignment,
+                 noop_deletion,
+@@ -76,25 +80,29 @@ where
+     (annotated_minus_lines, annotated_plus_lines)
+ }
+ 
+-lazy_static! {
+-    static ref TOKENIZATION_REGEXP: Regex = Regex::new(r#"[\t ,;.:()\[\]<>/'"-]+"#).unwrap();
+-}
+-
+ /// Split line into tokens for alignment. The alignment algorithm aligns sequences of substrings;
+ /// not individual characters.
+-fn tokenize(line: &str) -> Vec<&str> {
++fn tokenize<'a>(line: &'a str, regex: &Regex) -> Vec<&'a str> {
+     let mut tokens = Vec::new();
+     let mut offset = 0;
+-    for m in TOKENIZATION_REGEXP.find_iter(line) {
+-        tokens.push(&line[offset..m.start()]);
++    for m in regex.find_iter(line) {
++        if offset == 0 && m.start() > 0 {
++            tokens.push("");
++        }
+         // Align separating text as multiple single-character tokens.
+-        for i in m.start()..m.end() {
+-            tokens.push(&line[i..i + 1]);
++        for t in line[offset..m.start()].graphemes(true) {
++            tokens.push(t);
+         }
++        tokens.push(&line[m.start()..m.end()]);
+         offset = m.end();
+     }
+     if offset < line.len() {
+-        tokens.push(&line[offset..line.len()]);
++        if offset == 0 {
++            tokens.push("");
++        }
++        for t in line[offset..line.len()].graphemes(true) {
++            tokens.push(t);
++        }
+     }
+     tokens
+ }
+@@ -226,8 +234,14 @@ where
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use itertools::Itertools;
++    use lazy_static::lazy_static;
+     use unicode_segmentation::UnicodeSegmentation;
+ 
++    lazy_static! {
++        static ref DEFAULT_TOKENIZATION_REGEXP: Regex = Regex::new(r#"\w+"#).unwrap();
++    }
++
+     #[derive(Clone, Copy, Debug, PartialEq)]
+     enum EditOperation {
+         MinusNoop,
+@@ -243,16 +257,27 @@ mod tests {
+ 
+     use EditOperation::*;
+ 
++    #[test]
++    fn test_tokenize_0() {
++        assert_tokenize("", &[]);
++        assert_tokenize(";", &["", ";"]);
++        assert_tokenize(";;", &["", ";", ";"]);
++        assert_tokenize(";;a", &["", ";", ";", "a"]);
++        assert_tokenize(";;ab", &["", ";", ";", "ab"]);
++        assert_tokenize(";;ab;", &["", ";", ";", "ab", ";"]);
++        assert_tokenize(";;ab;;", &["", ";", ";", "ab", ";", ";"]);
++    }
++
+     #[test]
+     fn test_tokenize_1() {
+-        assert_eq!(tokenize("aaa bbb"), vec!["aaa", " ", "bbb"])
++        assert_tokenize("aaa bbb", &["aaa", " ", "bbb"])
+     }
+ 
+     #[test]
+     fn test_tokenize_2() {
+-        assert_eq!(
+-            tokenize("fn coalesce_edits<'a, EditOperation>("),
+-            vec![
++        assert_tokenize(
++            "fn coalesce_edits<'a, EditOperation>(",
++            &[
+                 "fn",
+                 " ",
+                 "coalesce_edits",
+@@ -263,16 +288,16 @@ mod tests {
+                 " ",
+                 "EditOperation",
+                 ">",
+-                "("
+-            ]
++                "(",
++            ],
+         );
+     }
+ 
+     #[test]
+     fn test_tokenize_3() {
+-        assert_eq!(
+-            tokenize("fn coalesce_edits<'a, 'b, EditOperation>("),
+-            vec![
++        assert_tokenize(
++            "fn coalesce_edits<'a, 'b, EditOperation>(",
++            &[
+                 "fn",
+                 " ",
+                 "coalesce_edits",
+@@ -287,21 +312,22 @@ mod tests {
+                 " ",
+                 "EditOperation",
+                 ">",
+-                "("
+-            ]
++                "(",
++            ],
+         );
+     }
+ 
+     #[test]
+     fn test_tokenize_4() {
+-        assert_eq!(
+-            tokenize("annotated_plus_lines.push(vec![(noop_insertion, plus_line)]);"),
+-            vec![
++        assert_tokenize(
++            "annotated_plus_lines.push(vec![(noop_insertion, plus_line)]);",
++            &[
+                 "annotated_plus_lines",
+                 ".",
+                 "push",
+                 "(",
+-                "vec!",
++                "vec",
++                "!",
+                 "[",
+                 "(",
+                 "noop_insertion",
+@@ -311,11 +337,111 @@ mod tests {
+                 ")",
+                 "]",
+                 ")",
+-                ";"
+-            ]
++                ";",
++            ],
+         );
+     }
+ 
++    #[test]
++    fn test_tokenize_5() {
++        assert_tokenize(
++            "         let col = Color::from_str(s).unwrap_or_else(|_| die());",
++            &[
++                "",
++                " ",
++                " ",
++                " ",
++                " ",
++                " ",
++                " ",
++                " ",
++                " ",
++                " ",
++                "let",
++                " ",
++                "col",
++                " ",
++                "=",
++                " ",
++                "Color",
++                ":",
++                ":",
++                "from_str",
++                "(",
++                "s",
++                ")",
++                ".",
++                "unwrap_or_else",
++                "(",
++                "|",
++                "_",
++                "|",
++                " ",
++                "die",
++                "(",
++                ")",
++                ")",
++                ";",
++            ],
++        )
++    }
++
++    #[test]
++    fn test_tokenize_6() {
++        assert_tokenize(
++            "         (minus_file, plus_file) => format!(\"renamed: {} ⟶  {}\", minus_file, plus_file),",
++            &["",
++              " ",
++              " ",
++              " ",
++              " ",
++              " ",
++              " ",
++              " ",
++              " ",
++              " ",
++              "(",
++              "minus_file",
++              ",",
++              " ",
++              "plus_file",
++              ")",
++              " ",
++              "=",
++              ">",
++              " ",
++              "format",
++              "!",
++              "(",
++              "\"",
++              "renamed",
++              ":",
++              " ",
++              "{",
++              "}",
++              " ",
++              "⟶",
++              " ",
++              " ",
++              "{",
++              "}",
++              "\"",
++              ",",
++              " ",
++              "minus_file",
++              ",",
++              " ",
++              "plus_file",
++              ")",
++              ","])
++    }
++
++    fn assert_tokenize(text: &str, expected_tokens: &[&str]) {
++        let actual_tokens = tokenize(text, &*DEFAULT_TOKENIZATION_REGEXP);
++        assert_eq!(text, expected_tokens.iter().join(""));
++        assert_eq!(actual_tokens, expected_tokens);
++    }
++
+     #[test]
+     fn test_infer_edits_1() {
+         assert_paired_edits(
+@@ -435,7 +561,7 @@ mod tests {
+                 "             s0.zip(s1)",
+                 "                 .take_while(|((_, c0), (_, c1))| c0 == c1) // TODO: Don't consume one-past-the-end!",
+                 "                 .fold(0, |offset, ((_, c0), (_, _))| offset + c0.len())"
+-            ], 0.66)
++            ], 0.5)
+     }
+ 
+     #[test]
+@@ -590,9 +716,11 @@ mod tests {
+             Deletion,
+             PlusNoop,
+             Insertion,
++            &*DEFAULT_TOKENIZATION_REGEXP,
+             max_line_distance,
+             0.0,
+         );
++        // compare_annotated_lines(actual_edits, expected_edits);
+         assert_eq!(actual_edits, expected_edits);
+     }
+ 
+diff --git a/src/paint.rs b/src/paint.rs
+index 2a2481f..9ed065c 100644
+--- a/src/paint.rs
++++ b/src/paint.rs
+@@ -292,6 +292,7 @@ impl<'a> Painter<'a> {
+             config.minus_emph_style,
+             config.plus_style,
+             config.plus_emph_style,
++            &config.tokenization_regex,
+             config.max_line_distance,
+             config.max_line_distance_for_naively_paired_lines,
+         );
+diff --git a/src/rewrite.rs b/src/rewrite.rs
+index 9bdcd57..685a2b0 100644
+--- a/src/rewrite.rs
++++ b/src/rewrite.rs
+@@ -94,6 +94,7 @@ fn rewrite_options_to_honor_git_config(
+             ("plus-non-emph-style", plus_non_emph_style),
+             ("plus-style", plus_style),
+             ("true-color", true_color),
++            ("word-diff-regex", tokenization_regex),
+             ("zero-style", zero_style)
+         ],
+         opt,

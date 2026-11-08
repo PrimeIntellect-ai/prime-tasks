@@ -1,0 +1,263 @@
+diff --git a/pkg/provider/azure_loadbalancer_test.go b/pkg/provider/azure_loadbalancer_test.go
+index 11dae8163..ff5010801 100644
+--- a/pkg/provider/azure_loadbalancer_test.go
++++ b/pkg/provider/azure_loadbalancer_test.go
+@@ -792,6 +792,82 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnsureLoadBalancerReusesNamedPublicIP(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	az := GetTestCloud(ctrl)
++	clusterResources, expectedInterfaces, expectedVirtualMachines := getClusterResources(az, 8, 4)
++	setMockEnv(az, ctrl, expectedInterfaces, expectedVirtualMachines, 2)
++
++	backendPool := az.LoadBalancerBackendPool.(*MockBackendPool)
++	backendPool.EXPECT().ReconcileBackendPools(gomock.Any(), gomock.Any(), gomock.Any()).Return(false, false, false, nil).AnyTimes()
++	backendPool.EXPECT().EnsureHostsInPool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++	backendPool.EXPECT().GetBackendPrivateIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
++
++	pipName := "shared-pip"
++	pipID := "/subscriptions/subscription/resourceGroups/named-rg/providers/Microsoft.Network/publicIPAddresses/shared-pip"
++	pip := network.PublicIPAddress{
++		ID:   pointer.String(pipID),
++		Name: pointer.String(pipName),
++		Tags: map[string]*string{consts.ServiceTagKey: pointer.String("default/primary")},
++		PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
++			IPAddress: pointer.String("9.8.7.6"),
++		},
++	}
++	pipClient := mockpublicipclient.NewMockInterface(ctrl)
++	az.PublicIPAddressesClient = pipClient
++	pipClient.EXPECT().List(gomock.Any(), "named-rg").Return([]network.PublicIPAddress{pip}, nil).AnyTimes()
++	pipClient.EXPECT().Get(gomock.Any(), "named-rg", pipName, gomock.Any()).Return(pip, nil).AnyTimes()
++	pipClient.EXPECT().Get(gomock.Any(), "named-rg", gomock.Any(), gomock.Any()).Return(network.PublicIPAddress{}, &retry.Error{HTTPStatusCode: http.StatusNotFound}).AnyTimes()
++	pipClient.EXPECT().CreateOrUpdate(gomock.Any(), "named-rg", gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++
++	service := getResourceGroupTestService("secondary", "named-rg", "", 8082)
++	service.Annotations[consts.ServiceAnnotationPIPName] = pipName
++	primaryService := getTestService("primary", v1.ProtocolTCP, nil, false, 8081)
++	lb := getTestLoadBalancer(pointer.String(testClusterName), pointer.String(az.ResourceGroup), pointer.String(testClusterName), pointer.String("aprimary1"), primaryService, "Basic")
++	fips := *lb.FrontendIPConfigurations
++	fips[0].FrontendIPConfigurationPropertiesFormat.PublicIPAddress.ID = pointer.String(pipID)
++	lb.FrontendIPConfigurations = &fips
++
++	var reconciledLB network.LoadBalancer
++	lbClient := mockloadbalancerclient.NewMockInterface(ctrl)
++	az.LoadBalancerClient = lbClient
++	lbClient.EXPECT().List(gomock.Any(), az.ResourceGroup).Return([]network.LoadBalancer{lb}, nil).AnyTimes()
++	lbClient.EXPECT().List(gomock.Any(), gomock.Not(az.ResourceGroup)).Return(nil, &retry.Error{HTTPStatusCode: http.StatusNotFound}).AnyTimes()
++	lbClient.EXPECT().Get(gomock.Any(), az.ResourceGroup, gomock.Any(), gomock.Any()).Return(lb, nil).AnyTimes()
++	lbClient.EXPECT().Get(gomock.Any(), gomock.Not(az.ResourceGroup), gomock.Any(), gomock.Any()).Return(network.LoadBalancer{}, &retry.Error{HTTPStatusCode: http.StatusNotFound}).AnyTimes()
++	lbClient.EXPECT().CreateOrUpdate(gomock.Any(), az.ResourceGroup, gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
++		func(_ context.Context, _, _ string, parameters network.LoadBalancer, _ string) *retry.Error {
++			reconciledLB = parameters
++			return nil
++		}).AnyTimes()
++	lbClient.EXPECT().Delete(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++
++	plsClient := mockprivatelinkserviceclient.NewMockInterface(ctrl)
++	plsClient.EXPECT().List(gomock.Any(), az.Config.ResourceGroup).Return([]network.PrivateLinkService{}, nil).AnyTimes()
++	az.PrivateLinkServiceClient = plsClient
++
++	status, err := az.EnsureLoadBalancer(context.TODO(), testClusterName, &service, clusterResources.nodes)
++	if !assert.NoError(t, err) {
++		return
++	}
++	if assert.NotNil(t, status) && assert.NotEmpty(t, status.Ingress) {
++		assert.Equal(t, "9.8.7.6", status.Ingress[0].IP)
++	}
++	if reconciledLB.FrontendIPConfigurations == nil {
++		t.Fatal("reconciliation did not return the existing frontend configuration")
++	}
++	configs := *reconciledLB.FrontendIPConfigurations
++	if len(configs) != 1 {
++		t.Fatalf("expected the new Service to reuse one frontend configuration, got %d", len(configs))
++	}
++	if configs[0].PublicIPAddress == nil || configs[0].PublicIPAddress.ID == nil {
++		t.Fatal("reused frontend configuration has no public IP reference")
++	}
++	assert.Equal(t, pipID, *configs[0].PublicIPAddress.ID)
++}
++
+ func TestServiceOwnsPublicIP(t *testing.T) {
+ 	tests := []struct {
+ 		desc                    string
+@@ -811,6 +887,7 @@ func TestServiceOwnsPublicIP(t *testing.T) {
+ 		{
+ 			desc: "false should be returned when service name tag doesn't match",
+ 			pip: &network.PublicIPAddress{
++				Name: pointer.String("pip1"),
+ 				Tags: map[string]*string{
+ 					consts.ServiceTagKey: pointer.String("default/nginx"),
+ 				},
+@@ -853,6 +930,7 @@ func TestServiceOwnsPublicIP(t *testing.T) {
+ 		{
+ 			desc: "false should be returned when cluster name matches while service name doesn't match",
+ 			pip: &network.PublicIPAddress{
++				Name: pointer.String("pip1"),
+ 				Tags: map[string]*string{
+ 					consts.ServiceTagKey:  pointer.String("default/web"),
+ 					consts.ClusterNameKey: pointer.String("kubernetes"),
+@@ -883,6 +961,7 @@ func TestServiceOwnsPublicIP(t *testing.T) {
+ 		{
+ 			desc: "false should be returned when the tag is empty and load balancer IP does not match",
+ 			pip: &network.PublicIPAddress{
++				Name: pointer.String("pip1"),
+ 				Tags: map[string]*string{
+ 					consts.ServiceTagKey:  pointer.String(""),
+ 					consts.ClusterNameKey: pointer.String("kubernetes"),
+@@ -914,6 +993,7 @@ func TestServiceOwnsPublicIP(t *testing.T) {
+ 		{
+ 			desc: "false should be returned if there is not a match among a multi-service tag",
+ 			pip: &network.PublicIPAddress{
++				Name: pointer.String("pip1"),
+ 				Tags: map[string]*string{
+ 					consts.ServiceTagKey:  pointer.String("default/nginx1,default/nginx2"),
+ 					consts.ClusterNameKey: pointer.String("kubernetes"),
+@@ -2059,59 +2139,6 @@ func TestIsFrontendIPChanged(t *testing.T) {
+ 	}
+ }
+ 
+-func TestFindMatchedPIPByLoadBalancerIP(t *testing.T) {
+-	ctrl := gomock.NewController(t)
+-	defer ctrl.Finish()
+-
+-	testPIP := network.PublicIPAddress{
+-		Name: pointer.String("pipName"),
+-		PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+-			IPAddress: pointer.String("1.2.3.4"),
+-		},
+-	}
+-	testCases := []struct {
+-		desc               string
+-		pips               []network.PublicIPAddress
+-		shouldRefreshCache bool
+-		expectedPIP        *network.PublicIPAddress
+-		expectedError      bool
+-	}{
+-		{
+-			desc:        "findMatchedPIPByLoadBalancerIP shall return the matched ip",
+-			pips:        []network.PublicIPAddress{testPIP},
+-			expectedPIP: &testPIP,
+-		},
+-		{
+-			desc:               "findMatchedPIPByLoadBalancerIP shall return error if ip is not found",
+-			pips:               []network.PublicIPAddress{},
+-			shouldRefreshCache: true,
+-			expectedError:      true,
+-		},
+-		{
+-			desc:               "findMatchedPIPByLoadBalancerIP should refresh cache if no matched ip is found",
+-			pips:               []network.PublicIPAddress{testPIP},
+-			shouldRefreshCache: true,
+-			expectedPIP:        &testPIP,
+-		},
+-	}
+-	for _, test := range testCases {
+-		t.Run(test.desc, func(t *testing.T) {
+-			az := GetTestCloud(ctrl)
+-			service := getTestService("test1", v1.ProtocolTCP, nil, false, 80)
+-			setServiceLoadBalancerIP(&service, "1.2.3.4")
+-
+-			mockPIPsClient := az.PublicIPAddressesClient.(*mockpublicipclient.MockInterface)
+-			if test.shouldRefreshCache {
+-				mockPIPsClient.EXPECT().List(gomock.Any(), "rg").Return([]network.PublicIPAddress{}, nil)
+-			}
+-			mockPIPsClient.EXPECT().List(gomock.Any(), "rg").Return(test.pips, nil)
+-			pip, err := az.findMatchedPIPByLoadBalancerIP(&service, "1.2.3.4", "rg")
+-			assert.Equal(t, test.expectedPIP, pip)
+-			assert.Equal(t, test.expectedError, err != nil)
+-		})
+-	}
+-}
+-
+ func TestDeterminePublicIPName(t *testing.T) {
+ 	ctrl := gomock.NewController(t)
+ 	defer ctrl.Finish()
+diff --git a/tests/e2e/network/ensureloadbalancer.go b/tests/e2e/network/ensureloadbalancer.go
+index 3363bc681..e911187fc 100644
+--- a/tests/e2e/network/ensureloadbalancer.go
++++ b/tests/e2e/network/ensureloadbalancer.go
+@@ -392,7 +392,7 @@ var _ = Describe("Ensure LoadBalancer", Label(utils.TestSuiteLabelLB), func() {
+ 		targetIP := pointer.StringDeref(pip.IPAddress, "")
+ 
+ 		serviceNames := []string{}
+-		for i := 0; i < 2; i++ {
++		for i := 0; i < 3; i++ {
+ 			serviceLabels := labels
+ 			deploymentName := testDeploymentName
+ 			tcpPort := int32(80 + i)
+@@ -411,6 +411,7 @@ var _ = Describe("Ensure LoadBalancer", Label(utils.TestSuiteLabelLB), func() {
+ 				Expect(err).NotTo(HaveOccurred())
+ 			}
+ 
++			var service *v1.Service
+ 			serviceName := fmt.Sprintf("%s-%d", testServiceName, i)
+ 			utils.Logf("Creating Service %q", serviceName)
+ 			serviceNames = append(serviceNames, serviceName)
+@@ -418,9 +419,17 @@ var _ = Describe("Ensure LoadBalancer", Label(utils.TestSuiteLabelLB), func() {
+ 				Port:       tcpPort,
+ 				TargetPort: intstr.FromInt(int(tcpPort)),
+ 			}}
+-			service := utils.CreateLoadBalancerServiceManifest(serviceName, nil, serviceLabels, ns.Name, servicePort)
+-			service = updateServiceLBIPs(service, false, []string{targetIP})
+-			_, err = cs.CoreV1().Services(ns.Name).Create(context.TODO(), service, metav1.CreateOptions{})
++			service = utils.CreateLoadBalancerServiceManifest(serviceName, nil, serviceLabels, ns.Name, servicePort)
++			if i < 2 {
++				targetIPs := []string{targetIP}
++				service = updateServiceLBIPs(service, false, targetIPs)
++			} else {
++				var pipNames []string
++				pipNames = append(pipNames, ipName)
++				utils.Logf("update pip names %s", strings.Join(pipNames, ","))
++				service = updateServicePIPNames(service, pipNames)
++			}
++			_, err := cs.CoreV1().Services(ns.Name).Create(context.TODO(), service, metav1.CreateOptions{})
+ 			defer func() {
+ 				err = utils.DeleteService(cs, ns.Name, serviceName)
+ 				Expect(err).NotTo(HaveOccurred())
+@@ -466,8 +475,16 @@ var _ = Describe("Ensure LoadBalancer", Label(utils.TestSuiteLabelLB), func() {
+ 				TargetPort: intstr.FromInt(int(tcpPort)),
+ 			}}
+ 			service := utils.CreateLoadBalancerServiceManifest(serviceName, nil, serviceLabels, ns.Name, servicePort)
+-			if len(sharedIPs) != 0 {
+-				service = updateServiceLBIPs(service, false, sharedIPs)
++			if i < 2 {
++				if len(sharedIPs) != 0 {
++					service = updateServiceLBIPs(service, false, sharedIPs)
++				}
++			} else {
++				pip, err := tc.GetPublicIPFromAddress(tc.GetResourceGroup(), sharedIPs[0])
++				Expect(err).NotTo(HaveOccurred())
++				pipNames := []string{pointer.StringDeref(pip.Name, "")}
++				utils.Logf("update pip names %s", strings.Join(pipNames, ","))
++				service = updateServicePIPNames(service, pipNames)
+ 			}
+ 			_, err := cs.CoreV1().Services(ns.Name).Create(context.TODO(), service, metav1.CreateOptions{})
+ 			Expect(err).NotTo(HaveOccurred())
+@@ -1040,6 +1057,22 @@ func updateServiceLBIPs(service *v1.Service, isInternal bool, ips []string) (res
+ 	return
+ }
+ 
++func updateServicePIPNames(service *v1.Service, pipNames []string) *v1.Service {
++	if service.Annotations == nil {
++		service.Annotations = map[string]string{}
++	}
++
++	for _, pipName := range pipNames {
++		if strings.HasSuffix(pipName, "-IPv6") {
++			service.Annotations[consts.ServiceAnnotationPIPNameDualStack[consts.IPVersionIPv6]] = pipName
++		} else {
++			service.Annotations[consts.ServiceAnnotationPIPNameDualStack[consts.IPVersionIPv4]] = pipName
++		}
++	}
++
++	return service
++}
++
+ func defaultPublicIPAddress(ipName string, isIPv6 bool) aznetwork.PublicIPAddress {
+ 	// The default sku for LoadBalancer and PublicIP is basic.
+ 	skuName := aznetwork.PublicIPAddressSkuNameBasic

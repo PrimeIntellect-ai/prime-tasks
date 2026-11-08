@@ -1,0 +1,4 @@
+[bug] Sequential string literals in expression should be syntax error
+A [comment](https://github.com/PebbleTemplates/pebble/blob/c0e5bde637293132a7a983f95083fcde96465ae0/pebble/src/main/java/com/mitchellbosecke/pebble/parser/ExpressionParser.java#L341) in the ExpressionParser suggests that an expression like `{{ 'one' 'two' }}` should not be allowed. Currently, it gets parsed as the concatenation of two literal strings into a single value. Here's a [test case](https://github.com/cjbrooks12/pebble/blob/ed29535174ccbfd3ac1a2415858e60e42ac90d80/pebble/src/test/java/com/mitchellbosecke/pebble/node/expression/ExpressionParserTest.java) demonstrating the issue.
+
+I'm currently working on a fix and should have a PR for it shortly. I just wanted to open an issue now so I can link here from where this bug was reported to me.

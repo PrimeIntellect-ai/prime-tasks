@@ -1,0 +1,2 @@
+Add `Unitify` transform to add units to columns
+It would be nice to be able to save units in column names according to a given standard, and provide transforms to "unitfy" the columns for the user. For example, we could follow the convention that `T [K]` the variable `T` has units `K`. We could then introduce a transform `Unitfy` that removes the suffix `[K]` and adds the corresponding unit with Unitful.jl to the array of values.

@@ -1,0 +1,15 @@
+Crash on load
+Loading this spec causes panic:
+
+```
+openapi: 3.0.1
+info:
+  title: Swagger API
+  version: v1
+paths:
+  /test:
+    post:
+      requestBody:
+        content:
+          application/json:
+```

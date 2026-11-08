@@ -1,0 +1,530 @@
+diff --git a/Makefile b/Makefile
+index a2bfc795..ee2ea803 100644
+--- a/Makefile
++++ b/Makefile
+@@ -59,7 +59,7 @@ smoke-test-exporter-examples: FORCE ## Run (some) exporter smoke test examples
+ # Note this does not include every exporter at the moment
+ 	$(DOCKER_COMPOSE) up -d --remove-orphans
+ 	$(DC_RUN_PHP) php ./examples/traces/exporters/zipkin.php
+-	$(DC_RUN_PHP) php ./examples/traces/parent_span_example.php
++	$(DC_RUN_PHP) php ./examples/traces/features/parent_span_example.php
+ # The following examples do not use the DC_RUN_PHP global because they need environment variables.
+ 	$(DOCKER_COMPOSE) run -e NEW_RELIC_ENDPOINT -e NEW_RELIC_INSERT_KEY --rm php php ./examples/traces/exporters/newrelic.php
+ 	$(DOCKER_COMPOSE) run -e NEW_RELIC_ENDPOINT -e NEW_RELIC_INSERT_KEY --rm php php ./examples/traces/exporters/zipkin_to_newrelic.php
+diff --git a/examples/autoload_sdk.php b/examples/autoload_sdk.php
+index e2a89678..a6f59452 100644
+--- a/examples/autoload_sdk.php
++++ b/examples/autoload_sdk.php
+@@ -2,13 +2,15 @@
+ 
+ declare(strict_types=1);
+ 
++use OpenTelemetry\API\Logs\EventLogger;
++use OpenTelemetry\API\Logs\LogRecord;
++
+ putenv('OTEL_PHP_AUTOLOAD_ENABLED=true');
+ putenv('OTEL_TRACES_EXPORTER=otlp');
+-putenv('OTEL_EXPORTER_OTLP_PROTOCOL=grpc');
+ putenv('OTEL_METRICS_EXPORTER=otlp');
+-putenv('OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=grpc');
++putenv('OTEL_LOGS_EXPORTER=otlp');
++putenv('OTEL_EXPORTER_OTLP_PROTOCOL=grpc');
+ putenv('OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317');
+-putenv('OTEL_PHP_TRACES_PROCESSOR=batch');
+ putenv('OTEL_PROPAGATORS=b3,baggage,tracecontext');
+ 
+ echo 'autoloading SDK example starting...' . PHP_EOL;
+@@ -21,4 +23,7 @@ $instrumentation = new \OpenTelemetry\API\Common\Instrumentation\CachedInstrumen
+ $instrumentation->tracer()->spanBuilder('root')->startSpan()->end();
+ $instrumentation->meter()->createCounter('cnt')->add(1);
+ 
++$eventLogger = new EventLogger($instrumentation->logger(), 'my-domain');
++$eventLogger->logEvent('foo', new LogRecord('hello, otel'));
++
+ echo 'Finished!' . PHP_EOL;
+diff --git a/examples/logs/features/monolog-otel-integration.php b/examples/logs/features/monolog-otel-integration.php
+index ce05bf76..33b3e9fe 100644
+--- a/examples/logs/features/monolog-otel-integration.php
++++ b/examples/logs/features/monolog-otel-integration.php
+@@ -6,17 +6,21 @@ use Monolog\Handler\AbstractProcessingHandler;
+ use Monolog\Handler\StreamHandler;
+ use Monolog\Logger;
+ use OpenTelemetry\API\Common\Instrumentation\Globals;
+-use OpenTelemetry\API\Logs\EventLogger;
++use OpenTelemetry\API\Logs\Bridge;
++use OpenTelemetry\API\Logs\LoggerInterface;
+ use OpenTelemetry\API\Logs\LoggerProviderInterface;
+ use OpenTelemetry\API\Logs\LogRecord;
+ use OpenTelemetry\API\Logs\Map\Psr3;
+ use Psr\Log\LogLevel;
+ 
+ /**
+- * This example creates a monolog handler which integrates with opentelemetry, as described in:
++ * This example creates a monolog handler which integrates with opentelemetry. In this example, the logger is
++ * configured from environment, and autoloaded as part of composer where is can be retrieved from `Globals`.
++ *
+  * @see https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/bridge-api.md#usage
+  */
+ 
++// create env vars before requiring composer
+ putenv('OTEL_PHP_AUTOLOAD_ENABLED=true');
+ putenv('OTEL_METRICS_EXPORTER=none');
+ putenv('OTEL_LOGS_EXPORTER=otlp');
+@@ -28,20 +32,20 @@ require __DIR__ . '/../../../vendor/autoload.php';
+ $streamHandler = new StreamHandler(STDOUT, LogLevel::DEBUG);
+ $tracer = Globals::tracerProvider()->getTracer('monolog-demo');
+ 
+-//otel handler for Monolog v2, which ignores logs < INFO
+-$otelHandler = new class('demo', 'demo-domain', LogLevel::INFO) extends AbstractProcessingHandler {
+-    private EventLogger $eventLogger;
++//otel handler for Monolog v2
++$otelHandler = new class(LogLevel::INFO) extends AbstractProcessingHandler {
++    private LoggerInterface $logger;
+ 
+-    public function __construct(string $name, string $domain, string $level, bool $bubble = true, ?LoggerProviderInterface $loggerProvider = null)
++    public function __construct(string $level, bool $bubble = true, ?LoggerProviderInterface $provider = null)
+     {
+         parent::__construct($level, $bubble);
+-        $loggerProvider ??= Globals::loggerProvider();
+-        $this->eventLogger = new EventLogger($loggerProvider->getLogger($name), $domain);
++        $provider ??= Globals::loggerProvider();
++        $this->logger = $provider->getLogger('monolog-demo', null, null, true, ['logging.library' => 'monolog']);
+     }
+ 
+     protected function write(array $record): void
+     {
+-        $this->eventLogger->logEvent('foo', $this->convert($record));
++        $this->logger->logRecord($this->convert($record));
+     }
+ 
+     private function convert(array $record): LogRecord
+diff --git a/examples/sdk_builder.php b/examples/sdk_builder.php
+index 7fa24240..184377a9 100644
+--- a/examples/sdk_builder.php
++++ b/examples/sdk_builder.php
+@@ -2,11 +2,16 @@
+ 
+ declare(strict_types=1);
+ 
++use Monolog\Handler\StreamHandler;
++use Monolog\Logger;
+ use OpenTelemetry\API\Common\Instrumentation\CachedInstrumentation;
++use OpenTelemetry\API\Common\Log\LoggerHolder;
+ use OpenTelemetry\API\Trace\Propagation\TraceContextPropagator;
+ use OpenTelemetry\Contrib\Otlp\MetricExporter;
+ use OpenTelemetry\SDK\Common\Export\Http\PsrTransportFactory;
+ use OpenTelemetry\SDK\Common\Time\ClockFactory;
++use OpenTelemetry\SDK\Logs\LoggerProvider;
++use OpenTelemetry\SDK\Logs\Processor\SimpleLogsProcessor;
+ use OpenTelemetry\SDK\Metrics\MeterProvider;
+ use OpenTelemetry\SDK\Metrics\MetricReader\ExportingReader;
+ use OpenTelemetry\SDK\Resource\ResourceInfoFactory;
+@@ -21,10 +26,11 @@ require __DIR__ . '/../vendor/autoload.php';
+ 
+ echo 'Starting SDK builder example' . PHP_EOL;
+ 
+-\OpenTelemetry\API\Common\Log\LoggerHolder::set(new \Monolog\Logger('grpc', [new \Monolog\Handler\StreamHandler('php://stderr')]));
++LoggerHolder::set(new Logger('grpc', [new StreamHandler('php://stderr')]));
+ 
+ $resource = ResourceInfoFactory::defaultResource();
+ $spanExporter = new InMemoryExporter();
++$logRecordExporter = new \OpenTelemetry\SDK\Logs\Exporter\InMemoryExporter();
+ 
+ $reader = new ExportingReader(
+     new MetricExporter(
+@@ -38,6 +44,12 @@ $meterProvider = MeterProvider::builder()
+     ->addReader($reader)
+     ->build();
+ 
++$loggerProvider = LoggerProvider::builder()
++    ->setLogRecordProcessor(
++        new SimpleLogsProcessor($logRecordExporter)
++    )
++    ->build();
++
+ $tracerProvider = TracerProvider::builder()
+     ->addSpanProcessor(
+         (new BatchSpanProcessorBuilder($spanExporter))
+@@ -51,6 +63,7 @@ $tracerProvider = TracerProvider::builder()
+ Sdk::builder()
+     ->setTracerProvider($tracerProvider)
+     ->setMeterProvider($meterProvider)
++    ->setLoggerProvider($loggerProvider)
+     ->setPropagator(TraceContextPropagator::getInstance())
+     ->setAutoShutdown(true)
+     ->buildAndRegisterGlobal();
+diff --git a/examples/traces/features/parent_span_example.php b/examples/traces/features/parent_span_example.php
+index d940ed25..c8beb660 100644
+--- a/examples/traces/features/parent_span_example.php
++++ b/examples/traces/features/parent_span_example.php
+@@ -14,8 +14,7 @@ $sampler = new AlwaysOnSampler();
+ 
+ // zipkin exporter
+ $zipkinExporter = new ZipkinExporter(
+-    $serviceName,
+-    PsrTransportFactory::discover()->create('http://zipkin:9411/api/v2/spans')
++    PsrTransportFactory::discover()->create('http://zipkin:9411/api/v2/spans', 'application/json')
+ );
+ 
+ $tracerProvider =  new TracerProvider(
+diff --git a/src/API/Logs/README.md b/src/API/Logs/README.md
+new file mode 100644
+index 00000000..414d8c2e
+--- /dev/null
++++ b/src/API/Logs/README.md
+@@ -0,0 +1,19 @@
++# Logs API
++
++This `Logger` API is not designed to be used by application developers, but rather by library developers for the purpose
++of integrating existing logging libraries with OpenTelemetry.
++
++## Logging from 3rd party loggers
++
++3rd party loggers should log to OpenTelemetry in accordance with the
++[logs bridge API](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/bridge-api.md)
++specification.
++
++This means that a "log appender" in the 3rd party logging library (sometimes known as a "handler") should:
++- accept an `OpenTelemetry\API\Logs\LoggerProviderInterface`, or obtain a globally registered one from `OpenTelemetry\API\Instrumentation\Globals`
++- obtain a `Logger` from the logger provider (optionally adding any resources that should be associated with logs emitted)
++- convert logs from its own log format into OpenTelemetry's `LogRecord` format
++- send the logs to OpenTelemetry via `Logger::logRecord()`
++
++See [monolog-otel-integration](examples/logs/features/monolog-otel-integration.md) for an example.
++
+diff --git a/src/Contrib/Newrelic/SpanConverter.php b/src/Contrib/Newrelic/SpanConverter.php
+index fb9069ce..9a70ec08 100644
+--- a/src/Contrib/Newrelic/SpanConverter.php
++++ b/src/Contrib/Newrelic/SpanConverter.php
+@@ -17,6 +17,7 @@ class SpanConverter implements SpanConverterInterface
+ {
+     const STATUS_CODE_TAG_KEY = 'otel.status_code';
+     const STATUS_DESCRIPTION_TAG_KEY = 'otel.status_description';
++    const KEY_DROPPED_ATTRIBUTES_COUNT = 'otel.dropped_attributes_count';
+ 
+     private string $defaultServiceName;
+ 
+@@ -71,6 +72,14 @@ class SpanConverter implements SpanConverterInterface
+             $row['attributes'][$k] = $v;
+         }
+ 
++        $droppedAttributes = $span->getAttributes()->getDroppedAttributesCount()
++            + $span->getInstrumentationScope()->getAttributes()->getDroppedAttributesCount()
++            + $span->getResource()->getAttributes()->getDroppedAttributesCount();
++
++        if ($droppedAttributes > 0) {
++            $row['attributes'][self::KEY_DROPPED_ATTRIBUTES_COUNT] = $droppedAttributes;
++        }
++
+         /*
+         foreach ($span->getEvents() as $event) {
+             if (!array_key_exists('annotations', $row)) {
+diff --git a/src/Contrib/Zipkin/SpanConverter.php b/src/Contrib/Zipkin/SpanConverter.php
+index 041c8921..70fa9ad4 100644
+--- a/src/Contrib/Zipkin/SpanConverter.php
++++ b/src/Contrib/Zipkin/SpanConverter.php
+@@ -21,6 +21,9 @@ class SpanConverter implements SpanConverterInterface
+     const STATUS_DESCRIPTION_TAG_KEY = 'error';
+     const KEY_INSTRUMENTATION_SCOPE_NAME = 'otel.scope.name';
+     const KEY_INSTRUMENTATION_SCOPE_VERSION = 'otel.scope.version';
++    const KEY_DROPPED_ATTRIBUTES_COUNT = 'otel.dropped_attributes_count';
++    const KEY_DROPPED_EVENTS_COUNT = 'otel.dropped_events_count';
++    const KEY_DROPPED_LINKS_COUNT = 'otel.dropped_links_count';
+ 
+     const REMOTE_ENDPOINT_PREFERRED_ATTRIBUTE_TO_RANK_MAP = [
+         'peer.service' => 1,
+@@ -136,6 +139,22 @@ class SpanConverter implements SpanConverterInterface
+             $row['annotations'][] = SpanConverter::toAnnotation($event);
+         }
+ 
++        if ($span->getTotalDroppedEvents() > 0) {
++            $row['tags'][self::KEY_DROPPED_EVENTS_COUNT] = $span->getTotalDroppedEvents();
++        }
++
++        if ($span->getTotalDroppedLinks() > 0) {
++            $row['tags'][self::KEY_DROPPED_LINKS_COUNT] = $span->getTotalDroppedLinks();
++        }
++
++        $droppedAttributes = $span->getAttributes()->getDroppedAttributesCount()
++            + $span->getInstrumentationScope()->getAttributes()->getDroppedAttributesCount()
++            + $span->getResource()->getAttributes()->getDroppedAttributesCount();
++
++        if ($droppedAttributes > 0) {
++            $row['tags'][self::KEY_DROPPED_ATTRIBUTES_COUNT] = $droppedAttributes;
++        }
++
+         if (($span->getKind() === SpanKind::KIND_CLIENT) || ($span->getKind() === SpanKind::KIND_PRODUCER)) {
+             $remoteEndpointData = SpanConverter::toRemoteEndpoint($span);
+             if ($remoteEndpointData !== null) {
+@@ -175,10 +194,15 @@ class SpanConverter implements SpanConverterInterface
+ 
+         $value = ($attributesAsJson !== null) ? sprintf('"%s": %s', $eventName, $attributesAsJson) : sprintf('"%s"', $eventName);
+ 
+-        return [
++        $annotation = [
+             'timestamp' => TimeUtil::nanosToMicros($event->getEpochNanos()),
+             'value' => $value,
+         ];
++        if ($event->getAttributes()->getDroppedAttributesCount() > 0) {
++            $annotation[self::KEY_DROPPED_ATTRIBUTES_COUNT] = $event->getAttributes()->getDroppedAttributesCount();
++        }
++
++        return $annotation;
+     }
+ 
+     private static function convertEventAttributesToJson(EventInterface $event): ?string
+diff --git a/src/SDK/Logs/Exporter/InMemoryExporter.php b/src/SDK/Logs/Exporter/InMemoryExporter.php
+new file mode 100644
+index 00000000..dca0531f
+--- /dev/null
++++ b/src/SDK/Logs/Exporter/InMemoryExporter.php
+@@ -0,0 +1,48 @@
++<?php
++
++declare(strict_types=1);
++
++namespace OpenTelemetry\SDK\Logs\Exporter;
++
++use ArrayObject;
++use OpenTelemetry\SDK\Common\Future\CancellationInterface;
++use OpenTelemetry\SDK\Common\Future\CompletedFuture;
++use OpenTelemetry\SDK\Common\Future\FutureInterface;
++use OpenTelemetry\SDK\Logs\LogRecordExporterInterface;
++
++class InMemoryExporter implements LogRecordExporterInterface
++{
++    private ArrayObject $storage;
++
++    public function __construct(?ArrayObject $storage = null)
++    {
++        $this->storage = $storage ?? new ArrayObject();
++    }
++
++    /**
++     * @inheritDoc
++     */
++    public function export(iterable $batch, ?CancellationInterface $cancellation = null): FutureInterface
++    {
++        foreach ($batch as $record) {
++            $this->storage[] = $record;
++        }
++
++        return new CompletedFuture(true);
++    }
++
++    public function forceFlush(?CancellationInterface $cancellation = null): bool
++    {
++        return true;
++    }
++
++    public function shutdown(?CancellationInterface $cancellation = null): bool
++    {
++        return true;
++    }
++
++    public function getStorage(): ArrayObject
++    {
++        return $this->storage;
++    }
++}
+diff --git a/src/SDK/Logs/Exporter/InMemoryExporterFactory.php b/src/SDK/Logs/Exporter/InMemoryExporterFactory.php
+new file mode 100644
+index 00000000..6f24defe
+--- /dev/null
++++ b/src/SDK/Logs/Exporter/InMemoryExporterFactory.php
+@@ -0,0 +1,16 @@
++<?php
++
++declare(strict_types=1);
++
++namespace OpenTelemetry\SDK\Logs\Exporter;
++
++use OpenTelemetry\SDK\Logs\LogRecordExporterFactoryInterface;
++use OpenTelemetry\SDK\Logs\LogRecordExporterInterface;
++
++class InMemoryExporterFactory implements LogRecordExporterFactoryInterface
++{
++    public function create(): LogRecordExporterInterface
++    {
++        return new InMemoryExporter();
++    }
++}
+diff --git a/src/SDK/Logs/Exporter/_register.php b/src/SDK/Logs/Exporter/_register.php
+index 71ab6c28..96958baa 100644
+--- a/src/SDK/Logs/Exporter/_register.php
++++ b/src/SDK/Logs/Exporter/_register.php
+@@ -3,3 +3,4 @@
+ declare(strict_types=1);
+ 
+ \OpenTelemetry\SDK\Registry::registerLogRecordExporterFactory('console', \OpenTelemetry\SDK\Logs\Exporter\ConsoleExporterFactory::class);
++\OpenTelemetry\SDK\Registry::registerLogRecordExporterFactory('memory', \OpenTelemetry\SDK\Logs\Exporter\InMemoryExporterFactory::class);
+diff --git a/src/SDK/Logs/LoggerProvider.php b/src/SDK/Logs/LoggerProvider.php
+index ae64cd51..8465e8ef 100644
+--- a/src/SDK/Logs/LoggerProvider.php
++++ b/src/SDK/Logs/LoggerProvider.php
+@@ -48,4 +48,9 @@ class LoggerProvider implements LoggerProviderInterface
+     {
+         return $this->loggerSharedState->getProcessor()->forceFlush($cancellation);
+     }
++
++    public static function builder(): LoggerProviderBuilder
++    {
++        return new LoggerProviderBuilder();
++    }
+ }
+diff --git a/src/SDK/Logs/LoggerProviderBuilder.php b/src/SDK/Logs/LoggerProviderBuilder.php
+new file mode 100644
+index 00000000..aea9b531
+--- /dev/null
++++ b/src/SDK/Logs/LoggerProviderBuilder.php
+@@ -0,0 +1,44 @@
++<?php
++
++declare(strict_types=1);
++
++namespace OpenTelemetry\SDK\Logs;
++
++use OpenTelemetry\SDK\Common\Attribute\Attributes;
++use OpenTelemetry\SDK\Common\Instrumentation\InstrumentationScopeFactory;
++use OpenTelemetry\SDK\Logs\Processor\NoopLogsProcessor;
++use OpenTelemetry\SDK\Resource\ResourceInfo;
++
++class LoggerProviderBuilder
++{
++    private LogRecordProcessorInterface $processor;
++    private ?ResourceInfo $resource = null;
++
++    public function __construct()
++    {
++        $this->processor = new NoopLogsProcessor();
++    }
++
++    public function setLogRecordProcessor(LogRecordProcessorInterface $processor): self
++    {
++        $this->processor = $processor;
++
++        return $this;
++    }
++
++    public function setResource(ResourceInfo $resource): self
++    {
++        $this->resource = $resource;
++
++        return $this;
++    }
++
++    public function build(): LoggerProviderInterface
++    {
++        return new LoggerProvider(
++            $this->processor,
++            new InstrumentationScopeFactory(Attributes::factory()),
++            $this->resource
++        );
++    }
++}
+diff --git a/src/SDK/Sdk.php b/src/SDK/Sdk.php
+index ad3cd087..3b63eb93 100644
+--- a/src/SDK/Sdk.php
++++ b/src/SDK/Sdk.php
+@@ -9,20 +9,24 @@ use OpenTelemetry\API\Trace\TracerProviderInterface;
+ use OpenTelemetry\Context\Propagation\TextMapPropagatorInterface;
+ use OpenTelemetry\SDK\Common\Configuration\Configuration;
+ use OpenTelemetry\SDK\Common\Configuration\Variables;
++use OpenTelemetry\SDK\Logs\LoggerProviderInterface;
+ 
+ class Sdk
+ {
+     private TracerProviderInterface $tracerProvider;
+     private MeterProviderInterface $meterProvider;
++    private LoggerProviderInterface $loggerProvider;
+     private TextMapPropagatorInterface $propagator;
+ 
+     public function __construct(
+         TracerProviderInterface $tracerProvider,
+         MeterProviderInterface $meterProvider,
++        LoggerProviderInterface $loggerProvider,
+         TextMapPropagatorInterface $propagator
+     ) {
+         $this->tracerProvider = $tracerProvider;
+         $this->meterProvider = $meterProvider;
++        $this->loggerProvider = $loggerProvider;
+         $this->propagator = $propagator;
+     }
+ 
+@@ -54,6 +58,11 @@ class Sdk
+         return $this->meterProvider;
+     }
+ 
++    public function getLoggerProvider(): LoggerProviderInterface
++    {
++        return $this->loggerProvider;
++    }
++
+     public function getPropagator(): TextMapPropagatorInterface
+     {
+         return $this->propagator;
+diff --git a/src/SDK/SdkBuilder.php b/src/SDK/SdkBuilder.php
+index 65b26feb..caf94a2e 100644
+--- a/src/SDK/SdkBuilder.php
++++ b/src/SDK/SdkBuilder.php
+@@ -10,6 +10,8 @@ use OpenTelemetry\Context\Propagation\NoopTextMapPropagator;
+ use OpenTelemetry\Context\Propagation\TextMapPropagatorInterface;
+ use OpenTelemetry\Context\ScopeInterface;
+ use OpenTelemetry\SDK\Common\Util\ShutdownHandler;
++use OpenTelemetry\SDK\Logs\LoggerProviderInterface;
++use OpenTelemetry\SDK\Logs\NoopLoggerProvider;
+ use OpenTelemetry\SDK\Metrics\MeterProviderInterface;
+ use OpenTelemetry\SDK\Metrics\NoopMeterProvider;
+ use OpenTelemetry\SDK\Trace\NoopTracerProvider;
+@@ -19,6 +21,7 @@ class SdkBuilder
+ {
+     private ?TracerProviderInterface $tracerProvider = null;
+     private ?MeterProviderInterface  $meterProvider = null;
++    private ?LoggerProviderInterface $loggerProvider = null;
+     private ?TextMapPropagatorInterface $propagator = null;
+     private bool $autoShutdown = false;
+ 
+@@ -46,6 +49,13 @@ class SdkBuilder
+         return $this;
+     }
+ 
++    public function setLoggerProvider(LoggerProviderInterface $loggerProvider): self
++    {
++        $this->loggerProvider = $loggerProvider;
++
++        return $this;
++    }
++
+     public function setPropagator(TextMapPropagatorInterface $propagator): self
+     {
+         $this->propagator = $propagator;
+@@ -57,15 +67,18 @@ class SdkBuilder
+     {
+         $tracerProvider = $this->tracerProvider ?? new NoopTracerProvider();
+         $meterProvider = $this->meterProvider ?? new NoopMeterProvider();
++        $loggerProvider = $this->loggerProvider ?? new NoopLoggerProvider();
+         if ($this->autoShutdown) {
+             // rector rule disabled in config, because ShutdownHandler::register() does not keep a strong reference to $this
+             ShutdownHandler::register([$tracerProvider, 'shutdown']);
+             ShutdownHandler::register([$meterProvider, 'shutdown']);
++            ShutdownHandler::register([$loggerProvider, 'shutdown']);
+         }
+ 
+         return new Sdk(
+             $tracerProvider,
+             $meterProvider,
++            $loggerProvider,
+             $this->propagator ?? NoopTextMapPropagator::getInstance(),
+         );
+     }
+@@ -77,9 +90,9 @@ class SdkBuilder
+             ->withPropagator($sdk->getPropagator())
+             ->withTracerProvider($sdk->getTracerProvider())
+             ->withMeterProvider($sdk->getMeterProvider())
++            ->withLoggerProvider($sdk->getLoggerProvider())
+             ->storeInContext();
+ 
+-        // @todo could auto-shutdown self?
+         return Context::storage()->attach($context);
+     }
+ }

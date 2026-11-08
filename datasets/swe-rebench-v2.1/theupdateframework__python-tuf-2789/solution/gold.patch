@@ -1,0 +1,187 @@
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index a1203eb9..d3ccf453 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -1,5 +1,21 @@
+ # Changelog
+ 
++## Unreleased
++
++### Changed
++
++This release is API compatible but contains a major internal change in the HTTP handling.
++
++* ngclient: urllib3 is used as the HTTP library by default instead of requests (#2762,
++  #2773, #2789)
++  * This removes dependencies on `requests`, `idna`, `charset-normalizer` and `certifi`
++  * The deprecated RequestsFetcher implementation is available but requires selecting
++    the fetcher at Updater initialization and explicitly depending on requests
++* ngclient: TLS certificate source was changed. Certificates now come from operating
++  system certificate store instead of `certifi` (#2762)
++* Test infrastucture has improved and should now be more usable externally, e.g. in
++  distro test suites (#2749)
++
+ ## v5.1.0
+ 
+ ### Changed
+diff --git a/tuf/ngclient/_internal/proxy.py b/tuf/ngclient/_internal/proxy.py
+new file mode 100644
+index 00000000..b42ea2f4
+--- /dev/null
++++ b/tuf/ngclient/_internal/proxy.py
+@@ -0,0 +1,101 @@
++# Copyright New York University and the TUF contributors
++# SPDX-License-Identifier: MIT OR Apache-2.0
++
++"""Proxy environment variable handling with Urllib3"""
++
++from __future__ import annotations
++
++from typing import Any
++from urllib.request import getproxies
++
++from urllib3 import BaseHTTPResponse, PoolManager, ProxyManager
++from urllib3.util.url import parse_url
++
++
++# TODO: ProxyEnvironment could implement the whole PoolManager.RequestMethods
++# Mixin: We only need request() so nothing else is currently implemented
++class ProxyEnvironment:
++    """A PoolManager manager for automatic proxy handling based on env variables
++
++    Keeps track of PoolManagers for different proxy urls based on proxy
++    environment variables. Use `get_pool_manager()` or `request()` to access
++    the right manager for a scheme/host.
++
++    Supports '*_proxy' variables, with special handling for 'no_proxy' and
++    'all_proxy'.
++    """
++
++    def __init__(
++        self,
++        **kw_args: Any,  # noqa: ANN401
++    ) -> None:
++        self._pool_managers: dict[str | None, PoolManager] = {}
++        self._kw_args = kw_args
++
++        self._proxies = getproxies()
++        self._all_proxy = self._proxies.pop("all", None)
++        no_proxy = self._proxies.pop("no", None)
++        if no_proxy is None:
++            self._no_proxy_hosts = []
++        else:
++            # split by comma, remove leading periods
++            self._no_proxy_hosts = [
++                h.lstrip(".") for h in no_proxy.replace(" ", "").split(",") if h
++            ]
++
++    def _get_proxy(self, scheme: str | None, host: str | None) -> str | None:
++        """Get a proxy url for scheme and host based on proxy env variables"""
++
++        if host is None:
++            # urllib3 only handles http/https but we can do something reasonable
++            # even for schemes that don't require host (like file)
++            return None
++
++        # does host match any of the "no_proxy" hosts?
++        for no_proxy_host in self._no_proxy_hosts:
++            # wildcard match, exact hostname match, or parent domain match
++            if no_proxy_host in ("*", host) or host.endswith(
++                f".{no_proxy_host}"
++            ):
++                return None
++
++        if scheme in self._proxies:
++            return self._proxies[scheme]
++        if self._all_proxy is not None:
++            return self._all_proxy
++
++        return None
++
++    def get_pool_manager(
++        self, scheme: str | None, host: str | None
++    ) -> PoolManager:
++        """Get a poolmanager for scheme and host.
++
++        Returns a ProxyManager if that is correct based on current proxy env
++        variables, otherwise returns a PoolManager
++        """
++
++        proxy = self._get_proxy(scheme, host)
++        if proxy not in self._pool_managers:
++            if proxy is None:
++                self._pool_managers[proxy] = PoolManager(**self._kw_args)
++            else:
++                self._pool_managers[proxy] = ProxyManager(
++                    proxy,
++                    **self._kw_args,
++                )
++
++        return self._pool_managers[proxy]
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        **request_kw: Any,  # noqa: ANN401
++    ) -> BaseHTTPResponse:
++        """Make a request using a PoolManager chosen based on url and
++        proxy environment variables.
++        """
++        u = parse_url(url)
++        manager = self.get_pool_manager(u.scheme, u.host)
++        return manager.request(method, url, **request_kw)
+diff --git a/tuf/ngclient/updater.py b/tuf/ngclient/updater.py
+index 8c88a96e..0dfab2a3 100644
+--- a/tuf/ngclient/updater.py
++++ b/tuf/ngclient/updater.py
+@@ -35,6 +35,19 @@
+ A simple example of using the Updater to implement a Python TUF client that
+ downloads target files is available in `examples/client
+ <https://github.com/theupdateframework/python-tuf/tree/develop/examples/client>`_.
++
++Notes on how Updater uses HTTP by default:
++  * urllib3 is the HTTP library
++  * Typically all requests are retried by urllib3 three times (in cases where
++    this seems useful)
++  * Operating system certificate store is used for TLS, in other words
++    ``certifi`` is not used as the certificate source
++  * Proxy use can be configured with ``https_proxy`` and other similar
++    environment variables
++
++All of the HTTP decisions can be changed with ``fetcher`` argument:
++Custom ``FetcherInterface`` implementations are possible. The alternative
++``RequestsFetcher`` implementation is also provided (although deprecated).
+ """
+ 
+ from __future__ import annotations
+diff --git a/tuf/ngclient/urllib3_fetcher.py b/tuf/ngclient/urllib3_fetcher.py
+index 5d4bb1cf..88d447bd 100644
+--- a/tuf/ngclient/urllib3_fetcher.py
++++ b/tuf/ngclient/urllib3_fetcher.py
+@@ -15,6 +15,7 @@
+ 
+ import tuf
+ from tuf.api import exceptions
++from tuf.ngclient._internal.proxy import ProxyEnvironment
+ from tuf.ngclient.fetcher import FetcherInterface
+ 
+ if TYPE_CHECKING:
+@@ -49,7 +50,7 @@ def __init__(
+         if app_user_agent is not None:
+             ua = f"{app_user_agent} {ua}"
+ 
+-        self._poolManager = urllib3.PoolManager(headers={"User-Agent": ua})
++        self._proxy_env = ProxyEnvironment(headers={"User-Agent": ua})
+ 
+     def _fetch(self, url: str) -> Iterator[bytes]:
+         """Fetch the contents of HTTP/HTTPS url from a remote server.
+@@ -72,7 +73,7 @@ def _fetch(self, url: str) -> Iterator[bytes]:
+         #  - connect timeout (max delay before first byte is received)
+         #  - read (gap) timeout (max delay between bytes received)
+         try:
+-            response = self._poolManager.request(
++            response = self._proxy_env.request(
+                 "GET",
+                 url,
+                 preload_content=False,

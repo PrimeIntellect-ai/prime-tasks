@@ -1,0 +1,247 @@
+diff --git a/Webtest.sh b/Webtest.sh
+index 46d5d9e..8751123 100755
+--- a/Webtest.sh
++++ b/Webtest.sh
+@@ -3,9 +3,9 @@ set -x
+ # Check we can build the image
+ make docker-internal TAG=webtest || exit 1
+ FORTIO_UI_PREFIX=/newprefix/ # test the non default prefix (not /fortio/)
+-#LOGLEVEL=debug
+-LOGLEVEL=info
+-DOCKERID=$(docker run -d --name fortio_server istio/fortio:webtest server -ui-path $FORTIO_UI_PREFIX -loglevel $LOGLEVEL)
++FILE_LIMIT=40 # must be low to detect leaks (a leak of 2 fds per call would exceed it)
++LOGLEVEL=info # change to debug to debug
++DOCKERID=$(docker run -d --ulimit nofile=$FILE_LIMIT --name fortio_server istio/fortio:webtest server -ui-path $FORTIO_UI_PREFIX -loglevel $LOGLEVEL)
+ function cleanup {
+   docker stop $DOCKERID
+   docker rm fortio_server
+@@ -23,6 +23,8 @@ $CURL https://istio.io/robots.txt
+ $CURL ${BASE_FORTIO}browse
+ # Check we can connect, and run a http QPS test against ourselves through fetch
+ $CURL "${BASE_FORTIO}fetch/localhost:8080$FORTIO_UI_PREFIX?url=http://localhost:8080/debug&load=Start&qps=-1&json=on" | grep ActualQPS
++# Check we can do it twice despite ulimit - check we get all 200s (exactly 80 of them; idle pooled connections are bounded, roughly 8 connections counted at both ends)
++$CURL "${BASE_FORTIO}fetch/localhost:8080$FORTIO_UI_PREFIX?url=http://localhost:8080/debug&load=Start&n=80&qps=-1&json=on" | grep '"200": 80'
+ # Check we can connect, and run a grpc QPS test against ourselves through fetch
+ $CURL "${BASE_FORTIO}fetch/localhost:8080$FORTIO_UI_PREFIX?url=localhost:8079&load=Start&qps=-1&json=on&n=100&runner=grpc" | grep '"1": 100'
+ # Check we get the logo (need to remove the CR from raw headers)
+diff --git a/fhttp/httprunner_test.go b/fhttp/httprunner_test.go
+index 3193f90..bb6d3ea 100644
+--- a/fhttp/httprunner_test.go
++++ b/fhttp/httprunner_test.go
+@@ -21,7 +21,14 @@ package fhttp
+ 
+ import (
+ 	"fmt"
++	"io"
++	"net"
+ 	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"runtime/debug"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -60,7 +67,7 @@ func TestHTTPRunner(t *testing.T) {
+ 		URL: opts.URL,
+ 	}
+ 	o1 := rawOpts
+-	if r, _, _ := NewBasicClient(&o1).Fetch(); r != http.StatusOK {
++	if r, _, _ := NewClient(&o1).Fetch(); r != http.StatusOK {
+ 		t.Errorf("Fast Client with raw option should still work with warning in logs")
+ 	}
+ 	o1 = rawOpts
+@@ -72,6 +79,182 @@ func TestHTTPRunner(t *testing.T) {
+ 	}
+ }
+ 
++// countOpenFds returns the number of file descriptors currently open by the
++// process, or -1 when that information is not available on this platform.
++func countOpenFds() int {
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		return -1
++	}
++	return len(entries)
++}
++
++func testHTTPNotLeaking(t *testing.T, opts *HTTPRunnerOptions) {
++	// Like the UI server (GOGC=off), keep finalizers from silently closing sockets
++	// that a client failed to release: the test must see such leaks itself.
++	defer debug.SetGCPercent(debug.SetGCPercent(-1))
++	port, mux := DynamicHTTPServer(false)
++	mux.HandleFunc("/echo100", EchoHandler)
++	url := fmt.Sprintf("http://localhost:%d/echo100", port)
++	numCalls := 20
++	opts.NumThreads = numCalls / 2
++	opts.Exactly = int64(numCalls)
++	opts.QPS = float64(numCalls)
++	opts.URL = url
++	runOnce := func(run int) {
++		res, err := RunHTTPTest(opts)
++		if err != nil {
++			t.Fatalf("run %d: %v", run+1, err)
++		}
++		if got := res.RetCodes[http.StatusOK]; opts.Exactly != got {
++			t.Fatalf("run %d: requested %d successful calls, got %v", run+1, opts.Exactly, res.RetCodes)
++		}
++	}
++	// Warm up first: a client may legitimately keep a bounded set of idle
++	// connections around for reuse, so measure growth after that is in place.
++	const warmupRuns = 3
++	const measuredRuns = 15
++	for run := 0; run < warmupRuns; run++ {
++		runOnce(run)
++	}
++	// Give asynchronous connection teardown a chance to finish.
++	runtime.GC()
++	time.Sleep(200 * time.Millisecond)
++	ngBefore := runtime.NumGoroutine()
++	fdBefore := countOpenFds()
++	for run := warmupRuns; run < warmupRuns+measuredRuns; run++ {
++		runOnce(run)
++	}
++	// No forced GC here: unreleased sockets would only be reclaimed by finalizers.
++	time.Sleep(200 * time.Millisecond)
++	// A per-run leak adds well over 20 descriptors across these runs, while a
++	// bounded pool of idle connections (at most one per thread, counted at both
++	// ends since the server runs in this process) stays within the tolerance.
++	if fdAfter := countOpenFds(); fdBefore >= 0 && fdAfter > fdBefore+20 {
++		t.Errorf("open file descriptors after repeated runs %d, expected near %d", fdAfter, fdBefore)
++	}
++	if got := runtime.NumGoroutine(); got > ngBefore+10 {
++		t.Errorf("goroutines after repeated runs %d, expected near %d", got, ngBefore)
++	}
++}
++
++func countProcessFds(pid int) int {
++	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
++	if err != nil {
++		return -1
++	}
++	return len(entries)
++}
++
++func TestUITriggeredRunsDoNotLeakConnections(t *testing.T) {
++	if _, err := os.Stat("/proc/self/fd"); err != nil {
++		t.Skip("process file descriptors are not available on this platform")
++	}
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := listener.Addr().(*net.TCPAddr).Port
++	if err := listener.Close(); err != nil {
++		t.Fatal(err)
++	}
++	serverPort := fmt.Sprintf("%d", port)
++	executable := filepath.Join(t.TempDir(), "fortio-server")
++	build := exec.Command("go", "build", "-a", "-mod=mod", "-o", executable, "..")
++	if output, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("building server: %v\n%s", err, output)
++	}
++	server := exec.Command(executable, "server", "-http-port="+serverPort, "-grpc-port=127.0.0.1:0",
++		"-redirect-port=disabled", "-ui-path=/fortio/", "-quiet", "-data-dir="+t.TempDir())
++	server.Env = []string{}
++	for _, env := range os.Environ() {
++		if !strings.HasPrefix(env, "GOGC=") {
++			server.Env = append(server.Env, env)
++		}
++	}
++	server.Env = append(server.Env, "GOGC=off")
++	if err := server.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer func() {
++		_ = server.Process.Kill()
++		_ = server.Wait()
++	}()
++	base := fmt.Sprintf("http://localhost:%d", port)
++	ready := false
++	for until := time.Now().Add(10 * time.Second); time.Now().Before(until); {
++		resp, err := http.Get(base + "/debug")
++		if err == nil {
++			_ = resp.Body.Close()
++			ready = true
++			break
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	if !ready {
++		t.Fatal("UI server did not become ready")
++	}
++	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
++	requestURL := fmt.Sprintf("%s/fortio/fetch/localhost:%d/fortio/?url=%s/debug&load=Start&qps=-1&n=2&json=on", base, port, base)
++	goroutineCount := func() int {
++		resp, err := client.Get(base + "/debug/pprof/goroutine?debug=2")
++		if err != nil {
++			t.Fatalf("reading server goroutine profile: %v", err)
++		}
++		profile, err := io.ReadAll(resp.Body)
++		_ = resp.Body.Close()
++		if err != nil || resp.StatusCode != http.StatusOK {
++			t.Fatalf("reading server goroutine profile: status %d, error %v", resp.StatusCode, err)
++		}
++		return strings.Count(string(profile), "goroutine ")
++	}
++	runUI := func(run int) {
++		resp, err := client.Get(requestURL)
++		if err != nil {
++			t.Fatalf("UI run %d: %v", run+1, err)
++		}
++		body, readErr := io.ReadAll(resp.Body)
++		_ = resp.Body.Close()
++		if readErr != nil {
++			t.Fatalf("reading UI run %d: %v", run+1, readErr)
++		}
++		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"200"`) {
++			t.Fatalf("UI run %d did not report successful requests (status %d): %s", run+1, resp.StatusCode, body)
++		}
++	}
++	// Warm up first, then measure growth over the later runs.
++	const warmupRuns = 3
++	const measuredRuns = 15
++	for run := 0; run < warmupRuns; run++ {
++		runUI(run)
++	}
++	time.Sleep(200 * time.Millisecond)
++	goRoutinesBefore := goroutineCount()
++	fdBefore := countProcessFds(server.Process.Pid)
++	for run := warmupRuns; run < warmupRuns+measuredRuns; run++ {
++		runUI(run)
++	}
++	time.Sleep(200 * time.Millisecond)
++	fdAfter := countProcessFds(server.Process.Pid)
++	t.Logf("server descriptors before/after UI runs: %d/%d", fdBefore, fdAfter)
++	if fdBefore >= 0 && fdAfter > fdBefore+20 {
++		t.Errorf("server descriptors after repeated UI runs %d, expected near %d", fdAfter, fdBefore)
++	}
++	goRoutinesAfter := goroutineCount()
++	t.Logf("server goroutines before/after UI runs: %d/%d", goRoutinesBefore, goRoutinesAfter)
++	if goRoutinesAfter > goRoutinesBefore+10 {
++		t.Errorf("server goroutines after repeated UI runs %d, expected near %d", goRoutinesAfter, goRoutinesBefore)
++	}
++}
++
++func TestHttpNotLeakingFastClient(t *testing.T) {
++	testHTTPNotLeaking(t, &HTTPRunnerOptions{})
++}
++
++func TestHttpNotLeakingStdClient(t *testing.T) {
++	testHTTPNotLeaking(t, &HTTPRunnerOptions{HTTPOptions: HTTPOptions{DisableFastClient: true}})
++}
++
+ func TestHTTPRunnerClientRace(t *testing.T) {
+ 	port, mux := DynamicHTTPServer(false)
+ 	mux.HandleFunc("/echo1/", EchoHandler)
+@@ -125,7 +308,8 @@ func TestServe(t *testing.T) {
+ 	o := NewHTTPOptions(url)
+ 	o.AddAndValidateExtraHeader("X-Header: value1")
+ 	o.AddAndValidateExtraHeader("X-Header: value2")
+-	code, data, _ := NewClient(o).Fetch()
++	// The debug dump of the environment can exceed the fast client buffer, so use the std client here.
++	code, data, _ := NewStdClient(o).Fetch()
+ 	if code != http.StatusOK {
+ 		t.Errorf("Unexpected non 200 ret code for debug url %s : %d", url, code)
+ 	}

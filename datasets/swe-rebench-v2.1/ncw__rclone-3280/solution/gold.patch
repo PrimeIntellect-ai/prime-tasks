@@ -1,0 +1,160 @@
+diff --git a/fs/march/march.go b/fs/march/march.go
+index 45eb4c9c..b1f95a67 100644
+--- a/fs/march/march.go
++++ b/fs/march/march.go
+@@ -8,6 +8,8 @@ import (
+ 	"strings"
+ 	"sync"
+ 
++	"github.com/pkg/errors"
++
+ 	"github.com/ncw/rclone/fs"
+ 	"github.com/ncw/rclone/fs/filter"
+ 	"github.com/ncw/rclone/fs/list"
+@@ -110,7 +112,7 @@ type listDirJob struct {
+ }
+ 
+ // Run starts the matching process off
+-func (m *March) Run() {
++func (m *March) Run() error {
+ 	m.init()
+ 
+ 	srcDepth := fs.Config.MaxDepth
+@@ -122,6 +124,10 @@ func (m *March) Run() {
+ 		dstDepth = fs.MaxLevel
+ 	}
+ 
++	var mu sync.Mutex // Protects vars below
++	var jobError error
++	var errCount int
++
+ 	// Start some directory listing go routines
+ 	var wg sync.WaitGroup         // sync closing of go routines
+ 	var traversing sync.WaitGroup // running directory traversals
+@@ -138,7 +144,16 @@ func (m *March) Run() {
+ 					if !ok {
+ 						return
+ 					}
+-					jobs := m.processJob(job)
++					jobs, err := m.processJob(job)
++					if err != nil {
++						mu.Lock()
++						// Keep reference only to the first encountered error
++						if jobError == nil {
++							jobError = err
++						}
++						errCount++
++						mu.Unlock()
++					}
+ 					if len(jobs) > 0 {
+ 						traversing.Add(len(jobs))
+ 						go func() {
+@@ -178,6 +193,11 @@ func (m *March) Run() {
+ 	traversing.Wait()
+ 	close(in)
+ 	wg.Wait()
++
++	if errCount > 1 {
++		return errors.Wrapf(jobError, "march failed with %d error(s): first error", errCount)
++	}
++	return jobError
+ }
+ 
+ // Check to see if the context has been cancelled
+@@ -339,8 +359,9 @@ func matchListings(srcListEntries, dstListEntries fs.DirEntries, transforms []ma
+ // more jobs
+ //
+ // returns errors using processError
+-func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
++func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
+ 	var (
++		jobs                   []listDirJob
+ 		srcList, dstList       fs.DirEntries
+ 		srcListErr, dstListErr error
+ 		wg                     sync.WaitGroup
+@@ -367,14 +388,14 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 	if srcListErr != nil {
+ 		fs.Errorf(job.srcRemote, "error reading source directory: %v", srcListErr)
+ 		fs.CountError(srcListErr)
+-		return nil
++		return nil, srcListErr
+ 	}
+ 	if dstListErr == fs.ErrorDirNotFound {
+ 		// Copy the stuff anyway
+ 	} else if dstListErr != nil {
+ 		fs.Errorf(job.dstRemote, "error reading destination directory: %v", dstListErr)
+ 		fs.CountError(dstListErr)
+-		return nil
++		return nil, dstListErr
+ 	}
+ 
+ 	// If NoTraverse is set, then try to find a matching object
+@@ -395,7 +416,7 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 	srcOnly, dstOnly, matches := matchListings(srcList, dstList, m.transforms)
+ 	for _, src := range srcOnly {
+ 		if m.aborting() {
+-			return nil
++			return nil, m.Ctx.Err()
+ 		}
+ 		recurse := m.Callback.SrcOnly(src)
+ 		if recurse && job.srcDepth > 0 {
+@@ -409,7 +430,7 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 	}
+ 	for _, dst := range dstOnly {
+ 		if m.aborting() {
+-			return nil
++			return nil, m.Ctx.Err()
+ 		}
+ 		recurse := m.Callback.DstOnly(dst)
+ 		if recurse && job.dstDepth > 0 {
+@@ -422,7 +443,7 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 	}
+ 	for _, match := range matches {
+ 		if m.aborting() {
+-			return nil
++			return nil, m.Ctx.Err()
+ 		}
+ 		recurse := m.Callback.Match(m.Ctx, match.dst, match.src)
+ 		if recurse && job.srcDepth > 0 && job.dstDepth > 0 {
+@@ -434,5 +455,5 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 			})
+ 		}
+ 	}
+-	return jobs
++	return jobs, nil
+ }
+diff --git a/fs/operations/operations.go b/fs/operations/operations.go
+index 10c6e107..62c0a01e 100644
+--- a/fs/operations/operations.go
++++ b/fs/operations/operations.go
+@@ -778,7 +778,7 @@ func CheckFn(ctx context.Context, fdst, fsrc fs.Fs, check checkFn, oneway bool)
+ 		Callback: c,
+ 	}
+ 	fs.Infof(fdst, "Waiting for checks to finish")
+-	m.Run()
++	err := m.Run()
+ 
+ 	if c.dstFilesMissing > 0 {
+ 		fs.Logf(fdst, "%d files missing", c.dstFilesMissing)
+@@ -797,7 +797,7 @@ func CheckFn(ctx context.Context, fdst, fsrc fs.Fs, check checkFn, oneway bool)
+ 	if c.differences > 0 {
+ 		return errors.Errorf("%d differences found", c.differences)
+ 	}
+-	return nil
++	return err
+ }
+ 
+ // Check the files in fsrc and fdst according to Size and hash
+diff --git a/fs/sync/sync.go b/fs/sync/sync.go
+index c2ce37ae..87a55b3b 100644
+--- a/fs/sync/sync.go
++++ b/fs/sync/sync.go
+@@ -666,7 +666,7 @@ func (s *syncCopyMove) run() error {
+ 		Callback:      s,
+ 		DstIncludeAll: filter.Active.Opt.DeleteExcluded,
+ 	}
+-	m.Run()
++	s.processError(m.Run())
+ 
+ 	s.stopTrackRenames()
+ 	if s.trackRenames {

@@ -1,0 +1,823 @@
+diff --git a/tests/__init__.py b/tests/__init__.py
+index ab4f2a49f..8a1644152 100644
+--- a/tests/__init__.py
++++ b/tests/__init__.py
+@@ -1,6 +1,8 @@
+ import logging
+ import os
++from functools import wraps
+ 
++from moto import mock_aws
+ from moto.core.config import default_user_config
+ 
+ # Disable extra logging for tests
+@@ -22,3 +24,27 @@ os.environ["MOTO_EC2_LOAD_DEFAULT_AMIS"] = "false"
+ 
+ # Don't reset boto3 Session, as it's unnecessarily slow
+ default_user_config["core"]["reset_boto3_session"] = False
++
++
++def allow_aws_request() -> bool:
++    return os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
++
++
++def aws_verified(func):
++    """
++    Function that is verified to work against AWS.
++    Can be run against AWS at any time by setting:
++      MOTO_TEST_ALLOW_AWS_REQUEST=true
++
++    If this environment variable is not set, the function runs in a `mock_aws` context.
++    """
++
++    @wraps(func)
++    def pagination_wrapper(**kwargs):
++        if allow_aws_request():
++            return func(**kwargs)
++        else:
++            with mock_aws():
++                return func(**kwargs)
++
++    return pagination_wrapper
+diff --git a/tests/test_applicationautoscaling/test_applicationautoscaling.py b/tests/test_applicationautoscaling/test_applicationautoscaling.py
+index a068dfa8d..1cc6e2664 100644
+--- a/tests/test_applicationautoscaling/test_applicationautoscaling.py
++++ b/tests/test_applicationautoscaling/test_applicationautoscaling.py
+@@ -5,6 +5,7 @@ import pytest
+ 
+ from moto import mock_aws
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
++from tests.test_dynamodb import dynamodb_aws_verified
+ 
+ DEFAULT_REGION = "us-east-1"
+ DEFAULT_ECS_CLUSTER = "default"
+@@ -50,6 +51,33 @@ def _create_ecs_defaults(ecs, create_service=True):
+         )
+ 
+ 
++def delete_scheduled_actions():
++    service_namespaces = ["custom-resource", "dynamodb", "ecs"]
++    client = boto3.client("application-autoscaling", region_name=DEFAULT_REGION)
++
++    for namespace in service_namespaces:
++        actions = client.describe_scheduled_actions(ServiceNamespace=namespace)[
++            "ScheduledActions"
++        ]
++        for a in actions:
++            client.delete_scheduled_action(
++                ServiceNamespace=namespace,
++                ScheduledActionName=a["ScheduledActionName"],
++                ResourceId=a["ResourceId"],
++                ScalableDimension=a["ScalableDimension"],
++            )
++
++        targets = client.describe_scalable_targets(ServiceNamespace=namespace)[
++            "ScalableTargets"
++        ]
++        for t in targets:
++            client.deregister_scalable_target(
++                ServiceNamespace=namespace,
++                ResourceId=t["ResourceId"],
++                ScalableDimension=t["ScalableDimension"],
++            )
++
++
+ @mock_aws
+ def test_describe_scalable_targets_one_basic_ecs_success():
+     ecs = boto3.client("ecs", region_name=DEFAULT_REGION)
+@@ -535,30 +563,62 @@ def test_describe_scheduled_actions():
+     assert len(resp["ScheduledActions"]) == 0
+ 
+ 
+-@mock_aws
+-def test_put_scheduled_action():
+-    client = boto3.client("application-autoscaling", region_name="ap-southeast-1")
+-    client.put_scheduled_action(
+-        ServiceNamespace="ecs",
+-        ScheduledActionName="action_name",
+-        ResourceId="ecs:cluster:x",
+-        ScalableDimension="ecs:service:DesiredCount",
+-    )
++@dynamodb_aws_verified()
++@pytest.mark.aws_verified
++def test_put_scheduled_action(table_name=None):
++    client = boto3.client("application-autoscaling", region_name="us-east-1")
++    try:
++        resource_id = f"table/{table_name}"
++        client.register_scalable_target(
++            ServiceNamespace="dynamodb",
++            ResourceId=resource_id,
++            ScalableDimension="dynamodb:table:ReadCapacityUnits",
++            MinCapacity=1,
++            MaxCapacity=100,
++        )
++        client.put_scheduled_action(
++            ServiceNamespace="dynamodb",
++            Schedule="rate(2 minutes)",
++            ScheduledActionName="action_name",
++            ResourceId=resource_id,
++            ScalableDimension="dynamodb:table:ReadCapacityUnits",
++            ScalableTargetAction={"MinCapacity": 1, "MaxCapacity": 5},
++        )
+ 
+-    resp = client.describe_scheduled_actions(ServiceNamespace="ecs")
+-    assert len(resp["ScheduledActions"]) == 1
++        resp = client.describe_scheduled_actions(ServiceNamespace="dynamodb")
++        assert len(resp["ScheduledActions"]) == 1
+ 
+-    action = resp["ScheduledActions"][0]
+-    assert action["ScheduledActionName"] == "action_name"
+-    assert (
+-        action["ScheduledActionARN"]
+-        == f"arn:aws:autoscaling:ap-southeast-1:{ACCOUNT_ID}:scheduledAction:ecs:scheduledActionName/action_name"
+-    )
+-    assert action["ServiceNamespace"] == "ecs"
+-    assert action["ResourceId"] == "ecs:cluster:x"
+-    assert action["ScalableDimension"] == "ecs:service:DesiredCount"
+-    assert "CreationTime" in action
+-    assert "ScalableTargetAction" not in action
++        action = resp["ScheduledActions"][0]
++        assert action["ScheduledActionName"] == "action_name"
++        assert action["ServiceNamespace"] == "dynamodb"
++        assert action["ResourceId"] == resource_id
++        assert action["ScalableDimension"] == "dynamodb:table:ReadCapacityUnits"
++        assert "CreationTime" in action
++
++        # Verify it's possible to create a second action against the same Dimension
++        client.put_scheduled_action(
++            ServiceNamespace="dynamodb",
++            Schedule="rate(1 hour)",
++            ScheduledActionName="action_name2",
++            ResourceId=resource_id,
++            ScalableDimension="dynamodb:table:ReadCapacityUnits",
++            ScalableTargetAction={"MinCapacity": 1, "MaxCapacity": 5},
++        )
++        actions = client.describe_scheduled_actions(ServiceNamespace="dynamodb")[
++            "ScheduledActions"
++        ]
++        assert len(actions) == 2
++
++        action1 = [a for a in actions if a["ScheduledActionName"] == "action_name"][0]
++        action2 = [a for a in actions if a["ScheduledActionName"] == "action_name2"][0]
++
++        assert action1["ResourceId"] == resource_id
++        assert action2["ResourceId"] == resource_id
++
++        assert action1["Schedule"] == "rate(2 minutes)"
++        assert action2["Schedule"] == "rate(1 hour)"
++    finally:
++        delete_scheduled_actions()
+ 
+ 
+ @mock_aws
+@@ -572,7 +632,7 @@ def test_put_scheduled_action__use_update():
+     )
+     client.put_scheduled_action(
+         ServiceNamespace="ecs",
+-        ScheduledActionName="action_name_updated",
++        ScheduledActionName="action_name",
+         ResourceId="ecs:cluster:x",
+         ScalableDimension="ecs:service:DesiredCount",
+         ScalableTargetAction={
+@@ -585,11 +645,7 @@ def test_put_scheduled_action__use_update():
+     assert len(resp["ScheduledActions"]) == 1
+ 
+     action = resp["ScheduledActions"][0]
+-    assert action["ScheduledActionName"] == "action_name_updated"
+-    assert (
+-        action["ScheduledActionARN"]
+-        == f"arn:aws:autoscaling:ap-southeast-1:{ACCOUNT_ID}:scheduledAction:ecs:scheduledActionName/action_name"
+-    )
++    assert action["ScheduledActionName"] == "action_name"
+     assert action["ServiceNamespace"] == "ecs"
+     assert action["ResourceId"] == "ecs:cluster:x"
+     assert action["ScalableDimension"] == "ecs:service:DesiredCount"
+diff --git a/tests/test_athena/__init__.py b/tests/test_athena/__init__.py
+index 1822c621a..e69de29bb 100644
+--- a/tests/test_athena/__init__.py
++++ b/tests/test_athena/__init__.py
+@@ -1,59 +0,0 @@
+-import os
+-from functools import wraps
+-from uuid import uuid4
+-
+-import boto3
+-
+-from moto import mock_aws
+-from moto.s3.responses import DEFAULT_REGION_NAME
+-from tests.test_s3 import empty_bucket
+-
+-
+-def athena_aws_verified(func):
+-    """
+-    Function that is verified to work against AWS.
+-    Can be run against AWS at any time by setting:
+-      MOTO_TEST_ALLOW_AWS_REQUEST=true
+-
+-    If this environment variable is not set, the function runs in a `mock_aws` context.
+-
+-    This decorator will:
+-      - Create a bucket
+-      - Run the test and pass the bucket_name as an argument
+-      - Delete the objects and the bucket itself
+-    """
+-
+-    @wraps(func)
+-    def pagination_wrapper():
+-        bucket_name = str(uuid4())
+-
+-        allow_aws_request = (
+-            os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
+-        )
+-
+-        if allow_aws_request:
+-            resp = create_bucket_and_test(bucket_name, is_aws=True)
+-        else:
+-            with mock_aws():
+-                resp = create_bucket_and_test(bucket_name, is_aws=False)
+-        return resp
+-
+-    def create_bucket_and_test(bucket_name: str, is_aws: bool):
+-        client = boto3.client("s3", region_name=DEFAULT_REGION_NAME)
+-
+-        client.create_bucket(Bucket=bucket_name)
+-        client.put_bucket_tagging(
+-            Bucket=bucket_name,
+-            Tagging={"TagSet": [{"Key": "environment", "Value": "moto_tests"}]},
+-        )
+-        try:
+-            resp = func(bucket_name, is_aws)
+-        finally:
+-            ### CLEANUP ###
+-
+-            empty_bucket(client, bucket_name)
+-            client.delete_bucket(Bucket=bucket_name)
+-
+-        return resp
+-
+-    return pagination_wrapper
+diff --git a/tests/test_athena/test_athena_integration.py b/tests/test_athena/test_athena_integration.py
+index 6af2ffca8..e69de29bb 100644
+--- a/tests/test_athena/test_athena_integration.py
++++ b/tests/test_athena/test_athena_integration.py
+@@ -1,155 +0,0 @@
+-import json
+-from unittest import SkipTest
+-from uuid import uuid4
+-
+-import boto3
+-import pytest
+-import requests
+-
+-from moto import settings
+-from tests.test_athena import athena_aws_verified
+-
+-DATA = ""
+-DATA += json.dumps({"k1": "r1_v1", "k2": "r1_v2", "k3": 1}) + "\n"
+-DATA += json.dumps({"k1": "r2_v1", "k2": "r2_v2", "k3": 2}) + "\n"
+-DATA += json.dumps({"k1": "r3_v1", "k2": "r3_v2"})
+-
+-ROWS_DATA = [
+-    {"Data": [{"VarCharValue": "k1"}, {"VarCharValue": "k2"}, {"VarCharValue": "k3"}]},
+-    {
+-        "Data": [
+-            {"VarCharValue": "r1_v1"},
+-            {"VarCharValue": "r1_v2"},
+-            {"VarCharValue": "1"},
+-        ]
+-    },
+-    {
+-        "Data": [
+-            {"VarCharValue": "r2_v1"},
+-            {"VarCharValue": "r2_v2"},
+-            {"VarCharValue": "2"},
+-        ]
+-    },
+-    {"Data": [{"VarCharValue": "r3_v1"}, {"VarCharValue": "r3_v2"}, {}]},
+-]
+-COLUMN_INFO = [
+-    {
+-        "CatalogName": "hive",
+-        "SchemaName": "",
+-        "TableName": "",
+-        "Name": "k1",
+-        "Label": "k1",
+-        "Type": "varchar",
+-        "Precision": 2147483647,
+-        "Scale": 0,
+-        "Nullable": "UNKNOWN",
+-        "CaseSensitive": True,
+-    },
+-    {
+-        "CatalogName": "hive",
+-        "SchemaName": "",
+-        "TableName": "",
+-        "Name": "k2",
+-        "Label": "k2",
+-        "Type": "varchar",
+-        "Precision": 2147483647,
+-        "Scale": 0,
+-        "Nullable": "UNKNOWN",
+-        "CaseSensitive": True,
+-    },
+-    {
+-        "CatalogName": "hive",
+-        "SchemaName": "",
+-        "TableName": "",
+-        "Name": "k3",
+-        "Label": "k3",
+-        "Type": "integer",
+-        "Precision": 10,
+-        "Scale": 0,
+-        "Nullable": "UNKNOWN",
+-        "CaseSensitive": False,
+-    },
+-]
+-
+-
+-@athena_aws_verified
+-@pytest.mark.aws_verified
+-def test_athena_csv_result(bucket_name=None, is_aws: bool = False):
+-    if not settings.TEST_DECORATOR_MODE:
+-        raise SkipTest("No point in testing this outside of decorators")
+-
+-    s3 = boto3.client("s3", "us-east-1")
+-    s3.put_object(Bucket=bucket_name, Key="input/data1.json", Body=DATA.encode("utf-8"))
+-
+-    athena = boto3.client("athena", "us-east-1")
+-
+-    config = {"OutputLocation": f"s3://{bucket_name}/output/"}
+-    db_name = f"db_{str(uuid4())[0:6]}"
+-
+-    athena.start_query_execution(
+-        QueryString=f"create database {db_name}", ResultConfiguration=config
+-    )
+-
+-    context = {"Database": db_name}
+-    CREATE_TABLE = f"""CREATE EXTERNAL TABLE mytable (
+-k1 string,
+-k2 string,
+-k3 int
+-) 
+-ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+-STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+-OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
+-LOCATION 's3://{bucket_name}/input/'; """
+-    get_query_results(CREATE_TABLE, athena, config, context)
+-
+-    if not is_aws:
+-        athena_result = {
+-            "results": [
+-                {
+-                    "rows": ROWS_DATA,
+-                    "column_info": COLUMN_INFO,
+-                }
+-            ]
+-        }
+-        requests.post(
+-            "http://motoapi.amazonaws.com/moto-api/static/athena/query-results",
+-            json=athena_result,
+-        )
+-
+-    query_exec_id, resp = get_query_results(
+-        "SELECT * FROM mytable", athena, config, context
+-    )
+-    assert resp["ResultSet"] == {
+-        "Rows": ROWS_DATA,
+-        "ResultSetMetadata": {"ColumnInfo": COLUMN_INFO},
+-    }
+-
+-    file = s3.get_object(Bucket=bucket_name, Key=f"output/{query_exec_id}.csv")
+-    assert (
+-        file["Body"].read()
+-        == b'"k1","k2","k3"\n"r1_v1","r1_v2","1"\n"r2_v1","r2_v2","2"\n"r3_v1","r3_v2",\n'
+-    )
+-
+-    get_query_results("DROP TABLE mytable", athena, config, context)
+-
+-    get_query_results(f"DROP database {db_name}", athena, config, context)
+-
+-
+-def get_query_results(CREATE_TABLE, athena, config, context):
+-    resp = athena.start_query_execution(
+-        QueryString=CREATE_TABLE,
+-        QueryExecutionContext=context,
+-        ResultConfiguration=config,
+-    )
+-    query_execution_id = resp["QueryExecutionId"]
+-
+-    status = ""
+-    while status not in ["SUCCEEDED", "FAILED"]:
+-        resp = athena.get_query_execution(QueryExecutionId=query_execution_id)[
+-            "QueryExecution"
+-        ]
+-
+-        status = resp["Status"]["State"]
+-
+-    resp = athena.get_query_results(QueryExecutionId=query_execution_id)
+-    return query_execution_id, resp
+diff --git a/tests/test_cloudformation/__init__.py b/tests/test_cloudformation/__init__.py
+index 2dc371035..e69de29bb 100644
+--- a/tests/test_cloudformation/__init__.py
++++ b/tests/test_cloudformation/__init__.py
+@@ -1,31 +0,0 @@
+-import os
+-from functools import wraps
+-
+-from moto import mock_aws
+-
+-
+-def cloudformation_aws_verified():
+-    """
+-    Function that is verified to work against AWS.
+-    Can be run against AWS at any time by setting:
+-      MOTO_TEST_ALLOW_AWS_REQUEST=true
+-
+-    If this environment variable is not set, the function runs in a `mock_aws` context.
+-    """
+-
+-    def inner(func):
+-        @wraps(func)
+-        def pagination_wrapper():
+-            allow_aws_request = (
+-                os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
+-            )
+-
+-            if allow_aws_request:
+-                return func()
+-            else:
+-                with mock_aws():
+-                    return func()
+-
+-        return pagination_wrapper
+-
+-    return inner
+diff --git a/tests/test_cloudformation/test_cloudformation_stack_crud_boto3.py b/tests/test_cloudformation/test_cloudformation_stack_crud_boto3.py
+index cc9fa776e..4320b1126 100644
+--- a/tests/test_cloudformation/test_cloudformation_stack_crud_boto3.py
++++ b/tests/test_cloudformation/test_cloudformation_stack_crud_boto3.py
+@@ -15,8 +15,7 @@ from moto import mock_aws, settings
+ from moto.cloudformation import cloudformation_backends
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
+ from moto.utilities.distutils_version import LooseVersion
+-from tests import EXAMPLE_AMI_ID
+-from tests.test_cloudformation import cloudformation_aws_verified
++from tests import EXAMPLE_AMI_ID, aws_verified
+ 
+ TEST_STACK_NAME = "test_stack"
+ REGION_NAME = "us-east-1"
+@@ -1373,7 +1372,7 @@ def test_update_stack_deleted_resources_can_reference_deleted_resources():
+ 
+ 
+ @pytest.mark.aws_verified
+-@cloudformation_aws_verified()
++@aws_verified
+ def test_update_stack_with_previous_value():
+     name = f"update-stack-with-previous-value-{str(uuid.uuid4())[0:6]}"
+     bucket_name = str(uuid.uuid4())
+diff --git a/tests/test_cloudformation/test_conditions.py b/tests/test_cloudformation/test_conditions.py
+index 343d3403c..3135ea55b 100644
+--- a/tests/test_cloudformation/test_conditions.py
++++ b/tests/test_cloudformation/test_conditions.py
+@@ -4,7 +4,7 @@ import boto3
+ import pytest
+ from botocore.exceptions import ClientError
+ 
+-from . import cloudformation_aws_verified
++from tests import aws_verified
+ 
+ conditional_output_conditional_value = """
+ Outputs:
+@@ -38,7 +38,7 @@ Resources:
+ 
+ 
+ @pytest.mark.aws_verified
+-@cloudformation_aws_verified()
++@aws_verified
+ def test_conditional_output_conditional_value():
+     cf = boto3.client("cloudformation", region_name="us-east-1")
+     param = [{"ParameterKey": "roleName", "ParameterValue": "myrole"}]
+@@ -104,7 +104,7 @@ Resources:
+ 
+ 
+ @pytest.mark.aws_verified
+-@cloudformation_aws_verified()
++@aws_verified
+ def test_permanent_output_conditional_value():
+     cf = boto3.client("cloudformation", region_name="us-east-1")
+     param = [{"ParameterKey": "roleName", "ParameterValue": "myrole"}]
+@@ -174,7 +174,7 @@ Resources:
+ 
+ 
+ @pytest.mark.aws_verified
+-@cloudformation_aws_verified()
++@aws_verified
+ def test_conditional_output_of_permanent_value():
+     cf = boto3.client("cloudformation", region_name="us-east-1")
+     param = [{"ParameterKey": "roleName", "ParameterValue": "myrole"}]
+diff --git a/tests/test_kms/__init__.py b/tests/test_kms/__init__.py
+index 3e557fa3b..e69de29bb 100644
+--- a/tests/test_kms/__init__.py
++++ b/tests/test_kms/__init__.py
+@@ -1,28 +0,0 @@
+-import os
+-from functools import wraps
+-
+-from moto import mock_aws
+-
+-
+-def kms_aws_verified(func):
+-    """
+-    Function that is verified to work against AWS.
+-    Can be run against AWS at any time by setting:
+-      MOTO_TEST_ALLOW_AWS_REQUEST=true
+-
+-    If this environment variable is not set, the function runs in a `mock_kms` context.
+-    """
+-
+-    @wraps(func)
+-    def pagination_wrapper():
+-        allow_aws_request = (
+-            os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
+-        )
+-
+-        if allow_aws_request:
+-            return func()
+-        else:
+-            with mock_aws():
+-                return func()
+-
+-    return pagination_wrapper
+diff --git a/tests/test_kms/test_kms_encrypt.py b/tests/test_kms/test_kms_encrypt.py
+index 5994f0943..3cfc8b8cc 100644
+--- a/tests/test_kms/test_kms_encrypt.py
++++ b/tests/test_kms/test_kms_encrypt.py
+@@ -5,13 +5,13 @@ import pytest
+ from botocore.exceptions import ClientError
+ 
+ from moto import mock_aws
++from tests import aws_verified
+ 
+-from . import kms_aws_verified
+ from .test_kms_boto3 import PLAINTEXT_VECTORS, _get_encoded_value
+ 
+ 
+ @pytest.mark.aws_verified
+-@kms_aws_verified
++@aws_verified
+ def test_encrypt_key_with_empty_content():
+     client_kms = boto3.client("kms", region_name="ap-northeast-1")
+     metadata = client_kms.create_key()["KeyMetadata"]
+@@ -27,7 +27,7 @@ def test_encrypt_key_with_empty_content():
+ 
+ 
+ @pytest.mark.aws_verified
+-@kms_aws_verified
++@aws_verified
+ def test_encrypt_key_with_large_content():
+     client_kms = boto3.client("kms", region_name="ap-northeast-1")
+     metadata = client_kms.create_key()["KeyMetadata"]
+diff --git a/tests/test_ses/__init__.py b/tests/test_ses/__init__.py
+index 208c44bab..e69de29bb 100644
+--- a/tests/test_ses/__init__.py
++++ b/tests/test_ses/__init__.py
+@@ -1,29 +0,0 @@
+-import os
+-from functools import wraps
+-
+-from moto import mock_aws
+-
+-
+-def ses_aws_verified(func):
+-    """
+-    Function that is verified to work against AWS.
+-    Can be run against AWS at any time by setting:
+-      MOTO_TEST_ALLOW_AWS_REQUEST=true
+-
+-    If this environment variable is not set, the function runs in a `mock_aws` context.
+-    """
+-
+-    @wraps(func)
+-    def pagination_wrapper():
+-        allow_aws_request = (
+-            os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
+-        )
+-
+-        if allow_aws_request:
+-            resp = func()
+-        else:
+-            with mock_aws():
+-                resp = func()
+-        return resp
+-
+-    return pagination_wrapper
+diff --git a/tests/test_ses/test_ses_boto3.py b/tests/test_ses/test_ses_boto3.py
+index ffe0ab706..9c05ae908 100644
+--- a/tests/test_ses/test_ses_boto3.py
++++ b/tests/test_ses/test_ses_boto3.py
+@@ -7,8 +7,7 @@ import pytest
+ from botocore.exceptions import ClientError, ParamValidationError
+ 
+ from moto import mock_aws
+-
+-from . import ses_aws_verified
++from tests import aws_verified
+ 
+ 
+ @mock_aws
+@@ -1314,7 +1313,7 @@ def test_render_template():
+ 
+ 
+ @pytest.mark.aws_verified
+-@ses_aws_verified
++@aws_verified
+ def test_render_template__advanced():
+     conn = boto3.client("ses", region_name="us-east-1")
+ 
+diff --git a/tests/test_sqs/__init__.py b/tests/test_sqs/__init__.py
+index 5d04e1d17..e69de29bb 100644
+--- a/tests/test_sqs/__init__.py
++++ b/tests/test_sqs/__init__.py
+@@ -1,28 +0,0 @@
+-import os
+-from functools import wraps
+-
+-from moto import mock_aws
+-
+-
+-def sqs_aws_verified(func):
+-    """
+-    Function that is verified to work against AWS.
+-    Can be run against AWS at any time by setting:
+-      MOTO_TEST_ALLOW_AWS_REQUEST=true
+-
+-    If this environment variable is not set, the function runs in a `mock_aws` context.
+-    """
+-
+-    @wraps(func)
+-    def pagination_wrapper(*args, **kwargs):
+-        allow_aws_request = (
+-            os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
+-        )
+-
+-        if allow_aws_request:
+-            return func(*args, **kwargs)
+-        else:
+-            with mock_aws():
+-                return func(*args, **kwargs)
+-
+-    return pagination_wrapper
+diff --git a/tests/test_sqs/test_sqs.py b/tests/test_sqs/test_sqs.py
+index c57286b23..b6294ff82 100644
+--- a/tests/test_sqs/test_sqs.py
++++ b/tests/test_sqs/test_sqs.py
+@@ -22,8 +22,7 @@ from moto.sqs.models import (
+     Queue,
+ )
+ from moto.utilities.distutils_version import LooseVersion
+-
+-from . import sqs_aws_verified
++from tests import aws_verified
+ 
+ TEST_POLICY = """
+ {
+@@ -3337,7 +3336,7 @@ def test_fifo_dedupe_error_no_message_dedupe_id_batch():
+     )
+ 
+ 
+-@sqs_aws_verified
++@aws_verified
+ @pytest.mark.aws_verified
+ @pytest.mark.parametrize(
+     "queue_config", [{"FifoQueue": "true"}, {"FifoQueue": "true", "DelaySeconds": "10"}]
+diff --git a/tests/test_timestreamwrite/__init__.py b/tests/test_timestreamwrite/__init__.py
+index 211bde487..e69de29bb 100644
+--- a/tests/test_timestreamwrite/__init__.py
++++ b/tests/test_timestreamwrite/__init__.py
+@@ -1,29 +0,0 @@
+-import os
+-from functools import wraps
+-
+-from moto import mock_aws
+-
+-
+-def timestreamwrite_aws_verified(func):
+-    """
+-    Function that is verified to work against AWS.
+-    Can be run against AWS at any time by setting:
+-      MOTO_TEST_ALLOW_AWS_REQUEST=true
+-
+-    If this environment variable is not set, the function runs in a `mock_aws` context.
+-
+-    """
+-
+-    @wraps(func)
+-    def pagination_wrapper():
+-        allow_aws_request = (
+-            os.environ.get("MOTO_TEST_ALLOW_AWS_REQUEST", "false").lower() == "true"
+-        )
+-
+-        if allow_aws_request:
+-            return func()
+-        else:
+-            with mock_aws():
+-                return func()
+-
+-    return pagination_wrapper
+diff --git a/tests/test_timestreamwrite/test_timestreamwrite_database.py b/tests/test_timestreamwrite/test_timestreamwrite_database.py
+index a600f6dca..b29b5eebe 100644
+--- a/tests/test_timestreamwrite/test_timestreamwrite_database.py
++++ b/tests/test_timestreamwrite/test_timestreamwrite_database.py
+@@ -6,12 +6,11 @@ from botocore.exceptions import ClientError
+ 
+ from moto import mock_aws
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
+-
+-from . import timestreamwrite_aws_verified
++from tests import aws_verified
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_create_database_simple():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     db_name = "db_" + str(uuid4())[0:6]
+@@ -71,7 +70,7 @@ def test_describe_database():
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_describe_unknown_database():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     with pytest.raises(ClientError) as exc:
+diff --git a/tests/test_timestreamwrite/test_timestreamwrite_table.py b/tests/test_timestreamwrite/test_timestreamwrite_table.py
+index c94beab9b..38ddd40b8 100644
+--- a/tests/test_timestreamwrite/test_timestreamwrite_table.py
++++ b/tests/test_timestreamwrite/test_timestreamwrite_table.py
+@@ -7,12 +7,11 @@ from botocore.exceptions import ClientError
+ 
+ from moto import mock_aws, settings
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
+-
+-from . import timestreamwrite_aws_verified
++from tests import aws_verified
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_create_table():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     db_name = "db_" + str(uuid4())[0:6]
+@@ -49,7 +48,7 @@ def test_create_table():
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_create_table__with_magnetic_store_write_properties():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     db_name = "db_" + str(uuid4())[0:6]
+@@ -94,7 +93,7 @@ def test_create_table__with_magnetic_store_write_properties():
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_create_table_without_retention_properties():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     db_name = "db_" + str(uuid4())[0:6]
+@@ -150,7 +149,7 @@ def test_describe_table():
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_describe_unknown_database():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     db_name = "db_" + str(uuid4())[0:6]
+diff --git a/tests/test_timestreamwrite/test_timestreamwrite_tagging.py b/tests/test_timestreamwrite/test_timestreamwrite_tagging.py
+index f4f9c510c..5b1d01b83 100644
+--- a/tests/test_timestreamwrite/test_timestreamwrite_tagging.py
++++ b/tests/test_timestreamwrite/test_timestreamwrite_tagging.py
+@@ -4,8 +4,7 @@ import boto3
+ import pytest
+ 
+ from moto import mock_aws
+-
+-from . import timestreamwrite_aws_verified
++from tests import aws_verified
+ 
+ 
+ @mock_aws
+@@ -68,7 +67,7 @@ def test_list_tagging_for_database_with_tags():
+ 
+ 
+ @pytest.mark.aws_verified
+-@timestreamwrite_aws_verified
++@aws_verified
+ def test_tag_and_untag_database():
+     ts = boto3.client("timestream-write", region_name="us-east-1")
+     db_name = "db_" + str(uuid4())[0:6]

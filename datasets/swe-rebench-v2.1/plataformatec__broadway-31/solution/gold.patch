@@ -1,0 +1,568 @@
+diff --git a/README.md b/README.md
+index 03471b5..c10b445 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,7 @@ Documentation can be found at [https://hexdocs.pm/broadway](https://hexdocs.pm/b
+   * Back-pressure
+   * Batching
+   * Fault tolerance through restarts
+-  * Clean shutdown (TODO)
++  * Clean shutdown
+   * Rate-limiting (TODO)
+   * Partitioning (TODO)
+   * Statistics/Metrics (TODO)
+@@ -50,17 +50,19 @@ end
+             ]
+           ]
+         ],
+-        processors: [stages: 50],
+-        publishers: [
++        processors: [
++          default: [stages: 50]
++        ],
++        batchers: [
+           s3: [stages: 5, batch_size: 10]
+         ]
+       )
+     end
+ 
+-    def handle_message(message, _) do
++    def handle_message(_, message, _) do
+       message
+       |> Message.update_data(&process_data/1)
+-      |> Message.put_publisher(:s3)
++      |> Message.put_batcher(:s3)
+     end
+ 
+     def handle_batch(:s3, messages, _, _) do
+diff --git a/lib/broadway.ex b/lib/broadway.ex
+index ece729b..6cb1268 100644
+--- a/lib/broadway.ex
++++ b/lib/broadway.ex
+@@ -39,8 +39,10 @@ defmodule Broadway do
+             producers: [
+               default: [module: Counter, stages: 1]
+             ],
+-            processors: [stages: 2],
+-            publishers: [
++            processors: [
++              default: [stages: 2]
++            ],
++            batchers: [
+               sqs: [stages: 2, batch_size: 10],
+               s3: [stages: 1, batch_size: 10]
+             ]
+@@ -54,8 +56,8 @@ defmodule Broadway do
+ 
+     * 1 producer
+     * 2 processors
+-    * 1 publisher named `:sqs` with 2 consumers
+-    * 1 publisher named `:s3` with 1 consumer
++    * 1 batcher named `:sqs` with 2 consumers
++    * 1 batcher named `:s3` with 1 consumer
+ 
+   Here is how this pipeline would be represented:
+ 
+@@ -82,7 +84,7 @@ defmodule Broadway do
+   ```
+ 
+   When using Broadway, you need to implement two callbacks:
+-  `c:handle_message/2`, invoked by the processor for each message,
++  `c:handle_message/3`, invoked by the processor for each message,
+   and `c:handle_batch/4`, invoked by consumers with each batch.
+   Here is how those callbacks would be implemented:
+ 
+@@ -93,16 +95,16 @@ defmodule Broadway do
+         ...start_link...
+ 
+         @impl true
+-        def handle_message(%Message{data: data} = message, _) when is_odd(data) do
++        def handle_message(_, %Message{data: data} = message, _) when is_odd(data) do
+           message
+           |> Message.update_data(&process_data/1)
+-          |> Message.put_publisher(:sqs)
++          |> Message.put_batcher(:sqs)
+         end
+ 
+-        def handle_message(%Message{data: data} = message, _context) do
++        def handle_message(_, %Message{data: data} = message, _context) do
+           message
+           |> Message.update_data(&process_data/1)
+-          |> Message.put_publisher(:s3)
++          |> Message.put_batcher(:s3)
+         end
+ 
+         @impl true
+@@ -119,13 +121,14 @@ defmodule Broadway do
+         end
+       end
+ 
+-  The publishers usually do the job of publishing the processing
+-  results elsewhere, although that's not strictly required. For
++  The batchers generate batches of messages that will be processed
++  by the batcher's consumers. The consumers publish the results
++  elsewhere, although that's not strictly required. For
+   example, results could be processed and published per message
+-  on the `c:handle_message/2` callback too. Publishers are also
++  on the `c:handle_message/3` callback too. Publishers are also
+   responsible to inform when a message has not been successfully
+   published. You can mark a message as :failed using
+-  `Broadway.Message.failed/2` in either `c:handle_message/2`
++  `Broadway.Message.failed/2` in either `c:handle_message/3`
+   or `c:handle_batch/4`. This information will be sent back to
+   the producer which will correctly acknowledge the message.
+ 
+@@ -176,8 +179,10 @@ defmodule Broadway do
+                 transformer: {__MODULE__, :transform, []}
+               ],
+             ],
+-            processors: [stages: 10],
+-            publishers: [
++            processors: [
++              default: [stages: 10]
++            ],
++            batchers: [
+               default: [stages: 2, batch_size: 5],
+             ]
+           )
+@@ -226,11 +231,11 @@ defmodule Broadway do
+                                           |
+                                           |   (demand dispatcher)
+                                           |
+-     handle_message/2 runs here ->   [processors]
++     handle_message/3 runs here ->   [processors]
+                                          / \
+                                         /   \   (partition dispatcher)
+                                        /     \
+-                                 [batcher]   [batcher]   <- one for each publisher key
++                                 [batcher]   [batcher]   <- one for each batcher key
+                                      |           |
+                                      |           |   (demand dispatcher)
+                                      |           |
+@@ -243,9 +248,9 @@ defmodule Broadway do
+       the user. It serves as the source of the pipeline.
+     * `Broadway.Processor` - This is where messages are processed, e.g. do
+       calculations, convert data into a custom json format etc. Here is where
+-      the code from `handle_message/2` runs.
++      the code from `handle_message/3` runs.
+     * `Broadway.Batcher` - Creates batches of messages based on the
+-      publisher's key. One Batcher for each key will be created.
++      batcher's key. One Batcher for each key will be created.
+     * `Broadway.Consumer` - This is where the code from `handle_batch/4` runs.
+ 
+   ### Fault-tolerance
+@@ -285,7 +290,7 @@ defmodule Broadway do
+ 
+   Another part of Broadway fault-tolerance comes from the fact the
+   callbacks are stateless, which allows us to provide back-off in
+-  processors and publishers out of the box.
++  processors and batchers out of the box.
+ 
+   Finally, Broadway guarantees proper shutdown of the supervision
+   tree, making sure that processes only terminate after all of the
+@@ -302,49 +307,51 @@ defmodule Broadway do
+   logic to do calculations. Basically, any CPU bounded task that runs against
+   a single message should be processed here.
+ 
++    * `processor`  is the key that defined the processor.
+     * `message` is the message to be processed.
+     * `context` is the user defined data structure passed to `start_link/3`.
+ 
+   In order to update the data after processing, use the `update_data/2` function.
+-  This way the new message can be properly forwared and handled by the publisher:
++  This way the new message can be properly forwared and handled by the batcher:
+ 
+       @impl true
+-      def handle_message(message, _) do
++      def handle_message(_, message, _) do
+         message
+         |> update_data(&do_calculation_and_returns_the_new_data/1)
+       end
+ 
+-  In case more than one publisher have been defined in the configuration,
++  In case more than one batcher have been defined in the configuration,
+   you need to specify which of them the resulting message will be forwarded
+-  to. You can do this by calling `put_publisher/2` and returning the new
++  to. You can do this by calling `put_batcher/2` and returning the new
+   updated message:
+ 
+       @impl true
+-      def handle_message(message, _) do
++      def handle_message(_, message, _) do
+         # Do whatever you need with the data
+         ...
+ 
+         message
+-        |> put_publisher(:s3)
++        |> put_batcher(:s3)
+       end
+ 
+   """
+-  @callback handle_message(message :: Message.t(), context :: any) :: Message.t()
++  @callback handle_message(processor :: atom, message :: Message.t(), context :: any) ::
++              Message.t()
+ 
+   @doc """
+   Invoked to handle generated batches.
+ 
+-    * `publisher` is the key that defined the publisher. All messages
++    * `batcher` is the key that defined the batcher. All messages
+       will be grouped as batches and then forwarded to this callback
+-      based on this key. This value can be set in the `handle_message/2`
+-      callback using `put_publisher/2`.
++      based on this key. This value can be set in the `handle_message/3`
++      callback using `put_batcher/2`.
+     * `messages` is the list of messages of the incoming batch.
+     * `bach_info` is a struct containing extra information about the incoming batch.
+     * `context` is the user defined data structure passed to `start_link/3`.
+ 
+   """
+   @callback handle_batch(
+-              publisher :: atom,
++              batcher :: atom,
+               messages :: [Message.t()],
+               batch_info :: BatchInfo.t(),
+               context :: any
+@@ -391,15 +398,16 @@ defmodule Broadway do
+       where the key is an atom as identifier and the value is another
+       keyword list of options. See "Producers options" section below.
+ 
+-    * `:processors` - Required. A keyword list of options that apply to
+-      all processors. See "Processors options" section below.
++    * `:processors` - Required. A keyword list of named processors
++      where the key is an atom as identifier and the value is another
++      keyword list of options. See "Processors options" section below.
+ 
+-    * `:publishers` - Required. Defines a keyword list of named publishers
++    * `:batchers` - Required. Defines a keyword list of named batchers
+       where the key is an atom as identifier and the value is another
+       keyword list of options. See "Consumers options" section below.
+ 
+     * `:context` - Optional. An immutable user defined data structure that will
+-      be passed to `handle_message/2` and `handle_batch/4`.
++      be passed to `handle_message/3` and `handle_batch/4`.
+ 
+     * `:shutdown` - Optional. The time in miliseconds given for Broadway to
+       gracefuly shutdown without losing events. Defaults to `5_000`(ms).
+@@ -436,13 +444,13 @@ defmodule Broadway do
+     * `:max_demand` - Optional. Set the maximum demand of all processors
+       stages. Default value is `10`.
+ 
+-  ### Publishers options
++  ### Batchers options
+ 
+     * `:stages` - Optional. The number of stages that will be created by
+-      Broadway. Use this option to control the concurrency level of the
+-      publishers. Note that this only sets the numbers of consumers for
+-      each prublisher group, not the number of batchers. The number of
+-      batchers will always be one for each publisher key defined.
++      Broadway. Use this option to control the concurrency level.
++      Note that this only sets the numbers of consumers for
++      each batcher group, not the number of batchers. The number of
++      batchers will always be one for each batcher key defined.
+       The default value is `1`.
+ 
+     * `:batch_size` - Optional. The size of the generated batches.
+@@ -489,12 +497,14 @@ defmodule Broadway do
+         required: true,
+         type: :keyword_list,
+         keys: [
+-          stages: [type: :pos_integer, default: System.schedulers_online() * 2],
+-          min_demand: [type: :non_neg_integer],
+-          max_demand: [type: :non_neg_integer, default: 10]
++          *: [
++            stages: [type: :pos_integer, default: System.schedulers_online() * 2],
++            min_demand: [type: :non_neg_integer],
++            max_demand: [type: :non_neg_integer, default: 10]
++          ]
+         ]
+       ],
+-      publishers: [
++      batchers: [
+         required: true,
+         type: :keyword_list,
+         keys: [
+diff --git a/lib/broadway/batch_info.ex b/lib/broadway/batch_info.ex
+index 1be6032..3a6761d 100644
+--- a/lib/broadway/batch_info.ex
++++ b/lib/broadway/batch_info.ex
+@@ -8,12 +8,12 @@ defmodule Broadway.BatchInfo do
+   """
+ 
+   @type t :: %__MODULE__{
+-          publisher_key: atom,
+-          batcher: pid
++          batcher_key: atom,
++          batcher_pid: pid
+         }
+ 
+   defstruct [
+-    :publisher_key,
+-    :batcher
++    :batcher_key,
++    :batcher_pid
+   ]
+ end
+diff --git a/lib/broadway/batcher.ex b/lib/broadway/batcher.ex
+index 4367b8c..6dd13cb 100644
+--- a/lib/broadway/batcher.ex
++++ b/lib/broadway/batcher.ex
+@@ -14,17 +14,17 @@ defmodule Broadway.Batcher do
+   @impl true
+   def init(args) do
+     Process.put(@all_batches, %{})
+-    publisher_key = args[:publisher_key]
++    batcher_key = args[:batcher_key]
+ 
+     state = %{
+-      publisher_key: publisher_key,
++      batcher_key: batcher_key,
+       batch_size: args[:batch_size],
+       batch_timeout: args[:batch_timeout]
+     }
+ 
+     Broadway.Subscriber.init(
+       args[:processors],
+-      [partition: publisher_key, max_demand: args[:batch_size]],
++      [partition: batcher_key, max_demand: args[:batch_size]],
+       state,
+       args
+     )
+@@ -160,8 +160,8 @@ defmodule Broadway.Batcher do
+   end
+ 
+   defp wrap_for_delivery(reversed_events, state) do
+-    %{publisher_key: publisher_key} = state
+-    batch_info = %BatchInfo{publisher_key: publisher_key, batcher: self()}
++    %{batcher_key: batcher_key} = state
++    batch_info = %BatchInfo{batcher_key: batcher_key, batcher_pid: self()}
+     {Enum.reverse(reversed_events), batch_info}
+   end
+ end
+diff --git a/lib/broadway/consumer.ex b/lib/broadway/consumer.ex
+index ca171dc..08344e7 100644
+--- a/lib/broadway/consumer.ex
++++ b/lib/broadway/consumer.ex
+@@ -28,21 +28,21 @@ defmodule Broadway.Consumer do
+   @impl true
+   def handle_events(events, _from, state) do
+     [{messages, batch_info}] = events
+-    %Broadway.BatchInfo{publisher_key: publisher_key} = batch_info
++    %Broadway.BatchInfo{batcher_key: batcher_key} = batch_info
+ 
+     {successful_messages, failed_messages} =
+-      handle_batch(publisher_key, messages, batch_info, state)
++      handle_batch(batcher_key, messages, batch_info, state)
+       |> Enum.split_with(&(&1.status == :ok))
+ 
+     Acknowledger.ack_messages(successful_messages, failed_messages)
+     {:noreply, [], state}
+   end
+ 
+-  defp handle_batch(publisher_key, messages, batch_info, state) do
++  defp handle_batch(batcher_key, messages, batch_info, state) do
+     %{module: module, context: context} = state
+ 
+     try do
+-      module.handle_batch(publisher_key, messages, batch_info, context)
++      module.handle_batch(batcher_key, messages, batch_info, context)
+     rescue
+       e ->
+         error_message = Exception.message(e)
+diff --git a/lib/broadway/message.ex b/lib/broadway/message.ex
+index c0c293d..f1a7f9f 100644
+--- a/lib/broadway/message.ex
++++ b/lib/broadway/message.ex
+@@ -5,7 +5,7 @@ defmodule Broadway.Message do
+   A message is first created by the producers. Once created,
+   the message is sent downstream and gets updated multiple
+   times, either by the module implementing the `Broadway`
+-  behaviour through the `c:Broadway.handle_message/2` callback
++  behaviour through the `c:Broadway.handle_message/3` callback
+   or internaly by one of the built-in stages of Broadway.
+ 
+   In order to manipulate a message, you should use one of
+@@ -17,20 +17,20 @@ defmodule Broadway.Message do
+   @type t :: %Message{
+           data: any,
+           acknowledger: {module, data :: any},
+-          publisher: atom,
++          batcher: atom,
+           status: :ok | {:failed, reason :: binary}
+         }
+ 
+   @enforce_keys [:data, :acknowledger]
+   defstruct data: nil,
+             acknowledger: nil,
+-            publisher: :default,
++            batcher: :default,
+             status: :ok
+ 
+   @doc """
+   Updates the data from a message.
+ 
+-  This function is usually used inside the `handle_message/2` implementation
++  This function is usually used inside the `handle_message/3` implementation
+   in order to replace the data with the new processed data.
+   """
+   @spec update_data(message :: Message.t(), fun :: (any -> any)) :: Message.t()
+@@ -39,11 +39,11 @@ defmodule Broadway.Message do
+   end
+ 
+   @doc """
+-  Defines the target publisher which the message should be forwarded to.
++  Defines the target batcher which the message should be forwarded to.
+   """
+-  @spec put_publisher(message :: Message.t(), publisher :: atom) :: Message.t()
+-  def put_publisher(%Message{} = message, publisher) when is_atom(publisher) do
+-    %Message{message | publisher: publisher}
++  @spec put_batcher(message :: Message.t(), batcher :: atom) :: Message.t()
++  def put_batcher(%Message{} = message, batcher) when is_atom(batcher) do
++    %Message{message | batcher: batcher}
+   end
+ 
+   @doc """
+diff --git a/lib/broadway/processor.ex b/lib/broadway/processor.ex
+index 21049be..c5d50b2 100644
+--- a/lib/broadway/processor.ex
++++ b/lib/broadway/processor.ex
+@@ -11,13 +11,14 @@ defmodule Broadway.Processor do
+ 
+   @impl true
+   def init(args) do
+-    processors_config = args[:processors_config]
++    processor_config = args[:processor_config]
++    processor_key = args[:processor_key]
+     context = args[:context]
+-    state = %{module: args[:module], context: context}
++    state = %{module: args[:module], context: context, processor_key: processor_key}
+ 
+     Broadway.Subscriber.init(
+       args[:producers],
+-      Keyword.take(processors_config, [:min_demand, :max_demand]),
++      Keyword.take(processor_config, [:min_demand, :max_demand]),
+       state,
+       args
+     )
+@@ -37,10 +38,10 @@ defmodule Broadway.Processor do
+   end
+ 
+   defp handle_message(message, state) do
+-    %{module: module, context: context} = state
++    %{module: module, context: context, processor_key: processor_key} = state
+ 
+     try do
+-      module.handle_message(message, context)
++      module.handle_message(processor_key, message, context)
+     rescue
+       e ->
+         error_message = Exception.message(e)
+diff --git a/lib/broadway/server.ex b/lib/broadway/server.ex
+index 87d174c..1a43f31 100644
+--- a/lib/broadway/server.ex
++++ b/lib/broadway/server.ex
+@@ -69,7 +69,7 @@ defmodule Broadway.Server do
+       module: module,
+       processors_config: opts[:processors],
+       producers_config: opts[:producers],
+-      publishers_config: opts[:publishers],
++      batchers_config: opts[:batchers],
+       context: opts[:context],
+       terminator: :"#{opts[:name]}.Terminator",
+       max_restarts: opts[:max_restarts],
+@@ -117,20 +117,26 @@ defmodule Broadway.Server do
+       module: module,
+       processors_config: processors_config,
+       context: context,
+-      publishers_config: publishers_config,
++      batchers_config: batchers_config,
+       resubscribe_interval: resubscribe_interval,
+       terminator: terminator
+     } = config
+ 
+-    n_processors = processors_config[:stages]
++    [{key, processor_config} | other_processors] = processors_config
++
++    if other_processors != [] do
++      raise "Only one set of processors is allowed for now"
++    end
++
++    n_processors = processor_config[:stages]
+ 
+     names =
+       for index <- 1..n_processors do
+-        process_name(broadway_name, "Processor", index)
++        process_name(broadway_name, "Processor_#{key}", index)
+       end
+ 
+-    partitions = Keyword.keys(publishers_config)
+-    dispatcher = {GenStage.PartitionDispatcher, partitions: partitions, hash: &{&1, &1.publisher}}
++    partitions = Keyword.keys(batchers_config)
++    dispatcher = {GenStage.PartitionDispatcher, partitions: partitions, hash: &{&1, &1.batcher}}
+ 
+     args = [
+       type: :producer_consumer,
+@@ -139,7 +145,8 @@ defmodule Broadway.Server do
+       module: module,
+       context: context,
+       dispatcher: dispatcher,
+-      processors_config: processors_config,
++      processor_key: key,
++      processor_config: processor_config,
+       producers: producers
+     ]
+ 
+@@ -158,11 +165,11 @@ defmodule Broadway.Server do
+ 
+   defp build_batchers_consumers_supervisors_specs(config, processors) do
+     names_and_specs =
+-      for {key, _} = publisher_config <- config.publishers_config do
+-        {batcher, batcher_spec} = build_batcher_spec(config, publisher_config, processors)
++      for {key, _} = batcher_config <- config.batchers_config do
++        {batcher, batcher_spec} = build_batcher_spec(config, batcher_config, processors)
+ 
+         {consumers_names, consumers_specs} =
+-          build_consumers_specs(config, publisher_config, batcher)
++          build_consumers_specs(config, batcher_config, batcher)
+ 
+         children = [
+           batcher_spec,
+@@ -176,9 +183,9 @@ defmodule Broadway.Server do
+     {Enum.concat(names), specs}
+   end
+ 
+-  defp build_batcher_spec(config, publisher_config, processors) do
++  defp build_batcher_spec(config, batcher_config, processors) do
+     %{terminator: terminator} = config
+-    {key, options} = publisher_config
++    {key, options} = batcher_config
+     name = process_name(config.name, "Batcher", key)
+ 
+     args =
+@@ -186,7 +193,7 @@ defmodule Broadway.Server do
+         type: :producer_consumer,
+         resubscribe: :never,
+         terminator: terminator,
+-        publisher_key: key,
++        batcher_key: key,
+         processors: processors
+       ] ++ options
+ 
+@@ -200,7 +207,7 @@ defmodule Broadway.Server do
+     {name, spec}
+   end
+ 
+-  defp build_consumers_specs(config, publisher_config, batcher) do
++  defp build_consumers_specs(config, batcher_config, batcher) do
+     %{
+       name: broadway_name,
+       module: module,
+@@ -208,7 +215,7 @@ defmodule Broadway.Server do
+       terminator: terminator
+     } = config
+ 
+-    {key, options} = publisher_config
++    {key, options} = batcher_config
+     n_consumers = options[:stages]
+ 
+     names =

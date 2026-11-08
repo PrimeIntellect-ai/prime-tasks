@@ -1,0 +1,119 @@
+diff --git a/internal/hcops/server_test.go b/internal/hcops/server_test.go
+index 22de059d..219a1c0c 100644
+--- a/internal/hcops/server_test.go
++++ b/internal/hcops/server_test.go
+@@ -1,17 +1,24 @@
+ package hcops_test
+ 
+ import (
++	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"net"
++	"net/http"
++	"net/http/httptest"
+ 	"testing"
+ 	"time"
+ 
++	_ "github.com/hetznercloud/hcloud-cloud-controller-manager/hcloud"
+ 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
+ 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/mocks"
+ 	"github.com/hetznercloud/hcloud-go/hcloud"
++	"github.com/hetznercloud/hcloud-go/hcloud/schema"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/mock"
++	cloudprovider "k8s.io/cloud-provider"
+ )
+ 
+ func TestAllServersCache_CacheMiss(t *testing.T) {
+@@ -71,6 +78,89 @@ func TestAllServersCache_CacheHit(t *testing.T) {
+ 	runAllServersCacheTests(t, "Cache hit", tmpl, cacheOps)
+ }
+ 
++func TestCreateRouteRecoversWhenCachedServerLacksNetwork(t *testing.T) {
++	serverListRequests := 0
++	mux := http.NewServeMux()
++	mux.HandleFunc("/servers", func(w http.ResponseWriter, r *http.Request) {
++		serverListRequests++
++		var servers []schema.Server
++		switch serverListRequests {
++		case 1: // Cloud initialization is unrelated to the route cache.
++		case 2: // The initial route lookup sees stale data.
++			servers = []schema.Server{{ID: 1, Name: "node15"}}
++		default: // Refreshed data includes the configured private network.
++			servers = []schema.Server{{
++				ID:   1,
++				Name: "node15",
++				PrivateNet: []schema.ServerPrivateNet{{
++					Network: 1,
++					IP:      "10.0.0.2",
++				}},
++			}}
++		}
++		_ = json.NewEncoder(w).Encode(schema.ServerListResponse{Servers: servers})
++	})
++	mux.HandleFunc("/servers/1", func(w http.ResponseWriter, r *http.Request) {
++		serverListRequests++
++		server := schema.Server{ID: 1, Name: "node15"}
++		if serverListRequests > 2 {
++			server.PrivateNet = []schema.ServerPrivateNet{{Network: 1, IP: "10.0.0.2"}}
++		}
++		_ = json.NewEncoder(w).Encode(schema.ServerGetResponse{Server: server})
++	})
++	mux.HandleFunc("/networks", func(w http.ResponseWriter, r *http.Request) {
++		_ = json.NewEncoder(w).Encode(schema.NetworkListResponse{Networks: []schema.Network{{ID: 1, Name: "network-1", IPRange: "10.0.0.0/8"}}})
++	})
++	mux.HandleFunc("/networks/1", func(w http.ResponseWriter, r *http.Request) {
++		_ = json.NewEncoder(w).Encode(schema.NetworkGetResponse{Network: schema.Network{ID: 1, Name: "network-1", IPRange: "10.0.0.0/8"}})
++	})
++	mux.HandleFunc("/actions/1", func(w http.ResponseWriter, r *http.Request) {
++		_ = json.NewEncoder(w).Encode(schema.NetworkActionAddRouteResponse{Action: schema.Action{ID: 1, Status: "success", Progress: 100}})
++	})
++	routeAdded := false
++	mux.HandleFunc("/networks/1/actions/add_route", func(w http.ResponseWriter, r *http.Request) {
++		routeAdded = true
++		var body schema.NetworkActionAddRouteRequest
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Errorf("decode route request: %v", err)
++			return
++		}
++		if body.Gateway != "10.0.0.2" {
++			t.Errorf("route gateway = %q, want refreshed server IP", body.Gateway)
++		}
++		_ = json.NewEncoder(w).Encode(schema.NetworkActionAddRouteResponse{Action: schema.Action{ID: 1, Status: "success", Progress: 100}})
++	})
++	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		t.Logf("unhandled mock API request: %s %s", r.Method, r.URL.String())
++		http.NotFound(w, r)
++	})
++	server := httptest.NewServer(mux)
++	defer server.Close()
++
++	t.Setenv("HCLOUD_TOKEN", "0123456789012345678901234567890123456789012345678901234567890123")
++	t.Setenv("HCLOUD_ENDPOINT", server.URL)
++	t.Setenv("HCLOUD_NETWORK", "1")
++	t.Setenv("NODE_NAME", "node15")
++
++	provider, err := cloudprovider.GetCloudProvider("hcloud", nil)
++	if err != nil {
++		t.Fatalf("create cloud provider: %v", err)
++	}
++	routes, ok := provider.Routes()
++	if !ok {
++		t.Fatal("route provider is unavailable")
++	}
++	err = routes.CreateRoute(context.Background(), "cluster", "route", &cloudprovider.Route{
++		Name: "route", TargetNode: "node15", DestinationCIDR: "10.5.0.0/24",
++	})
++	if err != nil {
++		t.Fatalf("create route from refreshed server data: %v", err)
++	}
++	if !routeAdded {
++		t.Fatal("route was not submitted")
++	}
++}
++
+ func TestAllServersCache_CacheRefresh(t *testing.T) {
+ 	srv := &hcloud.Server{
+ 		ID:   56789,

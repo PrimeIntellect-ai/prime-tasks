@@ -1,0 +1,317 @@
+diff --git a/patroni/config.py b/patroni/config.py
+index facf16f..d277051 100644
+--- a/patroni/config.py
++++ b/patroni/config.py
+@@ -13,6 +13,7 @@ from . import PATRONI_ENV_PREFIX
+ from .collections import CaseInsensitiveDict
+ from .dcs import ClusterConfig, Cluster
+ from .exceptions import ConfigParseError
++from .file_perm import pg_perm
+ from .postgresql.config import ConfigHandler
+ from .utils import deep_compare, parse_bool, parse_int, patch_config
+ 
+@@ -275,11 +276,13 @@ class Config(object):
+         if self._cache_needs_saving:
+             tmpfile = fd = None
+             try:
++                pg_perm.set_permissions_from_data_directory(self._data_dir)
+                 (fd, tmpfile) = tempfile.mkstemp(prefix=self.__CACHE_FILENAME, dir=self._data_dir)
+                 with os.fdopen(fd, 'w') as f:
+                     fd = None
+                     json.dump(self.dynamic_configuration, f)
+                 tmpfile = shutil.move(tmpfile, self._cache_file)
++                os.chmod(self._cache_file, pg_perm.file_create_mode)
+                 self._cache_needs_saving = False
+             except Exception:
+                 logger.exception('Exception when saving file: %s', self._cache_file)
+diff --git a/patroni/file_perm.py b/patroni/file_perm.py
+new file mode 100644
+index 0000000..ed9c4e6
+--- /dev/null
++++ b/patroni/file_perm.py
+@@ -0,0 +1,95 @@
++"""Helper object that helps with figuring out file and directory permissions based on permissions of PGDATA.
++
++:var logger: logger of this module.
++:var pg_perm: instance of the :class:`__FilePermissions` object.
++"""
++import logging
++import os
++import stat
++
++logger = logging.getLogger(__name__)
++
++
++class __FilePermissions:
++    """Helper class for managing permissions of directories and files under PGDATA.
++
++    Execute :meth:`set_permissions_from_data_directory` to figure out which permissions should be used for files and
++    directories under PGDATA based on permissions of PGDATA root directory.
++    """
++
++    # Mode mask for data directory permissions that only allows the owner to
++    # read/write directories and files -- mask 077.
++    __PG_MODE_MASK_OWNER = stat.S_IRWXG | stat.S_IRWXO
++
++    # Mode mask for data directory permissions that also allows group read/execute -- mask 027.
++    __PG_MODE_MASK_GROUP = stat.S_IWGRP | stat.S_IRWXO
++
++    # Default mode for creating directories -- mode 700.
++    __PG_DIR_MODE_OWNER = stat.S_IRWXU
++
++    # Mode for creating directories that allows group read/execute -- mode 750.
++    __PG_DIR_MODE_GROUP = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP
++
++    # Default mode for creating files -- mode 600.
++    __PG_FILE_MODE_OWNER = stat.S_IRUSR | stat.S_IWUSR
++
++    # Mode for creating files that allows group read -- mode 640.
++    __PG_FILE_MODE_GROUP = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP
++
++    def __init__(self) -> None:
++        """Create a :class:`__FilePermissions` object and set default permissions."""
++        self.__set_owner_permissions()
++        self.__set_umask()
++
++    def __set_umask(self) -> None:
++        """Set umask value based on calculations.
++
++        .. note::
++            Should only be called once either :meth:`__set_owner_permissions`
++            or :meth:`__set_group_permissions` has been executed.
++        """
++        try:
++            os.umask(self.__pg_mode_mask)
++        except Exception as e:
++            logger.error('Can not set umask to %03o: %r', self.__pg_mode_mask, e)
++
++    def __set_owner_permissions(self) -> None:
++        """Make directories/files accessible only by the owner."""
++        self.__pg_dir_create_mode = self.__PG_DIR_MODE_OWNER
++        self.__pg_file_create_mode = self.__PG_FILE_MODE_OWNER
++        self.__pg_mode_mask = self.__PG_MODE_MASK_OWNER
++
++    def __set_group_permissions(self) -> None:
++        """Make directories/files accessible by the owner and readable by group."""
++        self.__pg_dir_create_mode = self.__PG_DIR_MODE_GROUP
++        self.__pg_file_create_mode = self.__PG_FILE_MODE_GROUP
++        self.__pg_mode_mask = self.__PG_MODE_MASK_GROUP
++
++    def set_permissions_from_data_directory(self, data_dir: str) -> None:
++        """Set new permissions based on provided *data_dir*.
++
++        :param data_dir: reference to PGDATA to calculate permissions from.
++        """
++        try:
++            st = os.stat(data_dir)
++            if (st.st_mode & self.__PG_DIR_MODE_GROUP) == self.__PG_DIR_MODE_GROUP:
++                self.__set_group_permissions()
++            else:
++                self.__set_owner_permissions()
++        except Exception as e:
++            logger.error('Can not check permissions on %s: %r', data_dir, e)
++        else:
++            self.__set_umask()
++
++    @property
++    def dir_create_mode(self) -> int:
++        """Directory permissions."""
++        return self.__pg_dir_create_mode
++
++    @property
++    def file_create_mode(self) -> int:
++        """File permissions."""
++        return self.__pg_file_create_mode
++
++
++pg_perm = __FilePermissions()
+diff --git a/patroni/postgresql/config.py b/patroni/postgresql/config.py
+index 3a61a31..6d1fe38 100644
+--- a/patroni/postgresql/config.py
++++ b/patroni/postgresql/config.py
+@@ -6,14 +6,16 @@ import socket
+ import stat
+ import time
+ 
++from contextlib import contextmanager
+ from urllib.parse import urlparse, parse_qsl, unquote
+ from types import TracebackType
+-from typing import Any, Collection, Dict, List, Optional, Union, Tuple, Type, TYPE_CHECKING
++from typing import Any, Collection, Dict, Iterator, List, Optional, Union, Tuple, Type, TYPE_CHECKING
+ 
+ from .validator import recovery_parameters, transform_postgresql_parameter_value, transform_recovery_parameter_value
+ from ..collections import CaseInsensitiveDict, CaseInsensitiveSet
+ from ..dcs import Leader, Member, RemoteMember, slot_name_from_member_name
+ from ..exceptions import PatroniFatalException
++from ..file_perm import pg_perm
+ from ..utils import compare_values, parse_bool, parse_int, split_host_port, uri, validate_directory, is_subpath
+ from ..validator import IntValidator, EnumValidator
+ 
+@@ -367,6 +369,30 @@ class ConfigHandler(object):
+             configuration.append('pg_ident.conf')
+         return configuration
+ 
++    def set_file_permissions(self, filename: str) -> None:
++        """Set permissions of file *filename* according to the expected permissions if it resides under PGDATA.
++
++        .. note::
++            Do nothing if the file is not under PGDATA.
++
++        :param filename: path to a file which permissions might need to be adjusted.
++        """
++        if is_subpath(self._postgresql.data_dir, filename):
++            pg_perm.set_permissions_from_data_directory(self._postgresql.data_dir)
++            os.chmod(filename, pg_perm.file_create_mode)
++
++    @contextmanager
++    def config_writer(self, filename: str) -> Iterator[ConfigWriter]:
++        """Create :class:`ConfigWriter` object and set permissions on a *filename*.
++
++        :param filename: path to a config file.
++
++        :yields: :class:`ConfigWriter` object.
++        """
++        with ConfigWriter(filename) as writer:
++            yield writer
++        self.set_file_permissions(filename)
++
+     def save_configuration_files(self, check_custom_bootstrap: bool = False) -> bool:
+         """
+             copy postgresql.conf to postgresql.conf.backup to be able to retrieve configuration files
+@@ -380,6 +406,7 @@ class ConfigHandler(object):
+                     backup_file = os.path.join(self._postgresql.data_dir, f + '.backup')
+                     if os.path.isfile(config_file):
+                         shutil.copy(config_file, backup_file)
++                        self.set_file_permissions(backup_file)
+             except IOError:
+                 logger.exception('unable to create backup copies of configuration files')
+         return True
+@@ -393,9 +420,11 @@ class ConfigHandler(object):
+                 if not os.path.isfile(config_file):
+                     if os.path.isfile(backup_file):
+                         shutil.copy(backup_file, config_file)
++                        self.set_file_permissions(config_file)
+                     # Previously we didn't backup pg_ident.conf, if file is missing just create empty
+                     elif f == 'pg_ident.conf':
+                         open(config_file, 'w').close()
++                        self.set_file_permissions(config_file)
+         except IOError:
+             logger.exception('unable to restore configuration files from backup')
+ 
+@@ -409,7 +438,7 @@ class ConfigHandler(object):
+         if self._postgresql.enforce_hot_standby_feedback:
+             configuration['hot_standby_feedback'] = 'on'
+ 
+-        with ConfigWriter(self._postgresql_conf) as f:
++        with self.config_writer(self._postgresql_conf) as f:
+             include = self._config.get('custom_conf') or self._postgresql_base_conf_name
+             f.writeline("include '{0}'\n".format(ConfigWriter.escape(include)))
+             for name, value in sorted((configuration).items()):
+@@ -439,6 +468,7 @@ class ConfigHandler(object):
+         if not self.hba_file and not self._config.get('pg_hba'):
+             with open(self._pg_hba_conf, 'a') as f:
+                 f.write('\n{}\n'.format('\n'.join(config)))
++            self.set_file_permissions(self._pg_hba_conf)
+         return True
+ 
+     def replace_pg_hba(self) -> Optional[bool]:
+@@ -458,14 +488,14 @@ class ConfigHandler(object):
+                                   self.local_replication_address['host'], self.local_replication_address['port'],
+                                   0, socket.SOCK_STREAM, socket.IPPROTO_TCP)})
+ 
+-            with ConfigWriter(self._pg_hba_conf) as f:
++            with self.config_writer(self._pg_hba_conf) as f:
+                 for address, t in addresses.items():
+                     f.writeline((
+                         '{0}\treplication\t{1}\t{3}\ttrust\n'
+                         '{0}\tall\t{2}\t{3}\ttrust'
+                     ).format(t, self.replication['username'], self._superuser.get('username') or 'all', address))
+         elif not self.hba_file and self._config.get('pg_hba'):
+-            with ConfigWriter(self._pg_hba_conf) as f:
++            with self.config_writer(self._pg_hba_conf) as f:
+                 f.writelines(self._config['pg_hba'])
+             return True
+ 
+@@ -478,7 +508,7 @@ class ConfigHandler(object):
+         """
+ 
+         if not self.ident_file and self._config.get('pg_ident'):
+-            with ConfigWriter(self._pg_ident_conf) as f:
++            with self.config_writer(self._pg_ident_conf) as f:
+                 f.writelines(self._config['pg_ident'])
+             return True
+ 
+@@ -800,9 +830,11 @@ class ConfigHandler(object):
+         if self._postgresql.major_version >= 120000:
+             if parse_bool(recovery_params.pop('standby_mode', None)):
+                 open(self._standby_signal, 'w').close()
++                self.set_file_permissions(self._standby_signal)
+             else:
+                 self._remove_file_if_exists(self._standby_signal)
+                 open(self._recovery_signal, 'w').close()
++                self.set_file_permissions(self._recovery_signal)
+ 
+             def restart_required(name: str) -> bool:
+                 if self._postgresql.major_version >= 140000:
+@@ -813,8 +845,7 @@ class ConfigHandler(object):
+             self._current_recovery_params = CaseInsensitiveDict({n: [v, restart_required(n), self._postgresql_conf]
+                                                                  for n, v in recovery_params.items()})
+         else:
+-            with ConfigWriter(self._recovery_conf) as f:
+-                os.chmod(self._recovery_conf, stat.S_IWRITE | stat.S_IREAD)
++            with self.config_writer(self._recovery_conf) as f:
+                 self._write_recovery_params(f, recovery_params)
+ 
+     def remove_recovery_conf(self) -> None:
+@@ -843,6 +874,7 @@ class ConfigHandler(object):
+         if overwrite:
+             try:
+                 with open(self._auto_conf, 'w') as f:
++                    self.set_file_permissions(self._auto_conf)
+                     for raw_line in lines:
+                         f.write(raw_line)
+             except Exception:
+diff --git a/patroni/postgresql/slots.py b/patroni/postgresql/slots.py
+index fde81a7..6665795 100644
+--- a/patroni/postgresql/slots.py
++++ b/patroni/postgresql/slots.py
+@@ -10,6 +10,7 @@ from typing import Any, Dict, Generator, List, Optional, Union, Tuple, TYPE_CHEC
+ from .connection import get_connection_cursor
+ from .misc import format_lsn, fsync_dir
+ from ..dcs import Cluster, Leader
++from ..file_perm import pg_perm
+ from ..psycopg import OperationalError
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+@@ -471,23 +472,28 @@ class SlotsHandler(object):
+                 logger.error("Failed to copy logical slots from the %s via postgresql connection: %r", leader.name, e)
+ 
+         if copy_slots and self._postgresql.stop():
++            pg_perm.set_permissions_from_data_directory(self._postgresql.data_dir)
+             for name, value in copy_slots.items():
+-                slot_dir = os.path.join(self._postgresql.slots_handler.pg_replslot_dir, name)
++                slot_dir = os.path.join(self.pg_replslot_dir, name)
+                 slot_tmp_dir = slot_dir + '.tmp'
+                 if os.path.exists(slot_tmp_dir):
+                     shutil.rmtree(slot_tmp_dir)
+                 os.makedirs(slot_tmp_dir)
++                os.chmod(slot_tmp_dir, pg_perm.dir_create_mode)
+                 fsync_dir(slot_tmp_dir)
+-                with open(os.path.join(slot_tmp_dir, 'state'), 'wb') as f:
++                slot_filename = os.path.join(slot_tmp_dir, 'state')
++                with open(slot_filename, 'wb') as f:
++                    os.chmod(slot_filename, pg_perm.file_create_mode)
+                     f.write(value['data'])
+                     f.flush()
+                     os.fsync(f.fileno())
+                 if os.path.exists(slot_dir):
+                     shutil.rmtree(slot_dir)
+                 os.rename(slot_tmp_dir, slot_dir)
++                os.chmod(slot_dir, pg_perm.dir_create_mode)
+                 fsync_dir(slot_dir)
+                 self._logical_slots_processing_queue[name] = None
+-            fsync_dir(self._postgresql.slots_handler.pg_replslot_dir)
++            fsync_dir(self.pg_replslot_dir)
+             self._postgresql.start()
+ 
+     def schedule(self, value: Optional[bool] = None) -> None:

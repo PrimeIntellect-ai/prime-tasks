@@ -1,0 +1,305 @@
+diff --git a/src/errors/CodedTypeNotFoundError.ts b/src/errors/CodedTypeNotFoundError.ts
+index 7b0c7a7..84b7768 100644
+--- a/src/errors/CodedTypeNotFoundError.ts
++++ b/src/errors/CodedTypeNotFoundError.ts
+@@ -8,7 +8,7 @@ export class CodedTypeNotFoundError extends Error implements Annotated {
+     super(
+       `Cannot bind value set to ${foundTypes.join(
+         ','
+-      )}; must be coded (code, Coding, CodeableConcept, Quantity, CodeableReference), or the data types (string, uri).`
++      )}; must be coded (code, Coding, CodeableConcept, Quantity, CodeableReference), the data types (string, uri), or a logical model with the #can-bind characteristic.`
+     );
+   }
+ }
+diff --git a/src/export/Package.ts b/src/export/Package.ts
+index d19b25f..d695f77 100644
+--- a/src/export/Package.ts
++++ b/src/export/Package.ts
+@@ -192,6 +192,16 @@ export class Package implements Fishable {
+           if (metadata.canBeTarget === false && result.inProgress) {
+             return undefined;
+           }
++
++          metadata.canBind =
++            result.extension?.some(
++              ext => ext?.url === TYPE_CHARACTERISTICS_EXTENSION && ext?.valueCode === 'can-bind'
++            ) ?? false;
++          // if the export is still in progress, there may be unprocessed rules that make this a valid bindable type
++          // return undefined to force the metadata to come from the tank
++          if (metadata.canBeTarget === false && result.inProgress) {
++            return undefined;
++          }
+         }
+       }
+       return metadata;
+diff --git a/src/export/StructureDefinitionExporter.ts b/src/export/StructureDefinitionExporter.ts
+index 192ebda..746245e 100644
+--- a/src/export/StructureDefinitionExporter.ts
++++ b/src/export/StructureDefinitionExporter.ts
+@@ -857,7 +857,8 @@ export class StructureDefinitionExporter implements Fishable {
+             element.bindToVS(
+               vsURI,
+               rule.strength as ElementDefinitionBindingStrength,
+-              rule.sourceInfo
++              rule.sourceInfo,
++              this.fisher
+             );
+           } else if (rule instanceof ContainsRule) {
+             const isExtension =
+diff --git a/src/fhirdefs/FHIRDefinitions.ts b/src/fhirdefs/FHIRDefinitions.ts
+index fbf989a..02598dd 100644
+--- a/src/fhirdefs/FHIRDefinitions.ts
++++ b/src/fhirdefs/FHIRDefinitions.ts
+@@ -114,6 +114,7 @@ export class FHIRDefinitions extends BaseFHIRDefinitions implements Fishable {
+     const result = this.fishForFHIR(item, ...types);
+     if (result) {
+       let canBeTarget: boolean;
++      let canBind: boolean;
+       if (result.resourceType === 'StructureDefinition' && result.kind === 'logical') {
+         canBeTarget =
+           result.extension?.some((ext: any) => {
+@@ -122,6 +123,11 @@ export class FHIRDefinitions extends BaseFHIRDefinitions implements Fishable {
+               (ext?.url === LOGICAL_TARGET_EXTENSION && ext?.valueBoolean === true)
+             );
+           }) ?? false;
++        canBind =
++          result.extension?.some(
++            (ext: any) =>
++              ext?.url === TYPE_CHARACTERISTICS_EXTENSION && ext?.valueCode === 'can-bind'
++          ) ?? false;
+       }
+       return {
+         id: result.id as string,
+@@ -132,7 +138,8 @@ export class FHIRDefinitions extends BaseFHIRDefinitions implements Fishable {
+         abstract: result.abstract as boolean,
+         version: result.version as string,
+         resourceType: result.resourceType as string,
+-        canBeTarget
++        canBeTarget,
++        canBind
+       };
+     }
+   }
+diff --git a/src/fhirtypes/ElementDefinition.ts b/src/fhirtypes/ElementDefinition.ts
+index 52f3665..f9aafea 100644
+--- a/src/fhirtypes/ElementDefinition.ts
++++ b/src/fhirtypes/ElementDefinition.ts
+@@ -1623,7 +1623,8 @@ export class ElementDefinition {
+   bindToVS(
+     vsURI: string,
+     strength: ElementDefinitionBindingStrength,
+-    ruleSourceInfo?: SourceInfo
++    ruleSourceInfo?: SourceInfo,
++    fisher?: Fishable
+   ): void {
+     // Check if this is a valid type to be bound against
+     const validTypes = this.findTypesByCode(
+@@ -1635,8 +1636,19 @@ export class ElementDefinition {
+       'string',
+       'uri'
+     );
+-    if (isEmpty(validTypes)) {
+-      throw new CodedTypeNotFoundError(this.type ? this.type.map(t => t.code) : []);
++    const isBindable =
++      validTypes.length ||
++      this.type?.some(type => fisher?.fishForMetadata(type.code, Type.Logical)?.canBind);
++    if (!isBindable) {
++      if (this.type?.some(type => fisher?.fishForMetadata(type.code, Type.Logical) != null)) {
++        // Only warn if it was from a logical model that doesn't have #can-bind characteristic
++        logger.warn(
++          `Bindings can only be applied to logical model types with the #can-bind characteristic. Update the target logical model to declare the #can-bind characteristic or remove the binding from ${this.id}.`,
++          ruleSourceInfo
++        );
++      } else {
++        throw new CodedTypeNotFoundError(this.type ? this.type.map(t => t.code) : []);
++      }
+     }
+     // Check if a CodeableReference is attempting to bind directly to the concept element
+     if (
+@@ -1662,7 +1674,7 @@ export class ElementDefinition {
+     connectedElements.forEach(ce => {
+       if (vsURI == ce.binding?.valueSet) {
+         try {
+-          ce.bindToVS(vsURI, strength);
++          ce.bindToVS(vsURI, strength, null, fisher);
+         } catch (ex) {
+           // receiving a BindingStrengthError on a slice is not a problem, because
+           // it is fine if the slice has a stronger binding than the list element.
+diff --git a/src/import/FSHTank.ts b/src/import/FSHTank.ts
+index 87f8a20..1c6601c 100644
+--- a/src/import/FSHTank.ts
++++ b/src/import/FSHTank.ts
+@@ -419,82 +419,8 @@ export class FSHTank implements Fishable {
+           // Ref: https://chat.fhir.org/#narrow/stream/179177-conformance/topic/StructureDefinition.2Etype.20for.20Logical.20Models.2FCustom.20Resources/near/240488388
+           const HL7_URL = 'http://hl7.org/fhir/StructureDefinition/';
+           meta.sdType = meta.url.startsWith(HL7_URL) ? meta.url.slice(HL7_URL.length) : meta.url;
+-          meta.canBeTarget = false;
+-          if (result.characteristics.includes('can-be-target')) {
+-            meta.canBeTarget = true;
+-          } else {
+-            // * ^extension[0].url = "http://hl7.org/fhir/StructureDefinition/structuredefinition-type-characteristics"
+-            // * ^extension[0].valueCode = #can-be-target
+-            // or
+-            // * ^extension[0].url = "http://hl7.org/fhir/tools/StructureDefinition/logical-target"
+-            // * ^extension[0].valueBoolean = true
+-            // - give me every caret rule where path is empty and caretPath is extension.url or extension\[\d+\].url
+-            // - for each index, tell me what the last url is. so now we have a mapping of "index" to "url"
+-            // - filter that down to indices where the url is the one i want. so now i have the indices to check.
+-            // - now, give me every caret rule with no path, caretPath is extension.valueWhatever, and the index is in my list
+-            // - for each index, tell me what the last value is. that's the actual value.
+-            // - if one of them has The Value I Seek, then the overall condition is true
+-            // - otherwise, the overall condition is false
+-            const extensionUrlRules = result.rules.filter(rule => {
+-              return (
+-                rule instanceof CaretValueRule &&
+-                rule.path === '' &&
+-                /^extension(\[\d+\])?\.url$/.test(rule.caretPath)
+-              );
+-            }) as CaretValueRule[];
+-            const extensionUrls = new Map<number, string>();
+-            extensionUrlRules.forEach(urlRule => {
+-              const match = urlRule.caretPath.match(/^extension(\[(\d+)\])?\.url$/);
+-              if (match?.[2]) {
+-                extensionUrls.set(parseInt(match[2]), urlRule.value.toString());
+-              } else {
+-                extensionUrls.set(0, urlRule.value.toString());
+-              }
+-            });
+-            for (const [idx, url] of extensionUrls.entries()) {
+-              if (url === TYPE_CHARACTERISTICS_EXTENSION) {
+-                const caretPaths = [`extension[${idx}].valueCode`];
+-                if (idx === 0) {
+-                  caretPaths.push('extension.valueCode');
+-                }
+-                const valueRule = result.rules
+-                  .filter(rule => {
+-                    return (
+-                      rule instanceof CaretValueRule &&
+-                      rule.path === '' &&
+-                      caretPaths.includes(rule.caretPath)
+-                    );
+-                  })
+-                  .pop() as CaretValueRule;
+-                if (
+-                  valueRule &&
+-                  valueRule.value instanceof FshCode &&
+-                  valueRule.value.code === 'can-be-target'
+-                ) {
+-                  meta.canBeTarget = true;
+-                  break;
+-                }
+-              } else if (url === LOGICAL_TARGET_EXTENSION) {
+-                const caretPaths = [`extension[${idx}].valueBoolean`];
+-                if (idx === 0) {
+-                  caretPaths.push('extension.valueBoolean');
+-                }
+-                const valueRule = result.rules
+-                  .filter(rule => {
+-                    return (
+-                      rule instanceof CaretValueRule &&
+-                      rule.path === '' &&
+-                      caretPaths.includes(rule.caretPath)
+-                    );
+-                  })
+-                  .pop() as CaretValueRule;
+-                if (valueRule?.value === true) {
+-                  meta.canBeTarget = true;
+-                  break;
+-                }
+-              }
+-            }
+-          }
++          meta.canBeTarget = hasLogicalCharacteristic(result, 'can-be-target');
++          meta.canBind = hasLogicalCharacteristic(result, 'can-bind');
+         }
+       } else if (result instanceof FshValueSet || result instanceof FshCodeSystem) {
+         meta.url = getUrlFromFshDefinition(result, this.config.canonical);
+@@ -523,3 +449,76 @@ export class FSHTank implements Fishable {
+     // in order to implement the Fishable interface
+   }
+ }
++
++function hasLogicalCharacteristic(logical: Logical, code: string) {
++  if (logical.characteristics.includes(code)) {
++    return true;
++  } else {
++    // * ^extension[0].url = "http://hl7.org/fhir/StructureDefinition/structuredefinition-type-characteristics"
++    // * ^extension[0].valueCode = #can-be-target
++    // or
++    // * ^extension[0].url = "http://hl7.org/fhir/tools/StructureDefinition/logical-target"
++    // * ^extension[0].valueBoolean = true
++    // - give me every caret rule where path is empty and caretPath is extension.url or extension\[\d+\].url
++    // - for each index, tell me what the last url is. so now we have a mapping of "index" to "url"
++    // - filter that down to indices where the url is the one i want. so now i have the indices to check.
++    // - now, give me every caret rule with no path, caretPath is extension.valueWhatever, and the index is in my list
++    // - for each index, tell me what the last value is. that's the actual value.
++    // - if one of them has The Value I Seek, then the overall condition is true
++    // - otherwise, the overall condition is false
++    const extensionUrlRules = logical.rules.filter(rule => {
++      return (
++        rule instanceof CaretValueRule &&
++        rule.path === '' &&
++        /^extension(\[\d+\])?\.url$/.test(rule.caretPath)
++      );
++    }) as CaretValueRule[];
++    const extensionUrls = new Map<number, string>();
++    extensionUrlRules.forEach(urlRule => {
++      const match = urlRule.caretPath.match(/^extension(\[(\d+)\])?\.url$/);
++      if (match?.[2]) {
++        extensionUrls.set(parseInt(match[2]), urlRule.value.toString());
++      } else {
++        extensionUrls.set(0, urlRule.value.toString());
++      }
++    });
++    for (const [idx, url] of extensionUrls.entries()) {
++      if (url === TYPE_CHARACTERISTICS_EXTENSION) {
++        const caretPaths = [`extension[${idx}].valueCode`];
++        if (idx === 0) {
++          caretPaths.push('extension.valueCode');
++        }
++        const valueRule = logical.rules
++          .filter(rule => {
++            return (
++              rule instanceof CaretValueRule &&
++              rule.path === '' &&
++              caretPaths.includes(rule.caretPath)
++            );
++          })
++          .pop() as CaretValueRule;
++        if (valueRule && valueRule.value instanceof FshCode && valueRule.value.code === code) {
++          return true;
++        }
++      } else if (url === LOGICAL_TARGET_EXTENSION && code === 'can-be-target') {
++        const caretPaths = [`extension[${idx}].valueBoolean`];
++        if (idx === 0) {
++          caretPaths.push('extension.valueBoolean');
++        }
++        const valueRule = logical.rules
++          .filter(rule => {
++            return (
++              rule instanceof CaretValueRule &&
++              rule.path === '' &&
++              caretPaths.includes(rule.caretPath)
++            );
++          })
++          .pop() as CaretValueRule;
++        if (valueRule?.value === true) {
++          return true;
++        }
++      }
++    }
++  }
++  return false;
++}
+diff --git a/src/utils/Fishable.ts b/src/utils/Fishable.ts
+index c1393c4..561d0b9 100644
+--- a/src/utils/Fishable.ts
++++ b/src/utils/Fishable.ts
+@@ -25,6 +25,7 @@ export interface Metadata {
+   version?: string;
+   instanceUsage?: Instance['usage'];
+   canBeTarget?: boolean;
++  canBind?: boolean;
+ }
+ 
+ export interface Fishable {

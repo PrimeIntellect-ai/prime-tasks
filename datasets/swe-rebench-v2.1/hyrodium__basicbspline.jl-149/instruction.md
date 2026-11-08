@@ -1,0 +1,1 @@
+Add `UniformKnotVector` <: `AbstractKnotVector`

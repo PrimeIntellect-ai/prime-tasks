@@ -1,0 +1,817 @@
+diff --git a/internal/certs/certs_test.go b/internal/certs/certs_test.go
+index b51eab2..72e5fdd 100644
+--- a/internal/certs/certs_test.go
++++ b/internal/certs/certs_test.go
+@@ -15,9 +15,23 @@ limitations under the License.
+ package certs
+ 
+ import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"errors"
++	"math/big"
++	"os"
++	"os/exec"
++	"reflect"
+ 	"testing"
++	"time"
+ 
+ 	"gotest.tools/v3/assert"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+ func TestGenerateCASecret(t *testing.T) {
+@@ -26,7 +40,7 @@ func TestGenerateCASecret(t *testing.T) {
+ 	name := "ca-secret"
+ 	host := host1 + ", " + host2
+ 	cn := "www.example.com"
+-	ca_secret := GenerateSecret(name, cn, host, 0, nil)
++	ca_secret := mustGenerateSecret(t, name, cn, host, 0, nil)
+ 	data, ok := ca_secret.Data["tls.crt"]
+ 	if !ok {
+ 		t.Error("Invalid secret, tls.crt is missing")
+@@ -44,12 +58,34 @@ func TestGenerateCASecret(t *testing.T) {
+ 	assert.Equal(t, name, ca_secret.Name)
+ }
+ 
++func TestAGenerateSecretReturnsKeyGenerationError(t *testing.T) {
++	const childVariable = "SKUPPER_CERTS_KEYGEN_FAILURE_CHILD"
++	if os.Getenv(childVariable) == "1" {
++		randomReader := rand.Reader
++		rand.Reader = failingRandomReader{}
++		defer func() { rand.Reader = randomReader }()
++
++		_, err := invokeGenerateSecret("key-failure", "subject", "host", 0, nil)
++		if err == nil {
++			t.Fatal("expected key-generation failure to be returned")
++		}
++		return
++	}
++
++	command := exec.Command(os.Args[0], "-test.run=^TestAGenerateSecretReturnsKeyGenerationError$")
++	command.Env = append(os.Environ(), childVariable+"=1")
++	output, err := command.CombinedOutput()
++	if err != nil {
++		t.Fatalf("GenerateSecret did not return its key-generation error: %v\n%s", err, output)
++	}
++}
++
+ func TestGenerateSecret(t *testing.T) {
+ 	ca_cn := "www.example.com"
+-	ca_secret := GenerateSecret("test-secret", ca_cn, "134.565.56.77", 0, nil)
++	ca_secret := mustGenerateSecret(t, "test-secret", ca_cn, "134.565.56.77", 0, nil)
+ 	my_secret_cn := "www.my.example.com"
+ 	my_secret_host := "172.565.56.77"
+-	my_secret := GenerateSecret("my_secret", my_secret_cn, my_secret_host, 86400000000000 /*duration of 1 day*/, &ca_secret)
++	my_secret := mustGenerateSecret(t, "my_secret", my_secret_cn, my_secret_host, 86400000000000 /*duration of 1 day*/, ca_secret)
+ 	data, ok := my_secret.Data["tls.crt"]
+ 	if !ok {
+ 		t.Error("Invalid secret, tls.crt is missing")
+@@ -61,4 +97,72 @@ func TestGenerateSecret(t *testing.T) {
+ 
+ 	assert.Equal(t, my_secret_cn, my_cert.Subject.CommonName)
+ 	assert.Equal(t, ca_cn, my_cert.Issuer.CommonName)
++
++	// An empty CA must be reported as an error.
++	caSecret := &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{Name: "emptyCASecret"},
++		Data:       map[string][]byte{},
++		Type:       corev1.SecretTypeOpaque,
++	}
++
++	_, err = invokeGenerateSecret("test-secret", ca_cn, "134.565.56.77", 0, caSecret)
++	assert.Assert(t, err != nil, "expected an error when the CA secret contains no certificate data")
++
++	// A parseable ECDSA CA certificate paired with an RSA private key
++	// cannot sign a certificate; the generation failure must be returned.
++	keyMismatchCA := ca_secret.DeepCopy()
++	ecdsaKey, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	assert.NilError(t, keyErr)
++	caTemplate := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "mismatched-ca"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		IsCA:                  true,
++		BasicConstraintsValid: true,
++		KeyUsage:              x509.KeyUsageCertSign,
++	}
++	ecdsaDER, keyErr := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &ecdsaKey.PublicKey, ecdsaKey)
++	assert.NilError(t, keyErr)
++	keyMismatchCA.Data["tls.crt"] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ecdsaDER})
++	_, err = invokeGenerateSecret("mismatched-key", "child.example", "child.example", 0, keyMismatchCA)
++	assert.Assert(t, err != nil, "expected certificate creation failure to be returned")
++}
++
++// Call the public generator across the legacy and error-returning signatures.
++func invokeGenerateSecret(name, subject, hosts string, expiration time.Duration, ca *corev1.Secret) (any, error) {
++	outputs := reflect.ValueOf(GenerateSecret).Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject), reflect.ValueOf(hosts), reflect.ValueOf(expiration), reflect.ValueOf(ca)})
++	var generationErr error
++	if len(outputs) == 2 && !outputs[1].IsNil() {
++		generationErr = outputs[1].Interface().(error)
++	}
++	if generationErr != nil {
++		return nil, generationErr
++	}
++	return outputs[0].Interface(), nil
++}
++
++// Normalize either supported Secret result representation for subsequent test setup.
++func mustGenerateSecret(t *testing.T, name, subject, hosts string, expiration time.Duration, ca *corev1.Secret) *corev1.Secret {
++	t.Helper()
++	result, err := invokeGenerateSecret(name, subject, hosts, expiration, ca)
++	if err != nil {
++		t.Fatal(err)
++	}
++	switch secret := any(result).(type) {
++	case *corev1.Secret:
++		return secret
++	case corev1.Secret:
++		return &secret
++	default:
++		t.Fatalf("unexpected generated Secret result %T", result)
++		return nil
++	}
++}
++
++// A failing randomness source makes RSA key generation fail deterministically.
++type failingRandomReader struct{}
++
++func (failingRandomReader) Read([]byte) (int, error) {
++	return 0, errors.New("randomness unavailable")
+ }
+diff --git a/internal/kube/certificates/mgr_test.go b/internal/kube/certificates/mgr_test.go
+index c588cbd..c454b4d 100644
+--- a/internal/kube/certificates/mgr_test.go
++++ b/internal/kube/certificates/mgr_test.go
+@@ -2,6 +2,7 @@ package certificates
+ 
+ import (
+ 	"context"
++	"reflect"
+ 	"testing"
+ 	"time"
+ 
+@@ -518,9 +519,56 @@ func (c *Call) eventcount(events int) *Call {
+ 	return c
+ }
+ 
++func generateSecretCompat(name, subject, hosts string, expiration time.Duration, ca *corev1.Secret) (*corev1.Secret, error) {
++	fn := reflect.ValueOf(certs.GenerateSecret)
++	values := fn.Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject), reflect.ValueOf(hosts), reflect.ValueOf(expiration), reflect.ValueOf(ca)})
++	var err error
++	if len(values) == 2 && !values[1].IsNil() {
++		err = values[1].Interface().(error)
++	}
++	if err != nil {
++		return nil, err
++	}
++	switch value := values[0].Interface().(type) {
++	case *corev1.Secret:
++		return value, nil
++	case corev1.Secret:
++		return &value, nil
++	default:
++		panic("unexpected Secret result")
++	}
++}
++
+ func fixtureCASecret(t *testing.T, name, namespace string) *corev1.Secret {
+ 	t.Helper()
+-	secret := certs.GenerateSecret(name, "skupper test CA", "", time.Hour*8, nil)
++	secret, err := generateSecretCompat(name, "skupper test CA", "", time.Hour*8, nil)
++	if err != nil {
++		t.Error(err)
++	}
+ 	secret.Namespace = namespace
+-	return &secret
++	return secret
++}
++
++func TestCertificateManagerInvalidCA(t *testing.T) {
++	client, err := fakeclient.NewFakeClient("test", []runtime.Object{
++		secret("my-ca", "test", map[string][]byte{"tls.crt": []byte("not a certificate"), "tls.key": []byte("not a key")}, nil, nil),
++	}, []runtime.Object{
++		certificate("foo", "test", "my-ca", "my-subject", []string{"aaa"}, false, true, nil, nil),
++	}, "")
++	assert.Assert(t, err)
++	processor := watchers.NewEventProcessor("Controller", client)
++	mgr := NewCertificateManager(processor)
++	mgr.Watch(metav1.NamespaceAll)
++	stopCh := make(chan struct{})
++	defer close(stopCh)
++	processor.StartWatchers(stopCh)
++	processor.WaitForCacheSync(stopCh)
++	mgr.Recover()
++	processor.TestProcessAll()
++
++	actual, err := client.GetSkupperClient().SkupperV2alpha1().Certificates("test").Get(context.Background(), "foo", metav1.GetOptions{})
++	assert.Assert(t, err)
++	ready := meta.FindStatusCondition(actual.Status.Conditions, skupperv2alpha1.CONDITION_TYPE_READY)
++	assert.Assert(t, ready != nil, "certificate should report a Ready condition")
++	assert.Equal(t, ready.Status, metav1.ConditionFalse)
+ }
+diff --git a/internal/kube/grants/common_test.go b/internal/kube/grants/common_test.go
+index 5941350..524de5d 100644
+--- a/internal/kube/grants/common_test.go
++++ b/internal/kube/grants/common_test.go
+@@ -3,7 +3,9 @@ package grants
+ import (
+ 	"errors"
+ 	"io"
++	"reflect"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/google/uuid"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -132,10 +134,13 @@ func (*factory) grant(name string, namespace string, uid string) *v2alpha1.Acces
+ 
+ }
+ 
+-func (*factory) secret(name string, namespace string, subject string, hosts []string) *corev1.Secret {
+-	secret := certs.GenerateSecret(name, subject, strings.Join(hosts, ","), 0, nil)
++func (*factory) secret(name string, namespace string, subject string, hosts []string) (*corev1.Secret, error) {
++	secret, err := generateSecretCompat(name, subject, strings.Join(hosts, ","), 0, nil)
++	if err != nil {
++		return nil, err
++	}
+ 	secret.ObjectMeta.Namespace = namespace
+-	return &secret
++	return secret, nil
+ }
+ 
+ func (*factory) genericSecret(name string, namespace string) *corev1.Secret {
+@@ -215,3 +220,19 @@ func (*factory) addCost(link *v2alpha1.Link, cost int) *v2alpha1.Link {
+ type factory struct{}
+ 
+ var tf = &factory{}
++
++func generateSecretCompat(name, subject, hosts string, expiration time.Duration, ca *corev1.Secret) (*corev1.Secret, error) {
++	fn := reflect.ValueOf(certs.GenerateSecret)
++	values := fn.Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject), reflect.ValueOf(hosts), reflect.ValueOf(expiration), reflect.ValueOf(ca)})
++	if len(values) == 2 && !values[1].IsNil() {
++		return nil, values[1].Interface().(error)
++	}
++	switch value := values[0].Interface().(type) {
++	case *corev1.Secret:
++		return value, nil
++	case corev1.Secret:
++		return &value, nil
++	default:
++		panic("unexpected Secret result")
++	}
++}
+diff --git a/internal/kube/grants/enabled_test.go b/internal/kube/grants/enabled_test.go
+index 85a950d..a8f1545 100644
+--- a/internal/kube/grants/enabled_test.go
++++ b/internal/kube/grants/enabled_test.go
+@@ -7,6 +7,11 @@ import (
+ )
+ 
+ func Test_tlsCredentialsUpdated(t *testing.T) {
++	secret, err := tf.secret("simple", "test", "My Subject", []string{"foo.com", "bar.org"})
++	if err != nil {
++		t.Error(err)
++	}
++
+ 	var tests = []struct {
+ 		name   string
+ 		key    string
+@@ -15,7 +20,7 @@ func Test_tlsCredentialsUpdated(t *testing.T) {
+ 		{
+ 			name:   "simple",
+ 			key:    "test/simple",
+-			secret: tf.secret("simple", "test", "My Subject", []string{"foo.com", "bar.org"}),
++			secret: secret,
+ 		},
+ 		{
+ 			name:   "non tls secret",
+diff --git a/internal/kube/grants/init_test.go b/internal/kube/grants/init_test.go
+index b899a96..27c45e6 100644
+--- a/internal/kube/grants/init_test.go
++++ b/internal/kube/grants/init_test.go
+@@ -15,6 +15,14 @@ import (
+ 
+ func Test_Initialise(t *testing.T) {
+ 	grantUid := "0bde3bc8-a4a2-404a-bfbe-44fdf7bf3231"
++	myCredsSecret, err := tf.secret("my-creds", "test", "grant server", nil)
++	if err != nil {
++		t.Error(err)
++	}
++	grantSecret, err := tf.secret("skupper-grant-server", "test", "grant server", nil)
++	if err != nil {
++		t.Error(err)
++	}
+ 	var tests = []struct {
+ 		name           string
+ 		config         GrantConfig
+@@ -35,7 +43,7 @@ func Test_Initialise(t *testing.T) {
+ 				BaseUrl:              "foo:5432",
+ 				TlsCredentialsSecret: "my-creds",
+ 			},
+-			k8sObjects:     []runtime.Object{tf.secret("my-creds", "test", "grant server", nil)},
++			k8sObjects:     []runtime.Object{myCredsSecret},
+ 			expectedStatus: "OK",
+ 			expectedUrl:    "https://foo:5432/" + grantUid,
+ 		},
+@@ -48,7 +56,7 @@ func Test_Initialise(t *testing.T) {
+ 				TlsCredentialsSecret: "skupper-grant-server",
+ 			},
+ 			//add pregenerated secret as the certificate controller is not in action in this test
+-			k8sObjects: []runtime.Object{tf.pod("my-pod", "test", map[string]string{"foo": "bar"}, ref1), tf.secret("skupper-grant-server", "test", "grant server", nil)},
++			k8sObjects: []runtime.Object{tf.pod("my-pod", "test", map[string]string{"foo": "bar"}, ref1), grantSecret},
+ 			endpoint: &v2alpha1.Endpoint{
+ 				Host: "my-host",
+ 				Port: "1234",
+@@ -65,7 +73,7 @@ func Test_Initialise(t *testing.T) {
+ 				TlsCredentialsSecret: "skupper-grant-server",
+ 			},
+ 			//add pregenerated secret as the certificate controller is not in action in this test
+-			k8sObjects:     []runtime.Object{tf.secret("skupper-grant-server", "test", "grant server", nil)},
++			k8sObjects:     []runtime.Object{grantSecret},
+ 			expectedStatus: "Pending",
+ 		},
+ 	}
+diff --git a/internal/kube/grants/redeem_test.go b/internal/kube/grants/redeem_test.go
+index e0a9d88..5b3b4fb 100644
+--- a/internal/kube/grants/redeem_test.go
++++ b/internal/kube/grants/redeem_test.go
+@@ -100,6 +100,14 @@ func (t *TestTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+ }
+ 
+ func Test_handleTokenResponse(t *testing.T) {
++	myToken, err := tf.secret("my-token", "", "My Subject", nil)
++	if err != nil {
++		t.Error(err)
++	}
++	myToken1, err := tf.secret("my-token", "test", "Another Subject", nil)
++	if err != nil {
++		t.Error(err)
++	}
+ 	var tests = []struct {
+ 		name                 string
+ 		token                *v2alpha1.AccessToken
+@@ -120,7 +128,7 @@ func Test_handleTokenResponse(t *testing.T) {
+ 			token: tf.token("my-token", "test", "http://foo/xyz", "mycode", ""),
+ 			site:  tf.site("my-site", "test"),
+ 			body: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: myToken,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -145,7 +153,7 @@ func Test_handleTokenResponse(t *testing.T) {
+ 			token: tf.token("my-token", "test", "http://foo/xyz", "mycode", ""),
+ 			site:  tf.site("my-site", "test"),
+ 			body: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: myToken,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -163,7 +171,7 @@ func Test_handleTokenResponse(t *testing.T) {
+ 			token: tf.token("my-token", "test", "http://foo/xyz", "mycode", ""),
+ 			site:  tf.site("my-site", "test"),
+ 			body: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: myToken,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -174,14 +182,14 @@ func Test_handleTokenResponse(t *testing.T) {
+ 				},
+ 			},
+ 			expectedStatus:  "Controller could not create received secret: secrets \"my-token\" already exists",
+-			extraK8sObjects: []runtime.Object{tf.secret("my-token", "test", "Another Subject", nil)},
++			extraK8sObjects: []runtime.Object{myToken1},
+ 		},
+ 		{
+ 			name:  "link collision",
+ 			token: tf.token("my-token", "test", "http://foo/xyz", "mycode", ""),
+ 			site:  tf.site("my-site", "test"),
+ 			body: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: myToken,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -199,7 +207,7 @@ func Test_handleTokenResponse(t *testing.T) {
+ 			token: tf.addLinkCost(tf.token("my-token", "test", "http://foo/xyz", "mycode", ""), 10),
+ 			site:  tf.site("my-site", "test"),
+ 			body: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: myToken,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -384,7 +392,11 @@ func Test_RedeemAccessToken(t *testing.T) {
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			client, err := fake.NewFakeClient("test", []runtime.Object{tf.secret("skupper-site-ca", "test", "Test Site CA", nil)}, []runtime.Object{tf.site("my-site", "test"), tf.grant("my-grant", "test", "")}, "")
++			siteCa, err := tf.secret("skupper-site-ca", "test", "Test Site CA", nil)
++			if err != nil {
++				t.Error(err)
++			}
++			client, err := fake.NewFakeClient("test", []runtime.Object{siteCa}, []runtime.Object{tf.site("my-site", "test"), tf.grant("my-grant", "test", "")}, "")
+ 			site, err := client.GetSkupperClient().SkupperV2alpha1().Sites("test").Get(context.TODO(), "my-site", metav1.GetOptions{})
+ 			if err != nil {
+ 				t.Error(err)
+@@ -404,10 +416,14 @@ func Test_RedeemAccessToken(t *testing.T) {
+ 			server := newServer(":0", tt.scheme == "https", grants)
+ 			server.listen()
+ 			grants.setUrl(fmt.Sprintf("localhost:%d", server.port()))
++			myCreds, err := tf.secret("my-creds", "test", "grant server", []string{"localhost"})
++			if err != nil {
++				t.Error(err)
++			}
+ 			go server.serve()
+ 			defer server.stop()
+ 			if tt.scheme == "https" {
+-				secret := tf.secret("my-creds", "test", "grant server", []string{"localhost"})
++				secret := myCreds
+ 				err = server.setCertificateFromSecret(secret)
+ 				if err != nil {
+ 					t.Error(err)
+@@ -478,7 +494,10 @@ func (g *TestTokenGenerator) generate(namespace string, name string, subject str
+ 	if err != nil {
+ 		return err
+ 	}
+-	token := generator.NewCertToken(name, subject)
++	token, err := invokeNewCertToken(generator, name, subject)
++	if err != nil {
++		return err
++	}
+ 	return token.Write(writer)
+ }
+ 
+diff --git a/internal/kube/grants/server_test.go b/internal/kube/grants/server_test.go
+index f09d9a3..337d2d5 100644
+--- a/internal/kube/grants/server_test.go
++++ b/internal/kube/grants/server_test.go
+@@ -11,6 +11,10 @@ import (
+ )
+ 
+ func Test_setCertificateFromSecret(t *testing.T) {
++	simpleSecret, err := tf.secret("simple", "", "My Subject", []string{"foo.com", "bar.org"})
++	if err != nil {
++		t.Error(err)
++	}
+ 	var tests = []struct {
+ 		name             string
+ 		secret           *corev1.Secret
+@@ -20,7 +24,7 @@ func Test_setCertificateFromSecret(t *testing.T) {
+ 	}{
+ 		{
+ 			name:             "simple",
+-			secret:           tf.secret("simple", "", "My Subject", []string{"foo.com", "bar.org"}),
++			secret:           simpleSecret,
+ 			expectedSubject:  "My Subject",
+ 			expectedDNSNames: []string{"foo.com", "bar.org"},
+ 		},
+diff --git a/internal/kube/grants/tokens_test.go b/internal/kube/grants/tokens_test.go
+index 31fd239..c6abe7f 100644
+--- a/internal/kube/grants/tokens_test.go
++++ b/internal/kube/grants/tokens_test.go
+@@ -3,14 +3,21 @@ package grants
+ import (
+ 	"bytes"
+ 	"io"
++	"reflect"
+ 	"testing"
+ 
+ 	"gotest.tools/v3/assert"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	"github.com/skupperproject/skupper/pkg/apis/skupper/v2alpha1"
+ )
+ 
+ func Test_CertTokenWrite(t *testing.T) {
++	mySecret, err := tf.secret("my-token", "", "My Subject", nil)
++	if err != nil {
++		t.Error(err)
++	}
+ 	var tests = []struct {
+ 		name          string
+ 		cert          *CertToken
+@@ -20,7 +27,7 @@ func Test_CertTokenWrite(t *testing.T) {
+ 		{
+ 			name: "good",
+ 			cert: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: mySecret,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -34,7 +41,7 @@ func Test_CertTokenWrite(t *testing.T) {
+ 		{
+ 			name: "bad",
+ 			cert: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: mySecret,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -50,7 +57,7 @@ func Test_CertTokenWrite(t *testing.T) {
+ 		{
+ 			name: "later bad",
+ 			cert: &CertToken{
+-				tlsCredentials: tf.secret("my-token", "", "My Subject", nil),
++				tlsCredentials: mySecret,
+ 				links: []*v2alpha1.Link{
+ 					tf.link("my-token", "", []v2alpha1.Endpoint{
+ 						{
+@@ -87,3 +94,35 @@ func Test_CertTokenWrite(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func Test_NewCertTokenError(t *testing.T) {
++	// A CA secret that does not contain valid PEM encoded certificate data
++	// must cause certificate generation to fail, and NewCertToken must
++	// surface that failure as an error rather than panicking or exiting.
++	badCA := &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "bad-ca",
++			Namespace: "test",
++		},
++		Data: map[string][]byte{},
++	}
++	generator := &TokenGenerator{
++		namespace: "test",
++		ca:        badCA,
++		hosts:     []string{"host.example.com"},
++	}
++	_, err := invokeNewCertToken(generator, "my-token", "My Subject")
++	assert.Assert(t, err != nil, "expected an error when certificate generation fails")
++}
++
++func invokeNewCertToken(generator *TokenGenerator, name, subject string) (Token, error) {
++	outputs := reflect.ValueOf(generator.NewCertToken).Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject)})
++	var err error
++	if len(outputs) == 2 && !outputs[1].IsNil() {
++		err = outputs[1].Interface().(error)
++	}
++	if outputs[0].IsNil() {
++		return nil, err
++	}
++	return outputs[0].Interface().(Token), err
++}
+diff --git a/internal/nonkube/client/runtime/certs_test.go b/internal/nonkube/client/runtime/certs_test.go
+index 82b2564..82d94a7 100644
+--- a/internal/nonkube/client/runtime/certs_test.go
++++ b/internal/nonkube/client/runtime/certs_test.go
+@@ -5,12 +5,14 @@ import (
+ 	"io/fs"
+ 	"os"
+ 	"path"
++	"reflect"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/skupperproject/skupper/internal/certs"
+ 	"github.com/skupperproject/skupper/pkg/nonkube/api"
+ 	"gotest.tools/v3/assert"
++	corev1 "k8s.io/api/core/v1"
+ )
+ 
+ func TestTlsConfigRetriever(t *testing.T) {
+@@ -38,7 +40,10 @@ func TestTlsConfigRetriever(t *testing.T) {
+ 	t.Run("tls-config-retriever-valid-certs", func(t *testing.T) {
+ 		validity, err := time.ParseDuration("1h")
+ 		assert.Assert(t, err)
+-		ca := certs.GenerateSecret("my-ca", "my-ca", "my-ca.host", validity, nil)
++		ca, err := generateSecretCompat("my-ca", "my-ca", "my-ca.host", validity, nil)
++		if err != nil {
++			t.Error(err)
++		}
+ 
+ 		certPath := path.Join(baseCertsPath, "valid-certificate")
+ 		assert.Assert(t, os.MkdirAll(certPath, 0755))
+@@ -55,3 +60,19 @@ func TestTlsConfigRetriever(t *testing.T) {
+ 		assert.Assert(t, tlsCfg != nil)
+ 	})
+ }
++
++func generateSecretCompat(name, subject, hosts string, expiration time.Duration, ca *corev1.Secret) (*corev1.Secret, error) {
++	fn := reflect.ValueOf(certs.GenerateSecret)
++	values := fn.Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject), reflect.ValueOf(hosts), reflect.ValueOf(expiration), reflect.ValueOf(ca)})
++	if len(values) == 2 && !values[1].IsNil() {
++		return nil, values[1].Interface().(error)
++	}
++	switch value := values[0].Interface().(type) {
++	case *corev1.Secret:
++		return value, nil
++	case corev1.Secret:
++		return &value, nil
++	default:
++		panic("unexpected Secret result")
++	}
++}
+diff --git a/internal/nonkube/common/fs_config_renderer_test.go b/internal/nonkube/common/fs_config_renderer_test.go
+index 32cd0df..449040d 100644
+--- a/internal/nonkube/common/fs_config_renderer_test.go
++++ b/internal/nonkube/common/fs_config_renderer_test.go
+@@ -4,7 +4,9 @@ import (
+ 	"bytes"
+ 	"os"
+ 	"path"
++	"reflect"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/skupperproject/skupper/api/types"
+ 	"github.com/skupperproject/skupper/internal/certs"
+@@ -123,15 +125,24 @@ func compareCertificates(t *testing.T, customOutputPath string) {
+ func createInputCertificates(t *testing.T, customOutputPath string) {
+ 	// preparing certificates
+ 	fakeHosts := "10.0.0.1,10.0.0.2,fake.domain"
+-	ca := certs.GenerateSecret("fake-ca", "fake-ca", "", 0, nil)
+-	server := certs.GenerateSecret("fake-server-cert", "fake-server-cert", fakeHosts, 0, &ca)
+-	client := certs.GenerateSecret("fake-client-cert", "fake-client-cert", "", 0, &ca)
++	ca, err := generateSecretCompat("fake-ca", "fake-ca", "", 0, nil)
++	if err != nil {
++		t.Error(err)
++	}
++	server, err := generateSecretCompat("fake-server-cert", "fake-server-cert", fakeHosts, 0, ca)
++	if err != nil {
++		t.Error(err)
++	}
++	client, err := generateSecretCompat("fake-client-cert", "fake-client-cert", "", 0, ca)
++	if err != nil {
++		t.Error(err)
++	}
+ 
+ 	// paths for each provided certificate
+ 	caPath := path.Join(customOutputPath, "namespaces/default", string(api.InputIssuersPath), "skupper-site-ca")
+ 	serverPath := path.Join(customOutputPath, "namespaces/default", string(api.InputCertificatesPath), "link-access-one")
+ 	clientPath := path.Join(customOutputPath, "namespaces/default", string(api.InputCertificatesPath), "client-link-access-one")
+-	certsMap := map[string]corev1.Secret{
++	certsMap := map[string]*corev1.Secret{
+ 		caPath:     ca,
+ 		serverPath: server,
+ 		clientPath: client,
+@@ -289,3 +300,19 @@ func fakeSiteState() *api.SiteState {
+ 		ConfigMaps:      make(map[string]*corev1.ConfigMap),
+ 	}
+ }
++
++func generateSecretCompat(name, subject, hosts string, expiration time.Duration, ca *corev1.Secret) (*corev1.Secret, error) {
++	fn := reflect.ValueOf(certs.GenerateSecret)
++	values := fn.Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject), reflect.ValueOf(hosts), reflect.ValueOf(expiration), reflect.ValueOf(ca)})
++	if len(values) == 2 && !values[1].IsNil() {
++		return nil, values[1].Interface().(error)
++	}
++	switch value := values[0].Interface().(type) {
++	case *corev1.Secret:
++		return value, nil
++	case corev1.Secret:
++		return &value, nil
++	default:
++		panic("unexpected Secret result")
++	}
++}
+diff --git a/pkg/nonkube/api/token_test.go b/pkg/nonkube/api/token_test.go
+index 92cedfc..79207d8 100644
+--- a/pkg/nonkube/api/token_test.go
++++ b/pkg/nonkube/api/token_test.go
+@@ -3,10 +3,12 @@ package api
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"reflect"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/skupperproject/skupper/internal/certs"
+ 	"github.com/skupperproject/skupper/pkg/apis/skupper/v2alpha1"
+@@ -67,7 +69,7 @@ func TestCreateTokens(t *testing.T) {
+ 		{
+ 			name:         "invalid-server-cert",
+ 			ra:           fakeRouterAccessBothRoles(),
+-			serverSecret: fakeServerSecretBad(),
++			serverSecret: *fakeServerSecretBad(t),
+ 			expectedHosts: []string{
+ 				"127.0.0.1",
+ 			},
+@@ -75,7 +77,7 @@ func TestCreateTokens(t *testing.T) {
+ 		{
+ 			name:         "server-cert-no-hosts",
+ 			ra:           fakeRouterAccessBothRoles(),
+-			serverSecret: fakeServerSecret([]string{}),
++			serverSecret: *fakeServerSecret([]string{}, t),
+ 			expectedHosts: []string{
+ 				"127.0.0.1",
+ 			},
+@@ -92,7 +94,7 @@ func TestCreateTokens(t *testing.T) {
+ 		{
+ 			name:         "sans-provided-empty-server-cert",
+ 			ra:           fakeRouterAccessWithSANs("fake.host.one", "fake.host.two"),
+-			serverSecret: fakeServerSecret([]string{}),
++			serverSecret: *fakeServerSecret([]string{}, t),
+ 			expectedHosts: []string{
+ 				"127.0.0.1",
+ 				"fake.host.one",
+@@ -102,7 +104,7 @@ func TestCreateTokens(t *testing.T) {
+ 		{
+ 			name:         "sans-provided-server-cert-with-hosts",
+ 			ra:           fakeRouterAccessWithSANs("fake.host.one", "fake.host.two"),
+-			serverSecret: fakeServerSecret([]string{"server.host.one", "server.host.two"}),
++			serverSecret: *fakeServerSecret([]string{"server.host.one", "server.host.two"}, t),
+ 			expectedHosts: []string{
+ 				"127.0.0.1",
+ 				"server.host.one",
+@@ -112,7 +114,7 @@ func TestCreateTokens(t *testing.T) {
+ 		{
+ 			name:         "sans-provided-server-cert-with-hosts-and-ips",
+ 			ra:           fakeRouterAccessWithSANs("fake.host.one", "fake.host.two"),
+-			serverSecret: fakeServerSecret([]string{"server.host.one", "server.host.two", "10.0.0.1", "10.0.0.2"}),
++			serverSecret: *fakeServerSecret([]string{"server.host.one", "server.host.two", "10.0.0.1", "10.0.0.2"}, t),
+ 			expectedHosts: []string{
+ 				"127.0.0.1",
+ 				"10.0.0.1",
+@@ -125,7 +127,7 @@ func TestCreateTokens(t *testing.T) {
+ 
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+-			tokens := CreateTokens(test.ra, test.serverSecret, clientSecret)
++			tokens := invokeCreateTokens(test.ra, test.serverSecret, clientSecret)
+ 			// validate expected token count
+ 			tokensJson, _ := json.MarshalIndent(tokens, "", "  ")
+ 			assert.Equal(t, len(tokens), len(test.expectedHosts), "expected tokens for hosts: %v - got: %v", test.expectedHosts, string(tokensJson))
+@@ -162,6 +164,39 @@ func TestCreateTokens(t *testing.T) {
+ 	}
+ }
+ 
++func generateSecretForTest(name, subject, hosts string, expiration time.Duration, ca *v1.Secret) *v1.Secret {
++	outputs := reflect.ValueOf(certs.GenerateSecret).Call([]reflect.Value{reflect.ValueOf(name), reflect.ValueOf(subject), reflect.ValueOf(hosts), reflect.ValueOf(expiration), reflect.ValueOf(ca)})
++	var err error
++	if len(outputs) == 2 && !outputs[1].IsNil() {
++		err = outputs[1].Interface().(error)
++	}
++	if err != nil {
++		panic(err)
++	}
++	result := outputs[0].Interface()
++	switch secret := any(result).(type) {
++	case *v1.Secret:
++		return secret
++	case v1.Secret:
++		return &secret
++	default:
++		panic(fmt.Sprintf("unexpected generated Secret result %T", result))
++	}
++}
++
++func invokeCreateTokens(ra v2alpha1.RouterAccess, server v1.Secret, client v1.Secret) []*Token {
++	function := reflect.ValueOf(CreateTokens)
++	argument := reflect.ValueOf(server)
++	want := function.Type().In(1)
++	if want.Kind() == reflect.Ptr {
++		argument = reflect.ValueOf(&server)
++	} else if want != argument.Type() {
++		argument = argument.Convert(want)
++	}
++	results := function.Call([]reflect.Value{reflect.ValueOf(ra), argument, reflect.ValueOf(client)})
++	return results[0].Interface().([]*Token)
++}
++
+ func fakeRouterAccess() v2alpha1.RouterAccess {
+ 	var ra v2alpha1.RouterAccess
+ 	ra.Name = "fake-router-access"
+@@ -205,16 +240,16 @@ func fakeRouterAccessWithSANs(sans ...string) v2alpha1.RouterAccess {
+ 	return ra
+ }
+ 
+-func fakeServerSecretBad() v1.Secret {
+-	ca := certs.GenerateSecret("fake-ca", "fake-ca", "", 0, nil)
+-	server := certs.GenerateSecret("fake-server-cert", "fake-server-cert", "", 0, &ca)
+-	delete(server.Data, "tls.crt")
+-	return server
++func fakeServerSecretBad(t *testing.T) *v1.Secret {
++	ca := generateSecretForTest("fake-ca", "fake-ca", "", 0, nil)
++	serverCert := generateSecretForTest("fake-server-cert", "fake-server-cert", "", 0, ca)
++	delete(serverCert.Data, "tls.crt")
++	return serverCert
+ }
+ 
+-func fakeServerSecret(hosts []string) v1.Secret {
++func fakeServerSecret(hosts []string, t *testing.T) *v1.Secret {
+ 	hostsCsv := strings.Join(hosts, ",")
+-	ca := certs.GenerateSecret("fake-ca", "fake-ca", "", 0, nil)
+-	server := certs.GenerateSecret("fake-server-cert", "fake-server-cert", hostsCsv, 0, &ca)
+-	return server
++	ca := generateSecretForTest("fake-ca", "fake-ca", "", 0, nil)
++	serverCert := generateSecretForTest("fake-server-cert", "fake-server-cert", hostsCsv, 0, ca)
++	return serverCert
+ }

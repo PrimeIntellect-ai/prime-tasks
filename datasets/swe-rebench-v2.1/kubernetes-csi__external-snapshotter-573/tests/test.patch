@@ -1,0 +1,402 @@
+diff --git a/pkg/common-controller/framework_test.go b/pkg/common-controller/framework_test.go
+index 414cfcc4..5b3b88be 100644
+--- a/pkg/common-controller/framework_test.go
++++ b/pkg/common-controller/framework_test.go
+@@ -17,9 +17,16 @@ limitations under the License.
+ package common_controller
+ 
+ import (
++	"bytes"
+ 	"errors"
+ 	"fmt"
+-	"k8s.io/client-go/util/workqueue"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
+ 	"reflect"
+ 	sysruntime "runtime"
+ 	"strconv"
+@@ -29,6 +36,8 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"k8s.io/client-go/util/workqueue"
++
+ 	crdv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+ 	clientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+ 	"github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned/fake"
+@@ -727,6 +736,122 @@ func newSnapshotReactor(kubeClient *kubefake.Clientset, client *fake.Clientset,
+ 	return reactor
+ }
+ 
++func TestSnapshotControllerHTTPRoutes(t *testing.T) {
++	timeout := time.AfterFunc(90*time.Second, func() { t.Error("controller endpoint test timed out") })
++	defer timeout.Stop()
++	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/apis/snapshot.storage.k8s.io/v1/volumesnapshots":
++			fmt.Fprint(w, `{"apiVersion":"snapshot.storage.k8s.io/v1","kind":"VolumeSnapshotList","metadata":{"resourceVersion":"1"},"items":[]}`)
++		case "/apis/snapshot.storage.k8s.io/v1/volumesnapshotclasses":
++			fmt.Fprint(w, `{"apiVersion":"snapshot.storage.k8s.io/v1","kind":"VolumeSnapshotClassList","metadata":{"resourceVersion":"1"},"items":[]}`)
++		case "/apis/snapshot.storage.k8s.io/v1/volumesnapshotcontents":
++			fmt.Fprint(w, `{"apiVersion":"snapshot.storage.k8s.io/v1","kind":"VolumeSnapshotContentList","metadata":{"resourceVersion":"1"},"items":[]}`)
++		default:
++			w.WriteHeader(http.StatusNotFound)
++			fmt.Fprint(w, `{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}`)
++		}
++	}))
++	defer api.Close()
++
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("reserve an HTTP endpoint: %v", err)
++	}
++	endpoint := listener.Addr().String()
++	if err := listener.Close(); err != nil {
++		t.Fatalf("release reserved HTTP endpoint: %v", err)
++	}
++
++	config := fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: %s
++    insecure-skip-tls-verify: true
++  name: test
++contexts:
++- context:
++    cluster: test
++    user: test
++  name: test
++current-context: test
++users:
++- name: test
++  user: {}
++`, api.URL)
++	tempDir := t.TempDir()
++	kubeconfig := filepath.Join(tempDir, "kubeconfig")
++	if err := os.WriteFile(kubeconfig, []byte(config), 0600); err != nil {
++		t.Fatalf("write kubeconfig: %v", err)
++	}
++	binary := filepath.Join(tempDir, "snapshot-controller")
++	build := exec.Command("go", "build", "-o", binary, "../../cmd/snapshot-controller")
++	if output, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("build snapshot-controller: %v\n%s", err, output)
++	}
++
++	cmd := exec.Command(binary,
++		"--kubeconfig="+kubeconfig,
++		"--http-endpoint="+endpoint,
++		"--metrics-path=/snapshot-metrics",
++		"--leader-election=true")
++	var logs bytes.Buffer
++	cmd.Stdout = &logs
++	cmd.Stderr = &logs
++	if err := cmd.Start(); err != nil {
++		t.Fatalf("start snapshot-controller: %v", err)
++	}
++	defer func() {
++		_ = cmd.Process.Kill()
++		_ = cmd.Wait()
++	}()
++
++	client := &http.Client{Timeout: time.Second}
++	deadline := time.Now().Add(5 * time.Second)
++	metricsURL := "http://" + endpoint + "/snapshot-metrics"
++	var metricsBody string
++	var metricsContentType string
++	var metricsStatus int
++	for time.Now().Before(deadline) {
++		response, requestErr := client.Get(metricsURL)
++		if requestErr == nil {
++			body, readErr := io.ReadAll(response.Body)
++			response.Body.Close()
++			if readErr == nil {
++				metricsBody = string(body)
++				metricsContentType = response.Header.Get("Content-Type")
++				metricsStatus = response.StatusCode
++				if metricsStatus == http.StatusOK {
++					break
++				}
++			}
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	if metricsStatus != http.StatusOK || (!strings.Contains(metricsContentType, "text/plain") && !strings.Contains(metricsContentType, "application/openmetrics-text") && !strings.Contains(metricsContentType, "application/vnd.google.protobuf")) {
++		t.Fatalf("configured metrics endpoint did not return Prometheus exposition (status %d, content type %q, body %q); controller output: %s", metricsStatus, metricsContentType, metricsBody, logs.String())
++	}
++
++	healthURL := "http://" + endpoint + "/healthz/leader-election"
++	var healthStatus int
++	for time.Now().Before(deadline) {
++		response, requestErr := client.Get(healthURL)
++		if requestErr == nil {
++			healthStatus = response.StatusCode
++			response.Body.Close()
++			if healthStatus != http.StatusNotFound {
++				break
++			}
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	if healthStatus == http.StatusNotFound || healthStatus == 0 {
++		t.Fatalf("leader-election health endpoint was unavailable (status %d); controller output: %s", healthStatus, logs.String())
++	}
++}
++
+ func alwaysReady() bool { return true }
+ 
+ func newTestController(kubeClient kubernetes.Interface, clientset clientset.Interface,
+@@ -737,10 +862,6 @@ func newTestController(kubeClient kubernetes.Interface, clientset clientset.Inte
+ 
+ 	coreFactory := coreinformers.NewSharedInformerFactory(kubeClient, utils.NoResyncPeriodFunc())
+ 	metricsManager := metrics.NewMetricsManager()
+-	wg := &sync.WaitGroup{}
+-	wg.Add(1)
+-	metricsManager.StartMetricsEndpoint("/metrics", "localhost:0", nil, wg)
+-
+ 	ctrl := NewCSISnapshotCommonController(
+ 		clientset,
+ 		kubeClient,
+diff --git a/pkg/metrics/metrics_test.go b/pkg/metrics/metrics_test.go
+index c16fe971..9018ae7b 100644
+--- a/pkg/metrics/metrics_test.go
++++ b/pkg/metrics/metrics_test.go
+@@ -22,14 +22,18 @@ import (
+ 	"io"
+ 	"io/ioutil"
+ 	"log"
++	"net"
+ 	"net/http"
++	"os"
+ 	"reflect"
++	"runtime"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 	cmg "github.com/prometheus/client_model/go"
+ 	"github.com/prometheus/common/expfmt"
+ 	"k8s.io/apimachinery/pkg/types"
+@@ -60,35 +64,120 @@ func (s *fakeOpStatus) String() string {
+ 	return "Unknown"
+ }
+ 
+-func initMgr() (MetricsManager, *sync.WaitGroup, *http.Server) {
+-	wg := &sync.WaitGroup{}
+-	wg.Add(1)
++func initMgr() (MetricsManager, *http.Server) {
+ 	mgr := NewMetricsManager()
+-	srv, err := mgr.StartMetricsEndpoint(httpPattern, addr, nil, wg)
++	mux := http.NewServeMux()
++	err := callPrepareMetricsPath(mgr, mux, httpPattern)
+ 	if err != nil {
+ 		log.Fatalf("failed to start serving [%v]", err)
+ 	}
+-	return mgr, wg, srv
++	l, err := net.Listen("tcp", addr)
++	if err != nil {
++		log.Fatalf("failed to listen on address[%s], error[%v]", addr, err)
++	}
++	srv := &http.Server{Addr: l.Addr().String(), Handler: mux}
++	go func() {
++		if err := srv.Serve(l); err != http.ErrServerClosed {
++			log.Fatalf("failed to start endpoint at:%s/%s, error: %v", addr, httpPattern, err)
++		}
++	}()
++
++	return mgr, srv
+ }
+ 
+-func shutdown(srv *http.Server, wg *sync.WaitGroup) {
++func callPrepareMetricsPath(manager interface{}, mux *http.ServeMux, pattern string) error {
++	method := reflect.ValueOf(manager).MethodByName("PrepareMetricsPath")
++	if !method.IsValid() {
++		return fmt.Errorf("MetricsManager does not provide PrepareMetricsPath")
++	}
++	loggerType := reflect.TypeOf((*promhttp.Logger)(nil)).Elem()
++	wantInputs := []reflect.Type{reflect.TypeOf(mux), reflect.TypeOf(pattern), loggerType}
++	if method.Type().NumIn() != len(wantInputs) || method.Type().NumOut() != 1 {
++		return fmt.Errorf("PrepareMetricsPath has an unexpected signature")
++	}
++	for i, want := range wantInputs {
++		if method.Type().In(i) != want {
++			return fmt.Errorf("PrepareMetricsPath has an unexpected signature")
++		}
++	}
++	if method.Type().Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
++		return fmt.Errorf("PrepareMetricsPath must return an error")
++	}
++	result := method.Call([]reflect.Value{reflect.ValueOf(mux), reflect.ValueOf(pattern), reflect.Zero(loggerType)})[0]
++	if result.IsNil() {
++		return nil
++	}
++	return result.Interface().(error)
++}
++
++func shutdown(srv *http.Server) {
+ 	if err := srv.Shutdown(context.Background()); err != nil {
+ 		panic(err)
+ 	}
+-	wg.Wait()
++}
++
++func TestPrepareMetricsPathDoesNotStartServer(t *testing.T) {
++	if runtime.GOOS != "linux" {
++		t.Skip("process listener inspection is available on Linux")
++	}
++	before := selfListeningSocketInodes(t)
++
++	mgr := NewMetricsManager()
++	mux := http.NewServeMux()
++	if err := callPrepareMetricsPath(mgr, mux, "/metrics"); err != nil {
++		t.Fatalf("prepare metrics path: %v", err)
++	}
++	time.Sleep(100 * time.Millisecond)
++
++	after := selfListeningSocketInodes(t)
++	for inode := range after {
++		if !before[inode] {
++			t.Errorf("preparing a metrics path opened a TCP listener (socket %s)", inode)
++		}
++	}
++}
++
++func selfListeningSocketInodes(t *testing.T) map[string]bool {
++	t.Helper()
++	owned := make(map[string]bool)
++	fds, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read process file descriptors: %v", err)
++	}
++	for _, fd := range fds {
++		target, err := os.Readlink("/proc/self/fd/" + fd.Name())
++		if err == nil && strings.HasPrefix(target, "socket:[") {
++			owned[strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")] = true
++		}
++	}
++
++	listeners := make(map[string]bool)
++	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
++		contents, err := os.ReadFile(table)
++		if err != nil {
++			continue
++		}
++		for _, line := range strings.Split(string(contents), "\n")[1:] {
++			fields := strings.Fields(line)
++			if len(fields) > 9 && fields[3] == "0A" && owned[fields[9]] {
++				listeners[fields[9]] = true
++			}
++		}
++	}
++	return listeners
+ }
+ 
+ func TestNew(t *testing.T) {
+-	mgr, wg, srv := initMgr()
+-	defer shutdown(srv, wg)
++	mgr, srv := initMgr()
++	defer shutdown(srv)
+ 	if mgr == nil {
+ 		t.Errorf("failed testing new")
+ 	}
+ }
+ 
+ func TestDropNonExistingOperation(t *testing.T) {
+-	mgr, wg, srv := initMgr()
+-	defer shutdown(srv, wg)
++	mgr, srv := initMgr()
++	defer shutdown(srv)
+ 	op := OperationKey{
+ 		Name:       "drop-non-existing-operation-should-be-noop",
+ 		ResourceID: types.UID("uid"),
+@@ -97,9 +186,9 @@ func TestDropNonExistingOperation(t *testing.T) {
+ }
+ 
+ func TestRecordMetricsForNonExistingOperation(t *testing.T) {
+-	mgr, wg, srv := initMgr()
++	mgr, srv := initMgr()
+ 	srvAddr := "http://" + srv.Addr + httpPattern
+-	defer shutdown(srv, wg)
++	defer shutdown(srv)
+ 	opKey := OperationKey{
+ 		Name:       "no-metrics-should-be-recorded-as-operation-did-not-start",
+ 		ResourceID: types.UID("uid"),
+@@ -119,9 +208,9 @@ func TestRecordMetricsForNonExistingOperation(t *testing.T) {
+ }
+ 
+ func TestDropOperation(t *testing.T) {
+-	mgr, wg, srv := initMgr()
++	mgr, srv := initMgr()
+ 	srvAddr := "http://" + srv.Addr + httpPattern
+-	defer shutdown(srv, wg)
++	defer shutdown(srv)
+ 	opKey := OperationKey{
+ 		Name:       "should-have-been-dropped",
+ 		ResourceID: types.UID("uid"),
+@@ -176,9 +265,9 @@ snapshot_controller_operation_total_seconds_count{driver_name="driver",operation
+ }
+ 
+ func TestUnknownStatus(t *testing.T) {
+-	mgr, wg, srv := initMgr()
++	mgr, srv := initMgr()
+ 	srvAddr := "http://" + srv.Addr + httpPattern
+-	defer shutdown(srv, wg)
++	defer shutdown(srv)
+ 	opKey := OperationKey{
+ 		Name:       "unknown-status-operation",
+ 		ResourceID: types.UID("uid"),
+@@ -214,9 +303,9 @@ snapshot_controller_operation_total_seconds_count{driver_name="driver",operation
+ }
+ 
+ func TestRecordMetrics(t *testing.T) {
+-	mgr, wg, srv := initMgr()
++	mgr, srv := initMgr()
+ 	srvAddr := "http://" + srv.Addr + httpPattern
+-	defer shutdown(srv, wg)
++	defer shutdown(srv)
+ 	// add an operation
+ 	opKey := OperationKey{
+ 		Name:       "op1",
+@@ -284,9 +373,9 @@ snapshot_controller_operation_total_seconds_count{driver_name="driver2",operatio
+ }
+ 
+ func TestConcurrency(t *testing.T) {
+-	mgr, wg, srv := initMgr()
++	mgr, srv := initMgr()
+ 	srvAddr := "http://" + srv.Addr + httpPattern
+-	defer shutdown(srv, wg)
++	defer shutdown(srv)
+ 	success := &fakeOpStatus{
+ 		statusCode: 0,
+ 	}
+@@ -482,8 +571,8 @@ snapshot_controller_operation_total_seconds_count{driver_name="driver5",operatio
+ func TestInFlightMetric(t *testing.T) {
+ 	inFlightCheckInterval = time.Millisecond * 50
+ 
+-	mgr, wg, srv := initMgr()
+-	defer shutdown(srv, wg)
++	mgr, srv := initMgr()
++	defer shutdown(srv)
+ 	srvAddr := "http://" + srv.Addr + httpPattern
+ 
+ 	//  Start first operation, should be 1
+@@ -710,8 +799,8 @@ func containsMetrics(expectedMfs, gotMfs []*cmg.MetricFamily) bool {
+ }
+ 
+ func TestProcessStartTimeMetricExist(t *testing.T) {
+-	mgr, wg, srv := initMgr()
+-	defer shutdown(srv, wg)
++	mgr, srv := initMgr()
++	defer shutdown(srv)
+ 	metricsFamilies, err := mgr.GetRegistry().Gather()
+ 	if err != nil {
+ 		t.Fatalf("Error fetching metrics: %v", err)

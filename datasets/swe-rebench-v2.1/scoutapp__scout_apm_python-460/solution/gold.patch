@@ -1,0 +1,169 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c6ff089..066c00e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,8 +4,12 @@
+ 
+ ### Added
+ 
+-- Improved Falcon integration: tracing is automatically disabled if
+-  installation fails, and callable class-based responders are supported.
++- Improve Falcon integration: tracing is automatically disabled if
++  installation fails, track middleware, and support class-based responders
++  ([PR #453](https://github.com/scoutapp/scout_apm_python/pull/453),
++  [PR #460](https://github.com/scoutapp/scout_apm_python/pull/460)).
++- Add Hug integration
++  ([PR #460](https://github.com/scoutapp/scout_apm_python/pull/460)).
+ 
+ ### Fixed
+ 
+diff --git a/README.md b/README.md
+index b115ec1..9b3af42 100644
+--- a/README.md
++++ b/README.md
+@@ -23,6 +23,7 @@ Scout APM has integrations for the following frameworks:
+ * Falcon 2.0+
+ * Flask 0.10+
+ * Huey 2.0+
++* Hug 2.5.1+
+ * Nameko 2.0+
+ * Pyramid 1.8+
+ * RQ 1.0+
+diff --git a/src/scout_apm/falcon.py b/src/scout_apm/falcon.py
+index 30ff58a..a1b09a6 100644
+--- a/src/scout_apm/falcon.py
++++ b/src/scout_apm/falcon.py
+@@ -14,6 +14,11 @@ from scout_apm.core.web_requests import (
+     track_request_queue_time,
+ )
+ 
++try:
++    from hug.interface import HTTP as HugHTTP
++except ImportError:
++    HugHTTP = None
++
+ logger = logging.getLogger(__name__)
+ 
+ # Falcon Middleware docs:
+@@ -25,8 +30,9 @@ class ScoutMiddleware(object):
+     Falcon Middleware for integration with Scout APM.
+     """
+ 
+-    def __init__(self, config):
++    def __init__(self, config, hug_http_interface=None):
+         self.api = None
++        self.hug_http_interface = hug_http_interface
+         installed = install(config=config)
+         self._do_nothing = not installed
+ 
+@@ -38,9 +44,14 @@ class ScoutMiddleware(object):
+     def process_request(self, req, resp):
+         if self._do_nothing:
+             return
++        if self.api is None and self.hug_http_interface is not None:
++            self.api = self.hug_http_interface.falcon
+         tracked_request = TrackedRequest.instance()
+         tracked_request.is_real_request = True
+         req.context.scout_tracked_request = tracked_request
++        tracked_request.start_span(
++            operation="Middleware", should_capture_backtrace=False
++        )
+ 
+         path = req.path
+         # Falcon URL parameter values are *either* single items or lists
+@@ -98,19 +109,22 @@ class ScoutMiddleware(object):
+             # current resource but unfortunately not the method being called, hence
+             # we have to go through routing again.
+             responder, _params, _resource, _uri_template = self.api._get_responder(req)
+-            try:
+-                last_part = responder.__name__
+-            except AttributeError:
+-                last_part = req.method
+-            operation = "Controller/{}.{}.{}".format(
+-                resource.__module__, resource.__class__.__name__, last_part
+-            )
++            operation = self._name_operation(req, responder, resource)
+ 
+         span = tracked_request.start_span(
+             operation=operation, should_capture_backtrace=False
+         )
+         req.context.scout_resource_span = span
+ 
++    def _name_operation(self, req, responder, resource):
++        try:
++            last_part = responder.__name__
++        except AttributeError:
++            last_part = req.method
++        return "Controller/{}.{}.{}".format(
++            resource.__module__, resource.__class__.__name__, last_part
++        )
++
+     def process_response(self, req, resp, resource, req_succeeded):
+         tracked_request = getattr(req.context, "scout_tracked_request", None)
+         if tracked_request is None:
+@@ -131,5 +145,5 @@ class ScoutMiddleware(object):
+         span = getattr(req.context, "scout_resource_span", None)
+         if span is not None:
+             tracked_request.stop_span()
+-        else:
+-            tracked_request.finish()
++        # Stop Middleware span
++        tracked_request.stop_span()
+diff --git a/src/scout_apm/hug.py b/src/scout_apm/hug.py
+new file mode 100644
+index 0000000..d9f6721
+--- /dev/null
++++ b/src/scout_apm/hug.py
+@@ -0,0 +1,40 @@
++# coding=utf-8
++from __future__ import absolute_import, division, print_function, unicode_literals
++
++import hug
++from hug.interface import HTTP
++
++from scout_apm.falcon import ScoutMiddleware as FalconMiddleware
++
++
++class ScoutMiddleware(FalconMiddleware):
++    """
++    Hug's HTTP interface is based on Falcon. Therefore we use a subclass of our
++    Falcon integration with Hug specific extras.
++    """
++
++    def __init__(self, config, hug_http_interface):
++        super(ScoutMiddleware, self).__init__(config)
++        self.hug_http_interface = hug_http_interface
++
++    def process_request(self, req, resp):
++        if not self._do_nothing and self.api is None:
++            self.api = self.hug_http_interface.falcon
++        return super(ScoutMiddleware, self).process_request(req, resp)
++
++    def _name_operation(self, req, responder, resource):
++        if isinstance(responder, HTTP):
++            # Hug doesn't use functions but its custom callable classes
++            return "Controller/{}.{}".format(
++                responder.interface._function.__module__,
++                responder.interface._function.__name__,
++            )
++        return super(ScoutMiddleware, self)._name_operation(req, responder, resource)
++
++
++def integrate_scout(hug_module_name, config):
++    http_interface = hug.API(hug_module_name).http
++    scout_middleware = ScoutMiddleware(
++        config=config, hug_http_interface=http_interface,
++    )
++    http_interface.add_middleware(scout_middleware)
+diff --git a/tox.ini b/tox.ini
+index 2937571..3774d5c 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -51,6 +51,7 @@ deps =
+     flask
+     flask-sqlalchemy
+     huey
++    hug>=2.5.1 ; python_version >= "3.5"
+     httpretty
+     jinja2
+     nameko<3

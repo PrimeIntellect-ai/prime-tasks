@@ -1,0 +1,613 @@
+diff --git a/cmd/cmd-run.go b/cmd/cmd-run.go
+index f16380e..d2685b5 100755
+--- a/cmd/cmd-run.go
++++ b/cmd/cmd-run.go
+@@ -45,6 +45,14 @@ func RunCmd() *cobra.Command {
+ 	cmd.Flags().StringSliceP("skip-repo", "s", nil, "Skip changes on specified repositories, the name is including the owner of repository in the format \"ownerName/repoName\".")
+ 	cmd.Flags().BoolP("interactive", "i", false, "Take manual decision before committing any change. Requires git to be installed.")
+ 	cmd.Flags().BoolP("dry-run", "d", false, "Run without pushing changes or creating pull requests.")
++	cmd.Flags().StringP("conflict-strategy", "", "skip", `What should happen if the branch already exist.
++Available values:
++  skip: Skip making any changes to the existing branch and do not create a new pull request.
++  replace: Replace the existing content of the branch by force pushing any new changes, then reuse any existing pull request, or create a new one if none exist.
++`)
++	_ = cmd.RegisterFlagCompletionFunc("conflict-strategy", func(cmd *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
++		return []string{"skip", "replace"}, cobra.ShellCompDirectiveNoFileComp
++	})
+ 	cmd.Flags().StringP("author-name", "", "", "Name of the committer. If not set, the global git config setting will be used.")
+ 	cmd.Flags().StringP("author-email", "", "", "Email of the committer. If not set, the global git config setting will be used.")
+ 	configureGit(cmd)
+@@ -74,6 +82,7 @@ func run(cmd *cobra.Command, args []string) error {
+ 	dryRun, _ := flag.GetBool("dry-run")
+ 	forkMode, _ := flag.GetBool("fork")
+ 	forkOwner, _ := flag.GetString("fork-owner")
++	conflictStrategyStr, _ := flag.GetString("conflict-strategy")
+ 	authorName, _ := flag.GetString("author-name")
+ 	authorEmail, _ := flag.GetString("author-email")
+ 	strOutput, _ := flag.GetString("output")
+@@ -139,6 +148,11 @@ func run(cmd *cobra.Command, args []string) error {
+ 		return err
+ 	}
+ 
++	conflictStrategy, err := multigitter.ParseConflictStrategy(conflictStrategyStr)
++	if err != nil {
++		return err
++	}
++
+ 	// Set up signal listening to cancel the context and let started runs finish gracefully
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	c := make(chan os.Signal, 1)
+@@ -174,6 +188,7 @@ func run(cmd *cobra.Command, args []string) error {
+ 		CommitAuthor:     commitAuthor,
+ 		BaseBranch:       baseBranchName,
+ 		Assignees:        assignees,
++		ConflictStrategy: conflictStrategy,
+ 
+ 		Concurrent: concurrent,
+ 
+diff --git a/internal/git/cmdgit/git.go b/internal/git/cmdgit/git.go
+index 68e843d..2655d0a 100644
+--- a/internal/git/cmdgit/git.go
++++ b/internal/git/cmdgit/git.go
+@@ -129,8 +129,14 @@ func (g *Git) BranchExist(remoteName, branchName string) (bool, error) {
+ }
+ 
+ // Push the committed changes to the remote
+-func (g *Git) Push(remoteName string) error {
+-	cmd := exec.Command("git", "push", "--no-verify", remoteName, "HEAD")
++func (g *Git) Push(remoteName string, force bool) error {
++	args := []string{"push", "--no-verify", remoteName}
++	if force {
++		args = append(args, "--force")
++	}
++	args = append(args, "HEAD")
++
++	cmd := exec.Command("git", args...)
+ 	_, err := g.run(cmd)
+ 	return err
+ }
+diff --git a/internal/git/gogit/git.go b/internal/git/gogit/git.go
+index a350581..4314c41 100755
+--- a/internal/git/gogit/git.go
++++ b/internal/git/gogit/git.go
+@@ -186,9 +186,10 @@ func (g *Git) BranchExist(remoteName, branchName string) (bool, error) {
+ }
+ 
+ // Push the committed changes to the remote
+-func (g *Git) Push(remoteName string) error {
++func (g *Git) Push(remoteName string, force bool) error {
+ 	return g.repo.Push(&git.PushOptions{
+ 		RemoteName: remoteName,
++		Force:      force,
+ 	})
+ }
+ 
+diff --git a/internal/multigitter/run.go b/internal/multigitter/run.go
+index fb41559..b9759be 100755
+--- a/internal/multigitter/run.go
++++ b/internal/multigitter/run.go
+@@ -27,6 +27,7 @@ type VersionController interface {
+ 	GetRepositories(ctx context.Context) ([]scm.Repository, error)
+ 	CreatePullRequest(ctx context.Context, repo scm.Repository, prRepo scm.Repository, newPR scm.NewPullRequest) (scm.PullRequest, error)
+ 	GetPullRequests(ctx context.Context, branchName string) ([]scm.PullRequest, error)
++	GetOpenPullRequest(ctx context.Context, repo scm.Repository, branchName string) (scm.PullRequest, error)
+ 	MergePullRequest(ctx context.Context, pr scm.PullRequest) error
+ 	ClosePullRequest(ctx context.Context, pr scm.PullRequest) error
+ 	ForkRepository(ctx context.Context, repo scm.Repository, newOwner string) (scm.Repository, error)
+@@ -59,6 +60,8 @@ type Runner struct {
+ 	Fork      bool   // If set, create a fork and make the pull request from it
+ 	ForkOwner string // The owner of the new fork. If empty, the fork should happen on the logged in user
+ 
++	ConflictStrategy ConflictStrategy // Defines what will happen if a branch does already exist
++
+ 	Interactive bool // If set, interactive mode is activated and the user will be asked to verify every change
+ 
+ 	CreateGit func(dir string) Git
+@@ -275,17 +278,20 @@ func (r *Runner) runSingleRepo(ctx context.Context, repo scm.Repository) (scm.Pu
+ 		remoteName = "fork"
+ 	}
+ 
++	// Determine if a branch already exist and (depending on the conflict strategy) skip making changes
++	featureBranchExist := false
+ 	if !r.SkipPullRequest {
+-		featureBranchExist, err := sourceController.BranchExist(remoteName, r.FeatureBranch)
++		featureBranchExist, err = sourceController.BranchExist(remoteName, r.FeatureBranch)
+ 		if err != nil {
+ 			return nil, errors.Wrap(err, "could not verify if branch already exist")
+-		} else if featureBranchExist {
++		} else if featureBranchExist && r.ConflictStrategy == ConflictStrategySkip {
+ 			return nil, errBranchExist
+ 		}
+ 	}
+ 
+ 	log.Info("Pushing changes to remote")
+-	err = sourceController.Push(remoteName)
++	forcePush := featureBranchExist && r.ConflictStrategy == ConflictStrategyReplace
++	err = sourceController.Push(remoteName, forcePush)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "could not push changes")
+ 	}
+@@ -294,17 +300,33 @@ func (r *Runner) runSingleRepo(ctx context.Context, repo scm.Repository) (scm.Pu
+ 		return nil, nil
+ 	}
+ 
+-	log.Info("Creating pull request")
+-	pr, err := r.VersionController.CreatePullRequest(ctx, repo, prRepo, scm.NewPullRequest{
+-		Title:     r.PullRequestTitle,
+-		Body:      r.PullRequestBody,
+-		Head:      r.FeatureBranch,
+-		Base:      baseBranch,
+-		Reviewers: getReviewers(r.Reviewers, r.MaxReviewers),
+-		Assignees: r.Assignees,
+-	})
+-	if err != nil {
+-		return nil, err
++	// Fetching any potentially existing pull request
++	var existingPullRequest scm.PullRequest = nil
++	if featureBranchExist {
++		pr, err := r.VersionController.GetOpenPullRequest(ctx, repo, r.FeatureBranch)
++		if err != nil {
++			return nil, err
++		}
++		existingPullRequest = pr
++	}
++
++	var pr scm.PullRequest
++	if existingPullRequest != nil {
++		log.Info("Skip creating pull requests since one is already open")
++		pr = existingPullRequest
++	} else {
++		log.Info("Creating pull request")
++		pr, err = r.VersionController.CreatePullRequest(ctx, repo, prRepo, scm.NewPullRequest{
++			Title:     r.PullRequestTitle,
++			Body:      r.PullRequestBody,
++			Head:      r.FeatureBranch,
++			Base:      baseBranch,
++			Reviewers: getReviewers(r.Reviewers, r.MaxReviewers),
++			Assignees: r.Assignees,
++		})
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 
+ 	return pr, nil
+diff --git a/internal/multigitter/shared.go b/internal/multigitter/shared.go
+index 8add55c..cd030fa 100644
+--- a/internal/multigitter/shared.go
++++ b/internal/multigitter/shared.go
+@@ -29,7 +29,7 @@ type Git interface {
+ 	Changes() (bool, error)
+ 	Commit(commitAuthor *git.CommitAuthor, commitMessage string) error
+ 	BranchExist(remoteName, branchName string) (bool, error)
+-	Push(remoteName string) error
++	Push(remoteName string, force bool) error
+ 	AddRemote(name, url string) error
+ }
+ 
+@@ -47,3 +47,25 @@ func getStackTrace(err error) string {
+ 	}
+ 	return ""
+ }
++
++// ConflictStrategy define how a conflict of an already existing branch should be handled
++type ConflictStrategy int
++
++const (
++	// ConflictStrategySkip will skip the run for if the branch does already exist
++	ConflictStrategySkip ConflictStrategy = iota + 1
++	// ConflictStrategyReplace will ignore any existing branch and replace it with new changes
++	ConflictStrategyReplace
++)
++
++// ParseConflictStrategy parses a conflict strategy from a string
++func ParseConflictStrategy(str string) (ConflictStrategy, error) {
++	switch str {
++	default:
++		return ConflictStrategy(0), fmt.Errorf("could not parse \"%s\" as conflict strategy", str)
++	case "skip":
++		return ConflictStrategySkip, nil
++	case "replace":
++		return ConflictStrategyReplace, nil
++	}
++}
+diff --git a/internal/scm/bitbucketserver/bitbucket_server.go b/internal/scm/bitbucketserver/bitbucket_server.go
+index 736a92f..6cf1046 100644
+--- a/internal/scm/bitbucketserver/bitbucket_server.go
++++ b/internal/scm/bitbucketserver/bitbucket_server.go
+@@ -318,7 +318,7 @@ func (b *BitbucketServer) GetPullRequests(ctx context.Context, branchName string
+ 
+ 	var prs []scm.PullRequest
+ 	for _, repo := range repositories {
+-		pr, getPullRequestErr := b.getPullRequest(client, branchName, repo)
++		pr, getPullRequestErr := b.getPullRequest(client, branchName, repo.Project.Key, repo.Slug)
+ 		if getPullRequestErr != nil {
+ 			return nil, getPullRequestErr
+ 		}
+@@ -326,28 +326,37 @@ func (b *BitbucketServer) GetPullRequests(ctx context.Context, branchName string
+ 			continue
+ 		}
+ 
+-		status, pullRequestStatusErr := b.pullRequestStatus(client, repo, pr)
+-		if pullRequestStatusErr != nil {
+-			return nil, pullRequestStatusErr
++		convertedPR, err := b.convertPullRequest(client, repo.Project.Key, repo.Slug, branchName, pr)
++		if err != nil {
++			return nil, err
+ 		}
+ 
+-		prs = append(prs, pullRequest{
+-			repoName:   repo.Slug,
+-			project:    repo.Project.Key,
+-			branchName: branchName,
+-			prProject:  pr.FromRef.Repository.Project.Key,
+-			prRepoName: pr.FromRef.Repository.Slug,
+-			number:     pr.ID,
+-			version:    pr.Version,
+-			guiURL:     pr.Links.Self[0].Href,
+-			status:     status,
+-		})
++		prs = append(prs, convertedPR)
+ 	}
+ 
+ 	return prs, nil
+ }
+ 
+-func (b *BitbucketServer) pullRequestStatus(client *bitbucketv1.APIClient, repo *bitbucketv1.Repository, pr *bitbucketv1.PullRequest) (scm.PullRequestStatus, error) {
++func (b *BitbucketServer) convertPullRequest(client *bitbucketv1.APIClient, project, repoName, branchName string, pr *bitbucketv1.PullRequest) (pullRequest, error) {
++	status, err := b.pullRequestStatus(client, project, repoName, pr)
++	if err != nil {
++		return pullRequest{}, err
++	}
++
++	return pullRequest{
++		repoName:   repoName,
++		project:    project,
++		branchName: branchName,
++		prProject:  pr.FromRef.Repository.Project.Key,
++		prRepoName: pr.FromRef.Repository.Slug,
++		number:     pr.ID,
++		version:    pr.Version,
++		guiURL:     pr.Links.Self[0].Href,
++		status:     status,
++	}, nil
++}
++
++func (b *BitbucketServer) pullRequestStatus(client *bitbucketv1.APIClient, project, repoName string, pr *bitbucketv1.PullRequest) (scm.PullRequestStatus, error) {
+ 	switch pr.State {
+ 	case stateMerged:
+ 		return scm.PullRequestStatusMerged, nil
+@@ -355,7 +364,7 @@ func (b *BitbucketServer) pullRequestStatus(client *bitbucketv1.APIClient, repo
+ 		return scm.PullRequestStatusClosed, nil
+ 	}
+ 
+-	response, err := client.DefaultApi.CanMerge(repo.Project.Key, repo.Slug, int64(pr.ID))
++	response, err := client.DefaultApi.CanMerge(project, repoName, int64(pr.ID))
+ 	if err != nil {
+ 		return scm.PullRequestStatusUnknown, err
+ 	}
+@@ -377,12 +386,12 @@ func (b *BitbucketServer) pullRequestStatus(client *bitbucketv1.APIClient, repo
+ 	return scm.PullRequestStatusSuccess, nil
+ }
+ 
+-func (b *BitbucketServer) getPullRequest(client *bitbucketv1.APIClient, branchName string, repo *bitbucketv1.Repository) (*bitbucketv1.PullRequest, error) {
++func (b *BitbucketServer) getPullRequest(client *bitbucketv1.APIClient, branchName, project, repoName string) (*bitbucketv1.PullRequest, error) {
+ 	params := map[string]interface{}{"start": 0, "limit": 25}
+ 
+ 	var pullRequests []bitbucketv1.PullRequest
+ 	for {
+-		response, err := client.DefaultApi.GetPullRequestsPage(repo.Project.Key, repo.Slug, params)
++		response, err := client.DefaultApi.GetPullRequestsPage(project, repoName, params)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -411,6 +420,29 @@ func (b *BitbucketServer) getPullRequest(client *bitbucketv1.APIClient, branchNa
+ 	return nil, nil
+ }
+ 
++// GetOpenPullRequest gets a pull request for one specific repository
++func (b *BitbucketServer) GetOpenPullRequest(ctx context.Context, repo scm.Repository, branchName string) (scm.PullRequest, error) {
++	r := repo.(repository)
++
++	client := newClient(ctx, b.config)
++
++	pr, err := b.getPullRequest(client, branchName, r.project, r.name)
++	if err != nil {
++		return nil, err
++	}
++
++	if pr == nil {
++		return nil, nil
++	}
++
++	convertedPR, err := b.convertPullRequest(client, r.project, r.name, branchName, pr)
++	if err != nil {
++		return nil, err
++	}
++
++	return convertedPR, nil
++}
++
+ // MergePullRequest Merges a pull request, the pr parameter will always originate from the same package
+ func (b *BitbucketServer) MergePullRequest(ctx context.Context, pr scm.PullRequest) error {
+ 	bitbucketPR := pr.(pullRequest)
+diff --git a/internal/scm/gitea/gitea.go b/internal/scm/gitea/gitea.go
+index dacfd40..0c7775a 100644
+--- a/internal/scm/gitea/gitea.go
++++ b/internal/scm/gitea/gitea.go
+@@ -204,7 +204,10 @@ func (g *Gitea) CreatePullRequest(ctx context.Context, repo scm.Repository, prRe
+ 	r := repo.(repository)
+ 	prR := prRepo.(repository)
+ 
+-	head := fmt.Sprintf("%s:%s", prR.ownerName, newPR.Head)
++	head := newPR.Head
++	if r.ownerName != prR.ownerName {
++		head = fmt.Sprintf("%s:%s", prR.ownerName, newPR.Head)
++	}
+ 
+ 	pr, _, err := g.giteaClient(ctx).CreatePullRequest(r.ownerName, r.name, gitea.CreatePullRequestOption{
+ 		Head:      head,
+@@ -244,7 +247,7 @@ func (g *Gitea) GetPullRequests(ctx context.Context, branchName string) ([]scm.P
+ 
+ 	prs := []scm.PullRequest{}
+ 	for _, repo := range repos {
+-		pr, err := g.getPullRequest(ctx, branchName, repo)
++		pr, err := g.getPullRequest(ctx, branchName, repo.Owner.UserName, repo.Name, gitea.StateAll)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -252,30 +255,39 @@ func (g *Gitea) GetPullRequests(ctx context.Context, branchName string) ([]scm.P
+ 			continue
+ 		}
+ 
+-		status, err := g.pullRequestStatus(ctx, repo, pr)
++		convertedPR, err := g.convertPullRequest(ctx, pr)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 
+-		prs = append(prs, pullRequest{
+-			repoName:    repo.Name,
+-			ownerName:   repo.Owner.UserName,
+-			branchName:  branchName,
+-			prOwnerName: pr.Head.Repository.Owner.UserName,
+-			prRepoName:  pr.Head.Repository.Name,
+-			status:      status,
+-			index:       pr.Index,
+-			webURL:      pr.HTMLURL,
+-		})
++		prs = append(prs, convertedPR)
+ 	}
+ 
+ 	return prs, nil
+ }
+ 
+-func (g *Gitea) getPullRequest(ctx context.Context, branchName string, repo *gitea.Repository) (*gitea.PullRequest, error) {
++func (g *Gitea) convertPullRequest(ctx context.Context, pr *gitea.PullRequest) (pullRequest, error) {
++	status, err := g.pullRequestStatus(ctx, pr)
++	if err != nil {
++		return pullRequest{}, err
++	}
++
++	return pullRequest{
++		repoName:    pr.Base.Repository.Name,
++		ownerName:   pr.Base.Repository.Owner.UserName,
++		branchName:  pr.Head.Name,
++		prOwnerName: pr.Head.Repository.Owner.UserName,
++		prRepoName:  pr.Head.Repository.Name,
++		status:      status,
++		index:       pr.Index,
++		webURL:      pr.HTMLURL,
++	}, nil
++}
++
++func (g *Gitea) getPullRequest(ctx context.Context, branchName string, owner, repoName string, state gitea.StateType) (*gitea.PullRequest, error) {
+ 	// We would like to be able to search for a pr with a specific head here, but current (2021-04-24), that option does not exist in the API
+-	prs, _, err := g.giteaClient(ctx).ListRepoPullRequests(repo.Owner.UserName, repo.Name, gitea.ListPullRequestsOptions{
+-		State: "all",
++	prs, _, err := g.giteaClient(ctx).ListRepoPullRequests(owner, repoName, gitea.ListPullRequestsOptions{
++		State: state,
+ 		Sort:  "recentupdate",
+ 	})
+ 	if err != nil {
+@@ -290,7 +302,7 @@ func (g *Gitea) getPullRequest(ctx context.Context, branchName string, repo *git
+ 	return nil, nil
+ }
+ 
+-func (g *Gitea) pullRequestStatus(ctx context.Context, repo *gitea.Repository, pr *gitea.PullRequest) (scm.PullRequestStatus, error) {
++func (g *Gitea) pullRequestStatus(ctx context.Context, pr *gitea.PullRequest) (scm.PullRequestStatus, error) {
+ 	if pr.Merged != nil {
+ 		return scm.PullRequestStatusMerged, nil
+ 	}
+@@ -299,7 +311,7 @@ func (g *Gitea) pullRequestStatus(ctx context.Context, repo *gitea.Repository, p
+ 		return scm.PullRequestStatusClosed, nil
+ 	}
+ 
+-	status, _, err := g.giteaClient(ctx).GetCombinedStatus(repo.Owner.UserName, repo.Name, pr.Head.Sha)
++	status, _, err := g.giteaClient(ctx).GetCombinedStatus(pr.Base.Repository.Owner.UserName, pr.Base.Repository.Name, pr.Head.Sha)
+ 	if err != nil {
+ 		return scm.PullRequestStatusUnknown, err
+ 	}
+@@ -320,6 +332,21 @@ func (g *Gitea) pullRequestStatus(ctx context.Context, repo *gitea.Repository, p
+ 	return scm.PullRequestStatusUnknown, nil
+ }
+ 
++// GetOpenPullRequest gets a pull request for one specific repository
++func (g *Gitea) GetOpenPullRequest(ctx context.Context, repo scm.Repository, branchName string) (scm.PullRequest, error) {
++	r := repo.(repository)
++
++	pr, err := g.getPullRequest(ctx, branchName, r.ownerName, r.name, gitea.StateOpen)
++	if err != nil {
++		return nil, err
++	}
++	if pr == nil {
++		return nil, nil
++	}
++
++	return g.convertPullRequest(ctx, pr)
++}
++
+ // MergePullRequest merges a pull request
+ func (g *Gitea) MergePullRequest(ctx context.Context, pullReq scm.PullRequest) error {
+ 	pr := pullReq.(pullRequest)
+diff --git a/internal/scm/github/github.go b/internal/scm/github/github.go
+index 75d93f4..34a4760 100755
+--- a/internal/scm/github/github.go
++++ b/internal/scm/github/github.go
+@@ -70,7 +70,8 @@ type Github struct {
+ 	ghClient *github.Client
+ 
+ 	// Caching of the logged in user
+-	user string
++	user      string
++	userMutex sync.Mutex
+ 
+ 	// Used to make sure request that modifies state does not happen to often
+ 	modMutex       sync.Mutex
+@@ -309,16 +310,9 @@ func (g *Github) GetPullRequests(ctx context.Context, branchName string) ([]scm.
+ 		repoName := r.GetName()
+ 		log := log.WithField("repo", fmt.Sprintf("%s/%s", repoOwner, repoName))
+ 
+-		headOwner := repoOwner
+-		if g.Fork {
+-			if g.ForkOwner != "" {
+-				headOwner = g.ForkOwner
+-			} else {
+-				headOwner, err = g.loggedInUser(ctx)
+-				if err != nil {
+-					return nil, err
+-				}
+-			}
++		headOwner, err := g.headOwner(ctx, repoOwner)
++		if err != nil {
++			return nil, err
+ 		}
+ 
+ 		log.Debug("Fetching latest pull request")
+@@ -352,6 +346,9 @@ func (g *Github) GetPullRequests(ctx context.Context, branchName string) ([]scm.
+ }
+ 
+ func (g *Github) loggedInUser(ctx context.Context) (string, error) {
++	g.userMutex.Lock()
++	defer g.userMutex.Unlock()
++
+ 	if g.user != "" {
+ 		return g.user, nil
+ 	}
+@@ -366,6 +363,46 @@ func (g *Github) loggedInUser(ctx context.Context) (string, error) {
+ 	return g.user, nil
+ }
+ 
++// headOwner returns the owner of the repository from which any pullrequest will be made
++// This is normally the owner of the original repository, but if a fork has been made
++// it will be a different owner
++func (g *Github) headOwner(ctx context.Context, repoOwner string) (string, error) {
++	if !g.Fork {
++		return repoOwner, nil
++	}
++
++	if g.ForkOwner != "" {
++		return g.ForkOwner, nil
++	}
++
++	return g.loggedInUser(ctx)
++}
++
++// GetOpenPullRequest gets a pull request for one specific repository
++func (g *Github) GetOpenPullRequest(ctx context.Context, repo scm.Repository, branchName string) (scm.PullRequest, error) {
++	r := repo.(repository)
++
++	headOwner, err := g.headOwner(ctx, r.ownerName)
++	if err != nil {
++		return nil, err
++	}
++
++	prs, _, err := g.ghClient.PullRequests.List(ctx, headOwner, r.name, &github.PullRequestListOptions{
++		Head:  fmt.Sprintf("%s:%s", headOwner, branchName),
++		State: "open",
++		ListOptions: github.ListOptions{
++			PerPage: 1,
++		},
++	})
++	if err != nil {
++		return nil, err
++	}
++	if len(prs) == 0 {
++		return nil, nil
++	}
++	return convertPullRequest(prs[0]), nil
++}
++
+ // MergePullRequest merges a pull request
+ func (g *Github) MergePullRequest(ctx context.Context, pullReq scm.PullRequest) error {
+ 	pr := pullReq.(pullRequest)
+diff --git a/internal/scm/gitlab/gitlab.go b/internal/scm/gitlab/gitlab.go
+index 6884c20..2781122 100644
+--- a/internal/scm/gitlab/gitlab.go
++++ b/internal/scm/gitlab/gitlab.go
+@@ -291,21 +291,25 @@ func (g *Gitlab) GetPullRequests(ctx context.Context, branchName string) ([]scm.
+ 			continue
+ 		}
+ 
+-		prs = append(prs, pullRequest{
+-			repoName:   project.Path,
+-			ownerName:  project.Namespace.Path,
+-			targetPID:  mr.TargetProjectID,
+-			sourcePID:  mr.SourceProjectID,
+-			branchName: branchName,
+-			status:     pullRequestStatus(mr),
+-			iid:        mr.IID,
+-			webURL:     mr.WebURL,
+-		})
++		prs = append(prs, convertMergeRequest(mr, project.Path, project.Namespace.Path))
+ 	}
+ 
+ 	return prs, nil
+ }
+ 
++func convertMergeRequest(mr *gitlab.MergeRequest, repoName, ownerName string) pullRequest {
++	return pullRequest{
++		repoName:   repoName,
++		ownerName:  ownerName,
++		targetPID:  mr.TargetProjectID,
++		sourcePID:  mr.SourceProjectID,
++		branchName: mr.SourceBranch,
++		status:     pullRequestStatus(mr),
++		iid:        mr.IID,
++		webURL:     mr.WebURL,
++	}
++}
++
+ func (g *Gitlab) getPullRequest(ctx context.Context, branchName string, project *gitlab.Project) (*gitlab.MergeRequest, error) {
+ 	mrs, _, err := g.glClient.MergeRequests.ListProjectMergeRequests(project.ID, &gitlab.ListProjectMergeRequestsOptions{
+ 		ListOptions: gitlab.ListOptions{
+@@ -343,6 +347,29 @@ func pullRequestStatus(mr *gitlab.MergeRequest) scm.PullRequestStatus {
+ 	}
+ }
+ 
++// GetOpenPullRequest gets a pull request for one specific repository
++func (g *Gitlab) GetOpenPullRequest(ctx context.Context, repo scm.Repository, branchName string) (scm.PullRequest, error) {
++	project := repo.(repository)
++
++	state := "opened"
++	mrs, _, err := g.glClient.MergeRequests.ListProjectMergeRequests(project.pid, &gitlab.ListProjectMergeRequestsOptions{
++		ListOptions: gitlab.ListOptions{
++			PerPage: 1,
++		},
++		SourceBranch: &branchName,
++		State:        &state,
++	}, gitlab.WithContext(ctx))
++	if err != nil {
++		return nil, err
++	}
++
++	if len(mrs) == 0 {
++		return nil, nil
++	}
++
++	return convertMergeRequest(mrs[0], project.name, project.ownerName), nil
++}
++
+ // MergePullRequest merges a pull request
+ func (g *Gitlab) MergePullRequest(ctx context.Context, pullReq scm.PullRequest) error {
+ 	pr := pullReq.(pullRequest)

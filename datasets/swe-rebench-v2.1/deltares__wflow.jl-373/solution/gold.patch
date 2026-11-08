@@ -1,0 +1,142 @@
+diff --git a/docs/src/changelog.md b/docs/src/changelog.md
+index bc747bcb6..65f774665 100644
+--- a/docs/src/changelog.md
++++ b/docs/src/changelog.md
+@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Close netCDF `NCDataset` with state variables in extended BMI function `save_state`.
+ 
+ ### Changed
+-- Stop exposing scalar variables through BMI. The `BMI.get_value_ptr` function was
+-  not working correctly for scalar model variables (a `view` was applied). Only a few scalar
++- Stop exposing scalar variables through BMI. The `BMI.get_value_ptr` function was not
++  working correctly for scalar model variables (a `view` was applied). Only a few scalar
+   model parameters are defined, and it is not expected that exposing these variables is
+   required (e.g. for model coupling) while code changes for these variables (including
+   struct fields) are required.
+@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+   length `dl` at a ghost node should be set through the model parameter netCDF file
+   (`riverlength_bc`), providing this boundary condition through the `[model]` settings in
+   the TOML file (`model.riverlength_bc`) has been deprecated.
++- As part of the vertical `SBM` concept: 1) add variable `net_runoff` (land runoff minus
++  actual open water evaporation `ae_openw_l`) and 2) change the definition of variable
++  `runoff` by removing the subtraction of `ae_openw_l` (total land runoff). The variable
++  `net_runoff` is now input to the kinematic wave for overland flow (replaces the original
++  `runoff` variable as input). The lower limit of the original `runoff` variable was set at
++  zero, which may result in water balance errors. This lower limit was implemented in the
++  Python version of wflow\_sbm, to avoid a very slow kinematic wave solution for surface
++  flow computation (no distinction between a kinematic wave for overland and river flow).
++  When in the Python version of wflow\_sbm the kinematic wave for surface flow was split
++  into a river and land component, the lower limit was removed for river runoff
++  (`net_runoff_river`), but not for land runoff.
+ 
+ ### Added
+ - Total water storage as an export variable for `SBM` concept. This is the total water stored
+diff --git a/docs/src/model_docs/params_vertical.md b/docs/src/model_docs/params_vertical.md
+index fde92c15b..214fe3c17 100644
+--- a/docs/src/model_docs/params_vertical.md
++++ b/docs/src/model_docs/params_vertical.md
+@@ -115,7 +115,8 @@ profile `kv` is used and `z_layered` is required as input.
+ | `exfiltustore` | water exfiltrating from unsaturated store because of change in water table | mm Δt``^{-1}`` | - |
+ | `excesswatersoil` | excess water for non-compacted fraction | mm Δt``^{-1}`` | - |
+ | `excesswaterpath` | excess water for compacted fraction | mm Δt``^{-1}`` | - |
+-| `runoff` | total surface runoff from infiltration and saturation excess  | mm Δt``^{-1}`` | - |
++| `runoff` | total surface runoff from infiltration and saturation excess | mm Δt``^{-1}`` | - |
++| `net_runoff` | net surface runoff (`runoff` - `ae_openw_l`) | mm Δt``^{-1}`` | - |
+ | `vwc` | volumetric water content per soil layer (including θᵣ and saturated zone)  | - | - |
+ | `vwc_perc` | volumetric water content per soil layer (including θᵣ and saturated zone)  | % | - |
+ | `rootstore` | root water storage in unsaturated and saturated zone (excluding θᵣ)  | mm| - |
+diff --git a/src/flow.jl b/src/flow.jl
+index c10087a93..d81873196 100644
+--- a/src/flow.jl
++++ b/src/flow.jl
+@@ -1644,7 +1644,7 @@ end
+ """
+     set_land_inwater(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmGwfModel}
+ 
+-Set `inwater` of the lateral land component for the `SbmGwgModel` type.
++Set `inwater` of the lateral land component for the `SbmGwfModel` type.
+ """
+ function set_land_inwater(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmGwfModel}
+     @unpack lateral, vertical, network, config = model
+@@ -1657,10 +1657,22 @@ function set_land_inwater(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmGwfM
+     end
+ 
+     lateral.land.inwater .=
+-        (vertical.runoff .* network.land.xl .* network.land.yl .* 0.001) ./
++        (vertical.net_runoff .* network.land.xl .* network.land.yl .* 0.001) ./
+         lateral.land.Δt .+ drainflux
+ end
+ 
++"""
++    set_land_inwater(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmModel}
++
++Set `inwater` of the lateral land component for the `SbmModel` type.
++"""
++function set_land_inwater(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmModel}
++    @unpack lateral, vertical, network = model
++    lateral.land.inwater .=
++        (vertical.net_runoff .* network.land.xl .* network.land.yl .* 0.001) ./
++        lateral.land.Δt
++end
++
+ """
+     set_land_inwater(model)
+ 
+@@ -1794,7 +1806,7 @@ function surface_routing(
+     @unpack lateral, vertical, network, clock = model
+ 
+     @. lateral.land.runoff = (
+-        (vertical.runoff / 1000.0) * (network.land.xl * network.land.yl) / vertical.Δt +
++        (vertical.net_runoff / 1000.0) * (network.land.xl * network.land.yl) / vertical.Δt +
+         ssf_toriver +
+         # net_runoff_river
+         (
+diff --git a/src/sbm.jl b/src/sbm.jl
+index ece500ec6..ba508ddb5 100644
+--- a/src/sbm.jl
++++ b/src/sbm.jl
+@@ -136,8 +136,10 @@
+     excesswatersoil::Vector{T}
+     # Excess water for compacted fraction [mm Δt⁻¹]
+     excesswaterpath::Vector{T}
+-    # Total surface runoff from infiltration and saturation excess [mm Δt⁻¹]
++    # Total surface runoff from infiltration and saturation excess (excluding actual open water evaporation) [mm Δt⁻¹]
+     runoff::Vector{T}
++    # Net surface runoff (surface runoff - actual open water evaporation) [mm Δt⁻¹]
++    net_runoff::Vector{T}
+     # Volumetric water content [-] per soil layer (including θᵣ and saturated zone)
+     vwc::Vector{SVector{N,T}} | "-"
+     # Volumetric water content [%] per soil layer (including θᵣ and saturated zone)
+@@ -632,6 +634,7 @@ function initialize_sbm(nc, config, riverfrac, inds)
+         excesswatersoil = fill(mv, n),
+         excesswaterpath = fill(mv, n),
+         runoff = fill(mv, n),
++        net_runoff = fill(mv, n),
+         net_runoff_river = fill(mv, n),
+         vwc = svectorscopy(vwc, Val{maxlayers}()),
+         vwc_perc = svectorscopy(vwc_perc, Val{maxlayers}()),
+@@ -1071,14 +1074,12 @@ function update_after_subsurfaceflow(sbm::SBM, zi, exfiltsatwater)
+ 
+         ustoredepth = sum(@view usld[1:n_usl])
+ 
+-        runoff = max(
++        runoff =
+             exfiltustore +
+             exfiltsatwater[i] +
+             sbm.excesswater[i] +
+             sbm.runoff_land[i] +
+-            sbm.infiltexcess[i] - sbm.ae_openw_l[i],
+-            0.0,
+-        )
++            sbm.infiltexcess[i]
+ 
+         # volumetric water content per soil layer and root zone
+         vwc = sbm.vwc[i]
+@@ -1119,6 +1120,7 @@ function update_after_subsurfaceflow(sbm::SBM, zi, exfiltsatwater)
+         sbm.exfiltsatwater[i] = exfiltsatwater[i]
+         sbm.exfiltustore[i] = exfiltustore
+         sbm.runoff[i] = runoff
++        sbm.net_runoff[i] = runoff - sbm.ae_openw_l[i]
+         sbm.vwc[i] = vwc
+         sbm.vwc_perc[i] = vwc_perc
+         sbm.rootstore[i] = rootstore

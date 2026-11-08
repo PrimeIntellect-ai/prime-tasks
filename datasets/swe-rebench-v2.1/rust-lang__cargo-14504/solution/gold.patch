@@ -1,0 +1,296 @@
+diff --git a/src/bin/cargo/commands/read_manifest.rs b/src/bin/cargo/commands/read_manifest.rs
+index b86bbf795..692b79d1c 100644
+--- a/src/bin/cargo/commands/read_manifest.rs
++++ b/src/bin/cargo/commands/read_manifest.rs
+@@ -15,6 +15,9 @@ Deprecated, use `<cyan,bold>cargo metadata --no-deps</>` instead.\
+ 
+ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
+     let ws = args.workspace(gctx)?;
+-    gctx.shell().print_json(&ws.current()?.serialized())?;
++    gctx.shell().print_json(
++        &ws.current()?
++            .serialized(gctx.cli_unstable(), ws.unstable_features()),
++    )?;
+     Ok(())
+ }
+diff --git a/src/cargo/core/dependency.rs b/src/cargo/core/dependency.rs
+index 12c484119..2ec2aa1a3 100644
+--- a/src/cargo/core/dependency.rs
++++ b/src/cargo/core/dependency.rs
+@@ -9,7 +9,7 @@ use std::sync::Arc;
+ use tracing::trace;
+ 
+ use crate::core::compiler::{CompileKind, CompileTarget};
+-use crate::core::{PackageId, SourceId, Summary};
++use crate::core::{CliUnstable, Feature, Features, PackageId, SourceId, Summary};
+ use crate::util::errors::CargoResult;
+ use crate::util::interning::InternedString;
+ use crate::util::OptVersionReq;
+@@ -52,50 +52,32 @@ struct Inner {
+ }
+ 
+ #[derive(Serialize)]
+-struct SerializedDependency<'a> {
+-    name: &'a str,
++pub struct SerializedDependency {
++    name: InternedString,
+     source: SourceId,
+     req: String,
+     kind: DepKind,
+-    rename: Option<&'a str>,
++    rename: Option<InternedString>,
+ 
+     optional: bool,
+     uses_default_features: bool,
+-    features: &'a [InternedString],
++    features: Vec<InternedString>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+-    artifact: Option<&'a Artifact>,
+-    target: Option<&'a Platform>,
++    artifact: Option<Artifact>,
++    target: Option<Platform>,
+     /// The registry URL this dependency is from.
+     /// If None, then it comes from the default registry (crates.io).
+-    registry: Option<&'a str>,
++    registry: Option<String>,
+ 
+     /// The file system path for a local path dependency.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     path: Option<PathBuf>,
+-}
+ 
+-impl ser::Serialize for Dependency {
+-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+-    where
+-        S: ser::Serializer,
+-    {
+-        let registry_id = self.registry_id();
+-        SerializedDependency {
+-            name: &*self.package_name(),
+-            source: self.source_id(),
+-            req: self.version_req().to_string(),
+-            kind: self.kind(),
+-            optional: self.is_optional(),
+-            uses_default_features: self.uses_default_features(),
+-            features: self.features(),
+-            target: self.platform(),
+-            rename: self.explicit_name_in_toml().map(|s| s.as_str()),
+-            registry: registry_id.as_ref().map(|sid| sid.url().as_str()),
+-            path: self.source_id().local_path(),
+-            artifact: self.artifact(),
+-        }
+-        .serialize(s)
+-    }
++    /// `public` flag is unset if `-Zpublic-dependency` is not enabled
++    ///
++    /// Once that feature is stabilized, `public` will not need to be `Option`
++    #[serde(skip_serializing_if = "Option::is_none")]
++    public: Option<bool>,
+ }
+ 
+ #[derive(PartialEq, Eq, Hash, Ord, PartialOrd, Clone, Debug, Copy)]
+@@ -182,6 +164,34 @@ impl Dependency {
+         }
+     }
+ 
++    pub fn serialized(
++        &self,
++        unstable_flags: &CliUnstable,
++        features: &Features,
++    ) -> SerializedDependency {
++        SerializedDependency {
++            name: self.package_name(),
++            source: self.source_id(),
++            req: self.version_req().to_string(),
++            kind: self.kind(),
++            optional: self.is_optional(),
++            uses_default_features: self.uses_default_features(),
++            features: self.features().to_vec(),
++            target: self.inner.platform.clone(),
++            rename: self.explicit_name_in_toml(),
++            registry: self.registry_id().as_ref().map(|sid| sid.url().to_string()),
++            path: self.source_id().local_path(),
++            artifact: self.inner.artifact.clone(),
++            public: if unstable_flags.public_dependency
++                || features.is_enabled(Feature::public_dependency())
++            {
++                Some(self.inner.public)
++            } else {
++                None
++            },
++        }
++    }
++
+     pub fn version_req(&self) -> &OptVersionReq {
+         &self.inner.req
+     }
+diff --git a/src/cargo/core/mod.rs b/src/cargo/core/mod.rs
+index bdc9b2f4f..e857ca35d 100644
+--- a/src/cargo/core/mod.rs
++++ b/src/cargo/core/mod.rs
+@@ -1,4 +1,4 @@
+-pub use self::dependency::Dependency;
++pub use self::dependency::{Dependency, SerializedDependency};
+ pub use self::features::{CliUnstable, Edition, Feature, Features};
+ pub use self::manifest::{EitherManifest, VirtualManifest};
+ pub use self::manifest::{Manifest, Target, TargetKind};
+diff --git a/src/cargo/core/package.rs b/src/cargo/core/package.rs
+index 7dd412154..ac1bcdc5c 100644
+--- a/src/cargo/core/package.rs
++++ b/src/cargo/core/package.rs
+@@ -22,7 +22,10 @@ use crate::core::compiler::{CompileKind, RustcTargetData};
+ use crate::core::dependency::DepKind;
+ use crate::core::resolver::features::ForceAllTargets;
+ use crate::core::resolver::{HasDevUnits, Resolve};
+-use crate::core::{Dependency, Manifest, PackageId, PackageIdSpec, SourceId, Target};
++use crate::core::{
++    CliUnstable, Dependency, Features, Manifest, PackageId, PackageIdSpec, SerializedDependency,
++    SourceId, Target,
++};
+ use crate::core::{Summary, Workspace};
+ use crate::sources::source::{MaybePackage, SourceMap};
+ use crate::util::cache_lock::{CacheLock, CacheLockMode};
+@@ -73,7 +76,7 @@ pub struct SerializedPackage {
+     license_file: Option<String>,
+     description: Option<String>,
+     source: SourceId,
+-    dependencies: Vec<Dependency>,
++    dependencies: Vec<SerializedDependency>,
+     targets: Vec<Target>,
+     features: BTreeMap<InternedString, Vec<InternedString>>,
+     manifest_path: PathBuf,
+@@ -188,7 +191,11 @@ impl Package {
+         self.targets().iter().any(|t| t.is_example() || t.is_bin())
+     }
+ 
+-    pub fn serialized(&self) -> SerializedPackage {
++    pub fn serialized(
++        &self,
++        unstable_flags: &CliUnstable,
++        cargo_features: &Features,
++    ) -> SerializedPackage {
+         let summary = self.manifest().summary();
+         let package_id = summary.package_id();
+         let manmeta = self.manifest().metadata();
+@@ -203,7 +210,7 @@ impl Package {
+             .cloned()
+             .collect();
+         // Convert Vec<FeatureValue> to Vec<InternedString>
+-        let features = summary
++        let crate_features = summary
+             .features()
+             .iter()
+             .map(|(k, v)| {
+@@ -224,9 +231,13 @@ impl Package {
+             license_file: manmeta.license_file.clone(),
+             description: manmeta.description.clone(),
+             source: summary.source_id(),
+-            dependencies: summary.dependencies().to_vec(),
++            dependencies: summary
++                .dependencies()
++                .iter()
++                .map(|dep| dep.serialized(unstable_flags, cargo_features))
++                .collect(),
+             targets,
+-            features,
++            features: crate_features,
+             manifest_path: self.manifest_path().to_path_buf(),
+             metadata: self.manifest().custom_metadata().cloned(),
+             authors: manmeta.authors.clone(),
+diff --git a/src/cargo/ops/cargo_output_metadata.rs b/src/cargo/ops/cargo_output_metadata.rs
+index 1aadc05d7..246636d1f 100644
+--- a/src/cargo/ops/cargo_output_metadata.rs
++++ b/src/cargo/ops/cargo_output_metadata.rs
+@@ -33,7 +33,10 @@ pub fn output_metadata(ws: &Workspace<'_>, opt: &OutputMetadataOptions) -> Cargo
+         );
+     }
+     let (packages, resolve) = if opt.no_deps {
+-        let packages = ws.members().map(|pkg| pkg.serialized()).collect();
++        let packages = ws
++            .members()
++            .map(|pkg| pkg.serialized(ws.gctx().cli_unstable(), ws.unstable_features()))
++            .collect();
+         (packages, None)
+     } else {
+         let (packages, resolve) = build_resolve_graph(ws, opt)?;
+@@ -178,7 +181,7 @@ fn build_resolve_graph(
+     let actual_packages = package_map
+         .into_iter()
+         .filter_map(|(pkg_id, pkg)| node_map.get(&pkg_id).map(|_| pkg))
+-        .map(|pkg| pkg.serialized())
++        .map(|pkg| pkg.serialized(ws.gctx().cli_unstable(), ws.unstable_features()))
+         .collect();
+ 
+     let mr = MetadataResolve {
+diff --git a/src/doc/man/cargo-metadata.md b/src/doc/man/cargo-metadata.md
+index 0205a61e8..431725c35 100644
+--- a/src/doc/man/cargo-metadata.md
++++ b/src/doc/man/cargo-metadata.md
+@@ -123,7 +123,12 @@ The JSON output has the following format:
+                        If not specified or null, the dependency is from the default
+                        registry (crates.io).
+                     */
+-                    "registry": null
++                    "registry": null,
++                    /* (unstable) Boolean flag of whether or not this is a pulbic
++                       dependency. This field is only present when
++                       `-Zpublic-dependency` is enabled.
++                    */
++                    "public": false
+                 }
+             ],
+             /* Array of Cargo targets. */
+diff --git a/src/doc/man/generated_txt/cargo-metadata.txt b/src/doc/man/generated_txt/cargo-metadata.txt
+index 939826531..0fb8b8ad8 100644
+--- a/src/doc/man/generated_txt/cargo-metadata.txt
++++ b/src/doc/man/generated_txt/cargo-metadata.txt
+@@ -119,7 +119,12 @@ OUTPUT FORMAT
+                                   If not specified or null, the dependency is from the default
+                                   registry (crates.io).
+                                */
+-                               "registry": null
++                               "registry": null,
++                               /* (unstable) Boolean flag of whether or not this is a pulbic
++                                  dependency. This field is only present when
++                                  `-Zpublic-dependency` is enabled.
++                               */
++                               "public": false
+                            }
+                        ],
+                        /* Array of Cargo targets. */
+diff --git a/src/doc/src/commands/cargo-metadata.md b/src/doc/src/commands/cargo-metadata.md
+index d788235cb..52068e223 100644
+--- a/src/doc/src/commands/cargo-metadata.md
++++ b/src/doc/src/commands/cargo-metadata.md
+@@ -123,7 +123,12 @@ The JSON output has the following format:
+                        If not specified or null, the dependency is from the default
+                        registry (crates.io).
+                     */
+-                    "registry": null
++                    "registry": null,
++                    /* (unstable) Boolean flag of whether or not this is a pulbic
++                       dependency. This field is only present when
++                       `-Zpublic-dependency` is enabled.
++                    */
++                    "public": false
+                 }
+             ],
+             /* Array of Cargo targets. */
+diff --git a/src/etc/man/cargo-metadata.1 b/src/etc/man/cargo-metadata.1
+index 059b66d45..eb0e274d1 100644
+--- a/src/etc/man/cargo-metadata.1
++++ b/src/etc/man/cargo-metadata.1
+@@ -125,7 +125,12 @@ The JSON output has the following format:
+                        If not specified or null, the dependency is from the default
+                        registry (crates.io).
+                     */
+-                    "registry": null
++                    "registry": null,
++                    /* (unstable) Boolean flag of whether or not this is a pulbic
++                       dependency. This field is only present when
++                       `\-Zpublic\-dependency` is enabled.
++                    */
++                    "public": false
+                 }
+             ],
+             /* Array of Cargo targets. */

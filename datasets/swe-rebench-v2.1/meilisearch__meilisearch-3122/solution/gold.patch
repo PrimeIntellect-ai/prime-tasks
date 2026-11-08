@@ -1,0 +1,233 @@
+diff --git a/dump/src/lib.rs b/dump/src/lib.rs
+index 25e8d473b..423ad008c 100644
+--- a/dump/src/lib.rs
++++ b/dump/src/lib.rs
+@@ -87,7 +87,7 @@ pub struct TaskDump {
+     pub finished_at: Option<OffsetDateTime>,
+ }
+ 
+-// A `Kind` specific version made for the dump. If modified you may break the dump.
++// A `Kind` specific version made for the dump. If modified you may break the dump.
+ #[derive(Debug, PartialEq, Serialize, Deserialize)]
+ #[serde(rename_all = "camelCase")]
+ pub enum KindDump {
+@@ -125,7 +125,6 @@ pub enum KindDump {
+         tasks: RoaringBitmap,
+     },
+     DumpCreation {
+-        dump_uid: String,
+         keys: Vec<Key>,
+         instance_uid: Option<InstanceUid>,
+     },
+@@ -188,8 +187,8 @@ impl From<KindWithContent> for KindDump {
+             KindWithContent::TaskDeletion { query, tasks } => {
+                 KindDump::TasksDeletion { query, tasks }
+             }
+-            KindWithContent::DumpCreation { dump_uid, keys, instance_uid } => {
+-                KindDump::DumpCreation { dump_uid, keys, instance_uid }
++            KindWithContent::DumpCreation { keys, instance_uid } => {
++                KindDump::DumpCreation { keys, instance_uid }
+             }
+             KindWithContent::SnapshotCreation => KindDump::SnapshotCreation,
+         }
+diff --git a/dump/src/reader/compat/v5_to_v6.rs b/dump/src/reader/compat/v5_to_v6.rs
+index a19ff0860..c95211abc 100644
+--- a/dump/src/reader/compat/v5_to_v6.rs
++++ b/dump/src/reader/compat/v5_to_v6.rs
+@@ -119,11 +119,10 @@ impl CompatV5ToV6 {
+                             allow_index_creation,
+                             settings: Box::new(settings.into()),
+                         },
+-                        v5::tasks::TaskContent::Dump { uid } => v6::Kind::DumpCreation {
+-                            dump_uid: uid,
+-                            keys: keys.clone(),
+-                            instance_uid,
+-                        },
++                        v5::tasks::TaskContent::Dump { uid: _ } => {
++                            // in v6 we compute the dump_uid from the started_at processing time
++                            v6::Kind::DumpCreation { keys: keys.clone(), instance_uid }
++                        }
+                     },
+                     canceled_by: None,
+                     details: task_view.details.map(|details| match details {
+@@ -149,7 +148,9 @@ impl CompatV5ToV6 {
+                         v5::Details::ClearAll { deleted_documents } => {
+                             v6::Details::ClearAll { deleted_documents }
+                         }
+-                        v5::Details::Dump { dump_uid } => v6::Details::Dump { dump_uid },
++                        v5::Details::Dump { dump_uid } => {
++                            v6::Details::Dump { dump_uid: Some(dump_uid) }
++                        }
+                     }),
+                     error: task_view.error.map(|e| e.into()),
+                     enqueued_at: task_view.enqueued_at,
+diff --git a/index-scheduler/src/batch.rs b/index-scheduler/src/batch.rs
+index c244c6427..02cfdb178 100644
+--- a/index-scheduler/src/batch.rs
++++ b/index-scheduler/src/batch.rs
+@@ -36,6 +36,7 @@ use meilisearch_types::settings::{apply_settings_to_builder, Settings, Unchecked
+ use meilisearch_types::tasks::{Details, IndexSwap, Kind, KindWithContent, Status, Task};
+ use meilisearch_types::{compression, Index, VERSION_FILE_NAME};
+ use roaring::RoaringBitmap;
++use time::macros::format_description;
+ use time::OffsetDateTime;
+ use uuid::Uuid;
+ 
+@@ -680,11 +681,9 @@ impl IndexScheduler {
+             }
+             Batch::Dump(mut task) => {
+                 let started_at = OffsetDateTime::now_utc();
+-                let (keys, instance_uid, dump_uid) =
+-                    if let KindWithContent::DumpCreation { keys, instance_uid, dump_uid } =
+-                        &task.kind
+-                    {
+-                        (keys, instance_uid, dump_uid)
++                let (keys, instance_uid) =
++                    if let KindWithContent::DumpCreation { keys, instance_uid } = &task.kind {
++                        (keys, instance_uid)
+                     } else {
+                         unreachable!();
+                     };
+@@ -771,12 +770,17 @@ impl IndexScheduler {
+                     index_dumper.settings(&settings)?;
+                 }
+ 
++                let dump_uid = started_at.format(format_description!(
++                    "[year repr:full][month repr:numerical][day padding:zero]-[hour padding:zero][minute padding:zero][second padding:zero][subsecond digits:3]"
++                )).unwrap();
++
+                 let path = self.dumps_path.join(format!("{}.dump", dump_uid));
+                 let file = File::create(path)?;
+                 dump.persist_to(BufWriter::new(file))?;
+ 
+                 // if we reached this step we can tell the scheduler we succeeded to dump ourselves.
+                 task.status = Status::Succeeded;
++                task.details = Some(Details::Dump { dump_uid: Some(dump_uid) });
+                 Ok(vec![task])
+             }
+             Batch::IndexOperation { op, must_create_index } => {
+diff --git a/index-scheduler/src/lib.rs b/index-scheduler/src/lib.rs
+index 29c06ce2d..a6de65a25 100644
+--- a/index-scheduler/src/lib.rs
++++ b/index-scheduler/src/lib.rs
+@@ -826,8 +826,8 @@ impl IndexScheduler {
+                 KindDump::TasksDeletion { query, tasks } => {
+                     KindWithContent::TaskDeletion { query, tasks }
+                 }
+-                KindDump::DumpCreation { dump_uid, keys, instance_uid } => {
+-                    KindWithContent::DumpCreation { dump_uid, keys, instance_uid }
++                KindDump::DumpCreation { keys, instance_uid } => {
++                    KindWithContent::DumpCreation { keys, instance_uid }
+                 }
+                 KindDump::SnapshotCreation => KindWithContent::SnapshotCreation,
+             },
+diff --git a/index-scheduler/src/utils.rs b/index-scheduler/src/utils.rs
+index effa4e7f8..a193c2bec 100644
+--- a/index-scheduler/src/utils.rs
++++ b/index-scheduler/src/utils.rs
+@@ -487,10 +487,8 @@ impl IndexScheduler {
+                             assert_ne!(status, Status::Succeeded);
+                         }
+                     }
+-                    Details::Dump { dump_uid: d1 } => {
+-                        assert!(
+-                            matches!(&kind, KindWithContent::DumpCreation { dump_uid: d2, keys: _, instance_uid: _ } if &d1 == d2 )
+-                        );
++                    Details::Dump { dump_uid: _ } => {
++                        assert_eq!(kind.as_kind(), Kind::DumpCreation);
+                     }
+                 }
+             }
+diff --git a/meilisearch-http/src/routes/dump.rs b/meilisearch-http/src/routes/dump.rs
+index 1148cdcb6..8e0e63776 100644
+--- a/meilisearch-http/src/routes/dump.rs
++++ b/meilisearch-http/src/routes/dump.rs
+@@ -6,8 +6,6 @@ use meilisearch_auth::AuthController;
+ use meilisearch_types::error::ResponseError;
+ use meilisearch_types::tasks::KindWithContent;
+ use serde_json::json;
+-use time::macros::format_description;
+-use time::OffsetDateTime;
+ 
+ use crate::analytics::Analytics;
+ use crate::extractors::authentication::policies::*;
+@@ -27,16 +25,9 @@ pub async fn create_dump(
+ ) -> Result<HttpResponse, ResponseError> {
+     analytics.publish("Dump Created".to_string(), json!({}), Some(&req));
+ 
+-    let dump_uid = OffsetDateTime::now_utc()
+-        .format(format_description!(
+-            "[year repr:full][month repr:numerical][day padding:zero]-[hour padding:zero][minute padding:zero][second padding:zero][subsecond digits:3]"
+-        ))
+-        .unwrap();
+-
+     let task = KindWithContent::DumpCreation {
+         keys: auth_controller.list_keys()?,
+         instance_uid: analytics.instance_uid().cloned(),
+-        dump_uid,
+     };
+     let task: SummarizedTaskView =
+         tokio::task::spawn_blocking(move || index_scheduler.register(task)).await??.into();
+diff --git a/meilisearch-http/src/routes/tasks.rs b/meilisearch-http/src/routes/tasks.rs
+index 16d7fb483..914315711 100644
+--- a/meilisearch-http/src/routes/tasks.rs
++++ b/meilisearch-http/src/routes/tasks.rs
+@@ -98,7 +98,7 @@ pub struct DetailsView {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub original_filter: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+-    pub dump_uid: Option<String>,
++    pub dump_uid: Option<Option<String>>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     #[serde(flatten)]
+     pub settings: Option<Box<Settings<Unchecked>>>,
+diff --git a/meilisearch-types/src/tasks.rs b/meilisearch-types/src/tasks.rs
+index 57d39c798..ceddbd51c 100644
+--- a/meilisearch-types/src/tasks.rs
++++ b/meilisearch-types/src/tasks.rs
+@@ -127,7 +127,6 @@ pub enum KindWithContent {
+         tasks: RoaringBitmap,
+     },
+     DumpCreation {
+-        dump_uid: String,
+         keys: Vec<Key>,
+         instance_uid: Option<InstanceUid>,
+     },
+@@ -223,7 +222,7 @@ impl KindWithContent {
+                 deleted_tasks: None,
+                 original_filter: query.clone(),
+             }),
+-            KindWithContent::DumpCreation { .. } => None,
++            KindWithContent::DumpCreation { .. } => Some(Details::Dump { dump_uid: None }),
+             KindWithContent::SnapshotCreation => None,
+         }
+     }
+@@ -266,7 +265,7 @@ impl KindWithContent {
+                 deleted_tasks: Some(0),
+                 original_filter: query.clone(),
+             }),
+-            KindWithContent::DumpCreation { .. } => None,
++            KindWithContent::DumpCreation { .. } => Some(Details::Dump { dump_uid: None }),
+             KindWithContent::SnapshotCreation => None,
+         }
+     }
+@@ -304,9 +303,7 @@ impl From<&KindWithContent> for Option<Details> {
+                 deleted_tasks: None,
+                 original_filter: query.clone(),
+             }),
+-            KindWithContent::DumpCreation { dump_uid, .. } => {
+-                Some(Details::Dump { dump_uid: dump_uid.clone() })
+-            }
++            KindWithContent::DumpCreation { .. } => Some(Details::Dump { dump_uid: None }),
+             KindWithContent::SnapshotCreation => None,
+         }
+     }
+@@ -469,7 +466,7 @@ pub enum Details {
+     ClearAll { deleted_documents: Option<u64> },
+     TaskCancelation { matched_tasks: u64, canceled_tasks: Option<u64>, original_filter: String },
+     TaskDeletion { matched_tasks: u64, deleted_tasks: Option<u64>, original_filter: String },
+-    Dump { dump_uid: String },
++    Dump { dump_uid: Option<String> },
+     IndexSwap { swaps: Vec<IndexSwap> },
+ }
+ 

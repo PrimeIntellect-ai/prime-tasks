@@ -1,0 +1,6 @@
+warning with default solver
+I appreciate the idea of wanting to alert users that a default solver is being used, but it is odd that if I am writing a tutorial or example and want to explicitly set the default solver, that I get a warning (e.g. in the following figure). A warning usually implies that I should change my code, but here, it is just information. For the purposes of a tutorial, I then opt not to use the handy functionality of getting a default solver because having a warning message pop up is distracting (and I don't want to be promoting that users should suppress all warnings).
+
+![image](https://github.com/user-attachments/assets/6f558e37-60c1-42a4-ada8-6222fc8a73ca)
+
+So, then the question is what to do. I would suggest that we remove the warning and instead include a statement in the inversion log about what solver is being used (we could also add this as a statement that is printed out when running a "verbose" simulation, but I know that we don't have that option implemented uniformly across all simulations at the moment). Totally open to other suggestions too, but I think that when a user explicitly calls `get_default_solver` that we shouldn't throw a warning at them.

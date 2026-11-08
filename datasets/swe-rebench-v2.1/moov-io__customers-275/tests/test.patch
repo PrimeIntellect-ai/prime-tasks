@@ -1,0 +1,171 @@
+diff --git a/cmd/server/main_test.go b/cmd/server/main_test.go
+index 7f0e036..a535433 100644
+--- a/cmd/server/main_test.go
++++ b/cmd/server/main_test.go
+@@ -5,8 +5,12 @@
+ package main
+ 
+ import (
++	"bytes"
+ 	"os"
++	"os/exec"
++	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/moov-io/base/admin"
+ 	"github.com/moov-io/base/log"
+@@ -14,20 +18,6 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+-func TestMain__setupSigner(t *testing.T) {
+-	logger := log.NewNopLogger()
+-
+-	signer := setupSigner(logger, "", "file")
+-	if signer == nil {
+-		t.Fatal("expected non-nil Signer")
+-	}
+-
+-	signer = setupSigner(logger, "", "other")
+-	if signer != nil {
+-		t.Fatal("expected nil Signer")
+-	}
+-}
+-
+ func TestMain__setupValidationStrategies(t *testing.T) {
+ 	logger := log.NewNopLogger()
+ 	adminServer := admin.NewServer(*adminAddr)
+@@ -48,5 +38,132 @@ func TestMain__setupValidationStrategies(t *testing.T) {
+ 	// microdeposits / moov for now should always be there
+ 	_, found := strategies[validator.StrategyKey{Strategy: "micro-deposits", Vendor: "moov"}]
+ 	require.True(t, found)
++}
++
++// TestPreventInsecureStartup verifies that the PREVENT_INSECURE_STARTUP
++// configuration option actually changes startup behavior. When it is enabled
++// and required security options are missing the server must refuse to start,
++// and when it is disabled the server must continue running.
++func TestPreventInsecureStartup(t *testing.T) {
++	bin := buildServerBinary(t)
++
++	securityValues := map[string]string{
++		"APP_SALT":                 "app-salt",
++		"SSN_SECRET_KEY":           "ssn-key",
++		"DOCUMENTS_SECRET_KEY":     "documents-key",
++		"FILEBLOB_HMAC_SECRET":     "fileblob-secret",
++		"TRANSIT_LOCAL_BASE64_KEY": "dHJhbnNpdC1rZXk=",
++	}
++
++	t.Run("each missing required option prevents startup", func(t *testing.T) {
++		for option := range securityValues {
++			t.Run(option, func(t *testing.T) {
++				env := make(map[string]string, len(securityValues)+1)
++				for name, value := range securityValues {
++					if name != option {
++						env[name] = value
++					}
++				}
++				env["PREVENT_INSECURE_STARTUP"] = "true"
++
++				out, exited := runServer(t, bin, env, 30*time.Second)
++				require.True(t, exited, "server should stop when %s is missing; output:\n%s", option, out)
++				require.Contains(t, out, "prevented insecure startup")
++			})
++		}
++	})
++
++	t.Run("local-only options are not required for nonlocal providers", func(t *testing.T) {
++		out, _ := runServer(t, bin, map[string]string{
++			"PREVENT_INSECURE_STARTUP":   "true",
++			"APP_SALT":                   securityValues["APP_SALT"],
++			"TRANSIT_LOCAL_BASE64_KEY":   securityValues["TRANSIT_LOCAL_BASE64_KEY"],
++			"SSN_SECRET_PROVIDER":        "gcp",
++			"DOCUMENTS_SECRET_PROVIDER":  "gcp",
++			"DOCUMENTS_STORAGE_PROVIDER": "gcp",
++		}, 3*time.Second)
++		require.NotContains(t, out, "prevented insecure startup")
++	})
++
++	t.Run("enabled prevents startup with insecure defaults", func(t *testing.T) {
++		out, exited := runServer(t, bin, map[string]string{
++			"PREVENT_INSECURE_STARTUP": "true",
++		}, 30*time.Second)
++		require.True(t, exited, "server should stop when PREVENT_INSECURE_STARTUP is enabled; output:\n%s", out)
++		require.Contains(t, out, "prevented insecure startup")
++	})
++
++	t.Run("disabled warns and continues startup", func(t *testing.T) {
++		out, exited := runServer(t, bin, map[string]string{
++			"PREVENT_INSECURE_STARTUP": "false",
++		}, 10*time.Second)
++		require.False(t, exited, "server should keep running when PREVENT_INSECURE_STARTUP is disabled; output:\n%s", out)
++		require.Regexp(t, `(?i)warn(ing)?`, out)
++	})
++
++	for _, value := range []struct {
++		name string
++		flag *string
++	}{{name: "unset"}, {name: "invalid", flag: stringPointer("not-a-boolean")}} {
++		t.Run(value.name+" value defaults to disabled", func(t *testing.T) {
++			env := map[string]string{}
++			if value.flag != nil {
++				env["PREVENT_INSECURE_STARTUP"] = *value.flag
++			}
++			out, exited := runServer(t, bin, env, 10*time.Second)
++			require.False(t, exited, "server should continue when PREVENT_INSECURE_STARTUP is %s; output:\n%s", value.name, out)
++			require.Regexp(t, `(?i)warn(ing)?`, out)
++		})
++	}
++}
++
++func stringPointer(value string) *string {
++	return &value
++}
++
++func buildServerBinary(t *testing.T) string {
++	t.Helper()
++
++	bin := filepath.Join(t.TempDir(), "customers-server")
++	cmd := exec.Command("go", "build", "-o", bin, ".")
++	cmd.Env = os.Environ()
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("failed to build customers server: %v\n%s", err, out)
++	}
++	return bin
++}
++
++func runServer(t *testing.T, bin string, extraEnv map[string]string, wait time.Duration) (string, bool) {
++	t.Helper()
+ 
++	cmd := exec.Command(bin, "-http.addr=127.0.0.1:0", "-admin.addr=127.0.0.1:0")
++	cmd.Dir = t.TempDir()
++	env := []string{
++		"PATH=" + os.Getenv("PATH"),
++		"HOME=" + os.Getenv("HOME"),
++	}
++	for k, v := range extraEnv {
++		env = append(env, k+"="+v)
++	}
++	cmd.Env = env
++
++	var buf bytes.Buffer
++	cmd.Stdout = &buf
++	cmd.Stderr = &buf
++
++	if err := cmd.Start(); err != nil {
++		t.Fatalf("failed to start customers server: %v", err)
++	}
++
++	done := make(chan error, 1)
++	go func() { done <- cmd.Wait() }()
++
++	select {
++	case <-done:
++		return buf.String(), true
++	case <-time.After(wait):
++		_ = cmd.Process.Kill()
++		<-done
++		return buf.String(), false
++	}
+ }

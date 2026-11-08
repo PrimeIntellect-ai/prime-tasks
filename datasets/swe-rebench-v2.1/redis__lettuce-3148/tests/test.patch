@@ -1,0 +1,100 @@
+diff --git a/src/test/java/io/lettuce/core/dynamic/SimpleBatcherUnitTests.java b/src/test/java/io/lettuce/core/dynamic/SimpleBatcherUnitTests.java
+index 592bfe29..609b24e8 100644
+--- a/src/test/java/io/lettuce/core/dynamic/SimpleBatcherUnitTests.java
++++ b/src/test/java/io/lettuce/core/dynamic/SimpleBatcherUnitTests.java
+@@ -4,13 +4,20 @@ import static io.lettuce.TestTags.UNIT_TEST;
+ import static org.assertj.core.api.Assertions.*;
+ import static org.mockito.Mockito.*;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
+ 
+ import org.junit.jupiter.api.Tag;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
++import org.mockito.stubbing.Answer;
+ 
+ import io.lettuce.core.api.StatefulConnection;
+ import io.lettuce.core.dynamic.batch.CommandBatching;
+@@ -21,6 +28,7 @@ import io.lettuce.core.protocol.RedisCommand;
+ 
+ /**
+  * @author Mark Paluch
++ * @author Ivo Gaydajiev
+  */
+ @Tag(UNIT_TEST)
+ @ExtendWith(MockitoExtension.class)
+@@ -127,6 +135,66 @@ class SimpleBatcherUnitTests {
+         verify(connection).dispatch(Arrays.asList(c1, c2));
+     }
+ 
++    @Test
++    void shouldDispatchCommandsQueuedDuringOngoingFlush() throws InterruptedException {
++        RedisCommand<Object, Object, Object> c1 = createCommand();
++        RedisCommand<Object, Object, Object> c2 = createCommand();
++
++        CountDownLatch dispatchStarted = new CountDownLatch(1);
++        CountDownLatch releaseDispatch = new CountDownLatch(1);
++        CountDownLatch secondBatchSubmitted = new CountDownLatch(1);
++
++        // Record every command that is handed to the connection, regardless of whether it is
++        // dispatched individually or as part of a collection. The contract only requires the
++        // queued commands to be flushed, not a particular dispatch shape.
++        List<RedisCommand<?, ?, ?>> dispatched = Collections.synchronizedList(new ArrayList<>());
++
++        Answer<Object> recordDispatch = invocation -> {
++            Object argument = invocation.getArgument(0);
++            if (argument instanceof RedisCommand) {
++                dispatched.add((RedisCommand<?, ?, ?>) argument);
++            } else if (argument instanceof Collection) {
++                dispatched.addAll((Collection<RedisCommand<?, ?, ?>>) argument);
++            }
++
++            dispatchStarted.countDown();
++            releaseDispatch.await();
++
++            return null;
++        };
++
++        lenient().doAnswer(recordDispatch).when(connection).dispatch(any(RedisCommand.class));
++        lenient().doAnswer(recordDispatch).when(connection).dispatch(any(Collection.class));
++
++        SimpleBatcher batcher = new SimpleBatcher(connection, 4);
++
++        Thread batchThread1 = new Thread(() -> batcher.batch(c1, CommandBatching.flush()));
++        batchThread1.start();
++
++        // Wait until the first flush is actually dispatching, so the second request is guaranteed
++        // to arrive while a flush is in progress.
++        assertThat(dispatchStarted.await(5, TimeUnit.SECONDS)).isTrue();
++
++        Thread batchThread2 = new Thread(() -> {
++            batcher.batch(c2, CommandBatching.flush());
++            secondBatchSubmitted.countDown();
++        });
++        batchThread2.start();
++
++        // Let the second request be submitted (or give up after a timeout) and then allow the
++        // ongoing flush to complete. A command that is lost during the concurrent flush will never
++        // be dispatched and the assertion below fails.
++        secondBatchSubmitted.await(5, TimeUnit.SECONDS);
++        releaseDispatch.countDown();
++
++        batchThread1.join(5000);
++        batchThread2.join(5000);
++
++        assertThat(batchThread1.isAlive()).isFalse();
++        assertThat(batchThread2.isAlive()).isFalse();
++        assertThat(dispatched).contains(c1, c2);
++    }
++
+     private static RedisCommand<Object, Object, Object> createCommand() {
+         return new AsyncCommand<>(new Command<>(CommandType.COMMAND, null, null));
+     }

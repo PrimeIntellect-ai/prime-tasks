@@ -1,0 +1,220 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 278e58d6..d270ef7d 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,5 +1,6 @@
+ ## Changes in 0.2.0 (in dev)
+ 
++* Fixed `xcube serve` WMTS KVP API to allow for case-insensitive query parameters. (#77)
+ * `xcube serve` can now be run with data cube paths and styling information given via the CLI rather 
+   than a configuration file. For example `xcube serve --styles conc_chl=(0,20,"viridis") /path/to/my/chl-cube.zarr`.
+   This allows for quick inspection of newly generated cubes via `xcube gen`.
+diff --git a/xcube/api/compute.py b/xcube/api/compute.py
+index 04aba21c..eda70ae0 100644
+--- a/xcube/api/compute.py
++++ b/xcube/api/compute.py
+@@ -36,6 +36,18 @@ def compute_dataset(dataset: xr.Dataset,
+     """
+     Compute a dataset from another dataset and return it.
+ 
++    New variables are computed according to the value of an ``expression`` attribute which, if given,
++    must by a valid Python expression that can reference any other preceding variables by name.
++    The expression can also reference any flags defined by another variable according the their CF
++    attributes ``flag_meaning`` and ``flag_values``.
++
++    Invalid values may be masked out using the value of an
++    optional ``valid_pixel_expression`` attribute that forms a boolean Python expression.
++    The value of the ``_FillValue`` attribute or NaN will be used in the new variable where the
++    expression returns zero or false.
++
++    Other attributes will be stored as variable metadata as-is.
++
+     :param dataset: A dataset.
+     :param processed_variables: Optional list of variables that will be loaded or computed in the order given.
+            Each variable is either identified by name or by a name to variable attributes mapping.
+diff --git a/xcube/util/caseless.py b/xcube/util/caseless.py
+new file mode 100644
+index 00000000..a929045b
+--- /dev/null
++++ b/xcube/util/caseless.py
+@@ -0,0 +1,60 @@
++from typing import Dict, TypeVar, Optional
++
++
++def caseless_dict(*args, **kwargs) -> Dict:
++    """Create a dictionary that compares its string keys in a case-insensitive manner."""
++    return _CaselessDict(*args, **kwargs)
++
++
++_KT = TypeVar('_KT')
++_VT = TypeVar('_VT')
++_VT_co = TypeVar('_VT_co', covariant=True)
++
++
++class _CaselessDict(dict):
++
++    def __init__(self, *args, **kwargs: _VT):
++        super().__init__(*args, **kwargs)
++        self._lc_keys = {k.lower() if isinstance(k, str) else k: k for k in self.keys()}
++
++    def __getitem__(self, k: _KT) -> _VT:
++        if isinstance(k, str):
++            k = self._lc_keys.get(k.lower(), k)
++        return super().__getitem__(k)
++
++    def __setitem__(self, k: _KT, v: _VT) -> None:
++        if isinstance(k, str):
++            lc_key = k.lower()
++            if lc_key in self._lc_keys:
++                k = self._lc_keys[lc_key]
++            else:
++                self._lc_keys[lc_key] = k
++        super().__setitem__(k, v)
++
++    def __delitem__(self, k: _KT) -> None:
++        if isinstance(k, str):
++            lc_key = k.lower()
++            if lc_key in self._lc_keys:
++                k = self._lc_keys.pop(lc_key)
++        super().__delitem__(k)
++
++    def __contains__(self, k: object) -> bool:
++        if isinstance(k, str):
++            return k.lower() in self._lc_keys
++        return super().__contains__(k)
++
++    def get(self, k: _KT, default: _VT = None) -> Optional[_VT_co]:
++        if isinstance(k, str):
++            lc_key = k.lower()
++            if lc_key in self._lc_keys:
++                k = self._lc_keys[lc_key]
++            else:
++                return default
++        return super().get(k, default) if default is not None else super().get(k)
++
++    def pop(self, k: _KT) -> _VT:
++        if isinstance(k, str):
++            lc_key = k.lower()
++            if lc_key in self._lc_keys:
++                k = self._lc_keys.pop(lc_key)
++        return super().pop(k)
+diff --git a/xcube/webapi/app.py b/xcube/webapi/app.py
+index c5a07394..dc6119d1 100644
+--- a/xcube/webapi/app.py
++++ b/xcube/webapi/app.py
+@@ -29,7 +29,7 @@ from .handlers import GetNE2TileHandler, GetDatasetVarTileHandler, InfoHandler,
+     GetDatasetsHandler, FindPlacesHandler, FindDatasetPlacesHandler, \
+     GetDatasetCoordsHandler, GetTimeSeriesInfoHandler, GetTimeSeriesForPointHandler, WMTSKvpHandler, \
+     GetTimeSeriesForGeometryHandler, GetTimeSeriesForFeaturesHandler, GetTimeSeriesForGeometriesHandler, \
+-    GetPlaceGroupsHandler, GetDatasetVarLegendHandler, GetDatasetHandler
++    GetPlaceGroupsHandler, GetDatasetVarLegendHandler, GetDatasetHandler, GetWMTSTileHandler
+ from .service import url_pattern
+ 
+ __author__ = "Norman Fomferra (Brockmann Consult GmbH)"
+@@ -46,7 +46,7 @@ def new_application(name: str = DEFAULT_NAME):
+         (prefix + url_pattern('/wmts/1.0.0/WMTSCapabilities.xml'),
+          GetWMTSCapabilitiesXmlHandler),
+         (prefix + url_pattern('/wmts/1.0.0/tile/{{ds_id}}/{{var_name}}/{{z}}/{{y}}/{{x}}.png'),
+-         GetDatasetVarTileHandler),
++         GetWMTSTileHandler),
+         (prefix + url_pattern('/wmts/kvp'),
+          WMTSKvpHandler),
+ 
+diff --git a/xcube/webapi/handlers.py b/xcube/webapi/handlers.py
+index 3216862d..75dcdfec 100644
+--- a/xcube/webapi/handlers.py
++++ b/xcube/webapi/handlers.py
+@@ -37,20 +37,6 @@ from ..util.timecoord import timestamp_to_iso_string
+ 
+ __author__ = "Norman Fomferra (Brockmann Consult GmbH)"
+ 
+-_WMTS_KVP_KEYS = [
+-    'Service',
+-    'Request',
+-    'Version',
+-    'Format',
+-    'Style',
+-    'Layer',
+-    'TileMatrixSet',
+-    'TileMatrix',
+-    'TileRow',
+-    'TileCol'
+-]
+-
+-_WMTS_KVP_LOWER_KEYS = [k.lower() for k in _WMTS_KVP_KEYS]
+ _WMTS_VERSION = "1.0.0"
+ _WMTS_TILE_FORMAT = "image/png"
+ 
+@@ -59,8 +45,8 @@ _WMTS_TILE_FORMAT = "image/png"
+ class WMTSKvpHandler(ServiceRequestHandler):
+ 
+     async def get(self):
+-        # According to WMTS 1.0 spec, all WMTS-specific keys must be case insensitive.
+-        self._convert_wmts_keys_to_lower_case()
++        # According to WMTS 1.0 spec, query parameters must be case-insensitive.
++        self.set_caseless_query_arguments()
+ 
+         service = self.params.get_query_argument('service')
+         if service != "WMTS":
+@@ -107,17 +93,6 @@ class WMTSKvpHandler(ServiceRequestHandler):
+         else:
+             raise ServiceBadRequestError(f'Invalid request type "{request}"')
+ 
+-    def _convert_wmts_keys_to_lower_case(self):
+-        query_arguments = dict(self.request.query_arguments)
+-        query_keys = {k.lower(): k for k in query_arguments.keys()}
+-        for lower_key in _WMTS_KVP_LOWER_KEYS:
+-            if lower_key in query_keys:
+-                query_key = query_keys[lower_key]
+-                value = query_arguments[query_key]
+-                del query_arguments[query_key]
+-                query_arguments[lower_key] = value
+-        self.request.query_arguments = query_arguments
+-
+ 
+ # noinspection PyAbstractClass
+ class GetWMTSCapabilitiesXmlHandler(ServiceRequestHandler):
+@@ -160,6 +135,21 @@ class GetDatasetCoordsHandler(ServiceRequestHandler):
+         self.write(json.dumps(response, indent=2))
+ 
+ 
++# noinspection PyAbstractClass,PyBroadException
++class GetWMTSTileHandler(ServiceRequestHandler):
++
++    async def get(self, ds_id: str, var_name: str, z: str, y: str, x: str):
++        self.set_caseless_query_arguments()
++        tile = await IOLoop.current().run_in_executor(None,
++                                                      get_dataset_tile,
++                                                      self.service_context,
++                                                      ds_id, var_name,
++                                                      x, y, z,
++                                                      self.params)
++        self.set_header('Content-Type', 'image/png')
++        self.finish(tile)
++
++
+ # noinspection PyAbstractClass,PyBroadException
+ class GetDatasetVarTileHandler(ServiceRequestHandler):
+ 
+diff --git a/xcube/webapi/service.py b/xcube/webapi/service.py
+index d2b65ef3..0754874b 100644
+--- a/xcube/webapi/service.py
++++ b/xcube/webapi/service.py
+@@ -43,6 +43,7 @@ from .defaults import DEFAULT_ADDRESS, DEFAULT_PORT, DEFAULT_UPDATE_PERIOD, DEFA
+     DEFAULT_TILE_CACHE_SIZE, DEFAULT_NAME, DEFAULT_TRACE_PERF, DEFAULT_TILE_COMP_MODE
+ from .errors import ServiceBadRequestError
+ from .reqparams import RequestParams
++from ..util.caseless import caseless_dict
+ from ..util.undefined import UNDEFINED
+ 
+ __author__ = "Norman Fomferra (Brockmann Consult GmbH)"
+@@ -222,6 +223,9 @@ class ServiceRequestHandler(RequestHandler):
+         super().__init__(application, request, **kwargs)
+         self._params = ServiceRequestParams(self)
+ 
++    def set_caseless_query_arguments(self):
++        self.request.query_arguments = caseless_dict(self.request.query_arguments or {})
++
+     @property
+     def service_context(self) -> ServiceContext:
+         return self.application.service_context

@@ -1,0 +1,186 @@
+diff --git a/changelog b/changelog
+index 21278fdbe..b7735c83d 100644
+--- a/changelog
++++ b/changelog
+@@ -131,6 +131,10 @@
+ 	47) PR #2625 for #2619. Adds a create function for OMPParallelDoDirective
+ 	to avoid issues from using its parent class' create method.
+ 
++	48) PR #2609 for #2407. The OpenACC routine directive and transformation
++	now accept a "parallelism" attribute to set the level of parallelism, which
++	is mandatory in recent OpenACC standards.
++
+ release 2.5.0 14th of February 2024
+ 
+ 	1) PR #2199 for #2189. Fix bugs with missing maps in enter data
+diff --git a/src/psyclone/psyir/nodes/acc_directives.py b/src/psyclone/psyir/nodes/acc_directives.py
+index 0271564d8..ef5d9299c 100644
+--- a/src/psyclone/psyir/nodes/acc_directives.py
++++ b/src/psyclone/psyir/nodes/acc_directives.py
+@@ -144,12 +144,54 @@ class ACCStandaloneDirective(ACCDirective, StandaloneDirective,
+ 
+ 
+ class ACCRoutineDirective(ACCStandaloneDirective):
+-    ''' Class representing a "!$ACC routine" OpenACC directive in PSyIR. '''
++    '''
++    Class representing an "ACC routine" OpenACC directive in PSyIR.
++
++    :param str parallelism: the level of parallelism in the routine, one of
++        "gang", "worker", "vector", "seq".
++
++    '''
++    SUPPORTED_PARALLELISM = ["seq", "vector", "worker", "gang"]
++
++    def __init__(self, parallelism="seq", **kwargs):
++        self.parallelism = parallelism
++
++        super().__init__(self, **kwargs)
++
++    @property
++    def parallelism(self):
++        '''
++        :returns: the clause describing the level of parallelism within this
++                  routine (or a called one).
++        :rtype: str
++
++        '''
++        return self._parallelism
++
++    @parallelism.setter
++    def parallelism(self, value):
++        '''
++        :param str value: the new value for the level-of-parallelism within
++                          this routine (or a called one).
++
++        :raises TypeError: if `value` is not a str.
++        :raises ValueError: if `value` is not a recognised level of
++                            parallelism.
++        '''
++        if not isinstance(value, str):
++            raise TypeError(
++                f"Expected a str to specify the level of parallelism but got "
++                f"'{type(value).__name__}'")
++        if value.lower() not in self.SUPPORTED_PARALLELISM:
++            raise ValueError(
++                f"Expected one of {self.SUPPORTED_PARALLELISM} for the level "
++                f"of parallelism but got '{value}'")
++        self._parallelism = value.lower()
+ 
+     def gen_code(self, parent):
+-        '''Generate the fortran ACC Routine Directive and any associated code.
++        '''Generate the Fortran ACC Routine Directive and any associated code.
+ 
+-        :param parent: the parent Node in the Schedule to which to add our \
++        :param parent: the parent Node in the Schedule to which to add our
+                        content.
+         :type parent: sub-class of :py:class:`psyclone.f2pygen.BaseGen`
+         '''
+@@ -157,7 +199,8 @@ class ACCRoutineDirective(ACCStandaloneDirective):
+         self.validate_global_constraints()
+ 
+         # Generate the code for this Directive
+-        parent.add(DirectiveGen(parent, "acc", "begin", "routine", ""))
++        parent.add(DirectiveGen(parent, "acc", "begin", "routine",
++                                f"{self.parallelism}"))
+ 
+     def begin_string(self):
+         '''Returns the beginning statement of this directive, i.e.
+@@ -168,7 +211,7 @@ class ACCRoutineDirective(ACCStandaloneDirective):
+         :rtype: str
+ 
+         '''
+-        return "acc routine"
++        return f"acc routine {self.parallelism}"
+ 
+ 
+ class ACCEnterDataDirective(ACCStandaloneDirective):
+diff --git a/src/psyclone/transformations.py b/src/psyclone/transformations.py
+index 55c7a4a64..2d999da7a 100644
+--- a/src/psyclone/transformations.py
++++ b/src/psyclone/transformations.py
+@@ -379,7 +379,9 @@ class MarkRoutineForGPUMixin:
+         :raises TransformationError: if it is a kernel but without an
+                                      associated PSyIR.
+         :raises TransformationError: if any of the symbols in the kernel are
+-                                     accessed via a module use statement.
++                                     accessed via a module use statement (and
++                                     are not compile-time constants).
++        :raises TransformationError: if the routine contains any CodeBlocks.
+         :raises TransformationError: if the kernel contains any calls to other
+                                      routines.
+         '''
+@@ -2526,14 +2528,6 @@ class ACCRoutineTrans(Transformation, MarkRoutineForGPUMixin):
+     >>> rtrans.apply(kern)
+ 
+     '''
+-    @property
+-    def name(self):
+-        '''
+-        :returns: the name of this transformation class.
+-        :rtype: str
+-        '''
+-        return "ACCRoutineTrans"
+-
+     def apply(self, node, options=None):
+         '''
+         Add the '!$acc routine' OpenACC directive into the code of the
+@@ -2541,10 +2535,15 @@ class ACCRoutineTrans(Transformation, MarkRoutineForGPUMixin):
+         in the supplied Routine.
+ 
+         :param node: the kernel call or routine implementation to transform.
+-        :type node: :py:class:`psyclone.psyGen.Kern` or \
++        :type node: :py:class:`psyclone.psyGen.Kern` |
+                     :py:class:`psyclone.psyir.nodes.Routine`
+         :param options: a dictionary with options for transformations.
+         :type options: Optional[Dict[str, Any]]
++        :param bool options["force"]: whether to allow routines with
++            CodeBlocks to run on the GPU.
++        :param str options["parallelism"]: the level of parallelism that the
++            target routine (or a callee) exposes. One of "seq" (the default),
++            "vector", "worker" or "gang".
+ 
+         '''
+         # Check that we can safely apply this transformation
+@@ -2563,7 +2562,10 @@ class ACCRoutineTrans(Transformation, MarkRoutineForGPUMixin):
+         for child in routine.children:
+             if isinstance(child, ACCRoutineDirective):
+                 return  # The routine is already marked with ACCRoutine
+-        routine.children.insert(0, ACCRoutineDirective())
++
++        para = options.get("parallelism", "seq") if options else "seq"
++
++        routine.children.insert(0, ACCRoutineDirective(parallelism=para))
+ 
+     def validate(self, node, options=None):
+         '''
+@@ -2581,16 +2583,27 @@ class ACCRoutineTrans(Transformation, MarkRoutineForGPUMixin):
+         :raises TransformationError: if the node is not a kernel or a routine.
+         :raises TransformationError: if the target is a built-in kernel.
+         :raises TransformationError: if it is a kernel but without an
+-                                     associated PSyIR.
++            associated PSyIR.
+         :raises TransformationError: if any of the symbols in the kernel are
+-                                     accessed via a module use statement.
++            accessed via a module use statement.
+         :raises TransformationError: if the kernel contains any calls to other
+-                                     routines.
++            routines.
++        :raises TransformationError: if the 'parallelism' option is supplied
++            but is not a recognised level of parallelism.
++
+         '''
+         super().validate(node, options)
+ 
+         self.validate_it_can_run_on_gpu(node, options)
+ 
++        if options and "parallelism" in options:
++            para = options["parallelism"]
++            if para not in ACCRoutineDirective.SUPPORTED_PARALLELISM:
++                raise TransformationError(
++                    f"{self.name}: '{para}' is not a supported level of "
++                    f"parallelism. Should be one of "
++                    f"{ACCRoutineDirective.SUPPORTED_PARALLELISM}")
++
+ 
+ class ACCDataTrans(RegionTrans):
+     '''

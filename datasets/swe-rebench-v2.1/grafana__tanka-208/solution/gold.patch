@@ -1,0 +1,333 @@
+diff --git a/pkg/kubernetes/client/apply.go b/pkg/kubernetes/client/apply.go
+index c40e3ab..0524352 100644
+--- a/pkg/kubernetes/client/apply.go
++++ b/pkg/kubernetes/client/apply.go
+@@ -2,7 +2,6 @@ package client
+ 
+ import (
+ 	"os"
+-	"os/exec"
+ 	"strings"
+ 
+ 	"github.com/grafana/tanka/pkg/kubernetes/manifest"
+@@ -23,10 +22,7 @@ func (k Kubectl) Apply(data manifest.List, opts ApplyOpts) error {
+ }
+ 
+ func (k Kubectl) apply(data manifest.List, opts ApplyOpts) error {
+-	argv := []string{"apply",
+-		"--context", k.context.Get("name").MustStr(),
+-		"-f", "-",
+-	}
++	argv := []string{"-f", "-"}
+ 	if opts.Force {
+ 		argv = append(argv, "--force")
+ 	}
+@@ -35,7 +31,7 @@ func (k Kubectl) apply(data manifest.List, opts ApplyOpts) error {
+ 		argv = append(argv, "--validate=false")
+ 	}
+ 
+-	cmd := exec.Command("kubectl", argv...)
++	cmd := k.ctl("apply", argv...)
+ 	cmd.Stdout = os.Stdout
+ 	cmd.Stderr = os.Stderr
+ 
+diff --git a/pkg/kubernetes/client/context.go b/pkg/kubernetes/client/context.go
+index b13922d..f04bc1b 100644
+--- a/pkg/kubernetes/client/context.go
++++ b/pkg/kubernetes/client/context.go
+@@ -4,16 +4,22 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
++	"io/ioutil"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"strings"
+ 
++	"github.com/pkg/errors"
+ 	"github.com/stretchr/objx"
+ 	funk "github.com/thoas/go-funk"
+ )
+ 
+-// setupContext uses `kubectl config view` to obtain the KUBECONFIG and extracts the correct context from it
+-func (k *Kubectl) setupContext() error {
++// setupContext makes sure the kubectl client is set up to use the correct
++// context for the cluster IP:
++// - find a context that matches the IP
++// - create a patch for it to set the default namespace
++func (k *Kubectl) setupContext(namespace string) error {
+ 	if k.context != nil {
+ 		return nil
+ 	}
+@@ -23,9 +29,35 @@ func (k *Kubectl) setupContext() error {
+ 	if err != nil {
+ 		return err
+ 	}
++
++	nsPatch, err := writeNamespacePatch(k.context, namespace)
++	if err != nil {
++		return errors.Wrap(err, "creating $KUBECONFIG patch for default namespace")
++	}
++	k.nsPatch = nsPatch
++
+ 	return nil
+ }
+ 
++func writeNamespacePatch(context objx.Map, namespace string) (string, error) {
++	context.Set("context.namespace", namespace)
++
++	kubectx := map[string]interface{}{
++		"contexts": []interface{}{context},
++	}
++	out, err := json.Marshal(kubectx)
++	if err != nil {
++		return "", err
++	}
++
++	f := filepath.Join(os.TempDir(), "tk-kubectx-namespace.yaml")
++	if err := ioutil.WriteFile(f, []byte(out), 0644); err != nil {
++		return "", err
++	}
++
++	return f, nil
++}
++
+ // Kubeconfig returns the merged $KUBECONFIG of the host
+ func Kubeconfig() (map[string]interface{}, error) {
+ 	cmd := exec.Command("kubectl", "config", "view", "-o", "json")
+diff --git a/pkg/kubernetes/client/delete.go b/pkg/kubernetes/client/delete.go
+index ace845e..b9d8ebe 100644
+--- a/pkg/kubernetes/client/delete.go
++++ b/pkg/kubernetes/client/delete.go
+@@ -22,10 +22,8 @@ func (k Kubectl) DeleteByLabels(namespace string, labels map[string]interface{},
+ }
+ 
+ func (k Kubectl) delete(namespace string, sel []string, opts DeleteOpts) error {
+-	argv := append([]string{"delete",
+-		"-n", namespace,
+-		"--context", k.context.Get("name").MustStr(),
+-	}, sel...)
++	argv := append([]string{"-n", namespace}, sel...)
++	k.ctl("delete", argv...)
+ 
+ 	if opts.Force {
+ 		argv = append(argv, "--force")
+diff --git a/pkg/kubernetes/client/diff.go b/pkg/kubernetes/client/diff.go
+index f0fc4bd..18d804d 100644
+--- a/pkg/kubernetes/client/diff.go
++++ b/pkg/kubernetes/client/diff.go
+@@ -19,11 +19,7 @@ func (k Kubectl) DiffServerSide(data manifest.List) (*string, error) {
+ 	}
+ 
+ 	ready, missing := separateMissingNamespace(data, ns)
+-	argv := []string{"diff",
+-		"--context", k.context.Get("name").MustStr(),
+-		"-f", "-",
+-	}
+-	cmd := exec.Command("kubectl", argv...)
++	cmd := k.ctl("diff", "-f", "-")
+ 
+ 	raw := bytes.Buffer{}
+ 	cmd.Stdout = &raw
+@@ -58,7 +54,8 @@ func (k Kubectl) DiffServerSide(data manifest.List) (*string, error) {
+ 
+ func separateMissingNamespace(in manifest.List, exists map[string]bool) (ready, missingNamespace manifest.List) {
+ 	for _, r := range in {
+-		if !exists[r.Metadata().Namespace()] {
++		// namespace does not exist, also ignore implicit default ("")
++		if ns := r.Metadata().Namespace(); ns != "" && !exists[ns] {
+ 			missingNamespace = append(missingNamespace, r)
+ 			continue
+ 		}
+diff --git a/pkg/kubernetes/client/exec.go b/pkg/kubernetes/client/exec.go
+new file mode 100644
+index 0000000..1f6ccc8
+--- /dev/null
++++ b/pkg/kubernetes/client/exec.go
+@@ -0,0 +1,67 @@
++package client
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sort"
++	"strings"
++)
++
++// ctl returns an `exec.Cmd` for `kubectl`. It also forces the correct context
++// and injects our patched $KUBECONFIG for the default namespace.
++func (k Kubectl) ctl(action string, args ...string) *exec.Cmd {
++	// prepare the arguments
++	argv := []string{action,
++		"--context", k.context.Get("name").MustStr(),
++	}
++	argv = append(argv, args...)
++
++	// prepare the cmd
++	cmd := exec.Command("kubectl", argv...)
++	cmd.Env = patchKubeconfig(k.nsPatch, os.Environ())
++
++	return cmd
++}
++
++func patchKubeconfig(file string, e []string) []string {
++	// prepend namespace patch to $KUBECONFIG
++	env := newEnv(e)
++	if _, ok := env["KUBECONFIG"]; !ok {
++		env["KUBECONFIG"] = filepath.Join(homeDir(), ".kube", "config") // kubectl default
++	}
++	env["KUBECONFIG"] = fmt.Sprintf("%s:%s", file, env["KUBECONFIG"])
++
++	return env.render()
++}
++
++// environment is a helper type for manipulating os.Environ() more easily
++type environment map[string]string
++
++func newEnv(e []string) environment {
++	env := make(environment)
++	for _, s := range e {
++		kv := strings.SplitN(s, "=", 2)
++		env[kv[0]] = kv[1]
++	}
++	return env
++}
++
++func (e environment) render() []string {
++	s := make([]string, 0, len(e))
++	for k, v := range e {
++		s = append(s, fmt.Sprintf("%s=%s", k, v))
++	}
++	sort.Strings(s)
++	return s
++}
++
++func homeDir() string {
++	home, err := os.UserHomeDir()
++	// unable to find homedir. Should never happen on the supported os/arch
++	if err != nil {
++		panic("Unable to find your $HOME directory. This should not have ever happened. Please open an issue on https://github.com/grafana/tanka/issues with your OS and ARCH.")
++	}
++	return home
++}
+diff --git a/pkg/kubernetes/client/get.go b/pkg/kubernetes/client/get.go
+index 0368e42..e5062f2 100644
+--- a/pkg/kubernetes/client/get.go
++++ b/pkg/kubernetes/client/get.go
+@@ -4,7 +4,6 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
+-	"os/exec"
+ 	"strings"
+ 
+ 	"github.com/grafana/tanka/pkg/kubernetes/manifest"
+@@ -41,12 +40,11 @@ func (k Kubectl) GetByLabels(namespace string, labels map[string]interface{}) (m
+ }
+ 
+ func (k Kubectl) get(namespace string, sel []string) (manifest.Manifest, error) {
+-	argv := append([]string{"get",
++	argv := append([]string{
+ 		"-o", "json",
+ 		"-n", namespace,
+-		"--context", k.context.Get("name").MustStr(),
+ 	}, sel...)
+-	cmd := exec.Command("kubectl", argv...)
++	cmd := k.ctl("get", argv...)
+ 
+ 	var sout, serr bytes.Buffer
+ 	cmd.Stdout = &sout
+diff --git a/pkg/kubernetes/client/kubectl.go b/pkg/kubernetes/client/kubectl.go
+index ed67c71..02802fd 100644
+--- a/pkg/kubernetes/client/kubectl.go
++++ b/pkg/kubernetes/client/kubectl.go
+@@ -5,7 +5,6 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+-	"os/exec"
+ 	"regexp"
+ 
+ 	"github.com/Masterminds/semver"
+@@ -17,17 +16,20 @@ import (
+ 
+ // Kubectl uses the `kubectl` command to operate on a Kubernetes cluster
+ type Kubectl struct {
+-	context   objx.Map
+-	cluster   objx.Map
++	// kubeconfig
++	nsPatch string
++	context objx.Map
++	cluster objx.Map
++
+ 	APIServer string
+ }
+ 
+ // New returns a instance of Kubectl with a correct context already discovered.
+-func New(endpoint string) (*Kubectl, error) {
++func New(endpoint, namespace string) (*Kubectl, error) {
+ 	k := Kubectl{
+ 		APIServer: endpoint,
+ 	}
+-	if err := k.setupContext(); err != nil {
++	if err := k.setupContext(namespace); err != nil {
+ 		return nil, errors.Wrap(err, "finding usable context")
+ 	}
+ 	return &k, nil
+@@ -51,10 +53,7 @@ func (k Kubectl) Info() (*Info, error) {
+ 
+ // Version returns the version of kubectl and the Kubernetes api server
+ func (k Kubectl) version() (client, server *semver.Version, err error) {
+-	cmd := exec.Command("kubectl", "version",
+-		"-o", "json",
+-		"--context", k.context.Get("name").MustStr(),
+-	)
++	cmd := k.ctl("version", "-o", "json")
+ 	var buf bytes.Buffer
+ 	cmd.Stdout = &buf
+ 	cmd.Stderr = os.Stderr
+@@ -69,12 +68,7 @@ func (k Kubectl) version() (client, server *semver.Version, err error) {
+ 
+ // Namespaces of the cluster
+ func (k Kubectl) Namespaces() (map[string]bool, error) {
+-	argv := []string{"get",
+-		"-o", "json",
+-		"--context", k.context.Get("name").MustStr(),
+-		"namespaces",
+-	}
+-	cmd := exec.Command("kubectl", argv...)
++	cmd := k.ctl("get", "namespaces", "-o", "json")
+ 
+ 	var sout bytes.Buffer
+ 	cmd.Stdout = &sout
+diff --git a/pkg/kubernetes/kubernetes.go b/pkg/kubernetes/kubernetes.go
+index 19d2a64..3c17e66 100644
+--- a/pkg/kubernetes/kubernetes.go
++++ b/pkg/kubernetes/kubernetes.go
+@@ -33,7 +33,7 @@ type Differ func(manifest.List) (*string, error)
+ // New creates a new Kubernetes with an initialized client
+ func New(s v1alpha1.Spec) (*Kubernetes, error) {
+ 	// setup client
+-	ctl, err := client.New(s.APIServer)
++	ctl, err := client.New(s.APIServer, s.Namespace)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "creating client")
+ 	}
+diff --git a/pkg/kubernetes/reconcile.go b/pkg/kubernetes/reconcile.go
+index 9de42cd..ffc0d6f 100644
+--- a/pkg/kubernetes/reconcile.go
++++ b/pkg/kubernetes/reconcile.go
+@@ -29,10 +29,6 @@ func Reconcile(raw map[string]interface{}, spec v1alpha1.Spec, targets []*regexp
+ 
+ 	out := make(manifest.List, 0, len(extracted))
+ 	for _, m := range extracted {
+-		if spec.Namespace != "" && !m.Metadata().HasNamespace() {
+-			m.Metadata()["namespace"] = spec.Namespace
+-		}
+-
+ 		out = append(out, m)
+ 	}
+ 

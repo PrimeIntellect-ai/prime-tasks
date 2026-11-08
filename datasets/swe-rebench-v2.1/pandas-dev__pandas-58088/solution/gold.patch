@@ -1,0 +1,315 @@
+diff --git a/doc/source/development/maintaining.rst b/doc/source/development/maintaining.rst
+index 4f4a1cd811..fbcf017d60 100644
+--- a/doc/source/development/maintaining.rst
++++ b/doc/source/development/maintaining.rst
+@@ -84,7 +84,7 @@ Here's a typical workflow for triaging a newly opened issue.
+    example. See https://matthewrocklin.com/blog/work/2018/02/28/minimal-bug-reports
+    for a good explanation. If the example is not reproducible, or if it's
+    *clearly* not minimal, feel free to ask the reporter if they can provide
+-   and example or simplify the provided one. Do acknowledge that writing
++   an example or simplify the provided one. Do acknowledge that writing
+    minimal reproducible examples is hard work. If the reporter is struggling,
+    you can try to write one yourself and we'll edit the original post to include it.
+ 
+@@ -93,6 +93,9 @@ Here's a typical workflow for triaging a newly opened issue.
+    If a reproducible example is provided, but you see a simplification,
+    edit the original post with your simpler reproducible example.
+ 
++   If this is a regression report, post the result of a ``git bisect`` run.
++   More info on this can be found in the :ref:`maintaining.regressions` section.
++
+    Ensure the issue exists on the main branch and that it has the "Needs Triage" tag
+    until all steps have been completed. Add a comment to the issue once you have
+    verified it exists on the main branch, so others know it has been confirmed.
+@@ -125,7 +128,10 @@ Here's a typical workflow for triaging a newly opened issue.
+    If the issue is clearly defined and the fix seems relatively straightforward,
+    label the issue as "Good first issue".
+ 
+-   Once you have completed the above, make sure to remove the "needs triage" label.
++   If the issue is a regression report, add the "Regression" label and the next patch
++   release milestone.
++
++   Once you have completed the above, make sure to remove the "Needs Triage" label.
+ 
+ .. _maintaining.regressions:
+ 
+diff --git a/doc/source/whatsnew/v3.0.0.rst b/doc/source/whatsnew/v3.0.0.rst
+index a15da861cf..6a6abcf2d4 100644
+--- a/doc/source/whatsnew/v3.0.0.rst
++++ b/doc/source/whatsnew/v3.0.0.rst
+@@ -440,6 +440,7 @@ Missing
+ MultiIndex
+ ^^^^^^^^^^
+ - :func:`DataFrame.loc` with ``axis=0``  and :class:`MultiIndex` when setting a value adds extra columns (:issue:`58116`)
++- :meth:`DataFrame.melt` would not accept multiple names in ``var_name`` when the columns were a :class:`MultiIndex` (:issue:`58033`)
+ -
+ 
+ I/O
+diff --git a/pandas/core/apply.py b/pandas/core/apply.py
+index 32e8aea7ea..25836e967e 100644
+--- a/pandas/core/apply.py
++++ b/pandas/core/apply.py
+@@ -664,7 +664,7 @@ class Apply(metaclass=abc.ABCMeta):
+             # people may aggregate on a non-callable attribute
+             # but don't let them think they can pass args to it
+             assert len(args) == 0
+-            assert len([kwarg for kwarg in kwargs if kwarg not in ["axis"]]) == 0
++            assert not any(kwarg == "axis" for kwarg in kwargs)
+             return f
+         elif hasattr(np, func) and hasattr(obj, "__array__"):
+             # in particular exclude Window
+diff --git a/pandas/core/computation/eval.py b/pandas/core/computation/eval.py
+index c949cfd1bc..fee08c6199 100644
+--- a/pandas/core/computation/eval.py
++++ b/pandas/core/computation/eval.py
+@@ -193,6 +193,8 @@ def eval(
+     corresponding bitwise operators.  :class:`~pandas.Series` and
+     :class:`~pandas.DataFrame` objects are supported and behave as they would
+     with plain ol' Python evaluation.
++    `eval` can run arbitrary code which can make you vulnerable to code
++    injection if you pass user input to this function.
+ 
+     Parameters
+     ----------
+diff --git a/pandas/core/frame.py b/pandas/core/frame.py
+index c875ec7889..01ac5a2be3 100644
+--- a/pandas/core/frame.py
++++ b/pandas/core/frame.py
+@@ -4472,6 +4472,9 @@ class DataFrame(NDFrame, OpsMixin):
+         """
+         Query the columns of a DataFrame with a boolean expression.
+ 
++        This method can run arbitrary code which can make you vulnerable to code
++        injection if you pass user input to this function.
++
+         Parameters
+         ----------
+         expr : str
+diff --git a/pandas/core/generic.py b/pandas/core/generic.py
+index 0e91aa23fc..ca60ca9b48 100644
+--- a/pandas/core/generic.py
++++ b/pandas/core/generic.py
+@@ -1750,11 +1750,15 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
+             if `key` matches multiple labels
+         """
+         axis = self._get_axis_number(axis)
+-        other_axes = [ax for ax in range(self._AXIS_LEN) if ax != axis]
++        first_other_axes = next(
++            (ax for ax in range(self._AXIS_LEN) if ax != axis), None
++        )
+ 
+         if self._is_label_reference(key, axis=axis):
+             self._check_label_or_level_ambiguity(key, axis=axis)
+-            values = self.xs(key, axis=other_axes[0])._values
++            if first_other_axes is None:
++                raise ValueError("axis matched all axes")
++            values = self.xs(key, axis=first_other_axes)._values
+         elif self._is_level_reference(key, axis=axis):
+             values = self.axes[axis].get_level_values(key)._values
+         else:
+@@ -1762,7 +1766,9 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
+ 
+         # Check for duplicates
+         if values.ndim > 1:
+-            if other_axes and isinstance(self._get_axis(other_axes[0]), MultiIndex):
++            if first_other_axes is not None and isinstance(
++                self._get_axis(first_other_axes), MultiIndex
++            ):
+                 multi_message = (
+                     "\n"
+                     "For a multi-index, the label must be a "
+diff --git a/pandas/core/reshape/melt.py b/pandas/core/reshape/melt.py
+index b472030609..294de2cf2f 100644
+--- a/pandas/core/reshape/melt.py
++++ b/pandas/core/reshape/melt.py
+@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ 
+-from pandas.core.dtypes.common import is_list_like
++from pandas.core.dtypes.common import (
++    is_iterator,
++    is_list_like,
++)
+ from pandas.core.dtypes.concat import concat_compat
+ from pandas.core.dtypes.missing import notna
+ 
+@@ -64,9 +67,10 @@ def melt(
+     value_vars : scalar, tuple, list, or ndarray, optional
+         Column(s) to unpivot. If not specified, uses all columns that
+         are not set as `id_vars`.
+-    var_name : scalar, default None
++    var_name : scalar, tuple, list, or ndarray, optional
+         Name to use for the 'variable' column. If None it uses
+-        ``frame.columns.name`` or 'variable'.
++        ``frame.columns.name`` or 'variable'. Must be a scalar if columns are a
++        MultiIndex.
+     value_name : scalar, default 'value'
+         Name to use for the 'value' column, can't be an existing column label.
+     col_level : scalar, optional
+@@ -217,7 +221,16 @@ def melt(
+                 frame.columns.name if frame.columns.name is not None else "variable"
+             ]
+     elif is_list_like(var_name):
+-        raise ValueError(f"{var_name=} must be a scalar.")
++        if isinstance(frame.columns, MultiIndex):
++            if is_iterator(var_name):
++                var_name = list(var_name)
++            if len(var_name) > len(frame.columns):
++                raise ValueError(
++                    f"{var_name=} has {len(var_name)} items, "
++                    f"but the dataframe columns only have {len(frame.columns)} levels."
++                )
++        else:
++            raise ValueError(f"{var_name=} must be a scalar.")
+     else:
+         var_name = [var_name]
+ 
+diff --git a/pandas/io/excel/_base.py b/pandas/io/excel/_base.py
+index dd06c597c1..1eb22d4ee9 100644
+--- a/pandas/io/excel/_base.py
++++ b/pandas/io/excel/_base.py
+@@ -857,24 +857,23 @@ class BaseExcelReader(Generic[_WorkbookT]):
+         # a row containing just the index name(s)
+         has_index_names = False
+         if is_list_header and not is_len_one_list_header and index_col is not None:
+-            index_col_list: Sequence[int]
++            index_col_set: set[int]
+             if isinstance(index_col, int):
+-                index_col_list = [index_col]
++                index_col_set = {index_col}
+             else:
+                 assert isinstance(index_col, Sequence)
+-                index_col_list = index_col
++                index_col_set = set(index_col)
+ 
+             # We have to handle mi without names. If any of the entries in the data
+             # columns are not empty, this is a regular row
+             assert isinstance(header, Sequence)
+             if len(header) < len(data):
+                 potential_index_names = data[len(header)]
+-                potential_data = [
+-                    x
++                has_index_names = all(
++                    x == "" or x is None
+                     for i, x in enumerate(potential_index_names)
+-                    if not control_row[i] and i not in index_col_list
+-                ]
+-                has_index_names = all(x == "" or x is None for x in potential_data)
++                    if not control_row[i] and i not in index_col_set
++                )
+ 
+         if is_list_like(index_col):
+             # Forward fill values for MultiIndex index.
+@@ -1457,9 +1456,9 @@ def inspect_excel_format(
+         with zipfile.ZipFile(stream) as zf:
+             # Workaround for some third party files that use forward slashes and
+             # lower case names.
+-            component_names = [
++            component_names = {
+                 name.replace("\\", "/").lower() for name in zf.namelist()
+-            ]
++            }
+ 
+         if "xl/workbook.xml" in component_names:
+             return "xlsx"
+diff --git a/pandas/io/excel/_odfreader.py b/pandas/io/excel/_odfreader.py
+index 69b514da32..f79417d110 100644
+--- a/pandas/io/excel/_odfreader.py
++++ b/pandas/io/excel/_odfreader.py
+@@ -122,29 +122,25 @@ class ODFReader(BaseExcelReader["OpenDocument"]):
+         table: list[list[Scalar | NaTType]] = []
+ 
+         for sheet_row in sheet_rows:
+-            sheet_cells = [
+-                x
+-                for x in sheet_row.childNodes
+-                if hasattr(x, "qname") and x.qname in cell_names
+-            ]
+             empty_cells = 0
+             table_row: list[Scalar | NaTType] = []
+ 
+-            for sheet_cell in sheet_cells:
+-                if sheet_cell.qname == table_cell_name:
+-                    value = self._get_cell_value(sheet_cell)
+-                else:
+-                    value = self.empty_value
+-
+-                column_repeat = self._get_column_repeat(sheet_cell)
+-
+-                # Queue up empty values, writing only if content succeeds them
+-                if value == self.empty_value:
+-                    empty_cells += column_repeat
+-                else:
+-                    table_row.extend([self.empty_value] * empty_cells)
+-                    empty_cells = 0
+-                    table_row.extend([value] * column_repeat)
++            for sheet_cell in sheet_row.childNodes:
++                if hasattr(sheet_cell, "qname") and sheet_cell.qname in cell_names:
++                    if sheet_cell.qname == table_cell_name:
++                        value = self._get_cell_value(sheet_cell)
++                    else:
++                        value = self.empty_value
++
++                    column_repeat = self._get_column_repeat(sheet_cell)
++
++                    # Queue up empty values, writing only if content succeeds them
++                    if value == self.empty_value:
++                        empty_cells += column_repeat
++                    else:
++                        table_row.extend([self.empty_value] * empty_cells)
++                        empty_cells = 0
++                        table_row.extend([value] * column_repeat)
+ 
+             if max_row_len < len(table_row):
+                 max_row_len = len(table_row)
+diff --git a/pandas/io/excel/_xlrd.py b/pandas/io/excel/_xlrd.py
+index a444970792..5d39a84033 100644
+--- a/pandas/io/excel/_xlrd.py
++++ b/pandas/io/excel/_xlrd.py
+@@ -128,16 +128,13 @@ class XlrdReader(BaseExcelReader["Book"]):
+                         cell_contents = val
+             return cell_contents
+ 
+-        data = []
+-
+         nrows = sheet.nrows
+         if file_rows_needed is not None:
+             nrows = min(nrows, file_rows_needed)
+-        for i in range(nrows):
+-            row = [
++        return [
++            [
+                 _parse_cell(value, typ)
+                 for value, typ in zip(sheet.row_values(i), sheet.row_types(i))
+             ]
+-            data.append(row)
+-
+-        return data
++            for i in range(nrows)
++        ]
+diff --git a/pandas/io/sql.py b/pandas/io/sql.py
+index c0007c5e7d..874320f08f 100644
+--- a/pandas/io/sql.py
++++ b/pandas/io/sql.py
+@@ -157,6 +157,7 @@ def _convert_arrays_to_dataframe(
+     dtype_backend: DtypeBackend | Literal["numpy"] = "numpy",
+ ) -> DataFrame:
+     content = lib.to_object_array_tuples(data)
++    idx_len = content.shape[0]
+     arrays = convert_object_array(
+         list(content.T),
+         dtype=None,
+@@ -177,9 +178,9 @@ def _convert_arrays_to_dataframe(
+             result_arrays.append(ArrowExtensionArray(pa_array))
+         arrays = result_arrays  # type: ignore[assignment]
+     if arrays:
+-        df = DataFrame(dict(zip(range(len(columns)), arrays)))
+-        df.columns = columns
+-        return df
++        return DataFrame._from_arrays(
++            arrays, columns=columns, index=range(idx_len), verify_integrity=False
++        )
+     else:
+         return DataFrame(columns=columns)
+ 

@@ -1,0 +1,191 @@
+diff --git a/vault/config_test.go b/vault/config_test.go
+index 5db86c1..4d8af7e 100644
+--- a/vault/config_test.go
++++ b/vault/config_test.go
+@@ -4,11 +4,19 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"io/ioutil"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
+ 	"os"
+ 	"reflect"
++	"sort"
+ 	"testing"
+ 
+ 	"github.com/99designs/aws-vault/v6/vault"
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/credentials"
++	"github.com/aws/aws-sdk-go/aws/session"
++	"github.com/aws/aws-sdk-go/service/sts"
+ 	"github.com/google/go-cmp/cmp"
+ )
+ 
+@@ -377,3 +385,166 @@ source_profile=root
+ 		t.Fatalf("Expected '%s', got '%s'", expectedSourceProfileName, config.SourceProfileName)
+ 	}
+ }
++
++func TestSessionTagsFromProfileReachAssumeRole(t *testing.T) {
++	t.Setenv("AWS_SESSION_TAGS", "")
++	t.Setenv("AWS_TRANSITIVE_TAGS", "")
++	f := newConfigFile(t, []byte(`[profile base]
++[profile interim]
++role_arn = arn:aws:iam::123456789012:role/interim
++source_profile = base
++session_tags = interim=profile
++transitive_session_tags = interim
++[profile target]
++role_arn = arn:aws:iam::123456789012:role/target
++source_profile = interim
++session_tags = target=profile
++transitive_session_tags = target
++`))
++	defer os.Remove(f)
++
++	configFile, err := vault.LoadConfig(f)
++	if err != nil {
++		t.Fatal(err)
++	}
++	loader := &vault.ConfigLoader{File: configFile, ActiveProfile: "target"}
++	target, err := loader.LoadFromProfile("target")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := newAssumeRoleTestServer(t)
++	defer server.Close()
++
++	assertAssumeRoleTags(t, server, target, map[string]string{"target": "profile"}, []string{"target"})
++	assertAssumeRoleTags(t, server, target.SourceProfile, map[string]string{"interim": "profile"}, []string{"interim"})
++}
++
++func TestSessionTagsFromEnvironmentReachAssumeRole(t *testing.T) {
++	t.Setenv("AWS_SESSION_TAGS", "tagA=val1,tagB=val2")
++	t.Setenv("AWS_TRANSITIVE_TAGS", "tagB,tagA")
++	f := newConfigFile(t, []byte(`[profile target]
++role_arn = arn:aws:iam::123456789012:role/target
++`))
++	defer os.Remove(f)
++
++	configFile, err := vault.LoadConfig(f)
++	if err != nil {
++		t.Fatal(err)
++	}
++	config, err := (&vault.ConfigLoader{File: configFile, ActiveProfile: "target"}).LoadFromProfile("target")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := newAssumeRoleTestServer(t)
++	defer server.Close()
++
++	assertAssumeRoleTags(t, server, config, map[string]string{"tagA": "val1", "tagB": "val2"}, []string{"tagA", "tagB"})
++}
++
++func TestSessionTagsForEachChainedRoleReachAssumeRole(t *testing.T) {
++	t.Setenv("AWS_SESSION_TAGS", "")
++	t.Setenv("AWS_TRANSITIVE_TAGS", "")
++	f := newConfigFile(t, []byte(`[profile base]
++[profile interim]
++role_arn = arn:aws:iam::123456789012:role/interim
++source_profile = base
++session_tags = interim=profile
++transitive_session_tags = interim
++[profile target]
++role_arn = arn:aws:iam::123456789012:role/target
++source_profile = interim
++session_tags = target=profile
++transitive_session_tags = target
++`))
++	defer os.Remove(f)
++
++	configFile, err := vault.LoadConfig(f)
++	if err != nil {
++		t.Fatal(err)
++	}
++	config, err := (&vault.ConfigLoader{File: configFile, ActiveProfile: "target"}).LoadFromProfile("target")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := newAssumeRoleTestServer(t)
++	defer server.Close()
++
++	assertAssumeRoleTags(t, server, config, map[string]string{"target": "profile"}, []string{"target"})
++	assertAssumeRoleTags(t, server, config.SourceProfile, map[string]string{"interim": "profile"}, []string{"interim"})
++}
++
++type assumeRoleTestServer struct {
++	*httptest.Server
++	requests chan url.Values
++}
++
++func newAssumeRoleTestServer(t *testing.T) *assumeRoleTestServer {
++	t.Helper()
++	testServer := &assumeRoleTestServer{requests: make(chan url.Values, 10)}
++	testServer.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if err := r.ParseForm(); err != nil {
++			t.Errorf("Failed to parse AssumeRole request: %v", err)
++		}
++		if r.Form.Get("Action") != "AssumeRole" {
++			t.Errorf("Expected AssumeRole action, got %q", r.Form.Get("Action"))
++		}
++		testServer.requests <- r.Form
++		w.Header().Set("Content-Type", "text/xml")
++		fmt.Fprint(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><AssumedRoleUser><AssumedRoleId>AROA1234567890:session</AssumedRoleId><Arn>arn:aws:sts::123456789012:assumed-role/test/session</Arn></AssumedRoleUser><Credentials><AccessKeyId>ASIA1234567890</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult><ResponseMetadata><RequestId>request-id</RequestId></ResponseMetadata></AssumeRoleResponse>`)
++	}))
++	return testServer
++}
++
++func assertAssumeRoleTags(t *testing.T, server *assumeRoleTestServer, config *vault.Config, expectedTags map[string]string, expectedTransitive []string) {
++	t.Helper()
++	provider, err := vault.NewAssumeRoleProvider(credentials.NewStaticCredentials("AKID", "SECRET", "TOKEN"), nil, config)
++	if err != nil {
++		t.Fatalf("Failed to create AssumeRole provider: %v", err)
++	}
++	assumeRoleProvider, ok := provider.(*vault.AssumeRoleProvider)
++	if !ok {
++		t.Fatalf("Expected an AssumeRole provider, got %T", provider)
++	}
++	sess, err := session.NewSessionWithOptions(session.Options{
++		Config: aws.Config{
++			Region:      aws.String("us-east-1"),
++			Endpoint:    aws.String(server.URL),
++			Credentials: credentials.NewStaticCredentials("AKID", "SECRET", "TOKEN"),
++		},
++		SharedConfigState: session.SharedConfigDisable,
++	})
++	if err != nil {
++		t.Fatalf("Failed to create STS session: %v", err)
++	}
++	assumeRoleProvider.StsClient = sts.New(sess)
++	if _, err := provider.Retrieve(); err != nil {
++		t.Fatalf("AssumeRole failed: %v", err)
++	}
++
++	values := <-server.requests
++	gotTags := map[string]string{}
++	for i := 1; ; i++ {
++		key := values.Get(fmt.Sprintf("Tags.member.%d.Key", i))
++		if key == "" {
++			break
++		}
++		gotTags[key] = values.Get(fmt.Sprintf("Tags.member.%d.Value", i))
++	}
++	if !reflect.DeepEqual(expectedTags, gotTags) {
++		t.Fatalf("Expected STS AssumeRole tags %+v, got %+v", expectedTags, gotTags)
++	}
++
++	var gotTransitive []string
++	for i := 1; ; i++ {
++		key := values.Get(fmt.Sprintf("TransitiveTagKeys.member.%d", i))
++		if key == "" {
++			break
++		}
++		gotTransitive = append(gotTransitive, key)
++	}
++	sort.Strings(expectedTransitive)
++	sort.Strings(gotTransitive)
++	if diff := cmp.Diff(expectedTransitive, gotTransitive); diff != "" {
++		t.Fatalf("Unexpected STS AssumeRole transitive tag keys (-want +got):\n%s", diff)
++	}
++}

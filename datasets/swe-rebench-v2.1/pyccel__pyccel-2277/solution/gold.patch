@@ -1,0 +1,203 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5497cc21..237524ec 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -51,7 +51,7 @@ All notable changes to this project will be documented in this file.
+ -   #1744 : Add support for set method `intersection()`.
+ -   #1745 : Add support for set method `intersection_update()`.
+ -   #1745 : Add support for set method `isdisjoint()`.
+--   #2059 : Add C support for returning dictionaries from functions.
++-   #2059 : Add C and Fortran support for returning dictionaries from functions.
+ -   #2164 : Add support for dict indexing.
+ -   #1880 : Add support for dict method `clear()`.
+ -   #1884 : Add support for dict method `items()`.
+diff --git a/docs/type_annotations.md b/docs/type_annotations.md
+index 75dc8f1c..4b0b00de 100644
+--- a/docs/type_annotations.md
++++ b/docs/type_annotations.md
+@@ -102,6 +102,7 @@ b : dict[int,bool] = {1: False, 4: True}
+ c : dict[int,complex] = {}
+ ```
+ Strings are not yet supported as keys in Fortran.
++Dictionaries can be declared as local variables, or results of functions, but not yet as arguments or class variables.
+ 
+ ## Strings
+ 
+diff --git a/pyccel/codegen/wrapper/c_to_python_wrapper.py b/pyccel/codegen/wrapper/c_to_python_wrapper.py
+index 15e4bdc1..2ee14b0b 100644
+--- a/pyccel/codegen/wrapper/c_to_python_wrapper.py
++++ b/pyccel/codegen/wrapper/c_to_python_wrapper.py
+@@ -3031,7 +3031,7 @@ class CToPythonWrapper(Wrapper):
+ 
+         return {'c_results': c_results, 'py_result': py_res, 'body': body}
+ 
+-    def _extract_DictType_FunctionDefResult(self, orig_var, is_bind_c, funcdef):
++    def _extract_DictType_FunctionDefResult(self, wrapped_var, is_bind_c, funcdef):
+         """
+         Get the code which translates a `Variable` containing a dictionary to a PyObject.
+ 
+@@ -3039,7 +3039,7 @@ class CToPythonWrapper(Wrapper):
+ 
+         Parameters
+         ----------
+-        orig_var : Variable | IndexedElement
++        wrapped_var : Variable | IndexedElement
+             An object representing the variable or an element of the variable from the
+             FunctionDefResult being wrapped.
+         is_bind_c : bool
+@@ -3052,27 +3052,49 @@ class CToPythonWrapper(Wrapper):
+         dict
+             A dictionary describing the objects necessary to collect the result.
+         """
++        orig_var = getattr(wrapped_var, 'original_var', wrapped_var)
+         name = getattr(orig_var, 'name', 'tmp')
+         py_res = self.get_new_PyObject(f'{name}_obj', orig_var.dtype)
+         if is_bind_c:
+-            raise NotImplementedError("Can't return a dict from Fortran")
++            result = wrapped_var.new_var
++            key_ptr_var = funcdef.scope.collect_tuple_element(result[0])
++            val_ptr_var = funcdef.scope.collect_tuple_element(result[1])
++            shape_var = funcdef.scope.collect_tuple_element(result[2])
++            key_c_res = Variable(CStackArray(orig_var.class_type.key_type),
++                             self.scope.get_new_name(key_ptr_var.name))
++            val_c_res = Variable(CStackArray(orig_var.class_type.value_type),
++                             self.scope.get_new_name(val_ptr_var.name))
++            loop_size = shape_var.clone(self.scope.get_new_name(shape_var.name), is_argument = False)
++            c_results = [ObjectAddress(key_c_res), ObjectAddress(val_c_res), loop_size]
++            iterable = PythonRange(shape_var)
++            self.scope.insert_variable(key_c_res)
++            self.scope.insert_variable(val_c_res)
++            self.scope.insert_variable(shape_var)
++            idx = Variable(PythonNativeInt(), self.scope.get_new_name())
++            self.scope.insert_variable(idx)
++            iterable.set_loop_counter(idx)
++            key_elem = IndexedElement(key_c_res, idx)
++            val_elem = IndexedElement(val_c_res, idx)
+         else:
+             c_res = orig_var.clone(self.scope.get_new_name(name), is_argument = False)
+             c_results = [c_res]
+             iterable = DictItems(c_res)
++            self.scope.insert_variable(c_res)
++            iterable.set_loop_counter(Variable(PythonNativeInt(), self.scope.get_new_name()))
++            key_elem, val_elem = iterable.get_python_iterable_item()
+ 
+-        iterable.set_loop_counter(Variable(PythonNativeInt(), self.scope.get_new_name()))
+-        self.scope.insert_variable(c_res)
+ 
+         for_scope = self.scope.create_new_loop_scope()
+         self.scope = for_scope
+-        key_elem, val_elem = iterable.get_python_iterable_item()
+         key_extraction = self._extract_FunctionDefResult(key_elem, is_bind_c, funcdef)
+         value_extraction = self._extract_FunctionDefResult(val_elem, is_bind_c, funcdef)
+         elem_set = PyDict_SetItem(py_res, key_extraction['py_result'], value_extraction['py_result'])
+         for_body = [*key_extraction['body'], *value_extraction['body'],
+                     If(IfSection(PyccelEq(elem_set, PyccelUnarySub(LiteralInteger(1))),
+                                          [Return(self._error_exit_code)]))]
++        if is_bind_c:
++            for_body = [Assign(key_extraction['c_results'][0], key_elem),
++                        Assign(value_extraction['c_results'][0], val_elem)] + for_body
+         self.exit_scope()
+         for_loop = For((key_extraction['c_results'][0], value_extraction['c_results'][0]),
+                         iterable, for_body, for_scope)
+diff --git a/pyccel/codegen/wrapper/fortran_to_c_wrapper.py b/pyccel/codegen/wrapper/fortran_to_c_wrapper.py
+index c5bb27f5..9d26a695 100644
+--- a/pyccel/codegen/wrapper/fortran_to_c_wrapper.py
++++ b/pyccel/codegen/wrapper/fortran_to_c_wrapper.py
+@@ -17,6 +17,7 @@ from pyccel.ast.bind_c import BindCVariable, BindCArrayType, C_NULL_CHAR
+ from pyccel.ast.builtins import VariableIterator, PythonRange
+ from pyccel.ast.builtin_methods.list_methods import ListAppend
+ from pyccel.ast.builtin_methods.set_methods import SetAdd
++from pyccel.ast.builtin_methods.dict_methods import DictItems
+ from pyccel.ast.core import Assign, FunctionCallArgument
+ from pyccel.ast.core import Allocate, EmptyNode, FunctionAddress
+ from pyccel.ast.core import If, IfSection, Import, Interface, FunctionDefArgument
+@@ -889,6 +890,89 @@ class FortranToCWrapper(Wrapper):
+         body.append(For((elem,), iterator, for_body, scope = for_scope))
+         return result
+ 
++    def _extract_DictType_FunctionDefResult(self, orig_var, orig_func_scope):
++        name = orig_var.name
++        scope = self.scope
++        scope.insert_symbol(name)
++        memory_handling = 'alias' if isinstance(orig_var, DottedVariable) else orig_var.memory_handling
++
++        # Allocatable is not returned so it must appear in local scope
++        local_var = orig_var.clone(scope.get_expected_name(name), new_class = Variable,
++                            memory_handling = memory_handling)
++        scope.insert_variable(local_var, name)
++
++        # Create the C-compatible data pointer
++        key_bind_var = Variable(BindCPointer(),
++                            scope.get_new_name(f'bound_{name}_key'),
++                            is_const=False, memory_handling='alias')
++        val_bind_var = Variable(BindCPointer(),
++                            scope.get_new_name(f'bound_{name}_key'),
++                            is_const=False, memory_handling='alias')
++        shape_var = Variable(NumpyInt32Type(), scope.get_new_name(f'{name}_len'))
++        scope.insert_variable(shape_var)
++
++        # Check how to unpack elements
++        class_type = orig_var.class_type
++        key_var = Variable(class_type.key_type, scope.get_new_name(name+'_key'))
++        val_var = Variable(class_type.value_type, scope.get_new_name(name+'_val'))
++        key_wrap = self._extract_FunctionDefResult(key_var, orig_func_scope)
++        val_wrap = self._extract_FunctionDefResult(val_var, orig_func_scope)
++
++        # Get storage arrays
++        key_c_class_type = key_wrap['c_result'].new_var.class_type
++        key_ptr_var = Variable(NumpyNDArrayType(key_c_class_type, 1, None), scope.get_new_name(name+'_key_ptr'),
++                            memory_handling='alias')
++        key_bind_var = Variable(BindCPointer(),
++                            scope.get_new_name(f'bound_{name}_key'),
++                            is_const=False, memory_handling='alias')
++        scope.insert_variable(key_ptr_var)
++        scope.insert_variable(key_bind_var)
++
++        val_c_class_type = val_wrap['c_result'].new_var.class_type
++        val_ptr_var = Variable(NumpyNDArrayType(val_c_class_type, 1, None), scope.get_new_name(name+'_val_ptr'),
++                            memory_handling='alias')
++        val_bind_var = Variable(BindCPointer(),
++                            scope.get_new_name(f'bound_{name}_val'),
++                            is_const=False, memory_handling='alias')
++        scope.insert_variable(val_ptr_var)
++        scope.insert_variable(val_bind_var)
++
++        # Define the additional steps necessary to define and fill ptr_var
++        scope.insert_variable(key_wrap['c_result'])
++        scope.insert_variable(val_wrap['c_result'])
++        key_size = PyccelMul(BindCSizeOf(key_wrap['c_result']), shape_var)
++        val_size = PyccelMul(BindCSizeOf(val_wrap['c_result']), shape_var)
++        body = [Assign(shape_var, local_var.shape[0]),
++                Assign(key_bind_var, c_malloc(key_size)),
++                Assign(val_bind_var, c_malloc(val_size)),
++                C_F_Pointer(key_bind_var, key_ptr_var, (shape_var,)),
++                C_F_Pointer(val_bind_var, val_ptr_var, (shape_var,))]
++
++        # Start to construct the result
++        result = {'f_result' : local_var,
++                  'body' : body}
++
++        # Construct the loop which builds the result
++        for_scope = scope.create_new_loop_scope()
++        iterator = DictItems(local_var)
++        idx = Variable(PythonNativeInt(), self.scope.get_new_name())
++        self.scope.insert_variable(idx)
++        iterator.set_loop_counter(idx)
++
++        for_body = [*key_wrap['body'], Assign(IndexedElement(key_ptr_var, PyccelAdd(idx, LiteralInteger(1))), key_wrap['c_result']),
++                    *val_wrap['body'], Assign(IndexedElement(val_ptr_var, PyccelAdd(idx, LiteralInteger(1))), val_wrap['c_result']),
++                    Assign(idx, PyccelAdd(idx, LiteralInteger(1)))]
++        fill_for = For((key_var, val_var), iterator, for_body, scope = for_scope)
++        body.extend([Assign(idx, LiteralInteger(0)), fill_for])
++
++        result_var = Variable(InhomogeneousTupleType(BindCPointer(), BindCPointer(), NumpyInt32Type()),
++                            scope.get_new_name(), shape = (3,))
++        scope.insert_symbolic_alias(IndexedElement(result_var, LiteralInteger(0)), key_bind_var)
++        scope.insert_symbolic_alias(IndexedElement(result_var, LiteralInteger(1)), val_bind_var)
++        scope.insert_symbolic_alias(IndexedElement(result_var, LiteralInteger(2)), shape_var)
++        result['c_result'] = BindCVariable(result_var, orig_var)
++        return result
++
+     def _extract_StringType_FunctionDefResult(self, orig_var, orig_func_scope):
+         name = orig_var.name
+         scope = self.scope

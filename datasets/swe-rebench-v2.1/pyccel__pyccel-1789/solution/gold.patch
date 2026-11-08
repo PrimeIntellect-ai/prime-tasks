@@ -1,0 +1,187 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6765b21f..28409842 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
+ -   #1792 : Fix array unpacking.
+ -   #1795 : Fix bug when returning slices in C.
+ -   #1732 : Fix multidimensional list indexing in Python.
++-   #1785 : Add missing cast when creating an array of booleans from non-boolean values.
+ 
+ ### Changed
+ -   #1720 : functions with the `@inline` decorator are no longer exposed to Python in the shared library.
+diff --git a/pyccel/ast/builtins.py b/pyccel/ast/builtins.py
+index 8866f468..e8399de3 100644
+--- a/pyccel/ast/builtins.py
++++ b/pyccel/ast/builtins.py
+@@ -513,11 +513,6 @@ class PythonTuple(TypedAstNode):
+ 
+         # Get possible datatypes
+         dtypes = [a.class_type.datatype for a in args]
+-        # Extract all dtypes inside any inhomogeneous tuples
+-        while any(isinstance(d, InhomogeneousTupleType) for d in dtypes):
+-            dtypes = [di for d in dtypes for di in ((d_elem.datatype for d_elem in d)
+-                                                    if isinstance(d, InhomogeneousTupleType)
+-                                                    else [d])]
+         # Create a set of dtypes using the same key for compatible types
+         dtypes = set((d.primitive_type, d.precision) if isinstance(d, FixedSizeNumericType) else d for d in dtypes)
+ 
+diff --git a/pyccel/ast/datatypes.py b/pyccel/ast/datatypes.py
+index 9c903948..03f9576f 100644
+--- a/pyccel/ast/datatypes.py
++++ b/pyccel/ast/datatypes.py
+@@ -714,10 +714,14 @@ class InhomogeneousTupleType(ContainerType, TupleType, metaclass = ArgumentSingl
+     *args : tuple of DataTypes
+         The datatypes stored in the inhomogeneous tuple.
+     """
+-    __slots__ = ('_element_types',)
++    __slots__ = ('_element_types', '_datatype')
+ 
+     def __init__(self, *args):
+         self._element_types = args
++
++        possible_types = set(t.datatype for t in self._element_types)
++        dtype = possible_types.pop()
++        self._datatype = dtype if all(d == dtype for d in possible_types) else self
+         super().__init__()
+ 
+     def __str__(self):
+@@ -754,13 +758,11 @@ class InhomogeneousTupleType(ContainerType, TupleType, metaclass = ArgumentSingl
+         """
+         The datatype of the object.
+ 
+-        The datatype of the object.
++        The datatype of the object. For an inhomogeneous tuple the datatype is the type
++        of the tuple unless the tuple is comprised of containers which are all based on
++        compatible data types. In this case one of the underlying types is returned.
+         """
+-        possible_types = set(t.datatype for t in self._element_types)
+-        if len(possible_types) == 1:
+-            return possible_types.pop()
+-        else:
+-            return self
++        return self._datatype
+ 
+ class DictType(ContainerType, metaclass = ArgumentSingleton):
+     """
+diff --git a/pyccel/ast/numpyext.py b/pyccel/ast/numpyext.py
+index d4154e37..13f7a134 100644
+--- a/pyccel/ast/numpyext.py
++++ b/pyccel/ast/numpyext.py
+@@ -184,12 +184,14 @@ class NumpyFloat(PythonFloat):
+         The argument passed to the function.
+     """
+     __slots__ = ('_rank','_shape','_order','_class_type')
++    _static_type = NumpyFloat64Type()
+     name = 'float'
++
+     def __init__(self, arg):
+         self._shape = arg.shape
+         self._rank  = arg.rank
+         self._order = arg.order
+-        self._class_type = arg.class_type.switch_basic_type(self.static_type())
++        self._class_type = NumpyNDArrayType(self.static_type()) if self._rank else self.static_type()
+         super().__init__(arg)
+ 
+     @property
+@@ -250,7 +252,7 @@ class NumpyBool(PythonBool):
+         self._shape = arg.shape
+         self._rank  = arg.rank
+         self._order = arg.order
+-        self._class_type = arg.class_type.switch_basic_type(self.static_type())
++        self._class_type = NumpyNDArrayType(self.static_type()) if self._rank else self.static_type()
+         super().__init__(arg)
+ 
+     @property
+@@ -277,12 +279,14 @@ class NumpyInt(PythonInt):
+         The argument passed to the function.
+     """
+     __slots__ = ('_shape','_rank','_order','_class_type')
++    _static_type = numpy_precision_map[(PrimitiveIntegerType(), PythonInt._static_type.precision)]
+     name = 'int'
++
+     def __init__(self, arg=None, base=10):
+         self._shape = arg.shape
+         self._rank  = arg.rank
+         self._order = arg.order
+-        self._class_type = arg.class_type.switch_basic_type(self.static_type())
++        self._class_type = NumpyNDArrayType(self.static_type()) if self._rank else self.static_type()
+         super().__init__(arg)
+ 
+     @property
+@@ -374,7 +378,10 @@ class NumpyReal(PythonReal):
+     name = 'real'
+     def __new__(cls, arg):
+         if isinstance(arg.dtype, PythonNativeBool):
+-            return NumpyInt(arg)
++            if arg.rank:
++                return NumpyInt(arg)
++            else:
++                return PythonInt(arg)
+         else:
+             return super().__new__(cls, arg)
+ 
+@@ -452,14 +459,16 @@ class NumpyComplex(PythonComplex):
+     _real_cast = NumpyReal
+     _imag_cast = NumpyImag
+     __slots__ = ('_rank','_shape','_order','_class_type')
++    _static_type = NumpyComplex128Type()
+     name = 'complex'
++
+     def __init__(self, arg0, arg1 = None):
+         if arg1 is not None:
+             raise NotImplementedError("Use builtin complex function not deprecated np.complex")
+         self._shape = arg0.shape
+         self._rank  = arg0.rank
+         self._order = arg0.order
+-        self._class_type = arg0.class_type.switch_basic_type(self.static_type())
++        self._class_type = NumpyNDArrayType(self.static_type()) if self._rank else self.static_type()
+         super().__init__(arg0)
+ 
+     @property
+diff --git a/pyccel/codegen/printing/ccode.py b/pyccel/codegen/printing/ccode.py
+index 88794c13..a8b277e1 100644
+--- a/pyccel/codegen/printing/ccode.py
++++ b/pyccel/codegen/printing/ccode.py
+@@ -1242,7 +1242,7 @@ class CCodePrinter(CodePrinter):
+             else:
+                 errors.report(PYCCEL_RESTRICTION_TODO+' (rank>0)', symbol=expr, severity='fatal')
+         elif not isinstance(class_type, CustomDataType):
+-            dtype = self.find_in_dtype_registry(class_type)
++            dtype = self.find_in_dtype_registry(expr.dtype)
+         else:
+             dtype = self._print(expr.class_type)
+ 
+diff --git a/pyccel/codegen/printing/fcode.py b/pyccel/codegen/printing/fcode.py
+index 9a6766d6..dc86daf7 100644
+--- a/pyccel/codegen/printing/fcode.py
++++ b/pyccel/codegen/printing/fcode.py
+@@ -1190,12 +1190,17 @@ class FCodePrinter(CodePrinter):
+         return stmt
+ 
+     def _print_NumpyArray(self, expr):
+-        expr_args = (expr.arg,) if isinstance(expr.arg, Variable) else expr.arg
+         order = expr.order
++
++        try :
++            cast_func = DtypePrecisionToCastFunction[expr.dtype]
++        except KeyError:
++            errors.report(PYCCEL_RESTRICTION_TODO, severity='fatal')
++        arg = expr.arg if expr.arg.dtype == expr.dtype else cast_func(expr.arg)
+         # If Numpy array is stored with column-major ordering, transpose values
+         # use reshape with order for rank > 2
+         if expr.rank <= 2:
+-            rhs_code = self._print(expr.arg)
++            rhs_code = self._print(arg)
+             if expr.arg.order and expr.arg.order != expr.order:
+                 rhs_code = f'transpose({rhs_code})'
+             if expr.arg.rank < expr.rank:
+@@ -1205,6 +1210,8 @@ class FCodePrinter(CodePrinter):
+                     shape_code = ', '.join(self._print(i) for i in expr.shape[::-1])
+                 rhs_code = f"reshape({rhs_code}, [{shape_code}])"
+         else:
++            expr_args = (expr.arg,) if isinstance(expr.arg, Variable) else expr.arg
++            expr_args = tuple(a if a.dtype == expr.dtype else cast_func(a) for a in expr_args)
+             new_args = []
+             inv_order = 'C' if order == 'F' else 'F'
+             for a in expr_args:

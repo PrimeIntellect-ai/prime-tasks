@@ -1,0 +1,253 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 92b51b2a9..3eee59cb6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Features
+ 
++-   Added a step to discretisation that automatically compute the inverse of the mass matrix of the differential part of the problem so that the underlying DAEs can be provided in semi-explicit form, as required by the CasADi solver ([#769](https://github.com/pybamm-team/PyBaMM/pull/769))
+ -   Added the gradient operation for the Finite Element Method ([#767](https://github.com/pybamm-team/PyBaMM/pull/767))
+ -   Added `InputParameter` node for quickly changing parameter values ([#752](https://github.com/pybamm-team/PyBaMM/pull/752))
+ -   Added submodels for operating modes other than current-controlled ([#751](https://github.com/pybamm-team/PyBaMM/pull/751))
+diff --git a/pybamm/discretisations/discretisation.py b/pybamm/discretisations/discretisation.py
+index 24dcecb71..6e24a0df0 100644
+--- a/pybamm/discretisations/discretisation.py
++++ b/pybamm/discretisations/discretisation.py
+@@ -4,7 +4,8 @@
+ import pybamm
+ import numpy as np
+ from collections import defaultdict, OrderedDict
+-from scipy.sparse import block_diag, csr_matrix
++from scipy.sparse import block_diag, csc_matrix, csr_matrix
++from scipy.sparse.linalg import inv
+ 
+ 
+ def has_bc_of_form(symbol, side, bcs, form):
+@@ -206,7 +207,9 @@ class Discretisation(object):
+ 
+         # Create mass matrix
+         pybamm.logger.info("Create mass matrix for {}".format(model.name))
+-        model_disc.mass_matrix = self.create_mass_matrix(model_disc)
++        model_disc.mass_matrix, model_disc.mass_matrix_inv = self.create_mass_matrix(
++            model_disc
++        )
+ 
+         # Check that resulting model makes sense
+         if check_model:
+@@ -532,10 +535,14 @@ class Discretisation(object):
+         -------
+         :class:`pybamm.Matrix`
+             The mass matrix
++        :class:`pybamm.Matrix`
++            The inverse of the ode part of the mass matrix (required by solvers
++            which only accept the ODEs in explicit form)
+         """
+         # Create list of mass matrices for each equation to be put into block
+         # diagonal mass matrix for the model
+         mass_list = []
++        mass_inv_list = []
+ 
+         # get a list of model rhs variables that are sorted according to
+         # where they are in the state vector
+@@ -560,12 +567,26 @@ class Discretisation(object):
+             if var.domain == []:
+                 # If variable domain empty then mass matrix is just 1
+                 mass_list.append(1.0)
++                mass_inv_list.append(1.0)
+             else:
+-                mass_list.append(
++                mass = (
+                     self.spatial_methods[var.domain[0]]
+                     .mass_matrix(var, self.bcs)
+                     .entries
+                 )
++                mass_list.append(mass)
++                if isinstance(
++                    self.spatial_methods[var.domain[0]],
++                    (pybamm.ZeroDimensionalMethod, pybamm.FiniteVolume),
++                ):
++                    # for 0D methods the mass matrix is just a scalar 1 and for
++                    # finite volumes the mass matrix is identity, so no need to
++                    # compute the inverse
++                    mass_inv_list.append(mass)
++                else:
++                    # inverse is more efficient in csc format
++                    mass_inv = inv(csc_matrix(mass))
++                    mass_inv_list.append(mass_inv)
+ 
+         # Create lumped mass matrix (of zeros) of the correct shape for the
+         # discretised algebraic equations
+@@ -574,10 +595,14 @@ class Discretisation(object):
+             mass_algebraic = csr_matrix((mass_algebraic_size, mass_algebraic_size))
+             mass_list.append(mass_algebraic)
+ 
+-        # Create block diagonal (sparse) mass matrix
+-        mass_matrix = block_diag(mass_list, format="csr")
++        # Create block diagonal (sparse) mass matrix and inverse (if model has odes)
++        mass_matrix = pybamm.Matrix(block_diag(mass_list, format="csr"))
++        if model.rhs.keys():
++            mass_matrix_inv = pybamm.Matrix(block_diag(mass_inv_list, format="csr"))
++        else:
++            mass_matrix_inv = None
+ 
+-        return pybamm.Matrix(mass_matrix)
++        return mass_matrix, mass_matrix_inv
+ 
+     def create_jacobian(self, model):
+         """Creates Jacobian of the discretised model.
+diff --git a/pybamm/models/base_model.py b/pybamm/models/base_model.py
+index 45b4956c5..360a5510d 100644
+--- a/pybamm/models/base_model.py
++++ b/pybamm/models/base_model.py
+@@ -60,6 +60,9 @@ class BaseModel(object):
+     mass_matrix : :class:`pybamm.Matrix`
+         After discretisation, contains the mass matrix for the model. This is computed
+         automatically
++    mass_matrix_inv : :class:`pybamm.Matrix`
++        After discretisation, contains the inverse mass matrix for the differential
++        (rhs) part of model. This is computed automatically
+     jacobian : :class:`pybamm.Concatenation`
+         Contains the Jacobian for the model. If model.use_jacobian is True, the
+         Jacobian is computed automatically during solver set up
+@@ -88,7 +91,7 @@ class BaseModel(object):
+         - "casadi": convert into CasADi expression tree, which then uses CasADi's \
+         algorithm to calculate the Jacobian.
+ 
+-        Default is "python".
++        Default is "casadi".
+ 
+     """
+ 
+@@ -107,6 +110,7 @@ class BaseModel(object):
+         self._concatenated_algebraic = None
+         self._concatenated_initial_conditions = None
+         self._mass_matrix = None
++        self._mass_matrix_inv = None
+         self._jacobian = None
+         self._jacobian_algebraic = None
+         self.external_variables = []
+@@ -249,6 +253,14 @@ class BaseModel(object):
+     def mass_matrix(self, mass_matrix):
+         self._mass_matrix = mass_matrix
+ 
++    @property
++    def mass_matrix_inv(self):
++        return self._mass_matrix_inv
++
++    @mass_matrix_inv.setter
++    def mass_matrix_inv(self, mass_matrix_inv):
++        self._mass_matrix_inv = mass_matrix_inv
++
+     @property
+     def jacobian(self):
+         return self._jacobian
+diff --git a/pybamm/solvers/casadi_solver.py b/pybamm/solvers/casadi_solver.py
+index fb4dfb6b9..0610f65ac 100644
+--- a/pybamm/solvers/casadi_solver.py
++++ b/pybamm/solvers/casadi_solver.py
+@@ -93,11 +93,11 @@ class CasadiSolver(pybamm.DaeSolver):
+         """
+         if self.mode == "fast":
+             # Solve model normally by calling the solve method from parent class
+-            return super().solve(model, t_eval)
++            return super().solve(model, t_eval, inputs=inputs)
+         elif model.events == {}:
+             pybamm.logger.info("No events found, running fast mode")
+             # Solve model normally by calling the solve method from parent class
+-            return super().solve(model, t_eval)
++            return super().solve(model, t_eval, inputs=inputs)
+         elif self.mode == "safe":
+             # Step-and-check
+             timer = pybamm.Timer()
+@@ -122,7 +122,7 @@ class CasadiSolver(pybamm.DaeSolver):
+                     # different to t_eval, but shouldn't matter too much as it should
+                     # only happen near events.
+                     try:
+-                        current_step_sol = self.step(model, dt)
++                        current_step_sol = self.step(model, dt, inputs=inputs)
+                         solved = True
+                     except pybamm.SolverError:
+                         dt /= 2
+@@ -199,12 +199,7 @@ class CasadiSolver(pybamm.DaeSolver):
+         solve_start_time = timer.time()
+         pybamm.logger.debug("Calling DAE solver")
+         solution = self.integrate_casadi(
+-            self.casadi_rhs,
+-            self.casadi_algebraic,
+-            self.y0,
+-            t_eval,
+-            inputs,
+-            mass_matrix=model.mass_matrix.entries,
++            self.casadi_rhs, self.casadi_algebraic, self.y0, t_eval, inputs
+         )
+         solve_time = timer.time() - solve_start_time
+ 
+@@ -213,9 +208,7 @@ class CasadiSolver(pybamm.DaeSolver):
+ 
+         return solution, solve_time, termination
+ 
+-    def integrate_casadi(
+-        self, rhs, algebraic, y0, t_eval, inputs=None, mass_matrix=None
+-    ):
++    def integrate_casadi(self, rhs, algebraic, y0, t_eval, inputs=None):
+         """
+         Solve a DAE model defined by residuals with initial conditions y0.
+ 
+@@ -230,10 +223,6 @@ class CasadiSolver(pybamm.DaeSolver):
+             The times at which to compute the solution
+         inputs : dict, optional
+             Any input parameters to pass to the model when solving
+-        mass_matrix : array_like, optional
+-            The (sparse) mass matrix for the chosen spatial method. This is only passed
+-            to check that the mass matrix is diagonal with 1s for the odes and 0s for
+-            the algebraic equations, as CasADi does not allow to pass mass matrices.
+         """
+         inputs = inputs or {}
+         options = {
+diff --git a/pybamm/solvers/dae_solver.py b/pybamm/solvers/dae_solver.py
+index 182207436..02f2592e2 100644
+--- a/pybamm/solvers/dae_solver.py
++++ b/pybamm/solvers/dae_solver.py
+@@ -212,6 +212,8 @@ class DaeSolver(pybamm.BaseSolver):
+         self.event_funs = [get_event_class(event) for event in events.values()]
+         self.jacobian = jacobian
+ 
++        pybamm.logger.info("Finish solver set-up")
++
+     def set_up_casadi(self, model, inputs=None):
+         """Convert model to casadi format and use their inbuilt functionalities.
+ 
+@@ -336,8 +338,17 @@ class DaeSolver(pybamm.BaseSolver):
+         self.jacobian = jacobian
+ 
+         # Save CasADi functions for the CasADi solver
+-        self.casadi_rhs = concatenated_rhs_fn
+-        self.casadi_algebraic = concatenated_algebraic_fn
++        # Note: when we pass to casadi the ode part of the problem must be in explicit
++        # form so we pre-multiply by the inverse of the mass matrix
++        if isinstance(self, pybamm.CasadiSolver):
++            mass_matrix_inv = casadi.MX(model.mass_matrix_inv.entries)
++            explicit_rhs = mass_matrix_inv @ concatenated_rhs
++            self.casadi_rhs = casadi.Function(
++                "rhs", [t_casadi, y_casadi_w_ext, u_casadi_stacked], [explicit_rhs]
++            )
++            self.casadi_algebraic = concatenated_algebraic_fn
++
++        pybamm.logger.info("Finish solver set-up")
+ 
+     def set_inputs_and_external(self, inputs):
+         """
+diff --git a/pybamm/solvers/ode_solver.py b/pybamm/solvers/ode_solver.py
+index 8faf202cd..8d176ebe2 100644
+--- a/pybamm/solvers/ode_solver.py
++++ b/pybamm/solvers/ode_solver.py
+@@ -151,6 +151,8 @@ class OdeSolver(pybamm.BaseSolver):
+         self.event_funs = [get_event_class(event) for event in events.values()]
+         self.jacobian = jacobian
+ 
++        pybamm.logger.info("Finish solver set-up")
++
+     def set_up_casadi(self, model, inputs=None):
+         """Convert model to casadi format and use their inbuilt functionalities.
+ 

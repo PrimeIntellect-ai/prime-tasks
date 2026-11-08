@@ -1,0 +1,35 @@
+Clikt 5.0.0 does not complain about missing argument when passing unknown option
+Given this program:
+```kotlin
+package com.example
+
+import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.core.main
+import com.github.ajalt.clikt.parameters.arguments.argument
+
+class Hello : CliktCommand() {
+    val name by argument()
+
+    override fun run() {
+        echo("Hello $name!")
+    }
+}
+
+fun main(args: Array<String>) = Hello().main(arrayOf("--foo"))
+```
+
+Clikt before 5.0.0 would output:
+
+```
+Usage: hello [<options>] <name>
+
+Error: no such option --foo
+Error: missing argument <name>
+```
+
+But Clikt 5.0.0 only outputs this:
+```
+Usage: hello [<options>] <name>
+
+Error: no such option --foo
+```

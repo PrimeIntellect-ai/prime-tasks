@@ -1,0 +1,219 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index bbd401a..ddb2404 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -1,5 +1,5 @@
+ repos:
+-  - repo: https://github.com/python/black
++  - repo: https://github.com/ambv/black
+     rev: 19.3b0
+     hooks:
+     - id: black
+diff --git a/piptools/__init__.py b/piptools/__init__.py
+index e69de29..9f0c95a 100644
+--- a/piptools/__init__.py
++++ b/piptools/__init__.py
+@@ -0,0 +1,11 @@
++import locale
++
++from piptools.click import secho
++
++# Needed for locale.getpreferredencoding(False) to work
++# in pip._internal.utils.encoding.auto_decode
++try:
++    locale.setlocale(locale.LC_ALL, "")
++except locale.Error as e:  # pragma: no cover
++    # setlocale can apparently crash if locale are uninitialized
++    secho("Ignoring error when setting locale: {}".format(e), fg="red")
+diff --git a/piptools/scripts/compile.py b/piptools/scripts/compile.py
+index b9e12fb..896de7a 100755
+--- a/piptools/scripts/compile.py
++++ b/piptools/scripts/compile.py
+@@ -394,6 +394,7 @@ def cli(
+     writer = OutputWriter(
+         src_files,
+         output_file,
++        click_ctx=ctx,
+         dry_run=dry_run,
+         emit_header=header,
+         emit_index=index,
+diff --git a/piptools/utils.py b/piptools/utils.py
+index 085505d..ad01fe0 100644
+--- a/piptools/utils.py
++++ b/piptools/utils.py
+@@ -5,10 +5,21 @@ import sys
+ from collections import OrderedDict
+ from itertools import chain, groupby
+ 
++import six
++from six.moves import shlex_quote
++
+ from ._compat import install_req_from_line
+ from .click import style
+ 
+ UNSAFE_PACKAGES = {"setuptools", "distribute", "pip"}
++COMPILE_EXCLUDE_OPTIONS = {
++    "--dry-run",
++    "--quiet",
++    "--rebuild",
++    "--upgrade",
++    "--upgrade-package",
++    "--verbose",
++}
+ 
+ 
+ def key_from_ireq(ireq):
+@@ -260,3 +271,93 @@ def get_hashes_from_ireq(ireq):
+         for hash_ in hexdigests:
+             result.append("{}:{}".format(algorithm, hash_))
+     return result
++
++
++def force_text(s):
++    """
++    Return a string representing `s`.
++    """
++    if s is None:
++        return ""
++    if not isinstance(s, six.string_types):
++        return six.text_type(s)
++    return s
++
++
++def get_compile_command(click_ctx):
++    """
++    Returns a normalized compile command depending on cli context.
++
++    The command will be normalized by:
++        - expanding options short to long
++        - removing values that are already default
++        - sorting the arguments
++        - removing one-off arguments like '--upgrade'
++        - removing arguments that don't change build behaviour like '--verbose'
++    """
++    from piptools.scripts.compile import cli
++
++    # Map of the compile cli options (option name -> click.Option)
++    compile_options = {option.name: option for option in cli.params}
++
++    left_args = []
++    right_args = []
++
++    for option_name, value in click_ctx.params.items():
++        option = compile_options[option_name]
++
++        # Get the latest option name (usually it'll be a long name)
++        option_long_name = option.opts[-1]
++
++        # Collect variadic args separately, they will be added
++        # at the end of the command later
++        if option.nargs < 0:
++            right_args.extend([shlex_quote(force_text(val)) for val in value])
++            continue
++
++        # Exclude one-off options (--upgrade/--upgrade-package/--rebuild/...)
++        # or options that don't change compile behaviour (--verbose/--dry-run/...)
++        if option_long_name in COMPILE_EXCLUDE_OPTIONS:
++            continue
++
++        # Skip options without a value
++        if option.default is None and not value:
++            continue
++
++        # Skip options with a default value
++        if option.default == value:
++            continue
++
++        # Use a file name for file-like objects
++        if (
++            hasattr(value, "write")
++            and hasattr(value, "read")
++            and hasattr(value, "name")
++        ):
++            value = value.name
++
++        # Convert value to the list
++        if not isinstance(value, (tuple, list)):
++            value = [value]
++
++        for val in value:
++            # Flags don't have a value, thus add to args true or false option long name
++            if option.is_flag:
++                # If there are false-options, choose an option name depending on a value
++                if option.secondary_opts:
++                    # Get the latest false-option
++                    secondary_option_long_name = option.secondary_opts[-1]
++                    arg = option_long_name if val else secondary_option_long_name
++                # There are no false-options, use true-option
++                else:
++                    arg = option_long_name
++                left_args.append(shlex_quote(arg))
++            # Append to args the option with a value
++            else:
++                left_args.append(
++                    "{option}={value}".format(
++                        option=option_long_name, value=shlex_quote(force_text(val))
++                    )
++                )
++
++    return " ".join(["pip-compile"] + sorted(left_args) + sorted(right_args))
+diff --git a/piptools/writer.py b/piptools/writer.py
+index 91e7e59..18a715b 100644
+--- a/piptools/writer.py
++++ b/piptools/writer.py
+@@ -1,10 +1,18 @@
++from __future__ import unicode_literals
++
+ import os
+-import sys
+ from itertools import chain
+ 
+-from .click import get_os_args, unstyle
++from .click import unstyle
+ from .logging import log
+-from .utils import UNSAFE_PACKAGES, comment, dedup, format_requirement, key_from_req
++from .utils import (
++    UNSAFE_PACKAGES,
++    comment,
++    dedup,
++    format_requirement,
++    get_compile_command,
++    key_from_req,
++)
+ 
+ 
+ class OutputWriter(object):
+@@ -12,6 +20,7 @@ class OutputWriter(object):
+         self,
+         src_files,
+         dst_file,
++        click_ctx,
+         dry_run,
+         emit_header,
+         emit_index,
+@@ -27,6 +36,7 @@ class OutputWriter(object):
+     ):
+         self.src_files = src_files
+         self.dst_file = dst_file
++        self.click_ctx = click_ctx
+         self.dry_run = dry_run
+         self.emit_header = emit_header
+         self.emit_index = emit_index
+@@ -49,13 +59,10 @@ class OutputWriter(object):
+             yield comment("# This file is autogenerated by pip-compile")
+             yield comment("# To update, run:")
+             yield comment("#")
+-            custom_cmd = os.environ.get("CUSTOM_COMPILE_COMMAND")
+-            if custom_cmd:
+-                yield comment("#    {}".format(custom_cmd))
+-            else:
+-                prog = os.path.basename(sys.argv[0])
+-                args = " ".join(get_os_args())
+-                yield comment("#    {prog} {args}".format(prog=prog, args=args))
++            compile_command = os.environ.get(
++                "CUSTOM_COMPILE_COMMAND"
++            ) or get_compile_command(self.click_ctx)
++            yield comment("#    {}".format(compile_command))
+             yield comment("#")
+ 
+     def write_index_options(self):

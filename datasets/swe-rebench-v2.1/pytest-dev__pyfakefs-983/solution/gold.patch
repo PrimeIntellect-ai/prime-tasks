@@ -1,0 +1,409 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 45d4a67..91e97c0 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -29,6 +29,7 @@ The released versions correspond to PyPI releases.
+ * fixed handling of missing attribute in `os.getxattr` (see [#971](../../issues/971))
+ * fixed permission problem with `shutil.rmtree` if emulating Windows under POSIX
+   (see [#979](../../issues/979))
++* fixed handling of errors on opening files via file descriptor (see [#967](../../issues/967))
+ 
+ ### Infrastructure
+ * replace `undefined` by own minimal implementation to avoid importing it
+diff --git a/pyfakefs/fake_file.py b/pyfakefs/fake_file.py
+index fb2267c..5d7d3ee 100644
+--- a/pyfakefs/fake_file.py
++++ b/pyfakefs/fake_file.py
+@@ -53,6 +53,7 @@ from pyfakefs.helpers import (
+     AnyPath,
+     AnyString,
+     get_locale_encoding,
++    _OpenModes,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -134,6 +135,7 @@ class FakeFile:
+         encoding: Optional[str] = None,
+         errors: Optional[str] = None,
+         side_effect: Optional[Callable[["FakeFile"], None]] = None,
++        open_modes: Optional[_OpenModes] = None,
+     ):
+         """
+         Args:
+@@ -152,6 +154,7 @@ class FakeFile:
+             errors: The error mode used for encoding/decoding errors.
+             side_effect: function handle that is executed when file is written,
+                 must accept the file object as an argument.
++            open_modes: The modes the file was opened with (e.g. can read, write etc.)
+         """
+         # to be backwards compatible regarding argument order, we raise on None
+         if filesystem is None:
+@@ -180,6 +183,7 @@ class FakeFile:
+         # Linux specific: extended file system attributes
+         self.xattr: Dict = {}
+         self.opened_as: AnyString = ""
++        self.open_modes = open_modes
+ 
+     @property
+     def byte_contents(self) -> Optional[bytes]:
+@@ -755,6 +759,7 @@ class FakeFileWrapper:
+         errors: Optional[str],
+         buffering: int,
+         raw_io: bool,
++        opened_as_fd: bool,
+         is_stream: bool = False,
+     ):
+         self.file_object = file_object
+@@ -766,6 +771,7 @@ class FakeFileWrapper:
+         self._file_epoch = file_object.epoch
+         self.raw_io = raw_io
+         self._binary = binary
++        self.opened_as_fd = opened_as_fd
+         self.is_stream = is_stream
+         self._changed = False
+         self._buffer_size = buffering
+@@ -844,8 +850,17 @@ class FakeFileWrapper:
+             return
+ 
+         # for raw io, all writes are flushed immediately
+-        if self.allow_update and not self.raw_io:
+-            self.flush()
++        if not self.raw_io:
++            try:
++                self.flush()
++            except OSError as e:
++                if e.errno == errno.EBADF:
++                    # if we get here, we have an open file descriptor
++                    # without write permission, which has to be closed
++                    assert self.filedes
++                    self._filesystem._close_open_file(self.filedes)
++                raise
++
+             if self._filesystem.is_windows_fs and self._changed:
+                 self.file_object.st_mtime = helpers.now()
+ 
+@@ -880,8 +895,12 @@ class FakeFileWrapper:
+ 
+     def flush(self) -> None:
+         """Flush file contents to 'disk'."""
++        if self.is_stream:
++            return
++
+         self._check_open_file()
+-        if self.allow_update and not self.is_stream:
++
++        if self.allow_update:
+             contents = self._io.getvalue()
+             if self._append:
+                 self._sync_io()
+@@ -901,9 +920,15 @@ class FakeFileWrapper:
+                     self.file_object.st_ctime = current_time
+                     self.file_object.st_mtime = current_time
+             self._file_epoch = self.file_object.epoch
+-
+-            if not self.is_stream:
+-                self._flush_related_files()
++            self._flush_related_files()
++        else:
++            buf_length = len(self._io.getvalue())
++            content_length = 0
++            if self.file_object.byte_contents is not None:
++                content_length = len(self.file_object.byte_contents)
++            # an error is only raised if there is something to flush
++            if content_length != buf_length:
++                self._filesystem.raise_os_error(errno.EBADF)
+ 
+     def update_flush_pos(self) -> None:
+         self._flush_pos = self._io.tell()
+@@ -1146,7 +1171,7 @@ class FakeFileWrapper:
+             self._check_open_file()
+         if not self._read and reading:
+             return self._read_error()
+-        if not self.allow_update and writing:
++        if not self.opened_as_fd and not self.allow_update and writing:
+             return self._write_error()
+ 
+         if reading:
+diff --git a/pyfakefs/fake_filesystem.py b/pyfakefs/fake_filesystem.py
+index 1345a0f..cdbe7af 100644
+--- a/pyfakefs/fake_filesystem.py
++++ b/pyfakefs/fake_filesystem.py
+@@ -814,7 +814,7 @@ class FakeFilesystem:
+         if ns is not None and len(ns) != 2:
+             raise TypeError("utime: 'ns' must be a tuple of two ints")
+ 
+-    def _add_open_file(self, file_obj: AnyFileWrapper) -> int:
++    def add_open_file(self, file_obj: AnyFileWrapper) -> int:
+         """Add file_obj to the list of open files on the filesystem.
+         Used internally to manage open files.
+ 
+@@ -860,13 +860,29 @@ class FakeFilesystem:
+         Returns:
+             Open file object.
+         """
++        try:
++            return self.get_open_files(file_des)[0]
++        except IndexError:
++            self.raise_os_error(errno.EBADF, str(file_des))
++
++    def get_open_files(self, file_des: int) -> List[AnyFileWrapper]:
++        """Return the list of open files for a file descriptor.
++
++        Args:
++            file_des: File descriptor of the open files.
++
++        Raises:
++            OSError: an invalid file descriptor.
++            TypeError: filedes is not an integer.
++
++        Returns:
++            List of open file objects.
++        """
+         if not is_int_type(file_des):
+             raise TypeError("an integer is required")
+         valid = file_des < len(self.open_files)
+         if valid:
+-            file_list = self.open_files[file_des]
+-            if file_list is not None:
+-                return file_list[0]
++            return self.open_files[file_des] or []
+         self.raise_os_error(errno.EBADF, str(file_des))
+ 
+     def has_open_file(self, file_object: FakeFile) -> bool:
+@@ -3008,9 +3024,9 @@ class FakeFilesystem:
+         return str(self.root_dir)
+ 
+     def _add_standard_streams(self) -> None:
+-        self._add_open_file(StandardStreamWrapper(sys.stdin))
+-        self._add_open_file(StandardStreamWrapper(sys.stdout))
+-        self._add_open_file(StandardStreamWrapper(sys.stderr))
++        self.add_open_file(StandardStreamWrapper(sys.stdin))
++        self.add_open_file(StandardStreamWrapper(sys.stdout))
++        self.add_open_file(StandardStreamWrapper(sys.stderr))
+ 
+     def _tempdir_name(self):
+         """This logic is extracted from tempdir._candidate_tempdir_list.
+diff --git a/pyfakefs/fake_open.py b/pyfakefs/fake_open.py
+index b929b2e..a213b1b 100644
+--- a/pyfakefs/fake_open.py
++++ b/pyfakefs/fake_open.py
+@@ -17,7 +17,6 @@
+ import errno
+ import os
+ import sys
+-from collections import namedtuple
+ from stat import (
+     S_ISDIR,
+ )
+@@ -43,17 +42,13 @@ from pyfakefs.helpers import (
+     is_root,
+     PERM_READ,
+     PERM_WRITE,
++    _OpenModes,
+ )
+ 
+ if TYPE_CHECKING:
+     from pyfakefs.fake_filesystem import FakeFilesystem
+ 
+ 
+-_OpenModes = namedtuple(
+-    "_OpenModes",
+-    "must_exist can_read can_write truncate append must_not_exist",
+-)
+-
+ _OPEN_MODE_MAP = {
+     # mode name:(file must exist, can read, can write,
+     #            truncate, append, must not exist)
+@@ -148,6 +143,13 @@ class FakeFileOpen:
+             raise ValueError("binary mode doesn't take an encoding argument")
+ 
+         newline, open_modes = self._handle_file_mode(mode, newline, open_modes)
++        opened_as_fd = isinstance(file_, int)
++        if opened_as_fd and not helpers.IS_PYPY:
++            fd: int = cast(int, file_)
++            # cannot open the same file descriptor twice, except in PyPy
++            for f in self.filesystem.get_open_files(fd):
++                if isinstance(f, FakeFileWrapper) and f.opened_as_fd:
++                    raise OSError(errno.EBADF, "Bad file descriptor")
+ 
+         # the pathlib opener is defined in a Path instance that may not be
+         # patched under some circumstances; as it just calls standard open(),
+@@ -157,7 +159,9 @@ class FakeFileOpen:
+             # here as if directly passed
+             file_ = opener(file_, self._open_flags_from_open_modes(open_modes))
+ 
+-        file_object, file_path, filedes, real_path = self._handle_file_arg(file_)
++        file_object, file_path, filedes, real_path, can_write = self._handle_file_arg(
++            file_
++        )
+         if file_object is None and file_path is None:
+             # file must be a fake pipe wrapper, find it...
+             if (
+@@ -176,7 +180,7 @@ class FakeFileOpen:
+                 existing_wrapper.can_write,
+                 mode,
+             )
+-            file_des = self.filesystem._add_open_file(wrapper)
++            file_des = self.filesystem.add_open_file(wrapper)
+             wrapper.filedes = file_des
+             return wrapper
+ 
+@@ -197,7 +201,11 @@ class FakeFileOpen:
+ 
+         assert real_path is not None
+         file_object = self._init_file_object(
+-            file_object, file_path, open_modes, real_path
++            file_object,
++            file_path,
++            open_modes,
++            real_path,
++            check_file_permission=not opened_as_fd,
+         )
+ 
+         if S_ISDIR(file_object.st_mode):
+@@ -218,7 +226,7 @@ class FakeFileOpen:
+         fakefile = FakeFileWrapper(
+             file_object,
+             file_path,
+-            update=open_modes.can_write,
++            update=open_modes.can_write and can_write,
+             read=open_modes.can_read,
+             append=open_modes.append,
+             delete_on_close=self._delete_on_close,
+@@ -230,6 +238,7 @@ class FakeFileOpen:
+             errors=errors,
+             buffering=buffering,
+             raw_io=self.raw_io,
++            opened_as_fd=opened_as_fd,
+         )
+         if filedes is not None:
+             fakefile.filedes = filedes
+@@ -238,7 +247,7 @@ class FakeFileOpen:
+             assert open_files_list is not None
+             open_files_list.append(fakefile)
+         else:
+-            fakefile.filedes = self.filesystem._add_open_file(fakefile)
++            fakefile.filedes = self.filesystem.add_open_file(fakefile)
+         return fakefile
+ 
+     @staticmethod
+@@ -267,16 +276,25 @@ class FakeFileOpen:
+         file_path: AnyStr,
+         open_modes: _OpenModes,
+         real_path: AnyString,
++        check_file_permission: bool,
+     ) -> FakeFile:
+         if file_object:
+-            if not is_root() and (
+-                (open_modes.can_read and not file_object.has_permission(PERM_READ))
+-                or (open_modes.can_write and not file_object.has_permission(PERM_WRITE))
++            if (
++                check_file_permission
++                and not is_root()
++                and (
++                    (open_modes.can_read and not file_object.has_permission(PERM_READ))
++                    or (
++                        open_modes.can_write
++                        and not file_object.has_permission(PERM_WRITE)
++                    )
++                )
+             ):
+                 self.filesystem.raise_os_error(errno.EACCES, file_path)
+             if open_modes.can_write:
+                 if open_modes.truncate:
+                     file_object.set_contents("")
++            file_object
+         else:
+             if open_modes.must_exist:
+                 self.filesystem.raise_os_error(errno.ENOENT, file_path)
+@@ -304,16 +322,21 @@ class FakeFileOpen:
+ 
+     def _handle_file_arg(
+         self, file_: Union[AnyStr, int]
+-    ) -> Tuple[Optional[FakeFile], Optional[AnyStr], Optional[int], Optional[AnyStr]]:
++    ) -> Tuple[
++        Optional[FakeFile], Optional[AnyStr], Optional[int], Optional[AnyStr], bool
++    ]:
+         file_object = None
+         if isinstance(file_, int):
+             # opening a file descriptor
+             filedes: int = file_
+             wrapper = self.filesystem.get_open_file(filedes)
++            can_write = True
+             if isinstance(wrapper, FakePipeWrapper):
+-                return None, None, filedes, None
++                return None, None, filedes, None, can_write
+             if isinstance(wrapper, FakeFileWrapper):
+                 self._delete_on_close = wrapper.delete_on_close
++                can_write = wrapper.allow_update
++
+             file_object = cast(
+                 FakeFile, self.filesystem.get_open_file(filedes).get_object()
+             )
+@@ -324,6 +347,7 @@ class FakeFileOpen:
+                 cast(AnyStr, path),  # pytype: disable=invalid-annotation
+                 filedes,
+                 cast(AnyStr, path),  # pytype: disable=invalid-annotation
++                can_write,
+             )
+ 
+         # open a file file by path
+@@ -337,7 +361,7 @@ class FakeFileOpen:
+                 file_object = self.filesystem.get_object_from_normpath(
+                     real_path, check_read_perm=False
+                 )
+-        return file_object, file_path, None, real_path
++        return file_object, file_path, None, real_path, True
+ 
+     def _handle_file_mode(
+         self,
+diff --git a/pyfakefs/fake_os.py b/pyfakefs/fake_os.py
+index 68741a7..02eeb69 100644
+--- a/pyfakefs/fake_os.py
++++ b/pyfakefs/fake_os.py
+@@ -291,7 +291,7 @@ class FakeOsModule:
+                 ) or open_modes.can_write:
+                     self.filesystem.raise_os_error(errno.EISDIR, path)
+                 dir_wrapper = FakeDirWrapper(obj, path, self.filesystem)
+-                file_des = self.filesystem._add_open_file(dir_wrapper)
++                file_des = self.filesystem.add_open_file(dir_wrapper)
+                 dir_wrapper.filedes = file_des
+                 return file_des
+ 
+@@ -373,10 +373,10 @@ class FakeOsModule:
+     def pipe(self) -> Tuple[int, int]:
+         read_fd, write_fd = os.pipe()
+         read_wrapper = FakePipeWrapper(self.filesystem, read_fd, False)
+-        file_des = self.filesystem._add_open_file(read_wrapper)
++        file_des = self.filesystem.add_open_file(read_wrapper)
+         read_wrapper.filedes = file_des
+         write_wrapper = FakePipeWrapper(self.filesystem, write_fd, True)
+-        file_des = self.filesystem._add_open_file(write_wrapper)
++        file_des = self.filesystem.add_open_file(write_wrapper)
+         write_wrapper.filedes = file_des
+         return read_wrapper.filedes, write_wrapper.filedes
+ 
+diff --git a/pyfakefs/helpers.py b/pyfakefs/helpers.py
+index 71cc178..4852e37 100644
+--- a/pyfakefs/helpers.py
++++ b/pyfakefs/helpers.py
+@@ -19,6 +19,7 @@ import platform
+ import stat
+ import sys
+ import time
++from collections import namedtuple
+ from copy import copy
+ from stat import S_IFLNK
+ from typing import Union, Optional, Any, AnyStr, overload, cast
+@@ -37,6 +38,11 @@ PERM_DEF = 0o777  # Default permission bits.
+ PERM_DEF_FILE = 0o666  # Default permission bits (regular file)
+ PERM_ALL = 0o7777  # All permission bits.
+ 
++_OpenModes = namedtuple(
++    "_OpenModes",
++    "must_exist can_read can_write truncate append must_not_exist",
++)
++
+ if sys.platform == "win32":
+     USER_ID = 1
+     GROUP_ID = 1

@@ -1,0 +1,483 @@
+diff --git a/keras_nlp/models/__init__.py b/keras_nlp/models/__init__.py
+index 12ae1534..701f31cc 100644
+--- a/keras_nlp/models/__init__.py
++++ b/keras_nlp/models/__init__.py
+@@ -79,6 +79,10 @@ from keras_nlp.models.gpt2.gpt2_causal_lm_preprocessor import (
+ from keras_nlp.models.gpt2.gpt2_preprocessor import GPT2Preprocessor
+ from keras_nlp.models.gpt2.gpt2_tokenizer import GPT2Tokenizer
+ from keras_nlp.models.gpt_neo_x.gpt_neo_x_backbone import GPTNeoXBackbone
++from keras_nlp.models.gpt_neo_x.gpt_neo_x_causal_lm import GPTNeoXCausalLM
++from keras_nlp.models.gpt_neo_x.gpt_neo_x_causal_lm_preprocessor import (
++    GPTNeoXCausalLMPreprocessor,
++)
+ from keras_nlp.models.gpt_neo_x.gpt_neo_x_preprocessor import (
+     GPTNeoXPreprocessor,
+ )
+diff --git a/keras_nlp/models/gpt_neo_x/gpt_neo_x_attention.py b/keras_nlp/models/gpt_neo_x/gpt_neo_x_attention.py
+index 41be273b..38fb99e2 100644
+--- a/keras_nlp/models/gpt_neo_x/gpt_neo_x_attention.py
++++ b/keras_nlp/models/gpt_neo_x/gpt_neo_x_attention.py
+@@ -74,7 +74,7 @@ class GPTNeoXAttention(keras.layers.Layer):
+             output_shape=(None, self.num_heads, 3 * self.attn_head_size),
+             bias_axes="de",
+             **self._get_common_kwargs_for_sublayer(use_bias=True),
+-            name="query",
++            name="query_key_value",
+         )
+         self._qkv_dense.build(input_shape)
+ 
+@@ -145,16 +145,41 @@ class GPTNeoXAttention(keras.layers.Layer):
+     def call(
+         self,
+         hidden_states,
+-        attention_mask,
++        attention_mask=None,
++        cache=None,
++        cache_update_index=None,
+         training=None,
+     ):
+         query_key_value = self._qkv_dense(hidden_states)
+ 
+         query = query_key_value[..., : self.attn_head_size]
+-        key = query_key_value[
+-            ..., self.attn_head_size : 2 * self.attn_head_size
+-        ]
+-        value = query_key_value[..., 2 * self.attn_head_size :]
++
++        if cache is not None:
++            key_cache = cache[:, 0, ...]
++            value_cache = cache[:, 1, ...]
++            if cache_update_index is None:
++                key = key_cache
++                value = value_cache
++            else:
++                key_update = query_key_value[
++                    ..., self.attn_head_size : 2 * self.attn_head_size
++                ]
++                value_update = query_key_value[..., 2 * self.attn_head_size :]
++                start = [0, cache_update_index, 0, 0]
++                key = ops.slice_update(key_cache, start, key_update)
++                value = ops.slice_update(value_cache, start, value_update)
++                cache = ops.stack((key, value), axis=1)
++        else:
++            if cache_update_index is not None:
++                raise ValueError(
++                    "`cache_update_index` should not be set if `cache` is "
++                    f"`None`. Received: cache={cache}, "
++                    f"cache_update_index={cache_update_index}"
++                )
++            key = query_key_value[
++                ..., self.attn_head_size : 2 * self.attn_head_size
++            ]
++            value = query_key_value[..., 2 * self.attn_head_size :]
+ 
+         query_rot, query_pass = (
+             query[..., : self.rotary_dim],
+@@ -165,7 +190,8 @@ class GPTNeoXAttention(keras.layers.Layer):
+             key[..., self.rotary_dim :],
+         )
+ 
+-        query_rot, key_rot = self.rotary_embedding(query_rot, key_rot)
++        query_rot = self.rotary_embedding(query_rot)
++        key_rot = self.rotary_embedding(key_rot)
+ 
+         query = ops.concatenate((query_rot, query_pass), axis=-1)
+         key = ops.concatenate((key_rot, key_pass), axis=-1)
+@@ -190,7 +216,7 @@ class GPTNeoXAttention(keras.layers.Layer):
+ 
+         attention_output = self._output_dense(attention_output)
+ 
+-        return attention_output
++        return attention_output, cache
+ 
+     def get_config(self):
+         config = super().get_config()
+diff --git a/keras_nlp/models/gpt_neo_x/gpt_neo_x_backbone.py b/keras_nlp/models/gpt_neo_x/gpt_neo_x_backbone.py
+index eaf55d68..43689c27 100644
+--- a/keras_nlp/models/gpt_neo_x/gpt_neo_x_backbone.py
++++ b/keras_nlp/models/gpt_neo_x/gpt_neo_x_backbone.py
+@@ -11,6 +11,9 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++
++"""GPT-NeoX backbone model."""
++
+ from keras_nlp.api_export import keras_nlp_export
+ from keras_nlp.backend import keras
+ from keras_nlp.models.backbone import Backbone
+diff --git a/keras_nlp/models/gpt_neo_x/gpt_neo_x_causal_lm.py b/keras_nlp/models/gpt_neo_x/gpt_neo_x_causal_lm.py
+new file mode 100644
+index 00000000..f74aa1ae
+--- /dev/null
++++ b/keras_nlp/models/gpt_neo_x/gpt_neo_x_causal_lm.py
+@@ -0,0 +1,234 @@
++# Copyright 2022 The KerasNLP Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""GPTNeoX Causal LM (Language Model)."""
++
++from keras_nlp.api_export import keras_nlp_export
++from keras_nlp.backend import keras
++from keras_nlp.backend import ops
++from keras_nlp.models.generative_task import GenerativeTask
++from keras_nlp.models.gpt_neo_x.gpt_neo_x_backbone import GPTNeoXBackbone
++from keras_nlp.models.gpt_neo_x.gpt_neo_x_causal_lm_preprocessor import (
++    GPTNeoXCausalLMPreprocessor,
++)
++from keras_nlp.utils.python_utils import classproperty
++
++
++class ReverseEmbedding(keras.layers.Layer):
++    def __init__(self, embedding, **kwargs):
++        super().__init__(**kwargs)
++        self.embedding = embedding
++
++    def call(self, inputs):
++        kernel = ops.transpose(ops.convert_to_tensor(self.embedding.embeddings))
++        return ops.matmul(inputs, kernel)
++
++    def compute_output_shape(self, input_shape):
++        return (input_shape[0],) + (self.embedding.embeddings.shape[0],)
++
++
++@keras_nlp_export("keras_nlp.models.GPTNeoXCausalLM")
++class GPTNeoXCausalLM(GenerativeTask):
++    """An end-to-end GPTNeoX model for causal langauge modeling.
++
++    A causal language model (LM) predicts the next token based on previous
++    tokens. This task setup can be used to train the model unsupervised on
++    plain text input, or to autoregressively generate plain text similar to
++    the data used for training. This task can be used for pre-training or
++    fine-tuning a GPT-NeoX model, simply by calling `fit()`.
++
++    This model has a `generate()` method, which generates text based on a
++    prompt. The generation strategy used is controlled by an additional
++    `sampler` argument on `compile()`. You can recompile the model with
++    different `keras_nlp.samplers` objects to control the generation. By
++    default, `"top_k"` sampling will be used.
++
++    Args:
++        backbone: A `keras_nlp.models.GPTNeoXBackbone` instance.
++        preprocessor: A `keras_nlp.models.GPTNeoXCausalLMPreprocessor` or `None`.
++            If `None`, this model will not apply preprocessing, and inputs
++            should be preprocessed before calling the model.
++    """
++
++    def __init__(
++        self,
++        backbone,
++        preprocessor=None,
++        **kwargs,
++    ):
++        inputs = backbone.input
++        x = backbone(inputs)
++        # Use token embedding weights to project from the token representation
++        # to vocabulary logits.
++        outputs = ReverseEmbedding(
++            backbone.token_embedding,
++            name="reverse_embedding",
++        )(x)
++
++        # Instantiate using Functional API Model constructor.
++        super().__init__(
++            inputs=inputs,
++            outputs=outputs,
++            include_preprocessing=preprocessor is not None,
++            **kwargs,
++        )
++        self.backbone = backbone
++        self.preprocessor = preprocessor
++        self.generate_function = None
++        self._sampler = None
++
++        # Default compilation
++        self.compile(
++            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
++            optimizer=keras.optimizers.Adam(2e-5),
++            metrics=[keras.metrics.SparseCategoricalAccuracy()],
++            jit_compile=True,
++        )
++
++    @classproperty
++    def backbone_cls(cls):
++        return GPTNeoXBackbone
++
++    @classproperty
++    def preprocessor_cls(cls):
++        return GPTNeoXCausalLMPreprocessor
++
++    def call_with_cache(
++        self,
++        token_ids,
++        cache,
++        cache_update_index,
++    ):
++        """Forward pass of `GPTNeoXCausalLM` with cache.
++
++        `call_with_cache` adds an additional forward pass for the model for
++        autoregressive inference. Unlike calling the model directly, this method
++        allows caching previous key/value Tensors in multi-head attention layer,
++        and avoids recomputing the outputs of seen tokens.
++
++        Args:
++            token_ids: a dense int Tensor with shape `(batch_size, max_length)`.
++            cache: a dense float Tensor, the cache of key and value.
++            cache_update_index: int, or int Tensor. The index of current inputs
++            in the whole sequence.
++
++        Returns:
++            A (logits, hidden_states, cache) tuple. Where `logits` is the
++            language model logits for the input token_ids, `hidden_states` is
++            the final hidden representation of the input tokens, and `cache` is
++            the decoding cache.
++        """
++        token_embedding = self.backbone.get_layer("token_embedding")(token_ids)
++        x = self.backbone.get_layer("embeddings_dropout")(token_embedding)
++        # Each decoder layer has a cache; we update them separately.
++        caches = []
++        for i in range(self.backbone.num_layers):
++            current_cache = cache[:, i, ...]
++            x, next_cache = self.backbone.get_layer(f"transformer_layer_{i}")(
++                x,
++                self_attention_cache=current_cache,
++                self_attention_cache_update_index=cache_update_index,
++            )
++            caches.append(next_cache)
++        cache = ops.stack(caches, axis=1)
++        x = self.backbone.get_layer("layer_norm")(x)
++        hidden_states = x
++        logits = self.get_layer("reverse_embedding")(x)
++        return logits, hidden_states, cache
++
++    def _build_cache(self, token_ids):
++        """Build an empty cache for use with `call_with_cache()`."""
++        batch_size = ops.shape(token_ids)[0]
++        max_length = ops.shape(token_ids)[1]
++        num_layers = self.backbone.num_layers
++        num_heads = self.backbone.num_heads
++        head_dim = self.backbone.hidden_dim // self.backbone.num_heads
++        shape = [batch_size, num_layers, 2, max_length, num_heads, head_dim]
++        cache = ops.zeros(shape, dtype=self.compute_dtype)
++        # Seed the cache.
++        _, hidden_states, cache = self.call_with_cache(token_ids, cache, 0)
++        return hidden_states, cache
++
++    def generate_step(
++        self,
++        inputs,
++        end_token_id=None,
++    ):
++        """A compilable generation function for a single batch of inputs.
++
++        This function represents the inner, XLA-compilable, generation function
++        for a single batch of inputs. Inputs should have the same structure as
++        model inputs, a dictionary with keys `"token_ids"` and `"padding_mask"`.
++
++        Args:
++            inputs: A dictionary with two keys `"token_ids"` and
++                `"padding_mask"` and batched tensor values.
++            end_token_id: The id of the end token to stop on. If all
++                sequences have produced a new `end_token_id`, generation
++                will stop.
++        """
++        token_ids, padding_mask = inputs["token_ids"], inputs["padding_mask"]
++        # Create and seed cache with a single forward pass.
++        hidden_states, cache = self._build_cache(token_ids)
++        # Compute the lengths of all user inputted tokens ids.
++        row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
++        # Start at the first index that has no user inputted id.
++        index = ops.min(row_lengths)
++
++        def next(prompt, cache, index):
++            # The cache index is the index of our previous token.
++            cache_update_index = index - 1
++            batch_size = ops.shape(prompt)[0]
++            prompt = ops.slice(prompt, [0, cache_update_index], [batch_size, 1])
++            logits, hidden_states, cache = self.call_with_cache(
++                prompt,
++                cache,
++                cache_update_index,
++            )
++            return (
++                ops.squeeze(logits, axis=1),
++                ops.squeeze(hidden_states, axis=1),
++                cache,
++            )
++
++        token_ids = self._sampler(
++            next=next,
++            prompt=token_ids,
++            cache=cache,
++            index=index,
++            mask=padding_mask,
++            end_token_id=end_token_id,
++            hidden_states=hidden_states,
++        )
++
++        # Compute an output padding mask with the token ids we updated.
++        if end_token_id is not None:
++            # Build a mask of `end_token_id` locations not in the original
++            # prompt (not in locations where `padding_mask` is True).
++            end_locations = ops.logical_and(
++                ops.equal(token_ids, end_token_id),
++                ops.logical_not(padding_mask),
++            )
++            end_locations = ops.cast(end_locations, "int32")
++            # Use cumsum to get ones in all locations after end_locations.
++            cumsum = ops.cast(ops.cumsum(end_locations, axis=-1), "int32")
++            overflow = cumsum - end_locations
++            # Our padding mask is the inverse of these overflow locations.
++            padding_mask = ops.logical_not(ops.cast(overflow, "bool"))
++        else:
++            # Without early stopping, all locations will have been updated.
++            padding_mask = ops.ones_like(token_ids, dtype="bool")
++        return {
++            "token_ids": token_ids,
++            "padding_mask": padding_mask,
++        }
+diff --git a/keras_nlp/models/gpt_neo_x/gpt_neo_x_decoder.py b/keras_nlp/models/gpt_neo_x/gpt_neo_x_decoder.py
+index 7fe102e0..1ad2fd26 100644
+--- a/keras_nlp/models/gpt_neo_x/gpt_neo_x_decoder.py
++++ b/keras_nlp/models/gpt_neo_x/gpt_neo_x_decoder.py
+@@ -144,9 +144,15 @@ class GPTNeoXDecoder(keras.layers.Layer):
+         decoder_sequence,
+         decoder_padding_mask=None,
+         decoder_attention_mask=None,
++        self_attention_cache=None,
++        self_attention_cache_update_index=None,
+     ):
+         self_attention_mask = self._compute_self_attention_mask(
+-            decoder_sequence, decoder_padding_mask, decoder_attention_mask
++            decoder_sequence=decoder_sequence,
++            decoder_padding_mask=decoder_padding_mask,
++            decoder_attention_mask=decoder_attention_mask,
++            self_attention_cache=self_attention_cache,
++            self_attention_cache_update_index=self_attention_cache_update_index,
+         )
+ 
+         residual = decoder_sequence
+@@ -154,9 +160,11 @@ class GPTNeoXDecoder(keras.layers.Layer):
+         x = self._self_attention_layernorm(decoder_sequence)
+ 
+         # Self attention block.
+-        x = self._self_attention_layer(
++        x, self_attention_cache = self._self_attention_layer(
+             hidden_states=x,
+             attention_mask=self_attention_mask,
++            cache=self_attention_cache,
++            cache_update_index=self_attention_cache_update_index,
+         )
+         x = self._self_attention_dropout(x)
+         attention_output = x
+@@ -165,25 +173,40 @@ class GPTNeoXDecoder(keras.layers.Layer):
+         x = self._feedforward_intermediate_dense(x)
+         x = self._feedforward_output_dense(x)
+         feedforward_output = x
++        x = feedforward_output + attention_output + residual
+ 
+-        return feedforward_output + attention_output + residual
++        if self_attention_cache is not None:
++            return (x, self_attention_cache)
++        else:
++            return x
+ 
+     def _compute_self_attention_mask(
+         self,
+         decoder_sequence,
+         decoder_padding_mask,
+         decoder_attention_mask,
++        self_attention_cache=None,
++        self_attention_cache_update_index=None,
+     ):
+         decoder_mask = merge_padding_and_attention_mask(
+             decoder_sequence, decoder_padding_mask, decoder_attention_mask
+         )
+         batch_size = ops.shape(decoder_sequence)[0]
+         input_length = output_length = ops.shape(decoder_sequence)[1]
++        # We need to handle a rectangular causal mask when doing cached
++        # decoding. For generative inference, `decoder_sequence` will
++        # generally be length 1, and `cache` will be the full generation length.
++        if self_attention_cache is not None:
++            input_length = ops.shape(self_attention_cache)[2]
+ 
+         causal_mask = compute_causal_mask(
+-            batch_size, input_length, output_length, 0
++            batch_size,
++            input_length,
++            output_length,
++            0
++            if self_attention_cache_update_index is None
++            else self_attention_cache_update_index,
+         )
+-
+         return (
+             ops.minimum(decoder_mask, causal_mask)
+             if decoder_mask is not None
+diff --git a/keras_nlp/models/gpt_neo_x/rotary_embedding.py b/keras_nlp/models/gpt_neo_x/rotary_embedding.py
+index e15f58f9..611b97df 100644
+--- a/keras_nlp/models/gpt_neo_x/rotary_embedding.py
++++ b/keras_nlp/models/gpt_neo_x/rotary_embedding.py
+@@ -20,16 +20,15 @@ class RotaryEmbedding(keras.layers.Layer):
+         super().__init__(**kwargs)
+         self.max_wavelength = max_wavelength
+ 
+-    def call(self, query, key):
+-        rotary_dim = ops.shape(query)[-1]
++    def call(self, inputs):
++        rotary_dim = ops.shape(inputs)[-1]
+ 
+         cos_emb, sin_emb = self._compute_cos_sin_embedding(
+-            key, rotary_dim, seq_dim=1
++            inputs, rotary_dim, seq_dim=1
+         )
+-        query = self._apply_rotary_pos_emb(query, cos_emb, sin_emb)
+-        key = self._apply_rotary_pos_emb(key, cos_emb, sin_emb)
++        outputs = self._apply_rotary_pos_emb(inputs, cos_emb, sin_emb)
+ 
+-        return query, key
++        return outputs
+ 
+     def _apply_rotary_pos_emb(self, tensor, cos_emb, sin_emb):
+         cos_emb = cos_emb[:, : ops.shape(tensor)[1], :, :]
+@@ -63,3 +62,6 @@ class RotaryEmbedding(keras.layers.Layer):
+             }
+         )
+         return config
++
++    def compute_output_shape(self, input_shape):
++        return input_shape
+diff --git a/keras_nlp/tokenizers/tokenizer.py b/keras_nlp/tokenizers/tokenizer.py
+index dbc7c4bb..e03123b0 100644
+--- a/keras_nlp/tokenizers/tokenizer.py
++++ b/keras_nlp/tokenizers/tokenizer.py
+@@ -123,3 +123,6 @@ class Tokenizer(PreprocessingLayer):
+ 
+     def call(self, inputs, *args, training=None, **kwargs):
+         return self.tokenize(inputs, *args, **kwargs)
++
++    def compute_output_shape(self, inputs_shape):
++        return tuple(inputs_shape) + (self.sequence_length,)
+diff --git a/requirements.txt b/requirements.txt
+index aafbf77f..99adbbd6 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,6 @@
+ # Core deps.
+-tensorflow~=2.12.0
+-tensorflow-text~=2.12.0
++tensorflow~=2.13.0
++tensorflow-text~=2.13.0
+ tensorflow-datasets
+ 
+ # Common deps.

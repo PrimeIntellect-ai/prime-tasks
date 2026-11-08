@@ -1,0 +1,286 @@
+diff --git a/chalk-integration/src/lowering.rs b/chalk-integration/src/lowering.rs
+index 9573cd52..e68ae55e 100644
+--- a/chalk-integration/src/lowering.rs
++++ b/chalk-integration/src/lowering.rs
+@@ -381,7 +381,7 @@ impl LowerProgram for Program {
+                     let id = FnDefId(raw_id);
+                     fn_def_ids.insert(type_kind.name.clone(), id);
+                     fn_def_kinds.insert(id, type_kind);
+-                    fn_def_abis.insert(id, defn.abi.lower()?);
++                    fn_def_abis.insert(id, defn.sig.abi.lower()?);
+                 }
+                 Item::ClosureDefn(defn) => {
+                     let type_kind = defn.lower_type_kind()?;
+@@ -1208,8 +1208,20 @@ impl LowerFnDefn for FnDefn {
+ 
+         Ok(rust_ir::FnDefDatum {
+             id: fn_def_id,
+-            abi: self.abi.lower()?,
++            sig: self.sig.lower()?,
+             binders,
++        })
++    }
++}
++
++trait LowerFnSig {
++    fn lower(&self) -> LowerResult<chalk_ir::FnSig<ChalkIr>>;
++}
++
++impl LowerFnSig for FnSig {
++    fn lower(&self) -> LowerResult<chalk_ir::FnSig<ChalkIr>> {
++        Ok(chalk_ir::FnSig {
++            abi: self.abi.lower()?,
+             safety: ast_safety_to_chalk_safety(self.safety),
+             variadic: self.variadic,
+         })
+@@ -1646,9 +1658,7 @@ impl LowerTy for Ty {
+             Ty::ForAll {
+                 lifetime_names,
+                 types,
+-                abi,
+-                safety,
+-                variadic,
++                sig,
+             } => {
+                 let quantified_env = env.introduce(lifetime_names.iter().map(|id| {
+                     chalk_ir::WithKind::new(chalk_ir::VariableKind::Lifetime, id.str.clone())
+@@ -1662,9 +1672,7 @@ impl LowerTy for Ty {
+                 let function = chalk_ir::FnPointer {
+                     num_binders: lifetime_names.len(),
+                     substitution: Substitution::from_iter(interner, lowered_tys),
+-                    abi: abi.lower()?,
+-                    safety: ast_safety_to_chalk_safety(*safety),
+-                    variadic: *variadic,
++                    sig: sig.lower()?,
+                 };
+                 Ok(chalk_ir::TyData::Function(function).intern(interner))
+             }
+@@ -1992,7 +2000,7 @@ impl LowerGoal<LoweredProgram> for Goal {
+         let fn_def_abis: BTreeMap<_, _> = program
+             .fn_def_data
+             .iter()
+-            .map(|fn_def_data| (*fn_def_data.0, fn_def_data.1.abi))
++            .map(|fn_def_data| (*fn_def_data.0, fn_def_data.1.sig.abi))
+             .collect();
+ 
+         let env = Env {
+diff --git a/chalk-ir/src/debug.rs b/chalk-ir/src/debug.rs
+index 7c2f2185..7a7d3638 100644
+--- a/chalk-ir/src/debug.rs
++++ b/chalk-ir/src/debug.rs
+@@ -238,14 +238,12 @@ impl<I: Interner> Debug for FnPointer<I> {
+         let FnPointer {
+             num_binders,
+             substitution,
+-            abi,
+-            safety,
+-            variadic: _,
++            sig,
+         } = self;
+         write!(
+             fmt,
+             "for<{}> {:?} {:?} {:?}",
+-            num_binders, safety, abi, substitution
++            num_binders, sig.safety, sig.abi, substitution
+         )
+     }
+ }
+diff --git a/chalk-ir/src/fold/binder_impls.rs b/chalk-ir/src/fold/binder_impls.rs
+index 1f751f16..dc290e92 100644
+--- a/chalk-ir/src/fold/binder_impls.rs
++++ b/chalk-ir/src/fold/binder_impls.rs
+@@ -20,16 +20,16 @@ impl<I: Interner, TI: TargetInterner<I>> Fold<I, TI> for FnPointer<I> {
+         let FnPointer {
+             num_binders,
+             substitution,
+-            abi,
+-            safety,
+-            variadic,
++            sig,
+         } = self;
+         Ok(FnPointer {
+             num_binders: *num_binders,
+             substitution: substitution.fold_with(folder, outer_binder.shifted_in())?,
+-            abi: TI::transfer_abi(*abi),
+-            safety: *safety,
+-            variadic: *variadic,
++            sig: FnSig {
++                abi: TI::transfer_abi(sig.abi),
++                safety: sig.safety,
++                variadic: sig.variadic,
++            },
+         })
+     }
+ }
+diff --git a/chalk-ir/src/lib.rs b/chalk-ir/src/lib.rs
+index 3a1cad53..6bdc0923 100644
+--- a/chalk-ir/src/lib.rs
++++ b/chalk-ir/src/lib.rs
+@@ -865,15 +865,22 @@ impl InferenceVar {
+     }
+ }
+ 
++/// A function signature.
++#[derive(Clone, Copy, PartialEq, Eq, Hash, HasInterner, Debug)]
++#[allow(missing_docs)]
++pub struct FnSig<I: Interner> {
++    pub abi: I::FnAbi,
++    pub safety: Safety,
++    pub variadic: bool,
++}
++
+ /// for<'a...'z> X -- all binders are instantiated at once,
+ /// and we use deBruijn indices within `self.ty`
+ #[derive(Clone, PartialEq, Eq, Hash, HasInterner)]
+ #[allow(missing_docs)]
+ pub struct FnPointer<I: Interner> {
+     pub num_binders: usize,
+-    pub abi: I::FnAbi,
+-    pub safety: Safety,
+-    pub variadic: bool,
++    pub sig: FnSig<I>,
+     pub substitution: Substitution<I>,
+ }
+ 
+diff --git a/chalk-parse/src/ast.rs b/chalk-parse/src/ast.rs
+index 8feb4438..81f025c7 100644
+--- a/chalk-parse/src/ast.rs
++++ b/chalk-parse/src/ast.rs
+@@ -66,6 +66,13 @@ pub struct AdtRepr {
+     pub repr_packed: bool,
+ }
+ 
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct FnSig {
++    pub abi: FnAbi,
++    pub safety: Safety,
++    pub variadic: bool,
++}
++
+ #[derive(Clone, PartialEq, Eq, Debug)]
+ pub struct FnDefn {
+     pub name: Identifier,
+@@ -73,9 +80,7 @@ pub struct FnDefn {
+     pub where_clauses: Vec<QuantifiedWhereClause>,
+     pub argument_types: Vec<Ty>,
+     pub return_type: Ty,
+-    pub abi: FnAbi,
+-    pub safety: Safety,
+-    pub variadic: bool,
++    pub sig: FnSig,
+ }
+ 
+ #[derive(Clone, PartialEq, Eq, Debug)]
+@@ -261,9 +266,7 @@ pub enum Ty {
+     ForAll {
+         lifetime_names: Vec<Identifier>,
+         types: Vec<Box<Ty>>,
+-        abi: FnAbi,
+-        safety: Safety,
+-        variadic: bool,
++        sig: FnSig,
+     },
+     Tuple {
+         types: Vec<Box<Ty>>,
+diff --git a/chalk-parse/src/parser.lalrpop b/chalk-parse/src/parser.lalrpop
+index a509f59f..838a54f1 100644
+--- a/chalk-parse/src/parser.lalrpop
++++ b/chalk-parse/src/parser.lalrpop
+@@ -146,11 +146,13 @@ FnDefn: FnDefn = {
+         name: n,
+         variable_kinds: p,
+         where_clauses: w,
+-        variadic: args.is_variadic(),
++        sig: FnSig {
++            abi: abi.unwrap_or_default(),
++            safety: safety.unwrap_or_default(),
++            variadic: args.is_variadic(),
++        },
+         argument_types: args.to_tys(),
+         return_type: ret_ty.unwrap_or_else(|| Ty::Tuple { types: Vec::new() }),
+-        abi: abi.unwrap_or_default(),
+-        safety: safety.unwrap_or_default(),
+     }
+ };
+ 
+@@ -336,14 +338,16 @@ FnArgTys: FnArgs = {
+ TyWithoutId: Ty = {
+     <l:ForLifetimes?> <safety:Safety?> <abi:FnAbi?> "fn" "(" <types:FnArgTys> ")" <ret_ty:FnReturn?> => Ty::ForAll {
+         lifetime_names: l.unwrap_or_default(),
+-        variadic: types.is_variadic(),
++        sig: FnSig {
++            variadic: types.is_variadic(),
++            safety: safety.unwrap_or_default(),
++            abi: abi.unwrap_or_default(),
++        },
+         types: types
+                    .to_tys()
+                    .into_iter()
+                    .chain(std::iter::once(ret_ty.unwrap_or_else(|| Ty::Tuple { types: Vec::new() })))
+                    .map(Box::new).collect(),
+-        safety: safety.unwrap_or_default(),
+-        abi: abi.unwrap_or_default(),
+     },
+     <ScalarType> => Ty::Scalar { ty: <> },
+     "str" => Ty::Str,
+diff --git a/chalk-solve/src/clauses/builtin_traits/fn_family.rs b/chalk-solve/src/clauses/builtin_traits/fn_family.rs
+index 2012367b..9178f80a 100644
+--- a/chalk-solve/src/clauses/builtin_traits/fn_family.rs
++++ b/chalk-solve/src/clauses/builtin_traits/fn_family.rs
+@@ -99,7 +99,7 @@ pub fn add_fn_trait_program_clauses<I: Interner>(
+         TyData::Apply(apply) => match apply.name {
+             TypeName::FnDef(fn_def_id) => {
+                 let fn_def_datum = builder.db.fn_def_datum(fn_def_id);
+-                if fn_def_datum.safety == Safety::Safe && !fn_def_datum.variadic {
++                if fn_def_datum.sig.safety == Safety::Safe && !fn_def_datum.sig.variadic {
+                     let bound = fn_def_datum
+                         .binders
+                         .substitute(builder.interner(), &apply.substitution);
+@@ -140,7 +140,7 @@ pub fn add_fn_trait_program_clauses<I: Interner>(
+             }
+             _ => Ok(()),
+         },
+-        TyData::Function(fn_val) if fn_val.safety == Safety::Safe && !fn_val.variadic => {
++        TyData::Function(fn_val) if fn_val.sig.safety == Safety::Safe && !fn_val.sig.variadic => {
+             let (binders, orig_sub) = fn_val.into_binders_and_value(interner);
+             let bound_ref = Binders::new(VariableKinds::from_iter(interner, binders), orig_sub);
+             builder.push_binders(&bound_ref, |builder, orig_sub| {
+diff --git a/chalk-solve/src/infer/unify.rs b/chalk-solve/src/infer/unify.rs
+index 57b76d5b..f7d7a11d 100644
+--- a/chalk-solve/src/infer/unify.rs
++++ b/chalk-solve/src/infer/unify.rs
+@@ -129,7 +129,7 @@ impl<'t, I: Interner> Unifier<'t, I> {
+ 
+             // Unifying `forall<X> { T }` with some other forall type `forall<X> { U }`
+             (&TyData::Function(ref fn1), &TyData::Function(ref fn2)) => {
+-                if fn1.abi == fn2.abi && fn1.safety == fn2.safety && fn1.variadic == fn2.variadic {
++                if fn1.sig == fn2.sig {
+                     self.unify_binders(fn1, fn2)
+                 } else {
+                     Err(NoSolution)
+diff --git a/chalk-solve/src/rust_ir.rs b/chalk-solve/src/rust_ir.rs
+index 74fdd85b..b87d1a82 100644
+--- a/chalk-solve/src/rust_ir.rs
++++ b/chalk-solve/src/rust_ir.rs
+@@ -9,8 +9,8 @@ use chalk_ir::interner::{Interner, TargetInterner};
+ use chalk_ir::{
+     visit::{Visit, VisitResult},
+     AdtId, AliasEq, AliasTy, AssocTypeId, Binders, DebruijnIndex, FnDefId, GenericArg, ImplId,
+-    OpaqueTyId, ProjectionTy, QuantifiedWhereClause, Safety, Substitution, ToGenericArg, TraitId,
+-    TraitRef, Ty, TyData, TypeName, VariableKind, WhereClause, WithKind,
++    OpaqueTyId, ProjectionTy, QuantifiedWhereClause, Substitution, ToGenericArg, TraitId, TraitRef,
++    Ty, TyData, TypeName, VariableKind, WhereClause, WithKind,
+ };
+ use std::iter;
+ 
+@@ -144,9 +144,7 @@ pub struct AdtRepr {
+ /// a specific function definition.
+ pub struct FnDefDatum<I: Interner> {
+     pub id: FnDefId<I>,
+-    pub abi: I::FnAbi,
+-    pub safety: Safety,
+-    pub variadic: bool,
++    pub sig: chalk_ir::FnSig<I>,
+     pub binders: Binders<FnDefDatumBound<I>>,
+ }
+ 

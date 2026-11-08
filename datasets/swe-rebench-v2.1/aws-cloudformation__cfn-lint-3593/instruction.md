@@ -1,0 +1,51 @@
+v1.10.0: Possible false-positive for `E3054: 'RequiresCompatibilities' is a required property`
+### CloudFormation Lint Version
+
+1.10.0
+
+### What operating system are you using?
+
+Windows 11
+
+### Describe the bug
+
+After updating to `1.10.0` i get the following error for `AWS::ECS::TaskDefinition`:
+
+```plaintext
+[cfn-lint] E3054: 'RequiresCompatibilities' is a required property
+Registers a new task definition from the supplied ``family`` and ``containerDefinitions``.
+Optionally, you can add data volumes to your containers with the ``volumes`` parameter.
+For more information about task definition parameters and defaults, see [Amazon ECS Task Definitions]([https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_defintions.html\](vscode-file://vscode-app/d:/Programme/VSCode/resources/app/out/vs/code/electron-sandbox/workbench/workbench.html)) in the *Amazon Elastic Container Service Developer Guide*.
+
+You can specify a role for your task with the ``taskRoleArn`` parameter.
+When you specify a role for a task, its containers can then use the latest versions of the CLI or SDKs to make API requests to the AWS services that are specified in the policy that's associated with the role.
+For more information, see [IAM Roles for Tasks]([https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html\](vscode-file://vscode-app/d:/Programme/VSCode/resources/app/out/vs/code/electron-sandbox/workbench/workbench.html)) in the *Amazon Elastic Container Service Developer Guide*.....
+```
+
+### Expected behavior
+
+cfn-lint doesn't give that error, since i can deploy the stack.
+
+### Reproduction template
+
+```yaml
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      Cpu: 512
+      Memory: 1024
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+      ContainerDefinitions:
+        - Name: ContainerName
+          Image: <IMAGE>
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: !Ref AWS::StackName
+```

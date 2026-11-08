@@ -1,0 +1,313 @@
+diff --git a/src/Netscript/APIWrapper.ts b/src/Netscript/APIWrapper.ts
+index cfa097bd6..940c25afb 100644
+--- a/src/Netscript/APIWrapper.ts
++++ b/src/Netscript/APIWrapper.ts
+@@ -46,7 +46,9 @@ class NSProxyHandler<API extends GenericAPI<API>> {
+ 
+   getOwnPropertyDescriptor(__target: unknown, key: keyof API & string): PropertyDescriptor | undefined {
+     if (!this.has(__target, key)) return undefined;
+-    return { value: this.get(__target, key, this), configurable: true, enumerable: true, writable: false };
++    if (Object.hasOwn(this.memoed, key)) return Object.getOwnPropertyDescriptor(this.memoed, key);
++    this.get(__target, key, this);
++    return Object.getOwnPropertyDescriptor(this.memoed, key);
+   }
+ 
+   defineProperty(__target: unknown, __key: unknown, __attrs: unknown): boolean {
+@@ -62,8 +64,9 @@ class NSProxyHandler<API extends GenericAPI<API>> {
+     const ours = this.memoed[key];
+     if (ours) return ours;
+ 
+-    const field = this.ns[key];
+-    if (!field) return field;
++    const descriptor = Object.getOwnPropertyDescriptor(this.ns, key);
++    if (!descriptor) return descriptor;
++    const field = descriptor.value;
+ 
+     if (typeof field === "function") {
+       const arrayPath = [...this.tree, key];
+@@ -75,10 +78,11 @@ class NSProxyHandler<API extends GenericAPI<API>> {
+       const wrappedFunction = function (...args: unknown[]): unknown {
+         // What remains *must* be called every time.
+         helpers.checkEnvFlags(ctx);
+-        helpers.updateDynamicRam(ctx, getRamCost(...arrayPath));
++        helpers.updateDynamicRam(ctx, getRamCost(arrayPath));
+         return func(...args);
+       };
+-      return ((this.memoed[key] as APIFn) = wrappedFunction);
++      Object.defineProperty(this.memoed, key, { ...descriptor, value: wrappedFunction });
++      return wrappedFunction;
+     }
+     if (typeof field === "object") {
+       return ((this.memoed[key] as GenericAPI<API[keyof API]>) = NSProxy(
+@@ -105,12 +109,26 @@ export function NSProxy<API extends GenericAPI<API>>(
+ }
+ 
+ /** Specify when a function was removed from the game, and its replacement function. */
+-export function removedFunction(version: string, replacement: string, replaceMsg?: boolean) {
+-  return (ctx: NetscriptContext) => () => {
+-    throw helpers.makeRuntimeErrorMsg(
+-      ctx,
+-      `Function removed in ${version}. ${replaceMsg ? replacement : `Please use ${replacement} instead.`}`,
+-      "REMOVED FUNCTION",
+-    );
+-  };
++interface RemovedFunctionInfo {
++  /** The version in which the function was removed */
++  version: string;
++  /** The replacement function to use, or the entire replacement message if replaceMsg is true. */
++  replacement: string;
++  /** If set, replacement is treated as a full replacement message. */
++  replaceMsg?: true;
++}
++export function setRemovedFunctions(api: object, infos: Record<string, RemovedFunctionInfo>) {
++  for (const [key, { version, replacement, replaceMsg }] of Object.entries(infos)) {
++    Object.defineProperty(api, key, {
++      value: (ctx: NetscriptContext) => () => {
++        throw helpers.makeRuntimeErrorMsg(
++          ctx,
++          `Function removed in ${version}. ${replaceMsg ? replacement : `Please use ${replacement} instead.`}`,
++          "REMOVED FUNCTION",
++        );
++      },
++      configurable: true,
++      enumerable: false,
++    });
++  }
+ }
+diff --git a/src/Netscript/RamCostGenerator.ts b/src/Netscript/RamCostGenerator.ts
+index f73a1ad13..3aa95f4ab 100644
+--- a/src/Netscript/RamCostGenerator.ts
++++ b/src/Netscript/RamCostGenerator.ts
+@@ -615,32 +615,27 @@ export const RamCosts: RamCostTree<NSFull> = {
+   },
+ } as const;
+ 
+-export function getRamCost(...args: string[]): number {
+-  if (args.length === 0) {
+-    throw new Error(`No arguments passed to getRamCost()`);
+-  }
++type RamTreeGeneric = { [key: string]: number | (() => number) | RamTreeGeneric | undefined };
+ 
+-  let curr = RamCosts[args[0] as keyof typeof RamCosts];
+-  for (let i = 1; i < args.length; ++i) {
+-    if (curr == null) {
+-      throw new Error(`Invalid function passed to getRamCost: ${args.join(".")}`);
+-    }
++export function getRamCost(tree: string[], throwOnUndefined = false): number {
++  if (tree.length === 0) throw new Error(`No arguments passed to getRamCost()`);
+ 
+-    const currType = typeof curr;
+-    if (currType === "function" || currType === "number") {
+-      break;
+-    }
+-
+-    curr = curr[args[i] as keyof typeof curr];
+-  }
++  let obj: RamTreeGeneric = RamCosts;
+ 
+-  if (typeof curr === "number") {
+-    return curr;
+-  }
++  for (const branch of tree) {
++    const next = obj[branch];
++    if (next === undefined) {
++      // If no ram cost is defined (e.g. for removed functions), the cost is 0.
++      const errorText = `No ram cost is defined for (ns.${tree.join(".")})`;
++      if (throwOnUndefined) throw errorText;
++      return 0;
++    }
++    if (next && typeof next === "object") {
++      obj = next;
++      continue;
++    }
+ 
+-  if (typeof curr === "function") {
+-    return curr();
++    return typeof next === "function" ? next() : next;
+   }
+-
+-  throw new Error(`Invalid function passed to getRamCost: ${args.join(".")}`);
++  throw new Error(`Tried to get ram cost for ns.${tree.join(".")} but the value was an invalid type`);
+ }
+diff --git a/src/NetscriptFunctions.ts b/src/NetscriptFunctions.ts
+index 1ae405eb5..276e4e7c3 100644
+--- a/src/NetscriptFunctions.ts
++++ b/src/NetscriptFunctions.ts
+@@ -86,7 +86,7 @@ import { Flags } from "./NetscriptFunctions/Flags";
+ import { calculateIntelligenceBonus } from "./PersonObjects/formulas/intelligence";
+ import { CalculateShareMult, StartSharing } from "./NetworkShare/Share";
+ import { recentScripts } from "./Netscript/RecentScripts";
+-import { InternalAPI, removedFunction, NSProxy } from "./Netscript/APIWrapper";
++import { InternalAPI, setRemovedFunctions, NSProxy } from "./Netscript/APIWrapper";
+ import { INetscriptExtra } from "./NetscriptFunctions/Extra";
+ import { ScriptDeath } from "./Netscript/ScriptDeath";
+ import { getBitNodeMultipliers } from "./BitNode/BitNode";
+@@ -1764,7 +1764,7 @@ export const ns: InternalAPI<NSFull> = {
+   }),
+   getFunctionRamCost: (ctx) => (_name) => {
+     const name = helpers.string(ctx, "name", _name);
+-    return getRamCost(...name.split("."));
++    return getRamCost(name.split("."), true);
+   },
+   tprintRaw: () => (value) => {
+     Terminal.printRaw(wrapUserNode(value));
+@@ -1775,9 +1775,10 @@ export const ns: InternalAPI<NSFull> = {
+   flags: Flags,
+   ...NetscriptExtra(),
+ };
+-// Object.assign to bypass ts for removedFunctions which have no documentation or ramcost
+-Object.assign(ns, {
+-  getServerRam: removedFunction("v2.2.0", "getServerMaxRam and getServerUsedRam"),
++
++// Removed functions
++setRemovedFunctions(ns, {
++  getServerRam: { version: "2.2.0", replacement: "getServerMaxRam and getServerUsedRam" },
+ });
+ 
+ export function NetscriptFunctions(ws: WorkerScript): NSFull {
+diff --git a/src/NetscriptFunctions/Corporation.ts b/src/NetscriptFunctions/Corporation.ts
+index 549be63a0..0c1f58eb3 100644
+--- a/src/NetscriptFunctions/Corporation.ts
++++ b/src/NetscriptFunctions/Corporation.ts
+@@ -57,7 +57,7 @@ import * as corpConstants from "../Corporation/data/Constants";
+ import { ResearchMap } from "../Corporation/ResearchMap";
+ import { Factions } from "../Faction/Factions";
+ import { currentNodeMults } from "../BitNode/BitNodeMultipliers";
+-import { InternalAPI, NetscriptContext, removedFunction } from "../Netscript/APIWrapper";
++import { InternalAPI, NetscriptContext, setRemovedFunctions } from "../Netscript/APIWrapper";
+ import { helpers } from "../Netscript/NetscriptHelpers";
+ import { getEnumHelper } from "../utils/EnumHelper";
+ import { MaterialInfo } from "../Corporation/MaterialInfo";
+@@ -841,22 +841,26 @@ export function NetscriptCorporation(): InternalAPI<NSCorporation> {
+     },
+   };
+ 
+-  // TODO 3.0: Remove these removedFunctions warnings.
+-  Object.assign(corpFunctions, {
+-    assignJob: removedFunction(
+-      "v2.2.0",
+-      "Removed due to employees no longer being objects. Use ns.corporation.setAutoJobAssignment instead.",
+-      true,
+-    ),
+-    getEmployee: removedFunction("v2.2.0", "Removed due to employees no longer being individual objects.", true),
+-    getExpandCityCost: removedFunction("v2.2.0", "corporation.getConstants().officeInitialCost"),
+-    getExpandIndustryCost: removedFunction("v2.2.0", "corporation.getIndustryData"),
+-    getIndustryTypes: removedFunction("v2.2.0", "corporation.getConstants().industryNames"),
+-    getMaterialNames: removedFunction("v2.2.0", "corporation.getConstants().materialNames"),
+-    getPurchaseWarehouseCost: removedFunction("v2.2.0", "corporation.getConstants().warehouseInitialCost"),
+-    getResearchNames: removedFunction("v2.2.0", "corporation.getConstants().researchNames"),
+-    getUnlockables: removedFunction("v2.2.0", "corporation.getConstants().unlockNames"),
+-    getUpgradeNames: removedFunction("v2.2.0", "corporation.getConstants().upgradeNames"),
++  // Removed functions
++  setRemovedFunctions(corpFunctions, {
++    assignJob: {
++      version: "2.2.0",
++      replacement: "Removed due to employees no longer being objects. Use ns.corporation.setAutoJobAssignment instead.",
++      replaceMsg: true,
++    },
++    getEmployee: {
++      version: "2.2.0",
++      replacement: "Removed due to employees no longer being individual objects.",
++      replaceMsg: true,
++    },
++    getExpandCityCost: { version: "2.2.0", replacement: "corporation.getConstants().officeInitialCost" },
++    getExpandIndustryCost: { version: "2.2.0", replacement: "corporation.getIndustryData" },
++    getIndustryTypes: { version: "2.2.0", replacement: "corporation.getConstants().industryNames" },
++    getMaterialNames: { version: "2.2.0", replacement: "corporation.getConstants().materialNames" },
++    getPurchaseWarehouseCost: { version: "2.2.0", replacement: "corporation.getConstants().warehouseInitialCost" },
++    getResearchNames: { version: "2.2.0", replacement: "corporation.getConstants().researchNames" },
++    getUnlockables: { version: "2.2.0", replacement: "corporation.getConstants().unlockNames" },
++    getUpgradeNames: { version: "2.2.0", replacement: "corporation.getConstants().upgradeNames" },
+   });
+   return corpFunctions;
+ }
+diff --git a/src/NetscriptFunctions/Formulas.ts b/src/NetscriptFunctions/Formulas.ts
+index d56b9d7ec..b35bca832 100644
+--- a/src/NetscriptFunctions/Formulas.ts
++++ b/src/NetscriptFunctions/Formulas.ts
+@@ -46,7 +46,7 @@ import {
+ } from "../Gang/formulas/formulas";
+ import { favorToRep as calculateFavorToRep, repToFavor as calculateRepToFavor } from "../Faction/formulas/favor";
+ import { repFromDonation } from "../Faction/formulas/donation";
+-import { InternalAPI, NetscriptContext, removedFunction } from "../Netscript/APIWrapper";
++import { InternalAPI, NetscriptContext, setRemovedFunctions } from "../Netscript/APIWrapper";
+ import { helpers } from "../Netscript/NetscriptHelpers";
+ import { calculateCrimeWorkStats } from "../Work/Formulas";
+ import { calculateCompanyWorkStats } from "../Work/Formulas";
+@@ -427,10 +427,10 @@ export function NetscriptFormulas(): InternalAPI<IFormulas> {
+       },
+     },
+   };
+-  // Removed undocumented functions added using Object.assign because typescript.
+-  // TODO: Remove these at 3.0
+-  Object.assign(formulasFunctions.work, {
+-    classGains: removedFunction("2.2.0", "formulas.work.universityGains or formulas.work.gymGains"),
++
++  // Removed functions
++  setRemovedFunctions(formulasFunctions.work, {
++    classGains: { version: "2.2.0", replacement: "formulas.work.universityGains or formulas.work.gymGains" },
+   });
+   return formulasFunctions;
+ }
+diff --git a/src/NetscriptFunctions/Singularity.ts b/src/NetscriptFunctions/Singularity.ts
+index ea89f98a2..d52bf8dc3 100644
+--- a/src/NetscriptFunctions/Singularity.ts
++++ b/src/NetscriptFunctions/Singularity.ts
+@@ -40,7 +40,7 @@ import { Server } from "../Server/Server";
+ import { netscriptCanHack } from "../Hacking/netscriptCanHack";
+ import { FactionInfos } from "../Faction/FactionInfo";
+ import { donate, repNeededToDonate } from "../Faction/formulas/donation";
+-import { InternalAPI, removedFunction } from "../Netscript/APIWrapper";
++import { InternalAPI, setRemovedFunctions } from "../Netscript/APIWrapper";
+ import { enterBitNode } from "../RedPill";
+ import { ClassWork } from "../Work/ClassWork";
+ import { CreateProgramWork, isCreateProgramWork } from "../Work/CreateProgramWork";
+@@ -1204,11 +1204,13 @@ export function NetscriptSingularity(): InternalAPI<ISingularity> {
+       return canGetBonus();
+     },
+   };
+-  Object.assign(singularityAPI, {
+-    getAugmentationCost: removedFunction(
+-      "v2.2.0",
+-      "singularity.getAugmentationPrice and singularity.getAugmentationRepReq",
+-    ),
++
++  // Removed functions
++  setRemovedFunctions(singularityAPI, {
++    getAugmentationCost: {
++      version: "2.2.0",
++      replacement: "singularity.getAugmentationPrice and singularity.getAugmentationRepReq",
++    },
+   });
+   return singularityAPI;
+ }
+diff --git a/src/NetscriptFunctions/Sleeve.ts b/src/NetscriptFunctions/Sleeve.ts
+index c7c713cc1..493ac9c86 100644
+--- a/src/NetscriptFunctions/Sleeve.ts
++++ b/src/NetscriptFunctions/Sleeve.ts
+@@ -5,7 +5,7 @@ import { Player } from "@player";
+ import { Augmentations } from "../Augmentation/Augmentations";
+ import { findCrime } from "../Crime/CrimeHelpers";
+ import { getEnumHelper } from "../utils/EnumHelper";
+-import { InternalAPI, NetscriptContext, removedFunction } from "../Netscript/APIWrapper";
++import { InternalAPI, NetscriptContext, setRemovedFunctions } from "../Netscript/APIWrapper";
+ import { isSleeveBladeburnerWork } from "../PersonObjects/Sleeve/Work/SleeveBladeburnerWork";
+ import { isSleeveFactionWork } from "../PersonObjects/Sleeve/Work/SleeveFactionWork";
+ import { isSleeveCompanyWork } from "../PersonObjects/Sleeve/Work/SleeveCompanyWork";
+@@ -262,11 +262,11 @@ export function NetscriptSleeve(): InternalAPI<NetscriptSleeve> {
+       return Player.sleeves[sleeveNumber].bladeburner(action, contract);
+     },
+   };
+-  // Removed undocumented functions added using Object.assign because typescript.
+-  // TODO: Remove these at 3.0
+-  Object.assign(sleeveFunctions, {
+-    getSleeveStats: removedFunction("v2.2.0", "sleeve.getSleeve"),
+-    getInformation: removedFunction("v2.2.0", "sleeve.getSleeve"),
++
++  // Removed functions
++  setRemovedFunctions(sleeveFunctions, {
++    getSleeveStats: { version: "2.2.0", replacement: "sleeve.getSleeve" },
++    getInformation: { version: "2.2.0", replacement: "sleeve.getSleeve" },
+   });
+   return sleeveFunctions;
+ }

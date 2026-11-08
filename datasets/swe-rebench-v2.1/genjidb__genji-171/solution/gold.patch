@@ -1,0 +1,322 @@
+diff --git a/engine/badgerengine/engine.go b/engine/badgerengine/engine.go
+index 4706337a..8dc141df 100644
+--- a/engine/badgerengine/engine.go
++++ b/engine/badgerengine/engine.go
+@@ -36,6 +36,7 @@ func (e *Engine) Begin(writable bool) (engine.Transaction, error) {
+ 	tx := e.DB.NewTransaction(writable)
+ 
+ 	return &Transaction{
++		ng:       e,
+ 		tx:       tx,
+ 		writable: writable,
+ 	}, nil
+@@ -48,6 +49,7 @@ func (e *Engine) Close() error {
+ 
+ // A Transaction uses Badger's transactions.
+ type Transaction struct {
++	ng        *Engine
+ 	tx        *badger.Txn
+ 	writable  bool
+ 	discarded bool
+@@ -110,6 +112,7 @@ func (t *Transaction) GetStore(name []byte) (engine.Store, error) {
+ 	pkey := buildStorePrefixKey(name)
+ 
+ 	return &Store{
++		ng:       t.ng,
+ 		tx:       t.tx,
+ 		prefix:   pkey,
+ 		writable: t.writable,
+diff --git a/engine/badgerengine/store.go b/engine/badgerengine/store.go
+index cbf57b80..5733d70f 100644
+--- a/engine/badgerengine/store.go
++++ b/engine/badgerengine/store.go
+@@ -10,6 +10,7 @@ import (
+ 
+ // A Store is an implementation of the engine.Store interface.
+ type Store struct {
++	ng       *Engine
+ 	tx       *badger.Txn
+ 	prefix   []byte
+ 	writable bool
+@@ -102,6 +103,30 @@ func (s *Store) Truncate() error {
+ 	return nil
+ }
+ 
++// NextSequence returns a monotonically increasing integer.
++func (s *Store) NextSequence() (uint64, error) {
++	if !s.writable {
++		return 0, engine.ErrTransactionReadOnly
++	}
++
++	// TODO: this is an ineficient way of generating sequences.
++	// use a bigger lease in the future.
++	seq, err := s.ng.DB.GetSequence([]byte(s.name), 1)
++	if err != nil {
++		return 0, err
++	}
++	defer seq.Release()
++
++	nb, err := seq.Next()
++	if err != nil {
++		return 0, err
++	}
++
++	// the first number in a Badger sequence is always zero
++	// but Genji expects the first to be 1.
++	return nb + 1, nil
++}
++
+ // NewIterator uses a Badger iterator with default options.
+ // Only one iterator is allowed per read-write transaction.
+ func (s *Store) NewIterator(cfg engine.IteratorConfig) engine.Iterator {
+diff --git a/engine/boltengine/store.go b/engine/boltengine/store.go
+index 3ec0efa2..b49eddd3 100644
+--- a/engine/boltengine/store.go
++++ b/engine/boltengine/store.go
+@@ -62,6 +62,15 @@ func (s *Store) Truncate() error {
+ 	return err
+ }
+ 
++// NextSequence returns a monotonically increasing integer.
++func (s *Store) NextSequence() (uint64, error) {
++	if !s.bucket.Writable() {
++		return 0, engine.ErrTransactionReadOnly
++	}
++
++	return s.bucket.NextSequence()
++}
++
+ // NewIterator uses the bucket cursor.
+ func (s *Store) NewIterator(cfg engine.IteratorConfig) engine.Iterator {
+ 	return &iterator{
+diff --git a/engine/engine.go b/engine/engine.go
+index 02b3ee7d..0f9cfb2d 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -67,6 +67,8 @@ type Store interface {
+ 	Truncate() error
+ 	// NewIterator creates an iterator with the given config.
+ 	NewIterator(IteratorConfig) Iterator
++	// NextSequence returns a monotonically increasing integer.
++	NextSequence() (uint64, error)
+ }
+ 
+ // IteratorConfig is used to configure an iterator upon creation.
+diff --git a/engine/memoryengine/engine.go b/engine/memoryengine/engine.go
+index cd5fc7fb..028b6d66 100644
+--- a/engine/memoryengine/engine.go
++++ b/engine/memoryengine/engine.go
+@@ -17,16 +17,17 @@ const btreeDegree = 12
+ // Engine is a simple memory engine implementation that stores data in
+ // an in-memory Btree. It allows multiple readers and one single writer.
+ type Engine struct {
+-	closed bool
+-	stores map[string]*btree.BTree
+-
+-	mu sync.RWMutex
++	closed    bool
++	stores    map[string]*btree.BTree
++	sequences map[string]uint64
++	mu        sync.RWMutex
+ }
+ 
+ // NewEngine creates an in-memory engine.
+ func NewEngine() *Engine {
+ 	return &Engine{
+-		stores: make(map[string]*btree.BTree),
++		stores:    make(map[string]*btree.BTree),
++		sequences: make(map[string]uint64),
+ 	}
+ }
+ 
+@@ -124,7 +125,7 @@ func (tx *transaction) GetStore(name []byte) (engine.Store, error) {
+ 		return nil, engine.ErrStoreNotFound
+ 	}
+ 
+-	return &storeTx{tx: tx, tr: tr}, nil
++	return &storeTx{tx: tx, tr: tr, name: string(name)}, nil
+ }
+ 
+ func (tx *transaction) CreateStore(name []byte) error {
+diff --git a/engine/memoryengine/store.go b/engine/memoryengine/store.go
+index e65fd76f..a8bb742e 100644
+--- a/engine/memoryengine/store.go
++++ b/engine/memoryengine/store.go
+@@ -37,8 +37,9 @@ func (i *item) Less(than btree.Item) bool {
+ 
+ // storeTx implements an engine.Store.
+ type storeTx struct {
+-	tr *btree.BTree
+-	tx *transaction
++	tr   *btree.BTree
++	tx   *transaction
++	name string
+ }
+ 
+ func (s *storeTx) Put(k, v []byte) error {
+@@ -159,6 +160,17 @@ func (s *storeTx) Truncate() error {
+ 	return nil
+ }
+ 
++// NextSequence returns a monotonically increasing integer.
++func (s *storeTx) NextSequence() (uint64, error) {
++	if !s.tx.writable {
++		return 0, engine.ErrTransactionReadOnly
++	}
++
++	s.tx.ng.sequences[s.name]++
++
++	return s.tx.ng.sequences[s.name], nil
++}
++
+ func (s *storeTx) NewIterator(cfg engine.IteratorConfig) engine.Iterator {
+ 	return &iterator{
+ 		tx:      s.tx,
+diff --git a/index/index.go b/index/index.go
+index 37392384..ac85efb9 100644
+--- a/index/index.go
++++ b/index/index.go
+@@ -9,10 +9,8 @@ import (
+ )
+ 
+ const (
+-	// StorePrefix is the prefix used to name the index store.
+-	StorePrefix = "i" + string(separator)
+-
+-	separator byte = 0x1E
++	// storePrefix is the prefix used to name the index stores.
++	storePrefix = "i"
+ )
+ 
+ var valueTypes = []document.ValueType{
+@@ -75,13 +73,10 @@ func NewUniqueIndex(tx engine.Transaction, idxName string) *UniqueIndex {
+ func buildIndexName(name []byte, t document.ValueType) []byte {
+ 	var buf bytes.Buffer
+ 
+-	// We can deterministically set the size of the buffer.
+-	// The last 2 bytes are for the separator and the Type t.
+-	buf.Grow(len(StorePrefix) + len(name) + 2)
++	buf.Grow(len(storePrefix) + len(name) + 1)
+ 
+-	buf.WriteString(StorePrefix)
++	buf.WriteString(storePrefix)
+ 	buf.Write(name)
+-	buf.WriteByte(separator)
+ 	buf.WriteByte(byte(t))
+ 
+ 	return buf.Bytes()
+diff --git a/index/list.go b/index/list.go
+index 2e32d171..8cc2b7a7 100644
+--- a/index/list.go
++++ b/index/list.go
+@@ -31,14 +31,14 @@ func (idx *ListIndex) Set(v document.Value, k []byte) error {
+ 		return err
+ 	}
+ 
+-	enc := key.AppendValue(nil, v)
+-
+-	buf := make([]byte, 0, len(enc)+len(k)+1)
+-	buf = append(buf, enc...)
+-	buf = append(buf, separator)
+-	buf = append(buf, k...)
++	buf := key.AppendValue(nil, v)
++	seq, err := st.NextSequence()
++	if err != nil {
++		return err
++	}
++	buf = key.AppendInt64(buf, int64(seq))
+ 
+-	return st.Put(buf, nil)
++	return st.Put(buf, k)
+ }
+ 
+ // Delete all the references to the key from the index.
+@@ -52,19 +52,35 @@ func (idx *ListIndex) Delete(v document.Value, k []byte) error {
+ 		}
+ 	}
+ 
+-	enc := key.AppendValue(nil, v)
+-
+ 	st, err := getOrCreateStore(idx.tx, v.Type, idx.name)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	buf := make([]byte, 0, len(enc)+len(k)+1)
+-	buf = append(buf, enc...)
+-	buf = append(buf, separator)
+-	buf = append(buf, k...)
++	seek := key.AppendValue(nil, v)
++
++	it := st.NewIterator(engine.IteratorConfig{})
++	defer it.Close()
++
++	var buf []byte
++	var toDelete []byte
++	for it.Seek(seek); it.Valid(); it.Next() {
++		item := it.Item()
++		buf, err = item.ValueCopy(buf)
++		if err != nil {
++			return err
++		}
++		if bytes.Equal(buf, k) {
++			toDelete = item.Key()
++			break
++		}
++	}
++
++	if toDelete != nil {
++		return st.Delete(toDelete)
++	}
+ 
+-	return st.Delete(buf)
++	return engine.ErrKeyNotFound
+ }
+ 
+ // AscendGreaterOrEqual seeks for the pivot and then goes through all the subsequent key value pairs in increasing order and calls the given function for each pair.
+@@ -134,18 +150,25 @@ func (idx *ListIndex) iterateOnStore(pivot document.Value, reverse bool, fn func
+ 		seek = enc
+ 
+ 		if reverse {
+-			seek = append(seek, separator, 0xFF)
++			seek = append(seek, 0xFF)
+ 		}
+ 	}
+ 
+ 	it := st.NewIterator(engine.IteratorConfig{Reverse: reverse})
+ 	defer it.Close()
+ 
++	var buf []byte
+ 	for it.Seek(seek); it.Valid(); it.Next() {
+ 		item := it.Item()
+-		k := item.Key()
+-		idx := bytes.LastIndexByte(k, separator)
+-		err = fn(k[:idx], k[idx+1:], bytes.Equal(k[:idx], enc))
++		v := item.Key()
++		idx := len(v) - 8
++
++		buf, err = item.ValueCopy(buf)
++		if err != nil {
++			return err
++		}
++
++		err = fn(v[:idx], buf, bytes.Equal(v[:idx], enc))
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/key/encoding.go b/key/encoding.go
+index 5aeb0b98..3b193b81 100644
+--- a/key/encoding.go
++++ b/key/encoding.go
+@@ -16,11 +16,6 @@ import (
+ 	"github.com/genjidb/genji/document"
+ )
+ 
+-// EncodeString takes a string and returns its binary representation.
+-func EncodeString(buf []byte, x string) {
+-	copy(buf, x)
+-}
+-
+ // AppendBool takes a bool and returns its binary representation.
+ func AppendBool(buf []byte, x bool) []byte {
+ 	if x {

@@ -1,0 +1,214 @@
+diff --git a/actors/builtin/miner/miner_actor.go b/actors/builtin/miner/miner_actor.go
+index 50c7525f..836690f9 100644
+--- a/actors/builtin/miner/miner_actor.go
++++ b/actors/builtin/miner/miner_actor.go
+@@ -909,11 +909,16 @@ func (a Actor) ReportConsensusFault(rt Runtime, params *ReportConsensusFaultPara
+ 		rt.Abortf(exitcode.ErrIllegalArgument, "invalid fault epoch %v ahead of current %v", fault.Epoch, rt.CurrEpoch())
+ 	}
+ 
++	// Reward reporter with a share of the miner's current balance.
++	slasherReward := RewardForConsensusSlashReport(faultAge, rt.CurrentBalance())
++	_, code := rt.Send(reporter, builtin.MethodSend, nil, slasherReward)
++	builtin.RequireSuccess(rt, code, "failed to reward reporter")
++
+ 	var st State
+ 	rt.State().Readonly(&st)
+ 
+ 	// Notify power actor with lock-up total being removed.
+-	_, code := rt.Send(
++	_, code = rt.Send(
+ 		builtin.StoragePowerActorAddr,
+ 		builtin.MethodsPower.OnConsensusFault,
+ 		&st.LockedFunds,
+@@ -921,15 +926,9 @@ func (a Actor) ReportConsensusFault(rt Runtime, params *ReportConsensusFaultPara
+ 	)
+ 	builtin.RequireSuccess(rt, code, "failed to notify power actor on consensus fault")
+ 
+-	// TODO: terminate deals with market actor, https://github.com/filecoin-project/specs-actors/issues/279
++	// close deals and burn funds
++	terminateMiner(rt)
+ 
+-	// Reward reporter with a share of the miner's current balance.
+-	slasherReward := rewardForConsensusSlashReport(faultAge, rt.CurrentBalance())
+-	_, code = rt.Send(reporter, builtin.MethodSend, nil, slasherReward)
+-	builtin.RequireSuccess(rt, code, "failed to reward reporter")
+-
+-	// Delete the actor and burn all remaining funds
+-	rt.DeleteActor(builtin.BurntFundsActorAddr)
+ 	return nil
+ }
+ 
+@@ -1600,6 +1599,17 @@ func getVerifyInfo(rt Runtime, params *SealVerifyStuff) *abi.SealVerifyInfo {
+ 	}
+ }
+ 
++// Closes down this miner by erasing its power, terminating all its deals and burning its funds
++func terminateMiner(rt Runtime) {
++	var st State
++	rt.State().Readonly(&st)
++
++	requestTerminateAllDeals(rt, &st)
++
++	// Delete the actor and burn all remaining funds
++	rt.DeleteActor(builtin.BurntFundsActorAddr)
++}
++
+ // Requests the storage market actor compute the unsealed sector CID from a sector's deals.
+ func requestUnsealedSectorCID(rt Runtime, proofType abi.RegisteredSealProof, dealIDs []abi.DealID) cid.Cid {
+ 	ret, code := rt.Send(
+diff --git a/actors/builtin/miner/policy.go b/actors/builtin/miner/policy.go
+index 166785cf..0c4450fa 100644
+--- a/actors/builtin/miner/policy.go
++++ b/actors/builtin/miner/policy.go
+@@ -167,7 +167,7 @@ var PledgeVestingSpec = VestSpec{
+ 	Quantization: 12 * builtin.EpochsInHour,               // 12 hours for testnet, PARAM_FINISH
+ }
+ 
+-func rewardForConsensusSlashReport(elapsedEpoch abi.ChainEpoch, collateral abi.TokenAmount) abi.TokenAmount {
++func RewardForConsensusSlashReport(elapsedEpoch abi.ChainEpoch, collateral abi.TokenAmount) abi.TokenAmount {
+ 	// PARAM_FINISH
+ 	// var growthRate = SLASHER_SHARE_GROWTH_RATE_NUM / SLASHER_SHARE_GROWTH_RATE_DENOM
+ 	// var multiplier = growthRate^elapsedEpoch
+diff --git a/support/mock/mockrt.go b/support/mock/mockrt.go
+index eb55ff73..d619ed29 100644
+--- a/support/mock/mockrt.go
++++ b/support/mock/mockrt.go
+@@ -50,16 +50,18 @@ type Runtime struct {
+ 	hashfunc func(data []byte) [32]byte
+ 
+ 	// Expectations
+-	t                        testing.TB
+-	expectValidateCallerAny  bool
+-	expectValidateCallerAddr []addr.Address
+-	expectValidateCallerType []cid.Cid
+-	expectRandomness         []*expectRandomness
+-	expectSends              []*expectedMessage
+-	expectCreateActor        *expectCreateActor
+-	expectVerifySig          *expectVerifySig
+-	expectVerifySeal         *expectVerifySeal
+-	expectVerifyPoSt         *expectVerifyPoSt
++	t                          testing.TB
++	expectValidateCallerAny    bool
++	expectValidateCallerAddr   []addr.Address
++	expectValidateCallerType   []cid.Cid
++	expectRandomness           []*expectRandomness
++	expectSends                []*expectedMessage
++	expectCreateActor          *expectCreateActor
++	expectVerifySig            *expectVerifySig
++	expectVerifySeal           *expectVerifySeal
++	expectVerifyPoSt           *expectVerifyPoSt
++	expectVerifyConsensusFault *expectVerifyConsensusFault
++	expectDeleteActor          *address.Address
+ }
+ 
+ type expectRandomness struct {
+@@ -116,6 +118,16 @@ type expectCreateActor struct {
+ 	address addr.Address
+ }
+ 
++type expectVerifyConsensusFault struct {
++	requireCorrectInput bool
++	BlockHeader1        []byte
++	BlockHeader2        []byte
++	BlockHeaderExtra    []byte
++
++	Fault *runtime.ConsensusFault
++	Err   error
++}
++
+ var _ runtime.Runtime = &Runtime{}
+ var _ runtime.StateHandle = &Runtime{}
+ var typeOfRuntimeInterface = reflect.TypeOf((*runtime.Runtime)(nil)).Elem()
+@@ -307,12 +319,19 @@ func (rt *Runtime) CreateActor(codeId cid.Cid, address addr.Address) {
+ 	rt.failTestNow("unexpected call to create actor")
+ }
+ 
+-func (rt *Runtime) DeleteActor(_ addr.Address) {
++func (rt *Runtime) DeleteActor(addr addr.Address) {
+ 	rt.requireInCall()
+ 	if rt.inTransaction {
+ 		rt.Abortf(exitcode.SysErrorIllegalActor, "side-effect within transaction")
+ 	}
+-	panic("implement me")
++	if rt.expectDeleteActor == nil {
++		rt.failTestNow("unexpected call to delete actor %s", addr.String())
++	}
++
++	if *rt.expectDeleteActor != addr {
++		rt.failTestNow("attempt to delete wrong actor. Expected %s, got %s.", rt.expectDeleteActor.String(), addr.String())
++	}
++	rt.expectDeleteActor = nil
+ }
+ 
+ func (rt *Runtime) TotalFilCircSupply() abi.TokenAmount {
+@@ -504,7 +523,27 @@ func (rt *Runtime) VerifyPoSt(vi abi.WindowPoStVerifyInfo) error {
+ }
+ 
+ func (rt *Runtime) VerifyConsensusFault(h1, h2, extra []byte) (*runtime.ConsensusFault, error) {
+-	panic("implement me")
++	if rt.expectVerifyConsensusFault == nil {
++		rt.failTestNow("Unexpected syscall VerifyConsensusFault")
++		return nil, nil
++	}
++
++	if rt.expectVerifyConsensusFault.requireCorrectInput {
++		if !bytes.Equal(h1, rt.expectVerifyConsensusFault.BlockHeader1) {
++			rt.failTest("block header 1 does not equal expected block header 1 (%v != %v)", h1, rt.expectVerifyConsensusFault.BlockHeader1)
++		}
++		if !bytes.Equal(h2, rt.expectVerifyConsensusFault.BlockHeader2) {
++			rt.failTest("block header 2 does not equal expected block header 2 (%v != %v)", h2, rt.expectVerifyConsensusFault.BlockHeader2)
++		}
++		if !bytes.Equal(extra, rt.expectVerifyConsensusFault.BlockHeaderExtra) {
++			rt.failTest("block header extra does not equal expected block header extra (%v != %v)", extra, rt.expectVerifyConsensusFault.BlockHeaderExtra)
++		}
++	}
++
++	fault := rt.expectVerifyConsensusFault.Fault
++	err := rt.expectVerifyConsensusFault.Err
++	rt.expectVerifyConsensusFault = nil
++	return fault, err
+ }
+ 
+ ///// Trace span implementation /////
+@@ -633,6 +672,10 @@ func (rt *Runtime) ExpectCreateActor(codeId cid.Cid, address addr.Address) {
+ 	}
+ }
+ 
++func (rt *Runtime) ExpectDeleteActor(beneficiary address.Address) {
++	rt.expectDeleteActor = &beneficiary
++}
++
+ func (rt *Runtime) SetHasher(f func(data []byte) [32]byte) {
+ 	rt.hashfunc = f
+ }
+@@ -660,6 +703,17 @@ func (rt *Runtime) ExpectVerifyPoSt(post abi.WindowPoStVerifyInfo, result error)
+ 	}
+ }
+ 
++func (rt *Runtime) ExpectVerifyConsensusFault(h1, h2, extra []byte, result *runtime.ConsensusFault, resultErr error) {
++	rt.expectVerifyConsensusFault = &expectVerifyConsensusFault{
++		requireCorrectInput: true,
++		BlockHeader1:        h1,
++		BlockHeader2:        h2,
++		BlockHeaderExtra:    extra,
++		Fault:               result,
++		Err:                 resultErr,
++	}
++}
++
+ // Verifies that expected calls were received, and resets all expectations.
+ func (rt *Runtime) Verify() {
+ 	rt.t.Helper()
+@@ -686,6 +740,12 @@ func (rt *Runtime) Verify() {
+ 	if rt.expectVerifySeal != nil {
+ 		rt.failTest("missing expected verify seal with %v", rt.expectVerifySeal.seal)
+ 	}
++	if rt.expectVerifyConsensusFault != nil {
++		rt.failTest("missing expected verify consensus fault")
++	}
++	if rt.expectDeleteActor != nil {
++		rt.failTest("missing expected delete actor with address %s", rt.expectDeleteActor.String())
++	}
+ 
+ 	rt.Reset()
+ }

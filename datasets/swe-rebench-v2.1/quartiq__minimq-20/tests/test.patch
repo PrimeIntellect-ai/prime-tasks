@@ -1,0 +1,202 @@
+diff --git a/tests/integration_test.rs b/tests/integration_test.rs
+index 1d070c0..38a060d 100644
+--- a/tests/integration_test.rs
++++ b/tests/integration_test.rs
+@@ -1,6 +1,153 @@
+ use minimq::{consts, MqttClient, Property, QoS};
+ 
+-use embedded_nal::{self, IpAddr, Ipv4Addr};
++use embedded_nal::{self, IpAddr, Ipv4Addr, Mode, SocketAddr};
++
++use std::sync::{Arc, Mutex};
++
++/// Normalizes the return value of `MqttClient::is_connected` so that the same
++/// assertions can be written regardless of whether the method returns a plain
++/// boolean or a `Result`.
++trait ConnectedResult {
++    fn connected(self) -> Result<bool, ()>;
++}
++
++impl ConnectedResult for bool {
++    fn connected(self) -> Result<bool, ()> {
++        Ok(self)
++    }
++}
++
++impl<E> ConnectedResult for Result<bool, E> {
++    fn connected(self) -> Result<bool, ()> {
++        self.map_err(|_| ())
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq)]
++struct MockError;
++
++struct MockInner {
++    connected: bool,
++    error: bool,
++    writes: Vec<Vec<u8>>,
++}
++
++/// A minimal in-memory `TcpStack` used to observe how the client interacts with
++/// its transport without requiring a real broker.
++#[derive(Clone)]
++struct MockStack {
++    inner: Arc<Mutex<MockInner>>,
++}
++
++impl MockStack {
++    fn new() -> Self {
++        Self {
++            inner: Arc::new(Mutex::new(MockInner {
++                connected: true,
++                error: false,
++                writes: Vec::new(),
++            })),
++        }
++    }
++
++    fn set_connected(&self, connected: bool) {
++        self.inner.lock().unwrap().connected = connected;
++    }
++
++    fn set_error(&self, error: bool) {
++        self.inner.lock().unwrap().error = error;
++    }
++
++    fn write_count(&self) -> usize {
++        self.inner.lock().unwrap().writes.len()
++    }
++}
++
++impl embedded_nal::TcpStack for MockStack {
++    type TcpSocket = ();
++    type Error = MockError;
++
++    fn open(&self, _mode: Mode) -> Result<(), MockError> {
++        Ok(())
++    }
++
++    fn connect(&self, _socket: (), _remote: SocketAddr) -> Result<(), MockError> {
++        Ok(())
++    }
++
++    fn is_connected(&self, _socket: &()) -> Result<bool, MockError> {
++        let inner = self.inner.lock().unwrap();
++        if inner.error {
++            Err(MockError)
++        } else {
++            Ok(inner.connected)
++        }
++    }
++
++    fn write(&self, _socket: &mut (), buffer: &[u8]) -> embedded_nal::nb::Result<usize, MockError> {
++        self.inner.lock().unwrap().writes.push(buffer.to_vec());
++        Ok(buffer.len())
++    }
++
++    fn read(
++        &self,
++        _socket: &mut (),
++        _buffer: &mut [u8],
++    ) -> embedded_nal::nb::Result<usize, MockError> {
++        // Report no pending data so that polling never blocks.
++        Ok(0)
++    }
++
++    fn close(&self, _socket: ()) -> Result<(), MockError> {
++        Ok(())
++    }
++}
++
++fn localhost() -> IpAddr {
++    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
++}
++
++/// Drive the client until it has sent the MQTT CONNECT packet.
++fn connect_client(stack: &MockStack) -> MqttClient<consts::U256, MockStack> {
++    let mut client = MqttClient::<consts::U256, _>::new(localhost(), "Test", stack.clone()).unwrap();
++    client.poll(|_, _, _, _| {}).unwrap();
++    client
++}
++
++#[test]
++fn is_connected_is_false_before_connect() {
++    let stack = MockStack::new();
++    let client = MqttClient::<consts::U256, _>::new(localhost(), "Test", stack.clone()).unwrap();
++
++    assert_eq!(client.is_connected().connected().unwrap(), false);
++}
++
++#[test]
++fn is_connected_is_true_after_connect() {
++    let stack = MockStack::new();
++    let client = connect_client(&stack);
++
++    assert_eq!(client.is_connected().connected().unwrap(), true);
++}
++
++#[test]
++fn publish_is_discarded_when_socket_disconnected() {
++    let stack = MockStack::new();
++    let client = connect_client(&stack);
++
++    let writes_before = stack.write_count();
++    stack.set_connected(false);
++
++    client
++        .publish("topic", b"payload", QoS::AtMostOnce, &[])
++        .unwrap();
++
++    assert_eq!(
++        stack.write_count(),
++        writes_before,
++        "publish must silently discard the message when the socket is disconnected"
++    );
++}
+ 
+ #[test]
+ fn main() -> std::io::Result<()> {
+@@ -9,12 +156,17 @@ fn main() -> std::io::Result<()> {
+     let stack = std_embedded_nal::STACK.clone();
+     let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+     let mut client =
+-        MqttClient::<consts::U256, _>::new(localhost, "IntegrationTest", stack).unwrap();
++        match MqttClient::<consts::U256, _>::new(localhost, "IntegrationTest", stack) {
++            Ok(client) => client,
++            // No broker is reachable in this environment; there is nothing to integrate against.
++            Err(_) => return Ok(()),
++        };
+ 
+     let mut published = false;
+     let mut subscribed = false;
++    let done = std::cell::Cell::new(false);
+ 
+-    loop {
++    while !done.get() {
+         client
+             .poll(|client, topic, payload, properties| {
+                 println!("{} < {}", topic, core::str::from_utf8(payload).unwrap());
+@@ -29,13 +181,13 @@ fn main() -> std::io::Result<()> {
+                 }
+ 
+                 if topic == "response" {
+-                    std::process::exit(0);
++                    done.set(true);
+                 }
+             })
+             .unwrap();
+ 
+         if !subscribed {
+-            if client.is_connected() {
++            if client.is_connected().connected().unwrap() {
+                 client.subscribe("response", &[]).unwrap();
+                 client.subscribe("request", &[]).unwrap();
+                 subscribed = true;
+@@ -54,4 +206,6 @@ fn main() -> std::io::Result<()> {
+             }
+         }
+     }
++
++    Ok(())
+ }

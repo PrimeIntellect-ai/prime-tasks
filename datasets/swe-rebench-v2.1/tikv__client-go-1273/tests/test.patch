@@ -1,0 +1,119 @@
+diff --git a/internal/locate/replica_selector_test.go b/internal/locate/replica_selector_test.go
+index 521700d..003d45e 100644
+--- a/internal/locate/replica_selector_test.go
++++ b/internal/locate/replica_selector_test.go
+@@ -95,6 +95,7 @@ type replicaSelectorAccessPathCase struct {
+ 	accessErrInValid bool
+ 	expect           *accessPathResult
+ 	result           accessPathResult
++	key              []byte
+ 	beforeRun        func() // beforeRun will be called before the test case execute, if it is nil, resetStoreState will be called.
+ 	afterRun         func() // afterRun will be called after the test case execute, if it is nil, invalidateRegion will be called.
+ }
+@@ -2540,6 +2541,76 @@ func TestReplicaReadAccessPathByProxyCase(t *testing.T) {
+ 	s.True(s.runCaseAndCompare(ca))
+ }
+ 
++func TestProxyFailureRefreshesOtherRegionsAndDiscoversLeader(t *testing.T) {
++	s := new(testReplicaSelectorSuite)
++	s.SetupTest(t)
++	defer s.TearDownTest()
++	s.cache.enableForwarding = true
++	config.UpdateGlobal(func(conf *config.Config) {
++		conf.TiKVClient.EnableReplicaSelectorV2 = true
++	})
++
++	// Split the PD region and cache both halves. Both regions still refer to
++	// the same store instances when the request fails.
++	upperRegionID := s.cluster.AllocID()
++	s.cluster.Split(s.regionID, upperRegionID, []byte("m"), s.peerIDs, s.leaderPeer)
++	oldRegion := s.getRegion()
++	s.cache.InvalidateCachedRegion(oldRegion.VerID())
++	firstLoc, err := s.cache.LocateKey(s.bo, []byte("key"))
++	s.NoError(err)
++	secondLoc, err := s.cache.LocateKey(s.bo, []byte("z"))
++	s.NoError(err)
++	s.NotEqual(firstLoc.Region, secondLoc.Region)
++	failedRequest := replicaSelectorAccessPathCase{
++		reqType:   tikvrpc.CmdGet,
++		readType:  kv.ReplicaReadLeader,
++		key:       []byte("key"),
++		accessErr: []RegionErrorType{DeadLineExceededErr, ServerIsBusyWithEstimatedWaitMsErr, ServerIsBusyWithEstimatedWaitMsErr},
++		afterRun:  func() { /* preserve cache state for the next request */ },
++	}
++	failedRequest.run(s)
++	s.cluster.ChangeLeader(s.regionID, s.peerIDs[1])
++	s.cluster.ChangeLeader(upperRegionID, s.peerIDs[1])
++
++	// Neither request's setup invalidates cached routing. A fresh leader address
++	// therefore demonstrates that the failed request caused PD state to be used.
++	refreshedRequest := replicaSelectorAccessPathCase{
++		reqType:   tikvrpc.CmdGet,
++		readType:  kv.ReplicaReadLeader,
++		key:       []byte("key"),
++		beforeRun: func() {},
++		afterRun:  func() { /* preserve the observed routing */ },
++	}
++	refreshedRequest.run(s)
++	newLeaderWasUsed := false
++	for _, access := range refreshedRequest.result.accessPath {
++		if strings.Contains(access, "forward_addr: store2") ||
++			(!strings.Contains(access, "forward_addr:") && strings.Contains(access, "addr: store2")) {
++			newLeaderWasUsed = true
++		}
++	}
++	s.True(newLeaderWasUsed, "expected a request to reach the leader reported by PD; accesses: %v", refreshedRequest.result.accessPath)
++
++	// A second cached region that shared the failed store must also discover its
++	// new leader rather than continuing to use stale region routing.
++	otherRegionRequest := replicaSelectorAccessPathCase{
++		reqType:   tikvrpc.CmdGet,
++		readType:  kv.ReplicaReadLeader,
++		key:       []byte("z"),
++		beforeRun: func() {},
++		afterRun:  func() { /* preserve the observed routing */ },
++	}
++	otherRegionRequest.run(s)
++	usedFailedStoreAsTarget := false
++	for _, access := range otherRegionRequest.result.accessPath {
++		if strings.Contains(access, "forward_addr: store1") ||
++			(!strings.Contains(access, "forward_addr:") && strings.Contains(access, "addr: store1")) {
++			usedFailedStoreAsTarget = true
++		}
++	}
++	s.False(usedFailedStoreAsTarget, "request reused the failed store as its target: %v", otherRegionRequest.result.accessPath)
++}
++
+ func TestReplicaReadAccessPathByLearnerCase(t *testing.T) {
+ 	s := new(testReplicaSelectorSuite)
+ 	s.SetupTest(t)
+@@ -2936,7 +3007,13 @@ func (ca *replicaSelectorAccessPathCase) run(s *testReplicaSelectorSuite) *Regio
+ 	sender := NewRegionRequestSender(s.cache, fnClient)
+ 	req, opts, timeout := ca.buildRequest(s)
+ 	beforeRun(s, ca)
+-	rc := s.getRegion()
++	key := ca.key
++	if key == nil {
++		key = []byte("key")
++	}
++	loc, locateErr := s.cache.LocateKey(s.bo, key)
++	s.NoError(locateErr)
++	rc := s.cache.GetCachedRegionWithRLock(loc.Region)
+ 	s.NotNil(rc)
+ 	bo := retry.NewBackofferWithVars(context.Background(), 40000, nil)
+ 	resp, _, _, err := sender.SendReqCtx(bo, req, rc.VerID(), timeout, tikvrpc.TiKV, opts...)
+@@ -2965,9 +3042,11 @@ func (ca *replicaSelectorAccessPathCase) buildRequest(s *testReplicaSelectorSuit
+ 	var req *tikvrpc.Request
+ 	switch ca.reqType {
+ 	case tikvrpc.CmdGet:
+-		req = tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{
+-			Key: []byte("key"),
+-		})
++		key := ca.key
++		if key == nil {
++			key = []byte("key")
++		}
++		req = tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{Key: key})
+ 	case tikvrpc.CmdPrewrite:
+ 		req = tikvrpc.NewRequest(tikvrpc.CmdPrewrite, &kvrpcpb.PrewriteRequest{})
+ 	default:

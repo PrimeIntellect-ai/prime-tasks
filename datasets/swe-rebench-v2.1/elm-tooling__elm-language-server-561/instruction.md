@@ -1,0 +1,2 @@
+Completions for default imports are broken
+Regression from dd1d6b8e481acd15cf4bcd176d6a5adba736298b.

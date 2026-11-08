@@ -1,0 +1,246 @@
+diff --git a/pkg/compose/volumes_test.go b/pkg/compose/volumes_test.go
+new file mode 100644
+index 00000000..478b8393
+--- /dev/null
++++ b/pkg/compose/volumes_test.go
+@@ -0,0 +1,240 @@
++/*
++   Copyright 2020 Docker Compose CLI authors
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package compose_test
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/docker/cli/cli/config/configfile"
++	"github.com/docker/cli/cli/streams"
++	cmdcompose "github.com/docker/compose/v2/cmd/compose"
++	"github.com/docker/compose/v2/pkg/api"
++	pkgcompose "github.com/docker/compose/v2/pkg/compose"
++	"github.com/docker/compose/v2/pkg/mocks"
++	"github.com/docker/docker/api/types/container"
++	"github.com/docker/docker/api/types/system"
++	"github.com/docker/docker/api/types/volume"
++	"github.com/spf13/cobra"
++	"go.uber.org/mock/gomock"
++	"gotest.tools/v3/assert"
++)
++
++const testProject = "testProject"
++
++// writeComposeFile writes the given Compose file content to a temporary file and
++// returns its path.
++func writeComposeFile(t *testing.T, content string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "compose.yaml")
++	assert.NilError(t, os.WriteFile(path, []byte(content), 0o644))
++	return path
++}
++
++// runVolumesCommand executes the public `volumes` command end to end against a
++// mock Docker API and returns the command output.
++//
++// The mock Docker API returns the project-scoped volumes only when the query is
++// filtered by the project label; otherwise it also returns unrelated host
++// volumes. This makes it observable whether the command scopes its listing to
++// the current project or dumps every volume available on the host.
++func runVolumesCommand(t *testing.T, composeFile string, projectVolumes, hostVolumes []*volume.Volume, containers []container.Summary, args ...string) (string, error) {
++	t.Helper()
++	ctrl := gomock.NewController(t)
++
++	buf := new(bytes.Buffer)
++	cli := mocks.NewMockCli(ctrl)
++	cli.EXPECT().Out().Return(streams.NewOut(buf)).AnyTimes()
++	cli.EXPECT().Err().Return(streams.NewOut(buf)).AnyTimes()
++	cli.EXPECT().ConfigFile().Return(&configfile.ConfigFile{}).AnyTimes()
++	mockApi := mocks.NewMockAPIClient(ctrl)
++	cli.EXPECT().Client().Return(mockApi).AnyTimes()
++
++	mockApi.EXPECT().Info(gomock.Any()).Return(system.Info{}, nil).AnyTimes()
++	mockApi.EXPECT().ContainerList(gomock.Any(), gomock.Any()).Return(containers, nil).AnyTimes()
++	mockApi.EXPECT().VolumeList(gomock.Any(), gomock.Any()).DoAndReturn(
++		func(_ context.Context, opts volume.ListOptions) (volume.ListResponse, error) {
++			for _, label := range opts.Filters.Get("label") {
++				if label == api.ProjectLabel+"="+testProject {
++					return volume.ListResponse{Volumes: projectVolumes}, nil
++				}
++			}
++			all := append([]*volume.Volume{}, projectVolumes...)
++			all = append(all, hostVolumes...)
++			return volume.ListResponse{Volumes: all}, nil
++		}).AnyTimes()
++
++	backend, ok := pkgcompose.NewComposeService(cli).(cmdcompose.Backend)
++	assert.Assert(t, ok, "compose service must implement the CLI backend")
++
++	root := cmdcompose.RootCommand(cli, backend)
++	parent := &cobra.Command{Use: "docker", TraverseChildren: true}
++	parent.AddCommand(root)
++	parent.SetArgs(append([]string{"compose", "-f", composeFile, "volumes"}, args...))
++	parent.SetOut(buf)
++	parent.SetErr(buf)
++	err := parent.Execute()
++	return buf.String(), err
++}
++
++func TestVolumesCommandRegistered(t *testing.T) {
++	mockCtrl := gomock.NewController(t)
++	mockApi := mocks.NewMockAPIClient(mockCtrl)
++	mockCli := mocks.NewMockCli(mockCtrl)
++	mockCli.EXPECT().Client().Return(mockApi).AnyTimes()
++	mockCli.EXPECT().Out().Return(streams.NewOut(io.Discard)).AnyTimes()
++	mockCli.EXPECT().Err().Return(streams.NewOut(io.Discard)).AnyTimes()
++
++	backend, ok := pkgcompose.NewComposeService(mockCli).(cmdcompose.Backend)
++	assert.Assert(t, ok, "compose service must implement the CLI backend")
++
++	root := cmdcompose.RootCommand(mockCli, backend)
++
++	var found bool
++	for _, c := range root.Commands() {
++		if c.Name() == "volumes" {
++			found = true
++			break
++		}
++	}
++	assert.Assert(t, found, "expected a 'volumes' command to be registered")
++}
++
++func TestVolumesCommandListsProjectVolumes(t *testing.T) {
++	composeFile := writeComposeFile(t, `
++name: testProject
++services:
++  service1:
++    image: busybox
++    volumes:
++      - vol1:/data
++volumes:
++  vol1:
++`)
++	projectVolume := &volume.Volume{
++		Name:   "testProject_vol1",
++		Labels: map[string]string{api.ProjectLabel: testProject},
++	}
++	hostVolume := &volume.Volume{
++		Name:   "otherProject_vol",
++		Labels: map[string]string{api.ProjectLabel: "otherProject"},
++	}
++	containers := []container.Summary{
++		{
++			Labels: map[string]string{api.ServiceLabel: "service1"},
++			Mounts: []container.MountPoint{{Name: "testProject_vol1"}},
++		},
++	}
++
++	out, err := runVolumesCommand(t, composeFile, []*volume.Volume{projectVolume}, []*volume.Volume{hostVolume}, containers)
++	assert.NilError(t, err)
++	assert.Assert(t, strings.Contains(out, "testProject_vol1"),
++		"expected the project's volume to be listed, got: %q", out)
++	assert.Assert(t, !strings.Contains(out, "otherProject_vol"),
++		"unrelated host volumes must not be listed, got: %q", out)
++}
++
++func TestVolumesCommandFiltersByService(t *testing.T) {
++	composeFile := writeComposeFile(t, `
++name: testProject
++services:
++  service1:
++    image: busybox
++    volumes:
++      - vol1:/data
++  service2:
++    image: busybox
++    volumes:
++      - vol2:/data
++volumes:
++  vol1:
++  vol2:
++`)
++	vol1 := &volume.Volume{Name: "testProject_vol1", Labels: map[string]string{api.ProjectLabel: testProject}}
++	vol2 := &volume.Volume{Name: "testProject_vol2", Labels: map[string]string{api.ProjectLabel: testProject}}
++	containers := []container.Summary{
++		{
++			Labels: map[string]string{api.ServiceLabel: "service1"},
++			Mounts: []container.MountPoint{{Name: "testProject_vol1"}},
++		},
++		{
++			Labels: map[string]string{api.ServiceLabel: "service2"},
++			Mounts: []container.MountPoint{{Name: "testProject_vol2"}},
++		},
++	}
++
++	out, err := runVolumesCommand(t, composeFile, []*volume.Volume{vol1, vol2}, nil, containers, "service1")
++	assert.NilError(t, err)
++	assert.Assert(t, strings.Contains(out, "testProject_vol1"),
++		"expected service1's volume to be listed, got: %q", out)
++	assert.Assert(t, !strings.Contains(out, "testProject_vol2"),
++		"service2's volume must not be listed, got: %q", out)
++}
++
++func TestVolumesCommandFiltersByMultipleServices(t *testing.T) {
++	composeFile := writeComposeFile(t, `
++name: testProject
++services:
++  service1:
++    image: busybox
++    volumes:
++      - vol1:/data
++  service2:
++    image: busybox
++    volumes:
++      - vol2:/data
++  service3:
++    image: busybox
++    volumes:
++      - vol3:/data
++volumes:
++  vol1:
++  vol2:
++  vol3:
++`)
++	vol1 := &volume.Volume{Name: "testProject_vol1", Labels: map[string]string{api.ProjectLabel: testProject}}
++	vol2 := &volume.Volume{Name: "testProject_vol2", Labels: map[string]string{api.ProjectLabel: testProject}}
++	vol3 := &volume.Volume{Name: "testProject_vol3", Labels: map[string]string{api.ProjectLabel: testProject}}
++	containers := []container.Summary{
++		{
++			Labels: map[string]string{api.ServiceLabel: "service1"},
++			Mounts: []container.MountPoint{{Name: "testProject_vol1"}},
++		},
++		{
++			Labels: map[string]string{api.ServiceLabel: "service2"},
++			Mounts: []container.MountPoint{{Name: "testProject_vol2"}},
++		},
++		{
++			Labels: map[string]string{api.ServiceLabel: "service3"},
++			Mounts: []container.MountPoint{{Name: "testProject_vol3"}},
++		},
++	}
++
++	out, err := runVolumesCommand(t, composeFile, []*volume.Volume{vol1, vol2, vol3}, nil, containers, "service1", "service2")
++	assert.NilError(t, err)
++	assert.Assert(t, strings.Contains(out, "testProject_vol1"),
++		"expected service1's volume to be listed, got: %q", out)
++	assert.Assert(t, strings.Contains(out, "testProject_vol2"),
++		"expected service2's volume to be listed, got: %q", out)
++	assert.Assert(t, !strings.Contains(out, "testProject_vol3"),
++		"service3's volume must not be listed, got: %q", out)
++}

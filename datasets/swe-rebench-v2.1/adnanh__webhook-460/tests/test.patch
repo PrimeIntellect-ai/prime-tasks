@@ -1,0 +1,142 @@
+diff --git a/webhook_test.go b/webhook_test.go
+index 4671c24..cebc482 100644
+--- a/webhook_test.go
++++ b/webhook_test.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
+ 	"fmt"
+ 	"io/ioutil"
+ 	"log"
+@@ -63,6 +64,104 @@ func TestStaticParams(t *testing.T) {
+ 	}
+ }
+ 
++func TestCommandLookupPaths(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("uses executable shell scripts")
++	}
++
++	tmp, err := ioutil.TempDir("", "webhook-command-lookup-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(tmp)
++
++	workingDir := filepath.Join(tmp, "working")
++	pathDir := filepath.Join(tmp, "path")
++	if err := os.MkdirAll(workingDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(pathDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	writeCommand := func(path, output string) {
++		t.Helper()
++		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := ioutil.WriteFile(path, []byte("#!/bin/sh\necho "+output+"\n"), 0755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	writeCommand(filepath.Join(workingDir, "probe"), "working-directory")
++	writeCommand(filepath.Join(pathDir, "probe"), "path-entry")
++
++	absoluteCommand := filepath.Join(tmp, "absolute-command-that-is-not-present")
++	// This executable would be considered only by a fallback that prefixes the
++	// working directory to the configured absolute command.
++	writeCommand(filepath.Join(workingDir, absoluteCommand), "prefixed-absolute")
++
++	hooks := []hook.Hook{
++		{ID: "relative-lookup", ExecuteCommand: "probe", CommandWorkingDirectory: workingDir, CaptureCommandOutput: true, HTTPMethods: []string{"POST"}},
++		{ID: "absolute-lookup", ExecuteCommand: absoluteCommand, CommandWorkingDirectory: workingDir, CaptureCommandOutput: true, HTTPMethods: []string{"POST"}},
++	}
++	config, err := json.Marshal(hooks)
++	if err != nil {
++		t.Fatal(err)
++	}
++	configPath := filepath.Join(tmp, "hooks.json")
++	if err := ioutil.WriteFile(configPath, config, 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	webhook, cleanupWebhook := buildWebhook(t)
++	defer cleanupWebhook()
++	ip, port := serverAddress(t)
++	logs := &buffer{}
++	cmd := exec.Command(webhook, fmt.Sprintf("-hooks=%s", configPath), fmt.Sprintf("-ip=%s", ip), fmt.Sprintf("-port=%s", port), "-debug")
++	cmd.Stderr = logs
++	cmd.Env = webhookEnv()
++	foundPath := false
++	for i, value := range cmd.Env {
++		if strings.HasPrefix(value, "PATH=") {
++			cmd.Env[i] = "PATH=" + pathDir
++			foundPath = true
++			break
++		}
++	}
++	if !foundPath {
++		cmd.Env = append(cmd.Env, "PATH="+pathDir)
++	}
++	if err := cmd.Start(); err != nil {
++		t.Fatalf("failed to start webhook: %s", err)
++	}
++	defer killAndWait(cmd)
++	waitForServerReady(t, ip, port)
++
++	request := func(id string) (int, string) {
++		t.Helper()
++		res, err := http.Post(fmt.Sprintf("http://%s:%s/hooks/%s", ip, port, id), "application/json", strings.NewReader("{}"))
++		if err != nil {
++			t.Fatalf("POST hook %q: %v", id, err)
++		}
++		defer res.Body.Close()
++		body, err := ioutil.ReadAll(res.Body)
++		if err != nil {
++			t.Fatalf("read hook %q response: %v", id, err)
++		}
++		return res.StatusCode, string(body)
++	}
++
++	status, body := request("relative-lookup")
++	if status != http.StatusOK || !strings.Contains(body, "working-directory") || strings.Contains(body, "path-entry") {
++		t.Errorf("relative command should come from its configured working directory; got status %d and body %q", status, body)
++	}
++
++	status, _ = request("absolute-lookup")
++	if status == http.StatusOK {
++		t.Errorf("an absolute command that does not exist should not be found by prefixing its working directory; logs: %s", logs)
++	}
++}
++
+ func TestWebhook(t *testing.T) {
+ 	hookecho, cleanupHookecho := buildHookecho(t)
+ 	defer cleanupHookecho()
+@@ -143,6 +242,15 @@ func TestWebhook(t *testing.T) {
+ 				if !matched {
+ 					t.Errorf("failed log match for %q (id: %s):\nmatch pattern: %q\ngot:\n%s", tt.desc, tt.id, tt.logMatch, b)
+ 				}
++				if tt.id == "warn-on-space" {
++					_, lookupErr := exec.LookPath(hookecho + " foo")
++					if lookupErr == nil {
++						t.Fatal("expected command lookup to fail")
++					}
++					if !strings.Contains(b.String(), lookupErr.Error()) {
++						t.Errorf("log should include the underlying command lookup error %q; got:\n%s", lookupErr, b)
++					}
++				}
+ 			})
+ 		}
+ 	}
+@@ -720,7 +828,7 @@ env: HOOK_head_commit.timestamp=2013-03-12T08:14:29-07:00
+ 
+ 	// Check logs
+ 	{"static params should pass", "static-params-ok", nil, "POST", nil, "application/json", `{}`, http.StatusOK, "arg: passed\n", `(?s)command output: arg: passed`},
+-	{"command with space logs warning", "warn-on-space", nil, "POST", nil, "application/json", `{}`, http.StatusInternalServerError, "Error occurred while executing the hook's command. Please check your logs for more details.", `(?s)error locating command.*use 'pass[-]arguments[-]to[-]command' to specify args`},
++	{"command with space logs warning", "warn-on-space", nil, "POST", nil, "application/json", `{}`, http.StatusInternalServerError, "Error occurred while executing the hook's command. Please check your logs for more details.", `(?s).*(no such file|not found|cannot find).*use 'pass[-]arguments[-]to[-]command' to specify args`},
+ 	{"unsupported content type error", "github", nil, "POST", map[string]string{"Content-Type": "nonexistent/format"}, "application/json", `{}`, http.StatusBadRequest, `Hook rules were not satisfied.`, `(?s)error parsing body payload due to unsupported content type header:`},
+ }
+ 

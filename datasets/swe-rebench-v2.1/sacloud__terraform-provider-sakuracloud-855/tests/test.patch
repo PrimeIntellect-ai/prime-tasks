@@ -1,0 +1,253 @@
+diff --git a/sakuracloud/resource_sakuracloud_server_test.go b/sakuracloud/resource_sakuracloud_server_test.go
+index eaa5be7a..e3d659f4 100644
+--- a/sakuracloud/resource_sakuracloud_server_test.go
++++ b/sakuracloud/resource_sakuracloud_server_test.go
+@@ -21,8 +21,13 @@ import (
+ 	"testing"
+ 
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
++	internetBuilder "github.com/sacloud/libsacloud/v2/helper/builder/internet"
++	"github.com/sacloud/libsacloud/v2/helper/power"
++	"github.com/sacloud/libsacloud/v2/pkg/size"
+ 	"github.com/sacloud/libsacloud/v2/sacloud"
++	"github.com/sacloud/libsacloud/v2/sacloud/testutil"
+ 	"github.com/sacloud/libsacloud/v2/sacloud/types"
+ )
+ 
+@@ -155,6 +160,75 @@ func TestAccSakuraCloudServer_planChange(t *testing.T) {
+ 	})
+ }
+ 
++func TestAccSakuraCloudServer_planChangeByOutsideOfTerraform(t *testing.T) {
++	resourceName := "sakuracloud_server.foobar"
++	rand := randomName()
++	password := randomPassword()
++
++	var step1, step2, step3 sacloud.Server
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testCheckSakuraCloudServerDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config:             buildConfigWithArgs(testAccSakuraCloudServer_standardPlan, rand, password),
++				ExpectNonEmptyPlan: true, // Terraform外での変更を擬似的にStepの中で行うためtrueにしておく
++				Check: resource.ComposeTestCheckFunc(
++					testCheckSakuraCloudServerExists(resourceName, &step1),
++					resource.TestCheckResourceAttr(resourceName, "name", rand),
++					resource.TestCheckResourceAttr(resourceName, "core", "2"),
++					resource.TestCheckResourceAttr(resourceName, "memory", "4"),
++					resource.TestCheckResourceAttr(resourceName, "commitment", "standard"),
++					func(*terraform.State) error {
++						client := testAccProvider.Meta().(*APIClient)
++						ctx := context.Background()
++						// shutdown
++						if err := power.ShutdownServer(ctx, sacloud.NewServerOp(client), step1.Zone.Name, step1.ID, true); err != nil {
++							return err
++						}
++
++						serverOp := sacloud.NewServerOp(client)
++						tags := append(types.Tags{}, step1.Tags...)
++						tags = append(tags, fmt.Sprintf("@previous-id=%s", step1.ID))
++						if _, err := serverOp.Update(ctx, step1.Zone.Name, step1.ID, &sacloud.ServerUpdateRequest{
++							Name: step1.Name, Description: step1.Description, Tags: tags,
++							IconID: step1.IconID, PrivateHostID: step1.PrivateHostID, InterfaceDriver: step1.InterfaceDriver,
++						}); err != nil {
++							return err
++						}
++						updated, err := serverOp.ChangePlan(ctx, step1.Zone.Name, step1.ID, &sacloud.ServerChangePlanRequest{
++							CPU: 1, MemoryMB: size.GiB, ServerPlanCommitment: types.Commitments.Standard,
++							ServerPlanGeneration: types.PlanGenerations.Default,
++						})
++						if err != nil {
++							return err
++						}
++						step2 = *updated
++						return nil
++					},
++				),
++			},
++			{
++				Config: buildConfigWithArgs(testAccSakuraCloudServer_standardPlan, rand, password),
++				Check: resource.ComposeTestCheckFunc(
++					testCheckSakuraCloudServerExists(resourceName, &step3),
++					resource.TestCheckResourceAttr(resourceName, "name", rand),
++					resource.TestCheckResourceAttr(resourceName, "core", "2"),
++					resource.TestCheckResourceAttr(resourceName, "memory", "4"),
++					resource.TestCheckResourceAttr(resourceName, "commitment", "standard"),
++					func(*terraform.State) error {
++						if step1.ID == step2.ID || step1.ID == step3.ID || step2.ID == step3.ID {
++							return fmt.Errorf("server plan changed, but id is not updated")
++						}
++						return nil
++					},
++				),
++			},
++		},
++	})
++}
++
+ func TestAccSakuraCloudServer_withoutShutdown(t *testing.T) {
+ 	resourceName := "sakuracloud_server.foobar"
+ 	rand := randomName()
+@@ -874,3 +948,158 @@ resource "sakuracloud_server" "foobar" {
+   }
+ }
+ `
++
++func TestSakuraCloudServerReadTracksPreviousID(t *testing.T) {
++	ctx := context.Background()
++	caller := testutil.SingletonAPICaller()
++	zone := testutil.TestZone()
++	op := sacloud.NewServerOp(caller)
++	server, err := op.Create(ctx, zone, &sacloud.ServerCreateRequest{
++		Name: testutil.ResourceName("server-previous-id-provider-test"), CPU: 1, MemoryMB: size.GiB,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	previousTag := fmt.Sprintf("@previous-id=%s", server.ID)
++	if _, err := op.Update(ctx, zone, server.ID, &sacloud.ServerUpdateRequest{Name: server.Name, Tags: types.Tags{previousTag}}); err != nil {
++		t.Fatal(err)
++	}
++	updated, err := op.ChangePlan(ctx, zone, server.ID, &sacloud.ServerChangePlanRequest{
++		CPU: 1, MemoryMB: 2 * size.GiB, ServerPlanCommitment: types.Commitments.Standard,
++		ServerPlanGeneration: types.PlanGenerations.Default,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertHasPreviousIDTag(t, updated.Tags, previousTag)
++
++	provider, meta := configuredFakeProvider(t, zone)
++	serverResource := provider.ResourcesMap["sakuracloud_server"]
++	d := schema.TestResourceDataRaw(t, serverResource.Schema, map[string]interface{}{"zone": zone})
++	d.SetId(server.ID.String())
++	diags := serverResource.ReadContext(ctx, d, meta)
++	if diags.HasError() {
++		t.Fatalf("reading server by its previous ID failed: %v", diags)
++	}
++	if got, want := d.Id(), updated.ID.String(); got != want {
++		t.Fatalf("Terraform ID after fallback = %q, want current ID %q", got, want)
++	}
++	if err := op.Delete(ctx, zone, updated.ID); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestSakuraCloudRouterReadTracksPreviousID(t *testing.T) {
++	ctx := context.Background()
++	caller := testutil.SingletonAPICaller()
++	zone := testutil.TestZone()
++	op := sacloud.NewInternetOp(caller)
++	builder := &internetBuilder.Builder{
++		Name: testutil.ResourceName("router-previous-id-provider-test"), NetworkMaskLen: 28,
++		BandWidthMbps: 100, Client: internetBuilder.NewAPIClient(caller),
++	}
++	router, err := builder.Build(ctx, zone)
++	if err != nil {
++		t.Fatal(err)
++	}
++	previousTag := fmt.Sprintf("@previous-id=%s", router.ID)
++	if err := op.Delete(ctx, zone, router.ID); err != nil {
++		t.Fatal(err)
++	}
++	builder.Name = testutil.ResourceName("router-replacement-previous-id-test")
++	builder.Tags = types.Tags{previousTag}
++	updated, err := builder.Build(ctx, zone)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if updated.ID == router.ID {
++		t.Fatalf("replacement router retained old ID %s", router.ID)
++	}
++	assertHasPreviousIDTag(t, updated.Tags, previousTag)
++
++	provider, meta := configuredFakeProvider(t, zone)
++	routerResource := provider.ResourcesMap["sakuracloud_internet"]
++	d := schema.TestResourceDataRaw(t, routerResource.Schema, map[string]interface{}{"zone": zone})
++	d.SetId(router.ID.String())
++	diags := routerResource.ReadContext(ctx, d, meta)
++	if diags.HasError() {
++		t.Fatalf("reading router by its previous ID failed: %v", diags)
++	}
++	if got, want := d.Id(), updated.ID.String(); got != want {
++		t.Fatalf("Terraform ID after fallback = %q, want current ID %q", got, want)
++	}
++	if err := op.Delete(ctx, zone, updated.ID); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestSakuraCloudELBReadTracksPreviousID(t *testing.T) {
++	ctx := context.Background()
++	caller := testutil.SingletonAPICaller()
++	zone := testutil.TestZone()
++	op := sacloud.NewProxyLBOp(caller)
++	elb, err := op.Create(ctx, &sacloud.ProxyLBCreateRequest{
++		Plan: types.ProxyLBPlans.CPS100, Region: types.ProxyLBRegions.IS1,
++		Name:        testutil.ResourceName("elb-previous-id-provider-test"),
++		HealthCheck: &sacloud.ProxyLBHealthCheck{Protocol: types.ProxyLBProtocols.TCP, DelayLoop: 10},
++		Timeout:     &sacloud.ProxyLBTimeout{InactiveSec: 10},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	previousTag := fmt.Sprintf("@previous-id=%s", elb.ID)
++	if err := op.Delete(ctx, elb.ID); err != nil {
++		t.Fatal(err)
++	}
++	updated, err := op.Create(ctx, &sacloud.ProxyLBCreateRequest{
++		Plan: types.ProxyLBPlans.CPS500, Region: types.ProxyLBRegions.IS1,
++		Name: testutil.ResourceName("elb-replacement-previous-id-test"), Tags: types.Tags{previousTag},
++		HealthCheck: &sacloud.ProxyLBHealthCheck{Protocol: types.ProxyLBProtocols.TCP, DelayLoop: 10},
++		Timeout:     &sacloud.ProxyLBTimeout{InactiveSec: 10},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if updated.ID == elb.ID {
++		t.Fatalf("replacement ELB retained old ID %s", elb.ID)
++	}
++	assertHasPreviousIDTag(t, updated.Tags, previousTag)
++
++	provider, meta := configuredFakeProvider(t, zone)
++	elbResource := provider.ResourcesMap["sakuracloud_proxylb"]
++	d := schema.TestResourceDataRaw(t, elbResource.Schema, map[string]interface{}{"zone": zone})
++	d.SetId(elb.ID.String())
++	diags := elbResource.ReadContext(ctx, d, meta)
++	if diags.HasError() {
++		t.Fatalf("reading ELB by its previous ID failed: %v", diags)
++	}
++	if got, want := d.Id(), updated.ID.String(); got != want {
++		t.Fatalf("Terraform ID after fallback = %q, want current ID %q", got, want)
++	}
++	if err := op.Delete(ctx, updated.ID); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func assertHasPreviousIDTag(t *testing.T, tags types.Tags, want string) {
++	t.Helper()
++	for _, tag := range tags {
++		if tag == want {
++			return
++		}
++	}
++	t.Errorf("resource tags %v do not contain previous-ID metadata %q", tags, want)
++}
++
++func configuredFakeProvider(t *testing.T, zone string) (*schema.Provider, interface{}) {
++	t.Helper()
++	provider := Provider()
++	providerData := schema.TestResourceDataRaw(t, provider.Schema, map[string]interface{}{
++		"token": "dummy", "secret": "dummy", "zone": zone, "fake_mode": "1",
++	})
++	meta, diags := provider.ConfigureContextFunc(context.Background(), providerData)
++	if diags.HasError() {
++		t.Fatalf("configuring fake provider failed: %v", diags)
++	}
++	return provider, meta
++}

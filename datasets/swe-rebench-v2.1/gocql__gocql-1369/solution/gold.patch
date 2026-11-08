@@ -1,0 +1,430 @@
+diff --git a/.travis.yml b/.travis.yml
+index facaa79..5ccd938 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -34,6 +34,8 @@ go:
+   - 1.15.x
+   - 1.16.x
+ 
++go_import_path: github.com/gocql/gocql
++
+ install:
+   - ./install_test_deps.sh $TRAVIS_REPO_SLUG
+   - cd ../..
+diff --git a/conn.go b/conn.go
+index 60ad7b2..bc7ed44 100644
+--- a/conn.go
++++ b/conn.go
+@@ -1395,10 +1395,11 @@ func (c *Conn) executeBatch(ctx context.Context, batch *Batch) *Iter {
+ }
+ 
+ func (c *Conn) query(ctx context.Context, statement string, values ...interface{}) (iter *Iter) {
+-	q := c.session.Query(statement, values...).Consistency(One)
+-	q.trace = nil
++	q := c.session.Query(statement, values...).Consistency(One).Trace(nil)
+ 	q.skipPrepare = true
+ 	q.disableSkipMetadata = true
++	// we want to keep the query on this connection
++	q.conn = c
+ 	return c.executeQuery(ctx, q)
+ }
+ 
+diff --git a/connectionpool.go b/connectionpool.go
+index 9c80319..75c28bc 100644
+--- a/connectionpool.go
++++ b/connectionpool.go
+@@ -437,6 +437,8 @@ func (pool *hostConnPool) fill() {
+ 			}
+ 			return
+ 		}
++		// notify the session that this node is connected
++		go pool.session.handleNodeUp(pool.host.ConnectAddress(), pool.port)
+ 
+ 		// filled one
+ 		fillCount--
+@@ -448,6 +450,11 @@ func (pool *hostConnPool) fill() {
+ 
+ 		// mark the end of filling
+ 		pool.fillingStopped(err != nil)
++
++		if err == nil && startCount > 0 {
++			// notify the session that this node is connected again
++			go pool.session.handleNodeUp(pool.host.ConnectAddress(), pool.port)
++		}
+ 	}()
+ }
+ 
+diff --git a/control.go b/control.go
+index de9f414..9ab9c1c 100644
+--- a/control.go
++++ b/control.go
+@@ -285,8 +285,6 @@ func (c *controlConn) setupConn(conn *Conn) error {
+ 	}
+ 
+ 	c.conn.Store(ch)
+-	c.session.handleNodeUp(host.ConnectAddress(), host.Port(), false)
+-
+ 	return nil
+ }
+ 
+@@ -452,6 +450,8 @@ func (c *controlConn) query(statement string, values ...interface{}) (iter *Iter
+ 
+ 	for {
+ 		iter = c.withConn(func(conn *Conn) *Iter {
++			// we want to keep the query on the control connection
++			q.conn = conn
+ 			return conn.executeQuery(context.TODO(), q)
+ 		})
+ 
+diff --git a/events.go b/events.go
+index f7f727b..c633825 100644
+--- a/events.go
++++ b/events.go
+@@ -164,55 +164,43 @@ func (s *Session) handleNodeEvent(frames []frame) {
+ 
+ 		switch f.change {
+ 		case "NEW_NODE":
+-			s.handleNewNode(f.host, f.port, true)
++			s.handleNewNode(f.host, f.port)
+ 		case "REMOVED_NODE":
+ 			s.handleRemovedNode(f.host, f.port)
+ 		case "MOVED_NODE":
+ 		// java-driver handles this, not mentioned in the spec
+ 		// TODO(zariel): refresh token map
+ 		case "UP":
+-			s.handleNodeUp(f.host, f.port, true)
++			s.handleNodeUp(f.host, f.port)
+ 		case "DOWN":
+ 			s.handleNodeDown(f.host, f.port)
+ 		}
+ 	}
+ }
+ 
+-func (s *Session) addNewNode(host *HostInfo) {
+-	if s.cfg.filterHost(host) {
+-		return
+-	}
+-
+-	host.setState(NodeUp)
+-	s.pool.addHost(host)
+-	s.policy.AddHost(host)
+-}
+-
+-func (s *Session) handleNewNode(ip net.IP, port int, waitForBinary bool) {
+-	if gocqlDebug {
+-		Logger.Printf("gocql: Session.handleNewNode: %s:%d\n", ip.String(), port)
+-	}
+-
+-	ip, port = s.cfg.translateAddressPort(ip, port)
+-
++func (s *Session) addNewNode(ip net.IP, port int) {
+ 	// Get host info and apply any filters to the host
+ 	hostInfo, err := s.hostSource.getHostInfo(ip, port)
+ 	if err != nil {
+ 		Logger.Printf("gocql: events: unable to fetch host info for (%s:%d): %v\n", ip, port, err)
+ 		return
+ 	} else if hostInfo == nil {
+-		// If hostInfo is nil, this host was filtered out by cfg.HostFilter
++		// ignore if it's null because we couldn't find it
+ 		return
+ 	}
+ 
+-	if t := hostInfo.Version().nodeUpDelay(); t > 0 && waitForBinary {
++	if t := hostInfo.Version().nodeUpDelay(); t > 0 {
+ 		time.Sleep(t)
+ 	}
+ 
+ 	// should this handle token moving?
+ 	hostInfo = s.ring.addOrUpdate(hostInfo)
+ 
+-	s.addNewNode(hostInfo)
++	if !s.cfg.filterHost(hostInfo) {
++		// we let the pool call handleNodeUp to change the host state
++		s.pool.addHost(hostInfo)
++		s.policy.AddHost(hostInfo)
++	}
+ 
+ 	if s.control != nil && !s.cfg.IgnorePeerAddr {
+ 		// TODO(zariel): debounce ring refresh
+@@ -220,6 +208,22 @@ func (s *Session) handleNewNode(ip net.IP, port int, waitForBinary bool) {
+ 	}
+ }
+ 
++func (s *Session) handleNewNode(ip net.IP, port int) {
++	if gocqlDebug {
++		Logger.Printf("gocql: Session.handleNewNode: %s:%d\n", ip.String(), port)
++	}
++
++	ip, port = s.cfg.translateAddressPort(ip, port)
++
++	// if we already have the host and it's already up, then do nothing
++	host := s.ring.getHost(ip)
++	if host != nil && host.IsUp() {
++		return
++	}
++
++	s.addNewNode(ip, port)
++}
++
+ func (s *Session) handleRemovedNode(ip net.IP, port int) {
+ 	if gocqlDebug {
+ 		Logger.Printf("gocql: Session.handleRemovedNode: %s:%d\n", ip.String(), port)
+@@ -232,45 +236,37 @@ func (s *Session) handleRemovedNode(ip net.IP, port int) {
+ 	if host == nil {
+ 		host = &HostInfo{connectAddress: ip, port: port}
+ 	}
+-
+-	if s.cfg.HostFilter != nil && !s.cfg.HostFilter.Accept(host) {
+-		return
+-	}
++	s.ring.removeHost(ip)
+ 
+ 	host.setState(NodeDown)
+-	s.policy.RemoveHost(host)
+-	s.pool.removeHost(ip)
+-	s.ring.removeHost(ip)
++	if !s.cfg.filterHost(host) {
++		s.policy.RemoveHost(host)
++		s.pool.removeHost(ip)
++	}
+ 
+ 	if !s.cfg.IgnorePeerAddr {
+ 		s.hostSource.refreshRing()
+ 	}
+ }
+ 
+-func (s *Session) handleNodeUp(eventIp net.IP, eventPort int, waitForBinary bool) {
++func (s *Session) handleNodeUp(eventIp net.IP, eventPort int) {
+ 	if gocqlDebug {
+ 		Logger.Printf("gocql: Session.handleNodeUp: %s:%d\n", eventIp.String(), eventPort)
+ 	}
+ 
+-	ip, _ := s.cfg.translateAddressPort(eventIp, eventPort)
++	ip, port := s.cfg.translateAddressPort(eventIp, eventPort)
+ 
+ 	host := s.ring.getHost(ip)
+ 	if host == nil {
+-		// TODO(zariel): avoid the need to translate twice in this
+-		// case
+-		s.handleNewNode(eventIp, eventPort, waitForBinary)
++		s.addNewNode(ip, port)
+ 		return
+ 	}
+ 
+-	if s.cfg.HostFilter != nil && !s.cfg.HostFilter.Accept(host) {
+-		return
+-	}
++	host.setState(NodeUp)
+ 
+-	if t := host.Version().nodeUpDelay(); t > 0 && waitForBinary {
+-		time.Sleep(t)
++	if !s.cfg.filterHost(host) {
++		s.policy.HostUp(host)
+ 	}
+-
+-	s.addNewNode(host)
+ }
+ 
+ func (s *Session) handleNodeDown(ip net.IP, port int) {
+@@ -283,11 +279,11 @@ func (s *Session) handleNodeDown(ip net.IP, port int) {
+ 		host = &HostInfo{connectAddress: ip, port: port}
+ 	}
+ 
+-	if s.cfg.HostFilter != nil && !s.cfg.HostFilter.Accept(host) {
++	host.setState(NodeDown)
++	if s.cfg.filterHost(host) {
+ 		return
+ 	}
+ 
+-	host.setState(NodeDown)
+ 	s.policy.HostDown(host)
+ 	s.pool.hostDown(ip)
+ }
+diff --git a/host_source.go b/host_source.go
+index 8a7ecdd..f6716ca 100644
+--- a/host_source.go
++++ b/host_source.go
+@@ -640,7 +640,7 @@ func (r *ringDescriber) refreshRing() error {
+ 
+ 	// TODO: move this to session
+ 	for _, h := range hosts {
+-		if filter := r.session.cfg.HostFilter; filter != nil && !filter.Accept(h) {
++		if r.session.cfg.filterHost(h) {
+ 			continue
+ 		}
+ 
+diff --git a/policies.go b/policies.go
+index 8b47c21..06e1c13 100644
+--- a/policies.go
++++ b/policies.go
+@@ -853,6 +853,51 @@ func (d *dcAwareRR) Pick(q ExecutableQuery) NextHost {
+ 	return roundRobbin(int(nextStartOffset), d.localHosts.get(), d.remoteHosts.get())
+ }
+ 
++// ReadyPolicy defines a policy for when a HostSelectionPolicy can be used. After
++// each host connects during session initialization, the Ready method will be
++// called. If you only need a single Host to be up you can wrap a
++// HostSelectionPolicy policy with SingleHostReadyPolicy.
++type ReadyPolicy interface {
++	Ready() bool
++}
++
++// SingleHostReadyPolicy wraps a HostSelectionPolicy and returns Ready after a
++// single host has been added via HostUp
++func SingleHostReadyPolicy(p HostSelectionPolicy) *singleHostReadyPolicy {
++	return &singleHostReadyPolicy{
++		HostSelectionPolicy: p,
++	}
++}
++
++type singleHostReadyPolicy struct {
++	HostSelectionPolicy
++	ready    bool
++	readyMux sync.Mutex
++}
++
++func (s *singleHostReadyPolicy) HostUp(host *HostInfo) {
++	s.HostSelectionPolicy.HostUp(host)
++
++	s.readyMux.Lock()
++	s.ready = true
++	s.readyMux.Unlock()
++}
++
++func (s *singleHostReadyPolicy) Ready() bool {
++	s.readyMux.Lock()
++	ready := s.ready
++	s.readyMux.Unlock()
++	if !ready {
++		return false
++	}
++
++	// in case the wrapped policy is also a ReadyPolicy, defer to that
++	if rdy, ok := s.HostSelectionPolicy.(ReadyPolicy); ok {
++		return rdy.Ready()
++	}
++	return true
++}
++
+ // ConvictionPolicy interface is used by gocql to determine if a host should be
+ // marked as DOWN based on the error and host info
+ type ConvictionPolicy interface {
+diff --git a/session.go b/session.go
+index 5b4aeeb..46b15ae 100644
+--- a/session.go
++++ b/session.go
+@@ -226,26 +226,44 @@ func (s *Session) init() error {
+ 	}
+ 
+ 	hosts = hosts[:0]
+-
+-	var wg sync.WaitGroup
++	// each host will increment left and decrement it after connecting and once
++	// there's none left, we'll close hostCh
++	var left int64
++	// we will receive up to len(hostMap) of messages so create a buffer so we
++	// don't end up stuck in a goroutine if we stopped listening
++	connectedCh := make(chan struct{}, len(hostMap))
++	// we add one here because we don't want to end up closing hostCh until we're
++	// done looping and the decerement code might be reached before we've looped
++	// again
++	atomic.AddInt64(&left, 1)
+ 	for _, host := range hostMap {
+ 		host := s.ring.addOrUpdate(host)
+ 		if s.cfg.filterHost(host) {
+ 			continue
+ 		}
+ 
+-		host.setState(NodeUp)
+-		hosts = append(hosts, host)
+-
+-		wg.Add(1)
++		atomic.AddInt64(&left, 1)
+ 		go func() {
+-			defer wg.Done()
+ 			s.pool.addHost(host)
++			connectedCh <- struct{}{}
++
++			// if there are no hosts left, then close the hostCh to unblock the loop
++			// below if its still waiting
++			if atomic.AddInt64(&left, -1) == 0 {
++				close(connectedCh)
++			}
+ 		}()
+-	}
+ 
+-	wg.Wait()
++		hosts = append(hosts, host)
++	}
++	// once we're done looping we subtract the one we initially added and check
++	// to see if we should close
++	if atomic.AddInt64(&left, -1) == 0 {
++		close(connectedCh)
++	}
+ 
++	// before waiting for them to connect, add them all to the policy so we can
++	// utilize efficiencies by calling AddHosts if the policy supports it
+ 	type bulkAddHosts interface {
+ 		AddHosts([]*HostInfo)
+ 	}
+@@ -257,6 +275,15 @@ func (s *Session) init() error {
+ 		}
+ 	}
+ 
++	readyPolicy, _ := s.policy.(ReadyPolicy)
++	// now loop over connectedCh until it's closed (meaning we've connected to all)
++	// or until the policy says we're ready
++	for range connectedCh {
++		if readyPolicy != nil && readyPolicy.Ready() {
++			break
++		}
++	}
++
+ 	// TODO(zariel): we probably dont need this any more as we verify that we
+ 	// can connect to one of the endpoints supplied by using the control conn.
+ 	// See if there are any connections in the pool
+@@ -327,7 +354,8 @@ func (s *Session) reconnectDownedHosts(intv time.Duration) {
+ 				if h.IsUp() {
+ 					continue
+ 				}
+-				s.handleNodeUp(h.ConnectAddress(), h.Port(), true)
++				// we let the pool call handleNodeUp to change the host state
++				s.pool.addHost(h)
+ 			}
+ 		case <-s.ctx.Done():
+ 			return
+@@ -813,6 +841,7 @@ type Query struct {
+ 	trace                 Tracer
+ 	observer              QueryObserver
+ 	session               *Session
++	conn                  *Conn
+ 	rt                    RetryPolicy
+ 	spec                  SpeculativeExecutionPolicy
+ 	binding               func(q *QueryInfo) ([]interface{}, error)
+@@ -1176,6 +1205,11 @@ func (q *Query) Iter() *Iter {
+ 	if isUseStatement(q.stmt) {
+ 		return &Iter{err: ErrUseStmt}
+ 	}
++	// if the query was specifically run on a connection then re-use that
++	// connection when fetching the next results
++	if q.conn != nil {
++		return q.conn.executeQuery(q.Context(), q)
++	}
+ 	return q.session.executeQuery(q)
+ }
+ 
+@@ -1551,7 +1585,13 @@ func (n *nextIter) fetchAsync() {
+ 
+ func (n *nextIter) fetch() *Iter {
+ 	n.once.Do(func() {
+-		n.next = n.qry.session.executeQuery(n.qry)
++		// if the query was specifically run on a connection then re-use that
++		// connection when fetching the next results
++		if n.qry.conn != nil {
++			n.next = n.qry.conn.executeQuery(n.qry.Context(), n.qry)
++		} else {
++			n.next = n.qry.session.executeQuery(n.qry)
++		}
+ 	})
+ 	return n.next
+ }

@@ -1,0 +1,336 @@
+diff --git a/internal/certs/certs.go b/internal/certs/certs.go
+index 26140212..6ab82947 100644
+--- a/internal/certs/certs.go
++++ b/internal/certs/certs.go
+@@ -21,7 +21,6 @@ import (
+ 	"crypto/x509/pkix"
+ 	"encoding/pem"
+ 	"fmt"
+-	"log"
+ 	"math/big"
+ 	"net"
+ 	"strings"
+@@ -57,31 +56,43 @@ type CertificateAuthority struct {
+ 
+ type CertificateData map[string][]byte
+ 
+-func decodeDataElement(in []byte, name string) []byte {
++func decodeDataElement(in []byte, name string) ([]byte, error) {
+ 	block, _ := pem.Decode(in)
+ 	if block == nil {
+-		log.Fatal("failed to decode PEM block of type " + name)
++		return nil, fmt.Errorf("failed to read PEM encoded data from %q", name)
+ 	}
+-	return block.Bytes
++	return block.Bytes, nil
+ }
+ 
+-func getCAFromSecret(secret *corev1.Secret) *CertificateAuthority {
++func getCAFromSecret(secret *corev1.Secret) (*CertificateAuthority, error) {
+ 	if secret == nil || secret.Data == nil {
+-		return nil
++		return nil, nil
++	}
++
++	certBytes, err := decodeDataElement(secret.Data["tls.crt"], "tls.crt")
++	if err != nil {
++		return nil, err
++	}
++
++	cert, err := x509.ParseCertificate(certBytes)
++	if err != nil {
++		return nil, err
+ 	}
+-	cert, err := x509.ParseCertificate(decodeDataElement(secret.Data["tls.crt"], "certificate"))
++
++	privateKeyBytes, err := decodeDataElement(secret.Data["tls.key"], "tls.key")
+ 	if err != nil {
+-		log.Fatal("failed to get CA certificate from secret")
++		return nil, err
+ 	}
+-	key, err := x509.ParsePKCS1PrivateKey(decodeDataElement(secret.Data["tls.key"], "private key"))
++	key, err := x509.ParsePKCS1PrivateKey(privateKeyBytes)
+ 	if err != nil {
+-		log.Fatal("failed to get CA private key from secret", err)
++		return nil, fmt.Errorf("failed to get CA private key from secret %s", err)
+ 	}
++
+ 	return &CertificateAuthority{
+ 		Certificate: cert,
+ 		Key:         key,
+ 		CrtData:     secret.Data["tls.crt"],
+-	}
++	}, nil
+ }
+ 
+ // GenerateSecret generates a kubernetes secret.
+@@ -90,12 +101,17 @@ func getCAFromSecret(secret *corev1.Secret) *CertificateAuthority {
+ // hosts are the host names in the x509 certificate. Comma separated if more than one hostname
+ // expiration is when the secret expires, if zero is passed in, the expiration is set to 5 years from now
+ // ca is the certificate authority, if nil a ca cert will be created.
+-func GenerateSecret(name string, subject string, hosts string, expiration time.Duration, ca *corev1.Secret) corev1.Secret {
+-	caCert := getCAFromSecret(ca)
++func GenerateSecret(name string, subject string, hosts string, expiration time.Duration, ca *corev1.Secret) (*corev1.Secret, error) {
++	caCert, err := getCAFromSecret(ca)
++
++	if err != nil {
++		return nil, fmt.Errorf("error reading CA Certificate from Secret %q: %s", ca.Name, err)
++	}
+ 
+ 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+ 	if err != nil {
+-		log.Fatalf("failed to generate private key: %s", err)
++		return nil, fmt.Errorf("failed to generate private key: %v", err)
++
+ 	}
+ 
+ 	notBefore := time.Now()
+@@ -107,7 +123,7 @@ func GenerateSecret(name string, subject string, hosts string, expiration time.D
+ 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+ 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+ 	if err != nil {
+-		log.Fatalf("failed to generate serial number: %s", err)
++		return nil, err
+ 	}
+ 
+ 	template := x509.Certificate{
+@@ -147,7 +163,7 @@ func GenerateSecret(name string, subject string, hosts string, expiration time.D
+ 
+ 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, parent, publicKey(priv), cakey)
+ 	if err != nil {
+-		log.Fatalf("Failed to create certificate: %s", err)
++		return nil, err
+ 	}
+ 
+ 	secret := corev1.Secret{
+@@ -173,7 +189,7 @@ func GenerateSecret(name string, subject string, hosts string, expiration time.D
+ 		secret.Data["ca.crt"] = secret.Data["tls.crt"] //self.signed
+ 	}
+ 
+-	return secret
++	return &secret, nil
+ }
+ 
+ func DecodeCertificate(data []byte) (*x509.Certificate, error) {
+diff --git a/internal/kube/certificates/mgr.go b/internal/kube/certificates/mgr.go
+index 503ebe43..9d0d046b 100644
+--- a/internal/kube/certificates/mgr.go
++++ b/internal/kube/certificates/mgr.go
+@@ -312,9 +312,13 @@ func (m *CertificateManagerImpl) updateSecret(key string, certificate *skupperv2
+ }
+ 
+ func (m *CertificateManagerImpl) generateSecret(certificate *skupperv2alpha1.Certificate) (*corev1.Secret, error) {
+-	var secret corev1.Secret
++	var secret *corev1.Secret
++	var err error
+ 	if certificate.Spec.Signing {
+-		secret = certs.GenerateSecret(certificate.Name, certificate.Spec.Subject, "", 0, nil)
++		secret, err = certs.GenerateSecret(certificate.Name, certificate.Spec.Subject, "", 0, nil)
++		if err != nil {
++			return secret, err
++		}
+ 	} else {
+ 		expiration := time.Hour * 24 * 365 * 5 // TODO: make this configurable (through controller setting or field on certificate?)
+ 		caKey := fmt.Sprintf("%s/%s", certificate.Namespace, certificate.Spec.Ca)
+@@ -324,10 +328,13 @@ func (m *CertificateManagerImpl) generateSecret(certificate *skupperv2alpha1.Cer
+ 			return nil, fmt.Errorf("CA %q not found", caKey)
+ 		}
+ 		// TODO: handle server and client roles properly
+-		secret = certs.GenerateSecret(certificate.Name, certificate.Spec.Subject, strings.Join(certificate.Spec.Hosts, ","), expiration, ca)
++		secret, err = certs.GenerateSecret(certificate.Name, certificate.Spec.Subject, strings.Join(certificate.Spec.Hosts, ","), expiration, ca)
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 	secret.ObjectMeta.OwnerReferences = ownerReferences(certificate)
+-	return &secret, nil
++	return secret, nil
+ }
+ 
+ func (m *CertificateManagerImpl) createSecret(key string, certificate *skupperv2alpha1.Certificate) error {
+diff --git a/internal/kube/controller/controller.go b/internal/kube/controller/controller.go
+index 6c560601..ce06283b 100644
+--- a/internal/kube/controller/controller.go
++++ b/internal/kube/controller/controller.go
+@@ -414,7 +414,10 @@ func (c *Controller) generateLinkConfig(namespace string, name string, subject s
+ 	if err != nil {
+ 		return err
+ 	}
+-	token := generator.NewCertToken(name, subject)
++	token, err := generator.NewCertToken(name, subject)
++	if err != nil {
++		return err
++	}
+ 	return token.Write(writer)
+ }
+ 
+diff --git a/internal/kube/grants/tokens.go b/internal/kube/grants/tokens.go
+index f003616a..c668b9a5 100644
+--- a/internal/kube/grants/tokens.go
++++ b/internal/kube/grants/tokens.go
+@@ -88,10 +88,13 @@ func (g *TokenGenerator) setValidHostsFromSite(site *skupperv2alpha1.Site) bool
+ 	return true
+ }
+ 
+-func (g *TokenGenerator) NewCertToken(name string, subject string) Token {
+-	cert := certs.GenerateSecret(name, subject, strings.Join(g.hosts, ","), 0, g.ca)
++func (g *TokenGenerator) NewCertToken(name string, subject string) (Token, error) {
++	cert, err := certs.GenerateSecret(name, subject, strings.Join(g.hosts, ","), 0, g.ca)
++	if err != nil {
++		return nil, err
++	}
+ 	token := &CertToken{
+-		tlsCredentials: &cert,
++		tlsCredentials: cert,
+ 	}
+ 	for i, endpoints := range g.endpoints {
+ 		linkName := name
+@@ -113,7 +116,7 @@ func (g *TokenGenerator) NewCertToken(name string, subject string) Token {
+ 		}
+ 		token.links = append(token.links, link)
+ 	}
+-	return token
++	return token, nil
+ }
+ 
+ func (t *CertToken) Write(writer io.Writer) error {
+diff --git a/internal/nonkube/common/fs_config_renderer.go b/internal/nonkube/common/fs_config_renderer.go
+index afaf0448..0d3a425e 100644
+--- a/internal/nonkube/common/fs_config_renderer.go
++++ b/internal/nonkube/common/fs_config_renderer.go
+@@ -282,7 +282,7 @@ func (c *FileSystemConfigurationRenderer) createTokens(siteState *api.SiteState)
+ 		if err != nil {
+ 			return fmt.Errorf("unable to load client secret %s: %v", secretName, err)
+ 		}
+-		routerTokens := api.CreateTokens(*linkAccess, *serverSecret, *secret)
++		routerTokens := api.CreateTokens(*linkAccess, serverSecret, *secret)
+ 		// routerAccess is valid (inter-router and edge endpoints defined)
+ 		if len(routerTokens) > 0 {
+ 			tokens = append(tokens, routerTokens...)
+@@ -371,18 +371,21 @@ func (c *FileSystemConfigurationRenderer) createTlsCertificates(siteState *api.S
+ 		if certificate.Spec.Signing == false {
+ 			continue
+ 		}
+-		secret := certs.GenerateSecret(name, certificate.Spec.Subject, "", 0, nil)
++		secret, err := certs.GenerateSecret(name, certificate.Spec.Subject, "", 0, nil)
++		if err != nil {
++			return err
++		}
+ 
+ 		ignoreExisting := true
+ 		userCaSecret, err := c.loadUserCertAsSecret(siteState, "ca", name)
+ 		if userCaSecret != nil && err == nil {
+ 			// override with user provided CA
+ 			ignoreExisting = false
+-			secret = *userCaSecret
++			secret = userCaSecret
+ 			fmt.Printf("-> User provided CA found: %s\n", name)
+ 		}
+ 		caPath := path.Join(outputPath, string(api.IssuersPath), name)
+-		err = writeSecretFilesIgnore(caPath, &secret, ignoreExisting)
++		err = writeSecretFilesIgnore(caPath, secret, ignoreExisting)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -390,7 +393,7 @@ func (c *FileSystemConfigurationRenderer) createTlsCertificates(siteState *api.S
+ 	// generate all other certificates now
+ 	for name, certificate := range siteState.Certificates {
+ 		var purpose string
+-		var secret corev1.Secret
++		var secret *corev1.Secret
+ 		var caSecret *corev1.Secret
+ 		if certificate.Spec.Ca != "" {
+ 			caSecret, err = c.loadCASecret(siteState, certificate.Spec.Ca)
+@@ -400,25 +403,31 @@ func (c *FileSystemConfigurationRenderer) createTlsCertificates(siteState *api.S
+ 		}
+ 		if certificate.Spec.Client {
+ 			purpose = "client"
+-			secret = certs.GenerateSecret(name, certificate.Spec.Subject, strings.Join(certificate.Spec.Hosts, ","), 0, caSecret)
++			secret, err = certs.GenerateSecret(name, certificate.Spec.Subject, strings.Join(certificate.Spec.Hosts, ","), 0, caSecret)
++			if err != nil {
++				return err
++			}
+ 			// TODO Not sure if connect.json is needed (probably need to get rid of it)
+ 			if connectJson := c.connectJson(siteState); connectJson != nil {
+ 				secret.Data["connect.json"] = []byte(*connectJson)
+ 			}
+ 		} else if certificate.Spec.Server {
+ 			purpose = "server"
+-			secret = certs.GenerateSecret(name, certificate.Spec.Subject, strings.Join(certificate.Spec.Hosts, ","), 0, caSecret)
++			secret, err = certs.GenerateSecret(name, certificate.Spec.Subject, strings.Join(certificate.Spec.Hosts, ","), 0, caSecret)
++			if err != nil {
++				return err
++			}
+ 		} else {
+ 			continue
+ 		}
+ 		userSecret, err := c.loadUserCertAsSecret(siteState, purpose, name)
+ 		if userSecret != nil && err == nil {
+ 			// override with user provided secret
+-			secret = *userSecret
++			secret = userSecret
+ 			fmt.Printf("-> User provided %s certificate found: %s\n", purpose, name)
+ 		}
+ 		certPath := path.Join(outputPath, string(api.CertificatesPath), name)
+-		err = writeSecretFiles(certPath, &secret)
++		err = writeSecretFiles(certPath, secret)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/pkg/nonkube/api/token.go b/pkg/nonkube/api/token.go
+index f6791152..36dd206f 100644
+--- a/pkg/nonkube/api/token.go
++++ b/pkg/nonkube/api/token.go
+@@ -11,7 +11,7 @@ import (
+ 
+ 	"github.com/skupperproject/skupper/internal/utils"
+ 	"github.com/skupperproject/skupper/pkg/apis/skupper/v2alpha1"
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+ 	"k8s.io/client-go/kubernetes/scheme"
+@@ -44,7 +44,7 @@ func (t *Token) Marshal() ([]byte, error) {
+ 	return buffer.Bytes(), nil
+ }
+ 
+-func CreateTokens(routerAccess v2alpha1.RouterAccess, serverSecret v1.Secret, clientSecret v1.Secret) []*Token {
++func CreateTokens(routerAccess v2alpha1.RouterAccess, serverSecret *v1.Secret, clientSecret v1.Secret) []*Token {
+ 	var tokens []*Token
+ 	interRouter := 0
+ 	edge := 0
+@@ -106,19 +106,22 @@ func CreateTokens(routerAccess v2alpha1.RouterAccess, serverSecret v1.Secret, cl
+ 	var hosts []string
+ 	hosts = append(hosts, utils.DefaultStr(routerAccess.Spec.BindHost, "127.0.0.1"))
+ 	// reading SANs from server certificate
+-	serverCertificateData := serverSecret.Data["tls.crt"]
+-	serverCertificateBlk, _ := pem.Decode(serverCertificateData)
+-	if serverCertificateBlk != nil {
+-		serverCertificate, err := x509.ParseCertificate(serverCertificateBlk.Bytes)
+-		if err == nil {
+-			for _, ipAddr := range serverCertificate.IPAddresses {
+-				if ipAddr.String() != "" && !slices.Contains(hosts, ipAddr.String()) {
+-					hosts = append(hosts, ipAddr.String())
++
++	if serverSecret != nil {
++		serverCertificateData := serverSecret.Data["tls.crt"]
++		serverCertificateBlk, _ := pem.Decode(serverCertificateData)
++		if serverCertificateBlk != nil {
++			serverCertificate, err := x509.ParseCertificate(serverCertificateBlk.Bytes)
++			if err == nil {
++				for _, ipAddr := range serverCertificate.IPAddresses {
++					if ipAddr.String() != "" && !slices.Contains(hosts, ipAddr.String()) {
++						hosts = append(hosts, ipAddr.String())
++					}
+ 				}
+-			}
+-			for _, dnsName := range serverCertificate.DNSNames {
+-				if dnsName != "" && !slices.Contains(hosts, dnsName) {
+-					hosts = append(hosts, dnsName)
++				for _, dnsName := range serverCertificate.DNSNames {
++					if dnsName != "" && !slices.Contains(hosts, dnsName) {
++						hosts = append(hosts, dnsName)
++					}
+ 				}
+ 			}
+ 		}

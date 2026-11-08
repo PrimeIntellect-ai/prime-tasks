@@ -1,0 +1,458 @@
+diff --git a/base.go b/base.go
+index 4749c7a..8e501a9 100644
+--- a/base.go
++++ b/base.go
+@@ -391,3 +391,15 @@ func isServiceName(s string) bool {
+ func isNull(msg json.RawMessage) bool {
+ 	return len(msg) == 4 && msg[0] == 'n' && msg[1] == 'u' && msg[2] == 'l' && msg[3] == 'l'
+ }
++
++// filterError filters an *Error value to distinguish context errors from other
++// error types. If err is not a context error, it is returned unchanged.
++func filterError(e *Error) error {
++	switch e.code {
++	case code.Cancelled:
++		return context.Canceled
++	case code.DeadlineExceeded:
++		return context.DeadlineExceeded
++	}
++	return e
++}
+diff --git a/client.go b/client.go
+index d10a5da..780b5b1 100644
+--- a/client.go
++++ b/client.go
+@@ -18,9 +18,11 @@ import (
+ type Client struct {
+ 	done chan struct{} // closed when the reader is done at shutdown time
+ 
+-	log    func(string, ...interface{}) // write debug logs here
+-	enctx  encoder
+-	snote  func(*jmessage) bool
++	log   func(string, ...interface{}) // write debug logs here
++	enctx encoder
++	snote func(*jmessage)
++	scall func(*jmessage) ([]byte, error)
++
+ 	allow1 bool // tolerate v1 replies with no version marker
+ 	allowC bool // send rpc.cancel when a request context ends
+ 
+@@ -40,6 +42,7 @@ func NewClient(ch channel.Channel, opts *ClientOptions) *Client {
+ 		allowC: opts.allowCancel(),
+ 		enctx:  opts.encodeContext(),
+ 		snote:  opts.handleNotification(),
++		scall:  opts.handleCallback(),
+ 
+ 		// Lock-protected fields
+ 		ch:      ch,
+@@ -89,17 +92,38 @@ func (c *Client) accept(ch channel.Receiver) error {
+ 	return nil
+ }
+ 
++// handleRequest handles a callback or notification from the server. The
++// caller must hold c.mu, and this blocks until the handler completes.
++// Precondition: msg is a request or notification, not a response or error.
++func (c *Client) handleRequest(msg *jmessage) {
++	if msg.isNotification() {
++		if c.snote == nil {
++			c.log("Discarding notification: %v", msg)
++		} else {
++			c.snote(msg)
++		}
++	} else if c.scall == nil {
++		c.log("Discarding callback request: %v", msg)
++	} else if bits, err := c.scall(msg); err != nil {
++		c.log("Callback for %v failed: %v", msg, err)
++	} else if err := c.ch.Send(bits); err != nil {
++		c.log("Sending reply for callback %v failed: %v", msg, err)
++	}
++}
++
+ // For each response, find the request pending on its ID and deliver it.  The
+ // caller must hold c.mu.  Unknown response IDs are logged and discarded.  As
+ // we are under the lock, we do not wait for the pending receiver to pick up
+ // the response; we just drop it in their channel.  The channel is buffered so
+ // we don't need to rendezvous.
+ func (c *Client) deliver(rsp *jmessage) {
+-	if id := string(fixID(rsp.ID)); id == "" {
+-		if !c.snote(rsp) {
+-			c.log("Discarding response without ID: %v", rsp)
+-		}
+-	} else if p := c.pending[id]; p == nil {
++	if rsp.isRequestOrNotification() {
++		c.handleRequest(rsp)
++		return
++	}
++
++	id := string(fixID(rsp.ID))
++	if p := c.pending[id]; p == nil {
+ 		c.log("Discarding response for unknown ID %q", id)
+ 	} else if !c.versionOK(rsp.V) {
+ 		delete(c.pending, id)
+@@ -243,9 +267,9 @@ func (c *Client) waitComplete(pctx context.Context, id string, p *Response) {
+ 	}
+ }
+ 
+-// Call initiates a single request and blocks until the response returns.  If
+-// err != nil then rsp == nil, which also means that if rsp != nil then the
+-// request succeeded. Errors from the server have concrete type *jrpc2.Error.
++// Call initiates a single request and blocks until the response returns.
++// A successful call reports a nil error and a non-nil response. Errors from
++// the server have concrete type *jrpc2.Error.
+ //
+ //    rsp, err := c.Call(ctx, method, params)
+ //    if e, ok := err.(*jrpc2.Error); ok {
+@@ -266,14 +290,7 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (*
+ 	}
+ 	rsp[0].wait()
+ 	if err := rsp[0].Error(); err != nil {
+-		switch err.code {
+-		case code.Cancelled:
+-			return nil, context.Canceled
+-		case code.DeadlineExceeded:
+-			return nil, context.DeadlineExceeded
+-		default:
+-			return nil, err
+-		}
++		return nil, filterError(err)
+ 	}
+ 	return rsp[0], nil
+ }
+diff --git a/cmd/examples/server/server.go b/cmd/examples/server/server.go
+index b0fa281..8640532 100644
+--- a/cmd/examples/server/server.go
++++ b/cmd/examples/server/server.go
+@@ -63,7 +63,7 @@ func (math) Div(ctx context.Context, arg binop) (float64, error) {
+ // Status simulates a health check, reporting "OK" to all callers.  It also
+ // demonstrates the use of server-side push.
+ func (math) Status(ctx context.Context) (string, error) {
+-	if err := jrpc2.ServerPush(ctx, "pushback", []string{"hello, friend"}); err != nil {
++	if err := jrpc2.PushNotify(ctx, "pushback", []string{"hello, friend"}); err != nil {
+ 		return "BAD", err
+ 	}
+ 	return "OK", nil
+diff --git a/ctx.go b/ctx.go
+index e62369d..c5d5e52 100644
+--- a/ctx.go
++++ b/ctx.go
+@@ -32,16 +32,31 @@ func InboundRequest(ctx context.Context) *Request {
+ 
+ type inboundRequestKey struct{}
+ 
+-// ServerPush posts a server notification to the client. If ctx does not
+-// contain a server notifier, this reports ErrNotifyUnsupported. The context
++// PushNotify posts a server notification to the client. If ctx does not
++// contain a server notifier, this reports ErrPushUnsupported. The context
+ // passed to the handler by *jrpc2.Server will support notifications if the
+ // server was constructed with the AllowPush option set true.
+-func ServerPush(ctx context.Context, method string, params interface{}) error {
++func PushNotify(ctx context.Context, method string, params interface{}) error {
+ 	s := ctx.Value(serverKey{}).(*Server)
+ 	if !s.allowP {
+-		return ErrNotifyUnsupported
++		return ErrPushUnsupported
+ 	}
+-	return s.Push(ctx, method, params)
++	return s.Notify(ctx, method, params)
++}
++
++// PushCall posts a server call to the client. If ctx does not contain a server
++// caller, this reports ErrPushUnsupported. The context passed to the handler
++// by *jrpc2.Server will support callbacks if the server was constructed with
++// the AllowPush option set true.
++//
++// A successful callback reports a nil error and a non-nil response. Errors
++// returned by the client have concrete type *jrpc2.Error.
++func PushCall(ctx context.Context, method string, params interface{}) (*Response, error) {
++	s := ctx.Value(serverKey{}).(*Server)
++	if !s.allowP {
++		return nil, ErrPushUnsupported
++	}
++	return s.Callback(ctx, method, params)
+ }
+ 
+ // CancelRequest requests the cancellation of the pending or in-flight request
+@@ -54,6 +69,6 @@ func CancelRequest(ctx context.Context, id string) {
+ 
+ type serverKey struct{}
+ 
+-// ErrNotifyUnsupported is returned by ServerPush if server notifications are
+-// not enabled in the specified context.
+-var ErrNotifyUnsupported = errors.New("server notifications are not enabled")
++// ErrPushUnsupported is returned by PushNotify and PushCall if server pushes
++// are not enabled in the specified context.
++var ErrPushUnsupported = errors.New("server push is not enabled")
+diff --git a/doc.go b/doc.go
+index 197507f..44f2b20 100644
+--- a/doc.go
++++ b/doc.go
+@@ -218,20 +218,25 @@ These extension methods are enabled by default, but may be disabled by setting
+ the DisableBuiltin server option to true when constructing the server.
+ 
+ 
+-Server Notifications
++Server Push
+ 
+ The AllowPush option in jrpc2.ServerOptions enables the server to "push"
+-notifications back to the client. This is a non-standard extension of JSON-RPC
+-used by some applications such as the Language Server Protocol (LSP). The Push
+-method sends a notification back to the client, if this feature is enabled:
++requests back to the client. This is a non-standard extension of JSON-RPC used
++by some applications such as the Language Server Protocol (LSP). If this
++feature is enabled, the server's Notify and Callback methods send requests back
++to the client:
+ 
+-  if err := s.Push(ctx, "methodName", params); err == jrpc2.ErrNotifyUnsupported {
+-    // server notifications are not enabled
++  if err := s.Notify(ctx, "methodName", params); err == jrpc2.ErrPushUnsupported {
++    // server push is not enabled
++  }
++  if rsp, err := s.Callback(ctx, "methodName", params); err == jrpc2.ErrPushUnsupported {
++    // server push is not enabled
+   }
+ 
+-A method handler may use jrpc2.ServerPush to access this functionality.  On the
+-client side, the OnNotify option in jrpc2.ClientOptions provides a callback to
+-which any server notifications are delivered if it is set.
++A method handler may use jrpc2.PushNotify and jrpc2.PushCall functions to
++access these methods.  On the client side, the OnNotify and OnCallback options
++in jrpc2.ClientOptions provide hooks to which any server requests are
++delivered, if they are set.
+ */
+ package jrpc2
+ 
+diff --git a/opts.go b/opts.go
+index 29ec43f..7eb626d 100644
+--- a/opts.go
++++ b/opts.go
+@@ -8,6 +8,7 @@ import (
+ 	"runtime"
+ 	"time"
+ 
++	"github.com/creachadair/jrpc2/code"
+ 	"github.com/creachadair/jrpc2/metrics"
+ )
+ 
+@@ -25,9 +26,9 @@ type ServerOptions struct {
+ 	// required "jsonrpc" version marker.
+ 	AllowV1 bool
+ 
+-	// Instructs the server to allow server notifications, a non-standard
+-	// extension to the JSON-RPC protocol. If AllowPush is false, the Push
+-	// method of the server will report an error when called.
++	// Instructs the server to allow server callbacks and notifications, a
++	// non-standard extension to the JSON-RPC protocol. If AllowPush is false,
++	// the Notify and Callback methods of the server report errors if called.
+ 	AllowPush bool
+ 
+ 	// Instructs the server to disable the built-in rpc.* handler methods.
+@@ -150,6 +151,12 @@ type ClientOptions struct {
+ 	// most one invocation of the callback will be active at a time.
+ 	// Server notifications are a non-standard extension of JSON-RPC.
+ 	OnNotify func(*Request)
++
++	// If set, this function is called if a request is received from the server.
++	// If unset, server requests are logged and discarded. At most one
++	// invocation of this callback will be active at a time.
++	// Server callbacks are a non-standard extension of JSON-RPC.
++	OnCallback func(context.Context, *Request) (interface{}, error)
+ }
+ 
+ func (c *ClientOptions) logger() logger {
+@@ -174,17 +181,41 @@ func (c *ClientOptions) encodeContext() encoder {
+ 	return c.EncodeContext
+ }
+ 
+-func (c *ClientOptions) handleNotification() func(*jmessage) bool {
++func (c *ClientOptions) handleNotification() func(*jmessage) {
+ 	if c == nil || c.OnNotify == nil {
+-		return func(*jmessage) bool { return false }
++		return nil
+ 	}
+ 	h := c.OnNotify
+-	return func(req *jmessage) bool {
+-		if req.isRequestOrNotification() {
+-			h(&Request{method: req.M, params: req.P})
+-			return true
++	return func(req *jmessage) { h(&Request{method: req.M, params: req.P}) }
++}
++
++func (c *ClientOptions) handleCallback() func(*jmessage) ([]byte, error) {
++	if c == nil || c.OnCallback == nil {
++		return nil
++	}
++	cb := c.OnCallback
++	return func(req *jmessage) ([]byte, error) {
++		ctx, cancel := context.WithCancel(context.Background())
++		defer cancel()
++
++		rsp := &jmessage{V: Version, ID: req.ID}
++		v, err := cb(ctx, &Request{
++			id:     req.ID,
++			method: req.M,
++			params: req.P,
++		})
++		if err == nil {
++			rsp.R, err = json.Marshal(v)
++		}
++		if err != nil {
++			rsp.R = nil
++			if e, ok := err.(*Error); ok {
++				rsp.E = e
++			} else {
++				rsp.E = &Error{code: code.FromError(err), message: err.Error()}
++			}
+ 		}
+-		return false
++		return json.Marshal(rsp)
+ 	}
+ }
+ 
+diff --git a/server.go b/server.go
+index ff824c2..fe12b89 100644
+--- a/server.go
++++ b/server.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"io"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -46,6 +47,11 @@ type Server struct {
+ 	// For each request ID currently in-flight, this map carries a cancel
+ 	// function attached to the context that was sent to the handler.
+ 	used map[string]context.CancelFunc
++
++	// For each push-call ID currently in flight, this map carries the response
++	// waiting for its reply.
++	call   map[string]*Response
++	callID int64
+ }
+ 
+ // NewServer returns a new unstarted server that will dispatch incoming
+@@ -76,6 +82,8 @@ func NewServer(mux Assigner, opts *ServerOptions) *Server {
+ 		builtin: opts.allowBuiltin(),
+ 		inq:     list.New(),
+ 		used:    make(map[string]context.CancelFunc),
++		call:    make(map[string]*Response),
++		callID:  1,
+ 	}
+ 	s.work = sync.NewCond(s.mu)
+ 	return s
+@@ -257,6 +265,12 @@ func (s *Server) checkAndAssign(next jmessages) tasks {
+ 			t.err = Errorf(code.InvalidRequest, "duplicate request id %q", id)
+ 		} else if !s.versionOK(req.V) {
+ 			t.err = ErrInvalidVersion
++		} else if !req.isRequestOrNotification() && s.call[id] != nil {
++			// This is a result or error for a pending push-call.
++			rsp := s.call[id]
++			delete(s.call, id)
++			rsp.ch <- req
++			continue // don't send a reply for this
+ 		} else if req.M == "" {
+ 			t.err = Errorf(code.InvalidRequest, "empty method name")
+ 		} else if s.setContext(t, id) {
+@@ -342,37 +356,86 @@ func (s *Server) ServerInfo() *ServerInfo {
+ 	return info
+ }
+ 
+-// Push posts a server-side notification to the client.  This is a non-standard
+-// extension of JSON-RPC, and may not be supported by all clients.  Unless s
+-// was constructed with the AllowPush option set true, this method will always
+-// report an error (ErrNotifyUnsupported) without sending anything.  If Push is
+-// called after the client connection is closed, it returns ErrConnClosed.
+-func (s *Server) Push(ctx context.Context, method string, params interface{}) error {
++// Notify posts a single server-side notification to the client.
++//
++// This is a non-standard extension of JSON-RPC, and may not be supported by
++// all clients.  Unless s was constructed with the AllowPush option set true,
++// this method will always report an error (ErrPushUnsupported) without sending
++// anything.  If Notify is called after the client connection is closed, it
++// returns ErrConnClosed.
++func (s *Server) Notify(ctx context.Context, method string, params interface{}) error {
+ 	if !s.allowP {
+-		return ErrNotifyUnsupported
++		return ErrPushUnsupported
++	}
++	_, err := s.pushReq(ctx, false /* no ID */, method, params)
++	return err
++}
++
++// Callback posts a single server-side call to the client. It blocks until a
++// reply is received or the client connection terminates.  A successful
++// callback reports a nil error and a non-nil response. Errors returned by the
++// client have concrete type *jrpc2.Error.
++//
++// This is a non-standard extension of JSON-RPC, and may not be supported by
++// all clients. Unless s was constructed with the AllowPush option set true,
++// this method will always report an error (ErrPushUnsupported) without sending
++// anything. If Callback is called after the client connection is closed, it
++// returns ErrConnClosed.
++func (s *Server) Callback(ctx context.Context, method string, params interface{}) (*Response, error) {
++	if !s.allowP {
++		return nil, ErrPushUnsupported
++	}
++	rsp, err := s.pushReq(ctx, true /* set ID */, method, params)
++	if err != nil {
++		return nil, err
++	}
++	rsp.wait()
++	if err := rsp.Error(); err != nil {
++		return nil, filterError(err)
+ 	}
++	return rsp, nil
++}
++
++func (s *Server) pushReq(ctx context.Context, wantID bool, method string, params interface{}) (rsp *Response, _ error) {
+ 	var bits []byte
+ 	if params != nil {
+ 		v, err := json.Marshal(params)
+ 		if err != nil {
+-			return err
++			return nil, err
+ 		}
+ 		bits = v
+ 	}
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	if s.ch == nil {
+-		return ErrConnClosed
++		return nil, ErrConnClosed
++	}
++
++	kind := "notification"
++	var jid json.RawMessage
++	if wantID {
++		kind = "call"
++		id := strconv.FormatInt(s.callID, 10)
++		s.callID++
++		jid = json.RawMessage(id)
++		rsp = &Response{
++			ch:     make(chan *jmessage, 1),
++			id:     id,
++			cancel: func() {},
++		}
++		s.call[id] = rsp
+ 	}
+-	s.log("Posting server notification %q %s", method, string(bits))
++
++	s.log("Posting server %s %q %s", kind, method, string(bits))
+ 	nw, err := encode(s.ch, jmessages{{
+-		V: Version,
+-		M: method,
+-		P: bits,
++		V:  Version,
++		ID: jid,
++		M:  method,
++		P:  bits,
+ 	}})
+ 	s.metrics.CountAndSetMax("rpc.bytesWritten", int64(nw))
+-	s.metrics.Count("rpc.notifications", 1)
+-	return err
++	s.metrics.Count("rpc."+kind+"s", 1)
++	return rsp, err
+ }
+ 
+ // Stop shuts down the server. It is safe to call this method multiple times or

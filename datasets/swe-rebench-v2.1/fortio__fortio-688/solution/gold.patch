@@ -1,0 +1,287 @@
+diff --git a/README.md b/README.md
+index 3e9432c..bdf4bd7 100644
+--- a/README.md
++++ b/README.md
+@@ -111,6 +111,7 @@ Most important flags for http load generation:
+ | `-a`     |  Automatically save JSON result with filename based on labels and timestamp |
+ | `-json filename` | Filename or `-` for stdout to output json result (relative to `-data-dir` by default, should end with .json if you want `fortio report` to show them; using `-a` is typicallly a better option)|
+ | `-labels "l1 l2 ..."` |  Additional config data/labels to add to the resulting JSON, defaults to target URL and hostname|
++| `-h2` |  Client calls will attempt to negotiate http/2.0 instead of http1.1, implies `-stdclient`|
+ 
+ You can switch from http GET queries to POST by setting `-content-type` or passing one of the `-payload-*` option.
+ 
+@@ -204,6 +205,8 @@ option unset.
+         grpc server port. Can be in the form of host:port, ip:port or port or
+ /unix/domain/path or "disabled" to not start the grpc server. (default "8079")
+   -h    Print usage/help on stdout
++  -h2
++        Attempt to use http2.0 / h2 (instead of http 1.1) with stdclient and TLS
+   -halfclose
+         When not keepalive, whether to half close the connection (only for fast
+ http)
+@@ -240,6 +243,9 @@ target URL and hostname
+         Log http non 2xx/418 error codes as they occur (default true)
+   -logcaller
+         Logs filename and line number of callers to log (default true)
++  -logfatalpanics
++        If true, log.Fatal will panic (stack trace) instead of just exit 1
++(default true)
+   -loglevel value
+         loglevel, one of [Debug Verbose Info Warning Error Critical Fatal]
+ (default Info)
+@@ -570,6 +576,10 @@ RTT histogram usec : count 3 avg 305.334 +/- 27.22 min 279.517 max 342.97 sum 91
+ 
+ #### `grpcping` using TLS
+ 
++Note that since 1.40 the same applies to the main http server port, it will listen on TLS if `-cert` and `-key` flags are provided.
++
++For testing use `make certs` to generate self signed test certificates.
++
+ * First, start Fortio server with the `-cert` and `-key` flags:
+ 
+ `/path/to/fortio/server.crt` and `/path/to/fortio/server.key` are paths to the TLS certificate and key that
+diff --git a/bincommon/commonflags.go b/bincommon/commonflags.go
+index eb6bfe6..790a013 100644
+--- a/bincommon/commonflags.go
++++ b/bincommon/commonflags.go
+@@ -71,6 +71,7 @@ var (
+ 	httpReqTimeoutFlag  = flag.Duration("timeout", fhttp.HTTPReqTimeOutDefaultValue, "Connection and read timeout value (for http)")
+ 	stdClientFlag       = flag.Bool("stdclient", false, "Use the slower net/http standard client (slower but supports h2)")
+ 	http10Flag          = flag.Bool("http1.0", false, "Use http1.0 (instead of http 1.1)")
++	h2Flag              = flag.Bool("h2", false, "Attempt to use http2.0 / h2 (instead of http 1.1) with stdclient and TLS")
+ 	httpsInsecureFlag   = flag.Bool("k", false, "Do not verify certs in https/tls/grpc connections")
+ 	httpsInsecureFlagL  = flag.Bool("https-insecure", false, "Long form of the -k flag")
+ 	resolve             = flag.String("resolve", "", "Resolve host name to this `IP`")
+@@ -204,6 +205,7 @@ func SharedHTTPOptions() *fhttp.HTTPOptions {
+ 	url := strings.TrimLeft(flag.Arg(0), " \t\r\n")
+ 	httpOpts.URL = url
+ 	httpOpts.HTTP10 = *http10Flag
++	httpOpts.H2 = *h2Flag
+ 	httpOpts.DisableFastClient = *stdClientFlag
+ 	httpOpts.DisableKeepAlive = !*keepAliveFlag
+ 	httpOpts.AllowHalfClose = *halfCloseFlag
+diff --git a/echosrv/echo.go b/echosrv/echo.go
+index 299453f..19422ed 100644
+--- a/echosrv/echo.go
++++ b/echosrv/echo.go
+@@ -32,6 +32,8 @@ import (
+ var (
+ 	port      = flag.String("port", "8080", "default http port, either port or address:port can be specified")
+ 	debugPath = flag.String("debug-path", "/debug", "path for debug url, set to empty for no debug")
++	certFlag  = flag.String("cert", "", "`Path` to the certificate file to be used for client or server TLS")
++	keyFlag   = flag.String("key", "", "`Path` to the key file matching the -cert")
+ )
+ 
+ func main() {
+@@ -40,7 +42,7 @@ func main() {
+ 		fmt.Println(version.Full())
+ 		os.Exit(0)
+ 	}
+-	if _, addr := fhttp.Serve(*port, *debugPath); addr == nil {
++	if _, addr := fhttp.ServeTLS(*port, *debugPath, *certFlag, *keyFlag); addr == nil {
+ 		os.Exit(1) // error already logged
+ 	}
+ 	select {}
+diff --git a/fgrpc/pingsrv.go b/fgrpc/pingsrv.go
+index d66f4f2..351cdac 100644
+--- a/fgrpc/pingsrv.go
++++ b/fgrpc/pingsrv.go
+@@ -77,10 +77,9 @@ func PingServer(port, cert, key, healthServiceName string, maxConcurrentStreams
+ 	if cert != "" && key != "" {
+ 		creds, err := credentials.NewServerTLSFromFile(cert, key)
+ 		if err != nil {
+-			log.Fatalf("Invalid TLS credentials: %v\n", err)
++			log.Fatalf("Invalid TLS credentials: %v", err)
+ 		}
+-		log.Infof("Using server certificate %v to construct TLS credentials", cert)
+-		log.Infof("Using server key %v to construct TLS credentials", key)
++		log.Infof("Using server certificate %v and key %v to construct TLS credentials", cert, key)
+ 		grpcOptions = append(grpcOptions, grpc.Creds(creds))
+ 	}
+ 	grpcServer := grpc.NewServer(grpcOptions...)
+diff --git a/fhttp/http_client.go b/fhttp/http_client.go
+index 9560e2b..d1a00f8 100644
+--- a/fhttp/http_client.go
++++ b/fhttp/http_client.go
+@@ -140,6 +140,10 @@ func (h *HTTPOptions) URLSchemeCheck() {
+ 		log.Errf("Unexpected init with empty url")
+ 		return
+ 	}
++	if h.H2 && !h.DisableFastClient {
++		log.Infof("H2 requested, switching to std client")
++		h.DisableFastClient = true
++	}
+ 	hs := "https://" // longer of the 2 prefixes
+ 	lcURL := h.URL
+ 	if len(lcURL) > len(hs) {
+@@ -169,6 +173,7 @@ type HTTPOptions struct {
+ 	Compression       bool // defaults to no compression, only used by std client
+ 	DisableFastClient bool // defaults to fast client
+ 	HTTP10            bool // defaults to http1.1
++	H2                bool // defaults to http1.1 (h2 only for stdclient)
+ 	DisableKeepAlive  bool // so default is keep alive
+ 	AllowHalfClose    bool // if not keepalive, whether to half close after request
+ 	FollowRedirects   bool // For the Std Client only: follow redirects.
+@@ -554,6 +559,7 @@ func NewStdClient(o *HTTPOptions) (*Client, error) {
+ 			return conn, err
+ 		},
+ 		TLSHandshakeTimeout: o.HTTPReqTimeOut,
++		ForceAttemptHTTP2:   o.H2,
+ 	}
+ 	var rt http.RoundTripper = &tr
+ 	if o.Transport != nil {
+diff --git a/fhttp/http_server.go b/fhttp/http_server.go
+index 214e97a..0adb0f0 100644
+--- a/fhttp/http_server.go
++++ b/fhttp/http_server.go
+@@ -17,6 +17,7 @@ package fhttp // import "fortio.org/fortio/fhttp"
+ // pprof import to get /debug/pprof endpoints on a mux through SetupPPROF.
+ import (
+ 	"bytes"
++	"crypto/tls"
+ 	"flag"
+ 	"fmt"
+ 	"io"
+@@ -205,6 +206,26 @@ func HTTPServerWithHandler(name string, port string, hdlr http.Handler) net.Addr
+ 	return addr
+ }
+ 
++func HTTPSServer(name string, port string, certFile string, keyFile string) (*http.ServeMux, net.Addr) {
++	listener, addr := fnet.Listen(name, port)
++	if listener == nil {
++		return nil, nil // error already logged
++	}
++	m := http.NewServeMux()
++	s := &http.Server{
++		ReadHeaderTimeout: serverIdleTimeout.Get(),
++		IdleTimeout:       serverIdleTimeout.Get(),
++		Handler:           m,
++	}
++	go func() {
++		err := s.ServeTLS(listener, certFile, keyFile)
++		if err != nil {
++			log.Fatalf("Unable to TLS serve %s on %s: %v", name, addr.String(), err)
++		}
++	}()
++	return m, addr
++}
++
+ // DynamicHTTPServer listens on an available port, sets up an http or a closing
+ // server simulating an https server (when closing is true) server on it and
+ // returns the listening port and mux to which one can attach handlers to.
+@@ -287,6 +308,7 @@ func DebugHandler(w http.ResponseWriter, r *http.Request) {
+ 	buf.WriteString(hostname)
+ 	buf.WriteString(" - request from ")
+ 	buf.WriteString(r.RemoteAddr)
++	buf.WriteString(TLSInfo(r))
+ 	buf.WriteString("\n\n")
+ 	buf.WriteString(r.Method)
+ 	buf.WriteByte(' ')
+@@ -371,8 +393,20 @@ func EchoDebugPath(debugPath string) string {
+ // The .Port can be retrieved from it when requesting the 0 port as
+ // input for dynamic http server.
+ func Serve(port, debugPath string) (*http.ServeMux, net.Addr) {
++	return ServeTLS(port, debugPath, "", "")
++}
++
++// ServeTLS starts a debug / echo server on the given port,
++// using TLS if certPath and keyPath aren't not empty.
++func ServeTLS(port, debugPath, certPath, keyPath string) (*http.ServeMux, net.Addr) {
+ 	startTime = time.Now()
+-	mux, addr := HTTPServer("http-echo", port)
++	var mux *http.ServeMux
++	var addr net.Addr
++	if certPath != "" && keyPath != "" {
++		mux, addr = HTTPSServer("https-echo", port, certPath, keyPath)
++	} else {
++		mux, addr = HTTPServer("http-echo", port)
++	}
+ 	if addr == nil {
+ 		return nil, nil // error already logged
+ 	}
+@@ -510,11 +544,20 @@ func RedirectToHTTPS(port string) net.Addr {
+ 	return a
+ }
+ 
++// TLSInfo returns " https <cipher suite>" if the request is using TLS, or "" otherwise.
++func TLSInfo(r *http.Request) string {
++	if r.TLS == nil {
++		return ""
++	}
++	return fmt.Sprintf(" https %s", tls.CipherSuiteName(r.TLS.CipherSuite))
++}
++
+ // LogRequest logs the incoming request, including headers when loglevel is verbose.
+ func LogRequest(r *http.Request, msg string) {
+ 	if log.Log(log.Info) {
+-		log.Printf("%s: %v %v %v %v (%s) %s %q", msg, r.Method, r.URL, r.Proto, r.RemoteAddr,
+-			r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-For"), r.Header.Get("User-Agent"))
++		tlsInfo := TLSInfo(r)
++		log.Printf("%s: %v %v %v %v (%v) %s %q%s", msg, r.Method, r.URL, r.Proto, r.RemoteAddr,
++			r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-For"), r.Header.Get("User-Agent"), tlsInfo)
+ 	}
+ 	if log.LogVerbose() {
+ 		// Host is removed from headers map and put separately
+diff --git a/rapi/restHandler.go b/rapi/restHandler.go
+index 84b7dcb..1fa7e7f 100644
+--- a/rapi/restHandler.go
++++ b/rapi/restHandler.go
+@@ -224,6 +224,7 @@ func RESTRunHandler(w http.ResponseWriter, r *http.Request) { //nolint:funlen
+ 	uniform := (FormValue(r, jd, "uniform") == "on")
+ 	nocatchup := (FormValue(r, jd, "nocatchup") == "on")
+ 	stdClient := (FormValue(r, jd, "stdclient") == "on")
++	h2 := (FormValue(r, jd, "h2") == "on")
+ 	sequentialWarmup := (FormValue(r, jd, "sequential-warmup") == "on")
+ 	httpsInsecure := (FormValue(r, jd, "https-insecure") == "on")
+ 	resolve := FormValue(r, jd, "resolve")
+@@ -274,6 +275,7 @@ func RESTRunHandler(w http.ResponseWriter, r *http.Request) { //nolint:funlen
+ 	httpopts.SequentialWarmup = sequentialWarmup
+ 	httpopts.Insecure = httpsInsecure
+ 	httpopts.Resolve = resolve
++	httpopts.H2 = h2
+ 	// Set the connection reuse range.
+ 	err = bincommon.ConnectionReuseRange.
+ 		WithValidator(bincommon.ConnectionReuseRangeValidator(httpopts)).
+diff --git a/ui/templates/main.html b/ui/templates/main.html
+index 74bcca1..0f138fb 100644
+--- a/ui/templates/main.html
++++ b/ui/templates/main.html
+@@ -62,6 +62,7 @@
+     tcp/udp/http: <input type="radio" name="runner" value="http/tcp/udp" checked/>
+     (https insecure:<input type="checkbox" name="https-insecure" />,
+     standard go client instead of fastclient:<input type="checkbox" name="stdclient"/>,
++    h2: <input type="checkbox" name="h2"/>,
+     sequential warmup: <input type="checkbox" name="sequential-warmup"/>,
+     resolve: <input type="text" name="resolve" size="12" value="" />)
+     <br />&nbsp;&nbsp;or<br />
+diff --git a/ui/uihandler.go b/ui/uihandler.go
+index 02e3406..efd5394 100644
+--- a/ui/uihandler.go
++++ b/ui/uihandler.go
+@@ -133,6 +133,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
+ 	uniform := (r.FormValue("uniform") == "on")
+ 	nocatchup := (r.FormValue("nocatchup") == "on")
+ 	stdClient := (r.FormValue("stdclient") == "on")
++	h2 := (r.FormValue("h2") == "on")
+ 	sequentialWarmup := (r.FormValue("sequential-warmup") == "on")
+ 	httpsInsecure := (r.FormValue("https-insecure") == "on")
+ 	resolve := r.FormValue("resolve")
+@@ -191,6 +192,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
+ 	httpopts.SequentialWarmup = sequentialWarmup
+ 	httpopts.Insecure = httpsInsecure
+ 	httpopts.Resolve = resolve
++	httpopts.H2 = h2
+ 	// Set the connection reuse range.
+ 	err := bincommon.ConnectionReuseRange.
+ 		WithValidator(bincommon.ConnectionReuseRangeValidator(httpopts)).
+@@ -665,7 +667,9 @@ func downloadOne(ctx context.Context, w http.ResponseWriter, client *fhttp.Clien
+ // (be a 'directory' path). Returns true if server is started successfully.
+ func Serve(hook bincommon.FortioHook, baseurl, port, debugpath, uipath, datadir string, percentileList []float64) bool {
+ 	startTime = time.Now()
+-	mux, addr := fhttp.Serve(port, debugpath)
++	// Kinda ugly that we get most params past in but we get the tls stuff from flags directly,
++	// it avoids making an already too long list of string params longer. probably should make a FortioConfig struct.
++	mux, addr := fhttp.ServeTLS(port, debugpath, *bincommon.CertFlag, *bincommon.KeyFlag)
+ 	if addr == nil {
+ 		return false // Error already logged
+ 	}

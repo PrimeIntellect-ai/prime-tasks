@@ -1,0 +1,158 @@
+diff --git a/executors/cmdexec/brick_test.go b/executors/cmdexec/brick_test.go
+index 2c0b7c9..5cc0ed1 100644
+--- a/executors/cmdexec/brick_test.go
++++ b/executors/cmdexec/brick_test.go
+@@ -10,9 +10,17 @@
+ package cmdexec
+ 
+ import (
++	"crypto/rand"
++	"crypto/rsa"
++	"encoding/binary"
++	"io"
++	"net"
+ 	"strings"
+ 	"testing"
+ 
++	sshexec "github.com/heketi/heketi/pkg/utils/ssh"
++	"golang.org/x/crypto/ssh"
++
+ 	"github.com/heketi/heketi/executors"
+ 	"github.com/heketi/heketi/pkg/utils"
+ 	"github.com/heketi/tests"
+@@ -61,13 +69,6 @@ func TestSshExecBrickCreate(t *testing.T) {
+ 					cmd == "mkfs.xfs -i size=512 "+
+ 						"-n size=8192 /dev/mapper/vg_xvgid-brick_id", cmd)
+ 
+-			case 3:
+-				tests.Assert(t,
+-					cmd == "echo \"/dev/mapper/vg_xvgid-brick_id "+
+-						"/var/lib/heketi/mounts/vg_xvgid/brick_id "+
+-						"xfs rw,inode64,noatime,nouuid 1 2\" | "+
+-						"tee -a /my/fstab > /dev/null", cmd)
+-
+ 			case 4:
+ 				tests.Assert(t,
+ 					cmd == "mount -o rw,inode64,noatime,nouuid "+
+@@ -134,13 +135,6 @@ func TestSshExecBrickCreateWithGid(t *testing.T) {
+ 					cmd == "mkfs.xfs -i size=512 "+
+ 						"-n size=8192 /dev/mapper/vg_xvgid-brick_id", cmd)
+ 
+-			case 3:
+-				tests.Assert(t,
+-					cmd == "echo \"/dev/mapper/vg_xvgid-brick_id "+
+-						"/var/lib/heketi/mounts/vg_xvgid/brick_id "+
+-						"xfs rw,inode64,noatime,nouuid 1 2\" | "+
+-						"tee -a /my/fstab > /dev/null", cmd)
+-
+ 			case 4:
+ 				tests.Assert(t,
+ 					cmd == "mount -o rw,inode64,noatime,nouuid "+
+@@ -218,13 +212,6 @@ func TestSshExecBrickCreateSudo(t *testing.T) {
+ 					cmd == "mkfs.xfs -i size=512 "+
+ 						"-n size=8192 /dev/mapper/vg_xvgid-brick_id", cmd)
+ 
+-			case 3:
+-				tests.Assert(t,
+-					cmd == "echo \"/dev/mapper/vg_xvgid-brick_id "+
+-						"/var/lib/heketi/mounts/vg_xvgid/brick_id "+
+-						"xfs rw,inode64,noatime,nouuid 1 2\" | "+
+-						"tee -a /my/fstab > /dev/null", cmd)
+-
+ 			case 4:
+ 				tests.Assert(t,
+ 					cmd == "mount -o rw,inode64,noatime,nouuid "+
+@@ -303,3 +290,93 @@ func TestSshExecBrickDestroy(t *testing.T) {
+ 	err = s.BrickDestroy("myhost", b)
+ 	tests.Assert(t, err == nil, err)
+ }
++
++func TestSshExecSudoAppliesToRequestedCommand(t *testing.T) {
++	private, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	hostKey, err := ssh.NewSignerFromKey(private)
++	if err != nil {
++		t.Fatal(err)
++	}
++	serverConfig := &ssh.ServerConfig{
++		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
++			return nil, nil
++		},
++	}
++	serverConfig.AddHostKey(hostKey)
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++
++	observed := make(chan string, 1)
++	serverErr := make(chan error, 1)
++	go func() {
++		conn, err := listener.Accept()
++		if err != nil {
++			serverErr <- err
++			return
++		}
++		defer conn.Close()
++		_, chans, reqs, err := ssh.NewServerConn(conn, serverConfig)
++		if err != nil {
++			serverErr <- err
++			return
++		}
++		go ssh.DiscardRequests(reqs)
++		for channelReq := range chans {
++			channel, requests, err := channelReq.Accept()
++			if err != nil {
++				serverErr <- err
++				return
++			}
++			for request := range requests {
++				if request.Type != "exec" {
++					request.Reply(false, nil)
++					continue
++				}
++				if len(request.Payload) < 4 {
++					serverErr <- io.ErrUnexpectedEOF
++					return
++				}
++				commandLen := binary.BigEndian.Uint32(request.Payload[:4])
++				if int(commandLen) > len(request.Payload)-4 {
++					serverErr <- io.ErrUnexpectedEOF
++					return
++				}
++				observed <- string(request.Payload[4 : 4+commandLen])
++				request.Reply(true, nil)
++				_, err = channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
++				if err != nil {
++					serverErr <- err
++					return
++				}
++				channel.Close()
++				return
++			}
++		}
++	}()
++
++	client := sshexec.NewSshExecWithPassword(utils.NewLogger("test", utils.LEVEL_NOLOG), "test", "password")
++	if client == nil {
++		t.Fatal("failed to construct SSH executor")
++	}
++	_, err = client.ConnectAndExec(listener.Addr().String(), []string{"echo requested"}, 1, true)
++	if err != nil {
++		t.Fatalf("SSH command failed: %v", err)
++	}
++	select {
++	case command := <-observed:
++		shellIndex := strings.Index(command, "/bin/bash")
++		sudoIndex := strings.Index(command, "sudo")
++		requestedIndex := strings.Index(command, "echo requested")
++		if sudoIndex < 0 || requestedIndex <= sudoIndex || (shellIndex >= 0 && sudoIndex < shellIndex) {
++			t.Fatalf("sudo should apply to the requested command, not the shell: %q", command)
++		}
++	case err := <-serverErr:
++		t.Fatalf("SSH server failed to observe command: %v", err)
++	}
++}

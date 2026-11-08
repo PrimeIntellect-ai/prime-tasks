@@ -1,0 +1,103 @@
+diff --git a/.github/workflows/k8s.yaml b/.github/workflows/k8s.yaml
+index 1042388fe..a96ce1ead 100644
+--- a/.github/workflows/k8s.yaml
++++ b/.github/workflows/k8s.yaml
+@@ -38,7 +38,7 @@ jobs:
+           path: jax
+ 
+       - name: Start Minikube cluster
+-        uses: medyagh/setup-minikube@cea33675329b799adccc9526aa5daccc26cd5052 # ratchet:medyagh/setup-minikube@v0.0.19
++        uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # ratchet:medyagh/setup-minikube@v0.0.18
+ 
+       - name: Install K8s Jobset
+         run: |
+diff --git a/jax/_src/dispatch.py b/jax/_src/dispatch.py
+index baab6d519..d205f860b 100644
+--- a/jax/_src/dispatch.py
++++ b/jax/_src/dispatch.py
+@@ -44,7 +44,6 @@ from jax._src.interpreters import mlir
+ from jax._src.interpreters import pxla
+ from jax._src.interpreters import xla
+ from jax._src.layout import DeviceLocalLayout, Layout
+-from jax._src.lib import jaxlib_extension_version
+ from jax._src.lib import xla_client as xc
+ from jax._src.mesh import AbstractMesh, Mesh
+ from jax._src.monitoring import record_event_duration_secs, record_event_time_span
+@@ -496,7 +495,7 @@ def _device_put_sharding_impl(x, aval, device, copy):
+         return _DeferredShardArg(x, x.sharding, aval, x.committed, copy)
+     elif is_single_device_sharding(x.sharding):
+       device = x.sharding._device_assignment[0] if device is None else device
+-      if copy == CopySemantics.COPY and jaxlib_extension_version >= 327:
++      if copy == CopySemantics.COPY:
+         return xc.batched_device_put(aval, SingleDeviceSharding(device), [x],
+                                      [device], True, True)
+       return pxla.batched_device_put(aval, SingleDeviceSharding(device), [x],
+diff --git a/jax/_src/util.py b/jax/_src/util.py
+index b3f7becee..30da28522 100644
+--- a/jax/_src/util.py
++++ b/jax/_src/util.py
+@@ -497,13 +497,8 @@ class HashablePartial:
+             self.args == other.args and self.kwargs == other.kwargs)
+ 
+   def __hash__(self):
+-    return hash(
+-      (
+-        self.f.__code__,
+-        self.args,
+-        tuple(sorted(self.kwargs.items(), key=lambda kv: kv[0])),
+-      ),
+-    )
++    kwargs = tuple(sorted(self.kwargs.items(), key=lambda kv: kv[0]))
++    return hash((self.f.__code__, self.args, kwargs))
+ 
+   def __call__(self, *args, **kwargs):
+     return self.f(*self.args, *args, **self.kwargs, **kwargs)
+diff --git a/jax/experimental/shard_map.py b/jax/experimental/shard_map.py
+index 3a46f444f..7c4a8c6e2 100644
+--- a/jax/experimental/shard_map.py
++++ b/jax/experimental/shard_map.py
+@@ -1403,6 +1403,44 @@ def _scan_rewrite(mesh, in_rep, *args, jaxpr, num_consts, num_carry, **params):
+       *args, jaxpr=jaxpr_, num_consts=num_consts, num_carry=num_carry, **params)
+   return out_vals, out_rep
+ 
++@register_check(control_flow.loops.while_p)
++def _while_check(mesh, *in_rep, body_jaxpr, cond_nconsts, body_nconsts, **_):
++  _, bconst_rep, carry_rep_in = split_list(in_rep, [cond_nconsts, body_nconsts])
++  carry_rep_out = _check_rep(mesh, body_jaxpr.jaxpr, [*bconst_rep, *carry_rep_in])
++  if tuple(carry_rep_in) != tuple(carry_rep_out):
++    raise Exception("Scanwhile_loopcarry input and output got mismatched "
++                    "replication types {carry_rep_in} and {carry_rep_out}. "
++                    "Please open an issue at "
++                    "https://github.com/jax-ml/jax/issues, and as a temporary "
++                    "workaround pass the check_rep=False argument to shard_map")
++  return carry_rep_out
++
++@register_rewrite(control_flow.loops.while_p)
++def _while_rewrite(mesh, in_rep, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
++                   body_nconsts):
++  # while while isn't transposable, we insert pbroadcasts for consistent carry
++  cconst_rep, bconst_rep, carry_rep_in = split_list(in_rep, [cond_nconsts, body_nconsts])
++  num_carry = len(args) - cond_nconsts - body_nconsts
++  for _ in range(1 + num_carry):
++    in_rep_ = [*bconst_rep, *carry_rep_in]
++    _, carry_rep_out = _replication_rewrite_nomatch(mesh, body_jaxpr, in_rep_)
++    if tuple(carry_rep_in) == tuple(carry_rep_out):
++      break
++    carry_rep_in = map(op.and_, carry_rep_in, carry_rep_out)
++  else:
++    assert False, "Fixpoint not reached"
++
++  cond_jaxpr_, _ = _replication_rewrite_nomatch(
++      mesh, cond_jaxpr, (*cconst_rep, *carry_rep_in))
++  body_jaxpr_ = _replication_rewrite_match(
++      mesh, body_jaxpr, (*bconst_rep, *carry_rep_in), carry_rep_out)
++  args_ = [pbroadcast(x, tuple(n for n in src if n not in dst))
++           if src - dst else x for x, src, dst in zip(args, in_rep, in_rep_)]
++  out_vals = control_flow.loops.while_p.bind(
++      *args_, cond_jaxpr=cond_jaxpr_, body_jaxpr=body_jaxpr_,
++      cond_nconsts=cond_nconsts, body_nconsts=body_nconsts)
++  return out_vals, carry_rep_out
++
+ @register_check(control_flow.conditionals.cond_p)
+ def _cond_rule(mesh, *in_rep, branches):
+   _, *args_rep = in_rep

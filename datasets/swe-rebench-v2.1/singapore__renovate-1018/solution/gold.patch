@@ -1,0 +1,207 @@
+diff --git a/lib/workers/branch/index.js b/lib/workers/branch/index.js
+index a33242edb..5a919cfd4 100644
+--- a/lib/workers/branch/index.js
++++ b/lib/workers/branch/index.js
+@@ -69,9 +69,9 @@ async function processBranch(branchConfig) {
+       await config.api.ensureComment(pr.number, subject, content);
+       return 'already-existed';
+     }
+-    config.parentBranch = await getParentBranch(config);
++    Object.assign(config, await getParentBranch(config));
+     logger.debug(`Using parentBranch: ${config.parentBranch}`);
+-    config.updatedPackageFiles = await getUpdatedPackageFiles(config);
++    Object.assign(config, await getUpdatedPackageFiles(config));
+     if (config.updatedPackageFiles.length) {
+       logger.debug(
+         { updatedPackageFiles: config.updatedPackageFiles },
+diff --git a/lib/workers/branch/package-files.js b/lib/workers/branch/package-files.js
+index 523dd239b..eaa3f305e 100644
+--- a/lib/workers/branch/package-files.js
++++ b/lib/workers/branch/package-files.js
+@@ -44,15 +44,35 @@ async function getUpdatedPackageFiles(config) {
+           config.logger
+         );
+       }
++      if (!newContent) {
++        if (config.parentBranch && config.canRebase) {
++          logger.info('Rebasing branch after error updating content');
++          return getUpdatedPackageFiles({
++            ...config,
++            parentBranch: undefined,
++          });
++        }
++        throw new Error('Error updating branch content and cannot rebase');
++      }
+       if (newContent !== existingContent) {
++        if (config.parentBranch && config.canRebase) {
++          // This ensure it's always 1 commit from Renovate
++          logger.info('Need to update package file so will rebase first');
++          return getUpdatedPackageFiles({
++            ...config,
++            parentBranch: undefined,
++          });
++        }
+         logger.debug('Updating packageFile content');
+         updatedPackageFiles[upgrade.packageFile] = newContent;
+       }
+     }
+   }
+-
+-  return Object.keys(updatedPackageFiles).map(packageFile => ({
+-    name: packageFile,
+-    contents: updatedPackageFiles[packageFile],
+-  }));
++  return {
++    parentBranch: config.parentBranch, // Need to overwrite original config
++    updatedPackageFiles: Object.keys(updatedPackageFiles).map(packageFile => ({
++      name: packageFile,
++      contents: updatedPackageFiles[packageFile],
++    })),
++  };
+ }
+diff --git a/lib/workers/branch/package-json.js b/lib/workers/branch/package-json.js
+index d4a2b2d16..d8d914efe 100644
+--- a/lib/workers/branch/package-json.js
++++ b/lib/workers/branch/package-json.js
+@@ -6,51 +6,57 @@ module.exports = {
+ 
+ function setNewValue(currentFileContent, depType, depName, newVersion, logger) {
+   logger.debug(`setNewValue: ${depType}.${depName} = ${newVersion}`);
+-  const parsedContents = JSON.parse(currentFileContent);
+-  // Save the old version
+-  const oldVersion = parsedContents[depType][depName];
+-  if (oldVersion === newVersion) {
+-    logger.debug('Version is already updated');
+-    return currentFileContent;
+-  }
+-  // Update the file = this is what we want
+-  parsedContents[depType][depName] = newVersion;
+-  // Look for the old version number
+-  const searchString = `"${oldVersion}"`;
+-  const newString = `"${newVersion}"`;
+-  let newFileContent = null;
+-  // Skip ahead to depType section
+-  let searchIndex = currentFileContent.indexOf(`"${depType}"`) + depType.length;
+-  logger.debug(`Starting search at index ${searchIndex}`);
+-  // Iterate through the rest of the file
+-  for (; searchIndex < currentFileContent.length; searchIndex += 1) {
+-    // First check if we have a hit for the old version
+-    if (matchAt(currentFileContent, searchIndex, searchString)) {
+-      logger.debug(`Found match at index ${searchIndex}`);
+-      // Now test if the result matches
+-      const testContent = replaceAt(
+-        currentFileContent,
+-        searchIndex,
+-        searchString,
+-        newString,
+-        logger
+-      );
+-      // Compare the parsed JSON structure of old and new
+-      if (_.isEqual(parsedContents, JSON.parse(testContent))) {
+-        newFileContent = testContent;
+-        break;
++  try {
++    const parsedContents = JSON.parse(currentFileContent);
++    // Save the old version
++    const oldVersion = parsedContents[depType][depName];
++    if (oldVersion === newVersion) {
++      logger.debug('Version is already updated');
++      return currentFileContent;
++    }
++    // Update the file = this is what we want
++    parsedContents[depType][depName] = newVersion;
++    // Look for the old version number
++    const searchString = `"${oldVersion}"`;
++    const newString = `"${newVersion}"`;
++    let newFileContent = null;
++    // Skip ahead to depType section
++    let searchIndex =
++      currentFileContent.indexOf(`"${depType}"`) + depType.length;
++    logger.debug(`Starting search at index ${searchIndex}`);
++    // Iterate through the rest of the file
++    for (; searchIndex < currentFileContent.length; searchIndex += 1) {
++      // First check if we have a hit for the old version
++      if (matchAt(currentFileContent, searchIndex, searchString)) {
++        logger.debug(`Found match at index ${searchIndex}`);
++        // Now test if the result matches
++        const testContent = replaceAt(
++          currentFileContent,
++          searchIndex,
++          searchString,
++          newString,
++          logger
++        );
++        // Compare the parsed JSON structure of old and new
++        if (_.isEqual(parsedContents, JSON.parse(testContent))) {
++          newFileContent = testContent;
++          break;
++        }
+       }
+     }
++    // istanbul ignore if
++    if (!newFileContent) {
++      logger.warn(
++        { currentFileContent, parsedContents, depType, depName, newVersion },
++        'setNewValue error'
++      );
++      return currentFileContent;
++    }
++    return newFileContent;
++  } catch (err) {
++    logger.info({ err }, 'setNewValue error');
++    return null;
+   }
+-  // istanbul ignore if
+-  if (!newFileContent) {
+-    logger.warn(
+-      { currentFileContent, parsedContents, depType, depName, newVersion },
+-      'setNewValue error'
+-    );
+-    return currentFileContent;
+-  }
+-  return newFileContent;
+ }
+ 
+ // Return true if the match string is found at index in content
+diff --git a/lib/workers/branch/parent.js b/lib/workers/branch/parent.js
+index c365c8b46..0bff7920e 100644
+--- a/lib/workers/branch/parent.js
++++ b/lib/workers/branch/parent.js
+@@ -17,7 +17,7 @@ async function getParentBranch(config) {
+   const branchExists = await api.branchExists(branchName);
+   if (!branchExists) {
+     logger.info(`Branch needs creating`);
+-    return undefined;
++    return { parentBranch: undefined };
+   }
+   logger.info(`Branch already exists`);
+ 
+@@ -34,11 +34,11 @@ async function getParentBranch(config) {
+       logger.info(`Branch is stale and needs rebasing`);
+       // We can rebase the branch only if no PR or PR can be rebased
+       if (!pr || pr.canRebase) {
+-        return undefined;
++        return { parentBranch: undefined };
+       }
+       // TODO: Warn here so that it appears in PR body
+       logger.info('Cannot rebase branch');
+-      return branchName;
++      return { parentBranch: branchName, canRebase: false };
+     }
+   }
+ 
+@@ -53,12 +53,12 @@ async function getParentBranch(config) {
+         await config.api.deleteBranch(branchName);
+       }
+       // Setting parentBranch back to undefined means that we'll use the default branch
+-      return undefined;
++      return { parentBranch: undefined };
+     }
+     // Don't do anything different, but warn
+     // TODO: Add warning to PR
+     logger.info(`Branch is not mergeable but can't be rebased`);
+   }
+   logger.debug(`Branch does not need rebasing`);
+-  return branchName;
++  return { parentBranch: branchName, canRebase: true };
+ }

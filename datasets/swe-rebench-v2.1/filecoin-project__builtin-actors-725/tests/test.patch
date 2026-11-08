@@ -1,0 +1,300 @@
+diff --git a/actors/verifreg/tests/harness/mod.rs b/actors/verifreg/tests/harness/mod.rs
+index fb14259..8ce3c95 100644
+--- a/actors/verifreg/tests/harness/mod.rs
++++ b/actors/verifreg/tests/harness/mod.rs
+@@ -344,6 +344,7 @@ impl Harness {
+         expected_alloc_results: BatchReturn,
+         expected_extension_results: BatchReturn,
+         expected_alloc_ids: Vec<AllocationID>,
++        expected_burn: u64,
+     ) -> Result<(), ActorError> {
+         rt.set_caller(*DATACAP_TOKEN_ACTOR_CODE_ID, DATACAP_TOKEN_ACTOR_ADDR);
+         let params = UniversalReceiverParams {
+@@ -351,11 +352,31 @@ impl Harness {
+             payload: serialize(&payload, "payload").unwrap(),
+         };
+ 
++        if !expected_burn.is_zero() {
++            rt.expect_send(
++                DATACAP_TOKEN_ACTOR_ADDR,
++                ext::datacap::Method::Burn as MethodNum,
++                RawBytes::serialize(&BurnParams { amount: TokenAmount::from_whole(expected_burn) })
++                    .unwrap(),
++                TokenAmount::zero(),
++                RawBytes::serialize(&BurnReturn { balance: TokenAmount::zero() }).unwrap(),
++                ExitCode::OK,
++            );
++        }
++
+         rt.expect_validate_caller_addr(vec![DATACAP_TOKEN_ACTOR_ADDR]);
+         let ret = rt.call::<VerifregActor>(
+             Method::UniversalReceiverHook as MethodNum,
+             &serialize(&params, "hook params").unwrap(),
+-        )?;
++        );
++        let ret = match ret {
++            Ok(ret) => ret,
++            Err(e) => {
++                // The burn may or may not have been sent before the abort; drop unmet expectations.
++                rt.reset();
++                return Err(e);
++            }
++        };
+         assert_eq!(
+             RawBytes::serialize(AllocationsResponse {
+                 allocation_results: expected_alloc_results,
+diff --git a/actors/verifreg/tests/verifreg_actor_test.rs b/actors/verifreg/tests/verifreg_actor_test.rs
+index 4c9abc5..284440d 100644
+--- a/actors/verifreg/tests/verifreg_actor_test.rs
++++ b/actors/verifreg/tests/verifreg_actor_test.rs
+@@ -542,6 +542,35 @@ mod allocs_claims {
+         assert!(h.load_alloc(&mut rt, CLIENT1, id2).is_none()); // removed
+     }
+ 
++    #[test]
++    fn allocation_datacap_is_burned_on_claim_or_refunded_on_expiry() {
++        let (h, mut rt) = new_harness();
++        let sector = 1000;
++        let expiry = 1500;
++
++        let claimable = make_alloc("claim-token", CLIENT1, PROVIDER1, ALLOC_SIZE);
++        h.create_alloc(&mut rt, &claimable).unwrap();
++        let claimed = h
++            .claim_allocations(
++                &mut rt,
++                PROVIDER1,
++                vec![make_claim_req(1, &claimable, sector, expiry)],
++                ALLOC_SIZE,
++                false,
++            )
++            .unwrap();
++        assert_eq!(claimed.claimed_space, BigInt::from(ALLOC_SIZE));
++
++        let mut expiring = make_alloc("expiry-token", CLIENT1, PROVIDER1, ALLOC_SIZE);
++        expiring.expiration = 1;
++        let expiring_id = h.create_alloc(&mut rt, &expiring).unwrap();
++        rt.set_epoch(expiring.expiration);
++        let removed = h
++            .remove_expired_allocations(&mut rt, CLIENT1, vec![expiring_id], ALLOC_SIZE)
++            .unwrap();
++        assert_eq!(removed.datacap_recovered, DataCap::from(ALLOC_SIZE));
++    }
++
+     #[test]
+     fn claim_allocs() {
+         let (h, mut rt) = new_harness();
+@@ -919,7 +948,7 @@ mod datacap {
+                 make_alloc_req(&rt, PROVIDER2, SIZE * 2),
+             ];
+             let payload = make_receiver_hook_token_payload(CLIENT1, reqs.clone(), vec![], SIZE * 3);
+-            h.receive_tokens(&mut rt, payload, BatchReturn::ok(2), BATCH_EMPTY, vec![1, 2])
++            h.receive_tokens(&mut rt, payload, BatchReturn::ok(2), BATCH_EMPTY, vec![1, 2], 0)
+                 .unwrap();
+ 
+             // Verify allocations in state.
+@@ -932,7 +961,8 @@ mod datacap {
+             // Make another allocation from a different client
+             let reqs = vec![make_alloc_req(&rt, PROVIDER1, SIZE)];
+             let payload = make_receiver_hook_token_payload(CLIENT2, reqs.clone(), vec![], SIZE);
+-            h.receive_tokens(&mut rt, payload, BatchReturn::ok(1), BATCH_EMPTY, vec![3]).unwrap();
++            h.receive_tokens(&mut rt, payload, BatchReturn::ok(1), BATCH_EMPTY, vec![3], 0)
++                .unwrap();
+ 
+             // Verify allocations in state.
+             assert_allocation(&rt, CLIENT2, 3, &alloc_from_req(CLIENT2, &reqs[0]));
+@@ -958,13 +988,15 @@ mod datacap {
+         let cid1 = h.create_claim(&mut rt, &claim1).unwrap();
+         let cid2 = h.create_claim(&mut rt, &claim2).unwrap();
+ 
+-        let reqs = vec![
+-            make_extension_req(PROVIDER1, cid1, term_max + 1000),
+-            make_extension_req(PROVIDER2, cid2, term_max + 2000),
+-        ];
+-        // Client1 extends both claims
+-        let payload = make_receiver_hook_token_payload(CLIENT1, vec![], reqs, SIZE * 3);
+-        h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(2), vec![]).unwrap();
++        let req1 = make_extension_req(PROVIDER1, cid1, term_max + 1000);
++        let payload = make_receiver_hook_token_payload(CLIENT1, vec![], vec![req1], SIZE);
++        h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![], SIZE)
++            .unwrap();
++
++        let req2 = make_extension_req(PROVIDER2, cid2, term_max + 2000);
++        let payload = make_receiver_hook_token_payload(CLIENT1, vec![], vec![req2], SIZE * 2);
++        h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![], SIZE * 2)
++            .unwrap();
+ 
+         // Verify claims in state.
+         assert_claim(&rt, PROVIDER1, cid1, &Claim { term_max: term_max + 1000, ..claim1 });
+@@ -991,22 +1023,30 @@ mod datacap {
+         let cid1 = h.create_claim(&mut rt, &claim1).unwrap();
+         let cid2 = h.create_claim(&mut rt, &claim2).unwrap();
+ 
+-        let ext_reqs = vec![
+-            make_extension_req(PROVIDER1, cid1, term_max + 1000),
+-            make_extension_req(PROVIDER2, cid2, term_max + 2000),
+-        ];
++        let ext_reqs = vec![make_extension_req(PROVIDER1, cid1, term_max + 1000)];
+ 
+-        // CLIENT1 makes two new allocations and extends two existing claims.
+-        let payload =
+-            make_receiver_hook_token_payload(CLIENT1, alloc_reqs.clone(), ext_reqs, SIZE * 6);
+-        h.receive_tokens(&mut rt, payload, BatchReturn::ok(2), BatchReturn::ok(2), vec![3, 4])
+-            .unwrap();
++        // CLIENT1 makes two new allocations and extends an existing claim.
++        let payload = make_receiver_hook_token_payload(
++            CLIENT1,
++            alloc_reqs.clone(),
++            ext_reqs,
++            SIZE * 4,
++        );
++        h.receive_tokens(
++            &mut rt,
++            payload,
++            BatchReturn::ok(2),
++            BatchReturn::ok(1),
++            vec![3, 4],
++            claim1.size.0,
++        )
++        .unwrap();
+ 
+         // Verify state.
+         assert_allocation(&rt, CLIENT1, 3, &alloc_from_req(CLIENT1, &alloc_reqs[0]));
+         assert_allocation(&rt, CLIENT1, 4, &alloc_from_req(CLIENT1, &alloc_reqs[1]));
+         assert_claim(&rt, PROVIDER1, cid1, &Claim { term_max: term_max + 1000, ..claim1 });
+-        assert_claim(&rt, PROVIDER2, cid2, &Claim { term_max: term_max + 2000, ..claim2 });
++        assert_claim(&rt, PROVIDER2, cid2, &claim2);
+ 
+         let st: State = rt.get_state();
+         assert_eq!(5, st.next_allocation_id);
+@@ -1088,7 +1128,7 @@ mod datacap {
+         expect_abort_contains_message(
+             ExitCode::USR_ILLEGAL_ARGUMENT,
+             format!("allocation provider {} must be a miner actor", provider1).as_str(),
+-            h.receive_tokens(&mut rt, payload, BatchReturn::ok(1), BATCH_EMPTY, vec![1]),
++            h.receive_tokens(&mut rt, payload, BatchReturn::ok(1), BATCH_EMPTY, vec![1], 0),
+         );
+         h.check_state(&rt);
+     }
+@@ -1106,7 +1146,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "allocation size 1048575 below minimum 1048576",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         // Min term too short
+@@ -1117,7 +1157,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "allocation term min 518399 below limit 518400",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         // Max term too long
+@@ -1128,7 +1168,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "allocation term max 5259486 above limit 5259485",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         // Term minimum greater than maximum
+@@ -1140,7 +1180,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "allocation term min 2103795 exceeds term max 2103794",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         // Allocation expires too late
+@@ -1151,7 +1191,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "allocation expiration 172801 exceeds maximum 172800",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         // Tokens received doesn't match sum of allocation sizes
+@@ -1162,7 +1202,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "total allocation size 2097152 must match data cap amount received 2097153",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         // One bad request fails the lot
+@@ -1176,7 +1216,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "allocation size 1048575 below minimum 1048576",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], 0),
+             );
+         }
+         h.check_state(&rt);
+@@ -1207,12 +1247,13 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "term_max 5260486 for claim 1 exceeds maximum 5260485 at current epoch 1100",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], SIZE),
+             );
+             // But just on the limit is allowed
+             let reqs = vec![make_extension_req(PROVIDER1, cid1, max_allowed_term)];
+             let payload = make_receiver_hook_token_payload(CLIENT1, vec![], reqs, SIZE);
+-            h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![]).unwrap();
++            h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![], SIZE)
++                .unwrap();
+         }
+         {
+             // Claim already expired
+@@ -1225,7 +1266,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_FORBIDDEN,
+                 "claim 1 expired at 518600, current epoch 518601",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], SIZE),
+             );
+             // But just at expiration is allowed
+             let epoch = term_start + term_max;
+@@ -1233,7 +1274,8 @@ mod datacap {
+             rt.set_epoch(epoch);
+             let reqs = vec![make_extension_req(PROVIDER1, cid1, new_term)];
+             let payload = make_receiver_hook_token_payload(CLIENT1, vec![], reqs, SIZE);
+-            h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![]).unwrap();
++            h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![], SIZE)
++                .unwrap();
+         }
+         {
+             // Extension is zero
+@@ -1244,7 +1286,7 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "term_max 518500 for claim 1 is not larger than existing term max 518500",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], SIZE),
+             );
+             // Extension is negative
+             let reqs = vec![make_extension_req(PROVIDER1, cid1, term_max - 1)];
+@@ -1252,12 +1294,13 @@ mod datacap {
+             expect_abort_contains_message(
+                 ExitCode::USR_ILLEGAL_ARGUMENT,
+                 "term_max 518499 for claim 1 is not larger than existing term max 518500",
+-                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![]),
++                h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BATCH_EMPTY, vec![], SIZE),
+             );
+             // But extension by just 1 epoch is allowed
+             let reqs = vec![make_extension_req(PROVIDER1, cid1, term_max + 1)];
+             let payload = make_receiver_hook_token_payload(CLIENT1, vec![], reqs, SIZE);
+-            h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![]).unwrap();
++            h.receive_tokens(&mut rt, payload, BATCH_EMPTY, BatchReturn::ok(1), vec![], SIZE)
++                .unwrap();
+         }
+     }
+ }

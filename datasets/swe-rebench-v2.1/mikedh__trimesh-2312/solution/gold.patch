@@ -1,0 +1,714 @@
+diff --git a/Dockerfile b/Dockerfile
+index f134a1bf..f864e423 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -61,9 +61,11 @@ COPY --chown=499 pyproject.toml .
+ COPY --chown=499 ./.git ./.git/
+ 
+ USER root
+-RUN trimesh-setup --install=test,gmsh,gltf_validator,llvmpipe,binvox
++RUN trimesh-setup --install=test,gmsh,gltf_validator,llvmpipe,binvox,blender
+ USER user
+ 
++RUN blender --version
++
+ # install things like pytest and make sure we're on Numpy 2.X
+ RUN pip install .[all] && \
+     python -c "import numpy as n; assert(n.__version__.startswith('2'))"
+diff --git a/docker/trimesh-setup b/docker/trimesh-setup
+index ba614dd1..f66977d7 100755
+--- a/docker/trimesh-setup
++++ b/docker/trimesh-setup
+@@ -6,15 +6,14 @@ environment for `trimesh` in a Debian Docker image.
+ It probably isn't useful for most people unless you are running
+ this exact configuration.
+ """
++
+ import argparse
+ import json
+ import logging
+ import os
+-import shutil
+ import subprocess
+ import sys
+ import tarfile
+-import tempfile
+ from fnmatch import fnmatch
+ from io import BytesIO
+ 
+@@ -43,8 +42,9 @@ config_json = """
+     ],
+     "test": [
+       "curl",
+-      "git"
+-    ],
++      "git",
++      "libxkbcommon0"
++],
+    "gmsh": ["libxft2", "libxinerama-dev", "libxcursor1","libgomp1"]
+   },
+   "fetch": {
+@@ -52,21 +52,30 @@ config_json = """
+       "url": "https://github.com/KhronosGroup/glTF-Validator/releases/download/2.0.0-dev.3.8/gltf_validator-2.0.0-dev.3.8-linux64.tar.xz",
+       "sha256": "374c7807e28fe481b5075f3bb271f580ddfc0af3e930a0449be94ec2c1f6f49a",
+       "target": "$PATH",
+-      "chmod": 755,
++      "chmod": {"gltf_validator": 755},
+       "extract_only": "gltf_validator"
+     },
+     "pandoc": {
+       "url": "https://github.com/jgm/pandoc/releases/download/3.1.1/pandoc-3.1.1-linux-amd64.tar.gz",
+       "sha256": "52b25f0115517e32047a06d821e63729108027bd06d9605fe8eac0fa83e0bf81",
+       "target": "$PATH",
+-      "chmod": 755,
++      "chmod": {"pandoc": 755},
+       "extract_only": "pandoc"
+     },
++
+     "binvox": {
+       "url": "https://trimesh.s3-us-west-1.amazonaws.com/binvox",
+       "sha256": "82ee314a75986f67f1d2b5b3ccdfb3661fe57a6b428aa0e0f798fdb3e1734fe0",
+       "target": "$PATH",
+-      "chmod": 755
++      "chmod": {"binvox": 755}
++    },
++
++    "blender": {
++      "url": "https://mirrors.ocf.berkeley.edu/blender/release/Blender4.2/blender-4.2.3-linux-x64.tar.xz",
++      "sha256": "3a64efd1982465395abab4259b4091d5c8c56054c7267e9633e4f702a71ea3f4",
++      "target": "$PATH",
++      "chmod": {"blender": 755},
++      "strip_components": 1
+     }
+   }
+ }
+@@ -154,7 +163,22 @@ def fetch(url, sha256):
+     return data
+ 
+ 
+-def copy_to_path(file_path, prefix="~"):
++def is_writable(path: str) -> bool:
++    if not os.path.isdir(path):
++        return False
++
++    test_fn = os.path.join(path, ".test_writeable_file")
++    try:
++        with open(test_fn, "w") as f:
++            f.write("can we write here?")
++        os.remove(test_fn)
++        return True
++    except BaseException as E:
++        print(path, E)
++        return False
++
++
++def choose_in_path(prefix="~") -> str:
+     """
+     Copy an executable file onto `PATH`, typically one of
+     the options in the current user's home directory.
+@@ -167,18 +191,6 @@ def copy_to_path(file_path, prefix="~"):
+       The path prefix it is acceptable to copy into,
+       typically `~` for `/home/{current_user}`.
+     """
+-    # get the full path of the requested file
+-    source = os.path.abspath(os.path.expanduser(file_path))
+-
+-    # get the file name
+-    file_name = os.path.split(source)[-1]
+-
+-    # make sure the source file is readable and not empty
+-    with open(source, "rb") as f:
+-        file_data = f.read()
+-    # check for empty files
+-    if len(file_data) == 0:
+-        raise ValueError(f"empty file: {file_path}")
+ 
+     # get all locations in PATH
+     candidates = [
+@@ -202,13 +214,9 @@ def copy_to_path(file_path, prefix="~"):
+ 
+     # try writing to the shortest paths first
+     for index in argsort(scores):
+-        path = os.path.join(candidates[index], file_name)
+-        try:
+-            shutil.copy(source, path)
+-            print(f"wrote `{path}`")
++        path = candidates[index]
++        if is_writable(path):
+             return path
+-        except BaseException:
+-            pass
+ 
+     # none of our candidates worked
+     raise ValueError("unable to write to file")
+@@ -259,17 +267,31 @@ def handle_fetch(
+       A hex string for the hash of the remote resource.
+     target : str
+       Target location on the local file system.
+-    chmod : None or int.
++    chmod : None or dict
+       Change permissions for extracted files.
+     extract_skip : None or iterable
+-      Skip a certain member of the archive.
+-    extract_only : None or str
+-      Extract *only* a single file from the archive,
+-      overrides `extract_skip`.
++      Skip a certain member of the archive using
++      an `fnmatch` pattern, i.e. "lib/*"
++    extract_only : None or iterable
++      Extract only whitelisted files from the archive
++      using an `fnmatch` pattern, i.e. "lib/*"
+     strip_components : int
+       Strip off this many components from the file path
+       in the archive, i.e. at `1`, `a/b/c` is extracted to `target/b/c`
+     """
++    if target.lower().strip() == "$path":
++        target = choose_in_path()
++        log.debug(f"identified destination as `{target}`")
++
++    if chmod is None:
++        chmod = {}
++        
++    if extract_skip is None:
++        extract_skip = []
++    # if passed a single string
++    if isinstance(extract_only, str):
++        extract_only = [extract_only]
++
+     # get the raw bytes
+     log.debug(f"fetching: `{url}`")
+     raw = fetch(url=url, sha256=sha256)
+@@ -284,10 +306,10 @@ def handle_fetch(
+         # get the archive
+         tar = tarfile.open(fileobj=BytesIO(raw), mode=mode)
+ 
+-        if extract_skip is None:
+-            extract_skip = []
+-
+         for member in tar.getmembers():
++            if member.isdir():
++                continue
++
+             # final name after stripping components
+             name = "/".join(member.name.split("/")[strip_components:])
+ 
+@@ -296,44 +318,28 @@ def handle_fetch(
+                 log.debug(f"skipping: `{name}`")
+                 continue
+ 
+-            if extract_only is None:
+-                path = os.path.join(target, name)
+-                log.debug(f"extracting: `{path}`")
+-                extract(tar=tar, member=member, path=path, chmod=chmod)
+-            else:
+-                name = name.split("/")[-1]
+-                if name == extract_only:
+-                    if target.lower() == "$path":
+-                        with tempfile.TemporaryDirectory() as D:
+-                            path = os.path.join(D, name)
+-                            log.debug(f"extracting `{path}`")
+-                            extract(tar=tar, member=member, path=path, chmod=chmod)
+-                            copy_to_path(path)
+-                            return
+-
+-                    path = os.path.join(target, name)
+-                    log.debug(f"extracting `{path}`")
+-                    extract(tar=tar, member=member, path=path, chmod=chmod)
+-                    return
++            if extract_only is not None and not any(
++                fnmatch(name, p) for p in extract_only
++            ):
++                log.debug(f"skipping: `{name}`")
++                continue
++
++            path = os.path.join(target, name)
++            log.debug(f"extracting: `{path}`")
++            extract(tar=tar, member=member, path=path, chmod=chmod.get(name, None))
++
+     else:
+         # a single file
+         name = url.split("/")[-1].strip()
+-        if target.lower() == "$path":
+-            with tempfile.TemporaryDirectory() as D:
+-                temp_path = os.path.join(D, name)
+-                with open(temp_path, "wb") as f:
+-                    f.write(raw)
+-                # move the file somewhere on the path
+-                path = copy_to_path(temp_path)
+-        else:
+-            path = target
+-            with open(path, "wb") as f:
+-                f.write(raw)
++        path = os.path.join(target, name)
++        with open(path, "wb") as f:
++            f.write(raw)
+ 
++        current = chmod.get(name, None)
+         # apply chmod if requested
+-        if chmod is not None:
++        if current is not None:
+             # python os.chmod takes an octal value
+-            os.chmod(path, int(str(chmod), base=8))
++            os.chmod(path, int(str(current), base=8))
+ 
+ 
+ def load_config():
+@@ -357,8 +363,8 @@ if __name__ == "__main__":
+     # collect `apt-get install`-able package
+     apt_select = []
+     handlers = {
+-        "fetch": lambda x: handle_fetch(**x),
+         "apt": lambda x: apt_select.extend(x),
++        "fetch": lambda x: handle_fetch(**x),
+     }
+ 
+     # allow comma delimiters and de-duplicate
+@@ -366,7 +372,7 @@ if __name__ == "__main__":
+         parser.print_help()
+         exit()
+     else:
+-        select = set(" ".join(args.install).replace(",", " ").split())
++        select = " ".join(args.install).replace(",", " ").split()
+ 
+     log.debug(f'installing metapackages: `{", ".join(select)}`')
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 6a906c4e..b385a492 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -5,7 +5,7 @@ requires = ["setuptools >= 61.0", "wheel"]
+ [project]
+ name = "trimesh"
+ requires-python = ">=3.8"
+-version = "4.5.1"
++version = "4.5.2"
+ authors = [{name = "Michael Dawson-Haggerty", email = "mikedh@kerfed.com"}]
+ license = {file = "LICENSE.md"}
+ description = "Import, export, process, analyze and view triangular meshes."
+@@ -24,10 +24,12 @@ classifiers = [
+     "Topic :: Multimedia :: Graphics",
+     "Topic :: Multimedia :: Graphics :: 3D Modeling"
+ ]
+-urls = {Homepage = "https://github.com/mikedh/trimesh"}
+-
+ dependencies = ["numpy>=1.20"]
+ 
++[project.urls]
++homepage = "https://github.com/mikedh/trimesh"
++documentation = "https://trimesh.org"
++
+ [project.readme]
+ file = "README.md"
+ content-type = "text/markdown"
+diff --git a/trimesh/__init__.py b/trimesh/__init__.py
+index 00ebec5d..0742d68f 100644
+--- a/trimesh/__init__.py
++++ b/trimesh/__init__.py
+@@ -25,6 +25,7 @@ from . import (
+     grouping,
+     inertia,
+     intersections,
++    iteration,
+     nsphere,
+     permutate,
+     poses,
+@@ -102,6 +103,7 @@ __all__ = [
+     "graph",
+     "grouping",
+     "inertia",
++    "iteration",
+     "intersections",
+     "load",
+     "load_mesh",
+diff --git a/trimesh/boolean.py b/trimesh/boolean.py
+index 009d767d..4c113f57 100644
+--- a/trimesh/boolean.py
++++ b/trimesh/boolean.py
+@@ -7,14 +7,16 @@ Do boolean operations on meshes using either Blender or Manifold.
+ 
+ import numpy as np
+ 
+-from . import exceptions, interfaces
+-from .typed import Callable, NDArray, Optional, Sequence, Union
++from . import interfaces
++from .exceptions import ExceptionWrapper
++from .iteration import reduce_cascade
++from .typed import Callable, Dict, Optional, Sequence
+ 
+ try:
+     from manifold3d import Manifold, Mesh
+ except BaseException as E:
+-    Mesh = exceptions.ExceptionWrapper(E)
+-    Manifold = exceptions.ExceptionWrapper(E)
++    Mesh = ExceptionWrapper(E)
++    Manifold = ExceptionWrapper(E)
+ 
+ 
+ def difference(
+@@ -168,76 +170,32 @@ def boolean_manifold(
+     return Trimesh(vertices=result_mesh.vert_properties, faces=result_mesh.tri_verts)
+ 
+ 
+-def reduce_cascade(operation: Callable, items: Union[Sequence, NDArray]):
+-    """
+-    Call an operation function in a cascaded pairwise way against a
+-    flat list of items.
+-
+-    This should produce the same result as `functools.reduce`
+-    if `operation` is commutable like addition or multiplication.
+-    This may be faster for an `operation` that runs with a speed
+-    proportional to its largest input, which mesh booleans appear to.
+-
+-    The union of a large number of small meshes appears to be
+-    "much faster" using this method.
+-
+-    This only differs from `functools.reduce` for commutative `operation`
+-    in that it returns `None` on empty inputs rather than `functools.reduce`
+-    which raises a `TypeError`.
+-
+-    For example on `a b c d e f g` this function would run and return:
+-        a b
+-        c d
+-        e f
+-        ab cd
+-        ef g
+-        abcd efg
+-     -> abcdefg
+-
+-    Where `functools.reduce` would run and return:
+-        a b
+-        ab c
+-        abc d
+-        abcd e
+-        abcde f
+-        abcdef g
+-     -> abcdefg
+-
+-    Parameters
+-    ----------
+-    operation
+-      The function to call on pairs of items.
+-    items
+-      The flat list of items to apply operation against.
+-    """
+-    if len(items) == 0:
+-        return None
+-    elif len(items) == 1:
+-        # skip the loop overhead for a single item
+-        return items[0]
+-    elif len(items) == 2:
+-        # skip the loop overhead for a single pair
+-        return operation(items[0], items[1])
+-
+-    for _ in range(int(1 + np.log2(len(items)))):
+-        results = []
+-        for i in np.arange(len(items) // 2) * 2:
+-            results.append(operation(items[i], items[i + 1]))
+-
+-        if len(items) % 2:
+-            results.append(items[-1])
++# which backend boolean engines do we have
++_engines: Dict[str, Callable] = {}
+ 
+-        items = results
++if isinstance(Manifold, ExceptionWrapper):
++    # manifold isn't available so use the import error
++    _engines["manifold"] = Manifold
++else:
++    # manifold3d is the preferred option
++    _engines["manifold"] = boolean_manifold
+ 
+-    # logic should have reduced to a single item
+-    assert len(results) == 1
+ 
+-    return results[0]
++if interfaces.blender.exists:
++    # we have `blender` in the path which  we can call with subprocess
++    _engines["blender"] = interfaces.blender.boolean
++else:
++    # failing that add a helpful error message
++    _engines["blender"] = ExceptionWrapper(ImportError("`blender` is not in `PATH`"))
+ 
++# pick the first value that isn't an ExceptionWrapper.
++_engines[None] = next(
++    (v for v in _engines.values() if not isinstance(v, ExceptionWrapper)),
++    ExceptionWrapper(
++        ImportError("No boolean backend: `pip install manifold3d` or install `blender`")
++    ),
++)
+ 
+-# which backend boolean engines
+-_engines = {
+-    None: boolean_manifold,
+-    "manifold": boolean_manifold,
+-    "blender": interfaces.blender.boolean,
++engines_available = {
++    k for k, v in _engines.items() if not isinstance(v, ExceptionWrapper)
+ }
+diff --git a/trimesh/exchange/xaml.py b/trimesh/exchange/xaml.py
+index 20a33926..a988a518 100644
+--- a/trimesh/exchange/xaml.py
++++ b/trimesh/exchange/xaml.py
+@@ -136,7 +136,7 @@ def load_XAML(file_obj, *args, **kwargs):
+             normals.append(c_normals)
+ 
+     # compile the results into clean numpy arrays
+-    result = {}
++    result = {"units": "meters"}
+     result["vertices"], result["faces"] = util.append_faces(vertices, faces)
+     result["face_colors"] = np.vstack(colors)
+     result["vertex_normals"] = np.vstack(normals)
+diff --git a/trimesh/interfaces/__init__.py b/trimesh/interfaces/__init__.py
+index 4f58ef4a..45416ec8 100644
+--- a/trimesh/interfaces/__init__.py
++++ b/trimesh/interfaces/__init__.py
+@@ -1,4 +1,4 @@
+ from . import blender, gmsh
+ 
+ # add to __all__ as per pep8
+-__all__ = ["blender", "gmsh"]
++__all__ = ["gmsh", "blender"]
+diff --git a/trimesh/iteration.py b/trimesh/iteration.py
+new file mode 100644
+index 00000000..5994341f
+--- /dev/null
++++ b/trimesh/iteration.py
+@@ -0,0 +1,125 @@
++import numpy as np
++
++from .typed import Any, Callable, Iterable, List, NDArray, Sequence, Union
++
++
++def reduce_cascade(operation: Callable, items: Union[Sequence, NDArray]):
++    """
++    Call an operation function in a cascaded pairwise way against a
++    flat list of items.
++
++    This should produce the same result as `functools.reduce`
++    if `operation` is commutable like addition or multiplication.
++    This may be faster for an `operation` that runs with a speed
++    proportional to its largest input, which mesh booleans appear to.
++
++    The union of a large number of small meshes appears to be
++    "much faster" using this method.
++
++    This only differs from `functools.reduce` for commutative `operation`
++    in that it returns `None` on empty inputs rather than `functools.reduce`
++    which raises a `TypeError`.
++
++    For example on `a b c d e f g` this function would run and return:
++        a b
++        c d
++        e f
++        ab cd
++        ef g
++        abcd efg
++     -> abcdefg
++
++    Where `functools.reduce` would run and return:
++        a b
++        ab c
++        abc d
++        abcd e
++        abcde f
++        abcdef g
++     -> abcdefg
++
++    Parameters
++    ----------
++    operation
++      The function to call on pairs of items.
++    items
++      The flat list of items to apply operation against.
++    """
++    if len(items) == 0:
++        return None
++    elif len(items) == 1:
++        # skip the loop overhead for a single item
++        return items[0]
++    elif len(items) == 2:
++        # skip the loop overhead for a single pair
++        return operation(items[0], items[1])
++
++    for _ in range(int(1 + np.log2(len(items)))):
++        results = []
++        for i in np.arange(len(items) // 2) * 2:
++            results.append(operation(items[i], items[i + 1]))
++
++        if len(items) % 2:
++            results.append(items[-1])
++
++        items = results
++
++    # logic should have reduced to a single item
++    assert len(results) == 1
++
++    return results[0]
++
++
++def chain(*args: Union[Iterable[Any], Any, None]) -> List[Any]:
++    """
++    A less principled version of `list(itertools.chain(*args))` that
++    accepts non-iterable values, filters `None`, and returns a list
++    rather than yielding values.
++
++    If all passed values are iterables this will return identical
++    results to `list(itertools.chain(*args))`.
++
++
++    Examples
++    ----------
++
++    In [1]: list(itertools.chain([1,2], [3]))
++    Out[1]: [1, 2, 3]
++
++    In [2]: trimesh.util.chain([1,2], [3])
++    Out[2]: [1, 2, 3]
++
++    In [3]: trimesh.util.chain([1,2], [3], 4)
++    Out[3]: [1, 2, 3, 4]
++
++    In [4]: list(itertools.chain([1,2], [3], 4))
++      ----> 1 list(itertools.chain([1,2], [3], 4))
++      TypeError: 'int' object is not iterable
++
++    In [5]: trimesh.util.chain([1,2], None, 3, None, [4], [], [], 5, [])
++    Out[5]: [1, 2, 3, 4, 5]
++
++
++    Parameters
++    -----------
++    args
++      Will be individually checked to see if they're iterable
++      before either being appended or extended to a flat list.
++
++
++    Returns
++    ----------
++    chained
++      The values in a flat list.
++    """
++    # collect values to a flat list
++    chained = []
++    # extend if it's a sequence, otherwise append
++    [
++        chained.extend(a)
++        if (hasattr(a, "__iter__") and not isinstance(a, str))
++        else chained.append(a)
++        for a in args
++        if a is not None
++    ]
++    return chained
+diff --git a/trimesh/path/polygons.py b/trimesh/path/polygons.py
+index e481dd57..7fa793db 100644
+--- a/trimesh/path/polygons.py
++++ b/trimesh/path/polygons.py
+@@ -3,9 +3,9 @@ from shapely import ops
+ from shapely.geometry import Polygon
+ 
+ from .. import bounds, geometry, graph, grouping
+-from ..boolean import reduce_cascade
+ from ..constants import log
+ from ..constants import tol_path as tol
++from ..iteration import reduce_cascade
+ from ..transformations import transform_points
+ from ..typed import Iterable, NDArray, Number, Optional, Union, float64, int64
+ from .simplify import fit_circle_check
+diff --git a/trimesh/util.py b/trimesh/util.py
+index ab452e69..66ac4775 100644
+--- a/trimesh/util.py
++++ b/trimesh/util.py
+@@ -22,8 +22,10 @@ from io import BytesIO, StringIO
+ 
+ import numpy as np
+ 
++from .iteration import chain
++
+ # use our wrapped types for wider version compatibility
+-from .typed import Any, Iterable, List, Union
++from .typed import Union
+ 
+ # create a default logger
+ log = logging.getLogger("trimesh")
+@@ -1384,59 +1386,6 @@ def type_named(obj, name):
+     raise ValueError("Unable to extract class of name " + name)
+ 
+ 
+-def chain(*args: Union[Iterable[Any], Any, None]) -> List[Any]:
+-    """
+-    A less principled version of `list(itertools.chain(*args))` that
+-    accepts non-iterable values, filters `None`, and returns a list
+-    rather than yielding values.
+-
+-    If all passed values are iterables this will return identical
+-    results to `list(itertools.chain(*args))`.
+-
+-
+-    Examples
+-    ----------
+-
+-    In [1]: list(itertools.chain([1,2], [3]))
+-    Out[1]: [1, 2, 3]
+-
+-    In [2]: trimesh.util.chain([1,2], [3])
+-    Out[2]: [1, 2, 3]
+-
+-    In [3]: trimesh.util.chain([1,2], [3], 4)
+-    Out[3]: [1, 2, 3, 4]
+-
+-    In [4]: list(itertools.chain([1,2], [3], 4))
+-      ----> 1 list(itertools.chain([1,2], [3], 4))
+-      TypeError: 'int' object is not iterable
+-
+-    In [5]: trimesh.util.chain([1,2], None, 3, None, [4], [], [], 5, [])
+-    Out[5]: [1, 2, 3, 4, 5]
+-
+-
+-    Parameters
+-    -----------
+-    args
+-      Will be individually checked to see if they're iterable
+-      before either being appended or extended to a flat list.
+-
+-
+-    Returns
+-    ----------
+-    chained
+-      The values in a flat list.
+-    """
+-    # collect values to a flat list
+-    chained = []
+-    # extend if it's a sequence, otherwise append
+-    [
+-        chained.extend(a) if is_sequence(a) else chained.append(a)
+-        for a in args
+-        if a is not None
+-    ]
+-    return chained
+-
+-
+ def concatenate(
+     a, b=None
+ ) -> Union["trimesh.Trimesh", "trimesh.path.Path2D", "trimesh.path.Path3D"]:  # noqa: F821
+diff --git a/trimesh/viewer/widget.py b/trimesh/viewer/widget.py
+index a6e8c909..3636a3da 100644
+--- a/trimesh/viewer/widget.py
++++ b/trimesh/viewer/widget.py
+@@ -14,7 +14,7 @@ from pyglet import gl
+ 
+ from .. import rendering
+ from .trackball import Trackball
+-from .windowed import SceneViewer, geometry_hash
++from .windowed import SceneViewer, _geometry_hash
+ 
+ 
+ class SceneGroup(pyglet.graphics.Group):
+@@ -249,7 +249,7 @@ class SceneWidget(glooey.Widget):
+         self._draw()
+ 
+     def _update_node(self, node_name, geometry_name, geometry, transform):
+-        geometry_hash_new = geometry_hash(geometry)
++        geometry_hash_new = _geometry_hash(geometry)
+         if self.vertex_list_hash.get(geometry_name) != geometry_hash_new:
+             # if geometry has texture defined convert it to opengl form
+             if hasattr(geometry, "visual") and hasattr(geometry.visual, "material"):

@@ -1,0 +1,383 @@
+diff --git a/crates/hir_def/src/nameres/path_resolution.rs b/crates/hir_def/src/nameres/path_resolution.rs
+index dd1db0094b..fdcdc23ae7 100644
+--- a/crates/hir_def/src/nameres/path_resolution.rs
++++ b/crates/hir_def/src/nameres/path_resolution.rs
+@@ -77,7 +77,7 @@ impl DefMap {
+         original_module: LocalModuleId,
+         visibility: &RawVisibility,
+     ) -> Option<Visibility> {
+-        let mut vis = match visibility {
++        match visibility {
+             RawVisibility::Module(path) => {
+                 let (result, remaining) =
+                     self.resolve_path(db, original_module, &path, BuiltinShadowMode::Module);
+@@ -86,28 +86,15 @@ impl DefMap {
+                 }
+                 let types = result.take_types()?;
+                 match types {
+-                    ModuleDefId::ModuleId(m) => Visibility::Module(m),
++                    ModuleDefId::ModuleId(m) => Some(Visibility::Module(m)),
+                     _ => {
+                         // error: visibility needs to refer to module
+-                        return None;
++                        None
+                     }
+                 }
+             }
+-            RawVisibility::Public => Visibility::Public,
+-        };
+-
+-        // In block expressions, `self` normally refers to the containing non-block module, and
+-        // `super` to its parent (etc.). However, visibilities must only refer to a module in the
+-        // DefMap they're written in, so we restrict them when that happens.
+-        if let Visibility::Module(m) = vis {
+-            if self.block_id() != m.block {
+-                mark::hit!(adjust_vis_in_block_def_map);
+-                vis = Visibility::Module(self.module_id(self.root()));
+-                log::debug!("visibility {:?} points outside DefMap, adjusting to {:?}", m, vis);
+-            }
++            RawVisibility::Public => Some(Visibility::Public),
+         }
+-
+-        Some(vis)
+     }
+ 
+     // Returns Yes if we are sure that additions to `ItemMap` wouldn't change
+diff --git a/crates/hir_expand/src/builtin_macro.rs b/crates/hir_expand/src/builtin_macro.rs
+index 57bc6fbd78..6fbb9570a8 100644
+--- a/crates/hir_expand/src/builtin_macro.rs
++++ b/crates/hir_expand/src/builtin_macro.rs
+@@ -6,7 +6,7 @@ use crate::{
+ 
+ use base_db::{AnchoredPath, FileId};
+ use either::Either;
+-use mbe::{parse_to_token_tree, ExpandResult};
++use mbe::{parse_exprs_with_sep, parse_to_token_tree, ExpandResult};
+ use parser::FragmentKind;
+ use syntax::ast::{self, AstToken};
+ 
+@@ -238,35 +238,21 @@ fn format_args_expand(
+     // ])
+     // ```,
+     // which is still not really correct, but close enough for now
+-    let mut args = Vec::new();
+-    let mut current = Vec::new();
+-    for tt in tt.token_trees.iter().cloned() {
+-        match tt {
+-            tt::TokenTree::Leaf(tt::Leaf::Punct(p)) if p.char == ',' => {
+-                args.push(current);
+-                current = Vec::new();
+-            }
+-            _ => {
+-                current.push(tt);
+-            }
+-        }
+-    }
+-    if !current.is_empty() {
+-        args.push(current);
+-    }
++    let mut args = parse_exprs_with_sep(tt, ',');
++
+     if args.is_empty() {
+         return ExpandResult::only_err(mbe::ExpandError::NoMatchingRule);
+     }
+     for arg in &mut args {
+         // Remove `key =`.
+-        if matches!(arg.get(1), Some(tt::TokenTree::Leaf(tt::Leaf::Punct(p))) if p.char == '=' && p.spacing != tt::Spacing::Joint)
++        if matches!(arg.token_trees.get(1), Some(tt::TokenTree::Leaf(tt::Leaf::Punct(p))) if p.char == '=' && p.spacing != tt::Spacing::Joint)
+         {
+-            arg.drain(..2);
++            arg.token_trees.drain(..2);
+         }
+     }
+     let _format_string = args.remove(0);
+     let arg_tts = args.into_iter().flat_map(|arg| {
+-        quote! { std::fmt::ArgumentV1::new(&(##arg), std::fmt::Display::fmt), }
++        quote! { std::fmt::ArgumentV1::new(&(#arg), std::fmt::Display::fmt), }
+     }.token_trees).collect::<Vec<_>>();
+     let expanded = quote! {
+         std::fmt::Arguments::new_v1(&[], &[##arg_tts])
+@@ -719,6 +705,25 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_format_args_expand_with_comma_exprs() {
++        let expanded = expand_builtin_macro(
++            r#"
++            #[rustc_builtin_macro]
++            macro_rules! format_args {
++                ($fmt:expr) => ({ /* compiler built-in */ });
++                ($fmt:expr, $($args:tt)*) => ({ /* compiler built-in */ })
++            }
++            format_args!("{} {:?}", a::<A,B>(), b);
++            "#,
++        );
++
++        assert_eq!(
++            expanded,
++            r#"std::fmt::Arguments::new_v1(&[], &[std::fmt::ArgumentV1::new(&(a::<A,B>()),std::fmt::Display::fmt),std::fmt::ArgumentV1::new(&(b),std::fmt::Display::fmt),])"#
++        );
++    }
++
+     #[test]
+     fn test_include_bytes_expand() {
+         let expanded = expand_builtin_macro(
+diff --git a/crates/mbe/src/expander/matcher.rs b/crates/mbe/src/expander/matcher.rs
+index 800931cd1d..e3bd4c09a0 100644
+--- a/crates/mbe/src/expander/matcher.rs
++++ b/crates/mbe/src/expander/matcher.rs
+@@ -3,15 +3,13 @@
+ use crate::{
+     expander::{Binding, Bindings, Fragment},
+     parser::{Op, RepeatKind, Separator},
+-    subtree_source::SubtreeTokenSource,
+     tt_iter::TtIter,
+     ExpandError, MetaTemplate,
+ };
+ 
+ use super::ExpandResult;
+-use parser::{FragmentKind::*, TreeSink};
+-use syntax::{SmolStr, SyntaxKind};
+-use tt::buffer::{Cursor, TokenBuffer};
++use parser::FragmentKind::*;
++use syntax::SmolStr;
+ 
+ impl Bindings {
+     fn push_optional(&mut self, name: &SmolStr) {
+@@ -409,68 +407,6 @@ impl<'a> TtIter<'a> {
+         .into())
+     }
+ 
+-    fn expect_fragment(
+-        &mut self,
+-        fragment_kind: parser::FragmentKind,
+-    ) -> ExpandResult<Option<tt::TokenTree>> {
+-        struct OffsetTokenSink<'a> {
+-            cursor: Cursor<'a>,
+-            error: bool,
+-        }
+-
+-        impl<'a> TreeSink for OffsetTokenSink<'a> {
+-            fn token(&mut self, kind: SyntaxKind, mut n_tokens: u8) {
+-                if kind == SyntaxKind::LIFETIME_IDENT {
+-                    n_tokens = 2;
+-                }
+-                for _ in 0..n_tokens {
+-                    self.cursor = self.cursor.bump_subtree();
+-                }
+-            }
+-            fn start_node(&mut self, _kind: SyntaxKind) {}
+-            fn finish_node(&mut self) {}
+-            fn error(&mut self, _error: parser::ParseError) {
+-                self.error = true;
+-            }
+-        }
+-
+-        let buffer = TokenBuffer::from_tokens(&self.inner.as_slice());
+-        let mut src = SubtreeTokenSource::new(&buffer);
+-        let mut sink = OffsetTokenSink { cursor: buffer.begin(), error: false };
+-
+-        parser::parse_fragment(&mut src, &mut sink, fragment_kind);
+-
+-        let mut err = None;
+-        if !sink.cursor.is_root() || sink.error {
+-            err = Some(err!("expected {:?}", fragment_kind));
+-        }
+-
+-        let mut curr = buffer.begin();
+-        let mut res = vec![];
+-
+-        if sink.cursor.is_root() {
+-            while curr != sink.cursor {
+-                if let Some(token) = curr.token_tree() {
+-                    res.push(token);
+-                }
+-                curr = curr.bump();
+-            }
+-        }
+-        self.inner = self.inner.as_slice()[res.len()..].iter();
+-        if res.len() == 0 && err.is_none() {
+-            err = Some(err!("no tokens consumed"));
+-        }
+-        let res = match res.len() {
+-            1 => Some(res[0].cloned()),
+-            0 => None,
+-            _ => Some(tt::TokenTree::Subtree(tt::Subtree {
+-                delimiter: None,
+-                token_trees: res.into_iter().map(|it| it.cloned()).collect(),
+-            })),
+-        };
+-        ExpandResult { value: res, err }
+-    }
+-
+     fn eat_vis(&mut self) -> Option<tt::TokenTree> {
+         let mut fork = self.clone();
+         match fork.expect_fragment(Visibility) {
+diff --git a/crates/mbe/src/lib.rs b/crates/mbe/src/lib.rs
+index 6b4a4eb53e..4c298f85fb 100644
+--- a/crates/mbe/src/lib.rs
++++ b/crates/mbe/src/lib.rs
+@@ -65,8 +65,8 @@ impl fmt::Display for ExpandError {
+ }
+ 
+ pub use crate::syntax_bridge::{
+-    ast_to_token_tree, parse_to_token_tree, syntax_node_to_token_tree, token_tree_to_syntax_node,
+-    TokenMap,
++    ast_to_token_tree, parse_exprs_with_sep, parse_to_token_tree, syntax_node_to_token_tree,
++    token_tree_to_syntax_node, TokenMap,
+ };
+ 
+ /// This struct contains AST for a single `macro_rules` definition. What might
+diff --git a/crates/mbe/src/syntax_bridge.rs b/crates/mbe/src/syntax_bridge.rs
+index 0cdc175be7..5a91781fc4 100644
+--- a/crates/mbe/src/syntax_bridge.rs
++++ b/crates/mbe/src/syntax_bridge.rs
+@@ -10,8 +10,8 @@ use syntax::{
+ };
+ use tt::buffer::{Cursor, TokenBuffer};
+ 
+-use crate::subtree_source::SubtreeTokenSource;
+ use crate::ExpandError;
++use crate::{subtree_source::SubtreeTokenSource, tt_iter::TtIter};
+ 
+ #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+ pub enum TokenTextRange {
+@@ -112,6 +112,43 @@ pub fn parse_to_token_tree(text: &str) -> Option<(tt::Subtree, TokenMap)> {
+     Some((subtree, conv.id_alloc.map))
+ }
+ 
++/// Split token tree with seperate expr: $($e:expr)SEP*
++pub fn parse_exprs_with_sep(tt: &tt::Subtree, sep: char) -> Vec<tt::Subtree> {
++    if tt.token_trees.is_empty() {
++        return Vec::new();
++    }
++
++    let mut iter = TtIter::new(tt);
++    let mut res = Vec::new();
++
++    while iter.peek_n(0).is_some() {
++        let expanded = iter.expect_fragment(FragmentKind::Expr);
++        if expanded.err.is_some() {
++            break;
++        }
++
++        res.push(match expanded.value {
++            None => break,
++            Some(tt @ tt::TokenTree::Leaf(_)) => {
++                tt::Subtree { delimiter: None, token_trees: vec![tt.into()] }
++            }
++            Some(tt::TokenTree::Subtree(tt)) => tt,
++        });
++
++        let mut fork = iter.clone();
++        if fork.expect_char(sep).is_err() {
++            break;
++        }
++        iter = fork;
++    }
++
++    if iter.peek_n(0).is_some() {
++        res.push(tt::Subtree { delimiter: None, token_trees: iter.into_iter().cloned().collect() });
++    }
++
++    res
++}
++
+ impl TokenMap {
+     pub fn token_by_range(&self, relative_range: TextRange) -> Option<tt::TokenId> {
+         let &(token_id, _) = self.entries.iter().find(|(_, range)| match range {
+diff --git a/crates/mbe/src/tt_iter.rs b/crates/mbe/src/tt_iter.rs
+index 46c4207185..a362d31fcf 100644
+--- a/crates/mbe/src/tt_iter.rs
++++ b/crates/mbe/src/tt_iter.rs
+@@ -1,5 +1,20 @@
+ //! FIXME: write short doc here
+ 
++use crate::{subtree_source::SubtreeTokenSource, ExpandError, ExpandResult};
++
++use parser::TreeSink;
++use syntax::SyntaxKind;
++use tt::buffer::{Cursor, TokenBuffer};
++
++macro_rules! err {
++    () => {
++        ExpandError::BindingError(format!(""))
++    };
++    ($($tt:tt)*) => {
++        ExpandError::BindingError(format!($($tt)*))
++    };
++}
++
+ #[derive(Debug, Clone)]
+ pub(crate) struct TtIter<'a> {
+     pub(crate) inner: std::slice::Iter<'a, tt::TokenTree>,
+@@ -56,6 +71,68 @@ impl<'a> TtIter<'a> {
+         }
+     }
+ 
++    pub(crate) fn expect_fragment(
++        &mut self,
++        fragment_kind: parser::FragmentKind,
++    ) -> ExpandResult<Option<tt::TokenTree>> {
++        struct OffsetTokenSink<'a> {
++            cursor: Cursor<'a>,
++            error: bool,
++        }
++
++        impl<'a> TreeSink for OffsetTokenSink<'a> {
++            fn token(&mut self, kind: SyntaxKind, mut n_tokens: u8) {
++                if kind == SyntaxKind::LIFETIME_IDENT {
++                    n_tokens = 2;
++                }
++                for _ in 0..n_tokens {
++                    self.cursor = self.cursor.bump_subtree();
++                }
++            }
++            fn start_node(&mut self, _kind: SyntaxKind) {}
++            fn finish_node(&mut self) {}
++            fn error(&mut self, _error: parser::ParseError) {
++                self.error = true;
++            }
++        }
++
++        let buffer = TokenBuffer::from_tokens(&self.inner.as_slice());
++        let mut src = SubtreeTokenSource::new(&buffer);
++        let mut sink = OffsetTokenSink { cursor: buffer.begin(), error: false };
++
++        parser::parse_fragment(&mut src, &mut sink, fragment_kind);
++
++        let mut err = None;
++        if !sink.cursor.is_root() || sink.error {
++            err = Some(err!("expected {:?}", fragment_kind));
++        }
++
++        let mut curr = buffer.begin();
++        let mut res = vec![];
++
++        if sink.cursor.is_root() {
++            while curr != sink.cursor {
++                if let Some(token) = curr.token_tree() {
++                    res.push(token);
++                }
++                curr = curr.bump();
++            }
++        }
++        self.inner = self.inner.as_slice()[res.len()..].iter();
++        if res.len() == 0 && err.is_none() {
++            err = Some(err!("no tokens consumed"));
++        }
++        let res = match res.len() {
++            1 => Some(res[0].cloned()),
++            0 => None,
++            _ => Some(tt::TokenTree::Subtree(tt::Subtree {
++                delimiter: None,
++                token_trees: res.into_iter().map(|it| it.cloned()).collect(),
++            })),
++        };
++        ExpandResult { value: res, err }
++    }
++
+     pub(crate) fn peek_n(&self, n: usize) -> Option<&tt::TokenTree> {
+         self.inner.as_slice().get(n)
+     }

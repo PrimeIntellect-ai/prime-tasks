@@ -1,0 +1,345 @@
+diff --git a/server/norace_test.go b/server/norace_test.go
+index 06a8d2b3..dba4556c 100644
+--- a/server/norace_test.go
++++ b/server/norace_test.go
+@@ -9141,3 +9141,7 @@ func TestNoRaceFileStoreLargeMsgsAndFirstMatching(t *testing.T) {
+ 	fs.LoadNextMsg("*.baz.*", true, fseq, nil)
+ 	require_True(t, time.Since(start) < 200*time.Microsecond)
+ }
++
++func TestNoRaceWSNoCorruptionWithFrameSizeLimit(t *testing.T) {
++	testWSNoCorruptionWithFrameSizeLimit(t, 50000, 100000)
++}
+diff --git a/server/websocket_test.go b/server/websocket_test.go
+index 3fdb1fdb..da6f678f 100644
+--- a/server/websocket_test.go
++++ b/server/websocket_test.go
+@@ -30,10 +30,12 @@ import (
+ 	"reflect"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/nats-io/jwt/v2"
++	"github.com/nats-io/nats.go"
+ 	"github.com/nats-io/nkeys"
+ 
+ 	"github.com/klauspost/compress/flate"
+@@ -4066,6 +4068,315 @@ func TestWSWithPartialWrite(t *testing.T) {
+ 	}
+ }
+ 
++func readWSMessageForTest(r io.Reader) ([]byte, error) {
++	var message []byte
++	for {
++		var header [2]byte
++		if _, err := io.ReadFull(r, header[:]); err != nil {
++			return nil, err
++		}
++		length := uint64(header[1] & 0x7f)
++		switch length {
++		case 126:
++			var extended [2]byte
++			if _, err := io.ReadFull(r, extended[:]); err != nil {
++				return nil, err
++			}
++			length = uint64(binary.BigEndian.Uint16(extended[:]))
++		case 127:
++			var extended [8]byte
++			if _, err := io.ReadFull(r, extended[:]); err != nil {
++				return nil, err
++			}
++			length = binary.BigEndian.Uint64(extended[:])
++		}
++		if length > uint64(^uint(0)>>1) {
++			return nil, fmt.Errorf("WebSocket frame is too large: %d", length)
++		}
++		frame := make([]byte, int(length))
++		if _, err := io.ReadFull(r, frame); err != nil {
++			return nil, err
++		}
++		message = append(message, frame...)
++		if header[0]&wsFinalBit != 0 {
++			return message, nil
++		}
++	}
++}
++
++func readBrowserNATSMessages(r io.Reader, payload []byte, total int) error {
++	var pending []byte
++	for received := 0; received < total; {
++		frame, err := readWSMessageForTest(r)
++		if err != nil {
++			return err
++		}
++		pending = append(pending, frame...)
++		for {
++			lineEnd := bytes.Index(pending, []byte("\r\n"))
++			if lineEnd < 0 {
++				break
++			}
++			fields := strings.Fields(string(pending[:lineEnd]))
++			if len(fields) < 4 || fields[0] != "MSG" || fields[1] != "foo" {
++				return fmt.Errorf("unexpected NATS message header %q", pending[:lineEnd])
++			}
++			var size int
++			if _, err := fmt.Sscanf(fields[len(fields)-1], "%d", &size); err != nil || size < 0 {
++				return fmt.Errorf("invalid NATS message size in %q", pending[:lineEnd])
++			}
++			start, end := lineEnd+2, lineEnd+2+size
++			if len(pending) < end+2 {
++				break
++			}
++			if !bytes.Equal(pending[start:end], payload) {
++				return fmt.Errorf("browser WebSocket message %d did not retain its original bytes", received)
++			}
++			if !bytes.Equal(pending[end:end+2], []byte("\r\n")) {
++				return fmt.Errorf("browser WebSocket message %d has an invalid terminator", received)
++			}
++			pending = pending[end+2:]
++			received++
++		}
++	}
++	return nil
++}
++
++func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total, payloadSize int) {
++	tmpl := `
++               listen: "127.0.0.1:-1"
++               cluster {
++                       name: "local"
++                       port: -1
++                       %s
++               }
++               websocket {
++                       listen: "127.0.0.1:-1"
++                       no_tls: true
++               }
++       `
++	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_)))
++	s1, o1 := RunServerWithConfig(conf1)
++	defer s1.Shutdown()
++
++	routes := fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port)
++	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl, routes)))
++	s2, o2 := RunServerWithConfig(conf2)
++	defer s2.Shutdown()
++
++	conf3 := createConfFile(t, []byte(fmt.Sprintf(tmpl, routes)))
++	s3, o3 := RunServerWithConfig(conf3)
++	defer s3.Shutdown()
++
++	checkClusterFormed(t, s1, s2, s3)
++
++	nc3 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o3.Websocket.Port))
++	defer nc3.Close()
++
++	nc2 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o2.Websocket.Port))
++	defer nc2.Close()
++
++	payload := make([]byte, payloadSize)
++	for i := 0; i < len(payload); i++ {
++		payload[i] = 'A' + byte(i%26)
++	}
++	errCh := make(chan error, 1)
++	doneCh := make(chan struct{}, 1)
++	count := int32(0)
++
++	createSub := func(nc *nats.Conn) {
++		sub := natsSub(t, nc, "foo", func(m *nats.Msg) {
++			if !bytes.Equal(m.Data, payload) {
++				stop := len(m.Data)
++				if l := len(payload); l < stop {
++					stop = l
++				}
++				start := 0
++				for i := 0; i < stop; i++ {
++					if m.Data[i] != payload[i] {
++						start = i
++						break
++					}
++				}
++				if stop-start > 20 {
++					stop = start + 20
++				}
++				select {
++				case errCh <- fmt.Errorf("Invalid message: [%d bytes same]%s[...]", start, m.Data[start:stop]):
++				default:
++				}
++				return
++			}
++			if n := atomic.AddInt32(&count, 1); int(n) == 3*total {
++				doneCh <- struct{}{}
++			}
++		})
++		sub.SetPendingLimits(-1, -1)
++	}
++	createSub(nc2)
++	createSub(nc3)
++
++	// Also verify ordinary NATS subscribers remain intact while WebSocket
++	// subscribers are receiving the same publications.
++	ncCore := natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", o1.Port))
++	defer ncCore.Close()
++	createSub(ncCore)
++
++	checkSubInterest(t, s1, globalAccountName, "foo", time.Second)
++
++	nc1 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o1.Websocket.Port))
++	defer nc1.Close()
++	natsFlush(t, nc1)
++
++	var browserDone <-chan error
++	if total <= 1000 {
++		browserConn, browserReader, _ := testNewWSClient(t, testWSClientOptions{
++			web: true, host: o1.Websocket.Host, port: o1.Websocket.Port, noTLS: true,
++		})
++		defer browserConn.Close()
++		if err := browserConn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
++			t.Fatalf("Could not set browser WebSocket read deadline: %v", err)
++		}
++		connect := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("CONNECT {\"verbose\":false,\"protocol\":1}\r\nPING\r\n"))
++		if _, err := browserConn.Write(connect); err != nil {
++			t.Fatalf("Could not initialize browser WebSocket client: %v", err)
++		}
++		if pong := testWSReadFrame(t, browserReader); !bytes.HasPrefix(pong, []byte("PONG\r\n")) {
++			t.Fatalf("Expected PONG after browser connection, got %q", pong)
++		}
++		sub := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("SUB foo 99\r\nPING\r\n"))
++		if _, err := browserConn.Write(sub); err != nil {
++			t.Fatalf("Could not subscribe browser WebSocket client: %v", err)
++		}
++		if pong := testWSReadFrame(t, browserReader); !bytes.HasPrefix(pong, []byte("PONG\r\n")) {
++			t.Fatalf("Expected PONG after browser subscription, got %q", pong)
++		}
++		done := make(chan error, 1)
++		browserDone = done
++		go func() { done <- readBrowserNATSMessages(browserReader, payload, total) }()
++	}
++
++	for i := 0; i < total; i++ {
++		natsPub(t, nc1, "foo", payload)
++		if i%100 == 0 {
++			select {
++			case err := <-errCh:
++				t.Fatalf("Error: %v", err)
++			default:
++			}
++		}
++	}
++	select {
++	case err := <-errCh:
++		t.Fatalf("Error: %v", err)
++	case <-doneCh:
++		if browserDone != nil {
++			select {
++			case err := <-browserDone:
++				if err != nil {
++					t.Fatalf("Browser WebSocket delivery failed: %v", err)
++				}
++			case <-time.After(10 * time.Second):
++				t.Fatalf("Timed out waiting for browser WebSocket messages")
++			}
++		}
++		return
++	case <-time.After(10 * time.Second):
++		t.Fatalf("Test timed out")
++	}
++}
++
++func TestWSNoCorruptionWithFrameSizeLimit(t *testing.T) {
++	testWSNoCorruptionWithFrameSizeLimit(t, 1000, 100000)
++}
++
++func TestWSNoCorruptionWithFrameSizeLimitLargePayload(t *testing.T) {
++	testWSNoCorruptionWithFrameSizeLimit(t, 100, 790000)
++}
++
++func TestWSNoCorruptionWithFrameSizeLimitJetStreamReplay(t *testing.T) {
++	conf := createConfFile(t, []byte(fmt.Sprintf(`
++               port: -1
++               jetstream { store_dir: %q }
++               websocket { listen: "127.0.0.1:-1"; no_tls: true }
++       `, t.TempDir())))
++	s, opts := RunServerWithConfig(conf)
++	defer s.Shutdown()
++
++	ncCore := natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port))
++	defer ncCore.Close()
++	ncWS := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", opts.Websocket.Port))
++	defer ncWS.Close()
++	ncWS2 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", opts.Websocket.Port))
++	defer ncWS2.Close()
++
++	js, err := ncWS.JetStream()
++	if err != nil {
++		t.Fatalf("Could not create JetStream context over WebSocket: %v", err)
++	}
++	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}}); err != nil {
++		t.Fatalf("Could not create stream: %v", err)
++	}
++	pull, err := js.PullSubscribe("foo", "WS_REPLAY", nats.BindStream("TEST"))
++	if err != nil {
++		t.Fatalf("Could not create WebSocket pull consumer: %v", err)
++	}
++	js2, err := ncWS2.JetStream()
++	if err != nil {
++		t.Fatalf("Could not create second JetStream context over WebSocket: %v", err)
++	}
++	pull2, err := js2.PullSubscribe("foo", "WS_REPLAY_2", nats.BindStream("TEST"))
++	if err != nil {
++		t.Fatalf("Could not create second WebSocket pull consumer: %v", err)
++	}
++	coreSub := natsSubSync(t, ncCore, "foo")
++	if err := ncCore.Flush(); err != nil {
++		t.Fatalf("Could not flush core subscription: %v", err)
++	}
++
++	payload := make([]byte, 100000)
++	for i := range payload {
++		payload[i] = 'A' + byte(i%26)
++	}
++	const total = 100
++	for i := 0; i < total; i++ {
++		if _, err := js.Publish("foo", payload); err != nil {
++			t.Fatalf("Could not publish JetStream message %d: %v", i, err)
++		}
++		coreMsg := natsNexMsg(t, coreSub, time.Second)
++		if !bytes.Equal(coreMsg.Data, payload) {
++			t.Fatalf("Core NATS message %d was corrupted (got %d bytes)", i, len(coreMsg.Data))
++		}
++	}
++
++	type fetchResult struct {
++		msgs []*nats.Msg
++		err  error
++	}
++	results := make(chan fetchResult, 2)
++	for _, sub := range []*nats.Subscription{pull, pull2} {
++		go func(sub *nats.Subscription) {
++			msgs, err := sub.Fetch(total, nats.MaxWait(10*time.Second))
++			results <- fetchResult{msgs: msgs, err: err}
++		}(sub)
++	}
++	for consumer := 0; consumer < 2; consumer++ {
++		result := <-results
++		if result.err != nil {
++			t.Fatalf("Could not retrieve JetStream batch for consumer %d: %v", consumer, result.err)
++		}
++		if len(result.msgs) != total {
++			t.Fatalf("Expected %d JetStream messages, got %d", total, len(result.msgs))
++		}
++		for i, msg := range result.msgs {
++			if !bytes.Equal(msg.Data, payload) {
++				t.Fatalf("JetStream message %d for consumer %d was corrupted (got %d bytes)", i, consumer, len(msg.Data))
++			}
++			msg.Ack()
++		}
++	}
++}
++
+ // ==================================================================
+ // = Benchmark tests
+ // ==================================================================

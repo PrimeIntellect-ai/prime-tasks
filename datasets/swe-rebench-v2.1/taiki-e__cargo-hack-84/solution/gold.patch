@@ -1,0 +1,431 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b659efc..052a316 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,8 @@ This project adheres to [Semantic Versioning](https://semver.org).
+ 
+ ## [Unreleased]
+ 
++* Diagnostic improvements.
++
+ ## [0.4.1] - 2020-10-24
+ 
+ * [Add `--group-features` option.][82]
+diff --git a/src/cli.rs b/src/cli.rs
+index ab2369d..7af6d58 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -230,7 +230,7 @@ pub(crate) struct Args<'a> {
+     /// --depth <NUM>
+     pub(crate) depth: Option<usize>,
+     /// --group-features <FEATURES>...
+-    pub(crate) group_features: Vec<Vec<&'a str>>,
++    pub(crate) group_features: Vec<(Vec<&'a str>, String)>,
+ 
+     /// --no-default-features
+     pub(crate) no_default_features: bool,
+@@ -575,13 +575,18 @@ pub(crate) fn parse_args<'a>(raw: &'a RawArgs, cargo: &OsStr, version: u32) -> R
+     let depth = depth.map(str::parse::<usize>).transpose()?;
+     let group_features =
+         group_features.iter().try_fold(Vec::with_capacity(group_features.len()), |mut v, g| {
+-            if g.contains(',') {
+-                v.push(g.split(',').collect::<Vec<_>>());
++            let g: Vec<_> = if g.contains(',') {
++                g.split(',').collect()
+             } else if g.contains(' ') {
+-                v.push(g.split(' ').collect());
++                g.split(' ').collect()
+             } else {
+-                bail!("--group-features requires a list of two or more features separated by space or comma");
+-            }
++                bail!(
++                    "--group-features requires a list of two or more features separated by space \
++                     or comma"
++                );
++            };
++            let s = g.join(",");
++            v.push((g, s));
+             Ok(v)
+         })?;
+ 
+@@ -664,6 +669,21 @@ For more information try --help
+         );
+     }
+ 
++    exclude_features.iter().for_each(|f| {
++        if features.contains(f) {
++            warn!("feature `{}` specified by both --exclude-features and --features", f);
++        }
++        if optional_deps.as_ref().map_or(false, |d| d.contains(f)) {
++            warn!("feature `{}` specified by both --exclude-features and --optional-deps", f);
++        }
++        if group_features.iter().any(|(v, _)| v.contains(f)) {
++            warn!("feature `{}` specified by both --exclude-features and --group-features", f);
++        }
++        if include_features.contains(f) {
++            warn!("feature `{}` specified by both --exclude-features and --include-features", f);
++        }
++    });
++
+     exclude_no_default_features |= no_default_features || !include_features.is_empty();
+     exclude_all_features |= !include_features.is_empty();
+     exclude_features.extend_from_slice(&features);
+diff --git a/src/context.rs b/src/context.rs
+index 2570f3e..cecc2ae 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -2,8 +2,9 @@ use std::{collections::HashMap, env, ffi::OsString, ops::Deref, path::Path};
+ 
+ use crate::{
+     cli::{self, Args, RawArgs},
++    features::Features,
+     manifest::Manifest,
+-    metadata::{Metadata, Node, Package, PackageId},
++    metadata::{Metadata, Package, PackageId},
+     version, ProcessBuilder, Result,
+ };
+ 
+@@ -11,6 +12,7 @@ pub(crate) struct Context<'a> {
+     args: Args<'a>,
+     metadata: Metadata,
+     manifests: HashMap<PackageId, Manifest>,
++    pkg_features: HashMap<PackageId, Features>,
+     cargo: OsString,
+     cargo_version: u32,
+ }
+@@ -49,29 +51,42 @@ impl<'a> Context<'a> {
+             HashMap::new()
+         };
+ 
+-        Ok(Self { args, metadata, manifests, cargo, cargo_version })
++        let mut pkg_features = HashMap::with_capacity(metadata.workspace_members.len());
++        for id in &metadata.workspace_members {
++            let features = Features::new(&metadata, id);
++            pkg_features.insert(id.clone(), features);
++        }
++
++        Ok(Self { args, metadata, manifests, pkg_features, cargo, cargo_version })
+     }
+ 
+     // Accessor methods.
++
+     pub(crate) fn packages(&self, id: &PackageId) -> &Package {
+         &self.metadata.packages[id]
+     }
++
+     pub(crate) fn workspace_members(&self) -> impl Iterator<Item = &PackageId> {
+         self.metadata.workspace_members.iter()
+     }
+-    pub(crate) fn nodes(&self, id: &PackageId) -> &Node {
+-        &self.metadata.resolve.nodes[id]
+-    }
++
+     pub(crate) fn current_package(&self) -> Option<&PackageId> {
+         self.metadata.resolve.root.as_ref()
+     }
++
+     pub(crate) fn workspace_root(&self) -> &Path {
+         &self.metadata.workspace_root
+     }
++
+     pub(crate) fn manifests(&self, id: &PackageId) -> &Manifest {
+         debug_assert!(self.require_manifest_info(self.cargo_version));
+         &self.manifests[id]
+     }
++
++    pub(crate) fn pkg_features(&self, id: &PackageId) -> &Features {
++        &self.pkg_features[id]
++    }
++
+     pub(crate) fn is_private(&self, id: &PackageId) -> bool {
+         if self.cargo_version >= 39 {
+             !self.packages(id).publish
+@@ -87,28 +102,6 @@ impl<'a> Context<'a> {
+         }
+         command
+     }
+-
+-    pub(crate) fn deps_features(&self, id: &PackageId) -> Vec<String> {
+-        let node = self.nodes(id);
+-        let package = self.packages(id);
+-        let mut features = Vec::new();
+-        // TODO: Unpublished dependencies are not included in `node.deps`.
+-        for dep in node.deps.iter().filter(|dep| {
+-            // ignore if `dep_kinds` is empty (i.e., not Rust 1.41+), target specific or not a normal dependency.
+-            dep.dep_kinds.iter().any(|kind| kind.kind.is_none() && kind.target.is_none())
+-        }) {
+-            let dep_package = self.packages(&dep.pkg);
+-            // TODO: `dep.name` (`resolve.nodes[].deps[].name`) is a valid rust identifier, not a valid feature flag.
+-            // And `packages[].dependencies` doesn't have package identifier,
+-            // so I'm not sure if there is a way to find the actual feature name exactly.
+-            if let Some(d) = package.dependencies.iter().find(|d| d.name == dep_package.name) {
+-                let name = d.rename.as_ref().unwrap_or(&d.name);
+-                features.extend(dep_package.features().map(|f| format!("{}/{}", name, f)));
+-            }
+-            // TODO: Optional deps of `dep_package`.
+-        }
+-        features
+-    }
+ }
+ 
+ impl<'a> Deref for Context<'a> {
+diff --git a/src/features.rs b/src/features.rs
+new file mode 100644
+index 0000000..7a5a5af
+--- /dev/null
++++ b/src/features.rs
+@@ -0,0 +1,61 @@
++use crate::{
++    metadata::{Dependency, Metadata},
++    PackageId,
++};
++
++pub(crate) struct Features {
++    features: Vec<String>,
++    /// [package features len, package features + optional deps len]
++    len: [usize; 2],
++}
++
++impl Features {
++    pub(crate) fn new(metadata: &Metadata, id: &PackageId) -> Self {
++        let package = &metadata.packages[id];
++        let node = &metadata.resolve.nodes[id];
++
++        let mut features = Vec::with_capacity(package.features.len());
++
++        for name in package.features.keys().cloned() {
++            features.push(name);
++        }
++        for name in package.dependencies.iter().filter_map(Dependency::as_feature) {
++            features.push(name.to_string());
++        }
++        let len = [package.features.len(), features.len()];
++
++        // TODO: Unpublished dependencies are not included in `node.deps`.
++        for dep in node.deps.iter().filter(|dep| {
++            // ignore if `dep_kinds` is empty (i.e., not Rust 1.41+), target specific or not a normal dependency.
++            dep.dep_kinds.iter().any(|kind| kind.kind.is_none() && kind.target.is_none())
++        }) {
++            let dep_package = &metadata.packages[&dep.pkg];
++            // TODO: `dep.name` (`resolve.nodes[].deps[].name`) is a valid rust identifier, not a valid feature flag.
++            // And `packages[].dependencies` doesn't have package identifier,
++            // so I'm not sure if there is a way to find the actual feature name exactly.
++            if let Some(d) = package.dependencies.iter().find(|d| d.name == dep_package.name) {
++                let name = d.rename.as_ref().unwrap_or(&d.name);
++                features.extend(dep_package.features.keys().map(|f| format!("{}/{}", name, f)));
++            }
++            // TODO: Optional deps of `dep_package`.
++        }
++
++        Self { features, len }
++    }
++
++    pub(crate) fn normal(&self) -> &[String] {
++        &self.features[..self.len[0]]
++    }
++
++    pub(crate) fn optional_deps(&self) -> &[String] {
++        &self.features[self.len[0]..self.len[1]]
++    }
++
++    pub(crate) fn deps_features(&self) -> &[String] {
++        &self.features[self.len[1]..]
++    }
++
++    pub(crate) fn contains(&self, name: &str) -> bool {
++        self.features.iter().any(|f| f == name)
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 2c1e411..d50401d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -16,6 +16,7 @@ mod term;
+ 
+ mod cli;
+ mod context;
++mod features;
+ mod manifest;
+ mod metadata;
+ mod process;
+@@ -24,7 +25,7 @@ mod restore;
+ mod version;
+ 
+ use anyhow::{bail, Context as _};
+-use std::{borrow::Cow, fmt::Write, fs};
++use std::{fmt::Write, fs};
+ 
+ use crate::{context::Context, metadata::PackageId, process::ProcessBuilder, restore::Restore};
+ 
+@@ -73,8 +74,8 @@ enum Kind<'a> {
+     NoSubcommand,
+     SkipAsPrivate,
+     Nomal,
+-    Each { features: Vec<Cow<'a, str>> },
+-    Powerset { features: Vec<Vec<Cow<'a, str>>> },
++    Each { features: Vec<&'a str> },
++    Powerset { features: Vec<Vec<&'a str>> },
+ }
+ 
+ fn determine_kind<'a>(cx: &'a Context<'_>, id: &PackageId, progress: &mut Progress) -> Kind<'a> {
+@@ -90,15 +91,24 @@ fn determine_kind<'a>(cx: &'a Context<'_>, id: &PackageId, progress: &mut Progre
+     }
+ 
+     let package = cx.packages(id);
+-    let filter = |f: &&_| {
+-        !cx.exclude_features.contains(f) && !cx.group_features.iter().any(|g| g.contains(f))
++    let filter = |f: &&str| {
++        !cx.exclude_features.contains(f) && !cx.group_features.iter().any(|(g, _)| g.contains(f))
+     };
+     let features = if cx.include_features.is_empty() {
+-        let mut features: Vec<_> = package.features().filter(filter).map(Cow::Borrowed).collect();
++        let feature_list = cx.pkg_features(id);
++
++        cx.exclude_features.iter().for_each(|d| {
++            if !feature_list.contains(d) {
++                warn!("specified feature `{}` not found in package `{}`", d, package.name);
++            }
++        });
++
++        let mut features: Vec<_> =
++            feature_list.normal().iter().map(String::as_str).filter(filter).collect();
+ 
+         if let Some(opt_deps) = &cx.optional_deps {
+             opt_deps.iter().for_each(|&d| {
+-                if !package.optional_deps().any(|f| f == d) {
++                if !feature_list.optional_deps().iter().any(|f| f == d) {
+                     warn!(
+                         "specified optional dependency `{}` not found in package `{}`",
+                         d, package.name
+@@ -107,26 +117,25 @@ fn determine_kind<'a>(cx: &'a Context<'_>, id: &PackageId, progress: &mut Progre
+             });
+ 
+             features.extend(
+-                package
++                feature_list
+                     .optional_deps()
+-                    .filter(|f| filter(f) && (opt_deps.is_empty() || opt_deps.contains(f)))
+-                    .map(Cow::Borrowed),
++                    .iter()
++                    .map(String::as_str)
++                    .filter(|f| filter(f) && (opt_deps.is_empty() || opt_deps.contains(f))),
+             );
+         }
+ 
+-        let deps_features =
+-            if cx.include_deps_features { cx.deps_features(id) } else { Vec::new() };
+         if cx.include_deps_features {
+-            features.extend(deps_features.into_iter().map(Cow::Owned).filter(|f| filter(&&**f)));
++            features.extend(feature_list.deps_features().iter().map(String::as_str).filter(filter));
+         }
+ 
+         if !cx.group_features.is_empty() {
+-            features.extend(cx.group_features.iter().map(|g| Cow::Owned(g.join(","))));
++            features.extend(cx.group_features.iter().map(|(_, s)| &**s));
+         }
+ 
+         features
+     } else {
+-        cx.include_features.iter().copied().filter(filter).map(Cow::Borrowed).collect()
++        cx.include_features.iter().copied().filter(filter).collect()
+     };
+ 
+     if cx.each_feature {
+diff --git a/src/metadata.rs b/src/metadata.rs
+index ca25bd7..6277f24 100644
+--- a/src/metadata.rs
++++ b/src/metadata.rs
+@@ -2,10 +2,11 @@ use anyhow::{format_err, Context as _};
+ use serde_json::{Map, Value};
+ use std::{
+     borrow::Cow,
+-    collections::{BTreeSet, HashMap},
++    collections::{BTreeMap, HashMap},
+     ffi::OsStr,
+     fmt,
+     path::PathBuf,
++    rc::Rc,
+ };
+ 
+ use crate::{cli::Args, Context, ProcessBuilder, Result};
+@@ -24,12 +25,12 @@ type ParseResult<T> = Result<T, &'static str>;
+ #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+ pub(crate) struct PackageId {
+     /// The underlying string representation of id.
+-    repr: String,
++    repr: Rc<str>,
+ }
+ 
+ impl PackageId {
+     fn new(repr: String) -> Self {
+-        Self { repr }
++        Self { repr: repr.into() }
+     }
+ }
+ 
+@@ -198,7 +199,7 @@ pub(crate) struct Package {
+     /// List of dependencies of this particular package
+     pub(crate) dependencies: Vec<Dependency>,
+     /// Features provided by the crate, mapped to the features required by that feature.
+-    pub(crate) features: BTreeSet<String>,
++    pub(crate) features: BTreeMap<String, Vec<String>>,
+     /// Path containing the `Cargo.toml`
+     pub(crate) manifest_path: PathBuf,
+     /// List of registries to which this package may be published.
+@@ -220,12 +221,16 @@ impl Package {
+                 .into_iter()
+                 .map(Dependency::from_value)
+                 .collect::<Result<_, _>>()?,
+-            // Check if values are array, but don't collect because we don't use them.
+             features: map
+                 .remove_object("features")?
+                 .into_iter()
+-                .map(|(k, v)| v.as_array().map(|_| k).ok_or("features"))
+-                .collect::<Result<_, _>>()?,
++                .map(|(k, v)| {
++                    into_array(v)
++                        .and_then(|v| v.into_iter().map(into_string).collect::<Option<_>>())
++                        .map(|v| (k, v))
++                })
++                .collect::<Option<_>>()
++                .ok_or("features")?,
+             manifest_path: map.remove_string("manifest_path")?.into(),
+             // This field was added in Rust 1.39.
+             publish: if version >= 39 {
+@@ -248,14 +253,6 @@ impl Package {
+             Cow::Borrowed(&self.name)
+         }
+     }
+-
+-    pub(crate) fn features(&self) -> impl Iterator<Item = &str> {
+-        self.features.iter().map(String::as_str)
+-    }
+-
+-    pub(crate) fn optional_deps(&self) -> impl Iterator<Item = &str> {
+-        self.dependencies.iter().filter_map(Dependency::as_feature)
+-    }
+ }
+ 
+ /// A dependency of the main crate
+diff --git a/src/process.rs b/src/process.rs
+index 22ffd1f..e19ad70 100644
+--- a/src/process.rs
++++ b/src/process.rs
+@@ -65,15 +65,12 @@ impl<'a> ProcessBuilder<'a> {
+ 
+     pub(crate) fn append_features_from_args(&mut self, cx: &Context<'_>, id: &PackageId) {
+         if cx.ignore_unknown_features {
+-            let package = cx.packages(id);
+             self.append_features(cx.features.iter().filter(|&&f| {
+-                if package.features.get(f).is_some()
+-                    || package.dependencies.iter().any(|dep| dep.as_feature() == Some(f))
+-                {
++                if cx.pkg_features(id).contains(f) {
+                     true
+                 } else {
+                     // ignored
+-                    info!("skipped applying unknown `{}` feature to {}", f, package.name);
++                    info!("skipped applying unknown `{}` feature to {}", f, cx.packages(id).name);
+                     false
+                 }
+             }))

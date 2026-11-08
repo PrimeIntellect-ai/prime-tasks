@@ -1,0 +1,166 @@
+diff --git a/herddb-cli/src/main/java/herddb/cli/HerdDBCLI.java b/herddb-cli/src/main/java/herddb/cli/HerdDBCLI.java
+index 7373f405..caeba860 100644
+--- a/herddb-cli/src/main/java/herddb/cli/HerdDBCLI.java
++++ b/herddb-cli/src/main/java/herddb/cli/HerdDBCLI.java
+@@ -153,6 +153,7 @@ public class HerdDBCLI {
+             options.addOption("g", "script", true, "Groovy Script to execute");
+             options.addOption("i", "ignoreerrors", false, "Ignore SQL Errors during file execution");
+             options.addOption("sc", "sqlconsole", false, "Execute SQL console in interactive mode");
++            options.addOption("nsch", "nosqlconsolehistory", false, "Disable SQL console history");
+             options.addOption("fmd", "mysql", false, "Intruct the parser that the script is coming from a MySQL Dump");
+             options.addOption("rwst", "rewritestatements", false, "Rewrite all statements to use JDBC parameters");
+             options.addOption("b", "backup", false, "Backup one or more tablespaces (selected with --schema)");
+@@ -257,7 +258,8 @@ public class HerdDBCLI {
+             String tablespacemapperfile = commandLine.getOptionValue("tablespacemapper", "");
+             int dumpfetchsize = Integer.parseInt(commandLine.getOptionValue("dumpfetchsize", 100000 + ""));
+             final boolean ignoreerrors = commandLine.hasOption("ignoreerrors");
+-            boolean sqlconsole = commandLine.hasOption("sqlconsole");
++            final boolean sqlconsole = commandLine.hasOption("sqlconsole");
++            final boolean persistSqlConsoleHistory = !commandLine.hasOption("nosqlconsolehistory");
+             final boolean frommysqldump = commandLine.hasOption("mysql");
+             final boolean rewritestatements = commandLine.hasOption("rewritestatements") || !tablespacemapperfile.
+                     isEmpty() || frommysqldump;
+@@ -371,7 +373,7 @@ public class HerdDBCLI {
+ 
+                     connection.setSchema(schema);
+                     if (sqlconsole) {
+-                        runSqlConsole(connection, statement, PRETTY_PRINT, verbose);
++                        runSqlConsole(statement, PRETTY_PRINT, verbose, persistSqlConsoleHistory);
+                     } else if (backup) {
+                         performBackup(statement, schema, file, options, connection, dumpfetchsize);
+                     } else if (restore) {
+@@ -1158,6 +1160,7 @@ public class HerdDBCLI {
+         println("Backup finished for tablespace " + schema);
+     }
+ 
++    @SuppressFBWarnings({"SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING", "SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"})
+     private static ExecuteStatementResult executeStatement(
+             boolean verbose, boolean ignoreerrors, boolean frommysqldump, boolean rewritestatements, String query,
+             final Statement statement,
+@@ -1219,6 +1222,16 @@ public class HerdDBCLI {
+                 System.out.println("Rollback executed.");
+                 return null;
+             }
++            if (formattedQuery.toLowerCase().startsWith("setschema ")) {
++                if (!statement.getConnection().getAutoCommit()) {
++                    System.out.println("Please commit or rollback before changing schema");
++                    return null;
++                }
++                String schema = formattedQuery.substring(10).trim();
++                statement.getConnection().setSchema(schema);
++                System.out.println("Changed schema to '" + schema + "'");
++                return null;
++            }
+ 
+             QueryWithParameters rewritten = null;
+             if (rewritestatements) {
+@@ -1595,23 +1608,33 @@ public class HerdDBCLI {
+         System.out.println(msg);
+     }
+ 
+-    private static void runSqlConsole(Connection connection, Statement statement, boolean pretty, boolean verbose) throws IOException {
++    private static void runSqlConsole(Statement statement, boolean pretty, boolean verbose, boolean persistHistory) throws IOException, SQLException {
+         Terminal terminal = TerminalBuilder.builder()
+                 .system(true)
+                 .build();
+-        LineReader reader = LineReaderBuilder.builder()
++        LineReaderBuilder readerBuilder = LineReaderBuilder.builder()
+                 .history(new DefaultHistory())
+-                .terminal(terminal)
+-                .build();
+-        String prompt = "herd: ";
++                .terminal(terminal);
++        if (persistHistory) {
++            String historyDirectory = System.getProperty("user.home", ".");
++            File historyFile = new File(historyDirectory, ".herddb.cli.history");
++            if (verbose) {
++                System.out.println("Storing SQL Console History to " + historyFile.getAbsolutePath());
++            }
++            readerBuilder = readerBuilder.variable(LineReader.HISTORY_FILE, historyFile);
++            readerBuilder = readerBuilder.variable(LineReader.HISTORY_FILE_SIZE, 100);
++        }
++        LineReader reader = readerBuilder.build();
++        String prompt = "herddb(" + statement.getConnection().getSchema() + "): ";
+         while (true) {
+-            String line = null;
++            String line;
+             try {
+                 line = reader.readLine(prompt);
+                 if (line == null) {
+                     return;
+                 }
+                 executeStatement(verbose, true, false, false, line, statement, null, false, pretty);
++                prompt = "herddb(" + statement.getConnection().getSchema() + "): ";
+             } catch (UserInterruptException | EndOfFileException e) {
+                 return;
+             } catch (Exception e) {
+diff --git a/herddb-core/src/main/java/herddb/client/ClientConfiguration.java b/herddb-core/src/main/java/herddb/client/ClientConfiguration.java
+index 95c64f50..141d71a7 100644
+--- a/herddb-core/src/main/java/herddb/client/ClientConfiguration.java
++++ b/herddb-core/src/main/java/herddb/client/ClientConfiguration.java
+@@ -230,7 +230,10 @@ public class ClientConfiguration {
+ 
+     @Override
+     public String toString() {
+-        return "ClientConfiguration{" + properties + '}';
++        Properties propsNoPassword = new Properties();
++        propsNoPassword.putAll(properties);
++        propsNoPassword.setProperty("password", "---");
++        return "ClientConfiguration{" + propsNoPassword + '}';
+     }
+ 
+ }
+diff --git a/herddb-core/src/main/java/herddb/core/TableSpaceManager.java b/herddb-core/src/main/java/herddb/core/TableSpaceManager.java
+index b20df38f..a7b2d8fb 100644
+--- a/herddb-core/src/main/java/herddb/core/TableSpaceManager.java
++++ b/herddb-core/src/main/java/herddb/core/TableSpaceManager.java
+@@ -1353,7 +1353,8 @@ public class TableSpaceManager {
+             }
+             AbstractTableManager tableManager = tables.get(statement.getTable());
+             if (tableManager == null) {
+-                throw new TableDoesNotExistException("no table " + statement.getTable() + " in tablespace " + tableSpaceName);
++                throw new TableDoesNotExistException("no table " + statement.getTable() + " in tablespace " + tableSpaceName + ","
++                        + " only " + tables.keySet());
+             }
+ 
+             Table newTable;
+diff --git a/herddb-core/src/main/java/herddb/sql/DDLSQLPlanner.java b/herddb-core/src/main/java/herddb/sql/DDLSQLPlanner.java
+index 1a917e40..162aaf4d 100644
+--- a/herddb-core/src/main/java/herddb/sql/DDLSQLPlanner.java
++++ b/herddb-core/src/main/java/herddb/sql/DDLSQLPlanner.java
+@@ -811,7 +811,7 @@ public class DDLSQLPlanner implements AbstractSQLPlanner {
+                     }
+                     return new AlterTableStatement(Collections.emptyList(),
+                             Collections.emptyList(), Collections.emptyList(),
+-                            null, oldTableName, tableSpaceName, newTableName);
++                            null, oldTableName.toLowerCase(), tableSpaceName, newTableName.toLowerCase());
+                 } catch (MetadataStorageManagerException err) {
+                     throw new StatementExecutionException(err);
+                 }
+@@ -984,7 +984,7 @@ public class DDLSQLPlanner implements AbstractSQLPlanner {
+                 throw new StatementExecutionException("supported alter operation '" + alter + "'");
+         }
+         return new AlterTableStatement(addColumns, modifyColumns, dropColumns,
+-                changeAutoIncrement, tableName, tableSpace, null);
++                changeAutoIncrement, tableName.toLowerCase(), tableSpace, null);
+     }
+ 
+     private Statement buildDropStatement(String defaultTableSpace, Drop drop) throws StatementExecutionException {
+diff --git a/herddb-jdbc/src/main/java/herddb/jdbc/BasicHerdDBDataSource.java b/herddb-jdbc/src/main/java/herddb/jdbc/BasicHerdDBDataSource.java
+index 2ee551ea..1ceb1d96 100644
+--- a/herddb-jdbc/src/main/java/herddb/jdbc/BasicHerdDBDataSource.java
++++ b/herddb-jdbc/src/main/java/herddb/jdbc/BasicHerdDBDataSource.java
+@@ -175,10 +175,9 @@ public class BasicHerdDBDataSource implements javax.sql.DataSource, AutoCloseabl
+     protected synchronized void ensureClient() throws SQLException {
+         if (client == null) {
+             ClientConfiguration clientConfiguration = new ClientConfiguration(properties);
+-            Properties propsNoPassword = new Properties(properties);
+-            if (propsNoPassword.contains("password")) {
+-                propsNoPassword.setProperty("password", "-------");
+-            }
++            Properties propsNoPassword = new Properties();
++            propsNoPassword.putAll(properties);
++            propsNoPassword.setProperty("password", "---");
+             LOGGER.log(Level.INFO, "Booting HerdDB Client, url:" + url + ", properties:" + propsNoPassword + " clientConfig " + clientConfiguration);
+             try {
+                 clientConfiguration.readJdbcUrl(url);

@@ -1,0 +1,154 @@
+diff --git a/deb/deb_test.go b/deb/deb_test.go
+index 7ad20d5..720e224 100644
+--- a/deb/deb_test.go
++++ b/deb/deb_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"bytes"
+ 	"compress/gzip"
+ 	"crypto/md5" // nolint: gosec
++	"crypto/sha1"
+ 	"encoding/hex"
+ 	"errors"
+ 	"flag"
+@@ -13,11 +14,14 @@ import (
+ 	"os"
+ 	"path"
+ 	"path/filepath"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/ProtonMail/go-crypto/openpgp"
++	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+ 	"github.com/blakesmith/ar"
+ 	"github.com/goreleaser/chglog"
+ 	"github.com/goreleaser/nfpm/v2"
+@@ -1001,8 +1005,10 @@ func TestDpkgSigSignature(t *testing.T) {
+ 
+ 	signature := extractFileFromAr(t, deb.Bytes(), "_gpgbuilder")
+ 
+-	err = sign.PGPReadMessage(signature, "../internal/sign/testdata/pubkey.asc")
++	msg, err := readAndVerifyDpkgSigMessage(signature, "../internal/sign/testdata/pubkey.asc")
+ 	require.NoError(t, err)
++
++	require.NoError(t, verifyDpkgSigFileHashes(extractAllFilesFromAr(t, deb.Bytes()), string(msg)))
+ }
+ 
+ func TestDpkgSigSignatureError(t *testing.T) {
+@@ -1032,8 +1038,10 @@ func TestDpkgSigSignatureCallback(t *testing.T) {
+ 
+ 	signature := extractFileFromAr(t, deb.Bytes(), "_gpgbuilder")
+ 
+-	err = sign.PGPReadMessage(signature, "../internal/sign/testdata/pubkey.asc")
++	msg, err := readAndVerifyDpkgSigMessage(signature, "../internal/sign/testdata/pubkey.asc")
+ 	require.NoError(t, err)
++
++	require.NoError(t, verifyDpkgSigFileHashes(extractAllFilesFromAr(t, deb.Bytes()), string(msg)))
+ }
+ 
+ func TestDisableGlobbing(t *testing.T) {
+@@ -1400,6 +1408,26 @@ func extractFileFromAr(tb testing.TB, arFile []byte, filename string) []byte {
+ 	return nil
+ }
+ 
++func extractAllFilesFromAr(tb testing.TB, arFile []byte) map[string][]byte {
++	tb.Helper()
++
++	tr := ar.NewReader(bytes.NewReader(arFile))
++	files := make(map[string][]byte)
++	for {
++		hdr, err := tr.Next()
++		if errors.Is(err, io.EOF) {
++			break // End of archive
++		}
++		require.NoError(tb, err)
++
++		fileContents, err := io.ReadAll(tr)
++		require.NoError(tb, err)
++
++		files[hdr.Name] = fileContents
++	}
++	return files
++}
++
+ func TestEmptyButRequiredDebFields(t *testing.T) {
+ 	item := nfpm.WithDefaults(&nfpm.Info{
+ 		Name:    "foo",
+@@ -1506,3 +1534,75 @@ func (zrc *zstdReadCloser) Close() error {
+ 
+ 	return nil
+ }
++
++func verifyDpkgSigFileHashes(arFiles map[string][]byte, msg string) error {
++	_, hashes, ok := strings.Cut(msg, "Files:")
++	if !ok {
++		return errors.New("expected Files section in dpkg-sig message")
++	}
++	lines := strings.Split(hashes, "\n")
++	seenComponents := make(map[string]bool)
++	for i := range lines {
++		lines[i] = strings.TrimSpace(lines[i])
++		if lines[i] == "" {
++			continue
++		}
++		var md5Hex, sha1Hex, size, name string
++		if n, err := fmt.Sscanln(lines[i], &md5Hex, &sha1Hex, &size, &name); err != nil {
++			return err
++		} else if n != 4 {
++			return fmt.Errorf("expected 4 elements in line %q, but got %d", lines[i], n)
++		}
++
++		md5Sum, err := hex.DecodeString(md5Hex)
++		if err != nil {
++			return err
++		}
++		sha1Sum, err := hex.DecodeString(sha1Hex)
++		if err != nil {
++			return err
++		}
++
++		content, ok := arFiles[name]
++		if !ok {
++			return fmt.Errorf("dpkg-sig message contains hash of file %q, but the package does not contain the file", name)
++		}
++		actualSize, err := strconv.Atoi(size)
++		if err != nil || actualSize != len(content) {
++			return fmt.Errorf("file %q has size %q, expected %d", name, size, len(content))
++		}
++		seenComponents[name] = true
++		actualMD5Sum, actualSHA1Sum := md5.Sum(content), sha1.Sum(content)
++		if !slices.Equal(actualMD5Sum[:], md5Sum) {
++			return fmt.Errorf("file %q has invalid MD5 sum", name)
++		}
++		if !slices.Equal(actualSHA1Sum[:], sha1Sum) {
++			return fmt.Errorf("file %q has invalid SHA1 sum", name)
++		}
++	}
++	for name := range arFiles {
++		if name != "_gpgbuilder" && !seenComponents[name] {
++			return fmt.Errorf("dpkg-sig message does not contain an entry for package component %q", name)
++		}
++	}
++	return nil
++}
++
++func readAndVerifyDpkgSigMessage(signature []byte, publicKeyFile string) ([]byte, error) {
++	keyData, err := os.ReadFile(publicKeyFile)
++	if err != nil {
++		return nil, err
++	}
++	keyring, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(keyData))
++	if err != nil {
++		return nil, err
++	}
++	block, _ := clearsign.Decode(signature)
++	if block == nil {
++		return nil, errors.New("invalid clear-signed message")
++	}
++	if _, err := block.VerifySignature(keyring, nil); err != nil {
++		return nil, err
++	}
++	return block.Plaintext, nil
++}

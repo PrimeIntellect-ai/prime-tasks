@@ -1,0 +1,215 @@
+diff --git a/services/graph/pkg/identity/ldap_test.go b/services/graph/pkg/identity/ldap_test.go
+index 3feb5188d..bad40d142 100644
+--- a/services/graph/pkg/identity/ldap_test.go
++++ b/services/graph/pkg/identity/ldap_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"net/url"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/go-ldap/ldap/v3"
+@@ -12,6 +13,7 @@ import (
+ 	"github.com/owncloud/ocis/v2/services/graph/mocks"
+ 	"github.com/owncloud/ocis/v2/services/graph/pkg/config"
+ 	"github.com/stretchr/testify/assert"
++	stretchrmock "github.com/stretchr/testify/mock"
+ 	"github.com/test-go/testify/mock"
+ )
+ 
+@@ -19,6 +21,49 @@ func getMockedBackend(l ldap.Client, lc config.LDAP, logger *log.Logger) (*LDAP,
+ 	return NewLDAPBackend(l, lc, logger)
+ }
+ 
++// searchRequestMatcher returns a testify argument matcher that accepts any LDAP
++// search request targeting the given base DN, size limit and filter. The order
++// and exact set of requested attributes are implementation details and are not
++// checked here; callers verify the required attributes separately. When capture
++// is non-nil, matching requests are appended to it.
++func searchRequestMatcher(baseDN string, sizeLimit int, filter string, capture *[]*ldap.SearchRequest) interface{} {
++	return stretchrmock.MatchedBy(func(req *ldap.SearchRequest) bool {
++		if req == nil || req.BaseDN != baseDN || req.SizeLimit != sizeLimit || req.Filter != filter {
++			return false
++		}
++		if capture != nil {
++			*capture = append(*capture, req)
++		}
++		return true
++	})
++}
++
++// hasAttributes reports whether the search request asks for all of the given
++// attributes, regardless of order, or requests every attribute.
++func hasAttributes(req *ldap.SearchRequest, required ...string) bool {
++	if len(req.Attributes) == 0 {
++		return true
++	}
++	for _, attr := range req.Attributes {
++		if attr == "*" {
++			return true
++		}
++	}
++	for _, r := range required {
++		found := false
++		for _, a := range req.Attributes {
++			if strings.EqualFold(a, r) {
++				found = true
++				break
++			}
++		}
++		if !found {
++			return false
++		}
++	}
++	return true
++}
++
+ var lconfig = config.LDAP{
+ 	UserBaseDN:               "ou=people,dc=test",
+ 	UserObjectClass:          "inetOrgPerson",
+@@ -45,6 +90,8 @@ var userEntry = ldap.NewEntry("uid=user",
+ 		"displayname": {"DisplayName"},
+ 		"mail":        {"user@example"},
+ 		"entryuuid":   {"abcd-defg"},
++		"sn":          {"surname"},
++		"givenname":   {"givenName"},
+ 	})
+ 
+ var invalidUserEntry = ldap.NewEntry("uid=user",
+@@ -136,6 +183,8 @@ func TestCreateUser(t *testing.T) {
+ 	assert.Equal(t, displayName, newUser.GetDisplayName())
+ 	assert.Equal(t, mail, newUser.GetMail())
+ 	assert.Equal(t, userName, newUser.GetOnPremisesSamAccountName())
++	assert.Equal(t, givenName, newUser.GetGivenName())
++	assert.Equal(t, surname, newUser.GetSurname())
+ }
+ 
+ func TestCreateUserModelFromLDAP(t *testing.T) {
+@@ -230,6 +279,9 @@ func TestGetUser(t *testing.T) {
+ 		t.Errorf("Expected GetUser to succeed. Got %s", err.Error())
+ 	} else if *u.Id != userEntry.GetEqualFoldAttributeValue(b.userAttributeMap.id) {
+ 		t.Errorf("Expected GetUser to return a valid user")
++	} else {
++		assert.Equal(t, userEntry.GetEqualFoldAttributeValue("sn"), u.GetSurname())
++		assert.Equal(t, userEntry.GetEqualFoldAttributeValue("givenname"), u.GetGivenName())
+ 	}
+ 
+ 	u, err = b.GetUser(context.Background(), "user", queryParamExpand)
+@@ -282,6 +334,37 @@ func TestGetUsers(t *testing.T) {
+ 	} else if g == nil || len(g) != 0 {
+ 		t.Errorf("Expected zero length user slice")
+ 	}
++
++	var userListSearchRequests []*ldap.SearchRequest
++	lm = &mocks.Client{}
++	lm.On("Search", stretchrmock.MatchedBy(func(req *ldap.SearchRequest) bool {
++		if req == nil {
++			return false
++		}
++		userListSearchRequests = append(userListSearchRequests, req)
++		return true
++	})).Return(&ldap.SearchResult{Entries: []*ldap.Entry{userEntry}}, nil)
++	b, _ = getMockedBackend(lm, lconfig, &logger)
++	users, err := b.GetUsers(context.Background(), url.Values{})
++	if err != nil {
++		t.Fatalf("Expected GetUsers to succeed. Got %s", err.Error())
++	}
++	if len(users) != 1 {
++		t.Fatalf("Expected one user, got %d", len(users))
++	}
++	assert.Equal(t, userEntry.GetEqualFoldAttributeValue("sn"), users[0].GetSurname())
++	assert.Equal(t, userEntry.GetEqualFoldAttributeValue("givenname"), users[0].GetGivenName())
++	if len(userListSearchRequests) == 0 {
++		t.Fatalf("Expected GetUsers to search LDAP")
++	}
++	requestedSurname, requestedGivenName := false, false
++	for _, req := range userListSearchRequests {
++		requestedSurname = requestedSurname || hasAttributes(req, "sn")
++		requestedGivenName = requestedGivenName || hasAttributes(req, "givenname")
++	}
++	if !requestedSurname || !requestedGivenName {
++		t.Errorf("Expected LDAP user lookups to provide surname and givenName")
++	}
+ }
+ 
+ func TestGetGroup(t *testing.T) {
+@@ -355,20 +438,8 @@ func TestGetGroup(t *testing.T) {
+ 		Attributes: []string{"cn", "entryUUID", "member"},
+ 		Controls:   []ldap.Control(nil),
+ 	}
+-	sr2 := &ldap.SearchRequest{
+-		BaseDN:     "uid=user,ou=people,dc=test",
+-		SizeLimit:  1,
+-		Filter:     "(objectClass=inetOrgPerson)",
+-		Attributes: []string{"displayname", "entryUUID", "mail", "uid"},
+-		Controls:   []ldap.Control(nil),
+-	}
+-	sr3 := &ldap.SearchRequest{
+-		BaseDN:     "uid=invalid,ou=people,dc=test",
+-		SizeLimit:  1,
+-		Filter:     "(objectClass=inetOrgPerson)",
+-		Attributes: []string{"displayname", "entryUUID", "mail", "uid"},
+-		Controls:   []ldap.Control(nil),
+-	}
++	sr2 := searchRequestMatcher("uid=user,ou=people,dc=test", 1, "(objectClass=inetOrgPerson)", nil)
++	sr3 := searchRequestMatcher("uid=invalid,ou=people,dc=test", 1, "(objectClass=inetOrgPerson)", nil)
+ 
+ 	lm.On("Search", sr1).Return(&ldap.SearchResult{Entries: []*ldap.Entry{groupEntry}}, nil)
+ 	lm.On("Search", sr2).Return(&ldap.SearchResult{Entries: []*ldap.Entry{userEntry}}, nil)
+@@ -390,6 +461,10 @@ func TestGetGroup(t *testing.T) {
+ 		t.Errorf("Expected GetGroup with expand to return one member")
+ 	case g.Members[0].GetId() != userEntry.GetEqualFoldAttributeValue(b.userAttributeMap.id):
+ 		t.Errorf("Expected GetGroup with expand to return correct member")
++	case g.Members[0].GetSurname() != userEntry.GetEqualFoldAttributeValue("sn"):
++		t.Errorf("Expected GetGroup with expand to return member with surname")
++	case g.Members[0].GetGivenName() != userEntry.GetEqualFoldAttributeValue("givenname"):
++		t.Errorf("Expected GetGroup with expand to return member with givenName")
+ 	}
+ 	g, err = b.GetGroup(context.Background(), "group", queryParamSelect)
+ 	switch {
+@@ -401,6 +476,10 @@ func TestGetGroup(t *testing.T) {
+ 		t.Errorf("Expected GetGroup with expand to return one member")
+ 	case g.Members[0].GetId() != userEntry.GetEqualFoldAttributeValue(b.userAttributeMap.id):
+ 		t.Errorf("Expected GetGroup with expand to return correct member")
++	case g.Members[0].GetSurname() != userEntry.GetEqualFoldAttributeValue("sn"):
++		t.Errorf("Expected GetGroup with expand to return member with surname")
++	case g.Members[0].GetGivenName() != userEntry.GetEqualFoldAttributeValue("givenname"):
++		t.Errorf("Expected GetGroup with expand to return member with givenName")
+ 	}
+ }
+ 
+@@ -450,20 +529,8 @@ func TestGetGroups(t *testing.T) {
+ 		Attributes: []string{"cn", "entryUUID", "member"},
+ 		Controls:   []ldap.Control(nil),
+ 	}
+-	sr2 := &ldap.SearchRequest{
+-		BaseDN:     "uid=user,ou=people,dc=test",
+-		SizeLimit:  1,
+-		Filter:     "(objectClass=inetOrgPerson)",
+-		Attributes: []string{"displayname", "entryUUID", "mail", "uid"},
+-		Controls:   []ldap.Control(nil),
+-	}
+-	sr3 := &ldap.SearchRequest{
+-		BaseDN:     "uid=invalid,ou=people,dc=test",
+-		SizeLimit:  1,
+-		Filter:     "(objectClass=inetOrgPerson)",
+-		Attributes: []string{"displayname", "entryUUID", "mail", "uid"},
+-		Controls:   []ldap.Control(nil),
+-	}
++	sr2 := searchRequestMatcher("uid=user,ou=people,dc=test", 1, "(objectClass=inetOrgPerson)", nil)
++	sr3 := searchRequestMatcher("uid=invalid,ou=people,dc=test", 1, "(objectClass=inetOrgPerson)", nil)
+ 
+ 	for _, param := range []url.Values{queryParamSelect, queryParamExpand} {
+ 		lm.On("Search", sr1).Return(&ldap.SearchResult{Entries: []*ldap.Entry{groupEntry}}, nil)
+@@ -480,6 +547,10 @@ func TestGetGroups(t *testing.T) {
+ 			t.Errorf("Expected GetGroup to return group with one member")
+ 		case g[0].Members[0].GetId() != userEntry.GetEqualFoldAttributeValue(b.userAttributeMap.id):
+ 			t.Errorf("Expected GetGroup to return group with correct member")
++		case g[0].Members[0].GetSurname() != userEntry.GetEqualFoldAttributeValue("sn"):
++			t.Errorf("Expected GetGroup to return group member with surname")
++		case g[0].Members[0].GetGivenName() != userEntry.GetEqualFoldAttributeValue("givenname"):
++			t.Errorf("Expected GetGroup to return group member with givenName")
+ 		}
+ 	}
+ }

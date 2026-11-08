@@ -1,0 +1,522 @@
+diff --git a/shadow/shadow_test.go b/shadow/shadow_test.go
+index ad97896..7d5ebab 100644
+--- a/shadow/shadow_test.go
++++ b/shadow/shadow_test.go
+@@ -1,314 +1,237 @@
+-package shadow
++package shadow_test
+ 
+ import (
++	"context"
++	"encoding/json"
++	"errors"
+ 	"reflect"
+ 	"testing"
++	"time"
+ 
+ 	mqtt "github.com/at-wat/mqtt-go"
++	mockmqtt "github.com/at-wat/mqtt-go/mock"
++	"github.com/seqsense/aws-iot-device-sdk-go/v4/shadow"
+ )
+ 
+-func TestShadow(t *testing.T) {
+-	t.Run("Rejected", func(t *testing.T) {
+-		chErr := make(chan error, 1)
+-		s := &shadow{
+-			doc: &ThingDocument{
+-				State: ThingState{
+-					Desired: map[string]interface{}{"key": "value_init"},
+-				},
+-				Version:   2,
+-				Timestamp: 12345,
+-			},
+-			onDelta: func(delta map[string]interface{}) {
+-				t.Error("onDelta must not be called on rejected")
+-			},
+-			onError: func(err error) {
+-				chErr <- err
+-			},
+-		}
+-		expectedDoc := &ThingDocument{
+-			State: ThingState{
+-				Desired: map[string]interface{}{"key": "value_init"},
+-			},
+-			Version:   2,
+-			Timestamp: 12345,
++const thingName = "test"
++
++type mockDevice struct {
++	*mockmqtt.Client
++}
++
++func (d *mockDevice) ThingName() string {
++	return thingName
++}
++
++func topic(operation string) string {
++	return "$aws/things/" + thingName + "/shadow/" + operation
++}
++
++func requestToken(payload []byte) (string, error) {
++	var req map[string]interface{}
++	if err := json.Unmarshal(payload, &req); err != nil {
++		return "", err
++	}
++	tok, _ := req["clientToken"].(string)
++	return tok, nil
++}
++
++func callOperation(s shadow.Shadow, method string, args ...interface{}) error {
++	methodValue := reflect.ValueOf(s).MethodByName(method)
++	values := make([]reflect.Value, len(args))
++	for i, arg := range args {
++		values[i] = reflect.ValueOf(arg)
++	}
++	for _, result := range methodValue.Call(values) {
++		if result.Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
++			if result.IsNil() {
++				return nil
++			}
++			return result.Interface().(error)
+ 		}
++	}
++	return nil
++}
+ 
+-		t.Run("Get", func(t *testing.T) {
+-			s.getRejected(&mqtt.Message{})
+-			select {
+-			case err := <-chErr:
+-				if err == nil {
+-					t.Error("onError must be called with non-nil error")
++func responseWithToken(token string) []byte {
++	payload, _ := json.Marshal(map[string]interface{}{"clientToken": token})
++	return payload
++}
++
++func newTestShadow(t *testing.T, ctx context.Context) (shadow.Shadow, *mockDevice) {
++	t.Helper()
++	cli := &mockDevice{Client: &mockmqtt.Client{}}
++	s, err := shadow.New(ctx, cli)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cli.Handle(s)
++	return s, cli
++}
++
++func TestClientTokenOnOperations(t *testing.T) {
++	operations := []struct {
++		name string
++		path string
++		call func(shadow.Shadow, context.Context) error
++	}{
++		{"get", "get", func(s shadow.Shadow, ctx context.Context) error { return callOperation(s, "Get", ctx) }},
++		{"report", "update", func(s shadow.Shadow, ctx context.Context) error {
++			return callOperation(s, "Report", ctx, map[string]interface{}{"key": "value"})
++		}},
++		{"desire", "update", func(s shadow.Shadow, ctx context.Context) error {
++			return callOperation(s, "Desire", ctx, map[string]interface{}{"key": "value"})
++		}},
++		{"delete", "delete", func(s shadow.Shadow, ctx context.Context) error { return callOperation(s, "Delete", ctx) }},
++	}
++	for _, operation := range operations {
++		t.Run(operation.name, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			s, cli := newTestShadow(t, ctx)
++			var gotToken string
++			cli.PublishFn = func(_ context.Context, msg *mqtt.Message) error {
++				var err error
++				gotToken, err = requestToken(msg.Payload)
++				if err != nil {
++					return err
+ 				}
+-			default:
+-				t.Fatal("Timeout")
+-			}
+-			if !reflect.DeepEqual(*expectedDoc, *s.doc) {
+-				t.Error("Document must not be changed on reject")
+-			}
+-		})
+-		t.Run("Update", func(t *testing.T) {
+-			s.updateRejected(&mqtt.Message{})
+-			select {
+-			case err := <-chErr:
+-				if err == nil {
+-					t.Error("onError must be called with non-nil error")
++				if gotToken == "" {
++					return errors.New("request did not include a clientToken")
+ 				}
+-			default:
+-				t.Fatal("Timeout")
++				cli.Serve(&mqtt.Message{Topic: topic(operation.path + "/accepted"), Payload: responseWithToken(gotToken)})
++				return nil
+ 			}
+-			if !reflect.DeepEqual(*expectedDoc, *s.doc) {
+-				t.Error("Document must not be changed on reject")
++			if err := operation.call(s, ctx); err != nil {
++				t.Fatalf("operation failed: %v", err)
+ 			}
+-		})
+-		t.Run("Delete", func(t *testing.T) {
+-			s.deleteRejected(&mqtt.Message{})
+-			select {
+-			case err := <-chErr:
+-				if err == nil {
+-					t.Error("onError must be called with non-nil error")
+-				}
+-			default:
+-				t.Fatal("Timeout")
+-			}
+-			if !reflect.DeepEqual(*expectedDoc, *s.doc) {
+-				t.Error("Document must not be changed on reject")
++			if gotToken == "" {
++				t.Fatal("request did not include a clientToken")
+ 			}
+ 		})
+-	})
++	}
++}
+ 
+-	t.Run("Accepted", func(t *testing.T) {
+-		t.Run("Get", func(t *testing.T) {
+-			chErr := make(chan error, 1)
+-			chDelta := make(chan map[string]interface{}, 1)
+-			s := &shadow{
+-				doc: &ThingDocument{
+-					State: ThingState{
+-						Desired: map[string]interface{}{"key": "value_init"},
+-					},
+-					Version:   2,
+-					Timestamp: 12345,
+-				},
+-				onDelta: func(delta map[string]interface{}) {
+-					chDelta <- delta
+-				},
+-				onError: func(err error) {
+-					chErr <- err
+-				},
+-			}
+-			expectedDoc := &ThingDocument{
+-				State: ThingState{
+-					Desired: map[string]interface{}{"key2": "value2"},
+-					Delta:   map[string]interface{}{"key2": "value2"},
+-				},
+-				Version:   3,
+-				Timestamp: 12346,
+-			}
+-			s.getAccepted(&mqtt.Message{Payload: []byte(
+-				"{" +
+-					"  \"state\": {" +
+-					"    \"desired\": {\"key2\": \"value2\"}," +
+-					"    \"delta\": {\"key2\": \"value2\"}" +
+-					"  }," +
+-					"  \"version\": 3," +
+-					"  \"timestamp\": 12346" +
+-					"}",
+-			)})
++func TestClientTokenAssociation(t *testing.T) {
++	operations := []struct {
++		name string
++		path string
++		call func(shadow.Shadow, context.Context) error
++	}{
++		{"get", "get", func(s shadow.Shadow, ctx context.Context) error { return callOperation(s, "Get", ctx) }},
++		{"report", "update", func(s shadow.Shadow, ctx context.Context) error {
++			return callOperation(s, "Report", ctx, map[string]interface{}{"key": "value"})
++		}},
++		{"desire", "update", func(s shadow.Shadow, ctx context.Context) error {
++			return callOperation(s, "Desire", ctx, map[string]interface{}{"key": "value"})
++		}},
++		{"delete", "delete", func(s shadow.Shadow, ctx context.Context) error { return callOperation(s, "Delete", ctx) }},
++	}
++	for _, operation := range operations {
++		t.Run(operation.name, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			s, cli := newTestShadow(t, ctx)
+ 
+-			select {
+-			case err := <-chErr:
+-				t.Error(err)
+-			case delta := <-chDelta:
+-				if !reflect.DeepEqual(expectedDoc.State.Delta, delta) {
+-					t.Errorf("Expected delta: %v, got: %v",
+-						expectedDoc.State.Delta, delta,
+-					)
++			wrongSent := make(chan struct{})
++			allowMatching := make(chan struct{})
++			var token string
++			cli.PublishFn = func(_ context.Context, msg *mqtt.Message) error {
++				var err error
++				token, err = requestToken(msg.Payload)
++				if err != nil {
++					return err
+ 				}
+-			default:
+-				t.Fatal("Timeout")
+-			}
+-			if !reflect.DeepEqual(expectedDoc, s.doc) {
+-				t.Errorf("Expected state: %v, got: %v",
+-					expectedDoc, s.doc,
+-				)
+-			}
+-		})
+-		t.Run("Delete", func(t *testing.T) {
+-			chErr := make(chan error, 1)
+-			s := &shadow{
+-				doc: &ThingDocument{
+-					State: ThingState{
+-						Desired: map[string]interface{}{"key": "value_init"},
+-					},
+-					Version:   2,
+-					Timestamp: 12345,
+-				},
+-				onDelta: func(delta map[string]interface{}) {
+-					t.Error("Delete must not trigger onDelta")
+-				},
+-				onError: func(err error) {
+-					chErr <- err
+-				},
++				if token == "" {
++					return errors.New("request did not include a clientToken")
++				}
++				cli.Serve(&mqtt.Message{Topic: topic(operation.path + "/accepted"), Payload: responseWithToken("not-" + token)})
++				close(wrongSent)
++				<-allowMatching
++				cli.Serve(&mqtt.Message{Topic: topic(operation.path + "/accepted"), Payload: responseWithToken(token)})
++				return nil
+ 			}
+-			s.deleteAccepted(&mqtt.Message{})
+ 
++			done := make(chan error, 1)
++			go func() { done <- operation.call(s, ctx) }()
+ 			select {
+-			case err := <-chErr:
+-				t.Error(err)
+-			default:
+-			}
+-			if s.doc != nil {
+-				t.Errorf("Document must be nil after delete")
++			case <-wrongSent:
++			case <-time.After(time.Second):
++				t.Fatal("request did not publish a response to correlate")
+ 			}
+-		})
+-	})
+-
+-	t.Run("Update", func(t *testing.T) {
+-		t.Run("Delta", func(t *testing.T) {
+-			chErr := make(chan error, 1)
+-			chDelta := make(chan map[string]interface{}, 1)
+-			s := &shadow{
+-				doc: &ThingDocument{
+-					State: ThingState{
+-						Desired: map[string]interface{}{"key2": "value2"},
+-					},
+-					Version:   2,
+-					Timestamp: 12345,
+-				},
+-				onDelta: func(delta map[string]interface{}) {
+-					chDelta <- delta
+-				},
+-				onError: func(err error) {
+-					chErr <- err
+-				},
+-			}
+-			expectedDoc := &ThingDocument{
+-				State: ThingState{
+-					Desired: map[string]interface{}{"key2": "value2"},
+-					Delta:   map[string]interface{}{"key2": "value2"},
+-				},
+-				Version:   3,
+-				Timestamp: 12346,
++			select {
++			case err := <-done:
++				t.Fatalf("request completed on a response with a different token: %v", err)
++			case <-time.After(20 * time.Millisecond):
+ 			}
+-			s.updateDelta(&mqtt.Message{Payload: []byte(
+-				"{" +
+-					"  \"state\": {" +
+-					"    \"key2\": \"value2\"" +
+-					"  }," +
+-					"  \"version\": 3," +
+-					"  \"timestamp\": 12346" +
+-					"}",
+-			)})
+-
++			close(allowMatching)
+ 			select {
+-			case err := <-chErr:
+-				t.Error(err)
+-			case delta := <-chDelta:
+-				if !reflect.DeepEqual(expectedDoc.State.Delta, delta) {
+-					t.Errorf("Expected delta: %v, got: %v",
+-						expectedDoc.State.Delta, delta,
+-					)
++			case err := <-done:
++				if err != nil {
++					t.Fatalf("matching response was not accepted: %v", err)
+ 				}
+-			default:
+-				t.Fatal("Timeout")
+-			}
+-			if !reflect.DeepEqual(expectedDoc, s.doc) {
+-				t.Errorf("Expected state: %v, got: %v",
+-					expectedDoc, s.doc,
+-				)
++			case <-time.After(time.Second):
++				t.Fatal("request did not complete after its matching response")
+ 			}
+ 		})
+-		t.Run("Accepted", func(t *testing.T) {
+-			chErr := make(chan error, 1)
+-			chDelta := make(chan map[string]interface{}, 1)
+-			s := &shadow{
+-				doc: &ThingDocument{
+-					State: ThingState{
+-						Reported: map[string]interface{}{"key1": "value1"},
+-					},
+-					Version:   2,
+-					Timestamp: 12345,
+-				},
+-				onDelta: func(delta map[string]interface{}) {
+-					chDelta <- delta
+-				},
+-				onError: func(err error) {
+-					chErr <- err
+-				},
+-			}
+-			expectedDoc := &ThingDocument{
+-				State: ThingState{
+-					Reported: map[string]interface{}{
+-						"key1": "value1",
+-						"key2": "value2",
+-					},
+-				},
+-				Version:   3,
+-				Timestamp: 12346,
+-			}
+-			s.updateAccepted(&mqtt.Message{Payload: []byte(
+-				"{" +
+-					"  \"state\": {" +
+-					"    \"Reported\": {" +
+-					"      \"key2\": \"value2\"" +
+-					"    }" +
+-					"  }," +
+-					"  \"version\": 3," +
+-					"  \"timestamp\": 12346" +
+-					"}",
+-			)})
++	}
++}
+ 
+-			select {
+-			case err := <-chErr:
+-				t.Error(err)
+-			case <-chDelta:
+-				t.Error("cbDelta must not be called on update accept")
+-			default:
++func TestRejectedOperationsReturnError(t *testing.T) {
++	operations := []struct {
++		name string
++		path string
++		call func(shadow.Shadow, context.Context) error
++	}{
++		{"report", "update", func(s shadow.Shadow, ctx context.Context) error {
++			return callOperation(s, "Report", ctx, map[string]interface{}{"key": "value"})
++		}},
++		{"desire", "update", func(s shadow.Shadow, ctx context.Context) error {
++			return callOperation(s, "Desire", ctx, map[string]interface{}{"key": "value"})
++		}},
++		{"delete", "delete", func(s shadow.Shadow, ctx context.Context) error { return callOperation(s, "Delete", ctx) }},
++	}
++	for _, operation := range operations {
++		t.Run(operation.name, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			s, cli := newTestShadow(t, ctx)
++			cli.PublishFn = func(_ context.Context, msg *mqtt.Message) error {
++				token, err := requestToken(msg.Payload)
++				if err != nil {
++					return err
++				}
++				payload, err := json.Marshal(map[string]interface{}{
++					"code": "Failed", "message": "Reason", "clientToken": token,
++				})
++				if err != nil {
++					return err
++				}
++				cli.Serve(&mqtt.Message{Topic: topic(operation.path + "/rejected"), Payload: payload})
++				return nil
+ 			}
+-			if !reflect.DeepEqual(expectedDoc, s.doc) {
+-				t.Errorf("Expected state: %v, got: %v",
+-					expectedDoc, s.doc,
+-				)
++			if err := operation.call(s, ctx); err == nil {
++				t.Fatal("expected an error for a rejected operation")
+ 			}
+ 		})
+-		t.Run("OldDelta", func(t *testing.T) {
+-			s := &shadow{
+-				doc: &ThingDocument{
+-					State: ThingState{
+-						Desired: map[string]interface{}{"key2": "value2"},
+-					},
+-					Version:   2,
+-					Timestamp: 12345,
+-				},
+-				onDelta: func(delta map[string]interface{}) {
+-					t.Error("Old delta must be discarded")
+-				},
+-				onError: func(err error) {
+-					t.Error("Old delta must be silently discarded")
+-				},
+-			}
+-			expectedDoc := &ThingDocument{
+-				State: ThingState{
+-					Desired: map[string]interface{}{"key2": "value2"},
+-				},
+-				Version:   2,
+-				Timestamp: 12345,
+-			}
+-			s.updateDelta(&mqtt.Message{Payload: []byte(
+-				"{" +
+-					"  \"state\": {" +
+-					"    \"key2\": \"value\"" +
+-					"  }," +
+-					"  \"version\": 1," +
+-					"  \"timestamp\": 12343" +
+-					"}",
+-			)})
++	}
++}
+ 
+-			if !reflect.DeepEqual(expectedDoc, s.doc) {
+-				t.Errorf("Expected state: %v, got: %v",
+-					expectedDoc, s.doc,
+-				)
+-			}
+-		})
+-	})
++func TestOnErrorForUnparseableMessage(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	s, cli := newTestShadow(t, ctx)
++
++	errorsReceived := make(chan error, 1)
++	s.OnError(func(err error) { errorsReceived <- err })
++	cli.Serve(&mqtt.Message{Topic: topic("get/rejected"), Payload: []byte("not-json")})
++
++	select {
++	case err := <-errorsReceived:
++		if err == nil {
++			t.Fatal("OnError received a nil error")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("OnError was not called for an unparseable message")
++	}
+ }

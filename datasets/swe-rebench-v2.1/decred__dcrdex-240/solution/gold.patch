@@ -1,0 +1,406 @@
+diff --git a/client/core/core.go b/client/core/core.go
+index 4f7cdff3..04fa37d8 100644
+--- a/client/core/core.go
++++ b/client/core/core.go
+@@ -505,6 +505,12 @@ func (c *Core) refreshUser() {
+ 
+ // CreateWallet creates a new exchange wallet.
+ func (c *Core) CreateWallet(appPW, walletPW string, form *WalletForm) error {
++	assetID := form.AssetID
++	_, exists := c.wallet(assetID)
++	if exists {
++		return fmt.Errorf("%s wallet already exists", unbip(assetID))
++	}
++
+ 	crypter, err := c.encryptionKey(appPW)
+ 	if err != nil {
+ 		return err
+@@ -515,45 +521,41 @@ func (c *Core) CreateWallet(appPW, walletPW string, form *WalletForm) error {
+ 	}
+ 
+ 	dbWallet := &db.Wallet{
+-		AssetID:     form.AssetID,
++		AssetID:     assetID,
+ 		Account:     form.Account,
+ 		INIPath:     form.INIPath,
+ 		EncryptedPW: encPW,
+ 	}
+-	_, exists := c.wallet(form.AssetID)
+-	if exists {
+-		return fmt.Errorf("%s wallet already exists", unbip(dbWallet.AssetID))
+-	}
+ 
+ 	wallet, err := c.loadWallet(dbWallet)
+ 	if err != nil {
+-		return fmt.Errorf("error loading wallet for %d -> %s: %v", dbWallet.AssetID, unbip(dbWallet.AssetID), err)
++		return fmt.Errorf("error loading wallet for %d -> %s: %v", assetID, unbip(assetID), err)
+ 	}
+ 
+ 	err = wallet.Connect(c.ctx)
+ 	if err != nil {
+-		// Assume that the wallet form values are invalid, and drop the wallet from
+-		// the wallets map.
+-		c.walletMtx.Lock()
+-		delete(c.wallets, dbWallet.AssetID)
+-		c.walletMtx.Unlock()
+ 		return fmt.Errorf("Error connecting wallet: %v", err)
+ 	}
+ 
+ 	initErr := func(s string, a ...interface{}) error {
+-		wallet.connector.Disconnect()
++		wallet.Disconnect()
+ 		return fmt.Errorf(s, a...)
+ 	}
+ 
++	err = wallet.Unlock(walletPW, aYear)
++	if err != nil {
++		return initErr("%s wallet authentication error: %v", unbip(assetID), err)
++	}
++
+ 	dbWallet.Balance, _, err = wallet.Balance(0)
+ 	if err != nil {
+-		return initErr("error getting balance for %s: %v", unbip(form.AssetID), err)
++		return initErr("error getting balance for %s: %v", unbip(assetID), err)
+ 	}
+ 	wallet.setBalance(dbWallet.Balance)
+ 
+ 	dbWallet.Address, err = wallet.Address()
+ 	if err != nil {
+-		return initErr("error getting deposit address for %s: %v", unbip(form.AssetID), err)
++		return initErr("error getting deposit address for %s: %v", unbip(assetID), err)
+ 	}
+ 	wallet.setAddress(dbWallet.Address)
+ 
+@@ -563,6 +565,11 @@ func (c *Core) CreateWallet(appPW, walletPW string, form *WalletForm) error {
+ 		return initErr("error storing wallet credentials: %v", err)
+ 	}
+ 
++	// The wallet has been successfully created. Store it.
++	c.walletMtx.Lock()
++	c.wallets[assetID] = wallet
++	c.walletMtx.Unlock()
++
+ 	c.refreshUser()
+ 	return nil
+ }
+@@ -591,10 +598,6 @@ func (c *Core) loadWallet(dbWallet *db.Wallet) (*xcWallet, error) {
+ 	}
+ 	wallet.Wallet = w
+ 	wallet.connector = dex.NewConnectionMaster(w)
+-
+-	c.walletMtx.Lock()
+-	c.wallets[dbWallet.AssetID] = wallet
+-	c.walletMtx.Unlock()
+ 	return wallet, nil
+ }
+ 
+@@ -659,7 +662,7 @@ func (c *Core) CloseWallet(assetID uint32) error {
+ 			return fmt.Errorf("cannot lock %s wallet with active orders or negotiations", unbip(assetID))
+ 		}
+ 	}
+-	err = wallet.lock()
++	err = wallet.Lock()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -1473,17 +1476,19 @@ func (c *Core) initialize() {
+ 	if err != nil {
+ 		log.Errorf("error loading wallets from database: %v", err)
+ 	}
++	c.walletMtx.Lock()
+ 	for _, dbWallet := range dbWallets {
+-		_, err := c.loadWallet(dbWallet)
++		wallet, err := c.loadWallet(dbWallet)
+ 		if err != nil {
+ 			aid := dbWallet.AssetID
+ 			log.Errorf("error loading %d -> %s wallet: %v", aid, unbip(aid), err)
++			continue
+ 		}
++		c.wallets[dbWallet.AssetID] = wallet
+ 	}
++	numWallets := len(c.wallets)
++	c.walletMtx.Unlock()
+ 	if len(dbWallets) > 0 {
+-		c.walletMtx.RLock()
+-		numWallets := len(c.wallets)
+-		c.walletMtx.RUnlock()
+ 		log.Infof("successfully loaded %d of %d wallets", numWallets, len(dbWallets))
+ 	}
+ 	c.refreshUser()
+@@ -1576,8 +1581,6 @@ func (c *Core) reFee(dcrWallet *xcWallet, dc *dexConnection) {
+ 		}
+ 		dc.acct.pay()
+ 		log.Infof("waiter: Fee paid at %s", dc.acct.url)
+-		// New account won't have any active negotiations, so OK to discard first
+-		// first return value from authDEX.
+ 		err = c.authDEX(dc)
+ 		if err != nil {
+ 			log.Errorf("fee paid, but failed to authenticate connection to %s", dc.acct.url)
+diff --git a/client/core/types.go b/client/core/types.go
+index 4c1210e0..b44bc52d 100644
+--- a/client/core/types.go
++++ b/client/core/types.go
+@@ -4,13 +4,11 @@
+ package core
+ 
+ import (
+-	"context"
+ 	"fmt"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+-	"time"
+ 
+ 	"decred.org/dcrdex/client/asset"
+ 	"decred.org/dcrdex/client/db"
+@@ -98,100 +96,6 @@ type SupportedAsset struct {
+ 	Info   *asset.WalletInfo `json:"info"`
+ }
+ 
+-// xcWallet is a wallet.
+-type xcWallet struct {
+-	asset.Wallet
+-	connector *dex.ConnectionMaster
+-	AssetID   uint32
+-	mtx       sync.RWMutex
+-	lockTime  time.Time
+-	hookedUp  bool
+-	balance   uint64
+-	balUpdate time.Time
+-	encPW     []byte
+-	address   string
+-}
+-
+-// Unlock unlocks the wallet.
+-func (w *xcWallet) Unlock(pw string, dur time.Duration) error {
+-	err := w.Wallet.Unlock(pw, dur)
+-	if err != nil {
+-		return err
+-	}
+-	w.mtx.Lock()
+-	w.lockTime = time.Now().Add(dur)
+-	w.mtx.Unlock()
+-	return nil
+-}
+-
+-// lock the wallet, setting the lockTime to the time when the wallet will be
+-// locked.
+-func (w *xcWallet) lock() error {
+-	w.mtx.Lock()
+-	w.lockTime = time.Time{}
+-	w.mtx.Unlock()
+-	return w.Lock()
+-}
+-
+-// unlocked will return true if the lockTime has not passed.
+-func (w *xcWallet) unlocked() bool {
+-	w.mtx.RLock()
+-	defer w.mtx.RUnlock()
+-	return w.lockTime.After(time.Now())
+-}
+-
+-// state returns the current WalletState.
+-func (w *xcWallet) state() *WalletState {
+-	w.mtx.RLock()
+-	defer w.mtx.RUnlock()
+-	winfo := w.Info()
+-	return &WalletState{
+-		Symbol:  unbip(w.AssetID),
+-		AssetID: w.AssetID,
+-		Open:    w.lockTime.After(time.Now()),
+-		Running: w.connector.On(),
+-		Balance: w.balance,
+-		Address: w.address,
+-		FeeRate: winfo.FeeRate, // Withdraw fee, not swap.
+-		Units:   winfo.Units,
+-	}
+-}
+-
+-// setBalance sets the wallet balance.
+-func (w *xcWallet) setBalance(bal uint64) {
+-	w.mtx.Lock()
+-	w.balance = bal
+-	w.balUpdate = time.Now()
+-	w.mtx.Unlock()
+-}
+-
+-// setAddress sets the wallet's deposit address.
+-func (w *xcWallet) setAddress(addr string) {
+-	w.mtx.Lock()
+-	w.address = addr
+-	w.mtx.Unlock()
+-}
+-
+-// connected is true if the wallet has already been connected.
+-func (w *xcWallet) connected() bool {
+-	w.mtx.RLock()
+-	defer w.mtx.RUnlock()
+-	return w.hookedUp
+-}
+-
+-// Connect calls the dex.Connector's Connect method and sets the
+-// xcWallet.hookedUp flag.
+-func (w *xcWallet) Connect(ctx context.Context) error {
+-	err := w.connector.Connect(ctx)
+-	if err != nil {
+-		return err
+-	}
+-	w.mtx.Lock()
+-	w.hookedUp = true
+-	w.mtx.Unlock()
+-	return nil
+-}
+-
+ // Registration is information necessary to register an account on a DEX.
+ type Registration struct {
+ 	DEX      string
+diff --git a/client/core/wallet.go b/client/core/wallet.go
+new file mode 100644
+index 00000000..e241b013
+--- /dev/null
++++ b/client/core/wallet.go
+@@ -0,0 +1,115 @@
++// This code is available on the terms of the project LICENSE.md file,
++// also available online at https://blueoakcouncil.org/license/1.0.0.
++
++package core
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"decred.org/dcrdex/client/asset"
++	"decred.org/dcrdex/dex"
++)
++
++// xcWallet is a wallet.
++type xcWallet struct {
++	asset.Wallet
++	connector *dex.ConnectionMaster
++	AssetID   uint32
++	mtx       sync.RWMutex
++	lockTime  time.Time
++	hookedUp  bool
++	balance   uint64
++	balUpdate time.Time
++	encPW     []byte
++	address   string
++}
++
++// Unlock unlocks the wallet.
++func (w *xcWallet) Unlock(pw string, dur time.Duration) error {
++	err := w.Wallet.Unlock(pw, dur)
++	if err != nil {
++		return err
++	}
++	w.mtx.Lock()
++	w.lockTime = time.Now().Add(dur)
++	w.mtx.Unlock()
++	return nil
++}
++
++// Lock the wallet. The lockTime is zeroed so that unlocked will return false.
++func (w *xcWallet) Lock() error {
++	w.mtx.Lock()
++	w.lockTime = time.Time{}
++	w.mtx.Unlock()
++	return w.Wallet.Lock()
++}
++
++// unlocked will return true if the lockTime has not passed.
++func (w *xcWallet) unlocked() bool {
++	w.mtx.RLock()
++	defer w.mtx.RUnlock()
++	return w.lockTime.After(time.Now())
++}
++
++// state returns the current WalletState.
++func (w *xcWallet) state() *WalletState {
++	w.mtx.RLock()
++	defer w.mtx.RUnlock()
++	winfo := w.Info()
++	return &WalletState{
++		Symbol:  unbip(w.AssetID),
++		AssetID: w.AssetID,
++		Open:    w.lockTime.After(time.Now()),
++		Running: w.connector.On(),
++		Balance: w.balance,
++		Address: w.address,
++		FeeRate: winfo.FeeRate, // Withdraw fee, not swap.
++		Units:   winfo.Units,
++	}
++}
++
++// setBalance sets the wallet balance.
++func (w *xcWallet) setBalance(bal uint64) {
++	w.mtx.Lock()
++	w.balance = bal
++	w.balUpdate = time.Now()
++	w.mtx.Unlock()
++}
++
++// setAddress sets the wallet's deposit address.
++func (w *xcWallet) setAddress(addr string) {
++	w.mtx.Lock()
++	w.address = addr
++	w.mtx.Unlock()
++}
++
++// connected is true if the wallet has already been connected.
++func (w *xcWallet) connected() bool {
++	w.mtx.RLock()
++	defer w.mtx.RUnlock()
++	return w.hookedUp
++}
++
++// Connect calls the dex.Connector's Connect method and sets the
++// xcWallet.hookedUp flag to true.
++func (w *xcWallet) Connect(ctx context.Context) error {
++	err := w.connector.Connect(ctx)
++	if err != nil {
++		return err
++	}
++	w.mtx.Lock()
++	w.hookedUp = true
++	w.mtx.Unlock()
++	return nil
++}
++
++// Disconnect calls the dex.Connector's Disconnect method and sets the
++// xcWallet.hookedUp flag to false.
++func (w *xcWallet) Disconnect() {
++	w.connector.Disconnect()
++	w.mtx.Lock()
++	w.hookedUp = false
++	w.mtx.Unlock()
++}
+diff --git a/client/webserver/api.go b/client/webserver/api.go
+index 30c65db5..20a1f26d 100644
+--- a/client/webserver/api.go
++++ b/client/webserver/api.go
+@@ -137,23 +137,6 @@ func (s *WebServer) apiNewWallet(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	s.notifyWalletUpdate(form.AssetID)
+-	type response struct {
+-		OK     bool   `json:"ok"`
+-		Locked bool   `json:"locked"`
+-		Msg    string `json:"msg"`
+-	}
+-	err = s.core.OpenWallet(form.AssetID, form.AppPW)
+-	if err != nil {
+-		errMsg := fmt.Sprintf("wallet connected, but failed to open with provided password: %v", err)
+-		log.Errorf(errMsg)
+-		resp := &response{
+-			Locked: true,
+-			Msg:    errMsg,
+-		}
+-		writeJSON(w, resp, s.indent)
+-		return
+-	}
+-	s.notifyWalletUpdate(form.AssetID)
+ 	writeJSON(w, simpleAck(), s.indent)
+ }
+ 

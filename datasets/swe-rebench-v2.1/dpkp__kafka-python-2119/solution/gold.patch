@@ -1,0 +1,691 @@
+diff --git a/.travis.yml b/.travis.yml
+index d660271..e837924 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -22,6 +22,7 @@ addons:
+   apt:
+     packages:
+       - libsnappy-dev
++      - libzstd-dev
+       - openjdk-8-jdk
+ 
+ cache:
+diff --git a/README.rst b/README.rst
+index bae567b..29e6935 100644
+--- a/README.rst
++++ b/README.rst
+@@ -2,7 +2,7 @@ Kafka Python client
+ ------------------------
+ 
+ .. image:: https://img.shields.io/badge/kafka-2.4%2C%202.3%2C%202.2%2C%202.1%2C%202.0%2C%201.1%2C%201.0%2C%200.11%2C%200.10%2C%200.9%2C%200.8-brightgreen.svg
+-    :target: https://kafka-python.readthedocs.io/compatibility.html
++    :target: https://kafka-python.readthedocs.io/en/master/compatibility.html
+ .. image:: https://img.shields.io/pypi/pyversions/kafka-python.svg
+     :target: https://pypi.python.org/pypi/kafka-python
+ .. image:: https://coveralls.io/repos/dpkp/kafka-python/badge.svg?branch=master&service=github
+diff --git a/docs/index.rst b/docs/index.rst
+index fa6f93c..9c46e33 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -122,11 +122,12 @@ multiprocessing is recommended.
+ Compression
+ ***********
+ 
+-kafka-python supports gzip compression/decompression natively. To produce or
+-consume lz4 compressed messages, you should install python-lz4 (pip install lz4).
+-To enable snappy, install python-snappy (also requires snappy library).
+-See `Installation <install.html#optional-snappy-install>`_ for more information.
++kafka-python supports multiple compression types:
+ 
++ - gzip : supported natively
++ - lz4 : requires `python-lz4 <https://pypi.org/project/lz4/>`_ installed
++ - snappy : requires the `python-snappy <https://pypi.org/project/python-snappy/>`_  package (which requires the snappy C library)
++ - zstd : requires the `python-zstandard <https://github.com/indygreg/python-zstandard>`_ package installed
+ 
+ Protocol
+ ********
+diff --git a/example.py b/example.py
+index dac97b7..9907450 100755
+--- a/example.py
++++ b/example.py
+@@ -1,15 +1,15 @@
+ #!/usr/bin/env python
+-import threading, logging, time
+-import multiprocessing
++import threading, time
+ 
+-from kafka import KafkaConsumer, KafkaProducer
++from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
++from kafka.admin import NewTopic
+ 
+ 
+ class Producer(threading.Thread):
+     def __init__(self):
+         threading.Thread.__init__(self)
+         self.stop_event = threading.Event()
+-        
++
+     def stop(self):
+         self.stop_event.set()
+ 
+@@ -23,14 +23,15 @@ class Producer(threading.Thread):
+ 
+         producer.close()
+ 
+-class Consumer(multiprocessing.Process):
++
++class Consumer(threading.Thread):
+     def __init__(self):
+-        multiprocessing.Process.__init__(self)
+-        self.stop_event = multiprocessing.Event()
+-        
++        threading.Thread.__init__(self)
++        self.stop_event = threading.Event()
++
+     def stop(self):
+         self.stop_event.set()
+-        
++
+     def run(self):
+         consumer = KafkaConsumer(bootstrap_servers='localhost:9092',
+                                  auto_offset_reset='earliest',
+@@ -44,29 +45,38 @@ class Consumer(multiprocessing.Process):
+                     break
+ 
+         consumer.close()
+-        
+-        
++
++
+ def main():
++    # Create 'my-topic' Kafka topic
++    try:
++        admin = KafkaAdminClient(bootstrap_servers='localhost:9092')
++
++        topic = NewTopic(name='my-topic',
++                         num_partitions=1,
++                         replication_factor=1)
++        admin.create_topics([topic])
++    except Exception:
++        pass
++
+     tasks = [
+         Producer(),
+         Consumer()
+     ]
+ 
++    # Start threads of a publisher/producer and a subscriber/consumer to 'my-topic' Kafka topic
+     for t in tasks:
+         t.start()
+ 
+     time.sleep(10)
+-    
++
++    # Stop threads
+     for task in tasks:
+         task.stop()
+ 
+     for task in tasks:
+         task.join()
+-        
+-        
++
++
+ if __name__ == "__main__":
+-    logging.basicConfig(
+-        format='%(asctime)s.%(msecs)s:%(name)s:%(thread)d:%(levelname)s:%(process)d:%(message)s',
+-        level=logging.INFO
+-        )
+     main()
+diff --git a/kafka/admin/client.py b/kafka/admin/client.py
+index d0fa845..1b91e1b 100644
+--- a/kafka/admin/client.py
++++ b/kafka/admin/client.py
+@@ -1,6 +1,6 @@
+ from __future__ import absolute_import
+ 
+-from collections import defaultdict
++from collections import defaultdict, namedtuple
+ import copy
+ import logging
+ import socket
+@@ -8,7 +8,10 @@ import socket
+ from . import ConfigResourceType
+ from kafka.vendor import six
+ 
++from kafka.admin.acl_resource import ACLOperation, ACLPermissionType, ACLFilter, ACL, ResourcePattern, ResourceType, \
++    ACLResourcePatternType
+ from kafka.client_async import KafkaClient, selectors
++from kafka.coordinator.protocol import ConsumerProtocolMemberMetadata, ConsumerProtocolMemberAssignment, ConsumerProtocol
+ import kafka.errors as Errors
+ from kafka.errors import (
+     IncompatibleBrokerVersion, KafkaConfigurationError, NotControllerError,
+@@ -19,9 +22,8 @@ from kafka.protocol.admin import (
+     ListGroupsRequest, DescribeGroupsRequest, DescribeAclsRequest, CreateAclsRequest, DeleteAclsRequest)
+ from kafka.protocol.commit import GroupCoordinatorRequest, OffsetFetchRequest
+ from kafka.protocol.metadata import MetadataRequest
+-from kafka.structs import TopicPartition, OffsetAndMetadata
+-from kafka.admin.acl_resource import ACLOperation, ACLPermissionType, ACLFilter, ACL, ResourcePattern, ResourceType, \
+-    ACLResourcePatternType
++from kafka.protocol.types import Array
++from kafka.structs import TopicPartition, OffsetAndMetadata, MemberInformation, GroupInformation
+ from kafka.version import __version__
+ 
+ 
+@@ -204,7 +206,7 @@ class KafkaAdminClient(object):
+         self._client = KafkaClient(metrics=self._metrics,
+                                    metric_group_prefix='admin',
+                                    **self.config)
+-        self._client.check_version()
++        self._client.check_version(timeout=(self.config['api_version_auto_timeout_ms'] / 1000))
+ 
+         # Get auto-discovered version from client if necessary
+         if self.config['api_version'] is None:
+@@ -271,7 +273,7 @@ class KafkaAdminClient(object):
+             response = future.value
+             controller_id = response.controller_id
+             # verify the controller is new enough to support our requests
+-            controller_version = self._client.check_version(controller_id)
++            controller_version = self._client.check_version(controller_id, timeout=(self.config['api_version_auto_timeout_ms'] / 1000))
+             if controller_version < (0, 10, 0):
+                 raise IncompatibleBrokerVersion(
+                     "The controller appears to be running Kafka {}. KafkaAdminClient requires brokers >= 0.10.0.0."
+@@ -1000,22 +1002,47 @@ class KafkaAdminClient(object):
+         """Process a DescribeGroupsResponse into a group description."""
+         if response.API_VERSION <= 3:
+             assert len(response.groups) == 1
+-            # TODO need to implement converting the response tuple into
+-            # a more accessible interface like a namedtuple and then stop
+-            # hardcoding tuple indices here. Several Java examples,
+-            # including KafkaAdminClient.java
+-            group_description = response.groups[0]
+-            error_code = group_description[0]
++            for response_field, response_name in zip(response.SCHEMA.fields, response.SCHEMA.names):
++                if isinstance(response_field, Array):
++                    described_groups = response.__dict__[response_name]
++                    described_groups_field_schema = response_field.array_of
++                    described_group = response.__dict__[response_name][0]
++                    described_group_information_list = []
++                    protocol_type_is_consumer = False
++                    for (described_group_information, group_information_name, group_information_field) in zip(described_group, described_groups_field_schema.names, described_groups_field_schema.fields):
++                        if group_information_name == 'protocol_type':
++                            protocol_type = described_group_information
++                            protocol_type_is_consumer = (protocol_type == ConsumerProtocol.PROTOCOL_TYPE or not protocol_type)
++                        if isinstance(group_information_field, Array):
++                            member_information_list = []
++                            member_schema = group_information_field.array_of
++                            for members in described_group_information:
++                                member_information = []
++                                for (member, member_field, member_name)  in zip(members, member_schema.fields, member_schema.names):
++                                    if protocol_type_is_consumer:
++                                        if member_name == 'member_metadata' and member:
++                                            member_information.append(ConsumerProtocolMemberMetadata.decode(member))
++                                        elif member_name == 'member_assignment' and member:
++                                            member_information.append(ConsumerProtocolMemberAssignment.decode(member))
++                                        else:
++                                            member_information.append(member)
++                                member_info_tuple = MemberInformation._make(member_information)
++                                member_information_list.append(member_info_tuple)
++                            described_group_information_list.append(member_information_list)
++                        else:
++                            described_group_information_list.append(described_group_information)
++                    # Version 3 of the DescribeGroups API introduced the "authorized_operations" field. This will cause the namedtuple to fail
++                    # Therefore, appending a placeholder of None in it.
++                    if response.API_VERSION <=2:
++                        described_group_information_list.append(None)
++                    group_description = GroupInformation._make(described_group_information_list)
++            error_code = group_description.error_code
+             error_type = Errors.for_code(error_code)
+             # Java has the note: KAFKA-6789, we can retry based on the error code
+             if error_type is not Errors.NoError:
+                 raise error_type(
+                     "DescribeGroupsResponse failed with response '{}'."
+                     .format(response))
+-            # TODO Java checks the group protocol type, and if consumer
+-            # (ConsumerProtocol.PROTOCOL_TYPE) or empty string, it decodes
+-            # the members' partition assignments... that hasn't yet been
+-            # implemented here so just return the raw struct results
+         else:
+             raise NotImplementedError(
+                 "Support for DescribeGroupsResponse_v{} has not yet been added to KafkaAdminClient."
+diff --git a/kafka/client_async.py b/kafka/client_async.py
+index caa88cf..58f22d4 100644
+--- a/kafka/client_async.py
++++ b/kafka/client_async.py
+@@ -201,10 +201,15 @@ class KafkaClient(object):
+             if key in configs:
+                 self.config[key] = configs[key]
+ 
++        # these properties need to be set on top of the initialization pipeline
++        # because they are used when __del__ method is called
++        self._closed = False
++        self._wake_r, self._wake_w = socket.socketpair()
++        self._selector = self.config['selector']()
++
+         self.cluster = ClusterMetadata(**self.config)
+         self._topics = set()  # empty set will fetch all topic metadata
+         self._metadata_refresh_in_progress = False
+-        self._selector = self.config['selector']()
+         self._conns = Dict()  # object to support weakrefs
+         self._api_versions = None
+         self._connecting = set()
+@@ -212,7 +217,6 @@ class KafkaClient(object):
+         self._refresh_on_disconnects = True
+         self._last_bootstrap = 0
+         self._bootstrap_fails = 0
+-        self._wake_r, self._wake_w = socket.socketpair()
+         self._wake_r.setblocking(False)
+         self._wake_w.settimeout(self.config['wakeup_timeout_ms'] / 1000.0)
+         self._wake_lock = threading.Lock()
+@@ -226,7 +230,6 @@ class KafkaClient(object):
+ 
+         self._selector.register(self._wake_r, selectors.EVENT_READ)
+         self._idle_expiry_manager = IdleConnectionManager(self.config['connections_max_idle_ms'])
+-        self._closed = False
+         self._sensors = None
+         if self.config['metrics']:
+             self._sensors = KafkaClientMetrics(self.config['metrics'],
+diff --git a/kafka/codec.py b/kafka/codec.py
+index aa9fc82..917400e 100644
+--- a/kafka/codec.py
++++ b/kafka/codec.py
+@@ -10,12 +10,18 @@ from kafka.vendor.six.moves import range
+ 
+ _XERIAL_V1_HEADER = (-126, b'S', b'N', b'A', b'P', b'P', b'Y', 0, 1, 1)
+ _XERIAL_V1_FORMAT = 'bccccccBii'
++ZSTD_MAX_OUTPUT_SIZE = 1024 * 1024
+ 
+ try:
+     import snappy
+ except ImportError:
+     snappy = None
+ 
++try:
++    import zstandard as zstd
++except ImportError:
++    zstd = None
++
+ try:
+     import lz4.frame as lz4
+ 
+@@ -58,6 +64,10 @@ def has_snappy():
+     return snappy is not None
+ 
+ 
++def has_zstd():
++    return zstd is not None
++
++
+ def has_lz4():
+     if lz4 is not None:
+         return True
+@@ -299,3 +309,18 @@ def lz4_decode_old_kafka(payload):
+         payload[header_size:]
+     ])
+     return lz4_decode(munged_payload)
++
++
++def zstd_encode(payload):
++    if not zstd:
++        raise NotImplementedError("Zstd codec is not available")
++    return zstd.ZstdCompressor().compress(payload)
++
++
++def zstd_decode(payload):
++    if not zstd:
++        raise NotImplementedError("Zstd codec is not available")
++    try:
++        return zstd.ZstdDecompressor().decompress(payload)
++    except zstd.ZstdError:
++        return zstd.ZstdDecompressor().decompress(payload, max_output_size=ZSTD_MAX_OUTPUT_SIZE)
+diff --git a/kafka/consumer/fetcher.py b/kafka/consumer/fetcher.py
+index 2c11eb9..e4f8c18 100644
+--- a/kafka/consumer/fetcher.py
++++ b/kafka/consumer/fetcher.py
+@@ -293,7 +293,7 @@ class Fetcher(six.Iterator):
+                 # Issue #1780
+                 # Recheck partition existence after after a successful metadata refresh
+                 if refresh_future.succeeded() and isinstance(future.exception, Errors.StaleMetadata):
+-                    log.debug("Stale metadata was raised, and we now have an updated metadata. Rechecking partition existance")
++                    log.debug("Stale metadata was raised, and we now have an updated metadata. Rechecking partition existence")
+                     unknown_partition = future.exception.args[0]  # TopicPartition from StaleMetadata
+                     if self._client.cluster.leader_for_partition(unknown_partition) is None:
+                         log.debug("Removed partition %s from offsets retrieval" % (unknown_partition, ))
+diff --git a/kafka/coordinator/base.py b/kafka/coordinator/base.py
+index cd110ce..5e41309 100644
+--- a/kafka/coordinator/base.py
++++ b/kafka/coordinator/base.py
+@@ -242,7 +242,7 @@ class BaseCoordinator(object):
+         """Block until the coordinator for this group is known
+         (and we have an active connection -- java client uses unsent queue).
+         """
+-        with self._lock:
++        with self._client._lock, self._lock:
+             while self.coordinator_unknown():
+ 
+                 # Prior to 0.8.2 there was no group coordinator
+@@ -345,7 +345,7 @@ class BaseCoordinator(object):
+ 
+     def ensure_active_group(self):
+         """Ensure that the group is active (i.e. joined and synced)"""
+-        with self._lock:
++        with self._client._lock, self._lock:
+             if self._heartbeat_thread is None:
+                 self._start_heartbeat_thread()
+ 
+@@ -763,7 +763,7 @@ class BaseCoordinator(object):
+ 
+     def maybe_leave_group(self):
+         """Leave the current group and reset local generation/memberId."""
+-        with self._lock:
++        with self._client._lock, self._lock:
+             if (not self.coordinator_unknown()
+                 and self.state is not MemberState.UNJOINED
+                 and self._generation is not Generation.NO_GENERATION):
+@@ -946,6 +946,15 @@ class HeartbeatThread(threading.Thread):
+             log.debug('Heartbeat thread closed')
+ 
+     def _run_once(self):
++        with self.coordinator._client._lock, self.coordinator._lock:
++            if self.enabled and self.coordinator.state is MemberState.STABLE:
++                # TODO: When consumer.wakeup() is implemented, we need to
++                # disable here to prevent propagating an exception to this
++                # heartbeat thread
++                # must get client._lock, or maybe deadlock at heartbeat 
++                # failure callbak in consumer poll
++                self.coordinator._client.poll(timeout_ms=0)
++
+         with self.coordinator._lock:
+             if not self.enabled:
+                 log.debug('Heartbeat disabled. Waiting')
+@@ -961,11 +970,6 @@ class HeartbeatThread(threading.Thread):
+                 self.disable()
+                 return
+ 
+-            # TODO: When consumer.wakeup() is implemented, we need to
+-            # disable here to prevent propagating an exception to this
+-            # heartbeat thread
+-            self.coordinator._client.poll(timeout_ms=0)
+-
+             if self.coordinator.coordinator_unknown():
+                 future = self.coordinator.lookup_coordinator()
+                 if not future.is_done or future.failed():
+diff --git a/kafka/producer/kafka.py b/kafka/producer/kafka.py
+index 9509ab9..cde26b0 100644
+--- a/kafka/producer/kafka.py
++++ b/kafka/producer/kafka.py
+@@ -12,7 +12,7 @@ from kafka.vendor import six
+ 
+ import kafka.errors as Errors
+ from kafka.client_async import KafkaClient, selectors
+-from kafka.codec import has_gzip, has_snappy, has_lz4
++from kafka.codec import has_gzip, has_snappy, has_lz4, has_zstd
+ from kafka.metrics import MetricConfig, Metrics
+ from kafka.partitioner.default import DefaultPartitioner
+ from kafka.producer.future import FutureRecordMetadata, FutureProduceResult
+@@ -119,7 +119,7 @@ class KafkaProducer(object):
+                 available guarantee.
+             If unset, defaults to acks=1.
+         compression_type (str): The compression type for all data generated by
+-            the producer. Valid values are 'gzip', 'snappy', 'lz4', or None.
++            the producer. Valid values are 'gzip', 'snappy', 'lz4', 'zstd' or None.
+             Compression is of full batches of data, so the efficacy of batching
+             will also impact the compression ratio (more batching means better
+             compression). Default: None.
+@@ -339,6 +339,7 @@ class KafkaProducer(object):
+         'gzip': (has_gzip, LegacyRecordBatchBuilder.CODEC_GZIP),
+         'snappy': (has_snappy, LegacyRecordBatchBuilder.CODEC_SNAPPY),
+         'lz4': (has_lz4, LegacyRecordBatchBuilder.CODEC_LZ4),
++        'zstd': (has_zstd, DefaultRecordBatchBuilder.CODEC_ZSTD),
+         None: (lambda: True, LegacyRecordBatchBuilder.CODEC_NONE),
+     }
+ 
+@@ -388,6 +389,9 @@ class KafkaProducer(object):
+         if self.config['compression_type'] == 'lz4':
+             assert self.config['api_version'] >= (0, 8, 2), 'LZ4 Requires >= Kafka 0.8.2 Brokers'
+ 
++        if self.config['compression_type'] == 'zstd':
++            assert self.config['api_version'] >= (2, 1, 0), 'Zstd Requires >= Kafka 2.1.0 Brokers'
++
+         # Check compression_type for library support
+         ct = self.config['compression_type']
+         if ct not in self._COMPRESSORS:
+@@ -445,6 +449,14 @@ class KafkaProducer(object):
+         self._cleanup = None
+ 
+     def __del__(self):
++        # Disable logger during destruction to avoid touching dangling references
++        class NullLogger(object):
++            def __getattr__(self, name):
++                return lambda *args: None
++
++        global log
++        log = NullLogger()
++
+         self.close()
+ 
+     def close(self, timeout=None):
+diff --git a/kafka/protocol/message.py b/kafka/protocol/message.py
+index 31527bf..4c5c031 100644
+--- a/kafka/protocol/message.py
++++ b/kafka/protocol/message.py
+@@ -3,8 +3,8 @@ from __future__ import absolute_import
+ import io
+ import time
+ 
+-from kafka.codec import (has_gzip, has_snappy, has_lz4,
+-                     gzip_decode, snappy_decode,
++from kafka.codec import (has_gzip, has_snappy, has_lz4, has_zstd,
++                     gzip_decode, snappy_decode, zstd_decode,
+                      lz4_decode, lz4_decode_old_kafka)
+ from kafka.protocol.frame import KafkaBytes
+ from kafka.protocol.struct import Struct
+@@ -35,6 +35,7 @@ class Message(Struct):
+     CODEC_GZIP = 0x01
+     CODEC_SNAPPY = 0x02
+     CODEC_LZ4 = 0x03
++    CODEC_ZSTD = 0x04
+     TIMESTAMP_TYPE_MASK = 0x08
+     HEADER_SIZE = 22  # crc(4), magic(1), attributes(1), timestamp(8), key+value size(4*2)
+ 
+@@ -119,7 +120,7 @@ class Message(Struct):
+ 
+     def decompress(self):
+         codec = self.attributes & self.CODEC_MASK
+-        assert codec in (self.CODEC_GZIP, self.CODEC_SNAPPY, self.CODEC_LZ4)
++        assert codec in (self.CODEC_GZIP, self.CODEC_SNAPPY, self.CODEC_LZ4, self.CODEC_ZSTD)
+         if codec == self.CODEC_GZIP:
+             assert has_gzip(), 'Gzip decompression unsupported'
+             raw_bytes = gzip_decode(self.value)
+@@ -132,6 +133,9 @@ class Message(Struct):
+                 raw_bytes = lz4_decode_old_kafka(self.value)
+             else:
+                 raw_bytes = lz4_decode(self.value)
++        elif codec == self.CODEC_ZSTD:
++            assert has_zstd(), "ZSTD decompression unsupported"
++            raw_bytes = zstd_decode(self.value)
+         else:
+             raise Exception('This should be impossible')
+ 
+diff --git a/kafka/record/default_records.py b/kafka/record/default_records.py
+index 07368bb..a098c42 100644
+--- a/kafka/record/default_records.py
++++ b/kafka/record/default_records.py
+@@ -62,8 +62,8 @@ from kafka.record.util import (
+ )
+ from kafka.errors import CorruptRecordException, UnsupportedCodecError
+ from kafka.codec import (
+-    gzip_encode, snappy_encode, lz4_encode,
+-    gzip_decode, snappy_decode, lz4_decode
++    gzip_encode, snappy_encode, lz4_encode, zstd_encode,
++    gzip_decode, snappy_decode, lz4_decode, zstd_decode
+ )
+ import kafka.codec as codecs
+ 
+@@ -97,6 +97,7 @@ class DefaultRecordBase(object):
+     CODEC_GZIP = 0x01
+     CODEC_SNAPPY = 0x02
+     CODEC_LZ4 = 0x03
++    CODEC_ZSTD = 0x04
+     TIMESTAMP_TYPE_MASK = 0x08
+     TRANSACTIONAL_MASK = 0x10
+     CONTROL_MASK = 0x20
+@@ -111,6 +112,8 @@ class DefaultRecordBase(object):
+             checker, name = codecs.has_snappy, "snappy"
+         elif compression_type == self.CODEC_LZ4:
+             checker, name = codecs.has_lz4, "lz4"
++        elif compression_type == self.CODEC_ZSTD:
++            checker, name = codecs.has_zstd, "zstd"
+         if not checker():
+             raise UnsupportedCodecError(
+                 "Libraries for {} compression codec not found".format(name))
+@@ -185,6 +188,8 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
+                     uncompressed = snappy_decode(data.tobytes())
+                 if compression_type == self.CODEC_LZ4:
+                     uncompressed = lz4_decode(data.tobytes())
++                if compression_type == self.CODEC_ZSTD:
++                    uncompressed = zstd_decode(data.tobytes())
+                 self._buffer = bytearray(uncompressed)
+                 self._pos = 0
+         self._decompressed = True
+@@ -517,6 +522,8 @@ class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
+                 compressed = snappy_encode(data)
+             elif self._compression_type == self.CODEC_LZ4:
+                 compressed = lz4_encode(data)
++            elif self._compression_type == self.CODEC_ZSTD:
++                compressed = zstd_encode(data)
+             compressed_size = len(compressed)
+             if len(data) <= compressed_size:
+                 # We did not get any benefit from compression, lets send
+diff --git a/kafka/record/memory_records.py b/kafka/record/memory_records.py
+index a6c4b51..fc2ef2d 100644
+--- a/kafka/record/memory_records.py
++++ b/kafka/record/memory_records.py
+@@ -117,7 +117,7 @@ class MemoryRecordsBuilder(object):
+ 
+     def __init__(self, magic, compression_type, batch_size):
+         assert magic in [0, 1, 2], "Not supported magic"
+-        assert compression_type in [0, 1, 2, 3], "Not valid compression type"
++        assert compression_type in [0, 1, 2, 3, 4], "Not valid compression type"
+         if magic >= 2:
+             self._builder = DefaultRecordBatchBuilder(
+                 magic=magic, compression_type=compression_type,
+diff --git a/kafka/structs.py b/kafka/structs.py
+index 9ab4f8b..bcb0236 100644
+--- a/kafka/structs.py
++++ b/kafka/structs.py
+@@ -1,27 +1,87 @@
++""" Other useful structs """
+ from __future__ import absolute_import
+ 
+ from collections import namedtuple
+ 
+ 
+-# Other useful structs
++"""A topic and partition tuple
++
++Keyword Arguments:
++    topic (str): A topic name
++    partition (int): A partition id
++"""
+ TopicPartition = namedtuple("TopicPartition",
+     ["topic", "partition"])
+ 
++
++"""A Kafka broker metadata used by admin tools.
++
++Keyword Arguments:
++    nodeID (int): The Kafka broker id.
++    host (str): The Kafka broker hostname.
++    port (int): The Kafka broker port.
++    rack (str): The rack of the broker, which is used to in rack aware
++                partition assignment for fault tolerance.
++    Examples: `RACK1`, `us-east-1d`. Default: None
++"""
+ BrokerMetadata = namedtuple("BrokerMetadata",
+     ["nodeId", "host", "port", "rack"])
+ 
++
++"""A topic partition metadata describing the state in the MetadataResponse.
++
++Keyword Arguments:
++    topic (str): The topic name of the partition this metadata relates to.
++    partition (int): The id of the partition this metadata relates to.
++    leader (int): The id of the broker that is the leader for the partition.
++    replicas (List[int]): The ids of all brokers that contain replicas of the
++                          partition.
++    isr (List[int]): The ids of all brokers that contain in-sync replicas of
++                     the partition.
++    error (KafkaError): A KafkaError object associated with the request for
++                        this partition metadata.
++"""
+ PartitionMetadata = namedtuple("PartitionMetadata",
+     ["topic", "partition", "leader", "replicas", "isr", "error"])
+ 
++
++"""The Kafka offset commit API
++
++The Kafka offset commit API allows users to provide additional metadata
++(in the form of a string) when an offset is committed. This can be useful
++(for example) to store information about which node made the commit,
++what time the commit was made, etc.
++
++Keyword Arguments:
++    offset (int): The offset to be committed
++    metadata (str): Non-null metadata
++"""
+ OffsetAndMetadata = namedtuple("OffsetAndMetadata",
+     # TODO add leaderEpoch: OffsetAndMetadata(offset, leaderEpoch, metadata)
+     ["offset", "metadata"])
+ 
++
++"""An offset and timestamp tuple
++
++Keyword Arguments:
++    offset (int): An offset
++    timestamp (int): The timestamp associated to the offset
++"""
+ OffsetAndTimestamp = namedtuple("OffsetAndTimestamp",
+     ["offset", "timestamp"])
+ 
++MemberInformation = namedtuple("MemberInformation",
++    ["member_id", "client_id", "client_host", "member_metadata", "member_assignment"])
++
++GroupInformation = namedtuple("GroupInformation",
++    ["error_code", "group", "state", "protocol_type", "protocol", "members", "authorized_operations"])
++
++"""Define retry policy for async producer
+ 
+-# Define retry policy for async producer
+-# Limit value: int >= 0, 0 means no retries
++Keyword Arguments:
++    Limit (int): Number of retries. limit >= 0, 0 means no retries
++    backoff_ms (int): Milliseconds to backoff.
++    retry_on_timeouts:
++"""
+ RetryOptions = namedtuple("RetryOptions",
+     ["limit", "backoff_ms", "retry_on_timeouts"])
+diff --git a/setup.py b/setup.py
+index 005c5ad..5cb2e72 100644
+--- a/setup.py
++++ b/setup.py
+@@ -35,6 +35,7 @@ setup(
+     version=__version__,
+ 
+     tests_require=test_require,
++    extras_require={"crc32c": ["crc32c"]},
+     cmdclass={"test": Tox},
+     packages=find_packages(exclude=['test']),
+     author="Dana Powers",
+diff --git a/tox.ini b/tox.ini
+index 8dfe2c5..10e9911 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -15,6 +15,7 @@ deps =
+     pytest-mock
+     mock
+     python-snappy
++    zstandard
+     lz4
+     xxhash
+     crc32c

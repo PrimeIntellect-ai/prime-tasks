@@ -1,0 +1,109 @@
+diff --git a/pushy/src/test/java/com/eatthepath/pushy/apns/ApnsClientTest.java b/pushy/src/test/java/com/eatthepath/pushy/apns/ApnsClientTest.java
+index f2ec10f..013b5bb 100644
+--- a/pushy/src/test/java/com/eatthepath/pushy/apns/ApnsClientTest.java
++++ b/pushy/src/test/java/com/eatthepath/pushy/apns/ApnsClientTest.java
+@@ -33,12 +33,16 @@ import org.junit.jupiter.params.provider.ValueSource;
+ 
+ import javax.net.ssl.SSLHandshakeException;
+ import java.io.InputStream;
++import java.time.Duration;
+ import java.time.Instant;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.stream.Stream;
+@@ -350,14 +354,85 @@ public class ApnsClientTest extends AbstractClientServerTest {
+             final PushNotificationResponse<SimpleApnsPushNotification> response =
+                     client.sendNotification(pushNotification).get();
+ 
+-            assertFalse(response.isAccepted(),
+-                    "Expired token failures should be fatal.");
++            assertFalse(response.isAccepted(), "Expired token failures should be fatal.");
+         } finally {
+             client.close().get();
+             server.shutdown().get();
+         }
+     }
+ 
++    @Test
++    void testConcurrentConnectionsShareRefreshedAuthenticationToken() throws Exception {
++        final CountDownLatch initialNotificationReceived = new CountDownLatch(1);
++        final CountDownLatch concurrentNotificationsReceived = new CountDownLatch(2);
++        final CountDownLatch releaseConcurrentNotifications = new CountDownLatch(1);
++        final AtomicInteger notificationCount = new AtomicInteger();
++        final List<String> concurrentAuthorizationHeaders = Collections.synchronizedList(new ArrayList<>());
++
++        final PushNotificationHandlerFactory handlerFactory = sslSession -> (headers, payload) -> {
++            if (notificationCount.incrementAndGet() == 1) {
++                initialNotificationReceived.countDown();
++            } else {
++                concurrentAuthorizationHeaders.add(headers.get("authorization").toString());
++                concurrentNotificationsReceived.countDown();
++
++                try {
++                    if (!releaseConcurrentNotifications.await(5, TimeUnit.SECONDS)) {
++                        throw new IllegalStateException("Timed out while waiting to release concurrent notifications.");
++                    }
++                } catch (final InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                    throw new IllegalStateException(e);
++                }
++            }
++        };
++
++        final MockApnsServer server = this.buildServer(handlerFactory);
++        final ExecutorService requestExecutor = Executors.newFixedThreadPool(2);
++        final ApnsClient client = new ApnsClientBuilder()
++                .setApnsServer(HOST, PORT)
++                .setTrustedServerCertificateChain(getClass().getResourceAsStream(CA_CERTIFICATE_FILENAME))
++                .setSigningKey(this.signingKey)
++                .setEventLoopGroup(CLIENT_EVENT_LOOP_GROUP)
++                .setTokenExpiration(Duration.ofSeconds(2))
++                .setConcurrentConnections(2)
++                .build();
++
++        try {
++            server.start(PORT).get();
++
++            final SimpleApnsPushNotification pushNotification =
++                    new SimpleApnsPushNotification(DEVICE_TOKEN, TOPIC, PAYLOAD);
++
++            client.sendNotification(pushNotification).get();
++            assertTrue(initialNotificationReceived.await(5, TimeUnit.SECONDS));
++
++            // Allow the first connection's token to be refreshed before opening a second connection. The client-wide
++            // token should be the same on both connections, even though they become active at different times.
++            Thread.sleep(3100);
++
++            final CompletableFuture<PushNotificationResponse<SimpleApnsPushNotification>> firstResponse =
++                    CompletableFuture.supplyAsync(() -> client.sendNotification(pushNotification), requestExecutor)
++                            .thenCompose(future -> future);
++            final CompletableFuture<PushNotificationResponse<SimpleApnsPushNotification>> secondResponse =
++                    CompletableFuture.supplyAsync(() -> client.sendNotification(pushNotification), requestExecutor)
++                            .thenCompose(future -> future);
++
++            assertTrue(concurrentNotificationsReceived.await(5, TimeUnit.SECONDS));
++            releaseConcurrentNotifications.countDown();
++            firstResponse.get();
++            secondResponse.get();
++
++            assertEquals(concurrentAuthorizationHeaders.get(0), concurrentAuthorizationHeaders.get(1),
++                    "Concurrent connections should send the same current provider token.");
++        } finally {
++            releaseConcurrentNotifications.countDown();
++            requestExecutor.shutdownNow();
++            client.close().get();
++            server.shutdown().get();
++        }
++    }
++
+     @ParameterizedTest
+     @ValueSource(booleans = { true, false })
+     void testSendManyNotifications(final boolean useTokenAuthentication) throws Exception {

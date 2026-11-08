@@ -1,0 +1,298 @@
+diff --git a/docs/rules/indent.md b/docs/rules/indent.md
+index ade61b75..9b375d86 100644
+--- a/docs/rules/indent.md
++++ b/docs/rules/indent.md
+@@ -84,6 +84,7 @@ This rule has an object option:
+ * `"ObjectExpression"` (default: 1) enforces indentation level for properties in objects. It can be set to the string `"first"`, indicating that all properties in the object should be aligned with the first property. This can also be set to `"off"` to disable checking for object properties.
+ * `"ImportDeclaration"` (default: 1) enforces indentation level for import statements. It can be set to the string `"first"`, indicating that all imported members from a module should be aligned with the first member in the list. This can also be set to `"off"` to disable checking for imported module members.
+ * `"flatTernaryExpressions": true` (`false` by default) requires no indentation for ternary expressions which are nested in other ternary expressions.
++* `ignoredNodes` accepts an array of [selectors](/docs/developer-guide/selectors). If an AST node is matched by any of the selectors, the indentation of tokens which are direct children of that node will be ignored. This can be used as an escape hatch to relax the rule if you disagree with the indentation that it enforces for a particular syntactic pattern.
+ 
+ Level of indentation denotes the multiple of the indent specified. Example:
+ 
+@@ -607,6 +608,38 @@ var a =
+     boop;
+ ```
+ 
++### ignoredNodes
++
++The following configuration ignores the indentation of `ConditionalExpression` ("ternary expression") nodes:
++
++Examples of **correct** code for this rule with the `4, { "ignoredNodes": ["ConditionalExpression"] }` option:
++
++```js
++/*eslint indent: ["error", 4, { "ignoredNodes": ["ConditionalExpression"] }]*/
++
++var a = foo
++      ? bar
++      : baz;
++
++var a = foo
++                ? bar
++: baz;
++```
++
++The following configuration ignores indentation in the body of IIFEs.
++
++Examples of **correct** code for this rule with the `4, { "ignoredNodes": ["CallExpression > FunctionExpression.callee > BlockStatement.body"] }` option:
++
++```js
++/*eslint indent: ["error", 4, { "ignoredNodes": ["CallExpression > FunctionExpression.callee > BlockStatement.body"] }]*/
++
++(function() {
++
++foo();
++bar();
++
++})
++```
+ 
+ ## Compatibility
+ 
+diff --git a/lib/rules/indent.js b/lib/rules/indent.js
+index 429567ee..6db82d18 100644
+--- a/lib/rules/indent.js
++++ b/lib/rules/indent.js
+@@ -581,6 +581,15 @@ module.exports = {
+                     ImportDeclaration: ELEMENT_LIST_SCHEMA,
+                     flatTernaryExpressions: {
+                         type: "boolean"
++                    },
++                    ignoredNodes: {
++                        type: "array",
++                        items: {
++                            type: "string",
++                            not: {
++                                pattern: ":exit$"
++                            }
++                        }
+                     }
+                 },
+                 additionalProperties: false
+@@ -618,7 +627,8 @@ module.exports = {
+             ArrayExpression: 1,
+             ObjectExpression: 1,
+             ImportDeclaration: 1,
+-            flatTernaryExpressions: false
++            flatTernaryExpressions: false,
++            ignoredNodes: []
+         };
+ 
+         if (context.options.length) {
+@@ -914,7 +924,7 @@ module.exports = {
+         * @param {ASTNode} node Unknown Node
+         * @returns {void}
+         */
+-        function ignoreUnknownNode(node) {
++        function ignoreNode(node) {
+             const unknownNodeTokens = new Set(sourceCode.getTokens(node, { includeComments: true }));
+ 
+             unknownNodeTokens.forEach(token => {
+@@ -930,19 +940,6 @@ module.exports = {
+             });
+         }
+ 
+-        /**
+-        * Ignore node if it is unknown
+-        * @param {ASTNode} node Node
+-        * @returns {void}
+-        */
+-        function checkForUnknownNode(node) {
+-            const isNodeUnknown = !(KNOWN_NODES.has(node.type));
+-
+-            if (isNodeUnknown) {
+-                ignoreUnknownNode(node);
+-            }
+-        }
+-
+         /**
+          * Check whether the given token is the first token of a statement.
+          * @param {Token} token The token to check.
+@@ -960,7 +957,7 @@ module.exports = {
+             return !node || node.range[0] === token.range[0];
+         }
+ 
+-        return {
++        const baseOffsetListeners = {
+             "ArrayExpression, ArrayPattern"(node) {
+                 const openingBracket = sourceCode.getFirstToken(node);
+                 const closingBracket = sourceCode.getTokenAfter(lodash.findLast(node.elements) || openingBracket, astUtils.isClosingBracketToken);
+@@ -1333,8 +1330,6 @@ module.exports = {
+                 }
+             },
+ 
+-            "*:exit": checkForUnknownNode,
+-
+             "JSXAttribute[value]"(node) {
+                 const equalsToken = sourceCode.getFirstTokenBetween(node.name, node.value, token => token.type === "Punctuator" && token.value === "=");
+ 
+@@ -1378,62 +1373,130 @@ module.exports = {
+                     1
+                 );
+                 offsets.setDesiredOffset(closingCurly, openingCurly, 0);
+-            },
++            }
++        };
+ 
+-            "Program:exit"() {
+-                addParensIndent(sourceCode.ast.tokens);
++        const listenerCallQueue = [];
+ 
+-                /*
+-                 * Create a Map from (tokenOrComment) => (precedingToken).
+-                 * This is necessary because sourceCode.getTokenBefore does not handle a comment as an argument correctly.
+-                 */
+-                const precedingTokens = sourceCode.ast.comments.reduce((commentMap, comment) => {
+-                    const tokenOrCommentBefore = sourceCode.getTokenBefore(comment, { includeComments: true });
++        /*
++         * To ignore the indentation of a node:
++         * 1. Don't call the node's listener when entering it (if it has a listener)
++         * 2. Call `ignoreNode` on the node sometime after exiting it and before validating offsets.
++         */
++        const offsetListeners = lodash.mapValues(
++            baseOffsetListeners,
++
++            /*
++             * Offset listener calls are deferred until traversal is finished, and are called as
++             * part of the final `Program:exit` listener. This is necessary because a node might
++             * be matched by multiple selectors.
++             *
++             * Example: Suppose there is an offset listener for `Identifier`, and the user has
++             * specified in configuration that `MemberExpression > Identifier` should be ignored.
++             * Due to selector specificity rules, the `Identifier` listener will get called first. However,
++             * if a given Identifier node is supposed to be ignored, then the `Identifier` offset listener
++             * should not have been called at all. Without doing extra selector matching, we don't know
++             * whether the Identifier matches the `MemberExpression > Identifier` selector until the
++             * `MemberExpression > Identifier` listener is called.
++             *
++             * To avoid this, the `Identifier` listener isn't called until traversal finishes and all
++             * ignored nodes are known.
++             */
++            listener =>
++                node =>
++                    listenerCallQueue.push({ listener, node })
++        );
+ 
+-                    return commentMap.set(comment, commentMap.has(tokenOrCommentBefore) ? commentMap.get(tokenOrCommentBefore) : tokenOrCommentBefore);
+-                }, new WeakMap());
++        // For each ignored node selector, set up a listener to collect it into the `ignoredNodes` set.
++        const ignoredNodes = new Set();
++        const addToIgnoredNodes = ignoredNodes.add.bind(ignoredNodes);
+ 
+-                sourceCode.lines.forEach((line, lineIndex) => {
+-                    const lineNumber = lineIndex + 1;
++        const ignoredNodeListeners = options.ignoredNodes.reduce(
++            (listeners, ignoredSelector) => Object.assign(listeners, { [ignoredSelector]: addToIgnoredNodes }),
++            {}
++        );
+ 
+-                    if (!tokenInfo.firstTokensByLineNumber.has(lineNumber)) {
++        /*
++         * Join the listeners, and add a listener to verify that all tokens actually have the correct indentation
++         * at the end.
++         *
++         * Using Object.assign will cause some offset listeners to be overwritten if the same selector also appears
++         * in `ignoredNodeListeners`. This isn't a problem because all of the matching nodes will be ignored,
++         * so those listeners wouldn't be called anyway.
++         */
++        return Object.assign(
++            offsetListeners,
++            ignoredNodeListeners,
++            {
++                "*:exit"(node) {
+ 
+-                        // Don't check indentation on blank lines
+-                        return;
++                    // If a node's type is nonstandard, we can't tell how its children should be offset, so ignore it.
++                    if (!KNOWN_NODES.has(node.type)) {
++                        ignoredNodes.add(node);
+                     }
++                },
++                "Program:exit"() {
+ 
+-                    const firstTokenOfLine = tokenInfo.firstTokensByLineNumber.get(lineNumber);
++                    // Invoke the queued offset listeners for the nodes that aren't ignored.
++                    listenerCallQueue
++                        .filter(nodeInfo => !ignoredNodes.has(nodeInfo.node))
++                        .forEach(nodeInfo => nodeInfo.listener(nodeInfo.node));
+ 
+-                    if (firstTokenOfLine.loc.start.line !== lineNumber) {
++                    // Update the offsets for ignored nodes to prevent their child tokens from being reported.
++                    ignoredNodes.forEach(ignoreNode);
+ 
+-                        // Don't check the indentation of multi-line tokens (e.g. template literals or block comments) twice.
+-                        return;
+-                    }
++                    addParensIndent(sourceCode.ast.tokens);
+ 
+-                    // If the token matches the expected expected indentation, don't report it.
+-                    if (validateTokenIndent(firstTokenOfLine, offsets.getDesiredIndent(firstTokenOfLine))) {
+-                        return;
+-                    }
++                    /*
++                     * Create a Map from (tokenOrComment) => (precedingToken).
++                     * This is necessary because sourceCode.getTokenBefore does not handle a comment as an argument correctly.
++                     */
++                    const precedingTokens = sourceCode.ast.comments.reduce((commentMap, comment) => {
++                        const tokenOrCommentBefore = sourceCode.getTokenBefore(comment, { includeComments: true });
++
++                        return commentMap.set(comment, commentMap.has(tokenOrCommentBefore) ? commentMap.get(tokenOrCommentBefore) : tokenOrCommentBefore);
++                    }, new WeakMap());
+ 
+-                    if (astUtils.isCommentToken(firstTokenOfLine)) {
+-                        const tokenBefore = precedingTokens.get(firstTokenOfLine);
+-                        const tokenAfter = tokenBefore ? sourceCode.getTokenAfter(tokenBefore) : sourceCode.ast.tokens[0];
++                    sourceCode.lines.forEach((line, lineIndex) => {
++                        const lineNumber = lineIndex + 1;
+ 
+-                        // If a comment matches the expected indentation of the token immediately before or after, don't report it.
+-                        if (
+-                            tokenBefore && validateTokenIndent(firstTokenOfLine, offsets.getDesiredIndent(tokenBefore)) ||
+-                            tokenAfter && validateTokenIndent(firstTokenOfLine, offsets.getDesiredIndent(tokenAfter))
+-                        ) {
++                        if (!tokenInfo.firstTokensByLineNumber.has(lineNumber)) {
++
++                            // Don't check indentation on blank lines
+                             return;
+                         }
+-                    }
+ 
+-                    // Otherwise, report the token/comment.
+-                    report(firstTokenOfLine, offsets.getDesiredIndent(firstTokenOfLine));
+-                });
+-            }
++                        const firstTokenOfLine = tokenInfo.firstTokensByLineNumber.get(lineNumber);
+ 
+-        };
++                        if (firstTokenOfLine.loc.start.line !== lineNumber) {
++
++                            // Don't check the indentation of multi-line tokens (e.g. template literals or block comments) twice.
++                            return;
++                        }
++
++                        // If the token matches the expected expected indentation, don't report it.
++                        if (validateTokenIndent(firstTokenOfLine, offsets.getDesiredIndent(firstTokenOfLine))) {
++                            return;
++                        }
++
++                        if (astUtils.isCommentToken(firstTokenOfLine)) {
++                            const tokenBefore = precedingTokens.get(firstTokenOfLine);
++                            const tokenAfter = tokenBefore ? sourceCode.getTokenAfter(tokenBefore) : sourceCode.ast.tokens[0];
+ 
++                            // If a comment matches the expected indentation of the token immediately before or after, don't report it.
++                            if (
++                                tokenBefore && validateTokenIndent(firstTokenOfLine, offsets.getDesiredIndent(tokenBefore)) ||
++                                tokenAfter && validateTokenIndent(firstTokenOfLine, offsets.getDesiredIndent(tokenAfter))
++                            ) {
++                                return;
++                            }
++                        }
++
++                        // Otherwise, report the token/comment.
++                        report(firstTokenOfLine, offsets.getDesiredIndent(firstTokenOfLine));
++                    });
++                }
++            }
++        );
+     }
+ };

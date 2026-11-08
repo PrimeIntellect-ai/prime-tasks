@@ -1,0 +1,2 @@
+LFRic alg layer error when using PSyIR: unknown kernel symbol
+The version of `mixed_schur_preconditioner_alg_mod` on LFRic trunk is causing LFRic PSyIR alg-layer parsing to fail as `dg_inc_matrix_vector_kernel_type` is not imported in subroutine `back_substitute`. This is an error in the LFRic code which I've passed on but I need to tidy the error produced by PSyclone to make it clearer what the problem is.

@@ -1,0 +1,179 @@
+diff --git a/docs/08-common-pitfalls.md b/docs/08-common-pitfalls.md
+index 15fef06..9a2533f 100644
+--- a/docs/08-common-pitfalls.md
++++ b/docs/08-common-pitfalls.md
+@@ -81,6 +81,37 @@ Error [ERR_WORKER_INVALID_EXEC_ARGV]: Initiated Worker with invalid execArgv fla
+ 
+ If possible don't specify the command line option when running AVA. Alternatively you could [disable worker threads in AVA](./06-configuration.md#options).
+ 
++## Timeouts because a file failed to exit
++
++You may get a "Timed out while running tests" error because AVA failed to exit when running a particular file.
++
++AVA waits for Node.js to exit the worker thread or child process. If this takes too long, AVA counts it as a timeout.
++
++It is best practice to make sure your code exits cleanly. We've also seen occurrences where an explicit `process.exit()` call inside a worker thread could not be observed in AVA's main process.
++
++For these reasons we're not providing an option to disable this timeout behavior. However, it is possible to register a callback for when AVA has completed the test run without uncaught exceptions or unhandled rejections. From inside this callback you can do whatever you need to do, including calling `process.exit()`.
++
++Create a `_force-exit.mjs` file:
++
++```js
++import process from 'node:process';
++import { registerCompletionHandler } from 'ava';
++
++registerCompletionHandler(() => {
++	process.exit();
++});
++```
++
++Completion handlers are invoked in order of registration. Results are not awaited.
++
++Load it for all test files through AVA's `require` option:
++
++```js
++export default {
++	require: ['./_force-exit.mjs'],
++};
++```
++
+ ## Sharing variables between asynchronous tests
+ 
+ By default AVA executes tests concurrently. This can cause problems if your tests are asynchronous and share variables.
+diff --git a/entrypoints/main.d.mts b/entrypoints/main.d.mts
+index d4fcdc1..6b4fb27 100644
+--- a/entrypoints/main.d.mts
++++ b/entrypoints/main.d.mts
+@@ -10,3 +10,11 @@ declare const test: TestFn;
+ 
+ /** Call to declare a test, or chain to declare hooks or test modifiers */
+ export default test;
++
++/**
++ * Register a function to be called when AVA has completed a test run without uncaught exceptions or unhandled rejections.
++ *
++ * Completion handlers are invoked in order of registration. Results are not awaited.
++ */
++declare const registerCompletionHandler: (handler: () => void) => void;
++export {registerCompletionHandler};
+diff --git a/entrypoints/main.mjs b/entrypoints/main.mjs
+index 36b076b..fec3793 100644
+--- a/entrypoints/main.mjs
++++ b/entrypoints/main.mjs
+@@ -1 +1,2 @@
+ export {default} from '../lib/worker/main.cjs';
++export {registerCompletionHandler} from '../lib/worker/completion-handlers.js';
+diff --git a/lib/run-status.js b/lib/run-status.js
+index cd80fc8..ae6b68c 100644
+--- a/lib/run-status.js
++++ b/lib/run-status.js
+@@ -38,6 +38,7 @@ export default class RunStatus extends Emittery {
+ 			timeouts: 0,
+ 			todoTests: 0,
+ 			uncaughtExceptions: 0,
++			unexpectedProcessExits: 0,
+ 			unhandledRejections: 0,
+ 		};
+ 	}
+@@ -56,6 +57,7 @@ export default class RunStatus extends Emittery {
+ 			skippedTests: 0,
+ 			todoTests: 0,
+ 			uncaughtExceptions: 0,
++			unexpectedProcessExits: 0,
+ 			unhandledRejections: 0,
+ 			...stats,
+ 		});
+@@ -167,6 +169,8 @@ export default class RunStatus extends Emittery {
+ 			}
+ 
+ 			case 'process-exit': {
++				stats.unexpectedProcessExits++;
++				fileStats.unexpectedProcessExits++;
+ 				event.pendingTests = this.pendingTests;
+ 				event.pendingTestsLogs = this.pendingTestsLogs;
+ 				this.pendingTests = new Map();
+@@ -237,6 +241,7 @@ export default class RunStatus extends Emittery {
+ 			|| this.stats.sharedWorkerErrors > 0
+ 			|| this.stats.timeouts > 0
+ 			|| this.stats.uncaughtExceptions > 0
++			|| this.stats.unexpectedProcessExits > 0
+ 			|| this.stats.unhandledRejections > 0
+ 		) {
+ 			return 1;
+diff --git a/lib/worker/base.js b/lib/worker/base.js
+index d5a483a..cc8d444 100644
+--- a/lib/worker/base.js
++++ b/lib/worker/base.js
+@@ -15,6 +15,7 @@ import Runner from '../runner.js';
+ import serializeError from '../serialize-error.js';
+ 
+ import channel from './channel.cjs';
++import {runCompletionHandlers} from './completion-handlers.js';
+ import lineNumberSelection from './line-numbers.js';
+ import {set as setOptions} from './options.cjs';
+ import {flags, refs, sharedWorkerTeardowns} from './state.cjs';
+@@ -23,17 +24,22 @@ import {isRunningInThread, isRunningInChildProcess} from './utils.cjs';
+ const currentlyUnhandled = setUpCurrentlyUnhandled();
+ let runner;
+ 
+-let forcingExit = false;
++let expectingExit = false;
+ 
+ const forceExit = () => {
+-	forcingExit = true;
++	expectingExit = true;
+ 	process.exit(1);
+ };
+ 
++const avaIsDone = () => {
++	expectingExit = true;
++	runCompletionHandlers();
++};
++
+ // Override process.exit with an undetectable replacement
+ // to report when it is called from a test (which it should never be).
+ const handleProcessExit = (target, thisArg, args) => {
+-	if (!forcingExit) {
++	if (!expectingExit) {
+ 		const error = new Error('Unexpected process.exit()');
+ 		Error.captureStackTrace(error, handleProcessExit);
+ 		channel.send({type: 'process-exit', stack: error.stack});
+@@ -118,7 +124,7 @@ const run = async options => {
+ 		nowAndTimers.setImmediate(() => {
+ 			const unhandled = currentlyUnhandled();
+ 			if (unhandled.length === 0) {
+-				return;
++				return avaIsDone();
+ 			}
+ 
+ 			for (const rejection of unhandled) {
+diff --git a/lib/worker/completion-handlers.js b/lib/worker/completion-handlers.js
+new file mode 100644
+index 0000000..ddf4b47
+--- /dev/null
++++ b/lib/worker/completion-handlers.js
+@@ -0,0 +1,13 @@
++import process from 'node:process';
++
++import state from './state.cjs';
++
++export function runCompletionHandlers() {
++	for (const handler of state.completionHandlers) {
++		process.nextTick(() => handler());
++	}
++}
++
++export function registerCompletionHandler(handler) {
++	state.completionHandlers.push(handler);
++}
+diff --git a/lib/worker/state.cjs b/lib/worker/state.cjs
+index 9e7deae..3cd9e2d 100644
+--- a/lib/worker/state.cjs
++++ b/lib/worker/state.cjs
+@@ -1,5 +1,6 @@
+ 'use strict';
+ exports.flags = {loadedMain: false};
+ exports.refs = {runnerChain: null};
++exports.completionHandlers = [];
+ exports.sharedWorkerTeardowns = [];
+ exports.waitForReady = [];

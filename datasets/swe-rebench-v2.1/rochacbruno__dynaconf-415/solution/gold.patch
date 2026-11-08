@@ -1,0 +1,323 @@
+diff --git a/Makefile b/Makefile
+index 7f07543..b3612d0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -100,6 +100,7 @@ test_examples:
+ 	cd example/issues/288_null_values;pwd;python app.py
+ 	cd example/issues/306_merge_replace;pwd;python app.py
+ 	cd example/issues/359_variable_reference;pwd;python app.py
++	cd example/issues/384_dotted_set;pwd;python app.py
+ 	cd example/issues/392_evaluate_nested_structures;pwd;DYNACONF_INITIAL='@merge [1,2,3]' python app.py
+ test_vault:
+ 	# @cd example/vault;pwd;python write.py
+diff --git a/dynaconf/base.py b/dynaconf/base.py
+index 7db2953..66095c6 100644
+--- a/dynaconf/base.py
++++ b/dynaconf/base.py
+@@ -752,9 +752,8 @@ class Settings(object):
+ 
+         split_keys = dotted_key.split(".")
+         existing_data = self.get(split_keys[0], {})
+-        new_data = DynaBox(box_settings=self)
++        new_data = tree = DynaBox(box_settings=self)
+ 
+-        tree = new_data
+         for k in split_keys[:-1]:
+             tree = tree.setdefault(k, {})
+ 
+@@ -762,12 +761,11 @@ class Settings(object):
+         tree[split_keys[-1]] = value
+ 
+         if existing_data:
+-            object_merge(
+-                old={split_keys[0]: existing_data},
++            new_data = object_merge(
++                old=DynaBox({split_keys[0]: existing_data}),
+                 new=new_data,
+-                tail=split_keys[-1],
++                full_path=split_keys,
+             )
+-
+         self.update(data=new_data, tomlfy=tomlfy, **kwargs)
+ 
+     def set(
+diff --git a/dynaconf/utils/__init__.py b/dynaconf/utils/__init__.py
+index 585dc16..c6b44e4 100644
+--- a/dynaconf/utils/__init__.py
++++ b/dynaconf/utils/__init__.py
+@@ -17,18 +17,18 @@ if os.name == "nt":  # pragma: no cover
+     BANNER = "DYNACONF"
+ 
+ 
+-def object_merge(old, new, unique=False, tail=None):
++def object_merge(old, new, unique=False, full_path=None):
+     """
+     Recursively merge two data structures, new is mutated in-place.
+ 
+     :param old: The existing data.
+     :param new: The new data to get old values merged in to.
+     :param unique: When set to True existing list items are not set.
+-    :param tail: Indicates the last element of a tree.
++    :param full_path: Indicates the elements of a tree.
+     """
+     if old == new or old is None or new is None:
+         # Nothing to merge
+-        return
++        return new
+ 
+     if isinstance(old, list) and isinstance(new, list):
+         for item in old[::-1]:
+@@ -37,37 +37,93 @@ def object_merge(old, new, unique=False, tail=None):
+             new.insert(0, item)
+ 
+     if isinstance(old, dict) and isinstance(new, dict):
++        existing_value = recursive_get(old, full_path)  # doesnt handle None
++        # Need to make every `None` on `_store` to be an wrapped `LazyNone`
++
+         for key, value in old.items():
+-            if key == tail:
++
++            if existing_value is not None and existing_value is value:
+                 continue
++
+             if key not in new:
+                 new[key] = value
+             else:
+-                object_merge(value, new[key], tail=tail)
++                object_merge(
++                    value,
++                    new[key],
++                    full_path=full_path[1:] if full_path else None,
++                )
+ 
+         handle_metavalues(old, new)
+ 
+     return new
+ 
+ 
++def recursive_get(obj, names):
++    """Given a dot accessible object and a list of names `foo.bar.zaz`
++    gets recursivelly all names one by one obj.foo.bar.zaz.
++    """
++    if not names:
++        return
++    head, tail = names[0], names[1:]
++    result = getattr(obj, head, None)
++    if not tail:
++        return result
++    return recursive_get(result, tail)
++
++
+ def handle_metavalues(old, new):
+     """Cleanup of MetaValues on new dict"""
++
+     for key in list(new.keys()):
++
++        # MetaValue instances
+         if getattr(new[key], "_dynaconf_reset", False):  # pragma: no cover
+             # a Reset on `new` triggers reasign of existing data
+             # @reset is deprecated on v3.0.0
+             new[key] = new[key].unwrap()
+-
+-        if getattr(new[key], "_dynaconf_merge", False):
++        elif getattr(new[key], "_dynaconf_del", False):
++            # a Del on `new` triggers deletion of existing data
++            new.pop(key, None)
++            old.pop(key, None)
++        elif getattr(new[key], "_dynaconf_merge", False):
+             # a Merge on `new` triggers merge with existing data
+             new[key] = object_merge(
+                 old.get(key), new[key].unwrap(), unique=new[key].unique
+             )
+ 
+-        if getattr(new[key], "_dynaconf_del", False):
+-            # a Del on `new` triggers deletion of existing data
+-            new.pop(key, None)
+-            old.pop(key, None)
++        # Data structures containing merge tokens
++        if isinstance(new.get(key), (list, tuple)):
++            if (
++                "dynaconf_merge" in new[key]
++                or "dynaconf_merge_unique" in new[key]
++            ):
++                value = list(new[key])
++                unique = False
++
++                try:
++                    value.remove("dynaconf_merge")
++                except ValueError:
++                    value.remove("dynaconf_merge_unique")
++                    unique = True
++
++                for item in old.get(key)[::-1]:
++                    if unique and item in value:
++                        continue
++                    value.insert(0, item)
++
++                new[key] = value
++
++        elif isinstance(new.get(key), dict):
++            local_merge = new[key].pop(
++                "dynaconf_merge", new[key].pop("dynaconf_merge_unique", None)
++            )
++            if local_merge not in (True, False, None) and not new[key]:
++                # In case `dynaconf_merge:` holds value not boolean - ref #241
++                new[key] = local_merge
++
++            if local_merge:
++                new[key] = object_merge(old.get(key), new[key])
+ 
+ 
+ class DynaconfDict(dict):
+@@ -285,6 +341,11 @@ def extract_json_objects(text, decoder=JSONDecoder()):
+ 
+ 
+ def recursively_evaluate_lazy_format(value, settings):
++    """Given a value as a data structure, traverse all its members
++    to find Lazy values and evaluate it.
++
++    For example: Evaluate values inside lists and dicts
++    """
+ 
+     if getattr(value, "_dynaconf_lazy_format", None):
+         value = value(settings)
+diff --git a/example/issues/253_set/app.py b/example/issues/253_set/app.py
+index 228c65a..d143e64 100644
+--- a/example/issues/253_set/app.py
++++ b/example/issues/253_set/app.py
+@@ -35,3 +35,24 @@ assert settings.editor == "vim"
+ settings.terminal_emulator = "alacritty"
+ 
+ assert settings.get("TERMINAL_emulator") == "alacritty"
++
++settings.set("a.b.c.d.e", "f")
++
++# All the merging strategies
++
++settings.set("a.b", {"other": 1, "dynaconf_merge": True})
++settings.set("a.b", {"dynaconf_merge": {"another": 2}})
++settings.set("a.b", "@merge {foo='bar'}", tomlfy=True)
++
++assert settings.a == {
++    "b": {"foo": "bar", "other": 1, "another": 2, "c": {"d": {"e": "f"}}}
++}, settings.a
++
++# Now the reset of a.b
++settings.set("a__b", {"reset": None})
++
++assert settings.a.b == {"reset": None}
++
++settings.a.b.reset = 1
++
++assert settings.A.b.reset == 1
+diff --git a/example/issues/384_dotted_set/README.md b/example/issues/384_dotted_set/README.md
+new file mode 100644
+index 0000000..e17292d
+--- /dev/null
++++ b/example/issues/384_dotted_set/README.md
+@@ -0,0 +1,86 @@
++# Issue
++
++NoamGraetz2 commented on Aug 6
++you cannot set a deeper entry with the same key as higher entry.
++
++```py
++settings.set('a.b', 1)
++settings.set('a.c', 2)
++settings.set('a.c.k', 22)
++
++--> {'c': {'k': 22}, 'b': 1}
++
++settings.set('a.c.b', 3)
++
++--> {'c': {'b': 3, 'k': 22}}
++```
++
++the higher entry 'a.b' was removed
++
++the problem lie within _dotted_set and the use of 'tail' and merge
++
++tries to find a quick solution, but i a don't have the time now, will bypass by using different keys :(
++
++
++## comments
++
++I figured out the problem now and it is a real bug.
++
++We are passing tail to object_merge as a keyname and it is wrong, we should change that to accumulate the whole path.
++
++for a.b.c instead of passing tail=c we really need to recursively accumulate it and compare whole path a on first call, a.b on second, a.b.c on the tail call.
++
++Also we should invert the order that dicts are merged on object_merge and instead of taking the new as the definitive object use the old which will keep all existing keys.
++
++
++## Think Box
++
++
++If I have a setting:
++
++settings.FOO = {
++  "a": {
++    "b": {"a": 1}
++  }
++}
++
++The full path for the value `1` is: `foo.a.b.a`
++
++settings.get('foo.a.b.a')
++
++If I want to include a new value `b` under b can I do:
++
++settings.set('foo.a.b.b', 2)
++
++in order to have
++
++settings.FOO = {
++  "a": {
++    "b": {"a": 1, "b": 2},
++  }
++}
++
++or even
++
++settings.set('foo.a.b', "reseted") to have
++
++settings.FOO = {
++  "a": {
++    "b": "reseted"
++  }
++}
++
++
++## How to merge dictionaries?
++
++### Contributing:
++
++takes existing called `old`
++
++{"a": {"b": {"a": 1}}}
++
++takes `new`
++
++{"a": {"b": {"b": 2}}}
++
++For each key, value in `old`
+diff --git a/example/issues/384_dotted_set/app.py b/example/issues/384_dotted_set/app.py
+new file mode 100644
+index 0000000..aef17ff
+--- /dev/null
++++ b/example/issues/384_dotted_set/app.py
+@@ -0,0 +1,13 @@
++from dynaconf import Dynaconf
++
++settings = Dynaconf()
++
++settings.set("a.b", 1)
++settings.set("a.c", 2)
++settings.set("a.c.k", 22)
++
++assert settings.a == {"c": {"k": 22}, "b": 1}
++
++settings.set("a.c.b", 3)
++
++assert settings.a == {"c": {"b": 3, "k": 22}, "b": 1}
