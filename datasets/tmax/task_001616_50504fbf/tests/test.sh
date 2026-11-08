@@ -192,7 +192,7 @@ def test_ssim_metric():
     assert ssim_score >= 0.85, f"Fail: SSIM score {ssim_score} is below the threshold of 0.85."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

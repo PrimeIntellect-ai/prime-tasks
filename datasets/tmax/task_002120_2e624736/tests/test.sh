@@ -67,7 +67,7 @@ def test_server_metrics_endpoint():
 TEST_EOF
 
 # Preserve the original checks against the server the agent left running.
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     ok=0
 fi
 
@@ -159,7 +159,7 @@ if [ -x "$binary" ]; then
         echo "Freshly built server did not become ready"
         cat /tmp/verifier-system-daemon.log 2>/dev/null || true
         ok=0
-    elif ! python3 -m pytest /tmp/test_final_state.py::test_server_metrics_endpoint -x --tb=short 2>&1; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py::test_server_metrics_endpoint -x --tb=short 2>&1; then
         ok=0
     fi
 fi

@@ -205,7 +205,7 @@ run_and_check() {
     cmp -s /home/user/data/users.csv "/tmp/${tag}_users.csv" || return 1
     cmp -s /home/user/data/friendships.csv "/tmp/${tag}_friendships.csv" || return 1
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if [[ "$passed" -eq 1 ]]; then

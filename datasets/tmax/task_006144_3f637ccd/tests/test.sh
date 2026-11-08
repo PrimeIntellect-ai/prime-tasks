@@ -248,7 +248,7 @@ def test_generated_files_exist():
     assert os.path.isfile(os.path.join(WORKSPACE_DIR, "evaluator_pb2_grpc.py")), "evaluator_pb2_grpc.py not generated."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 )
 STATUS=$?
 

@@ -127,7 +127,7 @@ def test_result_file_exists_and_correct_and_matches_application():
     assert content == stdout, f"{RESULT} does not exactly match the submitted application's standard output"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

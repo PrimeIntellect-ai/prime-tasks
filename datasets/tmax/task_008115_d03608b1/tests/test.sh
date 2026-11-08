@@ -74,7 +74,7 @@ def test_test_report_contents():
         f"Got:\n{content}"
     )
 PYTEST
-    python3 -m pytest "$TMPDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TMPDIR/test_final_state.py" -x --tb=short || return 1
     cp "$REPORT" "$TMPDIR/original_report.txt"
 
     python3 - "$BINARY" <<'PY'

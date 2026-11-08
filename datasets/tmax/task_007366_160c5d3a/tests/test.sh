@@ -115,7 +115,7 @@ def test_audit_trail_sha256():
     assert actual_hash in checksum_content, f"SHA256 checksum in {AUDIT_TRAIL_SHA256} does not match the actual hash of {AUDIT_TRAIL}. Expected hash: {actual_hash}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

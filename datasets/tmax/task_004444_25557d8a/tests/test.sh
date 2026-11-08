@@ -192,7 +192,7 @@ def test_mcmc_artifact_and_posterior_stats_file():
     assert len(sigma_match.group(1).split('.')[-1]) == 1, "sigma value must be rounded to exactly one decimal place"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

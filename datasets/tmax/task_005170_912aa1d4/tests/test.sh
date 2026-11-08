@@ -173,7 +173,7 @@ def test_api_authorized_rx42():
         assert math.isclose(actual["value"], expected["value"], rel_tol=1e-5, abs_tol=0.01), f"Mismatch in value at index {i}. Expected {expected['value']}, got {actual['value']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

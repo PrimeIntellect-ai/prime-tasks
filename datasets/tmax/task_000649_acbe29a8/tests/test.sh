@@ -83,7 +83,7 @@ def test_tcp_server_multiple_connections():
             assert resp_str == expected_resp, f"For frame {frame_id} on fresh connection, expected '{expected_resp.strip()}', got '{resp_str.strip()}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

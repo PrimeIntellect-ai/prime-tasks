@@ -175,7 +175,7 @@ fi
 
 if [ "$ok" -eq 1 ]; then
     ASAN_OPTIONS="detect_leaks=0:halt_on_error=1" LD_PRELOAD="$ASAN_LIB" \
-        python3 -m pytest /tmp/test_final_state.py -x --tb=short || ok=0
+        python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || ok=0
 fi
 
 if [ "$ok" -eq 1 ]; then

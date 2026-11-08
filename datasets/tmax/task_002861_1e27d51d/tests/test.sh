@@ -199,7 +199,7 @@ def test_manifest():
     assert safe_link not in manifest_dict, f"Symlink {safe_link} should not be included in the manifest."
 TEST_EOF
 
-if [ "$prep_rc" -eq 0 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$prep_rc" -eq 0 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -149,7 +149,7 @@ if rm -f /home/user/analyzer /home/user/fixed_analysis.json \
    && g++ -std=c++17 /home/user/trajectory_analyzer.cpp -o /home/user/analyzer \
    && test -x /home/user/analyzer \
    && /home/user/analyzer \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

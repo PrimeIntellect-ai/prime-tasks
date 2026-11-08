@@ -213,7 +213,7 @@ def test_pipeline_recomputes_from_database_and_follows_deep_hierarchy():
     assert all(type(value) is int for value in actual.values()), 'All totals must be integers'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

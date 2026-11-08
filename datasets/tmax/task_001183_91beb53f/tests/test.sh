@@ -44,7 +44,7 @@ def test_artifact_test_go_exists():
     assert 'func TestGenerateManifest(' in content, "TestGenerateManifest function is missing in artifact_test.go"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || ok=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || ok=0
 
 # Compile the whole module and actually execute the submitted tests.
 if ! (cd /home/user/workspace && go test -count=1 -v ./...) > /tmp/submitted_go_test.log 2>&1; then

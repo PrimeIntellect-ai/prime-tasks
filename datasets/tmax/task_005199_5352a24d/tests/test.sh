@@ -202,7 +202,7 @@ def test_final_output_txt_and_service_execution():
     assert open(SERVICE_PATH, "rb").read() == EXPECTED_SERVICE, "verify_and_run.py was modified during payload execution."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

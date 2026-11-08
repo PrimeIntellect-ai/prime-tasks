@@ -313,7 +313,7 @@ def test_http_server_large_poly():
     assert abs(data["result"] - (degree + 1)) < 1e-6, f"Expected result {degree + 1}, got {data['result']}"
 PY
 
-    POLY_SERVER_PID="$real_pid" python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    POLY_SERVER_PID="$real_pid" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
     kill -0 "$real_pid"
 )
 

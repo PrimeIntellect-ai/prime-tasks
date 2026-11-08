@@ -171,7 +171,7 @@ def test_fresh_fixture_is_actually_analyzed():
     execute_and_check(nodes, edges)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     RESULT=1
 fi
 exit 0

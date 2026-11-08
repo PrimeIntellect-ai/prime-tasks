@@ -62,7 +62,7 @@ def test_malicious_files_not_extracted():
     assert not os.path.lexists(malicious_symlink_path), "Malicious symlink was extracted despite pointing outside the destination directory."
 PY
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 - <<'PY' || return 1
 import glob

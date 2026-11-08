@@ -369,7 +369,7 @@ TEST_EOF
 gcc /tmp/seccomp_probe.c -o /tmp/seccomp_probe >/tmp/probe_build.log 2>&1
 compile_status=$?
 if [ "$compile_status" -eq 0 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
     test_status=$?
 else
     cat /tmp/probe_build.log

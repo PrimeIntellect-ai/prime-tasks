@@ -184,7 +184,7 @@ def test_orchestrator_api_fixed_and_unpredictable_requests():
         assert file_path in signer_calls, "The API did not invoke /app/mobile_signer with the requested file"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

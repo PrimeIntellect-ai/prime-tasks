@@ -152,7 +152,7 @@ TEST_EOF
 cd "$PROJECT" || STATUS=1
 python3 "$PROJECT/server.py" >/tmp/submitted_server.log 2>&1 &
 SERVER_PID=$!
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 STATUS=$?
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

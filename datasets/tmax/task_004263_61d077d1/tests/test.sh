@@ -194,18 +194,18 @@ verify_all() {
 
     # Execute the Rust application on the original fixtures and retain the original assertions.
     run_recommender || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Replace the fixed fixtures with an unpredictable case whose correct result is recomputed.
     # The generated case also guarantees that train-only and leaked normalization disagree.
     generate_hidden_fixture || return 1
     run_recommender || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Restore the required final inputs/output and check them once more.
     restore_inputs
     run_recommender || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify_all 2>&1; then

@@ -81,7 +81,7 @@ TEST_EOF
     # Require the submitted program itself to generate the log for the shipped tokens.
     rm -f /home/user/audit_trail.log
     (cd /home/user && timeout 20s /tmp/audit_submission)
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # Exercise the compiled program on unpredictable token payloads.
     python3 - << 'PY_EOF'
@@ -97,13 +97,13 @@ PY_EOF
 
     rm -f /home/user/audit_trail.log
     (cd /home/user && timeout 20s /tmp/audit_submission)
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # Restore the required final state and verify it again.
     cp "$original_tokens" /home/user/tokens.txt
     rm -f /home/user/audit_trail.log
     (cd /home/user && timeout 20s /tmp/audit_submission)
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

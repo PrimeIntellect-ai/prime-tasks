@@ -163,7 +163,7 @@ def test_parser_fixes():
     assert actual == expected, f"Generated routing table parsed as {actual}, expected {expected}."
 PY_EOF
 
-    "$PY" -m pytest /tmp/test_final_state.py -q --tb=short
+    "$PY" -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -q --tb=short
 
     cat > /tmp/verifier_no_network.py <<'PY_EOF'
 import urllib.request

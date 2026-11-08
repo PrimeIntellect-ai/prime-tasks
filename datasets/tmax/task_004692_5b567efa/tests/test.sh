@@ -175,7 +175,7 @@ def test_pipeline_generalizes_to_other_input_data(seed, shift):
 TEST_EOF
 
 status=0
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=$?
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=$?
 
 # Restore the required project input. On success, rerun the corrected artifact so
 # metrics.json is also left in the requested final state for the original data.

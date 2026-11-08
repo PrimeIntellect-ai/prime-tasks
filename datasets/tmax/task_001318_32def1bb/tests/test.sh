@@ -145,7 +145,7 @@ def test_filter_on_content_derived_hidden_inputs(tmp_path):
     run_hidden_cases(str(rebuilt), cases)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

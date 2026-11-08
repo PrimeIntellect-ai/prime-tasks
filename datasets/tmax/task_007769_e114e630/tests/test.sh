@@ -236,7 +236,7 @@ def test_query_plan_txt():
     assert has_scan or has_search or has_covering, "Query plan output does not contain expected EXPLAIN QUERY PLAN keywords (SCAN, SEARCH, etc.)."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

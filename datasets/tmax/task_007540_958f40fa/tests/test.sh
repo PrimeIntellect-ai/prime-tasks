@@ -187,7 +187,7 @@ fi
 
 # Run the verifier-owned behavioral suite, including unpredictable DAGs over HTTP.
 if [ "$PASS" -eq 1 ]; then
-    if ! timeout 60 "$VENV_PY" -m pytest /tmp/test_final_state.py -x --tb=short >/tmp/verifier_pytest.log 2>&1; then
+    if ! timeout 60 "$VENV_PY" -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short >/tmp/verifier_pytest.log 2>&1; then
         PASS=0
     fi
 fi

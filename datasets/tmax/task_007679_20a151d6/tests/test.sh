@@ -139,7 +139,7 @@ def test_general_dag_and_cycle_detection():
             assert False, "A generated circular dependency was not detected"
 TEST_EOF
 
-if python3 -m pytest /home/user/project/test_dag.py /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /home/user/project/test_dag.py /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

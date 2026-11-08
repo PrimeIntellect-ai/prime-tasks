@@ -114,7 +114,7 @@ def test_results_file_and_value():
         f"Integral {integral_val} does not match the independently calculated Scott-KDE integral {expected_integral}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

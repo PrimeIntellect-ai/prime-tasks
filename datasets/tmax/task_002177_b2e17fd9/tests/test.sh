@@ -210,7 +210,7 @@ def test_backup_script_executes_safely_on_derived_inputs():
         assert archived_files[name] == expected_content, f"Archived content differs from source file {name}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

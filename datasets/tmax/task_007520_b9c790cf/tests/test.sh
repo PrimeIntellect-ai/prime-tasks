@@ -37,7 +37,7 @@ def test_original_verified_files_removed():
         assert not os.path.exists(filepath), f"Verified file {filepath} was copied instead of moved (or not moved at all)."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
 cat << 'DYNAMIC_EOF' > /tmp/test_curator_dynamic.py
 import os

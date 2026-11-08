@@ -207,7 +207,7 @@ END_ARTIFACT
 TEST_EOF
 
 if (cd /home/user/artifacts && python3 -m pytest test_migrate.py -x --tb=short) \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

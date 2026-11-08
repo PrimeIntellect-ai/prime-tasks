@@ -81,7 +81,7 @@ def test_output_csv_format_and_content():
             f"Row {i+1} rolling_avg_3h mismatch. Expected approx {exp_rolling}, got {act_rolling_float}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -81,7 +81,7 @@ def test_ticket_5_imputation(clean_data):
     assert record["message"] == "Just a generic complaint about the UI. Nothing specific."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 baseline_status=$?
 
 if [ "$baseline_status" -eq 0 ]; then

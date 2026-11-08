@@ -234,6 +234,6 @@ def test_gatherer_readiness_precedes_backend(run_student_script):
     )
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     reward=1
 fi

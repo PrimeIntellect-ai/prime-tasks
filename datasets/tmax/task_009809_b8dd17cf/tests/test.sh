@@ -277,7 +277,7 @@ int main() {
             assert reverse == 1, 'anti-symmetry property failed'
 TEST_EOF
 
-if python3 -m pytest "$VERIFY_TMP/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$VERIFY_TMP/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

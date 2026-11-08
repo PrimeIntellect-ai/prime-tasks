@@ -188,7 +188,7 @@ if cd /home/user/primer_opt \
    && cargo build --release \
    && test -x /home/user/primer_opt/target/release/primer_opt \
    && /home/user/primer_opt/target/release/primer_opt /home/user/data/sequences.txt \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     passed=1
 fi
 

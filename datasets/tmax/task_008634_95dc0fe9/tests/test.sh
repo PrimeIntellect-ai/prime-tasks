@@ -154,7 +154,7 @@ def test_rust_pipeline_on_original_and_probe_inputs():
 TEST_EOF
 
 set +e
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 status=$?
 
 # Restore the instructed input regardless of the test outcome.

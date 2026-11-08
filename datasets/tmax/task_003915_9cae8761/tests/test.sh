@@ -221,7 +221,7 @@ def test_metrics_log():
     assert match is not None, f"Metrics log does not contain the correct format 'inference_time_ms:<time_in_milliseconds>'. Content: {content}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

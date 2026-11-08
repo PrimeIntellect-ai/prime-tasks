@@ -90,7 +90,7 @@ PROCESS_EOF
 
     timeout 10s runuser -u user -- bash -c 'cd /home/user/upload_service && exec ./process_upload.sh "$1"' _ /home/user/exploit.pkg || return 1
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if run_checks; then

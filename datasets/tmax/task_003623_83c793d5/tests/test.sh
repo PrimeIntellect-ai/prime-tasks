@@ -211,7 +211,7 @@ def test_source_uses_required_process_apis():
     assert re.search(r"\bpipe2?\s*\(", source), "Source does not create pipes"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 )
 
 if run_checks 2>&1; then

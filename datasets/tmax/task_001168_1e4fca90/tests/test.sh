@@ -37,7 +37,7 @@ def test_env_file_updated():
     assert found, f"FLUSH_ON_ERROR=1 is not correctly set in {env_path}. Make sure you updated the environment variables as requested."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

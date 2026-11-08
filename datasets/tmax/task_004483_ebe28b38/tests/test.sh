@@ -175,7 +175,7 @@ def test_benchmark_performance():
     assert runtime <= threshold, f"Performance regression: benchmark took {runtime:.6f}s, which is > {threshold}s threshold."
 TEST_EOF
 
-PYTHONPATH=/app:${PYTHONPATH} python3 -m pytest /tmp/test_final_state.py -x --tb=short || status=1
+PYTHONPATH=/app:${PYTHONPATH} python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

@@ -166,7 +166,7 @@ def test_requested_property_suite_really_passes(built_extension):
     assert "3 passed" in output, f"Expected all three property tests to run and pass.\n{output}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

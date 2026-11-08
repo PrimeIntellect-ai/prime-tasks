@@ -74,7 +74,7 @@ def test_file_contents():
         assert raw_content == proc_content, f"Content of {filename} in processed_backups does not match original."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     rm -f /tmp/processor-under-test
     go build -o /tmp/processor-under-test /home/user/processor.go || return 1

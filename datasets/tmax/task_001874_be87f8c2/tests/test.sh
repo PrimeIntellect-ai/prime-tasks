@@ -114,6 +114,6 @@ def test_fuzz_equivalence():
                 )
 TEST_EOF
 
-if python3 -m pytest "$verifier_tmp/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$verifier_tmp/test_final_state.py" -x --tb=short 2>&1; then
     reward=1
 fi

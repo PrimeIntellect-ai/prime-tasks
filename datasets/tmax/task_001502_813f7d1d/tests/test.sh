@@ -86,7 +86,7 @@ def test_api_u002():
     assert log["message"] == "Line 1\nLine 2\nLine 3", f"Incorrect message, multi-line not preserved: {repr(log.get('message'))}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_original_state.py -x --tb=short 2>&1 || exit 1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short 2>&1 || exit 1
 
 [ -f /home/user/pipeline.py ] || { echo "pipeline.py is missing" >&2; exit 1; }
 [ -f /home/user/server.py ] || { echo "server.py is missing" >&2; exit 1; }
@@ -236,7 +236,7 @@ def test_dynamic_pipeline_and_api_results():
         assert response.json() == {'logs': expected_logs}
 TEST_EOF
 
-python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1 || exit 1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1 || exit 1
 
 echo "1" > /logs/verifier/reward.txt
 exit 0

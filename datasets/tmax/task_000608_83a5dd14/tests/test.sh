@@ -146,7 +146,7 @@ run_checks() {
 
     rm -f /home/user/server_summary.csv
     (cd /home/user && timeout 30s /tmp/analyze_submission) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 - << 'PY_EOF' || return 1
 import csv
@@ -183,7 +183,7 @@ PY_EOF
 
     rm -f /home/user/server_summary.csv
     (cd /home/user && timeout 30s /tmp/analyze_submission) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 run_checks

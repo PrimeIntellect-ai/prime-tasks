@@ -78,7 +78,7 @@ def test_evidence_extraction_performance_and_accuracy():
     assert score >= 0.95, f"Image similarity score {score:.4f} is below threshold 0.95"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

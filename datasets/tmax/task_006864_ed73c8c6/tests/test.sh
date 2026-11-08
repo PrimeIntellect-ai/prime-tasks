@@ -185,7 +185,7 @@ PY_EOF
     test "$final_main_hash" = "$(sha256sum /home/user/main.c | awk '{print $1}')"
     test "$final_lib_hash" = "$(sha256sum /home/user/libmath.so | awk '{print $1}')"
     python3 "$WORKDIR/validate_artifacts.py" $'Result: 11\n'
-    python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

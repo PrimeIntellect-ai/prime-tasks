@@ -89,7 +89,7 @@ def test_decoded_dat_content():
     assert content == expected_text, f"Content of {decoded_path} does not match the expected decrypted text. The Go script might still be assembling chunks out of order."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

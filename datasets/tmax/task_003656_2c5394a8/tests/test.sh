@@ -132,7 +132,7 @@ def test_success_log_valgrind_leak_check():
     assert expected_leak_status in content, f"The Valgrind leak check did not report '{expected_leak_status}'. The memory leak might not be fixed properly, or the valgrind command was not run correctly."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

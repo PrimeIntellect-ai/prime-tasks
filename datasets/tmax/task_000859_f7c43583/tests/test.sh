@@ -198,7 +198,7 @@ def test_rescue_script_metric():
 TEST_EOF
 
 if gcc -shared -fPIC -O2 /tmp/capture_unlink.c -o /tmp/capture_unlink.so -ldl && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

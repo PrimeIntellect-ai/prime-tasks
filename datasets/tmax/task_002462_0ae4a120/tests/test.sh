@@ -209,7 +209,7 @@ def test_api_server_authorized():
         assert any('--input' in call.get('argv', []) for call in matching), "Classifier CLI was not called with --input"
 TEST_EOF
 
-if [ "$prep_ok" -eq 1 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$prep_ok" -eq 1 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     result=1
 else
     result=0

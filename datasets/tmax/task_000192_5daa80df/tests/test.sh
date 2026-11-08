@@ -165,7 +165,7 @@ def test_check_endpoints_execution_time_output_and_real_checks():
     assert len({item[0] for item in checks}) > 1, "Connectivity checks were not launched in parallel"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

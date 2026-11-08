@@ -206,7 +206,7 @@ TEST_EOF
     # a precomputed JSON file left by another tool.
     rm -f "$project/results.json"
     timeout 30 "$project/target/release/ml_prep"
-    python3 -m pytest "$tmpdir/test_final_state.py" -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$tmpdir/test_final_state.py" -x --tb=short
     cp "$project/results.json" "$tmpdir/verified_results.json"
 
     # Exercise the same executable on a second, verifier-generated data set so a
@@ -230,7 +230,7 @@ with open(path, "w", newline="") as f:
 PY
     rm -f "$project/results.json"
     timeout 30 "$project/target/release/ml_prep"
-    python3 -m pytest "$tmpdir/test_final_state.py" -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$tmpdir/test_final_state.py" -x --tb=short
 )
 
 if run_checks; then

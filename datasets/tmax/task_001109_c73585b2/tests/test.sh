@@ -180,7 +180,7 @@ def test_06_buggy_literal_removed():
     assert "dt = dt * 2.0" not in content, "The bug 'dt = dt * 2.0' is still present in simulate.py. It should be changed to reduce the step size."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

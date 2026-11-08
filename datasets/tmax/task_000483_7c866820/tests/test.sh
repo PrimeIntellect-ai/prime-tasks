@@ -124,7 +124,7 @@ def test_anomalies():
         assert abs(act[2] - exp[2]) < 1e-6, f"Row {i+1} value mismatch: expected {exp[2]}, got {act[2]}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

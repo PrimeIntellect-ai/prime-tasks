@@ -161,7 +161,7 @@ def test_benchmark_result_from_real_secure_run():
     assert score >= 250.0, f"Benchmark score {score} is below the required threshold of 250.0 (Logs processed per second)."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

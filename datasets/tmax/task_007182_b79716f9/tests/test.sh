@@ -174,7 +174,7 @@ TEST_EOF
 status=0
 if ! gcc -O2 /home/user/project_graph.c -o /home/user/project_graph; then
     status=1
-elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     status=1
 fi
 

@@ -254,7 +254,7 @@ def test_results_csv_correctness():
         assert abs(coil - exp_coil) <= 1e-4, f"Coil coefficient for {seq_id} incorrect. Expected {exp_coil}, got {coil}."
 TEST_EOF
 
-if [ "$pipeline_ok" -eq 1 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$pipeline_ok" -eq 1 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     if [ "$pipeline_ok" -ne 1 ]; then

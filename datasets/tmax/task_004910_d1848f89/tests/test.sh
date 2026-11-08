@@ -336,7 +336,7 @@ def test_user_cron_is_minutely_and_actually_executes():
             pass
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

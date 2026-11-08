@@ -130,6 +130,6 @@ def test_fuzz_equivalence():
             pytest.fail(f"Output length mismatch: Oracle has {len(oracle_lines)} lines, Agent has {len(agent_lines)} lines.")
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     reward=1
 fi

@@ -273,7 +273,7 @@ def test_z_seccomp_filter_really_blocks_execve():
     )
 PYEOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 result=$?
 
 if [ -n "$copy_pid" ]; then

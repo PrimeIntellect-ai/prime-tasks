@@ -252,7 +252,7 @@ def test_venv_exists():
     assert os.path.isfile(os.path.join(venv_dir, "pyvenv.cfg"))
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

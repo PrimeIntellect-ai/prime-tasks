@@ -194,7 +194,7 @@ if [ "$passed" = true ] && [ ! -x "$PROJECT/target/release/config_tracker" ]; th
 fi
 
 if [ "$passed" = true ]; then
-    if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         passed=false
     fi
 fi

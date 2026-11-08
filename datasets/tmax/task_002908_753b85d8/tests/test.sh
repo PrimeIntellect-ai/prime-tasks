@@ -168,7 +168,7 @@ def test_posterior_mean():
         assert abs(val - exp) < 0.05, f"Value at index {i} ({val}) is not within 0.05 of expected ({exp}). The sampler may still be diverging."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

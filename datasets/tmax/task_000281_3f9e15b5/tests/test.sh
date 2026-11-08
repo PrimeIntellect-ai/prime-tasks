@@ -72,7 +72,7 @@ def test_incident_report_contents():
     assert content == "VULNERABLE", f"The contents of /home/user/incident_report.txt are incorrect. Expected 'VULNERABLE', got '{content}'"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if verify_submission; then

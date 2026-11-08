@@ -214,7 +214,7 @@ def test_requires_exactly_two_arguments_and_valid_timestamp():
         assert result.returncode != 0, f'Invalid arguments were accepted: {args!r}'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

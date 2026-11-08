@@ -278,7 +278,7 @@ def test_bootstrap_script_executes_required_algorithm_on_fresh_data():
     assert saw_upper, "bootstrap_ci.py did not calculate the 97.5th percentile."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

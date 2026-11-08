@@ -237,7 +237,7 @@ def test_test_report_passed():
     assert passed >= 1, f"Expected at least 1 passed test in the summary, but got {passed}. Full summary: {summary}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

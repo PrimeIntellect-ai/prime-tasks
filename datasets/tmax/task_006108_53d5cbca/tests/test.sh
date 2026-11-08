@@ -104,7 +104,7 @@ def test_server_key_permissions_secured():
     assert perms == "600", f"The permissions for {SERVER_KEY} are not correctly secured. Expected 600, got {perms}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

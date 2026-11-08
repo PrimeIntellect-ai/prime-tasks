@@ -159,7 +159,7 @@ def test_runner_compiles_parses_dependencies_and_executes_plugins():
         assert _read_events(call_log) == order, "process_chunk was not executed once for each plugin in dependency order"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

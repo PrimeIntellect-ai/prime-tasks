@@ -115,7 +115,7 @@ def test_submitted_api_evaluates_derived_graphs():
         assert post_graph(graph) == {"result": expected}
 TEST_EOF
 
-    SUBMITTED_APP_PID="$APP_PID" python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    SUBMITTED_APP_PID="$APP_PID" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Exercise the Ruby client independently. A mock server returns a fresh,
     # unpredictable result and records the request, proving that the script sent

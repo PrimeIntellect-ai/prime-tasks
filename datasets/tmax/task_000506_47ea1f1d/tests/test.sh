@@ -58,7 +58,7 @@ def test_alerts_csv_exists_and_correct():
     assert prob_str in ["0.9909", "0.9910"], f"Expected probability to be '0.9909' or '0.9910', got '{prob_str}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

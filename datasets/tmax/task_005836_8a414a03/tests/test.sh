@@ -109,7 +109,7 @@ def test_top_3_similar_experiments():
         f"Expected top 3 similar experiments to be {expected_top_3}, but got {actual_top_3}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

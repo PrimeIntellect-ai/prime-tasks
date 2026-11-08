@@ -145,7 +145,7 @@ def test_live_pipeline_accuracy_on_10000_records():
     assert accuracy >= 0.99, f'Independently measured live pipeline accuracy was {accuracy:.5f} ({correct}/{count})'
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_verification 2>&1; then

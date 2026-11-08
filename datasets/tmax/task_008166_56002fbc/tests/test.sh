@@ -214,7 +214,7 @@ def test_script_aggregates_from_current_nodes_and_edges():
         assert_current_output(expected)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     printf '1\n' > /logs/verifier/reward.txt
 else
     printf '0\n' > /logs/verifier/reward.txt

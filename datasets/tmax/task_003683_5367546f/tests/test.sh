@@ -204,7 +204,7 @@ def test_executable_output_and_response_bin_contents():
     assert data == EXPECTED_RESPONSE, "response.bin must contain exactly one header, CRLF separator, and payload"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

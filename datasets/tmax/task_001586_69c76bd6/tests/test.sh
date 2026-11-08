@@ -197,7 +197,7 @@ def test_detector_on_neutral_paths_and_fresh_payloads():
                 f"Detector returned {result.returncode}, expected {expected_code}, for a neutral-path payload"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

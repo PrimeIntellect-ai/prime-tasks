@@ -67,7 +67,7 @@ def test_model_accuracy_mae():
     assert mae <= 0.5, f"Model MAE is {mae:.4f}, which exceeds the maximum allowed threshold of 0.5. Your weights: beta_0={b0}, beta_1={b1}, beta_2={b2}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

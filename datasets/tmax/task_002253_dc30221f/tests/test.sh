@@ -166,7 +166,7 @@ def test_fuzz_equivalence(iteration):
             )
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     HOLD_DIR=$(mktemp -d /root/graph-verifier-oracle.XXXXXX) || return 1
     chmod 700 "$HOLD_DIR" || return 1

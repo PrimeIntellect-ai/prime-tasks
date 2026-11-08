@@ -119,7 +119,7 @@ def test_runtime_generated_invalid_patches():
 TEST_EOF
 
 if [ "$ok" -eq 1 ]; then
-    if ! timeout 60s python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+    if ! timeout 60s python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
         ok=0
     fi
 fi

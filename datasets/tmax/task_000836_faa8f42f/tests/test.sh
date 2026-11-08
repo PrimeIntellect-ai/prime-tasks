@@ -175,7 +175,7 @@ def test_infected_files_list():
     assert len(lines) == 2, f"Expected exactly 2 infected files, but found {len(lines)}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     reward=1
 fi
 exit 0

@@ -169,7 +169,7 @@ def test_bootstrap_logic():
     assert abs(upper - true_upper) <= 0.05, f"Upper bound {upper} differs from expected {true_upper:.3f} by > 0.05"
 TEST_EOF
 
-    if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         reward=1
     fi
 fi

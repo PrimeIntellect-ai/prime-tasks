@@ -106,7 +106,7 @@ verify_submission() {
     rm -f /home/user/correlation.txt /home/user/cleaned.csv || return 1
     timeout 10s /home/user/processor || return 1
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 }
 
 if verify_submission; then

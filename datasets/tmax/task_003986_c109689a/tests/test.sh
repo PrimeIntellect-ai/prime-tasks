@@ -121,7 +121,7 @@ def test_cleaned_sensor_data():
         assert out_r['rolling_temp'] == exp_r['rolling_temp'], f"Row {i} 'rolling_temp' mismatch: expected {exp_r['rolling_temp']}, got {out_r['rolling_temp']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

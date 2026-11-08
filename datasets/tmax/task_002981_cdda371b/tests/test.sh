@@ -131,7 +131,7 @@ PY_EOF
 # an oracle during verification.
 pkill -KILL -u user >/dev/null 2>&1 || true
 
-if SECURE_AUTH_RUNNER="$workdir/runner.py" python3 -m pytest "$workdir/test_final_state.py" -x --tb=short 2>&1; then
+if SECURE_AUTH_RUNNER="$workdir/runner.py" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$workdir/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

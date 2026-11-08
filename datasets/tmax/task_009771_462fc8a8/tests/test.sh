@@ -228,7 +228,7 @@ def test_report_json_exists_and_correct():
     assert math.isclose(beta.get("projected_mem", 0), 4920.0, rel_tol=1e-5), "node-beta projected_mem is incorrect"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

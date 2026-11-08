@@ -95,7 +95,7 @@ def test_recommendations_output():
     assert actual_ids == expected_ids, f"Output IDs {actual_ids} do not match the expected top 3 IDs {expected_ids}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

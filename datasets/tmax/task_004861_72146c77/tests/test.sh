@@ -35,7 +35,7 @@ def test_json_report_content():
     assert math.isclose(data["ci_upper"], expected_ci_upper, abs_tol=tolerance), f"Expected 'ci_upper' to be close to {expected_ci_upper}, but got {data['ci_upper']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -118,7 +118,7 @@ def test_processed_csv_format_and_content():
             pytest.fail(f"Row {i+1} MovingAvg/Distance contains invalid floats.")
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     passed=0
 fi
 
@@ -232,7 +232,7 @@ def test_dynamic_output_is_derived_from_new_input():
         assert abs(Decimal(row[5]) - distance) < Decimal("0.0051"), f"Dynamic row {number} Distance mismatch"
 DYNAMIC_EOF
 
-if ! python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
     passed=0
 fi
 

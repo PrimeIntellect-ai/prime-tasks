@@ -145,7 +145,7 @@ def test_authentication_bypass():
     )
 TEST_EOF
 
-if cd /root/verifier_tests && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest --noconftest test_final_state.py -x --tb=short 2>&1; then
+if cd /root/verifier_tests && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

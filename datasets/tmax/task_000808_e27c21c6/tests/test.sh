@@ -100,7 +100,7 @@ def test_log_file_content():
 TEST_EOF
 
 ok=1
-if ! python3 -m pytest /tmp/test_original_requirements.py -x --tb=short; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_requirements.py -x --tb=short; then
     ok=0
 fi
 
@@ -257,7 +257,7 @@ def test_random_invalid_timestamps_are_rejected_without_hashing_or_logging():
         assert calls() == before_calls
 TEST_EOF
 
-    if ! python3 -m pytest /tmp/test_dynamic_behavior.py -x --tb=short; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_behavior.py -x --tb=short; then
         ok=0
     fi
 fi

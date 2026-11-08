@@ -49,7 +49,7 @@ def test_source_code_structure():
     assert os.path.isfile("/home/user/proxy/main.go"), "/home/user/proxy/main.go does not exist."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 [ "$(cd /home/user/analyzer && go list -m)" = "analyzer" ]
 [ "$(cd /home/user/proxy && go list -m)" = "proxy" ]

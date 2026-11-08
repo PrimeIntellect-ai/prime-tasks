@@ -219,7 +219,7 @@ def test_04_program_computes_changed_inputs():
     assert content == '0.0333', f"Expected '0.0333' in {RESULT}, but got {content!r}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

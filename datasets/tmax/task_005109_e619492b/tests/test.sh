@@ -234,7 +234,7 @@ if (
         sleep 1
     done
     test "$ready" = "1"
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

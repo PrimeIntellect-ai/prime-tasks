@@ -184,7 +184,7 @@ def test_output_correctness_and_sorting():
         assert config_data["app_name"] is not None, f"Record at line {i+1} has null 'app_name'."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if verify_submission 2>&1; then

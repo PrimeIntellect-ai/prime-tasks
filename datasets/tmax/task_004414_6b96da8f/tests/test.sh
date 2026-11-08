@@ -202,7 +202,7 @@ def test_z_dynamic_execution_traversal_rle_and_chunking():
             assert len(actual) == 512, f"Non-final chunk {name} is not exactly 512 bytes."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

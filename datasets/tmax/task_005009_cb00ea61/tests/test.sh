@@ -107,7 +107,7 @@ def test_vm_run_log_success():
     assert "SUCCESS" in content, f"Log file {log_path} does not contain 'SUCCESS'. The script may have failed."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if verify_task; then

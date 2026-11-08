@@ -149,7 +149,7 @@ def test_z_organizer_executes_and_processes_fresh_inputs():
     assert mock_data == {"test_mode": True, "version": highest}, "Generated mock_env.json has incorrect content"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -301,7 +301,7 @@ def test_similar_but_unprotected_roots_remain_safe():
         assert response == expected
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 RC=$?
 
 kill "$MOCK_PID" "$START_PID" 2>/dev/null || true

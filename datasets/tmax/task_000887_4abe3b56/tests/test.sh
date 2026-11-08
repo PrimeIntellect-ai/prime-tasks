@@ -104,7 +104,7 @@ def test_two_decimal_places_formatting():
             assert re.search(pattern, line), f"Line {i+1} does not format {field} to exactly 2 decimal places: {line}"
 TEST_EOF
 
-            if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+            if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
                 cat << 'DYNAMIC_EOF' > /tmp/test_dynamic.py
 import json
 import os

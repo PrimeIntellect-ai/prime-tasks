@@ -58,7 +58,7 @@ def test_untouched_files():
             assert "Just a normal text file uploaded by a user." in content, f"Content of {file_path} was altered."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ ! -f /home/user/audit_keys.go ] || [ -L /home/user/audit_keys.go ]; then
     echo "Missing regular Go source file: /home/user/audit_keys.go" >&2

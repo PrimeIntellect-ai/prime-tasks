@@ -122,7 +122,7 @@ def test_complete_decompressed_contents_match_archive():
             assert output.read() == expected_content, f"Decompressed content mismatch in {filename}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     BACKUP_DIR=$(mktemp -d)
     cp /home/user/dataset_incoming/robotics_data.tar.gz "$BACKUP_DIR/robotics_data.tar.gz" || return 1

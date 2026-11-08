@@ -169,7 +169,7 @@ def test_malformed_missing_and_wrong_type_payloads_are_rejected():
             assert run_sanitiser(path) == 1, f"Invalid payload was not rejected: {document!r}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

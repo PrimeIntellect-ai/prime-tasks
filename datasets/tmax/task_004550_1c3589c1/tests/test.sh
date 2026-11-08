@@ -87,7 +87,7 @@ def test_final_processed_output():
 TEST_EOF
 
 verify() {
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     test -f /home/user/app/migrate.sh || return 1
     test -f /home/user/app/rate_limiter.sh || return 1

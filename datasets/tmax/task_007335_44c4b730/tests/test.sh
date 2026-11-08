@@ -208,7 +208,7 @@ def test_reports_exist_and_content():
         assert max_str[:-1] in content, f"Expected max value ~{max_str} in {report_file}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if verify_task; then

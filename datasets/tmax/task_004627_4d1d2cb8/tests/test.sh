@@ -75,7 +75,7 @@ TEST_EOF
 stop_server
 python3 /home/user/ws_server.py >/tmp/original_ws.log 2>&1 &
 server_pid=$!
-if ! wait_for_port || ! run_submission || ! python3 -m pytest /tmp/test_original_state.py -x --tb=short; then
+if ! wait_for_port || ! run_submission || ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short; then
     overall=0
 fi
 stop_server

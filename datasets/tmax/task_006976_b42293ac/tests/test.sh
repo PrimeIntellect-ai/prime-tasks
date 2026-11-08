@@ -163,7 +163,7 @@ TEST_EOF
 if cd /home/user/seq_analyzer \
    && cargo build --quiet \
    && timeout 15s ./regression_test.sh; then
-    if cd / && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if cd / && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         score=1
     fi
 fi

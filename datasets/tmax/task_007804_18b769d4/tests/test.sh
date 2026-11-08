@@ -156,7 +156,7 @@ def test_mock_artifact_files():
         assert raw_content == expected_content, f"Content of {mock_file} must match exactly"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

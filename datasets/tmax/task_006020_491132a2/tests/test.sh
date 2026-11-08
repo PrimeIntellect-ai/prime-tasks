@@ -214,7 +214,7 @@ def test_complete_script_behavior():
     dynamic_behavior_check()
 TEST_EOF
 
-python3 -m pytest /tmp/test_curate_artifacts.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_curate_artifacts.py -x --tb=short 2>&1
 status=$?
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

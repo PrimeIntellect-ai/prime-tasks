@@ -235,7 +235,7 @@ def test_atomic_writes_ast():
     assert found_atomic, "Could not verify atomic writes: no os.rename/os.replace or tempfile usage found in AST."
 PY_EOF
 
-if [ "$LOGGER_STATUS" -eq 0 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$LOGGER_STATUS" -eq 0 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

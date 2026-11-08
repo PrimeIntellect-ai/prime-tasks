@@ -69,7 +69,7 @@ def test_process_normal_variance_with_truncation():
     assert math.isclose(data["final_score"], expected_score, rel_tol=1e-3), f"Expected final_score ~ {expected_score}, got {data.get('final_score')}"
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     exit 0
 fi
 
@@ -190,7 +190,7 @@ def test_randomized_processing_and_real_binary_integration():
         assert_binary_called_with(binary_args)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
     restore_binary
     trap - EXIT
     echo "1" > /logs/verifier/reward.txt

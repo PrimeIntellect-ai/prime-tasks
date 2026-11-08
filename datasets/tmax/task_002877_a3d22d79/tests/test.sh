@@ -84,7 +84,7 @@ def test_benchmark_results():
     assert abs(res["mean_diff_ci_upper"] - round(ci_upper, 4)) <= 0.0002, "mean_diff_ci_upper is incorrect."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

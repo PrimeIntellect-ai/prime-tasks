@@ -209,7 +209,7 @@ def test_mre_processes_both_literals_and_performs_no_file_reads():
     assert INVALID_MRE in seen, 'mre.py did not pass the required incomplete hardcoded string to json.loads.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

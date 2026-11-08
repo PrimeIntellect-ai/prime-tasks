@@ -89,7 +89,7 @@ TEST_EOF
 
     # Preserve the original assertion that the agent produced the requested file
     # for the image's supplied edges before verification began.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Exercise the submitted C parser directly under AddressSanitizer with enough
     # pairs to force repeated growth of its allocation.
@@ -227,7 +227,7 @@ PY_EOF
     cp "$BACKUP" "$PROJECT/edges.txt" || return 1
     rm -f "$OUTPUT"
     (cd "$PROJECT" && ./target/debug/plugin_manager) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_verification; then

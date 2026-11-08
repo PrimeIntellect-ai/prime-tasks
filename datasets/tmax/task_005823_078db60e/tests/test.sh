@@ -147,7 +147,7 @@ def test_outputs_match_independent_computation(independently_computed_results):
         assert ratio <= 20.0, f"Reported {key}={reported} is not plausible relative to an independent FAISS benchmark ({fresh})"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

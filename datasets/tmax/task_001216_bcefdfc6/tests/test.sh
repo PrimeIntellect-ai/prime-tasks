@@ -164,7 +164,7 @@ restore_inputs() {
 run_pipeline_and_tests() {
     rm -f "$OUTPUT_FILE" || return 1
     timeout 60s make --no-print-directory -C "$BASE_DIR" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 make_dynamic_inputs() {

@@ -178,7 +178,7 @@ def test_compiled_extension_on_derived_inputs():
         assert abs(actual - expected) < 1e-6, (a, b, actual, expected)
 TEST_EOF
 
-    (cd /tmp && python3 -m pytest /tmp/test_final_state.py -x --tb=short --noconftest) || return 1
+    (cd /tmp && python3 -m pytest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short --noconftest) || return 1
 }
 
 if verify; then

@@ -162,7 +162,7 @@ def test_program_parses_new_gzip_elf_packages_and_traversal():
         run_curate(malicious_file, f'[REJECT] {malicious_path} (Path Traversal)')
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

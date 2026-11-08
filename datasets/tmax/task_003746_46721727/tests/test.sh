@@ -237,7 +237,7 @@ def test_randomized_inputs_use_postgresql_graph_and_sql_analytics():
     assert re.search(r"\bover\s*\(", sql_log, re.IGNORECASE), "No SQL window function was executed"
 TEST_EOF
 
-if [ "$service_status" -eq 0 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$service_status" -eq 0 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

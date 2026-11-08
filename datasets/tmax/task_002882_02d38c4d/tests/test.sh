@@ -224,7 +224,7 @@ run_checks() {
 
     run_program /tmp/sql_audit_original.log || return 1
     python3 /tmp/check_sql.py /tmp/sql_audit_original.log || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 /tmp/dynamic_test.py || return 1
     python3 /tmp/check_sql.py /tmp/sql_audit_dynamic.log || return 1
@@ -232,7 +232,7 @@ run_checks() {
     cp /tmp/transactions.original.csv /home/user/transactions.csv || return 1
     run_program /tmp/sql_audit_final.log || return 1
     python3 /tmp/check_sql.py /tmp/sql_audit_final.log || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_checks; then

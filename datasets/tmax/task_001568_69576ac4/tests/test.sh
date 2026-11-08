@@ -213,6 +213,6 @@ def test_randomized_argument_boundaries_and_oracle_results():
     assert_request("", valid_token, 500)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 fi

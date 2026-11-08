@@ -85,7 +85,7 @@ def test_json_contents():
         assert sales_record[key] == expected_value, f"Expected {key}={expected_value} for Sales, found {sales_record[key]}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     python3 - <<'PY'
 import json

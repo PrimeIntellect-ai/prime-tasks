@@ -274,7 +274,7 @@ PY_EOF
         GOMAXPROCS=2 timeout 45s go test -count=1 -parallel=1 -run "^${fuzz_name}$" -fuzz "^${fuzz_name}$" -fuzztime=1s . || return 1
     done <<< "$fuzz_names"
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_checks 2>&1; then

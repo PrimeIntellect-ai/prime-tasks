@@ -170,7 +170,7 @@ if (
     rm -f parser_x86 parser_arm output_x86.json output_arm.json
     make -B all
     make test
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

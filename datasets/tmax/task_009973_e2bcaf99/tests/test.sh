@@ -124,7 +124,7 @@ def test_cgo_or_makefile_fixed():
     pass
 PYEOF
 
-if ! python3 -m pytest "$PYTEST_FILE" -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$PYTEST_FILE" -x --tb=short 2>&1; then
     score=0
 fi
 

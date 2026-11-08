@@ -172,7 +172,7 @@ def test_fresh_push_appended_current_jst_log_entry():
     assert start - 5 <= logged_epoch <= int(time.time()) + 5, "The new JST timestamp is not from the verifier's push."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

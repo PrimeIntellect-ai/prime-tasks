@@ -41,7 +41,7 @@ def test_original_assertions():
         with open(path) as f:
             assert f.read().strip() == value
 PY
-python3 -m pytest /tmp/test_final_state.py -x --tb=short >/tmp/original-tests.log 2>&1 || ok=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short >/tmp/original-tests.log 2>&1 || ok=0
 
 SRC=/home/user/auto_tuner.go
 BIN=/tmp/auto_tuner_submission

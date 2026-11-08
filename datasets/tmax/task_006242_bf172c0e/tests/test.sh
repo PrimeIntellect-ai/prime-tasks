@@ -54,7 +54,7 @@ def test_error_summary_created():
 TEST_EOF
 
 if (
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     python3 << 'PY_EOF'
 import os
@@ -209,7 +209,7 @@ PY_EOF
           /home/user/real_data/logs/error_summary.txt
     /home/user/service_manager.sh
     /home/user/rotate_and_report.sh
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ) 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else

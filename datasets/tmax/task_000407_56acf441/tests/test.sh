@@ -40,7 +40,7 @@ trap restore_validator EXIT
 
 run_checks() {
     # Preserve the original assertions.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     [ -f /home/user/validator ] && [ -x /home/user/validator ] || return 1
 

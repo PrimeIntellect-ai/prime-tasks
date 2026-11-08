@@ -115,7 +115,7 @@ cd /home/user/profiler || true
 if python3 -m pip install --disable-pip-version-check -r /home/user/profiler/requirements.txt; then
     rm -f /home/user/profiler/output.json
     if python3 /home/user/profiler/process_metrics.py --db /home/user/profiler/recovered.db --out /home/user/profiler/output.json; then
-        if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             reward=1
         fi
     fi

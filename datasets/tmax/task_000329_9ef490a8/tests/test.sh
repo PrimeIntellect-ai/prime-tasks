@@ -257,7 +257,7 @@ def test_reconstructed_data_serves_as_mre():
         assert abs(safe_sum - baseline) < 50.0
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     result=1
 else
     result=0

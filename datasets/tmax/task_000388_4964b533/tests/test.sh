@@ -116,7 +116,7 @@ def test_api_engineering_summary():
     assert data.get("employee_count") == 3, f"Expected employee_count 3, got {data.get('employee_count')}"
     assert data.get("total_salary") == 280000, f"Expected total_salary 280000, got {data.get('total_salary')}"
 PY
-python3 -m pytest /tmp/test_original_api.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_api.py -x --tb=short
 
 # Check that the requested project and local module replacement are real and buildable.
 test -f /home/user/etl-server/go.mod
@@ -257,7 +257,7 @@ def test_summaries_are_derived_from_replacement_dump():
         assert response.status_code == 200, response.text
         assert response.json() == expected
 PY
-python3 -m pytest /tmp/test_dynamic_api.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_api.py -x --tb=short
 )
 
 if run_checks; then

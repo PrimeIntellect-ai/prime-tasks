@@ -229,7 +229,7 @@ if test -f /home/user/server.go \
    && go build -o /tmp/submission_server /home/user/server.go \
    && ffmpeg -y -v error -i /app/demo.mp4 -pix_fmt rgb24 -f rawvideo /tmp/demo.rgb \
    && ffmpeg -y -v error -ss 00:00:04 -i /app/demo.mp4 -frames:v 1 /tmp/alternate.jpg \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     result=1
 fi
 

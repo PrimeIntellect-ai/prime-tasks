@@ -173,7 +173,7 @@ def test_audio_mse():
         assert a.read() == e.read(), "Processed WAV is not an exact copy of the complete server response."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_checks; then

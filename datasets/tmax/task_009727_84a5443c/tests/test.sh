@@ -165,7 +165,7 @@ ATOM      7  CA  ALA A   6      -0.600  -1.500   0.400  1.00  0.00           C
     validate_computed_report(final_ans, original_expected)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

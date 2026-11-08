@@ -200,7 +200,7 @@ def test_output_results():
     assert abs(parsed_integral - expected_integral) < 0.005, f'Integral ({parsed_integral}) does not match the expected value ({expected_integral:.4f}). Check your integrate_poly implementation.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

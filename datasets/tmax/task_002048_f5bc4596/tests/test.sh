@@ -134,7 +134,7 @@ def test_json_structure_and_values():
         assert data[i]["centrality"] == expected_top_3[i]["centrality"], f"Rank {i+1} centrality mismatch for {data[i]['entity_id']}. Expected {expected_top_3[i]['centrality']}, got {data[i]['centrality']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

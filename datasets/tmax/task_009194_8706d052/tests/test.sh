@@ -168,7 +168,7 @@ def test_invalid_metrics_csv():
         assert reader[i] == expected_row, f"Row {i} in invalid_metrics.csv does not match expected output."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 # Exercise the compiled artifact on fresh inputs, including embedded newlines and
 # both sides of the strict 20 percent quality-gate boundary.

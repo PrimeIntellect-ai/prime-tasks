@@ -75,7 +75,7 @@ def test_execution_time_and_accuracy():
     assert duration <= threshold, f"Execution time threshold exceeded. Metric: {duration:.4f} seconds, Threshold: {threshold} seconds"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

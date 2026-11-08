@@ -64,7 +64,7 @@ def test_main_go_fixed():
     assert "C.process_byte" in content, "main.go does not process data through the C emulator library"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     rm -f /home/user/release/libemu/emu.o /home/user/release/libemu/libemu.a
     make -C /home/user/release/libemu libemu.a

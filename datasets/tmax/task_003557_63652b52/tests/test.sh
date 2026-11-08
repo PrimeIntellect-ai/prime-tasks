@@ -314,7 +314,7 @@ def test_dynamic_csv_is_processed_by_go_artifact():
     pytest.fail("No submitted Go program processed the randomized CSV correctly:\n" + "\n".join(errors))
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

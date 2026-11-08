@@ -56,7 +56,7 @@ def test_valid_tokens_content():
 TEST_EOF
 
     # Preserve all original final-state assertions.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # Inspect the parsed Go syntax rather than trusting comments or textual output.
     cat << 'GO_EOF' > /tmp/check_websec_source.go

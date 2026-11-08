@@ -78,7 +78,7 @@ def test_authenticated_request():
         assert actual.get("rolling_sum") == expected["rolling_sum"], f"Item {i}: expected rolling_sum {expected['rolling_sum']}, got {actual.get('rolling_sum')}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

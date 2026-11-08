@@ -68,7 +68,7 @@ def test_rust_processor_evaluates_correctly():
             f"Expected allowed: {expected} for {payload}, got {data}"
         )
 TEST_EOF
-python3 -m pytest /tmp/test_initial_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_initial_state.py -x --tb=short
 
 # The submitted Rust project itself must compile and pass its complete test suite.
 cd /app/rust-processor

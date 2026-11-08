@@ -64,7 +64,7 @@ def test_builder_uses_requested_concurrency_primitives():
     assert re.search(r'\bchan\b', content), "builder.go does not use a Go channel"
 PY_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     rm -f /tmp/polybuild_worker_verify
     gcc -fsanitize=address,undefined -fno-omit-frame-pointer \

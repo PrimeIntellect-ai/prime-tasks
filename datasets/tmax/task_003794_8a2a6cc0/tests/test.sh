@@ -220,7 +220,7 @@ def test_fit_endpoint(trajectory):
     assert math.isclose(k_val, 25.0, abs_tol=1.5), f"Fitted 'k' ({k_val}) is not within tolerance of 25.0"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

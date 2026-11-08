@@ -118,7 +118,7 @@ def test_metric_recall_at_10():
     assert mean_recall >= 0.95, f"Metric failed: Recall@10 is {mean_recall:.4f}, expected >= 0.95"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

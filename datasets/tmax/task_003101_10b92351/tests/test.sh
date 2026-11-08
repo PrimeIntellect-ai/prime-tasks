@@ -104,7 +104,7 @@ if [ -f /home/user/tracker/Cargo.toml ] && [ -f /home/user/tracker/src/main.rs ]
    (cd /home/user/tracker && cargo build --quiet); then
     rm -f /home/user/experiments/predictions.json
     if (cd /home/user/tracker && cargo run --quiet) && \
-       python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+       python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
 
         if python3 - << 'DYNAMIC_EOF'
 import csv
@@ -154,7 +154,7 @@ DYNAMIC_EOF
         then
             rm -f /home/user/experiments/predictions.json
             if (cd /home/user/tracker && cargo run --quiet) && \
-               python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+               python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
                 passed=1
             fi
         fi

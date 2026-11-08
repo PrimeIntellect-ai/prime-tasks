@@ -212,12 +212,12 @@ PY_EOF
 
     rm -f "$output"
     (cd /home/user/workspace && timeout 30 "$binary") || return 1
-    python3 -m pytest /tmp/test_final_state.py::test_output_csv_content -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py::test_output_csv_content -x --tb=short || return 1
 
     cp "$original" "$input" || return 1
     rm -f "$output"
     (cd /home/user/workspace && timeout 30 "$binary") || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify 2>&1; then

@@ -247,7 +247,7 @@ def test_build_cache_contents():
     assert hashlib.sha256(serde_data).hexdigest() == "f22f281e59273c524e4c29ea76d2036c0a0058b297bcf95da4e8c1050e8200dd"
 TEST_EOF
 
-if python3 /tmp/verify_fetch_behavior.py && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 /tmp/verify_fetch_behavior.py && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

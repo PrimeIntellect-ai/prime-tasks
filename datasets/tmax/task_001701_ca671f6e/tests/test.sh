@@ -90,7 +90,7 @@ def test_script_exists_and_executable():
     assert os.access(script_path, os.X_OK), f"Script is not executable: {script_path}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_verification 2>&1; then

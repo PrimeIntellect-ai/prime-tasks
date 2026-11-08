@@ -59,7 +59,7 @@ def test_valgrind_log_no_leaks():
         )
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Install a temporary ABI-compatible instrumented library. It returns a
     # run-specific 16-bit representation and records real encode/free calls.

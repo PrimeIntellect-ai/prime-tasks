@@ -162,7 +162,7 @@ def test_process_handles_derived_inputs_and_api_serves_current_file():
     assert observed == last_expected, f"API did not serve current stats: expected {last_expected}, got {observed}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

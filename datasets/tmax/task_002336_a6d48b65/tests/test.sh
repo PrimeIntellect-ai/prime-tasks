@@ -115,7 +115,7 @@ TEST_EOF
 rm -f /home/user/params.txt /home/user/distance.txt
 
 if timeout 60 python3 /home/user/fit_gmm.py >/tmp/fit_gmm.stdout 2>/tmp/fit_gmm.stderr \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     cat /tmp/fit_gmm.stdout 2>/dev/null || true

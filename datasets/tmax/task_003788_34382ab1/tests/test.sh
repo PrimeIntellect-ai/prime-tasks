@@ -126,7 +126,7 @@ def test_anomalies_endpoint():
         assert math.isclose(actual['value'], expected['value'], rel_tol=1e-5), f"Mismatch at index {i}: expected value {expected['value']}, got {actual['value']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

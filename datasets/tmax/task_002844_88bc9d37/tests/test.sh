@@ -177,7 +177,7 @@ def test_test_results_log():
     assert "failed" not in content or "0 failed" in content, "The test results log indicates that some tests failed."
 TEST_EOF
 
-env PYTHONPATH="$SITE:$PROJECT_DIR" "$VENV/bin/python" -m pytest /tmp/test_final_state.py -x --tb=short
+env PYTHONPATH="$SITE:$PROJECT_DIR" "$VENV/bin/python" -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 echo "1" > /logs/verifier/reward.txt
 trap - EXIT

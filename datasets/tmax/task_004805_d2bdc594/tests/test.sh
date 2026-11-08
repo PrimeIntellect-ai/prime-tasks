@@ -250,7 +250,7 @@ def test_redaction_monitoring_log():
     assert len(redaction_lines) >= redacted_chunks, "etl.log does not contain a monitoring entry for each redacted chunk."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

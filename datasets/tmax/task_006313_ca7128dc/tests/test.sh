@@ -101,7 +101,7 @@ def test_profile_results_content():
     assert actual_str == expected_str, f"W1_distance is incorrect. Expected {expected_str}, but got {actual_str}."
 TEST_EOF
 
-if $passed && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if $passed && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

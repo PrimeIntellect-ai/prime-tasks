@@ -173,7 +173,7 @@ def test_05_ssh_key_backup_permissions():
     assert permissions == 0o400, f"Permissions for {path} should be 400 (owner read-only), but got {oct(permissions)}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

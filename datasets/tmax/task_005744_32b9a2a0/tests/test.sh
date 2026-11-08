@@ -165,7 +165,7 @@ then
        && [ -f /home/user/clean ] && [ -x /home/user/clean ]; then
         rm -f /home/user/optimal_k.txt /home/user/imputed.txt
         if (cd /home/user && timeout 20s ./clean) \
-           && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+           && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             passed=1
         fi
     fi

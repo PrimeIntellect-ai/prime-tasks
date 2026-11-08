@@ -130,7 +130,7 @@ run_case() {
     chmod 600 /home/user/output.csv || return 1
 
     timeout 30s runuser -u user -- /root/process_etl_bin >/tmp/process.stdout 2>/tmp/process.stderr || return 1
-    python3 -m pytest /root/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /root/test_final_state.py -x --tb=short || return 1
 }
 
 if [ ! -f /home/user/process.go ]; then

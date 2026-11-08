@@ -130,7 +130,7 @@ def test_verification_passed():
     assert log_content == expected_log, f"The verification log indicates failure or is incorrect. Found: '{log_content}'"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if run_checks; then

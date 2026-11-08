@@ -328,7 +328,7 @@ def test_log_rotation_executed(execute_submission_from_clean_state):
         assert f.read() == b"\0" * (12 * 1024), "app.log.1.gz is not the compressed seeded application log"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

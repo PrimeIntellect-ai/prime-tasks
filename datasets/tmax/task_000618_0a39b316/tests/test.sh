@@ -220,7 +220,7 @@ def test_lib_rs_optimized():
     assert "&str" in content, "lib.rs does not seem to use &str for string borrowing. You should borrow the string slice from Python instead of taking ownership."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

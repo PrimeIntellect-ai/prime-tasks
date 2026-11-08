@@ -209,7 +209,7 @@ def test_unpredictable_stream_is_persisted_and_aggregated_exactly():
         assert stored[edge_key] >= count, f"Posted edge was not persisted in TinyDB: {edge_key}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

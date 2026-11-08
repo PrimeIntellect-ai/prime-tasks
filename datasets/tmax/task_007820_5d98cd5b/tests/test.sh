@@ -85,7 +85,7 @@ def test_ci_success_log():
 TEST_EOF
 
     cd "$PROJECT_DIR"
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # The submitted log must contain the complete successful integration output,
     # not merely the single division line checked by the original assertions.

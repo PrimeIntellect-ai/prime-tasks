@@ -70,7 +70,7 @@ def test_merged_analysis_format_and_content():
             assert "." in lat and len(lat.split(".")[1]) >= 1, f"Row {i+1} avg_latency should be formatted with 1 decimal place. Got '{lat}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

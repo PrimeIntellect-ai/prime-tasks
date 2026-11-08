@@ -44,7 +44,7 @@ def test_summary_csv_metric():
     assert max_ae <= 0.05, f"Maximum absolute error {max_ae} exceeds threshold of 0.05."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

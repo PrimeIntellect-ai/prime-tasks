@@ -336,7 +336,7 @@ def test_manifest_exists_and_valid():
         assert digest == get_file_sha256(os.path.join(OUT_DIR, fname)), f"SHA256 hash mismatch for {fname}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

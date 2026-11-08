@@ -147,7 +147,7 @@ def test_final_report_accuracy():
     assert score >= 0.85, f"Accuracy score {score:.2f} is below the threshold of 0.85. Output was: {output}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
     return 0
 }
 

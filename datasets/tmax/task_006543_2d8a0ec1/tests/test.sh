@@ -37,7 +37,7 @@ def test_malicious_file_not_extracted():
     assert not os.path.exists(malicious_path), f"{malicious_path} exists! Path traversal vulnerability was not prevented."
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     status=1
 fi
 

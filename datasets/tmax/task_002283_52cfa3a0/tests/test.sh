@@ -264,7 +264,7 @@ if [ -f /home/user/process_feedback.py ]; then
           /home/user/processed/hourly_lang_summary.csv \
           /home/user/logs/pipeline.log
     if python3 /home/user/process_feedback.py; then
-        if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             passed=1
         fi
     fi

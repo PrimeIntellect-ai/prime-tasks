@@ -363,7 +363,7 @@ def test_zz_health_check_validates_the_protocol_response():
     assert success.returncode == 0, "health_check.sh must exit 0 after receiving a 250 response"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

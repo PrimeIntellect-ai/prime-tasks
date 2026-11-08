@@ -101,7 +101,7 @@ def test_not_indexed_query_was_executed():
         "The executed SQLite statements did not query communications using NOT INDEXED."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
     cp /home/user/cycles.txt /tmp/initial_cycles.txt
 
     cat << 'DYNAMIC_EOF' > /tmp/create_dynamic_case.py

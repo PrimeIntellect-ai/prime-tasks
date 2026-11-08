@@ -224,7 +224,7 @@ def test_compute_fuzz_and_dropped_requests_do_not_leak():
     assert SERVER_PROCESS.poll() is None, "The vendored server stopped while handling malformed requests"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -113,7 +113,7 @@ def test_maximum_gzip_compression_flag():
     assert header[8] == 2, 'clean.gz was not produced using maximum gzip compression.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

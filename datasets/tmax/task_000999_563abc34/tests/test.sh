@@ -23,7 +23,7 @@ def test_script_exists():
     assert os.path.isfile(script_file), f"Script file {script_file} is not a regular file."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 && python3 - <<'PY'
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 && python3 - <<'PY'
 import json
 import os
 import re

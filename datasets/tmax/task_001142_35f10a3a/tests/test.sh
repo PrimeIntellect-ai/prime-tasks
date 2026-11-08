@@ -203,7 +203,7 @@ TEST_EOF
 prepare_and_run
 prep_status=$?
 if [ "$prep_status" -eq 0 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
     test_status=$?
 else
     test_status=$prep_status

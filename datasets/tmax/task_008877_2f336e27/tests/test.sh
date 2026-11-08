@@ -149,7 +149,7 @@ TEST_EOF
 
 first_ok=0
 if timeout 240 /home/user/pipeline.sh; then
-    if python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+    if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
         first_ok=1
     fi
 fi
@@ -244,7 +244,7 @@ def test_dynamic_run_invoked_extract_in_strict_mode():
 TEST_EOF
 
     if timeout 240 /home/user/pipeline.sh; then
-        if python3 -m pytest /tmp/test_dynamic_pipeline.py -x --tb=short; then
+        if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_pipeline.py -x --tb=short; then
             reward=1
         fi
     fi

@@ -176,7 +176,7 @@ PY_EOF
 reward=0
 if gcc -shared -fPIC -O2 -o "$tmpdir/libno_delegate.so" "$tmpdir/no_delegate.c"; then
     chmod 755 "$tmpdir" "$tmpdir/libno_delegate.so"
-    if BLOCKER_PATH="$tmpdir/libno_delegate.so" python3 -m pytest "$tmpdir/test_final_state.py" -x --tb=short 2>&1; then
+    if BLOCKER_PATH="$tmpdir/libno_delegate.so" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$tmpdir/test_final_state.py" -x --tb=short 2>&1; then
         reward=1
     fi
 fi

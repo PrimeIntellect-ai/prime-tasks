@@ -245,7 +245,7 @@ if [ "$RESULT" -eq 1 ]; then
         echo "Built Rust server failed to bind to 127.0.0.1:5050" >&2
         cat /tmp/traffic-api-verifier.log >&2
         RESULT=0
-    elif ! VERIFY_PHASE=original python3 -m pytest /tmp/test_traffic_api.py -x --tb=short; then
+    elif ! VERIFY_PHASE=original python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_traffic_api.py -x --tb=short; then
         RESULT=0
     fi
     stop_server
@@ -282,7 +282,7 @@ PY
         echo "Rust server failed after verifier-generated CSV challenge" >&2
         cat /tmp/traffic-api-verifier.log >&2
         RESULT=0
-    elif ! VERIFY_PHASE=dynamic python3 -m pytest /tmp/test_traffic_api.py -x --tb=short; then
+    elif ! VERIFY_PHASE=dynamic python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_traffic_api.py -x --tb=short; then
         RESULT=0
     fi
     stop_server

@@ -108,7 +108,7 @@ def test_summary_csv_content_and_pipeline_execution():
     assert actual_lines == expected_lines, f"The content of {SUMMARY} is incorrect. Expected: {expected_lines}, but got: {actual_lines}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

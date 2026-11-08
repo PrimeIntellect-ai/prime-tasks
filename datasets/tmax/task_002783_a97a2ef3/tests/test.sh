@@ -184,7 +184,7 @@ def test_metrics_v2_db_migration():
     assert actual == expected, f'Migrated rows do not exactly correspond to all legacy rows: expected {expected}, got {actual}'
 PYTEST
 
-if ! python3 -m pytest /tmp/test_original_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short 2>&1; then
     status=1
 fi
 
@@ -249,7 +249,7 @@ if [ "$status" -eq 0 ]; then
     /home/user/auth_service >/tmp/auth_service_submitted.log 2>&1 &
     if ! wait_for_service; then
         status=1
-    elif ! python3 -m pytest /tmp/test_random_service.py -x --tb=short 2>&1; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_random_service.py -x --tb=short 2>&1; then
         status=1
     fi
     stop_listener
@@ -269,7 +269,7 @@ if [ "$status" -eq 0 ]; then
     if ! wait_for_service; then
         cat /tmp/auth_service_asan.log
         status=1
-    elif ! python3 -m pytest /tmp/test_random_service.py -x --tb=short 2>&1; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_random_service.py -x --tb=short 2>&1; then
         status=1
     fi
     stop_listener

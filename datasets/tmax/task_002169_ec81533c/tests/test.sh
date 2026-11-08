@@ -191,7 +191,7 @@ def test_generated_mixed_inputs_use_services_and_cache():
     run_and_check_case(input_path, replacement_output, replacement_rows)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

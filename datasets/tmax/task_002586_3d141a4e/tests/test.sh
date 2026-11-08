@@ -195,7 +195,7 @@ def test_missing_authentication():
     assert status in (401, 403), f'Expected 401 or 403 for missing authentication, got {status}'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     reward=1
 fi
 exit 0

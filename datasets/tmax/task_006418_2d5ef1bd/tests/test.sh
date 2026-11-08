@@ -161,7 +161,7 @@ DYNAMIC_EOF
 
 if [ -f /home/user/process_etl.py ] \
    && python3 /home/user/process_etl.py \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 \
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 \
    && python3 /tmp/test_dynamic_etl.py 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else

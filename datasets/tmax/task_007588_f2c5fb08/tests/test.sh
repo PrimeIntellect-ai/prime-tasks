@@ -217,7 +217,7 @@ def test_dat_outputs_were_published_by_atomic_rename():
             f'Temporary file for {destination} was not created in the output directory'
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_checks 2>&1; then

@@ -158,14 +158,14 @@ HIDDEN_EOF
 
 run_checks() {
     # Preserve all original assertions against the agent-produced final state.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     # Compile and execute the submitted C source, then ensure it reproduces the
     # required result rather than accepting a separately hardcoded CSV file.
     gcc /home/user/organizer.c -o /home/user/organizer -O2 || return 1
     rm -f /home/user/output.csv
     (cd /home/user && ./organizer) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     # Exercise classification, unknown-tag defaults, ordering, tie-breaking,
     # Jaccard matching, and the no-same-category-peer case on fresh inputs.

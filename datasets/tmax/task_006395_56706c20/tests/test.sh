@@ -225,7 +225,7 @@ if [ -f /home/user/pipeline/Cargo.toml ] \
    && rm -f /home/user/results.json \
    && timeout 240 cargo run --quiet --manifest-path /home/user/pipeline/Cargo.toml \
    && cargo build --quiet --release --manifest-path /tmp/bootstrap_oracle/Cargo.toml \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     status=1
 fi
 

@@ -149,7 +149,7 @@ run_and_test() {
     rm -f "$OUTPUT"
     (cd "$PROJECT" && timeout 180s cargo run --quiet) || return 1
     cmp -s "$before" "$INPUT" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 # Build and execute the submitted Rust project on the supplied data. Removing the

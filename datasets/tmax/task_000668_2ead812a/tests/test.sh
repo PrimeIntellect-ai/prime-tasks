@@ -326,7 +326,7 @@ def test_backends_and_curl_were_really_used():
     assert len(fft_calls) >= len(TESTED_SEQUENCES)
 PY
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > "$REWARD"
 else
     echo "0" > "$REWARD"

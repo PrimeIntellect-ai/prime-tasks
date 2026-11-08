@@ -244,7 +244,7 @@ if (
     rm -f /home/user/output/anomalies.json /home/user/output/hourly_stats.csv
     timeout 60s runuser -u user -- bash -c 'cd /home/user && python3 /home/user/process_pipeline.py'
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

@@ -237,7 +237,7 @@ def test_program_executes_and_recomputes_ci():
 TEST_EOF
 
 if g++ -O2 -std=c++17 /tmp/ci_oracle.cpp -o /tmp/ci_oracle \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

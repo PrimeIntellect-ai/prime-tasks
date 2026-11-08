@@ -113,7 +113,7 @@ def test_experiment_log():
         f"Last line of log file mismatch.\nExpected: {expected_log_line}\nActual:   {actual_last_line}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 # Exercise the compiled program on fresh, unpredictable valid input so a
 # submission that merely hard-codes the setup artifacts cannot pass.

@@ -140,7 +140,7 @@ def test_part2_missing_file_and_argument_errors():
     assert b"Traceback" not in no_argument_result.stderr, "Argument errors must be handled without an uncaught traceback"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

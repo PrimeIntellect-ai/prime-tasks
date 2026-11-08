@@ -206,7 +206,7 @@ def test_notify_eml_contents():
     assert actual_lines == expected_lines, f"The contents of {eml_path} do not match the expected email format."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 result=$?
 
 if [ -f /tmp/verifier_server.pid ]; then

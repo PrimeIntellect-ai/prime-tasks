@@ -220,7 +220,7 @@ def test_fast_organizer_speed_and_accuracy_on_unpredictable_wal():
     assert speedup >= 10.0, f"Speedup too low: {speedup:.2f}x (Legacy: {legacy_time:.2f}s, Agent: {agent_time:.2f}s). Expected >= 10.0x"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

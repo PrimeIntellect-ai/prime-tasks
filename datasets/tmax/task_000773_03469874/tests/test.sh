@@ -50,7 +50,7 @@ TEST_EOF
 if [ -f /home/user/backup_analyzer/Cargo.toml ] \
    && rm -f /home/user/top_backups.json \
    && timeout 120s cargo run --quiet --manifest-path /home/user/backup_analyzer/Cargo.toml \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

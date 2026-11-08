@@ -42,7 +42,7 @@ Copyright 2024 Acme Global. All rights reserved.
     assert actual_content == expected_content, "The decompressed content of the archive does not match the expected output."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
     python3 - <<'PY' || status=1

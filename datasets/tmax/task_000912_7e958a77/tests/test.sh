@@ -278,7 +278,7 @@ def test_cpp_function_is_used_for_concurrent_halves():
     assert sum(1 for _, active in records if active >= 2) >= len(all_lengths), records
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

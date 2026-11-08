@@ -97,7 +97,7 @@ def test_fuzz_equivalence():
         if oracle.stdout.strip() != agent.stdout.strip():
             pytest.fail(f'Mismatch on iteration {i}!\nInput:\n{data}\nOracle output:\n{oracle.stdout.strip()}\nAgent output:\n{agent.stdout.strip()}')
 PY
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 # Make the legacy executable unavailable while independently derived CLI and
 # REST tests run. This rejects symlinks and wrappers that delegate to it.

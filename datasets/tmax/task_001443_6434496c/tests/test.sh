@@ -231,7 +231,7 @@ if [ "$mutate_status" -eq 0 ] \
    && go build -o /tmp/analyzer_submission /home/user/analyzer.go \
    && rm -f /home/user/manifest.jsonl \
    && (cd /home/user && timeout 30s /tmp/analyzer_submission) \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     result=1
 fi
 

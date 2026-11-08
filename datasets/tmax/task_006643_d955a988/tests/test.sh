@@ -142,7 +142,7 @@ def test_valgrind_no_leaks():
     assert "definitely lost: 0 bytes in 0 blocks" in output, "Memory leak detected by valgrind. The leak in poly_math.c was not fully resolved."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -112,7 +112,7 @@ def test_plot_png_not_blank():
     assert not is_solid, 'The plot image appears to be completely blank (solid color). The plot script is likely still clearing the figure before saving.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

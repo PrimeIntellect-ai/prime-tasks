@@ -309,7 +309,7 @@ def test_regression_script_really_tests_request_and_status(built_server, tmp_pat
     assert pid_owns_listener(built_server[0].pid, PORT)
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

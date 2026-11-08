@@ -137,7 +137,7 @@ def test_new_schema_jsonl():
     assert actual_data == expected_data, f"Contents of {jsonl_path} do not match the expected computed hashes. Expected: {expected_data}, Actual: {actual_data}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

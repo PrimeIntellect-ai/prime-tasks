@@ -140,7 +140,7 @@ TEST_EOF
 if gcc -std=c11 /home/user/graph_analyzer.c -o /home/user/graph_analyzer -lsqlite3 \
    && rm -f /home/user/top_nodes.json \
    && timeout 10 /home/user/graph_analyzer \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -101,7 +101,7 @@ def test_serializer_executes_with_additional_unicode_inputs():
     run_serializer_case(long_name, secrets.randbelow(2**32))
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

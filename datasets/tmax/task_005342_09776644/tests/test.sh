@@ -72,7 +72,7 @@ def test_json_results():
         assert is_close(v2, 1630.9, tol=5.0), f"Variance 2 ({v2}) does not match expected ~1630.9"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

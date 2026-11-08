@@ -169,7 +169,7 @@ KILL_EOF
 if go build -o /tmp/analyzer_verified /home/user/analyzer.go >/tmp/analyzer_build.log 2>&1; then
     /tmp/analyzer_verified >/tmp/analyzer_server.log 2>&1 &
     server_pid=$!
-    if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         reward=1
     fi
 fi

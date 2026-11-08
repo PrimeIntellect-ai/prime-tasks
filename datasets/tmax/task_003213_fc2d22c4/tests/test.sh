@@ -258,7 +258,7 @@ finally:
 DYNAMIC_EOF
 
 ok=1
-python3 -m pytest /tmp/test_original_state.py -x --tb=short 2>&1 || ok=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short 2>&1 || ok=0
 if [ "$ok" -eq 1 ]; then
     python3 /tmp/test_dynamic_pipeline.py 2>&1 || ok=0
 fi

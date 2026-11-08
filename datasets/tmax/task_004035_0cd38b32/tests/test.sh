@@ -206,7 +206,7 @@ def test_randomized_binary_save_load_and_execution(clean_build, tmp_path):
             'VM produced the wrong result after loading and operating on serialized state'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

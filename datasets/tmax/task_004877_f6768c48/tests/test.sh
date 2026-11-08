@@ -168,7 +168,7 @@ verify_all() {
     mutate_database 1 || return 1
     rm -f /home/user/audit_report.csv
     timeout 20s /home/user/process_audit || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Independently compile the submitted source and exercise that build on another unseen
     # database mutation, ensuring the working behavior is implemented by process_audit.cpp.
@@ -176,7 +176,7 @@ verify_all() {
     mutate_database 2 || return 1
     rm -f /home/user/audit_report.csv
     timeout 20s /tmp/process_audit_from_source || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify_all 2>&1; then

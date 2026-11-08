@@ -161,7 +161,7 @@ TEST_EOF
 if g++ -std=c++17 -O2 -Wall -Wextra /home/user/process_graph.cpp -lsqlite3 -o /tmp/process_graph_verifier \
    && rm -f /home/user/impact_page_2.csv \
    && timeout 20s /tmp/process_graph_verifier \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

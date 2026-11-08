@@ -163,7 +163,7 @@ if test -f /home/user/process_configs.py \
    && python3 -m py_compile /home/user/process_configs.py \
    && rm -f /home/user/output/validation.txt /home/user/output/daily_configs.csv \
    && python3 /home/user/process_configs.py \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short \
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short \
    && python3 /tmp/test_dynamic_configs.py; then
     echo "1" > /logs/verifier/reward.txt
 else

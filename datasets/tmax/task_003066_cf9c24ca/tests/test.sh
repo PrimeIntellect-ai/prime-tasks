@@ -266,7 +266,7 @@ def test_pipeline_and_fast_query():
 TEST_EOF
 
 if gcc -shared -fPIC -O2 /tmp/count_interactions.c -o /tmp/count_interactions.so -ldl && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

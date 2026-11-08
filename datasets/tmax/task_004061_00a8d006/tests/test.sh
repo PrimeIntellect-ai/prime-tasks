@@ -42,7 +42,7 @@ def test_anomaly_scores_csv():
     assert auc >= 0.90, f"Failure: AUC below threshold. Expected >= 0.90, got {auc:.4f}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

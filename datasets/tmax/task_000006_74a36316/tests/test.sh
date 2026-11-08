@@ -285,7 +285,7 @@ def test_service_endpoints_and_math():
     assert abs(final_tcp["stddev_y"] - gt_stddev_y) < 0.001
 PYTEST_EOF
 
-if python3 -m pytest /tmp/test_vision_math.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_vision_math.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

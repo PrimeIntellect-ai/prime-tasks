@@ -237,7 +237,7 @@ assert valid, "Output was not atomically renamed from a .tmp file in final_docs"
 PY
 }
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 && behavioral_test; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 && behavioral_test; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

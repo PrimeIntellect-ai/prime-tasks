@@ -180,7 +180,7 @@ fn main() {
 RUST_EOF
 
     (cd /tmp/rng_oracle && cargo run --quiet --offline -- 10 > /tmp/expected_bootstrap_indices.txt) || return 1
-    python3 -m pytest /tmp/test_final_state.py -q -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -q -x --tb=short || return 1
 
     # Restore the supplied input, execute the artifact again, and retain the
     # originally required outputs as the final state.
@@ -188,7 +188,7 @@ RUST_EOF
     rm -f /home/user/train_processed.csv /home/user/test_processed.csv /home/user/train_bootstrapped.csv
     (cd /home/user/data_prep && cargo run --quiet) || return 1
     (cd /tmp/rng_oracle && cargo run --quiet --offline -- 8 > /tmp/expected_bootstrap_indices.txt) || return 1
-    python3 -m pytest /tmp/test_final_state.py -q -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -q -x --tb=short || return 1
 }
 
 STATUS=0

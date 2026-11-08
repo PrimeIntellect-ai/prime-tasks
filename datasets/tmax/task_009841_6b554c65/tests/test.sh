@@ -204,7 +204,7 @@ def test_compiled_source_rejects_all_nonpositive_inputs(compiled_server):
     assert json.loads(body) == expected_collatz(11), "Server returned an incorrect result after invalid requests."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

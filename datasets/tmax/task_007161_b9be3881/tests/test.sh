@@ -144,7 +144,7 @@ def test_scripts_exist_and_work_on_fresh_input():
     assert stat.S_IMODE(os.stat(SECURE_LOGS_DIR).st_mode) == 0o700
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     mkdir -p /logs/verifier
     echo "1" > /logs/verifier/reward.txt
 else

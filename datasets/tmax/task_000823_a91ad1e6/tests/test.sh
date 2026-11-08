@@ -252,6 +252,6 @@ def test_only_required_route_and_method_are_accepted():
     assert wrong_path.status_code != 200, "POST requests to routes other than /process must not be processed"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     REWARD=1
 fi

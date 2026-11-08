@@ -175,7 +175,7 @@ def test_rotator_executes_and_enforces_three_backup_limit():
     assert not any(p.name.startswith("app.log.") and p.name[8:].isdigit() and int(p.name[8:]) > 3 for p in logs.iterdir())
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

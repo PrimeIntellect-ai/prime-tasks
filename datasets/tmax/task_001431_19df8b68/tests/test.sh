@@ -210,7 +210,7 @@ def test_hidden_semantic_filtering_transcription_and_logs():
         run_hidden_case(mixed_input, os.path.join(tmpdir, "mixed_out.csv"), mixed_rows, expected_mixed)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

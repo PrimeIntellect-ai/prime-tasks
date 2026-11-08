@@ -213,7 +213,7 @@ def test_incremental_bin_exists_and_correct():
         assert file_data == expected_data, f"File data for {path} in {INCREMENTAL_BIN} does not match actual file content"
 TEST_EOF
 
-  python3 -m pytest /tmp/test_final_state.py -x --tb=short
+  python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if validate_submission 2>&1; then

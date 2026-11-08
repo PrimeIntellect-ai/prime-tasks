@@ -179,7 +179,7 @@ TEST_EOF
     go build -o /tmp/audit_submission /home/user/audit.go || return 1
     rm -f /home/user/sod_violations.json || return 1
     (cd /home/user && /tmp/audit_submission) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 }
 
 if run_verify; then

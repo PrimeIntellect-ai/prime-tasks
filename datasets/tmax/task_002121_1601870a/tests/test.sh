@@ -221,7 +221,7 @@ def test_dynamic_daemon_behavior():
         f"Incorrect dynamically generated audit entries: {new_lines!r}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_secure_archiver.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_secure_archiver.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

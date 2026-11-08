@@ -349,7 +349,7 @@ def test_git_push_behavior_for_added_and_modified_json():
         assert f"{invalid_modify[0]} {invalid_modify[1]}" in calls(), "Hook did not submit modified JSON to /verify"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     reward=1
 else
     reward=0

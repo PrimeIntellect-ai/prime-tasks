@@ -44,7 +44,7 @@ def test_es_final_json_content_and_format():
         f"The file {final_json_path} is not properly formatted. It must have an indent of 4 spaces and alphabetically sorted keys."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

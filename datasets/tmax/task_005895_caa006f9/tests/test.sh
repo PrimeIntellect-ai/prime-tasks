@@ -192,7 +192,7 @@ def test_final_k_value():
     assert actual_str == expected_str, f"Expected final k value to be '{expected_str}', but got '{actual_str}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

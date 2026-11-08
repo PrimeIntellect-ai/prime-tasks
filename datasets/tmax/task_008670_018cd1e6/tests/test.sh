@@ -156,7 +156,7 @@ def test_final_output_file():
     assert content == expected_content, f"Expected base32 string '{expected_content}', got '{content}'. Check the math and encoding logic."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

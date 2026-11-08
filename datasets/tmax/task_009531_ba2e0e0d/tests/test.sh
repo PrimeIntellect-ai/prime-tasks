@@ -97,7 +97,7 @@ TEST_EOF
 if timeout 300s python3 /tmp/probe_analyze_signal.py \
     && rm -f /home/user/energy_diff.txt /home/user/dominant_freq.txt \
     && timeout 300s python3 /home/user/analyze_signal.py \
-    && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

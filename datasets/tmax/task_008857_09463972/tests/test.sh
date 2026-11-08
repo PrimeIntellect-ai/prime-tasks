@@ -192,7 +192,7 @@ def test_plot_is_valid_nonempty_png():
     assert float(image.max()) > float(image.min()), "timing_plot.png contains no visible variation"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

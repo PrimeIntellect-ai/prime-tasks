@@ -156,7 +156,7 @@ run_application() {
 }
 
 run_tests() {
-    python3 -m pytest "$BACKUP_DIR/test_final_state.py" -x --tb=short -q
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$BACKUP_DIR/test_final_state.py" -x --tb=short -q
 }
 
 # Execute and validate the application against the original supplied datasets.

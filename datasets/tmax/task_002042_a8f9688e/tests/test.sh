@@ -44,7 +44,7 @@ def test_artifact_payload_extraction_and_compression():
     assert mse <= 0.0, f"MSE is {mse}, but expected 0.0. The extracted payload does not perfectly match the original data chunk."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

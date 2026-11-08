@@ -261,7 +261,7 @@ TEST_EOF
 rc=0
 python3 /tmp/prepare_dynamic_fixture.py || rc=1
 if [ "$rc" -eq 0 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || rc=1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || rc=1
 fi
 
 if [ "$rc" -eq 0 ]; then

@@ -55,7 +55,7 @@ def test_security_tests_implemented():
         "src/security_tests.rs does not seem to contain a proptest block."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 if [ $? -ne 0 ]; then
     FAILED=1
 fi

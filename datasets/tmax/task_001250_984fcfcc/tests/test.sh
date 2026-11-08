@@ -98,7 +98,7 @@ def test_symlink_latest_dataset():
     assert actual_target == expected_target, f"Symlink points to {actual_target}, expected {expected_target}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(10))') || return 1
     ROOT="/home/user/pipeline_test_${TOKEN}"

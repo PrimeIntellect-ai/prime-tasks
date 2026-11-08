@@ -59,7 +59,7 @@ def test_flask_service_predict_endpoint():
     assert 149.0 <= expected_clicks <= 151.0, f"Expected prediction around 150.0, but got {expected_clicks}"
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_original_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short 2>&1; then
     all_ok=0
 fi
 
@@ -240,7 +240,7 @@ def test_submitted_script_on_fresh_redis_data():
         log.close()
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_fresh_execution.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_fresh_execution.py -x --tb=short 2>&1; then
     all_ok=0
 fi
 

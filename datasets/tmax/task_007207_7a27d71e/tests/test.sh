@@ -251,7 +251,7 @@ TEST_EOF
     fi
     timeout 15s /tmp/orchestrator-under-test || return 1
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if verify 2>&1; then

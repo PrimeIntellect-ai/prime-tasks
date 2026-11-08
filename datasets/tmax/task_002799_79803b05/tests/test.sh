@@ -180,7 +180,7 @@ PY
     test -f /home/user/mlops/etl_output.csv || return 1
     test -f /home/user/mlops/report.txt || return 1
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify_submission 2>&1; then

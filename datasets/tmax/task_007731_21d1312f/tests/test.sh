@@ -64,7 +64,7 @@ def test_script_exists_and_executable():
     assert bool(st.st_mode & stat.S_IXUSR), f"Script {script_path} is not executable."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Build a second, independent archive so fixed output and dangling-link
     # implementations cannot pass. The checker derives its expectations by
@@ -174,7 +174,7 @@ def test_processing_of_independent_archive():
     )
 DYNAMIC_EOF
 
-    python3 -m pytest /tmp/test_dynamic_processing.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_processing.py -x --tb=short || return 1
     return 0
 }
 

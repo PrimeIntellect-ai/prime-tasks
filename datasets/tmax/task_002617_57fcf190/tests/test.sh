@@ -58,7 +58,7 @@ def test_output_file_format_and_content():
         assert actual_hum == expected_hum, f"Row {i+1}: Expected avg_humidity {expected_hum}, got {actual_hum}. Did you round to exactly 2 decimal places and forward-fill correctly?"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

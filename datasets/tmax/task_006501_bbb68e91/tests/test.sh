@@ -39,7 +39,7 @@ def test_drift_summary_matches_golden():
     assert agent_data == golden_data, "The contents of drift_summary.json do not match the expected output. Check grouping, chronological sorting, and extraction logic."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

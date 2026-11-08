@@ -44,7 +44,7 @@ def test_nginx_conf_exists():
     assert "9000" in content, "Nginx config does not seem to proxy to port 9000."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Ensure the submitted library is a loadable shared object implementing the
     # expected C interface, rather than an arbitrary file with the right name.

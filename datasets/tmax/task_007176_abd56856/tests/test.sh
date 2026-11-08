@@ -220,7 +220,7 @@ char *decode_message(const uint8_t *data, size_t len) {
     assert _contains_subsequence(calls, expected_decoded), "client.py did not pass all 100 received payloads through decode_message in order."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -67,7 +67,7 @@ def test_output_csv_formatting_and_logic():
             assert False, f"Timestamp {row['timestamp']} does not match ISO8601 UTC format YYYY-MM-DDTHH:MM:SSZ."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 rm -rf /home/user/input_data /home/user/output_data
 mkdir -p /home/user/input_data
@@ -161,7 +161,7 @@ def test_pipeline_on_altered_inputs():
     assert actual == expected
 TEST_EOF
 
-python3 -m pytest /tmp/test_altered_input.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_altered_input.py -x --tb=short 2>&1 || status=1
 
 rm -rf /home/user/input_data /home/user/output_data
 cp -a "$workdir/input_data" /home/user/input_data

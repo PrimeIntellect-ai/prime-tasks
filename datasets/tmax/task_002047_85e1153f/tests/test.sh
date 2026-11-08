@@ -54,7 +54,7 @@ def test_output_iou():
     assert avg_iou >= 0.85, f"Average IoU too low: {avg_iou:.4f} < 0.85. The tracking algorithm is not accurate enough or fails to interpolate corrupted frames properly."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

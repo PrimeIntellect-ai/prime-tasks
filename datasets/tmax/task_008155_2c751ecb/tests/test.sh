@@ -209,7 +209,7 @@ with tempfile.TemporaryDirectory(prefix="organize_verify_") as build_dir:
     run_and_check(rebuilt)
 DYNAMIC_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 && \
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 && \
    python3 /tmp/test_dynamic_behavior.py 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else

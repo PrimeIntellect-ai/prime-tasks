@@ -52,7 +52,7 @@ def test_metrics_endpoint():
     )
 TEST_EOF
 
-python3 -m pytest /tmp/test_original_state.py -x --tb=short 2>&1 || fail
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short 2>&1 || fail
 
 BACKUP=/tmp/legacy_cli.py.verifier_backup
 cp -a /home/user/legacy_cli.py "$BACKUP" || fail
@@ -275,7 +275,7 @@ def test_metrics_dynamically_invokes_expect_and_emits_prometheus_gauge():
     )
 TEST_EOF
 
-if python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

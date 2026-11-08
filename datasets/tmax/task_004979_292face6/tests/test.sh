@@ -85,7 +85,7 @@ if cd /home/user/audio_pipeline \
    && python setup.py build_ext --inplace \
    && rm -f /home/user/output_energies.csv \
    && python process.py /app/audio_data.wav 4096 /home/user/output_energies.csv \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

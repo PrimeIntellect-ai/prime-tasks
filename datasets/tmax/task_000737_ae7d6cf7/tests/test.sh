@@ -182,7 +182,7 @@ def test_phase4_compromised_file():
     assert content == mismatches[0], 'Phase 4 failed: compromised_file.txt does not identify the binary whose current MD5 differs from the known-good hash.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

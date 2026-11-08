@@ -166,7 +166,7 @@ def test_decrypted_log_exists_and_contains_flag():
     assert 'FLAG: 9a8b7c6d5e4f3g2h1i0j' in content, 'The decrypted log does not contain the expected FLAG string.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

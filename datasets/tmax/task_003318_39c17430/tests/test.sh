@@ -55,7 +55,7 @@ def test_corrected_metrics_output():
         assert actual == exp, f"Line {i+1} in {output_file} is incorrect. Expected {exp}, got {actual}."
 TEST_EOF
 
-    python3 -m pytest "$TMPDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TMPDIR/test_final_state.py" -x --tb=short || return 1
     cp "$APP_DIR/corrected_metrics.txt" "$TMPDIR/original_corrected_metrics.txt" || return 1
 
     # Exercise the compiled program on unpredictable inputs. Expected answers are

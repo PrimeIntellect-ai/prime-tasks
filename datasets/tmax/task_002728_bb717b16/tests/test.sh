@@ -231,7 +231,7 @@ def test_service_compiled_linked_and_running_on_8443():
     assert new_owners, "Freshly rebuilt jwt_server did not start a TLS listener on 0.0.0.0:8443"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

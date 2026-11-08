@@ -181,7 +181,7 @@ VARIANT_EOF
     if ! timeout 30s "$binary_path"; then
         echo "Go program failed on verifier-generated metadata"
         status=1
-    elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
         status=1
     fi
 
@@ -190,7 +190,7 @@ VARIANT_EOF
     if ! timeout 30s "$binary_path"; then
         echo "Go program failed on the supplied metadata"
         status=1
-    elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
         status=1
     fi
 fi

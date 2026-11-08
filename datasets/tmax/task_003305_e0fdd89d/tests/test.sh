@@ -116,7 +116,7 @@ def test_output_file_contents():
             "Ensure the script correctly decodes unicode escapes, formats as '<hash>  key=value', and sorts by hash."
         )
 PY
-    python3 -m pytest "$TMPDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TMPDIR/test_final_state.py" -x --tb=short || return 1
 
     # Exercise the artifact again on unpredictable fixtures. This prevents a
     # submission from passing by merely writing the five known output lines.

@@ -45,7 +45,7 @@ def test_audit_report_contents():
     assert actual_ips == expected_ips, f"malicious_ips list is not sorted alphabetically/numerically as strings. Expected {expected_ips}, got {actual_ips}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

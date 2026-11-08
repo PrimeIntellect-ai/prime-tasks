@@ -166,7 +166,7 @@ def test_optimal_params_values():
     assert math.isclose(k2, expected_k2, abs_tol=0.1), f"k2 value {k2} is not close enough to expected {expected_k2}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

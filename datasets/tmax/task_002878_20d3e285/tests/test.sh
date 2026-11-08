@@ -204,7 +204,7 @@ def test_built_binary_serves_websocket_upgrade():
             proc.wait(timeout=5)
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     reward=1
 fi

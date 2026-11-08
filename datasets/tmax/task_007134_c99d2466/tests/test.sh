@@ -84,7 +84,7 @@ def test_exploit_bin():
     assert content == expected_content, f"Content of {path} does not match the expected exploit payload."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Exercise analyzer.c on an unpredictable second capture so fixture bytes
     # cannot simply be hardcoded into the output files or program.

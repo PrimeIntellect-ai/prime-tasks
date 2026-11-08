@@ -82,13 +82,13 @@ run_checks() {
     local binary="/tmp/feature_extractor_verifier_$$"
 
     # Preserve the original assertions against the submitted final state.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # The submitted source must be valid C++17 and must itself generate the output.
     g++ -std=c++17 /home/user/feature_extractor.cpp -o "$binary" || return 1
     rm -f /home/user/features.csv
     timeout 10s "$binary" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Exercise the compiled extractor on verifier-supplied data so fixed output
     # for the four image rows cannot pass.
@@ -100,7 +100,7 @@ CGCG	CGCG	-2.0,-5.0;1.0,1.0;4.0,7.0;8.0,15.0
 DATA_EOF
     rm -f /home/user/features.csv
     timeout 10s "$binary" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     rm -f "$binary"
     return 0

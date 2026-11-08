@@ -169,7 +169,7 @@ def test_monitor_script_behavior_and_configuration_parsing():
         conf.write_bytes(original_conf)
 TEST_EOF
 
-python3 -m pytest /tmp/test_monitor.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_monitor.py -x --tb=short 2>&1
 status=$?
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

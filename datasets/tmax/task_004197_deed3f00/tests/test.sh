@@ -261,7 +261,7 @@ def test_nginx_required_directives_are_active_and_contextual():
     assert valid_http, "No http block has the required active access log, upstream, and SSL proxy server configuration"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -246,7 +246,7 @@ def test_live_metrics_endpoint_uses_post_and_survives_concurrency(server_process
     assert server_process.poll() is None, "Service crashed under concurrent POST requests"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

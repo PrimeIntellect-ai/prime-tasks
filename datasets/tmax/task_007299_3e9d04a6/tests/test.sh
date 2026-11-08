@@ -210,7 +210,7 @@ def test_04_execute_scripts_and_validate_artifacts():
             f"Result at index {i} is incorrect. Expected {expected}, got {actual}"
 TEST_EOF
 
-if python3 -m pytest -c /dev/null /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -p no:cacheprovider -c /dev/null /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

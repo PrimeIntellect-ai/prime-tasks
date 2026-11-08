@@ -56,7 +56,7 @@ def test_results_content():
     assert 38.2 <= lower <= 40.5, f"Bootstrap CI Lower bound {lower} is out of expected range [38.2, 40.5]."
     assert 48.5 <= upper <= 50.5, f"Bootstrap CI Upper bound {upper} is out of expected range [48.5, 50.5]."
 TEST_EOF
-    python3 -m pytest "$WORK/test_original.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORK/test_original.py" -x --tb=short || return 1
 
     python3 - "$WORK" << 'PY'
 import math

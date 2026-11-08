@@ -104,7 +104,7 @@ if (
     # Run and validate against the original supplied input.
     rm -f /home/user/anomalies.json
     (cd /home/user && timeout 10 "$binary_path") || exit 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || exit 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || exit 1
 
     # Replace the input with an unpredictable valid fixture so a hardcoded JSON
     # answer cannot pass. Expected results are derived independently by the tests.
@@ -138,13 +138,13 @@ PY_EOF
 
     rm -f /home/user/anomalies.json
     (cd /home/user && timeout 10 "$binary_path") || exit 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || exit 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || exit 1
 
     # Restore the supplied input and leave output corresponding to that input.
     cp "$backup_csv" "$input_path" || exit 1
     rm -f /home/user/anomalies.json
     (cd /home/user && timeout 10 "$binary_path") || exit 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || exit 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || exit 1
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

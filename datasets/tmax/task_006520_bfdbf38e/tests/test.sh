@@ -178,7 +178,7 @@ run_tests() {
 
     rm -f /home/user/payloads/output/* /home/user/rotation_summary.txt
     (cd /home/user/rotator && "$WORK/rotator_submission") || return 1
-    python3 -m pytest "$WORK/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORK/test_final_state.py" -x --tb=short || return 1
 
     python3 - "$WORK/dynamic.json" "$WORK/dynamic_filename" << 'PY_EOF' || return 1
 import base64

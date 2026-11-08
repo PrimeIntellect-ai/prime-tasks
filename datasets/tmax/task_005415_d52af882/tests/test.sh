@@ -105,7 +105,7 @@ if (
     rm -f /home/user/top_items.csv &&
     cd /home/user &&
     go run /home/user/process.go &&
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

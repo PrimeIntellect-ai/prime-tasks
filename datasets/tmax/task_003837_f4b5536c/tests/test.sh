@@ -48,7 +48,7 @@ def test_no_escaped_files():
 TEST_EOF
 
 verify_all() {
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     project=/home/user/storage_task/restorer
     test -d "$project" || return 1

@@ -132,7 +132,7 @@ def test_fast_log_grep_performance():
 TEST_EOF
 
 if g++ -shared -fPIC -O2 -o /tmp/libqueryengine_audit.so /tmp/queryengine_audit.cpp \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

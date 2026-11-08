@@ -237,7 +237,7 @@ TEST_EOF
 
 if [ "$SCORER_READY" -eq 1 ]; then
     VERIFIER_SCORER_TRACE="$TRACE_FILE" VERIFIER_REAL_SCORER="$REAL_SCORER" \
-        python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+        python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
     TEST_STATUS=$?
 else
     echo "Failed to instrument /app/relevance_scorer"

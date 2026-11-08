@@ -154,7 +154,7 @@ def test_zz_program_really_archives_committed_configuration_data():
     exercise_payload(VERIFIED_BINARY, committed, committed_probe, failed_probe)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

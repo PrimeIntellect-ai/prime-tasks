@@ -231,7 +231,7 @@ def test_complete_submission():
     assert collections.Counter(actual_lines) == collections.Counter(expected_lines), "Linux logger output was missing, duplicated, or not in the exact required format"
 PY
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

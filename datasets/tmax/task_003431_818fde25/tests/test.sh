@@ -81,7 +81,7 @@ def test_lineage_results_exist_and_correct():
         assert actual["depth"] == expected["depth"], f"Item at index {i}: Expected depth {expected['depth']}, got {actual['depth']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -88,7 +88,7 @@ run_checks() (
     set -e
 
     # Preserve all original final-state assertions.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # Require the requested Go source and module, and check implementation evidence
     # for line streaming and transaction-based insertion.

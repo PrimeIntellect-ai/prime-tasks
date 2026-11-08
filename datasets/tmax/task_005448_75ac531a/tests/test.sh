@@ -48,7 +48,7 @@ def test_incremental_archive_contents():
 TEST_EOF
 
     # Preserve all checks against the archive produced by the agent.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # Require a real Rust source file and compile it from a clean target directory.
     test -f /home/user/config_manager/src/main.rs

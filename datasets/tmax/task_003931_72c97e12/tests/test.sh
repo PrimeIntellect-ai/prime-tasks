@@ -135,7 +135,7 @@ def test_aggregator_script_modifications():
     assert "FORCE_SAFE_LOGGING_99" in script_content, "The script does not seem to contain the correct environment variable 'FORCE_SAFE_LOGGING_99'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

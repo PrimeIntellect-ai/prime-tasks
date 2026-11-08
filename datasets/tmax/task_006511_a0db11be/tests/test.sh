@@ -209,7 +209,7 @@ def test_database_records_count(executed_submission):
     assert Counter(actual_records) == Counter(expected_records), 'Database rows do not exactly match the parsed non-deleted log records.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

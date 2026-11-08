@@ -147,7 +147,7 @@ status=0
 # original verifier assertions.
 timeout 20s python3 /home/user/audit_vulnerabilities.py >/tmp/audit_stdout.txt 2>/tmp/audit_stderr.txt || status=1
 if [ "$status" -eq 0 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 fi
 
 # Exercise the script against an unpredictable graph and verify that an actual

@@ -87,7 +87,7 @@ def test_compiled_binary_behavior_matches_log():
     assert result.stdout.strip() == logged_output, "build.log does not match the compiled binary's output."
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     tests_ok=0
 fi
 

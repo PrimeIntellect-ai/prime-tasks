@@ -144,7 +144,7 @@ TEST_EOF
 
 # First verify that the agent actually left a running daemon and that the cron
 # artifact works behaviorally after an unpredictable repository change.
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     ok=0
 fi
 
@@ -257,7 +257,7 @@ if [ "$ok" -eq 1 ]; then
     python3 /tmp/kill_7331.py
     /tmp/dashboard_submission >/tmp/dashboard_submission.log 2>&1 &
     server_pid=$!
-    if ! python3 -m pytest /tmp/test_compiled_submission.py -x --tb=short 2>&1; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_compiled_submission.py -x --tb=short 2>&1; then
         cat /tmp/dashboard_submission.log
         ok=0
     fi

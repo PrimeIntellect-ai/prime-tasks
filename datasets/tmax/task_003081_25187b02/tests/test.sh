@@ -126,7 +126,7 @@ passed=0
 if [[ -f /home/user/pipeline.go ]] \
    && rm -f /home/user/clean_summary.json \
    && timeout 60s go run /home/user/pipeline.go \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     passed=1
 fi
 

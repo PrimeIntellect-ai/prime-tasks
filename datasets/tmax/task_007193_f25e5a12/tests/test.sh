@@ -171,7 +171,7 @@ def test_best_model_output():
     assert best_lines[1] == f"Best Path: {best_path}", f"Expected 'Best Path: {best_path}', got '{best_lines[1]}'"
 TEST_EOF
 
-if VERIFIER_WORK="$WORK" python3 -m pytest "$WORK/test_final_state.py" -x --tb=short 2>&1; then
+if VERIFIER_WORK="$WORK" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORK/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

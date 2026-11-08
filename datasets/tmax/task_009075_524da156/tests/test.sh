@@ -149,7 +149,7 @@ def test_result_file_correct_and_matches_server_reply():
         f"{RESULT} does not contain the exact string currently returned by the WebSocket server"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -232,7 +232,7 @@ def test_100_request_concurrency_10_run_reaches_binary_each_time():
 TEST_EOF
 
 if [ "$status" -eq 0 ]; then
-    if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
         status=1
     fi
 fi

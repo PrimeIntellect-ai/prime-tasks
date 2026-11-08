@@ -145,7 +145,7 @@ PY_EOF
 then
     rm -f /home/user/processed_dataset.jsonl /home/user/metrics.json
     if (cd /home/user && timeout 30s /home/user/run_pipeline.sh); then
-        if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             challenge_status=0
         fi
     fi
@@ -155,7 +155,7 @@ if [ -f "$backup" ]; then
     cp "$backup" /home/user/raw_math.jsonl
     rm -f /home/user/processed_dataset.jsonl /home/user/metrics.json
     if (cd /home/user && timeout 30s /home/user/run_pipeline.sh); then
-        if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             original_status=0
         fi
     fi

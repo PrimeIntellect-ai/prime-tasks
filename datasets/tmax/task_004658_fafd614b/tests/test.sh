@@ -221,7 +221,7 @@ DYNAMIC_EOF
 if [ -f /home/user/pipeline.py ] && [ -s /home/user/pipeline.py ] \
    && rm -f /home/user/processed_logs.csv /home/user/pipeline.log \
    && timeout 30s python3 /home/user/pipeline.py \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short \
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short \
    && python3 /tmp/test_dynamic.py; then
     echo "1" > /logs/verifier/reward.txt
 else

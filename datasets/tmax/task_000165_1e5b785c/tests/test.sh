@@ -228,7 +228,7 @@ def test_fresh_audio_through_cgi(index):
     assert mse <= 1e-8, f'fresh CGI probe {index} has MSE {mse}'
 PYTEST
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

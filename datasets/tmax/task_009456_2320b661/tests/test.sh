@@ -62,7 +62,7 @@ def test_translations_db():
         assert math.isclose(rolling_avg_ratio, expected_ratio, rel_tol=1e-5), f"Expected rolling_avg_ratio ~{expected_ratio} for {key}, got {rolling_avg_ratio}."
     conn.close()
 PY
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Generate a fresh, unpredictable fixture and independently derive its answers.
     python3 - <<'PY' || return 1

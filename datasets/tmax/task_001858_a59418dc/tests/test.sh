@@ -34,7 +34,7 @@ def test_cargo_test_log():
     assert "test_extract_valid_urls" in content, "The log does not show 'test_extract_valid_urls' being run."
     assert "test result: ok" in content or "test test_extract_valid_urls ... ok" in content, "The test suite did not pass successfully according to the log."
 TEST_EOF
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # The files which the instruction explicitly forbids changing must remain intact.
     cat << 'EOF' > /tmp/expected_build.rs

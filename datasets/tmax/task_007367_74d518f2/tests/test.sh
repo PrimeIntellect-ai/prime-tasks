@@ -262,7 +262,7 @@ def test_benchmark_log_generated_by_running_script_and_correct():
     assert faster, "C_IS_FASTER: True missing from benchmark log."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

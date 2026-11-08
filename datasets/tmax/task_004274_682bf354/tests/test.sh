@@ -127,7 +127,7 @@ def test_live_random_audio_through_proxy():
     assert np.max(np.abs(out_float - expected)) <= 2.0
 PYTEST
 
-python3 -m pytest /tmp/test_live_service.py -x --tb=short || RESULT=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_live_service.py -x --tb=short || RESULT=1
 
 # The submitted pytest suite must itself create the required output through the
 # running integration stack. Removing the old file prevents stale output passing.
@@ -226,7 +226,7 @@ def test_processed_audio_is_normalized_supplied_sample():
     assert np.max(np.abs(output_f - expected)) <= 2.0
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short || RESULT=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || RESULT=1
 
 if [ "$RESULT" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

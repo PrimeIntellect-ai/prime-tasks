@@ -251,7 +251,7 @@ def test_required_rust_and_mmap_implementation_present():
     assert os.path.isfile('/home/user/pipeline/start_all.sh')
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 PYTEST_STATUS=$?
 if [ "$STATUS" -eq 0 ] && [ "$PYTEST_STATUS" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

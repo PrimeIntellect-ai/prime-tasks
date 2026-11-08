@@ -155,7 +155,7 @@ def test_ci_tool_end_to_end_and_dynamic_behavior():
     assert_archive_contains_current_source()
 TEST_EOF
 
-if python3 -m pytest /tmp/test_ci_tool.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_ci_tool.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

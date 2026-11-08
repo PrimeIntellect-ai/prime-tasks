@@ -190,7 +190,7 @@ RUN_EOF
     timeout 45 /tmp/run_graph_submission.sh || return 1
 
     # Preserve all assertions from the original verifier on the supplied data.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Re-run the artifact on fresh graphs and independently recompute their answers.
     python3 /tmp/test_dynamic.py || return 1

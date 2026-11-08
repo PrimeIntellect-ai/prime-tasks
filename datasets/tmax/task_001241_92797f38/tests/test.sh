@@ -79,7 +79,7 @@ TEST_EOF
     command -v env-tester >/dev/null
     timeout 15s env-tester
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 )
 status=$?
 

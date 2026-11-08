@@ -212,7 +212,7 @@ def test_many_runtime_generated_cycles():
             f"Case {case}: wrong cycle error: {excinfo.value!r}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 if [ "$?" -ne 0 ]; then
     status=1
 fi

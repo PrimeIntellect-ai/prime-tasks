@@ -281,7 +281,7 @@ def test_report_expected_values():
     assert data["redos_payload"] == expected_payload, f"Incorrect redos_payload. Expected {expected_payload}, got {data['redos_payload']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

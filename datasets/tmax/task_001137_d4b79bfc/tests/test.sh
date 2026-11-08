@@ -167,7 +167,7 @@ if [ "$overall_ok" -eq 1 ] && [ -f "$SCRIPT_PATH" ] && [ -x "$SCRIPT_PATH" ]; th
     if cp -- "$challenge_csv" "$CSV_PATH" && run_clean_deployment; then
         # Restore the trusted challenge input in case the script altered it.
         cp -- "$challenge_csv" "$CSV_PATH"
-        if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             overall_ok=0
         fi
     else
@@ -184,7 +184,7 @@ if [ -s "$original_csv" ]; then
     cp -- "$original_csv" "$CSV_PATH" || overall_ok=0
     if [ -f "$SCRIPT_PATH" ] && [ -x "$SCRIPT_PATH" ] && run_clean_deployment; then
         cp -- "$original_csv" "$CSV_PATH"
-        if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             overall_ok=0
         fi
     else

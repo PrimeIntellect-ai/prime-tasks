@@ -108,7 +108,7 @@ verify() {
     ACTIVE_PID=""
 
     # Retain the original file, executable, and exact-output assertions.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     # Rebuild the submitted source and exercise it with unpredictable IDs,
     # statuses, and a corruption set that is not correlated with JSON values.

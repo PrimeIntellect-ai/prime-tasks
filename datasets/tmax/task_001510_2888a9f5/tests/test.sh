@@ -125,7 +125,7 @@ PY_EOF
         if ! timeout 30s /tmp/process_stream; then
             echo "The compiled Go program failed while processing the stream."
             status=1
-        elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             status=1
         fi
     fi

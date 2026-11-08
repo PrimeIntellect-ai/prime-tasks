@@ -53,7 +53,7 @@ def test_tcp_server_correct_passcode():
     except UnicodeDecodeError:
         pytest.fail("Server response was not valid UTF-8.")
 PY
-python3 -m pytest /tmp/test_original_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short
 
 # The requested artifact must exist and independently compile as C++.
 test -f /home/user/config_svc.cpp

@@ -215,6 +215,6 @@ def test_compute_hash_was_called_for_each_requested_filename():
         f"compute_hash was not invoked through the shared library for: {dict(missing)}"
 PY_EOF
 
-if python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short 2>&1; then
     printf '1\n' > /logs/verifier/reward.txt
 fi

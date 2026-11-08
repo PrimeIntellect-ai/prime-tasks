@@ -42,7 +42,7 @@ def test_audit_report_contents():
     assert data["audit_session_cookie"] == "sec_token_88ab49f2b3", f"Verification failed: Incorrect audit_session_cookie. Expected 'sec_token_88ab49f2b3', got '{data['audit_session_cookie']}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -85,7 +85,7 @@ def test_process_script_exists_and_parallel():
     assert has_parallel, "The script /home/user/process.sh does not appear to use parallel constructs (&, xargs -P, or parallel)."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

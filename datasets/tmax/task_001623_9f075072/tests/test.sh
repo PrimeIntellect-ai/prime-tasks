@@ -180,7 +180,7 @@ def test_jwt_filter_randomized_validation():
         assert run_filter(token) == b"REJECT\n", "A randomized forged, none-algorithm, or malformed token was not rejected exactly"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

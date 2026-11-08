@@ -181,7 +181,7 @@ def test_converged_N_and_confidence_intervals():
         f'ci_upper mismatch. Expected ~{expected_ci_upper:.6f}, got {student_ci_upper}'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

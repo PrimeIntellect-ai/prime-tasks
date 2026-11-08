@@ -204,7 +204,7 @@ def test_accuracy_metric():
     assert accuracy >= 1.0, f"Accuracy metric failed: {accuracy} < 1.0. The script did not correctly process every image and issue the required HTTP requests."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

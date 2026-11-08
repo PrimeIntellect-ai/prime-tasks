@@ -307,5 +307,5 @@ def test_json_content_matches_expected():
         assert actual.get("total_citations") == expected["total_citations"]
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 reward=1

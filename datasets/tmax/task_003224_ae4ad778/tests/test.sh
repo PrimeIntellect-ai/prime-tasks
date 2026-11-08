@@ -126,7 +126,7 @@ DYNAMIC_EOF
 
 rm -rf /home/user/artifacts
 if timeout 180 python3 /home/user/evaluate_model.py \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short \
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short \
    && timeout 60 python3 /tmp/test_dynamic_execution.py; then
     echo "1" > /logs/verifier/reward.txt
 else

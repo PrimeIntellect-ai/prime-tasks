@@ -183,7 +183,7 @@ PY
 
     rm -f /home/user/report.json
     (cd "$PROJECT" && timeout 30s "$EXECUTABLE")
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     python3 <<'PY'
 import base64
@@ -216,7 +216,7 @@ PY
 
     rm -f /home/user/report.json
     (cd "$PROJECT" && timeout 30s "$EXECUTABLE")
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 )
 
 if verify_task 2>&1; then

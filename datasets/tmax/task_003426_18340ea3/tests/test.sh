@@ -303,7 +303,7 @@ def test_mre_starts_server_and_uses_five_concurrent_clients():
     assert all(entry == "DATA:ERROR_TRIGGER" for entry in payload_entries), "mre.py clients did not all send ERROR_TRIGGER"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -83,7 +83,7 @@ def test_sshd_config_snippet():
     assert actual_lines == expected_lines, f"SSH config snippet content does not match exactly. Expected {expected_lines}, got {actual_lines}"
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     status=1
 fi
 

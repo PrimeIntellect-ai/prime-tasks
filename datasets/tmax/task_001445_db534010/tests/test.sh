@@ -53,7 +53,7 @@ def test_anomalies_json_content():
         assert actual["non_ascii_count"] == expected["non_ascii_count"], f"Anomaly {i} non_ascii_count mismatch: expected {expected['non_ascii_count']}, got {actual['non_ascii_count']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

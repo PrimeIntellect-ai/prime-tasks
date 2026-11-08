@@ -172,7 +172,7 @@ assert math.isclose(float(data["correlation"]), correlation, rel_tol=1e-4, abs_t
 DYNAMIC_EOF
 
 run_verification() {
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     test -f /home/user/performance_analysis/Cargo.toml || return 1
     test -s /home/user/performance_analysis/src/main.rs || return 1
@@ -207,7 +207,7 @@ CSV_EOF
     cp /tmp/system_metrics.original.csv /home/user/system_metrics.csv || return 1
     rm -f /home/user/analysis_results.json
     (cd /home/user/performance_analysis && timeout 180 cargo run --release --quiet) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_verification 2>&1; then

@@ -133,7 +133,7 @@ def test_pca_result_values():
         assert math.isclose(usr_pc2, exp_pc2, abs_tol=1e-4), f'Row {i+1} (id={usr_row[0]}): pc2 value mismatch. Expected {exp_pc2}, got {usr_pc2}'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

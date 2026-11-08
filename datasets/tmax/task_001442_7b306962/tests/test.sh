@@ -61,7 +61,7 @@ def test_compliance_report_exists_and_correct():
     expected_users_sorted = sorted(expected_users, key=lambda x: x.get("name", ""))
     assert redacted_users_sorted == expected_users_sorted, f"Redacted users do not match expected output. Got {redacted_users}."
 TEST_EOF
-    python3 -m pytest /tmp/test_original_report.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_report.py -x --tb=short || return 1
 
     test -f /home/user/policy_tester.py || return 1
 
@@ -200,7 +200,7 @@ def test_tester_exercised_api_and_generated_dynamic_report():
     assert "valid_login" in events, "Tester did not perform the required login request"
     assert "authorized_users" in events, "Tester did not query /api/users with the issued session cookie"
 TEST_EOF
-    python3 -m pytest /tmp/test_dynamic_report.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_report.py -x --tb=short || return 1
     return 0
 }
 

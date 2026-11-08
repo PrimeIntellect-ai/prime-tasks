@@ -135,7 +135,7 @@ def test_script_processes_unseen_large_node_values_with_bc_or_awk():
         assert invoked.strip() or traced_tool, "The working arithmetic path did not execute bc or awk"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

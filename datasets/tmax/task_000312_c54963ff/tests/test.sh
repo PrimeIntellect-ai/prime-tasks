@@ -137,7 +137,7 @@ def test_memory_leak_fixed():
     assert "definitely lost: 0 bytes in 0 blocks" in valgrind_output, f"Valgrind did not report zero definitely-lost memory:\n{valgrind_output}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

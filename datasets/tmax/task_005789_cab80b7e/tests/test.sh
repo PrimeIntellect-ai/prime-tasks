@@ -80,7 +80,7 @@ def test_bootstrap_means_json():
 PY_EOF
 
 # Preserve all original output assertions before rerunning the submitted program.
-python3 -m pytest "$workdir/test_original.py" -x --tb=short >/dev/null 2>&1 || ok=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$workdir/test_original.py" -x --tb=short >/dev/null 2>&1 || ok=0
 
 # The requested artifact must be a real Go source file and must compile.
 if [ ! -f /home/user/pipeline.go ] || [ -L /home/user/pipeline.go ] || [ ! -s /home/user/pipeline.go ]; then
@@ -199,7 +199,7 @@ PY_EOF
 
     if [ "$ok" -eq 1 ]; then
         DYNAMIC_RAW="$workdir/dynamic_raw.csv" EXPECTED_MEANS="$workdir/expected_means.json" \
-            python3 -m pytest "$workdir/test_dynamic.py" -x --tb=short >/dev/null 2>&1 || ok=0
+            python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$workdir/test_dynamic.py" -x --tb=short >/dev/null 2>&1 || ok=0
     fi
 
     cp "$workdir/original_raw.csv" /home/user/raw_metrics.csv

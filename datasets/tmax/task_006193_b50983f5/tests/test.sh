@@ -44,7 +44,7 @@ def test_test_results_log_exists_and_passed():
     assert "TestRolloutService" in content, "The test results log does not appear to contain the output of the TestRolloutService."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     rm -f "$HIDDEN_TEST"
     cat << 'GO_EOF' > "$HIDDEN_TEST"

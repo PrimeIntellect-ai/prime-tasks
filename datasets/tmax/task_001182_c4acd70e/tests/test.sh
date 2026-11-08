@@ -221,7 +221,7 @@ if [ -z "$SELECTED_SERVER" ]; then
     all_ok=0
 fi
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     all_ok=0
 fi
 

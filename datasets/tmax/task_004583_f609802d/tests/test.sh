@@ -81,7 +81,7 @@ def test_script_uses_flock():
         "The script must process work concurrently and wait for background jobs."
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_original_state.py -x --tb=short; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short; then
     exit 0
 fi
 
@@ -199,7 +199,7 @@ def test_dynamic_registry():
     assert len(lines) == len(expected), "registry.csv contains duplicate or extra lines"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short; then
     reward=1
 fi
 exit 0

@@ -242,7 +242,7 @@ def test_saved_results_are_exact_script_output():
     assert saved == run.stdout, "results.json is not the exact output of optimized_query.sh for CVE-2023-1234."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

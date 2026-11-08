@@ -240,11 +240,11 @@ def test_rust_program_recomputes_report_for_new_inputs():
 DYNAMIC_EOF
 
 ok=1
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     ok=0
 fi
 if [ "$ok" -eq 1 ]; then
-    if ! python3 -m pytest /tmp/test_rust_etl.py -x --tb=short 2>&1; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_rust_etl.py -x --tb=short 2>&1; then
         ok=0
     fi
 fi

@@ -217,7 +217,7 @@ def test_query_generalizes_to_changed_graphs():
         assert actual_csv == expected_for(rows), "CSV is incorrect for a changed task graph"
 TEST_EOF
 
-if TRACE_DIR="$TRACE_DIR" python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if TRACE_DIR="$TRACE_DIR" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

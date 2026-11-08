@@ -67,7 +67,7 @@ def test_fuzz_equivalence():
         assert agent_res_cached.stdout.strip() == dummy_cache_val, f"Agent did not read from Redis cache for key {key}. Expected: {dummy_cache_val}, Got: {agent_res_cached.stdout.strip()}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

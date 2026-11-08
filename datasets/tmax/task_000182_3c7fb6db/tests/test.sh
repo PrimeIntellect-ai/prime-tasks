@@ -189,7 +189,7 @@ def test_full_pipeline():
         f"Query execution time was {duration:.4f}s per run, which exceeds the 0.015s threshold. Indexes might be missing or the query is not optimized."
 PY
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

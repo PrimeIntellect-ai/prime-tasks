@@ -143,7 +143,7 @@ def test_cron_job_scheduled():
     assert found, "Cron job '0 2 * * * /home/user/process_drift.sh' not found for user 'user'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

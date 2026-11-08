@@ -272,7 +272,7 @@ def test_05_import_users_performance_and_database_contents():
     assert duration <= 12.0, f"Execution too slow: {duration:.2f} seconds (Threshold: <= 12.0s). Ensure you are using asynchronous I/O or a thread pool."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

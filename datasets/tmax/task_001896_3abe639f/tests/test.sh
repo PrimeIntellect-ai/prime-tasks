@@ -186,7 +186,7 @@ run_and_check() {
         echo "Submitted pipeline failed or timed out"
         return 1
     fi
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 # Run the submitted C++ pipeline on the provided dataset. Removing results first

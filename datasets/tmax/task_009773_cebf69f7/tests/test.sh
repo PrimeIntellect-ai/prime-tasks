@@ -192,7 +192,7 @@ def test_compiled_program_on_generated_inputs():
         assert_generated_csv(TEST_OUT, expected_test)
 TEST_EOF
 
-    if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         status=1
     fi
 fi

@@ -129,7 +129,7 @@ def test_bootstrap_ci(student_data, expected_data):
     assert math.isclose(actual_upper, expected_upper, abs_tol=1e-4), f"Expected upper CI ~ {expected_upper:.4f}, but got {actual_upper}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

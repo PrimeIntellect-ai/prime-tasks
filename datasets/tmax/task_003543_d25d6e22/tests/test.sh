@@ -295,7 +295,7 @@ else:
     raise AssertionError("Compiled backup_server did not remain running and own port 8080")
 PY
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if verify 2>&1; then

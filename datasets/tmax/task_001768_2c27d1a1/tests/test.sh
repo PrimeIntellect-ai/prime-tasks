@@ -344,7 +344,7 @@ def test_randomized_invalid_auth_is_dropped_without_backend_contact():
     assert response == b'', f'Invalid randomized authentication produced data: {response!r}'
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_verification; then

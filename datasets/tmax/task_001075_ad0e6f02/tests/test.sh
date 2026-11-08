@@ -164,6 +164,6 @@ def test_fuzz_equivalence():
         check_case(args, f"runtime fuzz test {i + 1}/20")
 PYEOF
 
-if INTEGRATOR_SANDBOX="$SANDBOX" python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if INTEGRATOR_SANDBOX="$SANDBOX" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     reward=1
 fi

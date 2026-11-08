@@ -53,7 +53,7 @@ def test_server_functionality():
         pytest.fail(f"Unexpected error on 4th request: {e}")
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_original_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short 2>&1; then
     RESULT=0
 fi
 
@@ -204,7 +204,7 @@ def test_random_utf16_payloads_per_ip_and_window():
     assert config_contents() == f"TARGET := {after_window}"
 TEST_EOF
 
-    if ! python3 -m pytest /tmp/test_extended.py -x --tb=short 2>&1; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_extended.py -x --tb=short 2>&1; then
         RESULT=0
     fi
 fi

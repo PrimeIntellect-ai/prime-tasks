@@ -85,7 +85,7 @@ def test_proxy_functionality():
     assert expected_log_entry in log_content, f"The expected log entry '{expected_log_entry}' was not found in {log_file}. The proxy might not be running, listening on the correct port, or logging correctly."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

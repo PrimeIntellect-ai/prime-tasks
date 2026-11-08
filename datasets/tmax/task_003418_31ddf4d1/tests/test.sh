@@ -95,7 +95,7 @@ def test_pipeline_fuzz_equivalence():
                         assert o_row[k] == a_row[k], f"Value mismatch for key '{k}' in row {j} on iteration {i}: Expected {o_row[k]}, got {a_row[k]}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

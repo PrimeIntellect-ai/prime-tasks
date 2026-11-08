@@ -129,7 +129,7 @@ def test_output_json_batch_data():
     assert actual_batch == actual_batch_sorted, "The batch array in the JSON is not sorted by author_id ascending, then paper_id ascending."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     REWARD=1
 else
     REWARD=0

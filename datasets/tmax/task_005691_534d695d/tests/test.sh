@@ -167,7 +167,7 @@ def test_wrapper_executes_failure_path_too():
 TEST_EOF
 
 # Use the installed pytest launcher so its intended SMTP test service is active.
-if /usr/local/bin/pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if /usr/local/bin/pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

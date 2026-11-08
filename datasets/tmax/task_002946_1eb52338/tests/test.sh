@@ -165,7 +165,7 @@ PY
     pid=$!
     wait_for_server "$pid" 100
     check_process_and_bind "$pid"
-    python3 -m pytest /tmp/test_original_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     kill_port_8080
@@ -286,7 +286,7 @@ if [ -x "$BIN" ]; then
     final_pid=$!
     if ! wait_for_server "$final_pid" 100 || ! check_process_and_bind "$final_pid"; then
         result=0
-    elif ! python3 -m pytest /tmp/test_original_state.py -x --tb=short >/tmp/final_pytest.log 2>&1; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short >/tmp/final_pytest.log 2>&1; then
         result=0
     fi
 else

@@ -103,7 +103,7 @@ def test_mailing_lists():
             assert actual_emails == expected_emails, f"Mailing list {dept} mismatch. Expected {expected_emails}, got {actual_emails}."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || ok=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || ok=0
 
 cat << 'BEHAVIOR_EOF' > /tmp/test_onboard_behavior.py
 import csv

@@ -191,7 +191,7 @@ for index, (actual, wanted) in enumerate(zip(rows, expected), 1):
 DYNAMIC_EOF
 
 passed=1
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || passed=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || passed=0
 if [ "$passed" -eq 1 ]; then
     python3 /tmp/test_dynamic_etl.py 2>&1 || passed=0
 fi

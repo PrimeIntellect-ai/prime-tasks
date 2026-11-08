@@ -201,7 +201,7 @@ def test_most_similar_exp_output():
     assert actual_output == closest_id, f"Expected '{closest_id}', but got '{actual_output}' in {output_path}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 }
 
 if main; then

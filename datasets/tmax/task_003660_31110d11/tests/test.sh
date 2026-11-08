@@ -245,7 +245,7 @@ uint64_t sum_of_divisors(uint64_t n) {
         shutil.rmtree(tempdir, ignore_errors=True)
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 status=$?
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

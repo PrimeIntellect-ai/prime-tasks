@@ -129,7 +129,7 @@ def test_export_safe_file():
     assert content == "test_safe_export_data"
 TEST_EOF
 
-python3 -m pytest /tmp/test_initial_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_initial_state.py -x --tb=short
 if [ $? -ne 0 ]; then status=1; fi
 
 # Replace the known backend with a verifier-controlled backend. Its evidence IDs,
@@ -271,7 +271,7 @@ def test_random_safe_export_stays_in_export_directory():
         assert f.read() == data
 TEST_EOF
 
-python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short
 if [ $? -ne 0 ]; then status=1; fi
 
 kill "$backend_pid" >/dev/null 2>&1 || true

@@ -226,7 +226,7 @@ def test_02_randomized_bucketing_deduplication_and_redis_storage():
         assert actual[index].get("rolling_5m_count") == expected_item["rolling_5m_count"], f"Wrong rolling count at {expected_item['minute']}: {actual[index]}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

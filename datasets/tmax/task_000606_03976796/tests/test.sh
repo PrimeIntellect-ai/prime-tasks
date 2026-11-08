@@ -231,7 +231,7 @@ def test_05_alert_appends_arbitrary_raw_bodies_as_lines():
 TEST_EOF
 
 passed=0
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     passed=1
 fi
 

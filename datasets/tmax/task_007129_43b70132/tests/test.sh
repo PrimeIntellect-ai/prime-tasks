@@ -80,7 +80,7 @@ def test_results_csv_exists_and_correct():
         assert row_cls == exp_cls, f"For id {row_id}, expected class {exp_cls}, but got {row_cls}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

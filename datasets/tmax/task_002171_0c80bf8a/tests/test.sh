@@ -209,7 +209,7 @@ run_and_check() {
     after_test=$(sha256sum /home/user/test.csv | awk '{print $1}') || return 1
     [ "$before_train" = "$after_train" ] || return 1
     [ "$before_test" = "$after_test" ] || return 1
-    python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short || return 1
 }
 
 make_alternate_inputs() {

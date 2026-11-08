@@ -41,7 +41,7 @@ def test_f1_score_threshold():
     assert score >= 0.85, f"Macro F1 Score is {score:.4f}, which is below the required threshold of 0.85. The ETL bug might not be fully fixed or hyperparameter tuning was insufficient."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

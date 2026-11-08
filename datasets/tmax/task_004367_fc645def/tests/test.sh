@@ -149,7 +149,7 @@ if cp "$APP_DIR/data.db" "$BACKUP_DB" \
    && cd "$APP_DIR" \
    && go build -o recon-service . \
    && timeout 5 ./recon-service > "$APP_DIR/result.txt" \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     passed=1
 fi
 

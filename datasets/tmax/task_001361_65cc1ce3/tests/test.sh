@@ -261,7 +261,7 @@ def test_proxy_forwards_dynamic_paths_bodies_headers_status_and_exact_response()
         )
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 RESULT=$?
 if [ "$RESULT" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

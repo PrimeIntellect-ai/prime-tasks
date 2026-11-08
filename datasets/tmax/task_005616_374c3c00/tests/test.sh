@@ -54,7 +54,7 @@ unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 
-if (cd / && python3 -m pytest "$TEST_DIR/test_final_state.py" -x --tb=short) 2>&1; then
+if (cd / && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_DIR/test_final_state.py" -x --tb=short) 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

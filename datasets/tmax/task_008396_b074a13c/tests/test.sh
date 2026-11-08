@@ -231,7 +231,7 @@ def test_service_behavior_randomness_safe_parsing_and_seccomp():
         assert f'Validating token: {token}' in result.stdout, 'Validation did not safely preserve the supplied token.'
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 if [ $? -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt
 else

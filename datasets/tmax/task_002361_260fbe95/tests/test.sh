@@ -196,7 +196,7 @@ def test_bom_summary_json_contents_and_script_behavior():
     assert actual_depth == expected_depth, f"Expected max_depth to be {expected_depth}, but got {actual_depth}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

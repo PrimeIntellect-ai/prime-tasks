@@ -67,7 +67,7 @@ def test_test_results_log():
 TEST_EOF
 
 run_checks() {
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     cd /home/user/app || return 1
     go build -o server_bin main.go || return 1

@@ -272,7 +272,7 @@ def test_query_endpoint(graph_data):
             assert data["results"] == expected_results, f"Expected results {expected_results} for query '{query_str}', got {data['results']}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

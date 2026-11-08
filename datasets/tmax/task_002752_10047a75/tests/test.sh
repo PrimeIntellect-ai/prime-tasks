@@ -88,7 +88,7 @@ def test_decoded_payload_exists_and_correct():
     assert content == expected_payload, f"The decoded payload is incorrect. Expected '{expected_payload}', got '{content}'."
 TEST_EOF
 
-    python3 -m pytest "$WORK_DIR/test_final_state.py" -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORK_DIR/test_final_state.py" -x --tb=short 2>&1 || return 1
 }
 
 if verify_all; then

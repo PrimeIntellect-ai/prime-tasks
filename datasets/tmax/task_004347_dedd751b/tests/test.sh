@@ -100,7 +100,7 @@ run_verification() {
     rm -f /home/user/report.csv
     (cd /home/user && timeout 15s "$BIN_PATH") || return 1
     sha256sum /home/user/configs.csv /home/user/metrics.csv /home/user/weights.txt | cmp -s - "$BACKUP_DIR/original.hash" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
     cp /home/user/report.csv "$VALID_REPORT" || return 1
 
     python3 - << 'PY_EOF' || return 1
@@ -144,7 +144,7 @@ PY_EOF
     rm -f /home/user/report.csv
     (cd /home/user && timeout 15s "$BIN_PATH") || return 1
     sha256sum /home/user/configs.csv /home/user/metrics.csv /home/user/weights.txt | cmp -s - "$BACKUP_DIR/dynamic.hash" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_verification; then

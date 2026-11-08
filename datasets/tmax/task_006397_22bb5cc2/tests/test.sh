@@ -309,7 +309,7 @@ def test_blocked_ip_parser_script_on_unseen_log_and_original_log():
         f"Contents of {BLOCKED_PATH} are incorrect. Expected: {expected_sorted}; got: {actual_ips}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

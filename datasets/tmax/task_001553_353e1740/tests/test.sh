@@ -130,7 +130,7 @@ def test_nginx_proxy_and_inference_math():
     assert math.isclose(actual_var, expected_var, rel_tol=1e-4), \
         f"Predictive variance is incorrect. Expected ~{expected_var:.5f}, got {actual_var}"
 TEST_EOF
-    python3 -m pytest /tmp/test_fixed_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_fixed_state.py -x --tb=short || return 1
 
     kill "$INFER_PID" >/dev/null 2>&1
     kill "$DATA_PID" >/dev/null 2>&1
@@ -244,7 +244,7 @@ def test_runtime_dataset_and_unpredictable_inputs():
         assert math.isclose(data['variance'], expected_var, rel_tol=1e-5, abs_tol=1e-7), \
             f"Incorrect variance for x={x_star}: expected {expected_var}, got {data['variance']}"
 TEST_EOF
-    python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short || return 1
     return 0
 }
 

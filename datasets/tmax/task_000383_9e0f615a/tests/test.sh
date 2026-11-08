@@ -40,7 +40,7 @@ run_checks() {
     rm -f /home/user/audit/compromised_actions.txt
     cargo run --manifest-path /home/user/audit_tool/Cargo.toml
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_checks 2>&1; then

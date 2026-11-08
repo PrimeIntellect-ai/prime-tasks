@@ -168,7 +168,7 @@ TEST_EOF
 
 if gcc /home/user/tracker.c -o /tmp/tracker_verify -lcrypto \
    && timeout 15s bash -c 'cd /home/user && /tmp/tracker_verify' \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

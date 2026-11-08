@@ -172,7 +172,7 @@ def test_incident_report_values():
     assert report.get("privesc_binary") == "/usr/bin/tar", f"Incorrect privesc_binary. Expected '/usr/bin/tar', got '{report.get('privesc_binary')}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

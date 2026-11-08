@@ -99,7 +99,7 @@ def test_top3_similar_correctness():
     assert student_top3 == expected_top3, f"Expected top 3 neighbors {expected_top3}, but got {student_top3}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

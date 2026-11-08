@@ -43,7 +43,7 @@ def test_csv_contents():
         assert actual_rows[i] == expected_rows[i], f"Row {i} is incorrect or not properly sorted. Expected {expected_rows[i]}, but got {actual_rows[i]}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

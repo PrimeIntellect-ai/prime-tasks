@@ -40,7 +40,7 @@ def test_main_go_exists():
     assert os.path.isfile(path), f"{path} is missing. You need to write the main application logic here."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     app=/home/user/uptime-app
     pkg=$(sed -nE 's/^[[:space:]]*package[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/p' "$app/calc.go" | head -n1)

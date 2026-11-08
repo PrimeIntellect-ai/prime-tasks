@@ -52,7 +52,7 @@ def test_analysis_results_values():
     assert math.isclose(best_cv_score, 0.9984, abs_tol=1e-3), f"Expected 'best_cv_score_r2' to be approximately 0.9984, got {best_cv_score}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

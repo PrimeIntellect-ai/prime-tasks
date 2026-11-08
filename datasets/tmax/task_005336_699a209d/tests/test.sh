@@ -376,7 +376,7 @@ def test_gateway_authorizes_random_admin_from_roles_file(running_gateway):
     assert probe_count(running_gateway) == before + 1, "Gateway did not invoke deploy.exp for the randomized admin"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

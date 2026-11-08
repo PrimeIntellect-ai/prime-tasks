@@ -162,7 +162,7 @@ def test_binary_rejects_invalid_startup_environments_and_simulator_runs_it():
     assert log.read_text().strip() == EXPECTED_CONTENT
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

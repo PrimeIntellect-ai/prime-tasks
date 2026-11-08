@@ -262,7 +262,7 @@ def test_restore_required_final_state():
     assert_success(BIN_ROTATE_PATH, require_trace=False)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     chmod 0600 /home/user/secret.key 2>/dev/null || true

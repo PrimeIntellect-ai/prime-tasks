@@ -134,7 +134,7 @@ def test_cron_job_setup():
     assert expected_cron in loaded_lines, "The required cron entry is not loaded as a complete, valid crontab line."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -214,7 +214,7 @@ def test_end_to_end_api_redis_deletion_and_invocation():
         assert set(client.keys("*")) == {clean_name.encode()}, "Redis contains artifacts other than the accepted clean upload"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -91,7 +91,7 @@ def test_experiment_metrics_json():
     assert math.isclose(metrics["final_mean_temperature"], expected_mean, rel_tol=1e-5), f"Expected final_mean_temperature to be approx {expected_mean}, got {metrics['final_mean_temperature']}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Exercise the compiled artifact on a fresh, unpredictable dataset. Expected
     # outputs are derived here rather than trusted from pre-existing files.

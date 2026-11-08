@@ -93,7 +93,7 @@ def test_archive_contents_log(expected_files):
     assert content == expected_files, f"Contents of {log_path} do not match expected sorted filenames. Actual: {content}, Expected: {expected_files}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

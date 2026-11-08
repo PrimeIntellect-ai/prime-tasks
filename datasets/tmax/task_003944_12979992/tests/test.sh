@@ -217,7 +217,7 @@ def test_performance_and_correctness():
         f"Speedup is {speedup:.2f}x (Baseline: {base_time:.3f}s, C++: {cpp_time:.3f}s), threshold is 5.0x"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

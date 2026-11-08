@@ -66,7 +66,7 @@ def test_test_app_cpp_modified():
     assert "test_result.log" in content, "test_app.cpp does not contain the filename 'test_result.log' to write to."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Independently exercise solve_constraint on derived inputs under memory and
     # undefined-behavior sanitizers instead of trusting the submitted log.

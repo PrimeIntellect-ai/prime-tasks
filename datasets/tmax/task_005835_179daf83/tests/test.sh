@@ -136,7 +136,7 @@ def test_real_authentication_flow_matches_success_file():
     assert saved == auth.stdout, "success.txt is not the exact stdout of the successful authentication run."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -172,6 +172,6 @@ def test_clean_config_content():
     assert actual_lines == expected_lines_clean, f"Content of {CLEAN_DATA_PATH} does not match expected output.\nExpected:\n{expected_content}\nActual:\n{actual_content}"
 TEST_EOF
 
-if python3 -m pytest "$WORK/test_final_state.py" -x --tb=short >/dev/null 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORK/test_final_state.py" -x --tb=short >/dev/null 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 fi

@@ -273,7 +273,7 @@ def test_prediction_metric():
     assert mse <= 1.0, f"Predicted value {pred} is too far from reference {ref:.2f}. MSE={mse:.4f} (Threshold <= 1.0)"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

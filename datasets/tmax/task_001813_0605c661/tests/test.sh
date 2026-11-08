@@ -105,6 +105,6 @@ INDEX_FILE=/home/user/curated_index.txt
 if [[ -f "$SCRIPT_FILE" && ! -L "$SCRIPT_FILE" ]] \
     && rm -f "$INDEX_FILE" \
     && timeout 10s runuser -u user -- bash -c 'cd /home/user && exec python3 /home/user/curate.py' \
-    && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 fi

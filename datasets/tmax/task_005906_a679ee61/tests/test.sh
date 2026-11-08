@@ -192,7 +192,7 @@ TEST_EOF
 if [ -f /home/user/query_pipeline.py ] \
    && rm -f /home/user/optimized_reports.json \
    && timeout 20s python3 /home/user/query_pipeline.py \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

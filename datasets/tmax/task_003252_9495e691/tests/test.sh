@@ -91,7 +91,7 @@ TEST_EOF
 run_verification() {
     rm -rf /home/user/clean_data /home/user/results || return 1
     timeout 60 /home/user/pipeline.sh || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 - <<'PY' || return 1
 import json
@@ -132,7 +132,7 @@ PY
 
     rm -rf /home/user/clean_data /home/user/results || return 1
     timeout 60 /home/user/pipeline.sh || return 1
-    python3 -m pytest /tmp/test_challenge_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_challenge_state.py -x --tb=short || return 1
 }
 
 if run_verification 2>&1; then

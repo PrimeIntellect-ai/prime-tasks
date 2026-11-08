@@ -198,7 +198,7 @@ def test_results_log_content():
     assert 3.2 < z2 < 3.4, f"Z-score for seq2.txt is out of expected range (expected ~3.33). Got: {z2}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

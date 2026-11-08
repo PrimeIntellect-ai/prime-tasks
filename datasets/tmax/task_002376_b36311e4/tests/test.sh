@@ -175,7 +175,7 @@ def test_stability_report_content():
     assert content == expected_content, f"Content of {file_path} is incorrect. Expected '{expected_content}', got '{content}'."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if main; then

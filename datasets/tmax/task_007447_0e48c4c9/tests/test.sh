@@ -40,7 +40,7 @@ def test_bug_report_format_and_content():
     assert actual_var == EXPECTED_VAR, f"Expected LEAKING_VAR to be '{EXPECTED_VAR}', but got '{actual_var}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

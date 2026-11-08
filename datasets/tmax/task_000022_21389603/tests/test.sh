@@ -123,7 +123,7 @@ def test_payload_works():
 TEST_EOF
 
 export TRUSTED_VALIDATOR_PATH="$TEST_DIR/validator.go"
-if python3 -m pytest "$TEST_DIR/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_DIR/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

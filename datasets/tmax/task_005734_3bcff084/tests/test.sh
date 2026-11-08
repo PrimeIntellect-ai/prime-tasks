@@ -214,7 +214,7 @@ def test_general_behavior_on_derived_inputs(tmp_path, rebuilt_binary):
         assert os.stat(dest / rel).st_nlink == 1, f"Unique file {rel} was incorrectly linked"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_dedup_archive.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dedup_archive.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

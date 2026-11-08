@@ -155,7 +155,7 @@ def test_api_response_and_parameters():
     assert abs(float(r) - expected_r) <= 0.005, f'r={r} disagrees with video-derived fit {expected_r}'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

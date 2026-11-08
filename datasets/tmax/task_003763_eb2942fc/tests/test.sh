@@ -73,7 +73,7 @@ if (
     test -x /tmp/math_project_app
     rm -f /home/user/result.txt
     LD_LIBRARY_PATH=/home/user/math_project/lib timeout 60 /tmp/math_project_app
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ) 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else

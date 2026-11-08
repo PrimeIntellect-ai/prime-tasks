@@ -273,7 +273,7 @@ def test_post_receive_hook_performs_real_deployment_pipeline():
     assert "[edge-node-42] DEPLOYMENT_SUCCESS" in appended, "Hook did not run health_monitor.py successfully"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

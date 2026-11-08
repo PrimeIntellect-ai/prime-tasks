@@ -148,7 +148,7 @@ def test_tcp_rejects_invalid_locales():
 TEST_EOF
 
 ok=1
-PHASE=initial python3 -m pytest /tmp/test_localeserver.py -x --tb=short 2>&1 || ok=0
+PHASE=initial python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_localeserver.py -x --tb=short 2>&1 || ok=0
 
 if [ "$ok" -eq 1 ]; then
     if [ ! -f /home/user/localeserver/main.go ]; then
@@ -215,7 +215,7 @@ KILL_EOF
 
     (cd /home/user/localeserver && exec /tmp/localeserver-submission >/tmp/localeserver-verifier.log 2>&1) &
     server_pid=$!
-    PHASE=restarted python3 -m pytest /tmp/test_localeserver.py -x --tb=short 2>&1 || ok=0
+    PHASE=restarted python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_localeserver.py -x --tb=short 2>&1 || ok=0
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
 fi

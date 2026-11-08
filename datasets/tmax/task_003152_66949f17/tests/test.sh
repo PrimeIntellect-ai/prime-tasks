@@ -315,7 +315,7 @@ def test_single_walks_are_random_uniform_3d_directions(tmp_path):
     assert min(cosines) < -0.45 and max(cosines) > 0.45, "Random directions do not cover the sphere"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

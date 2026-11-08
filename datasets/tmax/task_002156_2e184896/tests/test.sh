@@ -97,7 +97,7 @@ def test_unsafe_symlinks_not_copied():
         assert not os.path.exists(prep_path) and not os.path.islink(prep_path), f"Unsafe link should not exist in archive_prep: {prep_path}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

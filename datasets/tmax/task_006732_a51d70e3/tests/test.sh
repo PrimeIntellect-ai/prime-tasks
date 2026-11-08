@@ -208,7 +208,7 @@ verify_task() {
     timeout 60s runuser -u user -- python3 /home/user/analyze.py || return 1
     test -f /home/user/regression_results.txt || return 1
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 }
 
 if verify_task; then

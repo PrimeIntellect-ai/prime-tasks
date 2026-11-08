@@ -85,7 +85,7 @@ def test_monitor_binary_and_mock_script_exist():
     assert os.path.isfile(script), f"File {script} does not exist."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
     bash -n /home/user/start_mocks.sh || status=1

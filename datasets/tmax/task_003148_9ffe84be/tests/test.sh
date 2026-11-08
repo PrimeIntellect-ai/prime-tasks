@@ -192,7 +192,7 @@ print(json.dumps(np.argsort(-sim, axis=1)[:, :5].tolist()))
     assert metrics["top_5_indices"] == expected_top_5, "top_5_indices do not match the expected canonical values."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -164,7 +164,7 @@ def test_metrics_log_exists_and_format(run_result):
     assert after_bytes == run_result["after"], f"Logged After value {after_bytes} does not match du measurement {run_result['after']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

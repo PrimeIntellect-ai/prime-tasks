@@ -63,7 +63,7 @@ def test_output_file_content_and_format():
         assert record['log_message'] == expected['log_message'], f"Log message mismatch for ID {rec_id}. Expected '{expected['log_message']}', got '{record['log_message']}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

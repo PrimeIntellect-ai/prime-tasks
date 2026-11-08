@@ -271,7 +271,7 @@ def test_fresh_compiled_backend_is_reached_through_fresh_nginx():
     assert "WEBHOOK_RECEIVED" in appended, "The fresh proxied request did not write WEBHOOK_RECEIVED."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

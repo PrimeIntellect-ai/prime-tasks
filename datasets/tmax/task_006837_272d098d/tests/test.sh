@@ -206,7 +206,7 @@ def test_bash_remediation_script_executes_and_handles_derived_inputs():
     pytest.fail("No Bash remediation script passed dynamic execution:\n" + "\n".join(failures))
 TEST_EOF
 
-if LC_ALL=C python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if LC_ALL=C python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

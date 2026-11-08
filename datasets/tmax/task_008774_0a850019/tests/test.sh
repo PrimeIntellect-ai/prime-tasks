@@ -126,7 +126,7 @@ def test_correctness_of_values():
         f"Expected rank-2 Frobenius norm {expected_rank2_from_svd:.4f}, but got {student_rank2_norm}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

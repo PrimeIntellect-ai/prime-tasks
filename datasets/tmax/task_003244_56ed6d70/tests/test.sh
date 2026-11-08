@@ -93,7 +93,7 @@ def test_audit_report_content():
         "/home/user/audit_report.txt must contain exactly the three required lines in order."
 TEST_EOF
 
-if python3 -I -m pytest "$TEST_FILE" -x --tb=short 2>&1; then
+if python3 -I -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_FILE" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

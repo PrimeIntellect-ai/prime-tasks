@@ -167,7 +167,7 @@ def test_06_pipeline_and_artifacts_work():
         assert app_bytes in archived_apps, "The archive does not contain the compiled project binary."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

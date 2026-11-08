@@ -182,7 +182,7 @@ def test_port_forward_sh():
     assert re.search(r'iptables\s+-t\s+nat\s+-[AI]\s+PREROUTING\s+-i\s+eth1\s+-p\s+tcp\s+--dport\s+80\s+-j\s+DNAT\s+--to-destination\s+192\.168\.1\.100:8080', content), "port_forward.sh does not contain the exact required iptables command"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

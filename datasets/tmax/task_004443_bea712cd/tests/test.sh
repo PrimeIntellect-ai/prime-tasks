@@ -308,7 +308,7 @@ def test_generated_build_is_complete_atomic_and_actually_locks():
         assert len(lockers) >= 2, "Output locking was not used by multiple concurrent worker contexts"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

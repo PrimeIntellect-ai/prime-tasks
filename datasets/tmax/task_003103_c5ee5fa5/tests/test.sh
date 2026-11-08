@@ -113,7 +113,7 @@ def test_each_original_sample_is_in_model_selected_directory():
         assert (moved_output > 0) == (expected_dir == pos_path), f"Inference result for {name} does not match its directory."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

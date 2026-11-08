@@ -175,7 +175,7 @@ def test_generated_unseen_tokens_and_argument_handling(binaries):
         assert run_filter(binary, [missing]) == 1, f"{binary} must reject unreadable files"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

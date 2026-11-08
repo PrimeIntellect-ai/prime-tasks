@@ -205,7 +205,7 @@ def test_train_and_evaluate_executes_required_grid_search():
     assert actual['best_score'] == pytest.approx(float(expected_search.best_score_), abs=1e-12), 'Saved best_score does not match the executed grid search'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

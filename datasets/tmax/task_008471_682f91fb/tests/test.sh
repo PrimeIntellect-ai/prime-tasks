@@ -270,7 +270,7 @@ def test_parquet_format():
         assert magic == b"PAR1", f"File {fr_parquet} does not appear to be a valid Parquet file (missing PAR1 magic bytes)"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

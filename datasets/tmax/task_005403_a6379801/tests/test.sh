@@ -179,7 +179,7 @@ def test_optimize_script_executes_successfully():
     assert math.isclose(value, _derived_real_root(), rel_tol=0.0, abs_tol=1e-4)
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

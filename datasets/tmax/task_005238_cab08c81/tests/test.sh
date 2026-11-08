@@ -176,7 +176,7 @@ def test_evidence_file_contains_flag():
     assert content == expected_flag, f"The evidence file does not contain the correct flag. Found: '{content}'"
 PYTEST_EOF
 
-if python3 -m pytest "$VERIFY_DIR/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$VERIFY_DIR/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

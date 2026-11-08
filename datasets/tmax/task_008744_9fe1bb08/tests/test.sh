@@ -294,7 +294,7 @@ def test_anomalies_correctness():
         assert round(act['moving_average'], 2) == exp['moving_average'], f"Moving average mismatch for tx {exp['transaction_id']}: expected {exp['moving_average']}, got {act['moving_average']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

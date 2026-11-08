@@ -178,7 +178,7 @@ TEST_EOF
 # Correct a typo only in the copied existence guard while retaining its assertion.
 sed -i 's/SAFGUARD_SCRIPT/SAFEGUARD_SCRIPT/g' /tmp/test_final_state.py
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

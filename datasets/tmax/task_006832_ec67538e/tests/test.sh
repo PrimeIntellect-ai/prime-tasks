@@ -149,7 +149,7 @@ def test_script_performs_workflow_on_fresh_candidates():
         assert content == expected, f"Fresh execution output was incorrect. Got:\n{content}\nExpected:\n{expected}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

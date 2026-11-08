@@ -303,7 +303,7 @@ def test_proxy_really_depends_on_backend_and_restore_service():
     assert status == 200, f'Proxy did not resume forwarding after backend restart: {status}'
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

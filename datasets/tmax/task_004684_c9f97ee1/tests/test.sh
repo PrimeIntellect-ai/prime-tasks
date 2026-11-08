@@ -276,7 +276,7 @@ def test_audit_report_content():
 PY_EOF
 
     export AUDIT_TEST_TMP="$WORKDIR"
-    python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short
 )
 
 if run_verifier 2>&1; then

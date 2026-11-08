@@ -172,7 +172,7 @@ def test_manager_really_calls_the_requested_c_library_with_mutable_storage():
         assert raw == saved, "The C function was given immutable Python bytes instead of a mutable copy."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

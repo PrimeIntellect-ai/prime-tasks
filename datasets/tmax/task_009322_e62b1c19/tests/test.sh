@@ -263,7 +263,7 @@ def test_concurrent_executions_leave_complete_valid_manifest():
     assert all(entry.get("sha256") == PROBE["sha256"] for entry in probe_entries)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

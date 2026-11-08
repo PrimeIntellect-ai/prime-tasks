@@ -46,7 +46,7 @@ def test_leak_report():
     assert content == "4096", f"Expected leak_report.txt to contain '4096', but got '{content}'."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     # Exercise the script again with a shuffled, uniquely ordered graph and a
     # freshly compiled service whose leak size is unknown until verification.
@@ -157,7 +157,7 @@ def test_real_full_valgrind_run_and_extraction():
     assert int(report) == expected, f"Expected extracted value {expected}, got {report}"
 DYNAMIC_TEST_EOF
 
-    python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

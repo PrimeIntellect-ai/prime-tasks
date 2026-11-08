@@ -236,7 +236,7 @@ def test_independent_10000_request_load_and_memory():
     assert listener_pids(8080), 'Nginx service did not remain running after load'
 TEST_EOF
 
-if cd /tmp && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if cd /tmp && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

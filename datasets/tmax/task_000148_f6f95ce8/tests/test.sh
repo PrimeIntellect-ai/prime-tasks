@@ -280,7 +280,7 @@ def test_telemetry_gateway_http_endpoint():
     assert wrong.status_code == 401, f"Incorrect authentication should return 401, got {wrong.status_code}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -189,7 +189,7 @@ def test_invalid_utf8_rows_are_dropped_without_losing_neighbors(tmp_path):
     assert actual == header + good_before + good_after
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

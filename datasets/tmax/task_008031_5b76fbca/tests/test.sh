@@ -236,7 +236,7 @@ def test_parser_behavior_and_concurrent_locking():
             os.unlink(COMPILED)
 TEST_EOF
 
-if python3 -m pytest "$AUDIT_DIR/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$AUDIT_DIR/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

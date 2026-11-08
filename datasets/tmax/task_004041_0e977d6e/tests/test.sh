@@ -289,7 +289,7 @@ def test_phase3_sanitizer_dynamic_adversarial_cases():
     assert actual == expected, "Sanitizer did not apply all validation rules or changed valid-line order/content."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

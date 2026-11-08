@@ -203,7 +203,7 @@ assert configured, "generate_token argtypes/restype were not configured as c_int
 TEST_EOF
 
 status=0
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=$?
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=$?
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt
 else

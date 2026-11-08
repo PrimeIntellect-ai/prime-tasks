@@ -143,7 +143,7 @@ run_checks() {
         timeout 180s cargo run --quiet
     ) || return 1
     cmp -s /home/user/data/input.csv "$WORKDIR/run_input.csv" || return 1
-    python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short || return 1
 
     cp /home/user/data/output.csv "$WORKDIR/original_output.csv" || return 1
     cp /home/user/metrics.txt "$WORKDIR/original_metrics.txt" || return 1
@@ -190,7 +190,7 @@ GEN_EOF
         timeout 180s cargo run --quiet
     ) || return 1
     cmp -s /home/user/data/input.csv "$WORKDIR/generated_snapshot.csv" || return 1
-    python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short || return 1
 
     return 0
 }

@@ -238,7 +238,7 @@ def test_main_uses_current_input_and_regenerates_artifacts():
         assert f.read().strip() == "250"
 PYTEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_verifier 2>&1; then

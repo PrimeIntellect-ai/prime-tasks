@@ -134,7 +134,7 @@ def test_jwt_validity_and_payload():
 TEST_EOF
 
 if [ "$ok" -eq 1 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || ok=0
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || ok=0
 fi
 
 # Replace the fixed service with verifier-generated TLS services and rerun the

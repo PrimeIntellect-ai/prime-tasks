@@ -21,7 +21,7 @@ def test_debug_report_exists_and_correct():
     assert content[2].strip() == "FUNCTION: _Z31execute_cmd_vortex_8821_routinev", f"Third line is incorrect. Expected 'FUNCTION: _Z31execute_cmd_vortex_8821_routinev', got '{content[2]}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

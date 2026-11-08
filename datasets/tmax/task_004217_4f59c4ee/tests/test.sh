@@ -256,7 +256,7 @@ def test_tcp_exact_randomized_validation():
         assert tcp_exchange(message) == b"REJECTED\n", f"Invalid TCP message accepted: {message!r}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if verify 2>&1; then

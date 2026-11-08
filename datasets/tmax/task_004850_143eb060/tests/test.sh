@@ -101,7 +101,7 @@ verify() {
     rm -f /home/user/changes.log
 
     (cd /home/user && python3 /home/user/tracker.py)
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if verify 2>&1; then

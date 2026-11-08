@@ -108,7 +108,7 @@ def test_spectrum_csv_exists_and_correct():
 TEST_EOF
 
     EXPECTED_PATH="$oracle_dir/expected.csv" \
-        python3 -m pytest "$oracle_dir/test_final_state.py" -x --tb=short 2>&1 || return 1
+        python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$oracle_dir/test_final_state.py" -x --tb=short 2>&1 || return 1
 
     rm -rf "$oracle_dir"
     return 0

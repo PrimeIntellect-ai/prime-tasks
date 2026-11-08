@@ -46,7 +46,7 @@ def test_watcher_go_exists():
     assert os.path.isfile(path), f"Expected Go source file {path} does not exist."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 python3 - << 'PY'
 import os

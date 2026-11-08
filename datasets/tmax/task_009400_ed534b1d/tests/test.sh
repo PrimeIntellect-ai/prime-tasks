@@ -169,7 +169,7 @@ def test_pipeline_executes_submission_and_writes_computed_result():
     assert 0.01 <= val <= 0.08, f"Wasserstein distance {val} in {results_path} is outside expected bounds [0.01, 0.08]."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

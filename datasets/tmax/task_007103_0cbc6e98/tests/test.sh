@@ -250,7 +250,7 @@ def test_fixed_binary_solves_cancellation_and_general_inputs(fixed_binary, tmp_p
     assert len({round(value, 5) for value in outputs}) >= 4, "Fixed binary appears to emit a constant"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

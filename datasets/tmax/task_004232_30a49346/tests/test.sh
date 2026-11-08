@@ -151,7 +151,7 @@ original_ok=0
 artifact_ok=0
 dynamic_ok=0
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 && original_ok=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 && original_ok=1
 [ -f /home/user/serve_results.sh ] && [ ! -L /home/user/serve_results.sh ] && artifact_ok=1
 run_dynamic_test && dynamic_ok=1
 

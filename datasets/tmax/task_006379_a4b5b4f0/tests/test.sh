@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
         assert proc.returncode == 0, f"Library {library} is incorrect or leaks memory:\n{proc.stdout}\n{proc.stderr}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

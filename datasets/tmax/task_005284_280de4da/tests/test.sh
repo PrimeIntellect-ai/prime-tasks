@@ -76,7 +76,7 @@ def test_hierarchy_json_valid_and_correct():
         assert actual["depth"] == expected["depth"], f"Record at index {i}: Expected 'depth' {expected['depth']} for {actual['name']}, got {actual.get('depth')}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

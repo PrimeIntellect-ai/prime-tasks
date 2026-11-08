@@ -160,7 +160,7 @@ def test_pipeline_computes_results_for_unseen_input():
         assert cleanup.returncode == 0, f"pipeline.sh failed when restoring final outputs. stdout: {cleanup.stdout}\nstderr: {cleanup.stderr}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

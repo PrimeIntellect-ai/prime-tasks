@@ -178,7 +178,7 @@ def test_decoder_was_invoked_for_submitted_payloads():
         assert payload in calls, f"/app/telemetry_decoder was not invoked for payload {payload}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     printf '1\n' > /logs/verifier/reward.txt
 else
     printf '0\n' > /logs/verifier/reward.txt

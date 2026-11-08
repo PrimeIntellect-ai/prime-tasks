@@ -159,7 +159,7 @@ def test_service_unit_and_systemd_execution_generate_backup():
     assert failed_result.returncode != 0, f"mailer-backup.service is in a failed state:\n{failed_result.stdout}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

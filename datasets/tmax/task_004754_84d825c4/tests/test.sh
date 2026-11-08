@@ -164,7 +164,7 @@ def test_metric_threshold():
     assert score >= threshold, f"Score {score:.2f} is below the threshold of {threshold:.2f}. Key similarity: {similarity:.2f}, CSP score: {csp_score:.2f}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

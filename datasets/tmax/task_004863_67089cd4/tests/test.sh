@@ -54,7 +54,7 @@ def test_decoder_fuzz_equivalence():
             f"{error_msg} stderr oracle={oracle_proc.stderr!r}, agent={agent_proc.stderr!r}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

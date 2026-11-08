@@ -143,7 +143,7 @@ def test_denormalized_trials_json_content():
         assert student_item == expected_item, f"Mismatch at trial_id {expected_item['trial_id']}. Expected: {expected_item}, Got: {student_item}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

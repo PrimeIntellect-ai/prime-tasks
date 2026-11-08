@@ -83,7 +83,7 @@ def test_policy_engine_accuracy():
     assert accuracy >= 1.0, f"Classification accuracy is {accuracy:.4f}, expected >= 1.0. Your policy engine incorrectly classified some events."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

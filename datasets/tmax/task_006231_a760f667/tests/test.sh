@@ -160,11 +160,11 @@ def test_source_contains_required_kuzu_operations_and_validation():
     assert "SERDE_JSON" in normalized, "Rust source does not use serde_json to validate/serialize the output"
 FINAL_TEST_EOF
 
-if python3 -m pytest /tmp/test_initial_state.py -x --tb=short 2>&1 \
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_initial_state.py -x --tb=short 2>&1 \
    && python3 /tmp/make_dynamic_fixture.py \
    && rm -rf /home/user/kuzu_db /home/user/query_plan.txt /home/user/vulnerable_dbs.json \
    && timeout 300s cargo run --quiet --manifest-path /home/user/backup_auditor/Cargo.toml 2>&1 \
-   && python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -157,7 +157,7 @@ def test_scanner_accuracy_and_source_build():
     assert source_fresh == legacy_fresh, "scanner.c failed verification-time generated cases"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

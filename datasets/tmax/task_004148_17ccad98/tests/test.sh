@@ -285,7 +285,7 @@ def test_haproxy_routing(deployed_pids):
     assert seen_sensors == expected_sensors, f"Unexpected sensor IDs returned through HAProxy: {seen_sensors}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

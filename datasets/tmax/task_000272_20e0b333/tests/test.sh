@@ -27,7 +27,7 @@ def test_bottleneck_analysis_content():
     assert parsed_lines[1] == "Density at mean: 1.0558", f"Expected second line to be 'Density at mean: 1.0558', got '{parsed_lines[1]}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

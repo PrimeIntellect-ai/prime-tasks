@@ -57,7 +57,7 @@ def test_inference_normalized_csv_contents():
         assert abs(val - expected) < 1e-3, \
             f"Line {i} mismatch: expected {expected:.4f}, got {val}"
 PY
-    python3 -m pytest /tmp/test_original_outputs.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_outputs.py -x --tb=short || return 1
 
     # Replace the dataset with unpredictable values and derive the expected answers.
     python3 - <<'PY' || return 1

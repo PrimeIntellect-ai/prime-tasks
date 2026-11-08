@@ -253,7 +253,7 @@ def test_mail_spool_log_contains_status_fixed():
     assert "STATUS: FIXED" in content, f"File {path} does not contain 'STATUS: FIXED'. The mailer app did not successfully deliver the message."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

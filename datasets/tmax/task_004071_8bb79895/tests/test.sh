@@ -141,7 +141,7 @@ def test_convergence_rate_output():
     assert abs(slope - (-2.0)) < 0.05, f"Expected slope to be near -2.000, but got {slope:.3f}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

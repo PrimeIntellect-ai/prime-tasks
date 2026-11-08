@@ -142,7 +142,7 @@ run_verification() {
     timeout 10s /tmp/process_sensors_verifier || return 1
     hashes_after=$(sha256sum /home/user/data/sensor_A.csv /home/user/data/sensor_B.csv /home/user/data/sensor_C.csv) || return 1
     [ "$hashes_before" = "$hashes_after" ] || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     cat > /home/user/data/sensor_A.csv <<'EOF'
 120,1.0

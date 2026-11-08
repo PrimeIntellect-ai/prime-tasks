@@ -178,7 +178,7 @@ with tempfile.TemporaryDirectory() as backup:
 DYNAMIC_EOF
 
 verify_all() {
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
     test -f /home/user/project/extractor.cpp || return 1
     g++ -std=c++17 -O2 -I/home/user/project /home/user/project/extractor.cpp -o /tmp/extractor_under_test || return 1
     python3 /tmp/test_extractor_dynamic.py || return 1

@@ -65,7 +65,7 @@ if rustc /home/user/integrate.rs -o /tmp/integrate_submission; then
     # Remove any pre-existing or compile-time-created report so the submitted
     # executable itself must generate the file being checked.
     rm -f /home/user/report.json
-    if timeout 20s /tmp/integrate_submission && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if timeout 20s /tmp/integrate_submission && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         echo "1" > /logs/verifier/reward.txt
     else
         echo "0" > /logs/verifier/reward.txt

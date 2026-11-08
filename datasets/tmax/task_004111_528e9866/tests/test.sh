@@ -65,7 +65,7 @@ def test_results_csv_content():
         assert actual.strip() == expected.strip(), f"Row {i+1} mismatch.\nExpected: {expected}\nGot:      {actual}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     local backup="/tmp/company.db.verifier.$$"
     cp /home/user/company.db "$backup" || return 1

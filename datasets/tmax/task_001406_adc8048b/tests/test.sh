@@ -85,7 +85,7 @@ def test_edges_csv():
     assert parsed_lines == expected_parsed, f"The content of {edges_csv_path} does not match the expected output."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Change labels, categories, strengths, and add randomized entities and
     # interactions so fixed CSV output cannot pass the second execution.

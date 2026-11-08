@@ -182,7 +182,7 @@ def test_script_generalizes_to_exercised_data():
     assert actual == expected, f"The script's alternate-data results are incorrect: expected {expected}, got {actual}."
 TEST_EOF
 
-if [ "$ok" -eq 1 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$ok" -eq 1 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

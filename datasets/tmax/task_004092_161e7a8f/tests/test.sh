@@ -83,7 +83,7 @@ def test_output_records_correctness_and_sorting():
         assert float(actual["amount"]) == float(expected["amount"]), f"Record {i+1} amount mismatch: {actual['amount']} != {expected['amount']}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_original_state.py -x --tb=short || fail
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short || fail
 
 python3 << 'PY_EOF' || exit 1
 import csv
@@ -220,7 +220,7 @@ def test_dynamic_execution_result():
     ]
 TEST_EOF
 
-if python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

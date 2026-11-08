@@ -165,7 +165,7 @@ def test_compiled_solver_mode_and_optimality():
         f"D={D} is not optimal at 0.01 precision: score {claimed_score:.8f}, best grid score {best_grid_score:.8f}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

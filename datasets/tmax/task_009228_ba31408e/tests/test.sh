@@ -249,7 +249,7 @@ def test_pipeline_is_rust_and_executes_exact_bootstrap():
             RESULTS_PATH.write_bytes(restored_result)
 PYEOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 if [ $? -eq 0 ]; then
     reward=1
 fi

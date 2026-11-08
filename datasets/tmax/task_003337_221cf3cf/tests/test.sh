@@ -131,7 +131,7 @@ def test_c_program_builds_runs_and_predictions_match():
     assert mse <= 0.0001, f"MSE is {mse:.6f}, which is greater than the threshold of 0.0001"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

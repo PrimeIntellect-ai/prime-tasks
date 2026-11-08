@@ -76,7 +76,7 @@ run_checks() {
     rm -f /home/user/training_data.csv /tmp/generate_data.out
     timeout 60s python3 /home/user/generate_data.py > /tmp/generate_data.out 2>&1 || return 1
     grep -Fxq 'Regression Test Passed' /tmp/generate_data.out || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Add an unpredictable network only after the fixed-network assertions pass.
     python3 - << 'PY' || return 1

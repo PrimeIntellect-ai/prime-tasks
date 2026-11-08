@@ -307,7 +307,7 @@ def test_e2e_report_valid_and_successful():
     assert "Hello from the helper!" in run_res.get("output", ""), "RUN command output missing expected message."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 status=$?
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

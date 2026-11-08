@@ -133,7 +133,7 @@ PY
     test -f /home/user/organize_projects.sh || return 1
     test -x /home/user/organize_projects.sh || return 1
     timeout 30s /home/user/organize_projects.sh >/tmp/organize-original.out 2>/tmp/organize-original.err || return 1
-    python3 -m pytest /tmp/test_original_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short || return 1
     test ! -e /home/evil.sh || return 1
     test ! -e /etc/passwd_fake || return 1
 

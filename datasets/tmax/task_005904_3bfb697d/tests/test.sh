@@ -237,7 +237,7 @@ def test_posterior_mean_rounding():
         if '.' in text:
             assert len(text.split('.')[1]) <= 3, f'{key} value {data[key]} is not rounded to 3 decimal places.'
 PY
-  python3 -m pytest /tmp/osc_verify/test_final_state.py -q --tb=short
+  python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/osc_verify/test_final_state.py -q --tb=short
 }
 
 if verify >/tmp/osc_verify_result.out 2>&1; then

@@ -267,7 +267,7 @@ def test_cleanup():
 TEST_EOF
 
 status=0
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=$?
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=$?
 
 # Best-effort cleanup even when pytest stopped before its cleanup test.
 if [ -f /home/user/supervisor.pid ]; then

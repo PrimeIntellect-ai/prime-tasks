@@ -212,7 +212,7 @@ def test_dynamic_execution_arguments_contents_links_and_locking():
     assert latest_target in {(RELEASES / concurrent_a).resolve(), (RELEASES / concurrent_b).resolve()}
 TEST_EOF
 
-if python3 -m pytest /tmp/test_publish.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_publish.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -263,7 +263,7 @@ def test_complete_worker_behavior_and_performance():
         server.server_close()
 PYTEST_EOF
 
-if python3 -m pytest /tmp/test_organizer.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_organizer.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

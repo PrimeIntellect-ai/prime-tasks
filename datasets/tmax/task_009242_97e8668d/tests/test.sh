@@ -39,7 +39,7 @@ def test_incident_report_contents():
         assert parsed_report[key] == expected_val, f"Incorrect value for '{key}'. Expected '{expected_val}', but got '{parsed_report[key]}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

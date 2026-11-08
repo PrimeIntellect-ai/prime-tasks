@@ -150,7 +150,7 @@ def test_clean_rebuild_and_actual_pytest_run():
     assert re.search(r"\b1 passed\b", output), "The actual pytest run did not report exactly 1 passed test."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

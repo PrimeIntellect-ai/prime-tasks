@@ -37,7 +37,7 @@ def test_policy_json_updated():
     assert "192.168.5.99" in blocked_ips, "The attacker's IP '192.168.5.99' was not added to 'blocked_ips' in policy.json."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -80,7 +80,7 @@ def test_csv_values():
         assert abs(baseline - expected[g]['baseline']) < 0.1, f"Baseline for {g} is {baseline}, expected ~{expected[g]['baseline']}."
 TEST_EOF
 
-if [[ $success -eq 1 ]] && ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if [[ $success -eq 1 ]] && ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     success=0
 fi
 
@@ -199,7 +199,7 @@ def test_unseen_dataset_results():
         assert 0.0 <= float(row['phase']) < 2.0 * math.pi, f'Phase for {gene} is not normalized.'
 DYNAMIC_EOF
 
-if [[ $success -eq 1 ]] && ! python3 -m pytest /tmp/test_dynamic.py -x --tb=short; then
+if [[ $success -eq 1 ]] && ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic.py -x --tb=short; then
     success=0
 fi
 

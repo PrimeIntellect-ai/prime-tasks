@@ -179,7 +179,7 @@ def test_generated_schema_and_business_rules(compiled_source):
             assert rc == 1, f"{executable} did not reject a generated invalid record with exit 1 (exit {rc}): {payload}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

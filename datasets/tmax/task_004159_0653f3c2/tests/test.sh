@@ -102,7 +102,7 @@ def test_clean_data_contents():
             assert actual.get(key) == expected[key], f"Mismatch at row {i+1}, column '{key}'. Expected '{expected[key]}', got '{actual.get(key)}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

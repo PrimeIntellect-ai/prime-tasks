@@ -298,7 +298,7 @@ def test_health_check_sh():
     assert lines[-1] == "DOWN\n", f"Expected 'DOWN\\n' in log when server is unreachable, got {repr(lines[-1])}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

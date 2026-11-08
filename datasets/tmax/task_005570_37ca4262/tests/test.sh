@@ -137,7 +137,7 @@ def test_stratified_config_timeline_content():
         assert actual['config_hash'] == expected['config_hash'], f"Row {i+1}: Server {actual['server_name']} on {actual['date']} expected hash {expected['config_hash']}, got {actual['config_hash']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

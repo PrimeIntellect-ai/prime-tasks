@@ -298,7 +298,7 @@ assert atomic_replacements >= len(valid), (
 )
 PY_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 && \
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 && \
    python3 /tmp/test_dynamic_curator.py 2>&1; then
     printf '1\n' > /logs/verifier/reward.txt
 fi

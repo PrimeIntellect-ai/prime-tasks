@@ -144,7 +144,7 @@ def test_cpp_file_exists():
     assert os.path.exists('/home/user/analyze_network.cpp'), "The source code file /home/user/analyze_network.cpp is missing."
 PY_EOF
 
-    python3 -m pytest "$TMPDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TMPDIR/test_final_state.py" -x --tb=short || return 1
     cp /home/user/results.txt "$TMPDIR/original_results.txt" || return 1
 
     for case_number in 1 2; do

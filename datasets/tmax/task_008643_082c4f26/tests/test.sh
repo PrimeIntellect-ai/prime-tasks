@@ -81,7 +81,7 @@ def test_report_structure_and_values():
         f"Expected firewall_allows_8443_from_subnet to be {expected_firewall}, got {report['firewall_allows_8443_from_subnet']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

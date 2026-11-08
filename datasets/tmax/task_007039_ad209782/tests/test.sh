@@ -241,12 +241,12 @@ PY
     rm -f "$CSV" /tmp/process_trace.original
     (cd /home/user && TRACE_FILE=/tmp/process_trace.original LD_PRELOAD="$TRACE_SO" timeout 30 "$BIN") || return 1
     [ -s /tmp/process_trace.original ] || { echo "The submitted executable did not execute the required window-function query"; return 1; }
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     rm -f "$CSV" /tmp/process_trace.rebuilt
     (cd /home/user && TRACE_FILE=/tmp/process_trace.rebuilt LD_PRELOAD="$TRACE_SO" timeout 30 "$VERIFIED_BIN") || return 1
     [ -s /tmp/process_trace.rebuilt ] || { echo "The submitted source did not execute the required window-function query"; return 1; }
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify_all 2>&1; then

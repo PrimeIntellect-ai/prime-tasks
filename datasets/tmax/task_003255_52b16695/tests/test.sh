@@ -302,7 +302,7 @@ def test_atomic_write_logic_in_scripts():
 PY_EOF
 
 if gcc -shared -fPIC -O2 -o /tmp/rename_audit.so /tmp/rename_audit.c -ldl >/tmp/audit_build.log 2>&1 && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

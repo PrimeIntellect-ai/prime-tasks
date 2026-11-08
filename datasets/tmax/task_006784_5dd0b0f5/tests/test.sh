@@ -237,7 +237,7 @@ def test_benchmark_runs_1000_successful_requests():
     assert data.get('requests') == 1000, f"Expected 1000 requests, got {data.get('requests')}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

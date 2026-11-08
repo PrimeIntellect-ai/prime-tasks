@@ -248,7 +248,7 @@ def test_hook_pipeline_and_application_behavior():
     assert "error" in hook_failure.stdout.lower(), "The hook did not echo an error when application execution failed."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

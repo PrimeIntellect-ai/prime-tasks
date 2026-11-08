@@ -195,7 +195,7 @@ def test_compressed_files_are_genuine_and_ratio_passes():
     assert ratio >= 2.8, f"Compression ratio {ratio:.2f} is below the threshold of 2.8. Ensure noise is removed and keys are sorted."
 TEST_EOF
 
-if [ "$prereq_ok" -eq 1 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$prereq_ok" -eq 1 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

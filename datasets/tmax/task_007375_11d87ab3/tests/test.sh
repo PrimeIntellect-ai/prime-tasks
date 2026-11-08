@@ -259,7 +259,7 @@ def test_notebook_executes_parameter_sweep_and_regenerates_outputs():
     assert abs(float(restored_result["best_K"]) - 400.0) < 1e-5
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

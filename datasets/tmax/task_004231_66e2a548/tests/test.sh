@@ -88,14 +88,14 @@ TEST_EOF
 
 run_tests() {
     # Preserve all original assertions against the submitted final state.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Confirm the artifact is syntactically a Bash script, then actually execute it
     # from a clean lockfile against the original inputs.
     bash -n "$PROJECT/resolver.sh" || return 1
     rm -f "$PROJECT/lockfile.csv"
     (cd "$PROJECT" && timeout 30 ./resolver.sh) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Install a randomized registry with the same required behaviors: recursive
     # constraints, conflicting constraints, checksum fallback, and backtracking

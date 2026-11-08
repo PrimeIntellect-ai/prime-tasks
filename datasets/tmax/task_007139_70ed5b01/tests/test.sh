@@ -299,7 +299,7 @@ def test_notebook_was_fully_executed():
     assert all(c.get("execution_count") is not None for c in code_cells), "Notebook contains unexecuted code cells"
 PYTEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

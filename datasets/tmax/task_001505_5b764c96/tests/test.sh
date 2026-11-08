@@ -288,7 +288,7 @@ def test_script_recomputes_from_database_and_handles_tie_breaking():
     assert {key: data[key] for key in required_keys} == expected
 TEST_EOF
 
-if INSTRUMENT_DIR="$INSTRUMENT_DIR" python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if INSTRUMENT_DIR="$INSTRUMENT_DIR" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -121,7 +121,7 @@ fn test_verify_out_of_bounds_fix() {
         f'The fix verification failed. Every truncated payload must return Err("Out of bounds").\nStdout:\n{res.stdout}\nStderr:\n{res.stderr}'
 PYTEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

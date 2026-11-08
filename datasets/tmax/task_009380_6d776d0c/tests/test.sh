@@ -46,7 +46,7 @@ def test_report_json_exists_and_correct():
     assert report["crashing_function"] == "extract_metrics", f"Incorrect crashing_function. Expected 'extract_metrics', got {report['crashing_function']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

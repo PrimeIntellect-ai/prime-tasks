@@ -211,7 +211,7 @@ def test_patched_py_content():
 
     assert actual_content == expected_content.strip(), f"Content of {patched_file} does not match the expected patched output."
 PYTEST
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_checks; then

@@ -93,7 +93,7 @@ def test_frontend_logs_json():
             assert actual[key] == expected[key], f"Item {i} key '{key}' mismatch: expected {expected[key]}, got {actual[key]}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

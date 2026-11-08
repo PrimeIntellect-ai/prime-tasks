@@ -82,7 +82,7 @@ def test_rotated_password_log_content():
     assert content == expected_content, f"The content of {log_path} is incorrect. Expected '{expected_content}', got '{content}'."
 TEST_EOF
 
-if ! python3 -m pytest "$test_file" -x --tb=short >"$workdir/pytest.out" 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$test_file" -x --tb=short >"$workdir/pytest.out" 2>&1; then
     ok=0
 fi
 

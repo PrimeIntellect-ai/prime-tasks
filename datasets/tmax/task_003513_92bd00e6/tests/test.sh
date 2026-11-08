@@ -117,7 +117,7 @@ def test_chunks_redaction():
             assert '192.168.1.100' not in content, f'Sensitive IP found in {chunk_name}.'
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 # Compile the submitted artifact, remove its principal output, and execute it.
 # This proves sanitize.go itself can recreate the correctly sanitized master log.
@@ -150,7 +150,7 @@ def test_program_recreated_master():
     assert len(actual.splitlines()) == 120
 TEST_EOF
 
-python3 -m pytest /tmp/test_reexecution.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_reexecution.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

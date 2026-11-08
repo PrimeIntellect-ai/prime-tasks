@@ -103,7 +103,7 @@ def test_payload_bin():
     assert sha256_hash == expected_hash, f"Expected SHA256 {expected_hash}, but got {sha256_hash}."
 TEST_EOF
 
-if run_behavior_checks && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if run_behavior_checks && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

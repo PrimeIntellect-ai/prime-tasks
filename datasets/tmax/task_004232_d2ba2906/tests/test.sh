@@ -157,7 +157,7 @@ def test_compiled_engine_computes_results():
 TEST_EOF
 
 if timeout 180 cargo build --release --manifest-path /home/user/kg_engine/Cargo.toml >/tmp/kg_build.log 2>&1; then
-    if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         reward=1
     else
         cat /tmp/kg_build.log

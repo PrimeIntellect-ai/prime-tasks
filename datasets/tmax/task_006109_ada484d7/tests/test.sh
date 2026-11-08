@@ -165,7 +165,7 @@ def test_python_etl_script_processes_unseen_csv_inputs():
     assert working_script is not None, "No submitted Python script correctly processed multiple unseen sensor CSV fixtures."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -195,7 +195,7 @@ def test_pwned_log_exists_and_correct():
     assert os.stat(log_path).st_uid == 0, "pwned.log was not created by the root-run vulnerable service."
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     STATUS=1
 fi
 

@@ -74,7 +74,7 @@ def test_positive_predictions_file():
         assert abs(exp_pred - act_pred) < 1e-5, f"For id {exp_id}, expected prediction {exp_pred}, but got {act_pred}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

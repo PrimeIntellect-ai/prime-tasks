@@ -250,7 +250,7 @@ def test_verify_c_loads_correct_symbol_with_required_arguments_and_asserts(tmp_p
         restore_project_library(backup_lib)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

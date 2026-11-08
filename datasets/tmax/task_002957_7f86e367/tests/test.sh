@@ -209,6 +209,6 @@ def test_configuration_services_notebook_and_rest_workflow():
 PY_EOF
 
 if g++ -O3 -fopenmp /tmp/oracle.cpp -o /tmp/oracle_worker && \
-   python3 -m pytest /tmp/test_pipeline.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_pipeline.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 fi

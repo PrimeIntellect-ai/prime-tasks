@@ -101,7 +101,7 @@ mod tests {
 RUST_EOF
 
     cargo test --offline --manifest-path /tmp/rust_pipeline_verifier_probe/Cargo.toml || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify 2>&1; then

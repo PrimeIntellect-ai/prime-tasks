@@ -229,7 +229,7 @@ run_checks() {
     rm -f /home/user/audit_report.json || return 1
     timeout 20s python3 /home/user/audit.py || return 1
     [ -f /home/user/audit_report.json ] && [ ! -L /home/user/audit_report.json ] || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
     python3 /tmp/test_dynamic_audit.py || return 1
 }
 

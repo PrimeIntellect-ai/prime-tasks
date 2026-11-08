@@ -199,7 +199,7 @@ def test_redacted_payload_content():
     assert actual_content == expected_content, f"The redacted payload content is incorrect.\nExpected: '{expected_content}'\nGot: '{actual_content}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

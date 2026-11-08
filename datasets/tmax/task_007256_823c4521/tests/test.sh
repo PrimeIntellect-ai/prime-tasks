@@ -136,7 +136,7 @@ TEST_EOF
 # Remove any prebuilt database and require the submitted program to recreate it.
 rm -f /home/user/transactions.db
 if [ -f /home/user/processor.py ] && timeout 30s python3 /home/user/processor.py && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

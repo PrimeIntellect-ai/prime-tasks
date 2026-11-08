@@ -47,7 +47,7 @@ def test_result_txt_exists_and_correct():
             assert len(numbers) >= 4, f"Expected at least 4 values in the dataset, found {len(numbers)}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
     readelf -h /home/user/sim/integrate >/dev/null 2>&1 || return 1
 
     # Build a profiling shim that verifies the program really performs one

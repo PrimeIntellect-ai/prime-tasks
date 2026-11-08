@@ -209,7 +209,7 @@ int process_telemetry(const char* input_file, char* output_buffer, int max_len) 
     assert abs(float(row[3]) - battery_drain) < 0.0001
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

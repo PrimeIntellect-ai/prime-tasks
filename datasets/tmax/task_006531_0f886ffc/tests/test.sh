@@ -275,7 +275,7 @@ def test_release_rust_api_on_runtime_generated_inputs():
             output_file.close()
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 status=$?
 if [ "$status" -eq 0 ]; then
     printf '1\n' > /logs/verifier/reward.txt

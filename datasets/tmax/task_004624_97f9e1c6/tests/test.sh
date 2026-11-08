@@ -99,7 +99,7 @@ def test_analyze_script_decrypts_and_validates_dynamic_payloads():
     assert permissions == 0o400, f"Expected permissions 0o400 on {key_path}, but got {oct(permissions)}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

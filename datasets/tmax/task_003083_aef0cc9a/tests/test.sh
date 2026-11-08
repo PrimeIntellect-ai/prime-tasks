@@ -187,7 +187,7 @@ def test_fuzz_equivalence():
             pytest.fail(diff_msg)
 TEST_EOF
 
-    ASTRO_CASES_FILE="$CASES_FILE" python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    ASTRO_CASES_FILE="$CASES_FILE" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_verification 2>&1; then

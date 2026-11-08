@@ -77,7 +77,7 @@ def test_pipeline_json_content():
     assert parsed["pipeline"] == ["raw_clicks", "stg_clicks", "realtime_metrics", "executive_dashboard"], "The shortest path is incorrect."
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     exit 0
 fi
 
@@ -162,7 +162,7 @@ rm -f "$OUTPUT"
 if ! timeout 15s "$BINARY"; then
     exit 0
 fi
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     exit 0
 fi
 

@@ -138,7 +138,7 @@ def test_find_optimal_k_is_executed_and_computes_result():
     assert actual == 15 or binary_components(actual - 2, CLEAN_SAMPLE) != 1
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

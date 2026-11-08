@@ -107,7 +107,7 @@ def test_classification_on_neutral_random_paths():
         )
 TEST_EOF
 
-if python3 -m pytest "$TEST_DIR/test_final_state.py" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_DIR/test_final_state.py" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

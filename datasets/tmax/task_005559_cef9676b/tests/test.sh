@@ -130,7 +130,7 @@ verify() {
     python3 /tmp/test_streaming.py || return 1
     rm -rf /home/user/organized_docs || return 1
     timeout 30s bash -o pipefail -c 'python3 /home/user/generate_docs.py | python3 /home/user/chunker.py' || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if verify; then

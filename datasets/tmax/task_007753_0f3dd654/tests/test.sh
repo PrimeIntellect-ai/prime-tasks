@@ -37,7 +37,7 @@ def test_dropped_objects_content():
 TEST_EOF
 
 # Preserve all original final-state assertions.
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 # Compile the submitted source using the command required by the instruction.
 g++ -O3 /home/user/extract_drops.cpp -o /home/user/extract_drops

@@ -180,7 +180,7 @@ def test_heterogeneous_concurrent_requests():
 TEST_EOF
 
 pytest_ok=0
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     pytest_ok=1
 fi
 

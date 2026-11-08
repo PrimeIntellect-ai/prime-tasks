@@ -44,7 +44,7 @@ def test_quarantine_log():
     assert len(vulnerable_lines) == len(expected_lines), f"Expected exactly {len(expected_lines)} VULNERABLE lines, found {len(vulnerable_lines)}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 << 'PY_EOF' || return 1
 import os
@@ -94,7 +94,7 @@ def test_quarantine_log():
     assert len(vulnerable_lines) == len(expected_lines), f"Expected exactly {len(expected_lines)} VULNERABLE lines, found {len(vulnerable_lines)}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 << 'PY_EOF' || return 1
 import os
@@ -188,7 +188,7 @@ def test_fresh_execution_generated_complete_results():
     assert collections.Counter(actual_lines) == collections.Counter(expected_lines)
 TEST_EOF
 
-    python3 -m pytest /tmp/test_behavior.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_behavior.py -x --tb=short || return 1
 }
 
 if run_all_tests; then

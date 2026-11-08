@@ -72,7 +72,7 @@ def test_bootstrap_arm64_exists_and_content():
         f"Bootstrap mean {bootstrap_mean} is outside the acceptable range [{lower_bound}, {upper_bound}]."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     cat << 'DYNAMIC_EOF' > /tmp/test_dynamic.py
 import csv

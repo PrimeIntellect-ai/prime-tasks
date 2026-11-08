@@ -140,7 +140,7 @@ def test_bf_server_built():
 TEST_EOF
 
 # Preserve the original final-state assertions before creating verifier artifacts.
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 project=/home/user/emulator_port
 build="$project/.verifier-build"

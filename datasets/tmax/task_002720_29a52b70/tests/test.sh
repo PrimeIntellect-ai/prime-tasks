@@ -114,7 +114,7 @@ def test_10_execute_artifact_and_source_on_derived_inputs():
                          f'v{token}.3', f'v{token}.4')
 TEST_EOF
 
-if python3 -m pytest /tmp/test_organizer.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_organizer.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

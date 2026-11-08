@@ -227,7 +227,7 @@ run_checks() {
     rm -rf /home/user/processing
     rm -f /home/user/normalized_configs.tar.gz
     timeout 30 /home/user/.config_manager_verifier || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 /tmp/test_dynamic_probe.py || return 1
 
@@ -235,7 +235,7 @@ run_checks() {
     rm -rf /home/user/processing
     rm -f /home/user/normalized_configs.tar.gz
     timeout 30 /home/user/.config_manager_verifier || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if run_checks 2>&1; then

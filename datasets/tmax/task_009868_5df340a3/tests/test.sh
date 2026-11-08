@@ -55,7 +55,7 @@ def test_anomalies_file_content():
         assert actual == expected, f"Mismatch at line {i+1}: expected '{expected}', got '{actual}'."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     cat << 'DYNAMIC_EOF' > /tmp/test_dynamic.py
 import os
@@ -147,7 +147,7 @@ def test_program_processes_varied_inputs():
         run_case(events)
 DYNAMIC_EOF
 
-    python3 -m pytest /tmp/test_dynamic.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic.py -x --tb=short || return 1
 }
 
 if run_checks 2>&1; then

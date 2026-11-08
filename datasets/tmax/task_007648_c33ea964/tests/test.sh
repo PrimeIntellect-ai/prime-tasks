@@ -69,7 +69,7 @@ def test_required_go_implementation_is_present():
     assert re.search(r'\bgo\s+build\b', run_source), "run.sh must build the Go program."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     BIN="/tmp/loc_processor_$$_$RANDOM"
     trap 'rm -f "$BIN" /tmp/loc_expected.json /tmp/make_challenge.py /tmp/check_challenge.py' EXIT

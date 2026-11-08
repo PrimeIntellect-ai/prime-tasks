@@ -176,7 +176,7 @@ def test_optimizer_generalizes_to_unseen_data():
             assert abs(got - want) < 0.1, f'case {case_no}: {label} ({got}) is not within 0.1 of the fitted target ({want})'
 TEST_EOF
 
-if EXERCISE_OK="$exercise_ok" python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if EXERCISE_OK="$exercise_ok" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

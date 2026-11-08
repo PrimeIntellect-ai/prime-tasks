@@ -101,7 +101,7 @@ def test_output_file_contents():
         assert abs(act["total_tree_cost"] - exp["total_tree_cost"]) < 1e-6, f"Line {i+1} for manager_id {exp['manager_id']} total_tree_cost mismatch: expected {exp['total_tree_cost']}, got {act['total_tree_cost']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

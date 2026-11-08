@@ -51,7 +51,7 @@ def test_rate_limiter_implemented():
         "rate_limit.rs does not appear to update the 'counts' HashMap."
 TEST_EOF
 
-python3 -m pytest "$WORK_DIR/test_final_state.py" -x --tb=short >"$WORK_DIR/static-tests.log" 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORK_DIR/test_final_state.py" -x --tb=short >"$WORK_DIR/static-tests.log" 2>&1 || status=1
 
 # Compile and run the submitted C implementation under AddressSanitizer. This
 # catches the original one-byte heap overflow while also checking its output.

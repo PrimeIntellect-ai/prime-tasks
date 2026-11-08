@@ -235,7 +235,7 @@ def test_confidence_interval():
     assert abs(upper - expected_upper) < 1e-4, f"Upper bound mismatch: expected {expected_upper}, got {upper}"
 TEST_EOF
 
-if [[ "$ok" -eq 1 ]] && AUDIT_LOG="$audit_log" python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [[ "$ok" -eq 1 ]] && AUDIT_LOG="$audit_log" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

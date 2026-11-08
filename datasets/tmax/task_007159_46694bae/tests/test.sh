@@ -129,7 +129,7 @@ PY_EOF
     rm -f /home/user/processed_data.csv || return 1
     (cd /home/user/sensor_etl && timeout 180 cargo build --quiet) || return 1
     (cd /home/user/sensor_etl && timeout 180 cargo run --quiet) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
     python3 /tmp/test_dynamic_pipeline.py || return 1
 }
 

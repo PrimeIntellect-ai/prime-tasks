@@ -55,7 +55,7 @@ def test_reachable_depth_3():
     assert data == ["N-1000", "N-2000", "N-3000", "N-4000", "N-8392"], f"Expected ['N-1000', 'N-2000', 'N-3000', 'N-4000', 'N-8392'], got {data}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_original_state.py -x --tb=short >/tmp/original-tests.log 2>&1 || exit 0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short >/tmp/original-tests.log 2>&1 || exit 0
 
 # Require an actual buildable Rust project, rather than accepting an arbitrary
 # process that happened to be listening on the expected port.
@@ -203,6 +203,6 @@ def test_fresh_graph(depth):
     assert data == expected(depth)
 TEST_EOF
 
-python3 -m pytest /tmp/test_mutated_state.py -x --tb=short >/tmp/mutated-tests.log 2>&1 || exit 0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_mutated_state.py -x --tb=short >/tmp/mutated-tests.log 2>&1 || exit 0
 SCORE=1
 exit 0

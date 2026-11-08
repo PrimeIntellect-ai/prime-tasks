@@ -189,7 +189,7 @@ def test_sim_result_json(executed_notebook):
         "sim_result.json contains an incorrect total mass"
 TEST_EOF
 
-if OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

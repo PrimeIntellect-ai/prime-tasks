@@ -93,7 +93,7 @@ def test_ttest_pvalue_file(expected_results):
     assert agent_pval == expected_pval, f"T-test p-value is incorrect. Expected '{expected_pval}', but got '{agent_pval}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

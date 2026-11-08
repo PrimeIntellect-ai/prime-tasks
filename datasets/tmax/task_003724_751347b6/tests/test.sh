@@ -106,7 +106,7 @@ PY
 
     run_program || return 1
     cmp -s "$INPUT" "$ORIGINAL" || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     cat << 'DATA_EOF' > "$HIDDEN"
 {"tx_id":"h1","sender":"S1","receiver":"Z","amount":1}
@@ -123,7 +123,7 @@ PY
 DATA_EOF
     cp "$HIDDEN" "$INPUT" || return 1
     run_program || return 1
-    python3 -m pytest /tmp/test_hidden_case.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_hidden_case.py -x --tb=short || return 1
 }
 
 verify_submission || STATUS=1
@@ -133,7 +133,7 @@ cp "$ORIGINAL" "$INPUT" || STATUS=1
 if test -f "$MAIN" && test ! -L "$MAIN"; then
     run_program || STATUS=1
     cmp -s "$INPUT" "$ORIGINAL" || STATUS=1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || STATUS=1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || STATUS=1
 else
     STATUS=1
 fi

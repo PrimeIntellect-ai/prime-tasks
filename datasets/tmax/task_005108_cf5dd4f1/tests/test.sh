@@ -142,7 +142,7 @@ def test_csv_rows_match_chunks_frames_and_compressed_sizes():
     assert utf16_text.lstrip("\ufeff") == utf8_text.lstrip("\ufeff"), "index_utf16.csv is not the UTF-16LE conversion of index.csv"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

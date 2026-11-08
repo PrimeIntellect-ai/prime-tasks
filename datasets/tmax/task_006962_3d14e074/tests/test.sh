@@ -222,7 +222,7 @@ def test_worker_output_log():
     assert "CWD: /home/user/logs" in content, "Log file does not contain 'CWD: /home/user/logs'. Working directory was not changed correctly."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -97,7 +97,7 @@ def test_processed_data_content():
         assert math.isclose(actual["rolling_3h_temp"], expected["rolling_3h_temp"], abs_tol=0.01), f"Record {i} rolling_3h_temp mismatch: expected {expected['rolling_3h_temp']}, got {actual['rolling_3h_temp']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

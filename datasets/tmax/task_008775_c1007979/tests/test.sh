@@ -190,7 +190,7 @@ def test_source_is_concurrent_and_race_free_on_generated_inputs():
         run_case("/tmp/sensor_agg_race", batch_id, readings, race=True)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

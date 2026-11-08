@@ -166,7 +166,7 @@ verify_all() {
 
     cp "$ORIGINAL_DATA" /home/user/data.csv || return 1
     run_program || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     for case_number in 1 2 3; do
         expected="/tmp/generated_expected_${case_number}.json"
@@ -179,7 +179,7 @@ verify_all() {
     # recreates the originally required final artifact.
     cp "$ORIGINAL_DATA" /home/user/data.csv || return 1
     run_program || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 if verify_all 2>&1; then

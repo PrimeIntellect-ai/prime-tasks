@@ -156,7 +156,7 @@ def test_metrics_json_content():
     assert isinstance(actual_score, (int, float)), f"Expected 'evaluation_score' to be a number, got {type(actual_score).__name__}."
     assert abs(actual_score - expected_score) < 1e-5, f"Expected evaluation_score to be {expected_score}, got {actual_score}. Check the ComputeEmbedding and Evaluate implementations."
 TEST_EOF
-    python3 -m pytest "$testdir/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$testdir/test_final_state.py" -x --tb=short || return 1
 }
 
 if run_checks 2>&1; then

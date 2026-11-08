@@ -146,7 +146,7 @@ def test_idempotency():
     assert len(cache_endpoints) == 1, "The script is not idempotent: 'cache_service' was added multiple times."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

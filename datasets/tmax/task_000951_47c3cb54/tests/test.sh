@@ -70,7 +70,7 @@ def test_migration_log_csv():
 TEST_EOF
 
 ok=1
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || ok=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || ok=0
 
 if [ "$ok" -eq 1 ]; then
     python3 - <<'PY' || ok=0

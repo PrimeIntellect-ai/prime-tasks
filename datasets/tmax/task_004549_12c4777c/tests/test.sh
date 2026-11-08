@@ -78,7 +78,7 @@ def test_invalid_formats():
         assert agent_rc == 0, f"Expected exit code 0 for invalid format input '{inp}', got {agent_rc}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

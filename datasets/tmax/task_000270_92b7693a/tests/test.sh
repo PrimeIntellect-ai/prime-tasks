@@ -124,7 +124,7 @@ TEST_EOF
 
 if [ ! -f "$MAIN_RS" ] || [ ! -s "$MAIN_RS" ]; then
     status=1
-elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     status=1
 fi
 

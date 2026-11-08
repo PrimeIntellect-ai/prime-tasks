@@ -73,7 +73,7 @@ def test_end_to_end_integration():
     assert output == expected_hash, f"Expected hash {expected_hash} not found in Redis for key artifact:hash:{test_filename}. Got: {output}. Ensure your watcher script is running and correctly uploading the normalized data."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

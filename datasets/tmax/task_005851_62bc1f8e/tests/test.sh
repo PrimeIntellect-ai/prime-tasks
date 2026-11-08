@@ -122,7 +122,7 @@ def test_diagnostic_script_behavior_and_saved_output():
     assert saved == executed.stdout.strip(), "solution.txt is not the output produced by the corrected run_diag.sh."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

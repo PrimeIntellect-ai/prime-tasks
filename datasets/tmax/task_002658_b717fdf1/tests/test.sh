@@ -168,7 +168,7 @@ else
     python3 "$SCRIPT" || status=1
 fi
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ -f "$SCRIPT" ] && [ ! -L "$SCRIPT" ]; then
     python3 /tmp/test_script_behavior.py 2>&1 || status=1
@@ -177,7 +177,7 @@ else
 fi
 
 # Confirm the restored original inputs still produce the required final report.
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

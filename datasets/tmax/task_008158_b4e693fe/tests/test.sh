@@ -102,7 +102,7 @@ def test_author_metrics_csv_exists_and_content():
         assert actual == expected, f"Row {i+1} mismatch. Expected {expected}, got {actual}."
 TEST_EOF
 
-    python3 -m pytest "$work_dir/test_final_state.py" -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$work_dir/test_final_state.py" -x --tb=short
     cp "$csv_path" "$work_dir/final_author_metrics.csv"
 
     # Replace both inputs with an alternate fixture so hardcoded original rows fail.
@@ -196,7 +196,7 @@ def test_alternate_inputs_are_aggregated_and_formatted():
     assert actual == derive_expected()
 DYNAMIC_EOF
 
-    python3 -m pytest "$work_dir/test_dynamic_state.py" -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$work_dir/test_dynamic_state.py" -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

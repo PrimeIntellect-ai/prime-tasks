@@ -231,7 +231,7 @@ def test_filter_interface_and_unseen_inputs():
         assert run_filter(relative_name, cwd=td).returncode != 0, "filter accepted a relative path"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

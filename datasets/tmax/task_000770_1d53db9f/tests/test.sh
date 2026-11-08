@@ -107,7 +107,7 @@ def test_final_output_mse():
 TEST_EOF
 
 if [ "$status" -eq 0 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 fi
 
 # Preserve the correctly regenerated original result while testing the script
@@ -233,7 +233,7 @@ def test_script_recomputes_dynamic_ocr_pipeline():
 TEST_EOF
 
 if [ "$status" -eq 0 ]; then
-    python3 -m pytest /tmp/test_dynamic_pipeline.py -x --tb=short 2>&1 || status=1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_pipeline.py -x --tb=short 2>&1 || status=1
 fi
 
 if [ "$status" -eq 0 ]; then

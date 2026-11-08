@@ -158,7 +158,7 @@ HOOK_EOF
     [ -n "$SELECTED" ] || return 1
 
     # Preserve the original assertions after actually executing the submitted artifact.
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     BACKUP_DIR="$(mktemp -d /tmp/verifier-backup.XXXXXX)" || return 1
     cp -a /home/user/encryptor "$BACKUP_DIR/encryptor" || return 1

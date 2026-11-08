@@ -135,7 +135,7 @@ def test_output_data_correctness(expected_data):
         assert actual_redacted_parsed == expected["redacted_original_payload"], f"Item {i} redacted_original_payload mismatch. Expected {expected['redacted_original_payload']}, got {actual_redacted_parsed}."
 TEST_EOF
 
-if [ "$ok" -eq 1 ] && ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$ok" -eq 1 ] && ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     ok=0
 fi
 

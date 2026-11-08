@@ -179,7 +179,7 @@ def test_metrics_txt_content():
     assert content == expected_text, f"Content of {metrics_path} does not match expected. Expected '{expected_text}', got '{content}'"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
     return 0
 }
 

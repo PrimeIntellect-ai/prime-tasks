@@ -241,7 +241,7 @@ PY_EOF
 run_pipeline_and_tests() {
     rm -f /home/user/mlops/benchmark.json /home/user/mlops/artifacts/reduced.csv
     (cd /home/user/mlops && timeout 120s go run ./pipeline.go) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 }
 
 verify_all() {

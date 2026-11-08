@@ -66,7 +66,7 @@ def test_migration_report_exists_and_correct():
     assert rule_c.get("violating_opcodes") == [5], f"Expected violating_opcodes [5] for rule 102, got {rule_c.get('violating_opcodes')}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     # Exercise the compiled analyzer on fresh, unpredictable fixtures. Operand
     # bytes deliberately contain Python 2 opcode values and must be skipped.

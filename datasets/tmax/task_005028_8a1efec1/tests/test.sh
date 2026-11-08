@@ -272,6 +272,6 @@ def test_binary_rejects_incorrect_argument_counts():
 TEST_EOF
 
 if gcc -shared -fPIC -O2 -Wall /tmp/disk_nav_audit.c -o /tmp/libdisk_nav_audit.so -ldl \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     reward=1
 fi

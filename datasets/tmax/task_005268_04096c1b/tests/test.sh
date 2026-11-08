@@ -72,7 +72,7 @@ result=0
     cd /home/user
     timeout 10s /tmp/recover_submission
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     dynamic_digest="$(python3 - <<'PY'
 import hashlib

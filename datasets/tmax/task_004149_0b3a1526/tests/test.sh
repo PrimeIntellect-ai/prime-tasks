@@ -136,7 +136,7 @@ def test_02_hierarchy_json_correct():
     assert actual_sorted == expected_sorted, "The generated JSON does not match the expected hierarchy derived from the 'employees' table."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

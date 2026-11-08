@@ -49,7 +49,7 @@ def test_backup_created():
     except tarfile.ReadError:
         pytest.fail(f"Backup file {backup_path} is not a valid gzip-compressed tar archive.")
 PY
-python3 -m pytest /tmp/test_original_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_state.py -x --tb=short
 
 python3 << 'PY'
 import hashlib

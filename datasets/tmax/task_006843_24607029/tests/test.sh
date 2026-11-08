@@ -49,7 +49,7 @@ def test_build_succeeds():
     assert result.returncode == 0, f"Build script failed to run successfully. Exit code: {result.returncode}\nStdout: {result.stdout}\nStderr: {result.stderr}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

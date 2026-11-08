@@ -170,7 +170,7 @@ def test_large_files_are_processed_under_bounded_memory(tmp_path):
     assert_classification(DETECTOR_PATH, str(path), True, timeout=30, memory_limit=limit)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

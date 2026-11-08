@@ -192,7 +192,7 @@ def test_best_run_values():
     assert best_cv_r2 == float(derived_score), f"best_cv_r2 must be the derived best score rounded to 4 decimals: {derived_score}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

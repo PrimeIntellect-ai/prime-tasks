@@ -121,7 +121,7 @@ EOF
 passed=1
 
 # Check the state left by the agent against the actual supplied fixtures.
-if ! python3 -m pytest "$TEST_FILE" -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_FILE" -x --tb=short 2>&1; then
     passed=0
 fi
 
@@ -131,7 +131,7 @@ if [ "$passed" -eq 1 ]; then
     reset_fixtures
     if ! timeout 30s runuser -u user -- bash /home/user/organize.sh; then
         passed=0
-    elif ! python3 -m pytest "$TEST_FILE" -x --tb=short 2>&1; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_FILE" -x --tb=short 2>&1; then
         passed=0
     fi
 fi

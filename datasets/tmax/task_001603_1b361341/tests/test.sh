@@ -52,7 +52,7 @@ def test_malicious_file_not_extracted():
     assert not os.path.exists("/home/user/etc/hacked.sh"), "Malicious file was extracted to /home/user/etc/hacked.sh"
 STATIC_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 test -f /home/user/processor.go
 test ! -L /home/user/processor.go

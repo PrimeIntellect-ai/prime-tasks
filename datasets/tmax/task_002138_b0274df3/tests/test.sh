@@ -251,7 +251,7 @@ def test_trajectory_png_exists_and_contains_plot():
     assert max(ys) - min(ys) >= int((y1 - y0) * 0.15), 'Trajectory has no meaningful vertical variation'
 PY
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ); then
     echo "1" > /logs/verifier/reward.txt
 else

@@ -166,7 +166,7 @@ PY_EOF
 
     rm -f /home/user/report.json
     (cd /home/user/analyzer && timeout 180 "$executable") || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     local backup
     backup=$(mktemp -d)
@@ -223,7 +223,7 @@ PY_EOF
 
     rm -f /home/user/report.json
     (cd /home/user/analyzer && timeout 180 "$executable") || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     cp "$backup/traffic.log" /home/user/traffic.log
     cp "$backup/cert.pem" /home/user/cert.pem

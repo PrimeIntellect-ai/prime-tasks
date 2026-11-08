@@ -70,7 +70,7 @@ def test_pipeline_log():
     assert "Updated locale: fr" in lines, "pipeline.log is missing 'Updated locale: fr'"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 
     python3 << 'PREP_EOF' || return 1
 import json
@@ -198,7 +198,7 @@ def test_dynamic_pipeline_logging():
         assert f"Updated locale: {locale}" in lines
 DYNAMIC_EOF
 
-    python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1 || return 1
 }
 
 if run_checks; then

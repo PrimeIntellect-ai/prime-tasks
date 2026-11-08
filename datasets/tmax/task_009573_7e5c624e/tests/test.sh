@@ -64,7 +64,7 @@ def test_top_authors_json_exists_and_valid():
         assert data[i] == expected, f"Mismatch at index {i}. Expected {expected}, got {data[i]}."
 TEST_EOF
 
-    python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short || return 1
 
     # Exercise the binary on fresh inputs and derive the expected answer independently.
     for case_num in 1 2; do

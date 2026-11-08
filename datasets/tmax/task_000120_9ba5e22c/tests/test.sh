@@ -172,7 +172,7 @@ fi
 if [ "$overall" -eq 1 ]; then
     if ! run_pipeline; then
         overall=0
-    elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
         overall=0
     fi
 fi
@@ -218,7 +218,7 @@ PY
         chmod 644 "$RAW"
         if ! run_pipeline; then
             overall=0
-        elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+        elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
             overall=0
         fi
     fi

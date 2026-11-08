@@ -164,7 +164,7 @@ def test_dynamic_extraction_conversion_and_conditional_skip():
         assert f.read() == expected_report, "Rerunning the script did not regenerate the same report from the unchanged log."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

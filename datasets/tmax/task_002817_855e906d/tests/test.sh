@@ -81,7 +81,7 @@ def test_benchmark_txt_exists_and_non_empty():
         assert exit_status.group(1) == '0', "The benchmarked command did not complete successfully."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

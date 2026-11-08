@@ -215,7 +215,7 @@ def test_archive_contains_all_required_current_files():
             assert archived_bytes == live_bytes, f"Archived {archived_name} differs from the generated file"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

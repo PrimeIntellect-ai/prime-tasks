@@ -368,7 +368,7 @@ def test_tar_contents():
                     assert archived.read() == original.read(), f'Archived bytes differ for {path}'
 PY
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 if [ $? -eq 0 ]; then
     reward=1
 fi

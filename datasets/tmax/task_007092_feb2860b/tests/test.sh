@@ -107,7 +107,7 @@ DATA_EOF
 
     rm -f /home/user/aggregated_views.json /home/user/graph_import.cypher || return 1
     (cd /home/user && timeout 30s /home/user/etl.sh) || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 if run_verification; then

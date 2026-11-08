@@ -136,7 +136,7 @@ TEST_EOF
 
 rm -f /home/user/export_results.json
 if timeout 10s /home/user/run_export.sh >/tmp/run_export.stdout 2>/tmp/run_export.stderr && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

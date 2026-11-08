@@ -199,7 +199,7 @@ def test_benchmark_json_generated():
         assert reported <= measured_inside_replica + 1.0, f"Reported time for {key} is not consistent with the executed benchmark."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

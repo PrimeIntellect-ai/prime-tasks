@@ -233,7 +233,7 @@ if [ -f "$PROJECT/Cargo.toml" ] \
    && python3 /tmp/check_binary.py "$BINARY" \
    && python3 /tmp/prepare_inputs.py \
    && python3 /tmp/run_with_manifest_lock.py "$BINARY" \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     reward=1
 fi
 

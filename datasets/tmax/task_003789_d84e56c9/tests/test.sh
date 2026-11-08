@@ -53,7 +53,7 @@ def test_cleanup_report_content():
         assert expected in lines, f"Expected line '{expected}' not found in the report."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     [ -f /home/user/cleanup.go ] || return 1
     [ ! -L /home/user/cleanup.go ] || return 1

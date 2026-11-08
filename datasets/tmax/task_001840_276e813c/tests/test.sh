@@ -152,7 +152,7 @@ def test_merged_jsonl_content():
         assert abs(exp['total_amount'] - act['total_amount']) < 0.01, f"Total amount mismatch for uid {exp['uid']}: expected {exp['total_amount']}, got {act['total_amount']}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 }
 
 if run_checks; then

@@ -94,7 +94,7 @@ def test_release_list_txt():
     assert actual_lines == expected_lines, f"Release list content or order is incorrect. Expected: {expected_lines}, Found: {actual_lines}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 test -d /home/user/curator
 test -f /home/user/curator/Cargo.toml

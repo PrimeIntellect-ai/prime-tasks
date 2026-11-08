@@ -215,7 +215,7 @@ def test_generated_topologies_and_sliding_windows():
         run_case(tie_video, decoded_tie_edges, txs(3, base, 6000, 6000, 20), directory)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -97,7 +97,7 @@ def test_cracker_runs_and_handles_dynamically_generated_binary():
             SOLUTION_PATH.write_bytes(original_solution)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

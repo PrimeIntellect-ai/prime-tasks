@@ -195,7 +195,7 @@ def test_novel_dynamic_archives_have_exact_manifests():
         assert body["manifest"] == expected, f"Manifest did not exactly match novel archive contents: {body['manifest']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

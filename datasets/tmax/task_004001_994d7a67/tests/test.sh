@@ -190,7 +190,7 @@ TEST_EOF
 export VERIFIER_TRACE="$TRACE"
 RC=1
 if [ "$PREP_OK" -eq 1 ]; then
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
     RC=$?
 fi
 

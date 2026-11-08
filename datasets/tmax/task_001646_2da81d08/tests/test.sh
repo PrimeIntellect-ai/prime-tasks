@@ -291,7 +291,7 @@ def test_zz_cargo_built_service_is_real_and_executes_cpp_binary():
     assert SERVER_PROCESS.poll() is None, "The Cargo-built Rust server did not stay running"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -250,7 +250,7 @@ def test_hidden_disconnected_and_missing_nodes_return_404():
         assert 'error' in data
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_all 2>&1; then

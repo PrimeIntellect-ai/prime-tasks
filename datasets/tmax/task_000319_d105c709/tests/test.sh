@@ -191,7 +191,7 @@ def test_test_results_log_exists_and_passed():
     assert os.path.getmtime(log_file) >= os.path.getmtime(test_file), "test_results.log predates test_api.py; rerun the test and save its output"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -177,7 +177,7 @@ def test_tool_on_independent_configuration(compiled_and_executed_tool):
         workspace_log.write_bytes(saved_log)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_safe_backup.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_safe_backup.py -x --tb=short 2>&1; then
     reward=1
 else
     reward=0

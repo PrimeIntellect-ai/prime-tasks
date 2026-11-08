@@ -128,7 +128,7 @@ def test_02_validation_log_exists_and_format():
     assert abs(err_val - expected_err) < 0.001, f"Reported error {err_val} does not match actual difference {expected_err:.6f}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

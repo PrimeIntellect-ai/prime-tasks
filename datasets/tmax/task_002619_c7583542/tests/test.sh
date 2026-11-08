@@ -161,7 +161,7 @@ def test_authentication_and_routes_are_real():
     assert requests.get(f"{BASE_URL}/not-an-endpoint", headers=HEADERS, timeout=2).status_code != 200
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     PASS=0
 fi
 

@@ -254,7 +254,7 @@ TEST_EOF
 
 if [ -f /home/user/apply_update.go ] && [ ! -L /home/user/apply_update.go ] \
    && go build -o /tmp/apply_update_test /home/user/apply_update.go \
-   && python3 -m pytest /tmp/test_apply_update.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_apply_update.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -154,7 +154,7 @@ def test_best_model_is_fitted_correct_model_and_predicts_correctly():
         'Saved model probabilities do not match the required full-data fit'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

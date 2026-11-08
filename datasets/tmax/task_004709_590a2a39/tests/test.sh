@@ -137,7 +137,7 @@ def test_covariance_txt():
     assert actual_covariance == expected_covariance, f"Covariance mismatch. Expected exactly '{expected_covariance}', got '{actual_covariance}'."
 TEST_EOF
 
-if [ "$status" -eq 0 ] && ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if [ "$status" -eq 0 ] && ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     status=1
 fi
 

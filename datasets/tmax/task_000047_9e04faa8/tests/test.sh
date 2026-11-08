@@ -71,7 +71,7 @@ def test_no_extra_files_in_extracted():
     assert not extra_files, f"Found unexpected files in /home/user/extracted/: {extra_files}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     cat << 'DYNAMIC_EOF' > /tmp/test_dynamic_extractor.py
 import os

@@ -53,7 +53,7 @@ def test_cloud_session_exists():
     )
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || passed=0
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || passed=0
 
 if [ "$passed" -eq 1 ]; then
     baseline=$(mktemp /tmp/cloud_baseline.XXXXXX)

@@ -142,7 +142,7 @@ def test_cron_conf():
     assert "30 3 * * * /home/user/pipeline.sh" in content, "cron.conf does not contain the correct schedule."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 # Exercise the pipeline again with verifier-generated inputs and a distinct
 # template. This prevents fixed outputs from satisfying the checks.
@@ -249,7 +249,7 @@ def test_dynamic_template_report_and_cron():
     assert "30 3 * * * /home/user/pipeline.sh" in cron.read_text().strip()
 PYTEST
 
-python3 -m pytest /tmp/test_dynamic_pipeline.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_pipeline.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

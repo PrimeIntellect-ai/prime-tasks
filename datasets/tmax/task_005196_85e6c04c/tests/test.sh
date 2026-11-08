@@ -245,7 +245,7 @@ def test_posterior_mean_exists_and_valid():
         pytest.fail(f"Could not parse a valid float from {path}. Content: '{content}'")
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

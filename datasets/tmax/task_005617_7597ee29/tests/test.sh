@@ -345,7 +345,7 @@ def test_waf_test_log_contents():
     assert lines[3] == "403", f"Line 4 in {log_file} should be 403, got {lines[3]}."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

@@ -24,7 +24,7 @@ def test_best_experiment_content():
     assert re.match(expected_pattern, content), f"Content of {file_path} is incorrect. Expected 'exp_alpha.csv: 0.6750', but got '{content}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

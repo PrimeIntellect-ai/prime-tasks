@@ -117,7 +117,7 @@ def test_results_values():
     assert div_ids == recomputed_div_ids, f'Divergent IDs do not match residual classification. Expected {recomputed_div_ids}, got {div_ids}.'
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

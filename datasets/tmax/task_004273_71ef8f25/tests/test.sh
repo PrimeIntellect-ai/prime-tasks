@@ -237,7 +237,7 @@ if __name__ == "__main__":
     assert current_content == original_content, f"{gen_path} was modified."
 TEST_EOF
 
-if /home/user/venv/bin/python -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if /home/user/venv/bin/python -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

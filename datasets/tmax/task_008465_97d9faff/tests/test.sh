@@ -219,7 +219,7 @@ def test_06_process_script_parses_current_varied_logs():
     assert actual == expected, f"restored-log summary mismatch; expected {expected!r}, got {actual!r}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_edge_stack.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_edge_stack.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -120,7 +120,7 @@ def test_output_contents():
             f"Expected tf_l2_norm {expected['tf_l2_norm']} for doc_id {expected['doc_id']}, got {actual['tf_l2_norm']}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -95,7 +95,7 @@ def test_dept_metrics_content():
         assert abs(float(actual_depth) - expected["avg_depth"]) < 0.01, f"Incorrect avg_depth for {expected['department']}. Expected {expected['avg_depth']}, got {actual_depth}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
     cp /home/user/dept_metrics.json "$TMPDIR_VERIFY/dept_metrics.json" || return 1
 
     cat <<'EOF' > /home/user/departments.csv

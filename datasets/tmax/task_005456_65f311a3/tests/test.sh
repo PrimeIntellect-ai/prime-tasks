@@ -98,7 +98,7 @@ TEST_EOF
 run_script_and_tests() {
     rm -f /home/user/valid_joined.tsv /home/user/benchmark_report.tsv || return 1
     timeout 20s bash /home/user/clean_and_benchmark.sh || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 run_checks() {

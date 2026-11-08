@@ -89,7 +89,7 @@ def test_verification_log():
     assert expected_output in content, f"Verification log does not contain the expected output. Found: {content}"
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
     STATUS=1
 fi
 

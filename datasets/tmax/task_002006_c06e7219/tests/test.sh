@@ -77,7 +77,7 @@ def test_aligned_sensors_content():
             assert 1000.0 <= press <= 1100.0, f"Pressure {press} out of bounds [1000.0, 1100.0] at {ts}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

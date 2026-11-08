@@ -242,7 +242,7 @@ assert float(wave["average_age"]) == 58.0, f"Expected wave average 58.0, got {wa
 DYNAMIC_EOF
 
 ok=0
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     if python3 /tmp/test_dynamic_state.py 2>&1; then
         ok=1
     fi

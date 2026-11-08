@@ -164,7 +164,7 @@ TEST_EOF
     rm -f "$OUTPUT"
     (cd "$PROJECT" && timeout 180s /usr/bin/cargo run --quiet)
     test -f "$OUTPUT"
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
     python3 /tmp/validate_pipeline.py "$INPUT" "$OUTPUT"
 
     cat << 'PROBE_EOF' > "$INPUT"

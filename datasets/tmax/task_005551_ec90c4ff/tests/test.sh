@@ -33,7 +33,7 @@ def test_debug_report_exists_and_valid():
     assert actual["leaked_struct_name"] == expected["leaked_struct_name"], f"Incorrect leaked struct name. Expected {expected['leaked_struct_name']}, got {actual['leaked_struct_name']}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

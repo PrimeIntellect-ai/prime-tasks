@@ -123,7 +123,7 @@ def test_build_report_format_and_value():
     assert actual_total == expected_total, f"Expected total_metric to be {expected_total}, but got {actual_total}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -255,7 +255,7 @@ DB_STATUS=$?
 rm -f /home/user/violations.csv /tmp/quota_sql_trace.jsonl
 PYTHONPATH=/tmp python3 /home/user/check_quotas.py
 SCRIPT_STATUS=$?
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1
 TEST_STATUS=$?
 
 if [ "$DB_STATUS" -eq 0 ] && [ "$SCRIPT_STATUS" -eq 0 ] && [ "$TEST_STATUS" -eq 0 ]; then

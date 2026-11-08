@@ -148,7 +148,7 @@ def test_independently_generated_configurations():
             run_and_verify(path, expected, expect_timeout=expect_timeout)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     RESULT=1
 else
     RESULT=0

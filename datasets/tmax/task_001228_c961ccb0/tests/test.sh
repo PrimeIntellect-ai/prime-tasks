@@ -87,7 +87,7 @@ def test_mc_energy_reproducibility():
     assert math.isclose(val1, expected_val, rel_tol=1e-9), f"compute_energy result {val1} does not match expected {expected_val}. Ensure math.fsum is used correctly."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

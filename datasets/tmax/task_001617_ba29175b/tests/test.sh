@@ -171,7 +171,7 @@ TEST_EOF
 if [[ "$ok" -eq 1 ]]; then
     if ! cmp -s /home/user/sequence.fasta /tmp/canonical_sequence.fasta; then
         ok=0
-    elif ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    elif ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         ok=0
     fi
 fi

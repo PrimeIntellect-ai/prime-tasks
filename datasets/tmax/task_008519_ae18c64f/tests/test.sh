@@ -131,7 +131,7 @@ def test_result_txt_correct():
     assert abs(val - 0.5) < 1e-4, f"result.txt contains {val}, expected 0.500000 (numerical instability not fixed)."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

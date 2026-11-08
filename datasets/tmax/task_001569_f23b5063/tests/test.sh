@@ -322,7 +322,7 @@ def test_dynamic_archive_inspection_and_repeated_watch_events():
         assert entry + "\n" in log_content, f"Missing dynamic watch entry {entry!r}; log was {log_content!r}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

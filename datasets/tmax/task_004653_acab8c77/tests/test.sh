@@ -182,7 +182,7 @@ def test_detector_on_unlabeled_generated_cases_and_fast_covar_usage():
         assert not failures, f"Generated neutral-path classification failures (seed={seed}): {failures}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

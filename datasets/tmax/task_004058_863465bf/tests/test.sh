@@ -209,7 +209,7 @@ if (
     cd /home/user/upload_service &&
     timeout 60s python3 client.py > /tmp/upload_client_stdout.txt 2>&1
 ) && grep -Eq '[a-fA-F0-9]{64}' /tmp/upload_client_stdout.txt \
-  && python3 -m pytest /tmp/test_final_state.py -x --tb=short \
+  && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short \
   && python3 /tmp/verify.py \
   && python3 /tmp/test_upload_rpc.py; then
     echo "1" > /logs/verifier/reward.txt

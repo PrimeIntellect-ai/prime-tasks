@@ -129,7 +129,7 @@ def test_solution_format_and_metrics():
     assert max_err <= 0.005, f"Max error is {max_err:.5f}, which exceeds the threshold of 0.005."
 TEST_EOF
 
-    if python3 -m pytest "$workdir/test_final_state.py" -x --tb=short 2>&1; then
+    if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$workdir/test_final_state.py" -x --tb=short 2>&1; then
         reward=1
     fi
 fi

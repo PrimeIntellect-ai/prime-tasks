@@ -246,7 +246,7 @@ def test_general_polynomial_multiplication_after_orchestration():
         assert all(value != 0 for value in actual.coeffs.values()), "Zero coefficients were not cleaned up."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 status=$?
 mkdir -p /logs/verifier
 if [ "$status" -eq 0 ]; then

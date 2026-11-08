@@ -242,7 +242,7 @@ def test_fresh_general_validation_cases():
         assert request_status(raw) == 400, raw
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
     result=$?
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true

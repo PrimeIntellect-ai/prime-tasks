@@ -195,7 +195,7 @@ def test_diagnose_script_and_generated_summary():
         assert_summary(port, disk_pct, status)
 TEST_EOF
 
-if python3 -m pytest "$TEST_FILE" -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$TEST_FILE" -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

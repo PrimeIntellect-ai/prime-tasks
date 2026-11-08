@@ -91,7 +91,7 @@ PY
 then
     if go build -o "$BIN" /home/user/pipeline.go; then
         rm -f /home/user/clean_data.csv /home/user/result.txt
-        if timeout 20s "$BIN" && python3 -m pytest /tmp/test_final_state.py -x --tb=short; then
+        if timeout 20s "$BIN" && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short; then
             if python3 - << 'PY'
 import csv
 import secrets
@@ -162,7 +162,7 @@ with open('/tmp/expected_result.txt', 'w') as f:
 PY
             then
                 rm -f /home/user/clean_data.csv /home/user/result.txt
-                if timeout 20s "$BIN" && python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short; then
+                if timeout 20s "$BIN" && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short; then
                     score=1
                 fi
             fi

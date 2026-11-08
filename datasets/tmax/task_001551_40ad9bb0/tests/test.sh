@@ -262,7 +262,7 @@ def test_pipeline_on_generated_inputs(tmp_path):
     assert math.isclose(float(t_match.group(1)), expected_t, abs_tol=2e-6)
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

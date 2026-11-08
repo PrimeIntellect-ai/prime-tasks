@@ -238,7 +238,7 @@ def _save_count():
         f"Benchmark made only {calls} fast_eval.compute calls; 10,000 evaluations of the two-operation expression require at least 20,000."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

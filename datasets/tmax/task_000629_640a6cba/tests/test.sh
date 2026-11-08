@@ -209,7 +209,7 @@ def test_manifest_txt():
 TEST_EOF
 
 if [ "$ok" -eq 1 ]; then
-    python3 -m pytest "$workdir/test_final_state.py" -x --tb=short 2>&1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$workdir/test_final_state.py" -x --tb=short 2>&1
     if [ $? -ne 0 ]; then
         ok=0
     fi

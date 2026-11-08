@@ -56,7 +56,7 @@ def test_output_content():
 TEST_EOF
 
 status=0
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
 cat << 'TEST_EOF' > /tmp/test_program_behavior.py
@@ -168,7 +168,7 @@ def test_program_executes_and_handles_unseen_inputs():
             f.write(original_output)
 TEST_EOF
 
-python3 -m pytest /tmp/test_program_behavior.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_program_behavior.py -x --tb=short 2>&1 || status=1
 fi
 
 if [ "$status" -eq 0 ]; then

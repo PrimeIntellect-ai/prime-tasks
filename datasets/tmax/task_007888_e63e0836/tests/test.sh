@@ -59,7 +59,7 @@ def test_boot_ci():
     assert val1 == 509.0 and val2 == 601.0, f"Expected bootstrap CI to be 509.0, 601.0, but got {val1}, {val2}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

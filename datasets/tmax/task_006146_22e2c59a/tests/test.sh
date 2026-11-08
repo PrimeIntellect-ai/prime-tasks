@@ -301,7 +301,7 @@ def test_post_commit_hook_itself_controls_email_alerts():
     assert "Subject: ALERT: Link is DOWN" in email_data, "Hook email used the wrong subject."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

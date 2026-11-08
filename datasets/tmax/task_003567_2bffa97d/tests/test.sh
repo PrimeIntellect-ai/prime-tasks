@@ -56,7 +56,7 @@ def test_fitted_y_normalized():
     assert np.isclose(total_sum, 1.0, atol=1e-4), f"The fitted intensity array is not properly normalized. Sum is {total_sum:.5f}, expected 1.0"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

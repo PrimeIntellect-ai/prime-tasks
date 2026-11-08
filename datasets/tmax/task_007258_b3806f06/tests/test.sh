@@ -138,7 +138,7 @@ def test_output_content_matches():
         assert abs(actual_pr - expected_pr) <= 0.0001, f"Mismatch in pagerank at index {i}. Expected {expected_pr}, got {actual_pr}."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

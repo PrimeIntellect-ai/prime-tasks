@@ -39,7 +39,7 @@ def test_audit_report_endpoint():
     assert data == expected_data, f"JSON data does not match expected output.\nExpected: {expected_data}\nGot: {data}"
 PY
 
-if [[ "$ok" -eq 1 ]] && ! python3 -m pytest /tmp/test_original_report.py -x --tb=short; then
+if [[ "$ok" -eq 1 ]] && ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_original_report.py -x --tb=short; then
     ok=0
 fi
 
@@ -200,7 +200,7 @@ def test_dynamic_audit_report():
     assert data == expected_data, f"JSON data does not match dynamically derived output.\nExpected: {expected_data}\nGot: {data}"
 PY
 
-    if ! python3 -m pytest /tmp/test_dynamic_report.py -x --tb=short; then
+    if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_report.py -x --tb=short; then
         ok=0
     fi
 fi

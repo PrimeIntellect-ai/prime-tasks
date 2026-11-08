@@ -255,7 +255,7 @@ def test_built_grpc_service_and_rust_client_really_run(tmp_path):
     assert re.search(r'definitely lost:\s*0 bytes in 0 blocks', report, re.I), report
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

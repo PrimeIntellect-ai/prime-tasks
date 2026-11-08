@@ -172,7 +172,7 @@ def test_idempotent_setup_script_exists():
     assert os.path.isfile(file_path), f"{file_path} is missing."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
     rm -f /home/user/nginx/nginx.pid
     python3 /home/user/backend.py >/tmp/verifier_backend.log 2>&1 &

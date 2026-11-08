@@ -62,7 +62,7 @@ def test_server_file_exists():
     assert os.path.isfile(server_path), f"File {server_path} is missing."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     test -f /home/user/cicd/deploy.sh || return 1
     timeout 15 bash /home/user/cicd/deploy.sh >/tmp/deploy-verifier.out 2>&1 || return 1

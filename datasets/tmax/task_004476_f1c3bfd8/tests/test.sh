@@ -133,7 +133,7 @@ def test_summary_matches_required_pipeline():
     assert result['test_mse_ci_upper'] == pytest.approx(float(expected_upper), rel=1e-10, abs=1e-8), "Upper CI bound does not match the required bootstrap computation."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

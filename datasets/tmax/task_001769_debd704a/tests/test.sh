@@ -289,7 +289,7 @@ def test_script_artifact_recursive_streaming_locking_and_concurrency():
         f"Concurrent recursive execution produced an incorrect index. Missing: {missing}; unexpected: {unexpected}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

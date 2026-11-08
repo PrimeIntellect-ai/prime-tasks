@@ -159,7 +159,7 @@ def test_invalid_auth():
     assert response.status_code in [401, 403], f"Expected 401 or 403 for invalid auth, got {response.status_code}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     rm -rf "$BACKUP_DIR"
     mkdir -p "$BACKUP_DIR" || return 1
@@ -268,7 +268,7 @@ def test_generated_aggregate(node_id):
     }
 DYNAMIC_EOF
 
-    python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short || return 1
     return 0
 }
 

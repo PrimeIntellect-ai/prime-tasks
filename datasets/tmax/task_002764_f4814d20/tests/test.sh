@@ -189,7 +189,7 @@ def test_total_count():
     assert total_count == 10000, f"Expected total count of 10000 events, but got {total_count}. Malformed lines must be repaired and counted, not skipped."
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt

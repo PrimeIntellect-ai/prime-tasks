@@ -271,7 +271,7 @@ def test_benchmark_is_plausible_against_1000_live_inferences():
     assert reported_us <= live_average_us * 2 + 1
 PYTEST
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 }
 
 if run_verification 2>&1; then

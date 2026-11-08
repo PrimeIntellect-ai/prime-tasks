@@ -149,7 +149,7 @@ TEST_EOF
 if [ -f /home/user/etl_pipeline.py ] \
    && rm -f /home/user/output/top_modules_graph.json \
    && python3 /home/user/etl_pipeline.py \
-   && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

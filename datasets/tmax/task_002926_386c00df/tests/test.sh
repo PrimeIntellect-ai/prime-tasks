@@ -265,7 +265,7 @@ def test_performance_and_accuracy():
     assert speedup >= 50.0, f"Performance metric failed: Speedup={speedup:.2f}x is not >= 50.0x"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

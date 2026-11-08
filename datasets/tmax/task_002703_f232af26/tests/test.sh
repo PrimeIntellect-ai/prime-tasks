@@ -150,7 +150,7 @@ KILL_EOF
     service_pid=$!
     sleep 1
 
-    if kill -0 "$service_pid" 2>/dev/null && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+    if kill -0 "$service_pid" 2>/dev/null && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
         reward=1
     fi
 

@@ -267,6 +267,6 @@ def test_multiple_unpredictable_wav_payloads_are_parsed_each_request():
         assert_schema(response, req_id, transcript)
 PY_TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 kill -0 "$server_pid"
 reward=1

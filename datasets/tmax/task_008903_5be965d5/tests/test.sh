@@ -39,7 +39,7 @@ def test_scan_results_content():
     assert lines == expected_content, f"Content of {results_path} does not match the expected output. Got: {lines}"
 TEST_EOF
 
-  python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+  python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
   # Build the submitted source using the exact command required by the task.
   g++ -std=c++17 /home/user/vuln_scanner.cpp -o /home/user/vuln_scanner || return 1

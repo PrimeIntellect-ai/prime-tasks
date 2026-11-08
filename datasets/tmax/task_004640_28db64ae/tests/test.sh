@@ -303,7 +303,7 @@ def test_leak_rate(tmp_path):
     assert leak_rate <= 0.0, f"Metric leak_rate {leak_rate} > threshold 0.0. Passphrase leaked {leaks_detected} times out of {num_runs} runs."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

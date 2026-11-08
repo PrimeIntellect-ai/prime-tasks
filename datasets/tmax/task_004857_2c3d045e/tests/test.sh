@@ -80,7 +80,7 @@ def test_fast_sim_correctness_and_speed():
     assert speedup >= 10.0, f"Speedup {speedup:.2f}x is less than the required 10.0x (Binary: {total_time_bin:.3f}s, Script: {total_time_py:.3f}s)"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -188,7 +188,7 @@ def test_final_target_nodes():
     assert content[2] == "n5,0.1,C-8842", f"Expected row 2 to be 'n5,0.1,C-8842', got '{content[2]}'"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

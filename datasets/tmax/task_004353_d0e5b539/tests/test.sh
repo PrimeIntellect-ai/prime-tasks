@@ -65,7 +65,7 @@ def test_fast_scanner_speedup_and_correctness():
     assert speedup >= 5.0, f"Runtime speedup is {speedup:.2f}x, which is below the threshold of 5.0x (Legacy: {legacy_time:.4f}s, Fast: {fast_time:.4f}s)"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

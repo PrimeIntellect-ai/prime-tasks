@@ -266,7 +266,7 @@ def test_generated_mixed_corpus_content_hashes_and_rejection():
         assert first.stat().st_ino == duplicate.stat().st_ino, "Duplicate frames do not resolve to the same inode"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

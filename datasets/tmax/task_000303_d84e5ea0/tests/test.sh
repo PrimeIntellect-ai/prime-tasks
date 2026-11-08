@@ -128,7 +128,7 @@ TEST_EOF
 rm -f /home/user/top_anomalies.json /home/user/anomaly_plot.png
 
 if timeout 30s python3 /home/user/analyze.py >/tmp/analyze.stdout 2>/tmp/analyze.stderr && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     cat /tmp/analyze.stdout 2>/dev/null || true

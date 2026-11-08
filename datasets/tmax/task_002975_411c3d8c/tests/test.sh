@@ -79,7 +79,7 @@ def test_first_large_tx_identified_correctly(parsed_log_data):
     assert actual_tx_id == expected_tx_id, f"Expected first large tx_id to be '{expected_tx_id}', but got '{actual_tx_id}' in {FIRST_LARGE_TX_FILE}"
 TEST_EOF
 
-        if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+        if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
             reward=1
         fi
     fi

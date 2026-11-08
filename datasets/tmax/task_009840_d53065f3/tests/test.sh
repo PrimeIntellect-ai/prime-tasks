@@ -193,7 +193,7 @@ finally:
 DYNAMIC_EOF
 
 status=0
-python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || status=1
 if [ "$status" -eq 0 ]; then
     python3 /tmp/test_dynamic_execution.py 2>&1 || status=1
 fi

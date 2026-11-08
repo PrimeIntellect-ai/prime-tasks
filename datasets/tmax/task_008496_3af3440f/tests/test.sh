@@ -244,7 +244,7 @@ def test_plot_script_and_distribution():
     assert image.size > 0 and image.ndim in (2, 3), "distribution.png is not a valid rendered image"
 PYTEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

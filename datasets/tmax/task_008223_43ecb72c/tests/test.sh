@@ -97,7 +97,7 @@ def test_results_csv_exists_and_correct():
         assert abs(exp_rate - act_rate) <= 1e-4, f"For file '{exp_filename}', expected positive_rate {exp_rate:.4f} but got {act_rate}. Make sure rounding and logic are correct."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

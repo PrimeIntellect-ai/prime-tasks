@@ -187,7 +187,7 @@ def test_graph_edges_csv_exists_and_content():
     for i, expected_line in enumerate(expected_lines):
         assert content[i].strip() == expected_line, f"Line {i+1} in {file_path} does not match expected output."
 TEST_EOF
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 
 # Generate a fresh fixture after the agent has finished so hardcoded outputs do
 # not pass. Expected results are derived independently from that fixture.

@@ -86,7 +86,7 @@ def test_final_state():
     assert nova_corp_count > 0, "Could not find 'NovaCorp' in the updated archive. Replacement may have failed."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

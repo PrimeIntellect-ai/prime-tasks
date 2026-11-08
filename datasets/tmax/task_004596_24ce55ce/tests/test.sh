@@ -313,7 +313,7 @@ def test_adversarial_corpus_filter_optional_external_corpora():
         assert len(clean_modified) == 0, f"{len(clean_modified)} clean modified/rejected: {list(clean_modified)}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -283,7 +283,7 @@ def test_unseeded_independently_derived_cases():
         )
 PY
 
-WORKDIR="$WORKDIR" python3 -m pytest "$WORKDIR/test_final_state.py" -x --tb=short 2>&1
+WORKDIR="$WORKDIR" python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider "$WORKDIR/test_final_state.py" -x --tb=short 2>&1
 if [ $? -eq 0 ]; then
     echo "1" > /logs/verifier/reward.txt
 fi

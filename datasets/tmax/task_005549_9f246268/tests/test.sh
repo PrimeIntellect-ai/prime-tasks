@@ -185,7 +185,7 @@ DYNAMIC_EOF
 (
     rm -f /home/user/final_billing.json &&
     cd /home/user && python3 /home/user/billing_processor.py &&
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 &&
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 &&
     python3 /tmp/test_dynamic_billing.py
 )
 status=$?

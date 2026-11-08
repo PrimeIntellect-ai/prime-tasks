@@ -82,7 +82,7 @@ def test_fit_endpoint(true_A, true_D, true_F):
     assert abs(est_F - true_F) / true_F <= 0.05, f"Frequency {est_F} not within 5% of {true_F}"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

@@ -360,7 +360,7 @@ PY
     sleep 0.2
 done
 
-if [ "$startup_ok" -eq 1 ] && [ "$ready" -eq 1 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$startup_ok" -eq 1 ] && [ "$ready" -eq 1 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     cat /tmp/start_services.log 2>/dev/null || true

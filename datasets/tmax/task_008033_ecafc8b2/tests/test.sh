@@ -86,7 +86,7 @@ def test_summary_json_content():
         assert actual.get('cost_rank') == expected['cost_rank'], f"Record {i} ({expected['id']}): Expected cost_rank {expected['cost_rank']}, got {actual.get('cost_rank')}"
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     test -d /home/user/etl_pipeline || return 1
     test -f /home/user/etl_pipeline/main.go || return 1

@@ -149,7 +149,7 @@ def test_rust_program_on_fresh_unpredictable_input():
         'Report was not atomically renamed from quarantine_report.txt.tmp to quarantine_report.txt'
 PY_EOF
 
-python3 -m pytest /tmp/test_organizer.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_organizer.py -x --tb=short
 }
 
 if run_verification 2>&1; then

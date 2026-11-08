@@ -80,7 +80,7 @@ def test_validation_errors_txt():
     assert lines == expected_errors, f"validation_errors.txt content mismatch. Expected {expected_errors}, got {lines}."
 TEST_EOF
 
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short || return 1
 
     python3 << 'PY_EOF' || return 1
 import json
@@ -174,7 +174,7 @@ def test_dynamic_validation_errors():
     assert lines == [str(value) for value in EXPECTED['errors']]
 DYNAMIC_EOF
 
-    python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short || return 1
     return 0
 }
 

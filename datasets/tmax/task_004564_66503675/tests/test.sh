@@ -217,7 +217,7 @@ if [ -f /home/user/process_sensors.go ] && \
    GO111MODULE=off go build -o /tmp/process_sensors_verified /home/user/process_sensors.go && \
    rm -f /home/user/top_sensors.json && \
    timeout 20 /tmp/process_sensors_verified && \
-   python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+   python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     passed=1
 fi
 

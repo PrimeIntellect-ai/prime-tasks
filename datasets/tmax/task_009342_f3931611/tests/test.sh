@@ -297,7 +297,7 @@ def test_web_server_running_and_serve_script_works():
     assert peer_der == local_der, "Port 8443 is not using /home/user/cert.pem"
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

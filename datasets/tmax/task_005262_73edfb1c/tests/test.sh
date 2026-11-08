@@ -269,7 +269,7 @@ def test_http_artifact_not_found():
         assert resp.status_code == 404, f"Expected HTTP status 404 for {url}, got {resp.status_code}. Response: {resp.text[:100]}"
 TEST_EOF
 
-python3 -m pytest /tmp/test_final_state.py -x --tb=short
+python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short
 ) then
     reward=1
 fi

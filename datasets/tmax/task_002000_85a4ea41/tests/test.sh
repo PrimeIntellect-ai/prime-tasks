@@ -217,7 +217,7 @@ def test_daemon_invocation_protocol_and_deadlock_retries():
         assert packet_counts[packet] >= 2, 'DEADLOCK_DETECTED was not retried for packet %s' % packet
 TEST_EOF
 
-if [ "$START_STATUS" -eq 0 ] && python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if [ "$START_STATUS" -eq 0 ] && python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     if [ "$START_STATUS" -ne 0 ]; then

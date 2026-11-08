@@ -55,7 +55,7 @@ def test_output_json_format_and_content():
         assert actual["top_author_name"] == expected["top_author_name"], f"Item {i}: expected top_author_name '{expected['top_author_name']}', got '{actual['top_author_name']}'."
 TEST_EOF
 
-if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
     echo "0" > /logs/verifier/reward.txt

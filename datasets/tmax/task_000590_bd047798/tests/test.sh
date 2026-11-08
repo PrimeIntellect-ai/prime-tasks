@@ -92,7 +92,7 @@ def test_anomalies_content():
         assert data_rows[i] == expected, f"Anomaly row {i+1} mismatch. Expected {expected}, got {data_rows[i]}"
 TEST_EOF
 
-if ! python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
     result=0
 fi
 
@@ -203,7 +203,7 @@ def test_dynamic_anomaly_output():
     assert actual == expected_anomalies, f"Dynamic anomaly output mismatch: expected {expected_anomalies}, got {actual}"
 DYNAMIC_EOF
 
-if ! python3 -m pytest /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
+if ! python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_dynamic_state.py -x --tb=short 2>&1; then
     result=0
 fi
 

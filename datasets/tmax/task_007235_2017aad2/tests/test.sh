@@ -233,7 +233,7 @@ run_and_check() {
     program="$1"
     rm -rf /home/user/clean_data
     timeout 20s "$program" >/tmp/cleaner.stdout 2>/tmp/cleaner.stderr || return 1
-    python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
+    python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1 || return 1
 }
 
 # Exercise both the required submitted executable and a build of the required source.
