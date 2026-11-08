@@ -22,7 +22,7 @@ before the agent phase, so other runners must write that diff themselves.
 
 ## Task contract
 
-- `task.toml` pins a public Docker Hub image by digest (`docker.io/swerebenchv2/...`) and declares
+- `task.toml` pins a public Docker Hub image by digest alone (`docker.io/swerebenchv2/<name>@sha256:...`) and declares
   6 CPUs, 24 GiB of memory, 32 GiB of storage, a 3,000 s agent timeout, and a 2,400 s verifier
   timeout. `[metadata]` holds `repo`, `language`, `log_parser`, and `quality_flags`; 159 tasks are
   flagged `weak_f2p`.
@@ -60,9 +60,12 @@ Compared with their SWE-rebench V2 rows:
 
 ## Conversion to separate verifiers
 
-The import script changes three things in each upstream task:
+The import script changes four things in each upstream task:
 
 - `task.toml` sets `[verifier].environment_mode = "separate"`.
+- `task.toml` drops the tag from `docker_image` and keeps the digest. Prime resolves a
+  `name:tag@sha256:...` reference by its tag and serves an earlier build of the 13,154 images that
+  Nebius rebuilt under the same tags in October 2026.
 - `tests/test.sh` applies `/logs/artifacts/model.patch` before restoring the test files.
 - `tests/test.sh` raises the open-file limit to the hard limit. Prime sandboxes default to 1,024
   open files, under which meilisearch's integration tests fail even with the reference patch.

@@ -9,6 +9,7 @@ The verifier box receives only `/logs/artifacts/model.patch`, the agent's diff a
 image's starting tree, and its `tests/test.sh` applies that diff before the held-out test patch.
 """
 
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,9 @@ NUM_TASKS = 13_337
 DATASET_DIR = Path(__file__).resolve().parents[2] / "datasets" / "swe-rebench-v2.1"
 
 MODEL_PATCH = "/logs/artifacts/model.patch"
+
+# Prime resolves `repo:tag@sha256:digest` by its tag; the digest alone selects the pinned image.
+TAGGED_DIGEST = re.compile(r'^(docker_image = "[^":@]+(?:/[^":@]+)*):[^"@]+(@sha256:[0-9a-f]{64}")$', re.M)
 
 APPLY_MODEL_PATCH = f"""\
 if [ -s {MODEL_PATCH} ]; then
@@ -44,6 +48,11 @@ def convert(task_dir: Path) -> None:
     text = replace_once(
         toml_path.read_text(), "[verifier]\n", '[verifier]\nenvironment_mode = "separate"\n', toml_path
     )
+    text = TAGGED_DIGEST.sub(r"\1\2", text)
+    if not re.search(r'^docker_image = "[^"]+@sha256:[0-9a-f]{64}"$', text, re.M) or re.search(
+        r'^docker_image = "[^"@]+:[^"@/]+@', text, re.M
+    ):
+        raise SystemExit(f"{toml_path}: docker_image is not a digest-only reference")
     toml_path.write_text(text)
 
     script_path = task_dir / "tests" / "test.sh"
