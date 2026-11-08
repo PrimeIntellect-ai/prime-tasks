@@ -1,0 +1,310 @@
+diff --git a/client/httpclient.go b/client/httpclient.go
+index 7e1d5b5..fea31a9 100644
+--- a/client/httpclient.go
++++ b/client/httpclient.go
+@@ -42,11 +42,13 @@ func (c *httpClient) Start(ctx context.Context, settings types.StartSettings) er
+ 
+ 	c.opAMPServerURL = settings.OpAMPServerURL
+ 
+-	// TODO: implement compression based on settings.EnableCompression value.
+-
+ 	// Prepare Server connection settings.
+ 	c.sender.SetRequestHeader(settings.Header)
+ 
++	if settings.EnableCompression {
++		c.sender.EnableCompression()
++	}
++
+ 	// Prepare the first message to send.
+ 	err := c.common.PrepareFirstMessage(ctx)
+ 	if err != nil {
+diff --git a/client/internal/clientcommon.go b/client/internal/clientcommon.go
+index bc8211f..c734abf 100644
+--- a/client/internal/clientcommon.go
++++ b/client/internal/clientcommon.go
+@@ -16,6 +16,7 @@ var (
+ 	ErrAgentDescriptionNoAttributes = errors.New("AgentDescription has no attributes defined")
+ 	ErrAgentHealthMissing           = errors.New("AgentHealth is nil")
+ 	ErrReportsEffectiveConfigNotSet = errors.New("ReportsEffectiveConfig capability is not set")
++	ErrReportsRemoteConfigNotSet    = errors.New("ReportsRemoteConfig capability is not set")
+ 	ErrPackagesStateProviderNotSet  = errors.New("PackagesStateProvider must be set")
+ 	ErrAcceptsPackagesNotSet        = errors.New("AcceptsPackages and ReportsPackageStatuses must be set")
+ 
+@@ -293,6 +294,10 @@ func (c *ClientCommon) UpdateEffectiveConfig(ctx context.Context) error {
+ // It also remembers the new RemoteConfigStatus in the client state so that it can be
+ // sent to the Server when the Server asks for it.
+ func (c *ClientCommon) SetRemoteConfigStatus(status *protobufs.RemoteConfigStatus) error {
++	if c.Capabilities&protobufs.AgentCapabilities_ReportsRemoteConfig == 0 {
++		return ErrReportsRemoteConfigNotSet
++	}
++
+ 	if status.LastRemoteConfigHash == nil {
+ 		return errLastRemoteConfigHashNil
+ 	}
+diff --git a/client/internal/httpsender.go b/client/internal/httpsender.go
+index fa5e4fd..cd2f25c 100644
+--- a/client/internal/httpsender.go
++++ b/client/internal/httpsender.go
+@@ -2,6 +2,7 @@ package internal
+ 
+ import (
+ 	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"errors"
+ 	"fmt"
+@@ -21,6 +22,9 @@ import (
+ const OpAMPPlainHTTPMethod = "POST"
+ const defaultPollingIntervalMs = 30 * 1000 // default interval is 30 seconds.
+ 
++const headerContentEncoding = "Content-Encoding"
++const encodingTypeGZip = "gzip"
++
+ // HTTPSender allows scheduling messages to send. Once run, it will loop through
+ // a request/response cycle for each message to send and will process all received
+ // responses using a receivedProcessor. If there are no pending messages to send
+@@ -28,11 +32,12 @@ const defaultPollingIntervalMs = 30 * 1000 // default interval is 30 seconds.
+ type HTTPSender struct {
+ 	SenderCommon
+ 
+-	url               string
+-	logger            types.Logger
+-	client            *http.Client
+-	callbacks         types.Callbacks
+-	pollingIntervalMs int64
++	url                string
++	logger             types.Logger
++	client             *http.Client
++	callbacks          types.Callbacks
++	pollingIntervalMs  int64
++	compressionEnabled bool
+ 
+ 	// Headers to send with all requests.
+ 	requestHeader http.Header
+@@ -205,7 +210,23 @@ func (h *HTTPSender) prepareRequest(ctx context.Context) (*http.Request, error)
+ 		return nil, err
+ 	}
+ 
+-	body := bytes.NewReader(data)
++	var body io.Reader
++
++	if h.compressionEnabled {
++		var buf bytes.Buffer
++		g := gzip.NewWriter(&buf)
++		if _, err = g.Write(data); err != nil {
++			h.logger.Errorf("Failed to compress message: %v", err)
++			return nil, err
++		}
++		if err = g.Close(); err != nil {
++			h.logger.Errorf("Failed to close the writer: %v", err)
++			return nil, err
++		}
++		body = &buf
++	} else {
++		body = bytes.NewReader(data)
++	}
+ 	req, err := http.NewRequestWithContext(ctx, OpAMPPlainHTTPMethod, h.url, body)
+ 	if err != nil {
+ 		return nil, err
+@@ -238,3 +259,8 @@ func (h *HTTPSender) receiveResponse(ctx context.Context, resp *http.Response) {
+ func (h *HTTPSender) SetPollingInterval(duration time.Duration) {
+ 	atomic.StoreInt64(&h.pollingIntervalMs, duration.Milliseconds())
+ }
++
++func (h *HTTPSender) EnableCompression() {
++	h.compressionEnabled = true
++	h.requestHeader.Set(headerContentEncoding, encodingTypeGZip)
++}
+diff --git a/internal/examples/agent/agent/agent.go b/internal/examples/agent/agent/agent.go
+index fbfc274..65987a5 100644
+--- a/internal/examples/agent/agent/agent.go
++++ b/internal/examples/agent/agent/agent.go
+@@ -104,6 +104,7 @@ func (agent *Agent) start() error {
+ 		},
+ 		RemoteConfigStatus: agent.remoteConfigStatus,
+ 		Capabilities: protobufs.AgentCapabilities_AcceptsRemoteConfig |
++			protobufs.AgentCapabilities_ReportsRemoteConfig |
+ 			protobufs.AgentCapabilities_ReportsEffectiveConfig |
+ 			protobufs.AgentCapabilities_ReportsOwnMetrics,
+ 	}
+diff --git a/internal/examples/server/data/agent.go b/internal/examples/server/data/agent.go
+index f684632..cf53f37 100644
+--- a/internal/examples/server/data/agent.go
++++ b/internal/examples/server/data/agent.go
+@@ -211,7 +211,7 @@ func (agent *Agent) processStatusUpdate(
+ 	// Check if any fields were omitted in the status report.
+ 	effectiveConfigOmitted := agent.hasCapability(protobufs.AgentCapabilities_ReportsEffectiveConfig) && newStatus.EffectiveConfig == nil
+ 	packageStatusesOmitted := agent.hasCapability(protobufs.AgentCapabilities_ReportsPackageStatuses) && newStatus.PackageStatuses == nil
+-	remoteConfigStatusOmitted := agent.hasCapability(protobufs.AgentCapabilities_AcceptsRemoteConfig) && newStatus.RemoteConfigStatus == nil
++	remoteConfigStatusOmitted := agent.hasCapability(protobufs.AgentCapabilities_ReportsRemoteConfig) && newStatus.RemoteConfigStatus == nil
+ 	healthOmitted := agent.hasCapability(protobufs.AgentCapabilities_ReportsHealth) && newStatus.Health == nil
+ 
+ 	// True if the status was not fully reported.
+diff --git a/internal/examples/supervisor/supervisor/supervisor.go b/internal/examples/supervisor/supervisor/supervisor.go
+index 161e1a4..0b8f630 100644
+--- a/internal/examples/supervisor/supervisor/supervisor.go
++++ b/internal/examples/supervisor/supervisor/supervisor.go
+@@ -152,6 +152,7 @@ func (s *Supervisor) startOpAMP() error {
+ 			OnMessageFunc: s.onMessage,
+ 		},
+ 		Capabilities: protobufs.AgentCapabilities_AcceptsRemoteConfig |
++			protobufs.AgentCapabilities_ReportsRemoteConfig |
+ 			protobufs.AgentCapabilities_ReportsEffectiveConfig |
+ 			protobufs.AgentCapabilities_ReportsOwnMetrics |
+ 			protobufs.AgentCapabilities_ReportsHealth,
+diff --git a/internal/proto/opamp.proto b/internal/proto/opamp.proto
+index 851a7e7..61ed289 100644
+--- a/internal/proto/opamp.proto
++++ b/internal/proto/opamp.proto
+@@ -540,6 +540,8 @@ enum AgentCapabilities {
+     AcceptsRestartCommand          = 0x00000400;
+     // The Agent will report Health via AgentToServer.health field.
+     ReportsHealth                  = 0x00000800;
++    // The Agent will report RemoteConfig status via AgentToServer.remote_config_status field.
++    ReportsRemoteConfig            = 0x00001000;
+ 
+     // Add new capabilities here, continuing with the least significant unused bit.
+ }
+diff --git a/protobufs/opamp.pb.go b/protobufs/opamp.pb.go
+index ca75af2..273e8c0 100644
+--- a/protobufs/opamp.pb.go
++++ b/protobufs/opamp.pb.go
+@@ -140,6 +140,8 @@ const (
+ 	AgentCapabilities_AcceptsRestartCommand AgentCapabilities = 1024
+ 	// The Agent will report Health via AgentToServer.health field.
+ 	AgentCapabilities_ReportsHealth AgentCapabilities = 2048
++	// The Agent will report RemoteConfig status via AgentToServer.remote_config_status field.
++	AgentCapabilities_ReportsRemoteConfig AgentCapabilities = 4096
+ )
+ 
+ // Enum value maps for AgentCapabilities.
+@@ -158,6 +160,7 @@ var (
+ 		512:  "AcceptsOtherConnectionSettings",
+ 		1024: "AcceptsRestartCommand",
+ 		2048: "ReportsHealth",
++		4096: "ReportsRemoteConfig",
+ 	}
+ 	AgentCapabilities_value = map[string]int32{
+ 		"UnspecifiedAgentCapability":     0,
+@@ -173,6 +176,7 @@ var (
+ 		"AcceptsOtherConnectionSettings": 512,
+ 		"AcceptsRestartCommand":          1024,
+ 		"ReportsHealth":                  2048,
++		"ReportsRemoteConfig":            4096,
+ 	}
+ )
+ 
+@@ -2957,7 +2961,7 @@ var file_opamp_proto_rawDesc = []byte{
+ 	0x63, 0x63, 0x65, 0x70, 0x74, 0x73, 0x50, 0x61, 0x63, 0x6b, 0x61, 0x67, 0x65, 0x73, 0x53, 0x74,
+ 	0x61, 0x74, 0x75, 0x73, 0x10, 0x10, 0x12, 0x1c, 0x0a, 0x18, 0x4f, 0x66, 0x66, 0x65, 0x72, 0x73,
+ 	0x43, 0x6f, 0x6e, 0x6e, 0x65, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x53, 0x65, 0x74, 0x74, 0x69, 0x6e,
+-	0x67, 0x73, 0x10, 0x20, 0x2a, 0xe8, 0x02, 0x0a, 0x11, 0x41, 0x67, 0x65, 0x6e, 0x74, 0x43, 0x61,
++	0x67, 0x73, 0x10, 0x20, 0x2a, 0x82, 0x03, 0x0a, 0x11, 0x41, 0x67, 0x65, 0x6e, 0x74, 0x43, 0x61,
+ 	0x70, 0x61, 0x62, 0x69, 0x6c, 0x69, 0x74, 0x69, 0x65, 0x73, 0x12, 0x1e, 0x0a, 0x1a, 0x55, 0x6e,
+ 	0x73, 0x70, 0x65, 0x63, 0x69, 0x66, 0x69, 0x65, 0x64, 0x41, 0x67, 0x65, 0x6e, 0x74, 0x43, 0x61,
+ 	0x70, 0x61, 0x62, 0x69, 0x6c, 0x69, 0x74, 0x79, 0x10, 0x00, 0x12, 0x11, 0x0a, 0x0d, 0x52, 0x65,
+@@ -2979,11 +2983,13 @@ var file_opamp_proto_rawDesc = []byte{
+ 	0x74, 0x69, 0x6f, 0x6e, 0x53, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x10, 0x80, 0x04, 0x12,
+ 	0x1a, 0x0a, 0x15, 0x41, 0x63, 0x63, 0x65, 0x70, 0x74, 0x73, 0x52, 0x65, 0x73, 0x74, 0x61, 0x72,
+ 	0x74, 0x43, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x10, 0x80, 0x08, 0x12, 0x12, 0x0a, 0x0d, 0x52,
+-	0x65, 0x70, 0x6f, 0x72, 0x74, 0x73, 0x48, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x10, 0x80, 0x10, 0x42,
+-	0x2e, 0x5a, 0x2c, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x70,
+-	0x65, 0x6e, 0x2d, 0x74, 0x65, 0x6c, 0x65, 0x6d, 0x65, 0x74, 0x72, 0x79, 0x2f, 0x6f, 0x70, 0x61,
+-	0x6d, 0x70, 0x2d, 0x67, 0x6f, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x75, 0x66, 0x73, 0x62,
+-	0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x65, 0x70, 0x6f, 0x72, 0x74, 0x73, 0x48, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x10, 0x80, 0x10, 0x12,
++	0x18, 0x0a, 0x13, 0x52, 0x65, 0x70, 0x6f, 0x72, 0x74, 0x73, 0x52, 0x65, 0x6d, 0x6f, 0x74, 0x65,
++	0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x10, 0x80, 0x20, 0x42, 0x2e, 0x5a, 0x2c, 0x67, 0x69, 0x74,
++	0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x70, 0x65, 0x6e, 0x2d, 0x74, 0x65, 0x6c,
++	0x65, 0x6d, 0x65, 0x74, 0x72, 0x79, 0x2f, 0x6f, 0x70, 0x61, 0x6d, 0x70, 0x2d, 0x67, 0x6f, 0x2f,
++	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x75, 0x66, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x33,
+ }
+ 
+ var (
+diff --git a/server/serverimpl.go b/server/serverimpl.go
+index 4fee254..f1a3d34 100644
+--- a/server/serverimpl.go
++++ b/server/serverimpl.go
+@@ -1,6 +1,8 @@
+ package server
+ 
+ import (
++	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"errors"
+ 	"io"
+@@ -21,6 +23,9 @@ var (
+ 
+ const defaultOpAMPPath = "/v1/opamp"
+ const headerContentType = "Content-Type"
++const headerContentEncoding = "Content-Encoding"
++const headerAcceptEncoding = "Accept-Encoding"
++const contentEncodingGzip = "gzip"
+ const contentTypeProtobuf = "application/x-protobuf"
+ 
+ type server struct {
+@@ -228,8 +233,45 @@ func (s *server) handleWSConnection(wsConn *websocket.Conn) {
+ 	}
+ }
+ 
++func decompressGzip(data []byte) ([]byte, error) {
++	r, err := gzip.NewReader(bytes.NewBuffer(data))
++	if err != nil {
++		return nil, err
++	}
++	defer r.Close()
++	return io.ReadAll(r)
++}
++
++func (s *server) readReqBody(req *http.Request) ([]byte, error) {
++	data, err := io.ReadAll(req.Body)
++	if err != nil {
++		return nil, err
++	}
++	if req.Header.Get(headerContentEncoding) == contentEncodingGzip {
++		data, err = decompressGzip(data)
++		if err != nil {
++			return nil, err
++		}
++	}
++	return data, nil
++}
++
++func compressGzip(data []byte) ([]byte, error) {
++	var buf bytes.Buffer
++	w := gzip.NewWriter(&buf)
++	_, err := w.Write(data)
++	if err != nil {
++		return nil, err
++	}
++	err = w.Close()
++	if err != nil {
++		return nil, err
++	}
++	return buf.Bytes(), nil
++}
++
+ func (s *server) handlePlainHTTPRequest(req *http.Request, w http.ResponseWriter) {
+-	bytes, err := io.ReadAll(req.Body)
++	bytes, err := s.readReqBody(req)
+ 	if err != nil {
+ 		s.logger.Debugf("Cannot read HTTP body: %v", err)
+ 		w.WriteHeader(http.StatusBadRequest)
+@@ -280,6 +322,15 @@ func (s *server) handlePlainHTTPRequest(req *http.Request, w http.ResponseWriter
+ 
+ 	// Send the response.
+ 	w.Header().Set(headerContentType, contentTypeProtobuf)
++	if req.Header.Get(headerAcceptEncoding) == contentEncodingGzip {
++		bytes, err = compressGzip(bytes)
++		if err != nil {
++			s.logger.Errorf("Cannot compress response: %v", err)
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++		w.Header().Set(headerContentEncoding, contentEncodingGzip)
++	}
+ 	_, err = w.Write(bytes)
+ 
+ 	if err != nil {

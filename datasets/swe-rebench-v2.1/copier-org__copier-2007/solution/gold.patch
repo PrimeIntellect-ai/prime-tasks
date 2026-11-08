@@ -1,0 +1,277 @@
+diff --git a/copier/main.py b/copier/main.py
+index f164ff0..bb77f2f 100644
+--- a/copier/main.py
++++ b/copier/main.py
+@@ -7,9 +7,10 @@ import platform
+ import subprocess
+ import sys
+ from contextlib import suppress
++from contextvars import ContextVar
+ from dataclasses import asdict, field, replace
+ from filecmp import dircmp
+-from functools import cached_property, partial
++from functools import cached_property, partial, wraps
+ from itertools import chain
+ from pathlib import Path
+ from shutil import rmtree
+@@ -65,6 +66,8 @@ from .types import (
+     AnyByStrMutableMapping,
+     JSONSerializable,
+     LazyDict,
++    Operation,
++    ParamSpec,
+     Phase,
+     RelativePath,
+     StrOrPath,
+@@ -73,6 +76,29 @@ from .user_data import AnswersMap, Question, load_answersfile_data
+ from .vcs import get_git
+ 
+ _T = TypeVar("_T")
++_P = ParamSpec("_P")
++
++_operation: ContextVar[Operation] = ContextVar("_operation")
++
++
++def as_operation(value: Operation) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
++    """Decorator to set the current operation context, if not defined already.
++
++    This value is used to template specific configuration options.
++    """
++
++    def _decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
++        @wraps(func)
++        def _wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
++            token = _operation.set(_operation.get(value))
++            try:
++                return func(*args, **kwargs)
++            finally:
++                _operation.reset(token)
++
++        return _wrapper
++
++    return _decorator
+ 
+ 
+ @dataclass(config=ConfigDict(extra="forbid"))
+@@ -248,7 +274,7 @@ class Worker:
+         for method in self._cleanup_hooks:
+             method()
+ 
+-    def _check_unsafe(self, mode: Literal["copy", "update"]) -> None:
++    def _check_unsafe(self, mode: Operation) -> None:
+         """Check whether a template uses unsafe features."""
+         if self.unsafe or self.settings.is_trusted(self.template.url):
+             return
+@@ -327,8 +353,10 @@ class Worker:
+         Arguments:
+             tasks: The list of tasks to run.
+         """
++        operation = _operation.get()
+         for i, task in enumerate(tasks):
+             extra_context = {f"_{k}": v for k, v in task.extra_vars.items()}
++            extra_context["_copier_operation"] = operation
+ 
+             if not cast_to_bool(self._render_value(task.condition, extra_context)):
+                 continue
+@@ -358,7 +386,7 @@ class Worker:
+                 / Path(self._render_string(str(task.working_directory), extra_context))
+             ).absolute()
+ 
+-            extra_env = {k.upper(): str(v) for k, v in task.extra_vars.items()}
++            extra_env = {k[1:].upper(): str(v) for k, v in extra_context.items()}
+             with local.cwd(working_directory), local.env(**extra_env):
+                 subprocess.run(task_cmd, shell=use_shell, check=True, env=local.env)
+ 
+@@ -625,7 +653,14 @@ class Worker:
+     @cached_property
+     def match_exclude(self) -> Callable[[Path], bool]:
+         """Get a callable to match paths against all exclusions."""
+-        return self._path_matcher(self.all_exclusions)
++        # Include the current operation in the rendering context.
++        # Note: This method is a cached property, it needs to be regenerated
++        # when reusing an instance in different contexts.
++        extra_context = {"_copier_operation": _operation.get()}
++        return self._path_matcher(
++            self._render_string(exclusion, extra_context=extra_context)
++            for exclusion in self.all_exclusions
++        )
+ 
+     @cached_property
+     def match_skip(self) -> Callable[[Path], bool]:
+@@ -928,6 +963,7 @@ class Worker:
+         return self.template.local_abspath / subdir
+ 
+     # Main operations
++    @as_operation("copy")
+     def run_copy(self) -> None:
+         """Generate a subproject from zero, ignoring what was in the folder.
+ 
+@@ -938,6 +974,11 @@ class Worker:
+ 
+         See [generating a project][generating-a-project].
+         """
++        with suppress(AttributeError):
++            # We might have switched operation context, ensure the cached property
++            # is regenerated to re-render templates.
++            del self.match_exclude
++
+         self._check_unsafe("copy")
+         self._print_message(self.template.message_before_copy)
+         with Phase.use(Phase.PROMPT):
+@@ -967,6 +1008,7 @@ class Worker:
+             # TODO Unify printing tools
+             print("")  # padding space
+ 
++    @as_operation("copy")
+     def run_recopy(self) -> None:
+         """Update a subproject, keeping answers but discarding evolution."""
+         if self.subproject.template is None:
+@@ -977,6 +1019,7 @@ class Worker:
+         with replace(self, src_path=self.subproject.template.url) as new_worker:
+             new_worker.run_copy()
+ 
++    @as_operation("update")
+     def run_update(self) -> None:
+         """Update a subproject that was already generated.
+ 
+@@ -1024,6 +1067,11 @@ class Worker:
+             print(
+                 f"Updating to template version {self.template.version}", file=sys.stderr
+             )
++        with suppress(AttributeError):
++            # We might have switched operation context, ensure the cached property
++            # is regenerated to re-render templates.
++            del self.match_exclude
++
+         self._apply_update()
+         self._print_message(self.template.message_after_update)
+ 
+@@ -1232,10 +1280,13 @@ class Worker:
+                         # The 3-way merge might have resolved conflicts automatically,
+                         # so we need to check if the file contains conflict markers
+                         # before storing the file name for marking it as unmerged after the loop.
+-                        with Path(fname).open() as conflicts_candidate:
++                        with Path(fname).open("rb") as conflicts_candidate:
+                             if any(
+                                 line.rstrip()
+-                                in {"<<<<<<< before updating", ">>>>>>> after updating"}
++                                in {
++                                    b"<<<<<<< before updating",
++                                    b">>>>>>> after updating",
++                                }
+                                 for line in conflicts_candidate
+                             ):
+                                 conflicted.append(fname)
+diff --git a/copier/types.py b/copier/types.py
+index a8fd982..bcfa57f 100644
+--- a/copier/types.py
++++ b/copier/types.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import sys
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from enum import Enum
+@@ -24,6 +25,11 @@ from typing import (
+ 
+ from pydantic import AfterValidator
+ 
++if sys.version_info >= (3, 10):
++    from typing import ParamSpec as ParamSpec
++else:
++    from typing_extensions import ParamSpec as ParamSpec
++
+ # simple types
+ StrOrPath = Union[str, Path]
+ AnyByStrDict = Dict[str, Any]
+@@ -44,6 +50,7 @@ VCSTypes = Literal["git"]
+ Env = Mapping[str, str]
+ MissingType = NewType("MissingType", object)
+ MISSING = MissingType(object())
++Operation = Literal["copy", "update"]
+ 
+ 
+ # Validators
+diff --git a/docs/configuring.md b/docs/configuring.md
+index 9d3c5e5..d40d60e 100644
+--- a/docs/configuring.md
++++ b/docs/configuring.md
+@@ -962,6 +962,21 @@ to know available options.
+ 
+ The CLI option can be passed several times to add several patterns.
+ 
++Each pattern can be templated using Jinja.
++
++!!! example
++
++    Templating `exclude` patterns using `_copier_operation` allows to have files
++    that are rendered once during `copy`, but are never updated:
++
++    ```yaml
++    _exclude:
++        - "{% if _copier_operation == 'update' -%}src/*_example.py{% endif %}"
++    ```
++
++    The difference with [skip_if_exists][] is that it will never be rendered during
++    an update, no matter if it exitsts or not.
++
+ !!! info
+ 
+     When you define this parameter in `copier.yml`, it will **replace** the default
+@@ -1421,6 +1436,8 @@ configuring `secret: true` in the [advanced prompt format][advanced-prompt-forma
+ exist, but always be present. If they do not exist in a project during an `update`
+ operation, they will be recreated.
+ 
++Each pattern can be templated using Jinja.
++
+ !!! example
+ 
+     For example, it can be used if your project generates a password the 1st time and
+@@ -1571,6 +1588,9 @@ other items not present.
+         - [invoke, end-process, "--full-conf={{ _copier_conf|to_json }}"]
+         # Your script can be run by the same Python environment used to run Copier
+         - ["{{ _copier_python }}", task.py]
++        # Run a command during the initial copy operation only, excluding updates
++        - command: ["{{ _copier_python }}", task.py]
++          when: "{{ _copier_operation == 'copy' }}"
+         # OS-specific task (supported values are "linux", "macos", "windows" and `None`)
+         - command: rm {{ name_of_the_project }}/README.md
+           when: "{{ _copier_conf.os in  ['linux', 'macos'] }}"
+diff --git a/docs/creating.md b/docs/creating.md
+index 83e5398..b93129c 100644
+--- a/docs/creating.md
++++ b/docs/creating.md
+@@ -146,6 +146,16 @@ The current phase, one of `"prompt"`,`"tasks"`, `"migrate"` or `"render"`.
+     You may encounter this phase when rendering outside of those phases,
+     when rendering lazily (and the phase notion can be irrelevant) or when testing.
+ 
++## Variables (context-dependent)
++
++Some variables are only available in select contexts:
++
++### `_copier_operation`
++
++The current operation, either `"copy"` or `"update"`.
++
++Availability: [`exclude`](configuring.md#exclude), [`tasks`](configuring.md#tasks)
++
+ ## Variables (context-specific)
+ 
+ Some rendering contexts provide variables unique to them:
+diff --git a/docs/generating.md b/docs/generating.md
+index 1a4d042..b15bf58 100644
+--- a/docs/generating.md
++++ b/docs/generating.md
+@@ -18,6 +18,10 @@ Or within Python code:
+ copier.run_copy("path/to/project/template", "path/to/destination")
+ ```
+ 
++If `path/to/destination` doesn't exist, Copier will create the directory and populate it
++with the generated files. If `path/to/destination` exists, it must be writable (not
++read-only).
++
+ The "template" parameter can be a local path, an URL, or a shortcut URL:
+ 
+ -   GitHub: `gh:namespace/project`

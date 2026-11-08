@@ -1,0 +1,162 @@
+diff --git a/tests/test_sync.py b/tests/test_sync.py
+index 4578c1b..7b48f81 100644
+--- a/tests/test_sync.py
++++ b/tests/test_sync.py
+@@ -1,7 +1,14 @@
+ from collections import Counter
++import base64
++import csv
++import hashlib
++import io
+ import os
+ import platform
++import subprocess
+ import sys
++import zipfile
++from subprocess import CalledProcessError
+ 
+ import mock
+ import pytest
+@@ -211,6 +218,21 @@ def test_diff_with_editable(fake_dist, from_editable):
+     assert str(package.link) == _get_file_url(path_to_package)
+ 
+ 
++def _pip_install_input(args):
++    """Collect package arguments and any requirements files passed to pip."""
++    values = [str(arg) for arg in args]
++    for index, arg in enumerate(args):
++        path = None
++        if arg in ('-r', '--requirement') and index + 1 < len(args):
++            path = args[index + 1]
++        elif arg.startswith('--requirement='):
++            path = arg.split('=', 1)[1]
++        if path is not None:
++            with open(path) as req_file:
++                values.append(req_file.read())
++    return '\n'.join(values)
++
++
+ @pytest.mark.parametrize(
+     'lines',
+     [
+@@ -219,17 +241,112 @@ def test_diff_with_editable(fake_dist, from_editable):
+     ]
+ )
+ def test_sync_install(from_line, lines):
+-    with mock.patch('piptools.sync.check_call') as check_call:
+-        to_install = {from_line(line) for line in lines}
++    captured = {}
+ 
+-        sync(to_install, set())
+-        check_call.assert_called_once_with(['pip', 'install', '-q'] + sorted(lines))
++    def capture_check_call(args, *extra, **kwargs):
++        captured['input'] = _pip_install_input(args)
++
++    with mock.patch('piptools.sync.check_call', side_effect=capture_check_call):
++        sync({from_line(line) for line in lines}, set())
++
++    for line in lines:
++        assert line in captured['input']
+ 
+ 
+ def test_sync_with_editable(from_editable):
+-    with mock.patch('piptools.sync.check_call') as check_call:
++    captured = {}
++
++    def capture_check_call(args, *extra, **kwargs):
++        captured['input'] = _pip_install_input(args)
++
++    with mock.patch('piptools.sync.check_call', side_effect=capture_check_call):
+         path_to_package = os.path.join(os.path.dirname(__file__), 'test_data', 'small_fake_package')
+-        to_install = {from_editable(path_to_package)}
++        sync({from_editable(path_to_package)}, set())
++
++    assert (
++        path_to_package in captured['input']
++        or _get_file_url(path_to_package) in captured['input']
++    )
+ 
+-        sync(to_install, set())
+-        check_call.assert_called_once_with(['pip', 'install', '-q', '-e', _get_file_url(path_to_package)])
++
++def test_sync_install_raises_when_pip_fails(from_line):
++    with mock.patch('piptools.sync.check_call') as check_call:
++        check_call.side_effect = CalledProcessError(1, 'pip')
++        to_install = {
++            from_line('django==1.8', options={
++                'hashes': {
++                    'sha256': [
++                        '6a03ce2feafdd193a0ba8a26dbd9773e757d2e5d5e7933a62eac129813bd381a',
++                    ]
++                }
++            }),
++        }
++
++        try:
++            result = sync(to_install, set())
++        except (Exception, SystemExit):
++            pass
++        else:
++            assert isinstance(result, int) and result != 0
++
++
++def test_sync_accepts_any_matching_hash_and_rejects_nonmatching_artifacts(from_line, tmp_path):
++    wheel_path = tmp_path / 'hash_check_fixture-1.0-py3-none-any.whl'
++    files = {
++        'hash_check_fixture/__init__.py': b'VALUE = 1\n',
++        'hash_check_fixture-1.0.dist-info/METADATA': (
++            b'Metadata-Version: 2.1\nName: hash-check-fixture\nVersion: 1.0\n'
++        ),
++        'hash_check_fixture-1.0.dist-info/WHEEL': (
++            b'Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n'
++            b'Tag: py3-none-any\n'
++        ),
++    }
++    record = io.StringIO()
++    writer = csv.writer(record, lineterminator='\n')
++    for name, contents in files.items():
++        digest = base64.urlsafe_b64encode(hashlib.sha256(contents).digest()).rstrip(b'=')
++        writer.writerow((name, 'sha256=' + digest.decode('ascii'), len(contents)))
++    writer.writerow(('hash_check_fixture-1.0.dist-info/RECORD', '', ''))
++    files['hash_check_fixture-1.0.dist-info/RECORD'] = record.getvalue().encode('utf-8')
++
++    with zipfile.ZipFile(str(wheel_path), 'w') as wheel:
++        for name, contents in files.items():
++            wheel.writestr(name, contents)
++
++    actual_hash = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
++    target = tmp_path / 'installed-matching'
++
++    def install_with_pip(args, *extra, **kwargs):
++        # Run the real pip from the same interpreter, whatever launcher form was used
++        # to invoke it; only the subcommand and its arguments are forwarded.
++        subprocess.check_call([sys.executable, '-m', 'pip'] + args[args.index('install'):])
++
++    with mock.patch('piptools.sync.check_call', side_effect=install_with_pip):
++        sync(
++            {from_line('hash-check-fixture==1.0', options={
++                'hashes': {'sha256': ['0' * 64, actual_hash]},
++            })},
++            set(),
++            install_flags=[
++                '--no-index', '--find-links', str(tmp_path), '--target', str(target),
++            ],
++        )
++
++        assert (target / 'hash_check_fixture' / '__init__.py').is_file()
++
++        try:
++            result = sync(
++                {from_line('hash-check-fixture==1.0', options={
++                    'hashes': {'sha256': ['0' * 64]},
++                })},
++                set(),
++                install_flags=[
++                    '--no-index', '--find-links', str(tmp_path),
++                    '--target', str(tmp_path / 'installed-nonmatching'),
++                ],
++            )
++        except (Exception, SystemExit):
++            pass
++        else:
++            assert isinstance(result, int) and result != 0

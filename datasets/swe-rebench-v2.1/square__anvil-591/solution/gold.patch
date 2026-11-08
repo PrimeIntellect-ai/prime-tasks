@@ -1,0 +1,305 @@
+diff --git a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/reference/TypeReference.kt b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/reference/TypeReference.kt
+index 02fac6537..ddd979e40 100644
+--- a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/reference/TypeReference.kt
++++ b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/reference/TypeReference.kt
+@@ -128,23 +128,24 @@ public sealed class TypeReference {
+     override val unwrappedTypes: List<Psi> by lazy(NONE) {
+       type.typeElement!!.children
+         .filterIsInstance<KtTypeArgumentList>()
+-        .single()
+-        .children
+-        .filterIsInstance<KtTypeProjection>()
+-        .map { typeProjection ->
++        .singleOrNull()
++        ?.children
++        ?.filterIsInstance<KtTypeProjection>()
++        ?.map { typeProjection ->
+           typeProjection.children
+             .filterIsInstance<KtTypeReference>()
+             .single()
+             .toTypeReference(declaringClass)
+-        }
++        } ?: emptyList()
+     }
+ 
++    @Suppress("RedundantNullableReturnType")
+     override fun resolveGenericTypeOrNull(implementingClass: ClassReference): TypeReference? {
+       return resolveTypeReference(implementingClass)
+     }
+ 
+     /**
+-     * Safely resolves a PSI [KtTypeReference], when that type reference may be a generic
++     * Safely resolves a type reference, when that type reference may be a generic
+      * expressed by a type variable name. This is done by inspecting the class hierarchy to
+      * find where the generic type is declared, then resolving *that* reference.
+      *
+@@ -158,21 +159,32 @@ public sealed class TypeReference {
+      * interface ServiceFactory : Factory<Service>
+      * ```
+      *
+-     * The KtTypeReference `T` will fail to resolve, since it isn't a type. This function will
++     * The type reference `T` will fail to resolve, since it isn't a type. This function will
+      * instead look to the `ServiceFactory` interface, then look at the supertype declaration
+      * in order to determine the type.
+      *
++     * It's possible that this method may still return a generic type, if `T` resolves to another
++     * generic type. For instance, `T` will resolve to `R` in the following example:
++     *
++     * ```
++     * interface Factory<T>
++     *
++     * interface UnknownFactory<R> : Factory<R>
++     * ```
++     *
+      * @param implementingClass The class which actually references the type. In the above
+      * example, this would be `ServiceFactory`.
+      */
+     internal fun resolveTypeReference(
+       implementingClass: ClassReference
+-    ): TypeReference? {
++    ): TypeReference {
+       // If the element isn't a type variable name like `T`, it can be resolved through imports.
+       type.typeElement?.fqNameOrNull(module)
+         ?.let { return this }
+ 
+-      return resolveGenericTypeReference(implementingClass, declaringClass, type.text)
++      // When we fail to resolve the generic type here, we're potentially at the end of a chain of
++      // generics, so we return the current type instead of null.
++      return resolveGenericTypeReference(implementingClass, declaringClass, type.text) ?: this
+     }
+ 
+     override fun isFunctionType(): Boolean = type.typeElement is KtFunctionType
+diff --git a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/DaggerGenerationUtils.kt b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/DaggerGenerationUtils.kt
+index 1ace6a3d1..2e03c96f2 100644
+--- a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/DaggerGenerationUtils.kt
++++ b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/DaggerGenerationUtils.kt
+@@ -9,9 +9,11 @@ import com.squareup.anvil.compiler.internal.reference.ClassReference
+ import com.squareup.anvil.compiler.internal.reference.ParameterReference
+ import com.squareup.anvil.compiler.internal.reference.PropertyReference
+ import com.squareup.anvil.compiler.internal.reference.TypeParameterReference
++import com.squareup.anvil.compiler.internal.reference.TypeReference
+ import com.squareup.anvil.compiler.internal.reference.Visibility.PRIVATE
+ import com.squareup.anvil.compiler.internal.reference.allSuperTypeClassReferences
+ import com.squareup.anvil.compiler.internal.reference.argumentAt
++import com.squareup.anvil.compiler.internal.reference.asClassName
+ import com.squareup.anvil.compiler.internal.reference.generateClassName
+ import com.squareup.anvil.compiler.internal.withJvmSuppressWildcardsIfNeeded
+ import com.squareup.anvil.compiler.providerFqName
+@@ -116,7 +118,7 @@ internal fun ClassReference.memberInjectParameters(): List<MemberInjectParameter
+     .filterNot { it.isInterface() }
+     .toList()
+     .foldRight(listOf()) { classReference, acc ->
+-      acc + classReference.declaredMemberInjectParameters(acc)
++      acc + classReference.declaredMemberInjectParameters(acc, this)
+     }
+ }
+ 
+@@ -126,14 +128,18 @@ internal fun ClassReference.memberInjectParameters(): List<MemberInjectParameter
+  * @return the member-injected parameters for this class only, not including any super-classes
+  */
+ private fun ClassReference.declaredMemberInjectParameters(
+-  superParameters: List<Parameter>
++  superParameters: List<Parameter>,
++  implementingClass: ClassReference
+ ): List<MemberInjectParameter> {
+   return properties
+     .filter { it.isAnnotatedWith(injectFqName) }
+     .filter { it.visibility() != PRIVATE }
+     .fold(listOf()) { acc, property ->
+       val uniqueName = property.name.uniqueParameterName(superParameters, acc)
+-      acc + property.toMemberInjectParameter(uniqueName = uniqueName)
++      acc + property.toMemberInjectParameter(
++        uniqueName = uniqueName,
++        implementingClass = implementingClass
++      )
+     }
+ }
+ 
+@@ -188,7 +194,8 @@ internal fun List<Parameter>.asArgumentList(
+ }
+ 
+ private fun PropertyReference.toMemberInjectParameter(
+-  uniqueName: String
++  uniqueName: String,
++  implementingClass: ClassReference
+ ): MemberInjectParameter {
+   val originalName = name
+   val type = type()
+@@ -198,11 +205,24 @@ private fun PropertyReference.toMemberInjectParameter(
+   val isLazyWrappedInProvider = isWrappedInProvider &&
+     type.unwrappedTypes.first().asClassReferenceOrNull()?.fqName == daggerLazyFqName
+ 
+-  val typeName = when {
++  val unwrappedType = when {
+     isLazyWrappedInProvider -> type.unwrappedTypes.first().unwrappedTypes.first()
+     isWrappedInProvider || isWrappedInLazy -> type.unwrappedTypes.first()
+     else -> type
+-  }.asTypeName().withJvmSuppressWildcardsIfNeeded(this, type)
++  }
++  val typeName = unwrappedType.asTypeName().withJvmSuppressWildcardsIfNeeded(this, type)
++  val resolvedTypeName = if (unwrappedType.isGenericExcludingTypeAliases()) {
++    unwrappedType.asClassReferenceOrNull()
++      ?.asClassName()
++      ?.optionallyParameterizedByNames(
++        unwrappedType.unwrappedTypes.mapNotNull {
++          it.resolveGenericTypeNameOrNull(implementingClass)
++        }
++      )
++      ?.withJvmSuppressWildcardsIfNeeded(this, unwrappedType)
++  } else {
++    null
++  }
+ 
+   val assistedAnnotation = annotations.singleOrNull { it.fqName == assistedFqName }
+ 
+@@ -233,11 +253,13 @@ private fun PropertyReference.toMemberInjectParameter(
+     .filter { it.isQualifier() }
+     .map { it.toAnnotationSpec() }
+ 
++  val providerTypeName = typeName.wrapInProvider()
++
+   return MemberInjectParameter(
+     name = uniqueName,
+     originalName = originalName,
+     typeName = typeName,
+-    providerTypeName = typeName.wrapInProvider(),
++    providerTypeName = providerTypeName,
+     lazyTypeName = typeName.wrapInLazy(),
+     isWrappedInProvider = isWrappedInProvider,
+     isWrappedInLazy = isWrappedInLazy,
+@@ -248,10 +270,27 @@ private fun PropertyReference.toMemberInjectParameter(
+     isSetterInjected = isSetterInjected,
+     accessName = accessName,
+     qualifierAnnotationSpecs = qualifierAnnotations,
+-    injectedFieldSignature = fqName
++    injectedFieldSignature = fqName,
++    resolvedProviderTypeName = resolvedTypeName?.wrapInProvider() ?: providerTypeName
+   )
+ }
+ 
++private fun TypeReference.isGenericExcludingTypeAliases(): Boolean {
++  // A TypeReference for 'typealias StringList = List<String> would still show up as generic but
++  // would have no unwrapped types available (String).
++  return isGenericType() && unwrappedTypes.isNotEmpty()
++}
++
++private fun ClassName.optionallyParameterizedByNames(
++  typeNames: List<TypeName>
++): TypeName {
++  return if (typeNames.isEmpty()) {
++    this
++  } else {
++    parameterizedBy(typeNames)
++  }
++}
++
+ internal fun ClassName.optionallyParameterizedBy(
+   typeParameters: List<TypeParameterReference>
+ ): TypeName {
+diff --git a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/MembersInjectorGenerator.kt b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/MembersInjectorGenerator.kt
+index 96405fdc6..21b506be1 100644
+--- a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/MembersInjectorGenerator.kt
++++ b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/MembersInjectorGenerator.kt
+@@ -23,7 +23,6 @@ import com.squareup.kotlinpoet.KModifier.OVERRIDE
+ import com.squareup.kotlinpoet.KModifier.PRIVATE
+ import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
+ import com.squareup.kotlinpoet.PropertySpec
+-import com.squareup.kotlinpoet.STAR
+ import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.jvm.jvmStatic
+@@ -71,16 +70,19 @@ internal class MembersInjectorGenerator : PrivateCodeGenerator() {
+     val classId = clazz.generateClassName(suffix = "_MembersInjector")
+     val packageName = classId.packageFqName.safePackageString()
+     val className = classId.relativeClassName.asString()
++    val typeParameters = clazz.typeParameters
+ 
+     val classType = clazz.asClassName()
+       .let {
+         if (clazz.isGenericClass()) {
+-          it.parameterizedBy(List(size = clazz.clazz.typeParameters.size) { STAR })
++          it.parameterizedBy(typeParameters.map { typeParameter -> typeParameter.typeVariableName })
+         } else {
+           it
+         }
+       }
+ 
++    val membersInjectorType = MembersInjector::class.asClassName().parameterizedBy(classType)
++
+     fun createArgumentList(asProvider: Boolean): String {
+       return parameters
+         .map { it.name }
+@@ -96,13 +98,16 @@ internal class MembersInjectorGenerator : PrivateCodeGenerator() {
+       addType(
+         TypeSpec
+           .classBuilder(memberInjectorClass)
+-          .addSuperinterface(MembersInjector::class.asClassName().parameterizedBy(classType))
++          .addSuperinterface(membersInjectorType)
+           .apply {
++            typeParameters.forEach { typeParameter ->
++              addTypeVariable(typeParameter.typeVariableName)
++            }
+             primaryConstructor(
+               FunSpec.constructorBuilder()
+                 .apply {
+                   parameters.forEach { parameter ->
+-                    addParameter(parameter.name, parameter.providerTypeName)
++                    addParameter(parameter.name, parameter.resolvedProviderTypeName)
+                   }
+                 }
+                 .build()
+@@ -110,7 +115,7 @@ internal class MembersInjectorGenerator : PrivateCodeGenerator() {
+ 
+             parameters.forEach { parameter ->
+               addProperty(
+-                PropertySpec.builder(parameter.name, parameter.providerTypeName)
++                PropertySpec.builder(parameter.name, parameter.resolvedProviderTypeName)
+                   .initializer(parameter.name)
+                   .addModifiers(PRIVATE)
+                   .build()
+@@ -131,8 +136,12 @@ internal class MembersInjectorGenerator : PrivateCodeGenerator() {
+                 FunSpec.builder("create")
+                   .jvmStatic()
+                   .apply {
++                    typeParameters.forEach { typeParameter ->
++                      addTypeVariable(typeParameter.typeVariableName)
++                    }
++
+                     parameters.forEach { parameter ->
+-                      addParameter(parameter.name, parameter.providerTypeName)
++                      addParameter(parameter.name, parameter.resolvedProviderTypeName)
+                     }
+ 
+                     addStatement(
+@@ -140,7 +149,7 @@ internal class MembersInjectorGenerator : PrivateCodeGenerator() {
+                       memberInjectorClass
+                     )
+                   }
+-                  .returns(memberInjectorClass)
++                  .returns(membersInjectorType)
+                   .build()
+               )
+               .apply {
+@@ -155,6 +164,10 @@ internal class MembersInjectorGenerator : PrivateCodeGenerator() {
+                       FunSpec.builder("inject${parameter.accessName.capitalize()}")
+                         .jvmStatic()
+                         .apply {
++                          typeParameters.forEach { typeParameter ->
++                            addTypeVariable(typeParameter.typeVariableName)
++                          }
++
+                           // Don't add @InjectedFieldSignature when it's calling a setter method
+                           if (!parameter.isSetterInjected) {
+                             addAnnotation(
+diff --git a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/Parameter.kt b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/Parameter.kt
+index 88928f25d..963def43f 100644
+--- a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/Parameter.kt
++++ b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/dagger/Parameter.kt
+@@ -98,5 +98,6 @@ internal data class MemberInjectParameter(
+   override val assistedParameterKey: AssistedParameterKey = AssistedParameterKey(
+     typeName,
+     assistedIdentifier
+-  )
++  ),
++  val resolvedProviderTypeName: ParameterizedTypeName = providerTypeName
+ ) : Parameter

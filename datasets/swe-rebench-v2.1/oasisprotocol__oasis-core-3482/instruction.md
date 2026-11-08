@@ -1,0 +1,2 @@
+Storage checkpointer doesn't work with non-zero initial version
+The storage checkpointer (used by both consensus for state sync and runtimes for checkpoint sync) doesn't work correctly when the initial version (consensus height or runtime round) is non-zero. It will always try to create checkpoints from zero, failing and aborting the checkpoint process. It should instead skip to the earliest available version instead.

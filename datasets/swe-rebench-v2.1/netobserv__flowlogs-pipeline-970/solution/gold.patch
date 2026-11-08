@@ -1,0 +1,191 @@
+diff --git a/docs/api.md b/docs/api.md
+index e60a31b..a8cadaa 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -319,6 +319,8 @@ Following is the supported API format for writing to loki:
+          clientConfig: clientConfig
+          timestampLabel: label to use for time indexing
+          timestampScale: timestamp units scale (e.g. for UNIX = 1s)
++         format: the format of each line: printf (writes using golang's default map printing), fields (writes one key and value field per line) or json (default)
++         reorder: reorder json map keys
+ </pre>
+ ## Write Standard Output
+ Following is the supported API format for writing to standard output:
+diff --git a/pkg/api/write_loki.go b/pkg/api/write_loki.go
+index 6188575..344c8ed 100644
+--- a/pkg/api/write_loki.go
++++ b/pkg/api/write_loki.go
+@@ -44,6 +44,8 @@ type WriteLoki struct {
+ 	// scales of '1ms' (one millisecond) or just '1' (one nanosecond)
+ 	// Default value is '1s'
+ 	TimestampScale string `yaml:"timestampScale,omitempty" json:"timestampScale,omitempty" doc:"timestamp units scale (e.g. for UNIX = 1s)"`
++	Format         string `yaml:"format,omitempty" json:"format,omitempty" doc:"the format of each line: printf (writes using golang's default map printing), fields (writes one key and value field per line) or json (default)"`
++	Reorder        bool   `yaml:"reorder,omitempty" json:"reorder,omitempty" doc:"reorder json map keys"`
+ }
+ 
+ func (w *WriteLoki) SetDefaults() {
+@@ -71,6 +73,9 @@ func (w *WriteLoki) SetDefaults() {
+ 	if w.TimestampScale == "" {
+ 		w.TimestampScale = "1s"
+ 	}
++	if w.Format == "" {
++		w.Format = "json"
++	}
+ }
+ 
+ func (w *WriteLoki) Validate() error {
+diff --git a/pkg/pipeline/write/write_loki.go b/pkg/pipeline/write/write_loki.go
+index 95e7899..ec76076 100644
+--- a/pkg/pipeline/write/write_loki.go
++++ b/pkg/pipeline/write/write_loki.go
+@@ -30,7 +30,6 @@ import (
+ 	"github.com/netobserv/flowlogs-pipeline/pkg/utils"
+ 
+ 	logAdapter "github.com/go-kit/kit/log/logrus"
+-	jsonIter "github.com/json-iterator/go"
+ 	"github.com/netobserv/loki-client-go/loki"
+ 	"github.com/netobserv/loki-client-go/pkg/backoff"
+ 	"github.com/netobserv/loki-client-go/pkg/urlutil"
+@@ -38,8 +37,6 @@ import (
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+-var jsonEncodingConfig = jsonIter.Config{}.Froze()
+-
+ var (
+ 	keyReplacer = strings.NewReplacer("/", "_", ".", "_", "-", "_")
+ )
+@@ -61,6 +58,7 @@ type Loki struct {
+ 	timeNow        func() time.Time
+ 	exitChan       <-chan struct{}
+ 	metrics        *metrics
++	formatter      func(config.GenericMap) string
+ }
+ 
+ func buildLokiConfig(c *api.WriteLoki) (loki.Config, error) {
+@@ -110,13 +108,10 @@ func buildLokiConfig(c *api.WriteLoki) (loki.Config, error) {
+ func (l *Loki) ProcessRecord(in config.GenericMap) error {
+ 	labels, lines := l.splitLabelsLines(in)
+ 
+-	js, err := jsonEncodingConfig.Marshal(lines)
+-	if err != nil {
+-		return err
+-	}
+-
++	output := l.formatter(lines)
+ 	timestamp := l.extractTimestamp(lines)
+-	err = l.client.Handle(labels, timestamp, string(js))
++
++	err := l.client.Handle(labels, timestamp, output)
+ 	if err == nil {
+ 		l.metrics.recordsWritten.Inc()
+ 	}
+@@ -256,6 +251,7 @@ func NewWriteLoki(opMetrics *operational.Metrics, params config.StageParam) (*Lo
+ 		ignoreList[label] = nil
+ 	}
+ 
++	f := formatter(lokiConfigIn.Format, lokiConfigIn.Reorder)
+ 	l := &Loki{
+ 		lokiConfig:     lokiConfig,
+ 		apiConfig:      lokiConfigIn,
+@@ -266,6 +262,7 @@ func NewWriteLoki(opMetrics *operational.Metrics, params config.StageParam) (*Lo
+ 		timeNow:        time.Now,
+ 		exitChan:       pUtils.ExitChannel(),
+ 		metrics:        newMetrics(opMetrics, params.Name),
++		formatter:      f,
+ 	}
+ 
+ 	return l, nil
+diff --git a/pkg/pipeline/write/write_stdout.go b/pkg/pipeline/write/write_stdout.go
+index 5c22830..cb24db2 100644
+--- a/pkg/pipeline/write/write_stdout.go
++++ b/pkg/pipeline/write/write_stdout.go
+@@ -18,50 +18,66 @@
+ package write
+ 
+ import (
+-	"encoding/json"
+ 	"fmt"
+-	"os"
+ 	"sort"
++	"strings"
+ 	"text/tabwriter"
+ 	"time"
+ 
++	jsonIter "github.com/json-iterator/go"
+ 	"github.com/netobserv/flowlogs-pipeline/pkg/config"
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+ type writeStdout struct {
+-	format string
++	formatter func(config.GenericMap) string
+ }
+ 
+ // Write writes a flow before being stored
+ func (t *writeStdout) Write(v config.GenericMap) {
+ 	logrus.Tracef("entering writeStdout Write")
+-	if t.format == "json" {
+-		txt, _ := json.Marshal(v)
+-		fmt.Println(string(txt))
+-	} else if t.format == "fields" {
+-		var order sort.StringSlice
+-		for fieldName := range v {
+-			order = append(order, fieldName)
++	fmt.Println(t.formatter(v))
++}
++
++func formatter(format string, reorder bool) func(config.GenericMap) string {
++	if format == "json" {
++		jconf := jsonIter.Config{
++			SortMapKeys: reorder,
++		}.Froze()
++		return func(v config.GenericMap) string {
++			b, _ := jconf.Marshal(v)
++			return string(b)
+ 		}
+-		order.Sort()
+-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
+-		fmt.Fprintf(w, "\n\nFlow record at %s:\n", time.Now().Format(time.StampMilli))
+-		for _, field := range order {
+-			fmt.Fprintf(w, "%v\t=\t%v\n", field, v[field])
++	} else if format == "fields" {
++		return func(v config.GenericMap) string {
++			var sb strings.Builder
++			var order sort.StringSlice
++			for fieldName := range v {
++				order = append(order, fieldName)
++			}
++			order.Sort()
++			w := tabwriter.NewWriter(&sb, 0, 0, 1, ' ', 0)
++			fmt.Fprintf(w, "\n\nFlow record at %s:\n", time.Now().Format(time.StampMilli))
++			for _, field := range order {
++				fmt.Fprintf(w, "%v\t=\t%v\n", field, v[field])
++			}
++			w.Flush()
++			return sb.String()
+ 		}
+-		w.Flush()
+-	} else {
+-		fmt.Printf("%s: %v\n", time.Now().Format(time.StampMilli), v)
++	}
++	return func(v config.GenericMap) string {
++		return fmt.Sprintf("%v", v)
+ 	}
+ }
+ 
+ // NewWriteStdout create a new write
+ func NewWriteStdout(params config.StageParam) (Writer, error) {
+ 	logrus.Debugf("entering NewWriteStdout")
+-	writeStdout := &writeStdout{}
+-	if params.Write != nil && params.Write.Stdout != nil {
+-		writeStdout.format = params.Write.Stdout.Format
++	var format string
++	if params.Write.Stdout != nil {
++		format = params.Write.Stdout.Format
+ 	}
+-	return writeStdout, nil
++	return &writeStdout{
++		formatter: formatter(format, false),
++	}, nil
+ }

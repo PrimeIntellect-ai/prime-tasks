@@ -1,0 +1,381 @@
+diff --git a/.github/workflows/e2e_tests.yml b/.github/workflows/e2e_tests.yml
+index c9396c8..ca25572 100644
+--- a/.github/workflows/e2e_tests.yml
++++ b/.github/workflows/e2e_tests.yml
+@@ -45,9 +45,7 @@ jobs:
+           go mod download
+       - name: Run the operator locally
+         run: |
+-          set -o pipefail
+-          make install generate fmt vet
+-          go run ./main.go 2>&1 | tee /tmp/e2e-operator-run.log &
++          make start-e2e &
+       - name: Run tests
+         run: |
+           set -o pipefail
+diff --git a/controllers/deployment_test.go b/controllers/deployment_test.go
+index 69f8c30..1084cd4 100644
+--- a/controllers/deployment_test.go
++++ b/controllers/deployment_test.go
+@@ -2,6 +2,7 @@ package rollouts
+ 
+ import (
+ 	"context"
++	"reflect"
+ 
+ 	"github.com/argoproj-labs/argo-rollouts-manager/api/v1alpha1"
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -9,6 +10,7 @@ import (
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
+ var _ = Describe("Deployment Test", func() {
+@@ -36,7 +38,7 @@ var _ = Describe("Deployment Test", func() {
+ 	It("should create a new deployment if it does not exist", func() {
+ 
+ 		By("calling reconcileRolloutsDeployment")
+-		Expect(r.reconcileRolloutsDeployment(ctx, a, sa)).To(Succeed())
++		Expect(reconcileDeployment(r, ctx, a, sa)).To(Succeed())
+ 
+ 		By("fetch the Deployment")
+ 		fetchedDeployment := &appsv1.Deployment{}
+@@ -64,7 +66,7 @@ var _ = Describe("Deployment Test", func() {
+ 		Expect(r.Client.Create(ctx, existingDeployment)).To(Succeed())
+ 
+ 		By("calling reconcileRolloutsDeployment")
+-		Expect(r.reconcileRolloutsDeployment(ctx, a, sa)).To(Succeed())
++		Expect(reconcileDeployment(r, ctx, a, sa)).To(Succeed())
+ 
+ 		By("fetch the Deployment")
+ 		fetchedDeployment := &appsv1.Deployment{}
+@@ -85,6 +87,135 @@ var _ = Describe("Deployment Test", func() {
+ 
+ 	})
+ 
++	When("the deployment has not changed", func() {
++
++		It("should not update the live Deployment when it already matches the desired Deployment", func() {
++
++			By("calling reconcileRolloutsDeployment to create the Deployment")
++			Expect(reconcileDeployment(r, ctx, a, sa)).To(Succeed())
++
++			By("fetching the created Deployment and recording its resourceVersion")
++			createdDeployment := &appsv1.Deployment{}
++			Expect(fetchObject(ctx, r.Client, a.Namespace, DefaultArgoRolloutsResourceName, createdDeployment)).To(Succeed())
++			createdResourceVersion := createdDeployment.ResourceVersion
++			Expect(createdResourceVersion).ToNot(BeEmpty())
++
++			By("calling reconcileRolloutsDeployment again, on the unchanged live Deployment")
++			Expect(reconcileDeployment(r, ctx, a, sa)).To(Succeed())
++
++			By("verifying that the live Deployment was not updated")
++			fetchedDeployment := &appsv1.Deployment{}
++			Expect(fetchObject(ctx, r.Client, a.Namespace, DefaultArgoRolloutsResourceName, fetchedDeployment)).To(Succeed())
++			Expect(fetchedDeployment.ResourceVersion).To(Equal(createdResourceVersion), "reconcile should not update a Deployment that already matches the desired state")
++
++		})
++
++		It("should not update the live Deployment when it only differs by fields the operator does not manage", func() {
++
++			By("calling reconcileRolloutsDeployment to create the Deployment")
++			Expect(reconcileDeployment(r, ctx, a, sa)).To(Succeed())
++
++			By("simulating a default value that the cluster sets on the live Deployment")
++			liveDeployment := &appsv1.Deployment{}
++			Expect(fetchObject(ctx, r.Client, a.Namespace, DefaultArgoRolloutsResourceName, liveDeployment)).To(Succeed())
++			liveDeployment.Spec.Template.Spec.Containers[0].TerminationMessagePath = "/dev/termination-log"
++			Expect(r.Client.Update(ctx, liveDeployment)).To(Succeed())
++
++			By("fetching the live Deployment and recording its resourceVersion")
++			Expect(fetchObject(ctx, r.Client, a.Namespace, DefaultArgoRolloutsResourceName, liveDeployment)).To(Succeed())
++			resourceVersionBeforeReconcile := liveDeployment.ResourceVersion
++
++			By("calling reconcileRolloutsDeployment again")
++			Expect(reconcileDeployment(r, ctx, a, sa)).To(Succeed())
++
++			By("verifying that the live Deployment was not updated")
++			fetchedDeployment := &appsv1.Deployment{}
++			Expect(fetchObject(ctx, r.Client, a.Namespace, DefaultArgoRolloutsResourceName, fetchedDeployment)).To(Succeed())
++			Expect(fetchedDeployment.ResourceVersion).To(Equal(resourceVersionBeforeReconcile), "reconcile should not update a Deployment that only differs by unmanaged default fields")
++
++		})
++	})
++	When("the Rollouts Deployment resource is changed by the user, outside of the operator", func() {
++
++		DescribeTable("controller should detect and revert the change", func(fxn func(deployment *appsv1.Deployment)) {
++
++			By("ensuring the reconcileRolloutsDeployment will detect and revert the change")
++			{
++				By("calling reconcileRolloutsDeployment to create a default Deployment")
++				expectedDepl := appsv1.Deployment{
++					ObjectMeta: metav1.ObjectMeta{Name: DefaultArgoRolloutsResourceName, Namespace: a.Namespace},
++				}
++				Expect(reconcileDeployment(r, context.Background(), a, sa)).To(Succeed())
++				Expect(r.Client.Get(context.Background(), client.ObjectKeyFromObject(&expectedDepl), &expectedDepl)).To(Succeed())
++				updatedDepl := expectedDepl.DeepCopy()
++
++				By("updating the Deployment using the function, and then updating the cluster resource")
++				fxn(updatedDepl)
++				Expect(r.Client.Update(context.Background(), updatedDepl)).To(Succeed())
++
++				By("retrieving the cluster resource after the update, to ensure it is equal to the updated version")
++				updatedDeplFromClient := appsv1.Deployment{
++					ObjectMeta: metav1.ObjectMeta{Name: DefaultArgoRolloutsResourceName, Namespace: a.Namespace},
++				}
++				Expect(r.Client.Get(context.Background(), client.ObjectKeyFromObject(&updatedDeplFromClient), &updatedDeplFromClient)).To(Succeed())
++
++				By("calling reconcileRolloutsDeployment again, it should revert the change back to default")
++				Expect(reconcileDeployment(r, context.Background(), a, sa)).To(Succeed())
++
++				finalDeplFromClient := appsv1.Deployment{
++					ObjectMeta: metav1.ObjectMeta{Name: DefaultArgoRolloutsResourceName, Namespace: a.Namespace},
++				}
++
++				By("retrieving the Deployment version from the cluster")
++				Expect(r.Client.Get(context.Background(), client.ObjectKeyFromObject(&finalDeplFromClient), &finalDeplFromClient)).To(Succeed())
++				Expect(finalDeplFromClient.Labels).To(Equal(expectedDepl.Labels))
++				Expect(reflect.DeepEqual(finalDeplFromClient.Spec, expectedDepl.Spec)).To(BeTrue(), "managed Deployment spec should be restored")
++
++			}
++
++		},
++			Entry("label", func(deployment *appsv1.Deployment) {
++				deployment.ObjectMeta.Labels = map[string]string{"my": "label"}
++			}),
++			Entry("spec.selector", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Selector = &metav1.LabelSelector{
++					MatchLabels: map[string]string{"my": "label"},
++				}
++			}),
++			Entry(".spec.template.spec.containers.image", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.Containers[0].Image = "example.invalid/changed:tag"
++			}),
++			Entry(".spec.template.spec.containers.args", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.Containers[0].Args = []string{"new", "args"}
++			}),
++			Entry(".spec.template.spec.containers.env", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{
++					{Name: "my-env", Value: "my-env-value"}}
++			}),
++			Entry(".spec.template.spec.serviceAccountName", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.ServiceAccountName = "different-service-account-name"
++			}),
++			Entry(".spec.template.labels", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Labels = map[string]string{"new": "label"}
++			}),
++			Entry(".spec.template.spec.nodeSelector", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.NodeSelector = map[string]string{"my": "node"}
++			}),
++			Entry(".spec.template.spec.tolerations", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.Tolerations = []corev1.Toleration{{Key: "value"}}
++			}),
++			Entry(".spec.template.spec.securityContext", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
++					SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost},
++				}
++			}),
++			Entry(".spec.template.spec.volumes", func(deployment *appsv1.Deployment) {
++				deployment.Spec.Template.Spec.Volumes = []corev1.Volume{{Name: "my-volume"}}
++			}),
++		)
++
++	})
++
+ })
+ 
+ func deploymentCR(name string, namespace string, label string, volumeName string, nodeSelector string, serviceAccount string, rolloutManager *v1alpha1.RolloutManager) *appsv1.Deployment {
+@@ -118,7 +249,7 @@ func deploymentCR(name string, namespace string, label string, volumeName string
+ 					"kubernetes.io/os": nodeSelector,
+ 				},
+ 				Containers: []corev1.Container{
+-					rolloutsContainer(rolloutManager),
++					makeRolloutsContainer(rolloutManager),
+ 				},
+ 				ServiceAccountName: serviceAccount,
+ 				SecurityContext: &corev1.PodSecurityContext{
+@@ -131,3 +262,26 @@ func deploymentCR(name string, namespace string, label string, volumeName string
+ 	return deploymentCR
+ 
+ }
++
++// Keep these tests compatible with either ServiceAccount parameter form.
++type deploymentReconcilerByValue interface {
++	reconcileRolloutsDeployment(context.Context, *v1alpha1.RolloutManager, corev1.ServiceAccount) error
++}
++type deploymentReconcilerByPointer interface {
++	reconcileRolloutsDeployment(context.Context, *v1alpha1.RolloutManager, *corev1.ServiceAccount) error
++}
++
++func reconcileDeployment(r *RolloutManagerReconciler, ctx context.Context, manager *v1alpha1.RolloutManager, sa *corev1.ServiceAccount) error {
++	if reconciler, ok := any(r).(deploymentReconcilerByValue); ok {
++		return reconciler.reconcileRolloutsDeployment(ctx, manager, *sa)
++	}
++	return any(r).(deploymentReconcilerByPointer).reconcileRolloutsDeployment(ctx, manager, sa)
++}
++
++func makeRolloutsContainer(manager *v1alpha1.RolloutManager) corev1.Container {
++	factory := any(rolloutsContainer)
++	if byValue, ok := factory.(func(v1alpha1.RolloutManager) corev1.Container); ok {
++		return byValue(*manager)
++	}
++	return factory.(func(*v1alpha1.RolloutManager) corev1.Container)(manager)
++}
+diff --git a/hack/run-rollouts-manager-e2e-tests.sh b/hack/run-rollouts-manager-e2e-tests.sh
+new file mode 100755
+index 0000000..52d430b
+--- /dev/null
++++ b/hack/run-rollouts-manager-e2e-tests.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++
++SCRIPTPATH="$(
++  cd -- "$(dirname "$0")" >/dev/null 2>&1 || exit
++  pwd -P
++)"
++
++cd "$SCRIPTPATH/.."
++
++set -o pipefail
++set -ex
++
++go test -v -p=1 -timeout=10m -race -count=1 -coverprofile=coverage.out ./tests/e2e
++
++set +e
++
++# If the output from the E2E operator is available, then check it for errors
++if [ -f "/tmp/e2e-operator-run.log" ]; then
++
++    # Grep the log for unexpected errors
++    # - Ignore errors that are expected to occur
++
++    ERRORS_FOUND_TEXT=`cat /tmp/e2e-operator-run.log | grep "ERROR" | grep -v "unable to create new content in namespace argo-rollouts because it is being terminated" | grep -v "the object has been modified; please apply your changes to the latest version and try again"`
++
++    ERRORS_FOUND=`echo $ERRORS_FOUND_TEXT | grep "ERROR" | wc -l`
++
++    if [ "$ERRORS_FOUND" != "0" ]; then
++        echo "Unexpected errors found: $ERRORS_FOUND_TEXT"
++        exit 1
++    fi
++
++fi
+diff --git a/hack/run-upstream-argo-rollouts-e2e-tests.sh b/hack/run-upstream-argo-rollouts-e2e-tests.sh
+index be288c8..1d60955 100755
+--- a/hack/run-upstream-argo-rollouts-e2e-tests.sh
++++ b/hack/run-upstream-argo-rollouts-e2e-tests.sh
+@@ -4,8 +4,8 @@ CURRENT_ROLLOUTS_VERSION=v1.6.6
+ 
+ function cleanup {
+   echo "* Cleaning up"
+-	killall main
+-  killall go
++  killall main || true
++  killall go || true
+ }
+ 
+ set -x
+@@ -37,16 +37,22 @@ kubectl config set-context --current --namespace=argo-rollouts
+ 
+ # 3) Build, install, and start the argo-rollouts-manager controller
+ cd $SCRIPT_DIR/..
+-make generate fmt vet install
+ 
+-set +e
+ 
+-rm -f /tmp/e2e-operator-run.log || true
+-go run ./main.go 2>&1 | tee /tmp/e2e-operator-run.log &
++# Only start the controller if SKIP_RUN_STEP is empty
++# - Otherwise, we assume that Argo Rollouts operator is already installed and running (for example, via OpenShift GitOps)
++if [ -z "$SKIP_RUN_STEP" ]; then
++  make generate fmt vet install
+ 
+-set -e
++  set +e
++
++  rm -f /tmp/e2e-operator-run.log || true
++  go run ./main.go 2>&1 | tee /tmp/e2e-operator-run.log &
++
++  set -e
++fi
+ 
+-# 4) Install Argo Rollouts into the Namespace via RolloutManater CR
++# 4) Install Argo Rollouts into the Namespace via RolloutManager CR
+ 
+ cd $TMP_DIR/argo-rollouts
+ 
+diff --git a/hack/start-rollouts-manager-for-e2e-tests.sh b/hack/start-rollouts-manager-for-e2e-tests.sh
+new file mode 100755
+index 0000000..94ab0ee
+--- /dev/null
++++ b/hack/start-rollouts-manager-for-e2e-tests.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++
++SCRIPTPATH="$(
++  cd -- "$(dirname "$0")" >/dev/null 2>&1 || exit
++  pwd -P
++)"
++
++cd "$SCRIPTPATH/.."
++
++rm -f /tmp/e2e-operator-run.log || true
++
++set -o pipefail
++set -ex
++
++make install generate fmt vet
++go run ./main.go 2>&1 | tee /tmp/e2e-operator-run.log
+diff --git a/hack/verify-rollouts-e2e-tests/main.go b/hack/verify-rollouts-e2e-tests/main.go
+index d2d0bac..807175b 100644
+--- a/hack/verify-rollouts-e2e-tests/main.go
++++ b/hack/verify-rollouts-e2e-tests/main.go
+@@ -190,10 +190,13 @@ func parseTestResultsFromFile(fileContents []string, testsExpectedToFailList []s
+ 	return testResults, nil
+ }
+ 
+-// waitAndGetE2EFileContents waits for the last line of the file to start with 'DONE' before returning the contents
+-// This allows us to avoid a race condition with tee where the file contents of the file may not have been fully flushed.
++// waitAndGetE2EFileContents waits for one of the last 50 lines of the file to start with 'DONE' before returning the contents.
++// This allows us to avoid a race condition with tee where the file contents of the file may not have been fully written.
+ func waitAndGetE2EFileContents(testsE2EResultsLogPath string) ([]string, error) {
+ 
++	// Return whatever we have after 1 minute has elapsed
++	expireTime := time.Now().Add(1 * time.Minute)
++
+ 	for {
+ 
+ 		fileLines, err := readFileIntoListOfLines(testsE2EResultsLogPath, true)
+@@ -201,16 +204,26 @@ func waitAndGetE2EFileContents(testsE2EResultsLogPath string) ([]string, error)
+ 			return []string{}, err
+ 		}
+ 
+-		lastLine := fileLines[len(fileLines)-1]
++		lineIndexStart := len(fileLines) - 50
++		if lineIndexStart < 0 {
++			lineIndexStart = 0
++		}
++
++		for _, line := range fileLines[lineIndexStart:] {
++			// example line: DONE 6 runs, 144 tests, 6 skipped, 47 failures in 2279.668s
++			if strings.HasPrefix(line, "DONE ") {
++				fmt.Println("E2E tests file is complete:", line)
++				return fileLines, nil
++			}
++		}
+ 
+-		// example: DONE 6 runs, 144 tests, 6 skipped, 47 failures in 2279.668s
+-		if strings.HasPrefix(lastLine, "DONE ") {
+-			fmt.Println("E2E tests file is complete:", lastLine)
++		if time.Now().After(expireTime) {
++			fmt.Println("E2E tests file timed out waiting. Previous X lines were:", fileLines[lineIndexStart:])
+ 			return fileLines, nil
+ 		}
+ 
+ 		// Otherwise, wait a second then check again.
+-		fmt.Println("* Waiting for E2E test file to be complete:", lastLine)
++		fmt.Println("* Waiting for E2E test file to be complete")
+ 		time.Sleep(time.Second)
+ 	}
+ 

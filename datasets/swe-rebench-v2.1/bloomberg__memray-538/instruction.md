@@ -1,0 +1,2 @@
+Make the `%%memray_flamegraph` IPython magic use aggregated capture files
+See #519 for context. The `%%memray_flamegraph` IPython magic predates [aggregated capture files](https://bloomberg.github.io/memray/run.html#aggregated-capture-files), but considering that the capture file produced by `%%memray_flamegraph` is only used for the reports that aggregated capture files support, we should probably use aggregated capture files by default for the `%%memray_flamegraph` magic.

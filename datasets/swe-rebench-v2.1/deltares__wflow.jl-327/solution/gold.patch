@@ -1,0 +1,157 @@
+diff --git a/docs/src/changelog.md b/docs/src/changelog.md
+index ad8633198..c14da9a0c 100644
+--- a/docs/src/changelog.md
++++ b/docs/src/changelog.md
+@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Fixed
+ - Added missing BMI function `get_grid_size`, it is used for unstructured grids, for example
+   to get the length of arrays returned by BMI functions `get_grid_x` and `get_grid_y`.
++  
++### Changed
++
++### Added
++- Total water storage as an export variable for `SBM` concept. This is the total water stored
++  per grid cell in millimeters. Excluded from this variable are the floodplain, lakes and
++  reservoirs.
+ 
+ ## v0.7.3 - 2024-01-12
+ 
+diff --git a/docs/src/model_docs/params_vertical.md b/docs/src/model_docs/params_vertical.md
+index de39ff770..03a7817c0 100644
+--- a/docs/src/model_docs/params_vertical.md
++++ b/docs/src/model_docs/params_vertical.md
+@@ -116,6 +116,7 @@ specific_leaf = "Sl"
+ | **`leaf_area_index`** | leaf area index | m``^2`` m``{-2}`` | - |
+ | `waterlevel_land` | water level land | mm | - |
+ | `waterlevel_river` | water level river | mm | - |
++| `total_storage` | total water storage (excluding floodplains, lakes and reservoirs) | mm | - |
+ 
+ 
+ ## [HBV](@id params_hbv)
+diff --git a/src/sbm.jl b/src/sbm.jl
+index 67d2650ea..9cc336074 100644
+--- a/src/sbm.jl
++++ b/src/sbm.jl
+@@ -194,6 +194,8 @@
+     waterlevel_land::Vector{T} | "mm"
+     # Water level river [mm]
+     waterlevel_river::Vector{T} | "mm"
++    # Total water storage (excluding floodplain volume, lakes and reservoirs) [mm]
++    total_storage::Vector{T} | "mm"
+ 
+     function SBM{T,N,M}(args...) where {T,N,M}
+         equal_size_vectors(args)
+@@ -597,6 +599,7 @@ function initialize_sbm(nc, config, riverfrac, inds)
+         leaf_area_index = fill(mv, n),
+         waterlevel_land = fill(mv, n),
+         waterlevel_river = zeros(Float, n), #set to zero to account for cells outside river domain
++        total_storage = zeros(Float, n) # Set the total water storage from initialized values
+     )
+ 
+     return sbm
+@@ -1049,3 +1052,63 @@ function update_after_subsurfaceflow(sbm::SBM, zi, exfiltsatwater)
+         sbm.zi[i] = zi[i]
+     end
+ end
++
++"""
++Update the total water storage per cell at the end of a timestep.
++
++Takes the following parameters:
++- sbm:
++    The vertical concept (SBM struct)
++- river_network:
++    The indices of the river cells in relation to the active cells, i.e. model.network.index_river
++- cell_xsize:
++    Size in X direction of the cells acquired from model.network.land.xl
++- cell_ysize:
++    Size in Y direction of the cells acquired from model.network.land.yl
++- river_routing:
++    The river routing struct, i.e. model.lateral.river
++- land_routing:
++    The land routing struct, i.e. model.lateral.land
++"""
++function update_total_water_storage(
++    sbm::SBM, 
++    river_network, 
++    cell_xsize, 
++    cell_ysize, 
++    river_routing, 
++    land_routing
++)
++    # Get length active river cells
++    nriv = length(river_network)
++
++    # Set the total storage to zero
++    fill!(sbm.total_storage, 0)
++
++    # Burn the river routing values
++    sbm.total_storage[river_network] = (
++        ( river_routing.h_av[1:nriv] .* river_routing.width[1:nriv] .* 
++        river_routing.dl[1:nriv] ) ./
++        ( cell_xsize[river_network] .* cell_ysize[river_network] ) * 
++        1000 # Convert to mm
++    )
++
++    # Chunk the data for parallel computing
++    threaded_foreach(1:sbm.n, basesize=1000) do i
++
++        # Cumulate per vertical type
++        # Maybe re-categorize in the future
++        surface = (
++            sbm.glacierstore[i] * sbm.glacierfrac[i] +
++            sbm.snow[i] + sbm.snowwater[i] + sbm.canopystorage[i]
++        )
++        sub_surface = sbm.ustoredepth[i] + sbm.satwaterdepth[i]
++        lateral = (
++            land_routing.h_av[i] * (1 - sbm.riverfrac[i]) * 1000 # convert to mm
++        )
++        
++        # Add everything to the total water storage
++        sbm.total_storage[i] += (
++            surface + sub_surface + lateral
++        )
++    end
++end
+diff --git a/src/sbm_model.jl b/src/sbm_model.jl
+index 907bbd9bc..6ef34b51f 100644
+--- a/src/sbm_model.jl
++++ b/src/sbm_model.jl
+@@ -376,6 +376,7 @@ function update(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmModel}
+     # update lateral subsurface flow domain (kinematic wave)
+     update(lateral.subsurface, network.land, network.frac_toriver)
+     model = update_after_subsurfaceflow(model)
++    model = update_total_water_storage(model)
+ end
+ 
+ """
+@@ -438,6 +439,29 @@ function update_after_subsurfaceflow(
+     return model
+ end
+ 
++"""
++Update of the total water storage at the end of each timestep per model cell.
++
++This is done here at model level.
++"""
++function update_total_water_storage(
++    model::Model{N,L,V,R,W,T},
++) where {N,L,V,R,W,T<:SbmModel}
++    @unpack lateral, vertical, network, clock, config = model
++
++    # Update the total water storage based on vertical states
++    # TODO Maybe look at routing in the near future
++    update_total_water_storage(
++        vertical,
++        network.index_river,
++        network.land.xl,
++        network.land.yl,
++        lateral.river,
++        lateral.land,
++    )
++    return model
++end
++
+ function set_states(model::Model{N,L,V,R,W,T}) where {N,L,V,R,W,T<:SbmModel}
+     @unpack lateral, vertical, network, config = model
+ 

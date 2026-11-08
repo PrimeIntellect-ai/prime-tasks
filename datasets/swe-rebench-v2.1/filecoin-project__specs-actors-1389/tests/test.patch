@@ -1,0 +1,99 @@
+diff --git a/actors/builtin/miner/miner_test.go b/actors/builtin/miner/miner_test.go
+index 4c78684..a49fa66 100644
+--- a/actors/builtin/miner/miner_test.go
++++ b/actors/builtin/miner/miner_test.go
+@@ -12,6 +12,7 @@ import (
+ 	bitfield "github.com/filecoin-project/go-bitfield"
+ 	"github.com/filecoin-project/go-state-types/abi"
+ 	"github.com/filecoin-project/go-state-types/big"
++	"github.com/filecoin-project/go-state-types/cbor"
+ 	"github.com/filecoin-project/go-state-types/crypto"
+ 	"github.com/filecoin-project/go-state-types/dline"
+ 	"github.com/filecoin-project/go-state-types/exitcode"
+@@ -4365,18 +4366,24 @@ func TestReportConsensusFault(t *testing.T) {
+ 		actor.checkState(rt)
+ 	})
+ 
+-	t.Run("Report consensus fault pays reward and charges fee", func(t *testing.T) {
+-		rt := builder.Build(t)
+-		actor.constructAndVerify(rt)
+-		precommitEpoch := abi.ChainEpoch(1)
+-		rt.SetEpoch(precommitEpoch)
++	t.Run("Report consensus fault reward does not increase with fault age", func(t *testing.T) {
++		reportAtAge := func(age abi.ChainEpoch) abi.TokenAmount {
++			rt := builder.Build(t)
++			actor.constructAndVerify(rt)
++			rt.SetEpoch(age)
++			reward := actor.reportConsensusFault(rt, addr.TestAddress, &runtime.ConsensusFault{
++				Target: actor.receiver,
++				Epoch:  0,
++				Type:   runtime.ConsensusFaultDoubleForkMining,
++			})
++			actor.checkState(rt)
++			return reward
++		}
+ 
+-		actor.reportConsensusFault(rt, addr.TestAddress, &runtime.ConsensusFault{
+-			Target: actor.receiver,
+-			Epoch:  rt.Epoch() - 1,
+-			Type:   runtime.ConsensusFaultDoubleForkMining,
+-		})
+-		actor.checkState(rt)
++		rewardAtOneEpoch := reportAtAge(1)
++		rewardAfterManyEpochs := reportAtAge(100)
++		assert.True(t, rewardAtOneEpoch.Equals(rewardAfterManyEpochs),
++			"reporter compensation must not grow with the fault's unreported age")
+ 	})
+ 
+ 	t.Run("Report consensus fault updates consensus fault reported field", func(t *testing.T) {
+@@ -5789,7 +5796,25 @@ func (h *actorHarness) terminateSectors(rt *mock.Runtime, sectors bitfield.BitFi
+ 	return sectorPower.Neg(), pledgeDelta
+ }
+ 
+-func (h *actorHarness) reportConsensusFault(rt *mock.Runtime, from addr.Address, fault *runtime.ConsensusFault) {
++type consensusFaultSendRecorder struct {
++	*mock.Runtime
++	reporter   addr.Address
++	reward     abi.TokenAmount
++	rewardSent bool
++}
++
++func (rt *consensusFaultSendRecorder) Send(to addr.Address, method abi.MethodNum, params cbor.Marshaler, value abi.TokenAmount, out cbor.Er) exitcode.ExitCode {
++	if to == rt.reporter && method == builtin.MethodSend {
++		rt.reward = value
++		rt.rewardSent = true
++	}
++	if (to == rt.reporter || to == builtin.BurntFundsActorAddr) && method == builtin.MethodSend {
++		rt.Runtime.ExpectSend(to, method, params, value, nil, exitcode.Ok)
++	}
++	return rt.Runtime.Send(to, method, params, value, out)
++}
++
++func (h *actorHarness) reportConsensusFault(rt *mock.Runtime, from addr.Address, fault *runtime.ConsensusFault) abi.TokenAmount {
+ 	rt.SetCaller(from, builtin.AccountActorCodeID)
+ 	rt.ExpectValidateCallerType(builtin.CallerTypesSignable...)
+ 	params := &miner.ReportConsensusFaultParams{
+@@ -5810,17 +5835,13 @@ func (h *actorHarness) reportConsensusFault(rt *mock.Runtime, from addr.Address,
+ 	}
+ 	rt.ExpectSend(builtin.RewardActorAddr, builtin.MethodsReward.ThisEpochReward, nil, big.Zero(), &currentReward, exitcode.Ok)
+ 
+-	penaltyTotal := miner.ConsensusFaultPenalty(h.epochRewardSmooth.Estimate())
+-	// slash reward
+-	rwd := miner.RewardForConsensusSlashReport(1, penaltyTotal)
+-	rt.ExpectSend(from, builtin.MethodSend, nil, rwd, nil, exitcode.Ok)
+-
+-	// pay fault fee
+-	toBurn := big.Sub(penaltyTotal, rwd)
+-	rt.ExpectSend(builtin.BurntFundsActorAddr, builtin.MethodSend, nil, toBurn, nil, exitcode.Ok)
+-
+-	rt.Call(h.a.ReportConsensusFault, params)
++	recorder := &consensusFaultSendRecorder{Runtime: rt, reporter: from}
++	rt.Call(func(_ runtime.Runtime, p *miner.ReportConsensusFaultParams) *abi.EmptyValue {
++		return h.a.ReportConsensusFault(recorder, p)
++	}, params)
+ 	rt.Verify()
++	require.True(h.t, recorder.rewardSent, "successful report should send compensation to the reporter")
++	return recorder.reward
+ }
+ 
+ func (h *actorHarness) applyRewards(rt *mock.Runtime, amt, penalty abi.TokenAmount) {

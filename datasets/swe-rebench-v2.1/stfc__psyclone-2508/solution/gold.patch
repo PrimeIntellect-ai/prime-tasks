@@ -1,0 +1,284 @@
+diff --git a/changelog b/changelog
+index 5112b5491..8d9a9478e 100644
+--- a/changelog
++++ b/changelog
+@@ -11,6 +11,9 @@
+ 
+ 	5) PR #2506. Update test and integration test dependencies.
+ 
++	6) PR #2508 for #2507. Add a symbols_to_ignore argument to some
++	symbol_table operations and use it to fix inline transformation issues.
++
+ release 2.5.0 14th of February 2024
+ 
+ 	1) PR #2199 for #2189. Fix bugs with missing maps in enter data
+diff --git a/src/psyclone/psyir/backend/fortran.py b/src/psyclone/psyir/backend/fortran.py
+index 630870d64..43888bb5b 100644
+--- a/src/psyclone/psyir/backend/fortran.py
++++ b/src/psyclone/psyir/backend/fortran.py
+@@ -1183,7 +1183,15 @@ class FortranWriter(LanguageWriter):
+             whole_routine_scope = type(node.symbol_table)()
+ 
+             for schedule in node.walk(Schedule):
+-                whole_routine_scope.merge(schedule.symbol_table)
++                sched_table = schedule.symbol_table
++                # We can't declare a routine inside itself so make sure we
++                # skip any RoutineSymbol representing this routine.
++                try:
++                    rsym = sched_table.lookup_with_tag("own_routine_symbol")
++                    skip = [rsym] if isinstance(rsym, RoutineSymbol) else []
++                except KeyError:
++                    skip = []
++                whole_routine_scope.merge(sched_table, skip)
+ 
+             # Replace the symbol table
+             node.symbol_table.detach()
+diff --git a/src/psyclone/psyir/symbols/symbol_table.py b/src/psyclone/psyir/symbols/symbol_table.py
+index 2a7f00bec..cb7f3fd6e 100644
+--- a/src/psyclone/psyir/symbols/symbol_table.py
++++ b/src/psyclone/psyir/symbols/symbol_table.py
+@@ -42,6 +42,7 @@
+ # pylint: disable=too-many-lines
+ 
+ from collections import OrderedDict
++from collections.abc import Iterable
+ import inspect
+ import copy
+ 
+@@ -561,21 +562,33 @@ class SymbolTable():
+ 
+         self._symbols[key] = new_symbol
+ 
+-    def check_for_clashes(self, other_table):
++    def check_for_clashes(self, other_table, symbols_to_skip=()):
+         '''
+         Checks the symbols in the supplied table against those in
+         this table. If there is a name clash that cannot be resolved by
+-        renaming then a SymbolError is raised.
++        renaming then a SymbolError is raised. Any symbols appearing
++        in `symbols_to_skip` are excluded from the checks.
+ 
+         :param other_table: the table for which to check for clashes.
+         :type other_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+-
+-        :raises SymbolError: if there would be an unresolvable name clash \
++        :param symbols_to_skip: an optional list of symbols to exclude from
++            the check.
++        :type symbols_to_skip: Iterable[
++            :py:class:`psyclone.psyir.symbols.Symbol`]
++
++        :raises TypeError: if symbols_to_skip is supplied but is not an
++            instance of Iterable.
++        :raises SymbolError: if there would be an unresolvable name clash
+             when importing symbols from `other_table` into this table.
+ 
+         '''
++        if not isinstance(symbols_to_skip, Iterable):
++            raise TypeError(
++                f"check_for_clashes: 'symbols_to_skip' must be an instance of "
++                f"Iterable but got '{type(symbols_to_skip).__name__}'")
++
+         for other_sym in other_table.symbols:
+-            if other_sym.name not in self:
++            if other_sym.name not in self or other_sym in symbols_to_skip:
+                 continue
+             # We have a name clash.
+             this_sym = self.lookup(other_sym.name)
+@@ -617,7 +630,7 @@ class SymbolTable():
+         (This is a preliminary step to adding all symbols from other_table to
+         this table.)
+ 
+-        :param other_table: the symbol table from which to take container \
++        :param other_table: the symbol table from which to take container
+                             symbols.
+         :type other_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+ 
+@@ -666,38 +679,25 @@ class SymbolTable():
+                         self.lookup(csym.name),
+                         orig_name=isym.interface.orig_name)
+ 
+-    def _add_symbols_from_table(self, other_table, include_arguments=True):
++    def _add_symbols_from_table(self, other_table, symbols_to_skip=()):
+         '''
+         Takes symbols from the supplied symbol table and adds them to this
+-        table. _add_container_symbols_from_table() must have been called
++        table (unless they appear in `symbols_to_skip`).
++        _add_container_symbols_from_table() must have been called
+         before this method in order to handle any Container Symbols and update
+         those Symbols imported from them.
+ 
+         :param other_table: the symbol table from which to add symbols.
+         :type other_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+-        :param bool include_arguments: whether or not to include symbols that \
+-                                       are routine arguments.
++        :param symbols_to_skip: an optional list of symbols to exclude from
++                                the merge.
++        :type symbols_to_skip: Iterable[
++            :py:class:`psyclone.psyir.symbols.Symbol`]
+ 
+-        :raises InternalError: if an imported symbol is found that has not \
++        :raises InternalError: if an imported symbol is found that has not
+             already been updated to refer to a Container in this table.
+ 
+         '''
+-        if include_arguments:
+-            symbols_to_skip = []
+-        else:
+-            symbols_to_skip = other_table.argument_list[:]
+-
+-        try:
+-            # In the case where the 'other_table' belongs to a routine,
+-            # we don't want or need the symbol representing that routine.
+-            rsym = other_table.lookup_with_tag("own_routine_symbol")
+-            if isinstance(rsym, RoutineSymbol):
+-                # We only want to skip RoutineSymbols, not DataSymbols (which
+-                # we may have if we have a Fortran function).
+-                symbols_to_skip.append(rsym)
+-        except KeyError:
+-            pass
+-
+         for old_sym in other_table.symbols:
+ 
+             if old_sym in symbols_to_skip or isinstance(old_sym,
+@@ -732,32 +732,35 @@ class SymbolTable():
+                     other_table.rename_symbol(old_sym, new_name)
+                     self.add(old_sym)
+ 
+-    def merge(self, other_table, include_arguments=True):
++    def merge(self, other_table, symbols_to_skip=()):
+         '''Merges all of the symbols found in `other_table` into this
+         table. Symbol objects in *either* table may be renamed in the
+         event of clashes.
+ 
+-        If `other_table` belongs to a Routine and contains a symbol with the
+-        same name as the Routine (i.e. a function in Fortran) then that symbol
+-        is *not* added to this symbol table. Also, if `include_arguments` is
+-        False then any Symbols representing formal routine arguments are
+-        excluded.
++        Any Symbols appearing in `symbols_to_skip` are excluded.
+ 
+         :param other_table: the symbol table from which to add symbols.
+         :type other_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+-        :param bool include_arguments: whether to include Symbols that \
+-            represent routine arguments.
++        :param symbols_to_skip: an optional list of Symbols to exclude from
++                                the merge.
++        :type symbols_to_skip: Iterable[
++            :py:class:`psyclone.psyir.symbols.Symbol`]
+ 
+         :raises TypeError: if `other_table` is not a SymbolTable.
++        :raises TypeError: if `symbols_to_skip` is not an Iterable.
+         :raises SymbolError: if name clashes prevent the merge.
+ 
+         '''
+         if not isinstance(other_table, SymbolTable):
+             raise TypeError(f"SymbolTable.merge() expects a SymbolTable "
+                             f"instance but got '{type(other_table).__name__}'")
+-
++        if not isinstance(symbols_to_skip, Iterable):
++            raise TypeError(
++                f"SymbolTable.merge() expects 'symbols_to_skip' to be an "
++                f"Iterable but got '{type(symbols_to_skip).__name__}'")
+         try:
+-            self.check_for_clashes(other_table)
++            self.check_for_clashes(other_table,
++                                   symbols_to_skip=symbols_to_skip)
+         except SymbolError as err:
+             raise SymbolError(
+                 f"Cannot merge {other_table.view()} with {self.view()} due to "
+@@ -767,8 +770,9 @@ class SymbolTable():
+         self._add_container_symbols_from_table(other_table)
+ 
+         # Copy each Symbol from the supplied table into this one, excluding
+-        # ContainerSymbols and, optionally, those that represent formal args.
+-        self._add_symbols_from_table(other_table, include_arguments)
++        # ContainerSymbols and any listed in `symbols_to_skip`.
++        self._add_symbols_from_table(other_table,
++                                     symbols_to_skip=symbols_to_skip)
+ 
+     def swap_symbol_properties(self, symbol1, symbol2):
+         '''Swaps the properties of symbol1 and symbol2 apart from the symbol
+diff --git a/src/psyclone/psyir/transformations/inline_trans.py b/src/psyclone/psyir/transformations/inline_trans.py
+index bf27c9b4d..255f9213e 100644
+--- a/src/psyclone/psyir/transformations/inline_trans.py
++++ b/src/psyclone/psyir/transformations/inline_trans.py
+@@ -46,7 +46,8 @@ from psyclone.psyir.nodes import (
+ from psyclone.psyir.nodes.array_mixin import ArrayMixin
+ from psyclone.psyir.symbols import (
+     ArgumentInterface, ArrayType, DataSymbol, UnresolvedType, INTEGER_TYPE,
+-    StaticInterface, Symbol, SymbolError, UnknownInterface, UnsupportedType)
++    RoutineSymbol, StaticInterface, Symbol, SymbolError, UnknownInterface,
++    UnsupportedType)
+ from psyclone.psyir.transformations.reference2arrayrange_trans import (
+     Reference2ArrayRangeTrans)
+ from psyclone.psyir.transformations.transformation_error import (
+@@ -159,7 +160,9 @@ class InlineTrans(Transformation):
+ 
+         # Shallow copy the symbols from the routine into the table at the
+         # call site.
+-        table.merge(routine_table, include_arguments=False)
++        table.merge(routine_table,
++                    symbols_to_skip=self._symbols_to_skip(routine_table))
++
+         # When constructing new references to replace references to formal
+         # args, we need to know whether any of the actual arguments are array
+         # accesses. If they use 'array notation' (i.e. represent a whole array)
+@@ -213,7 +216,7 @@ class InlineTrans(Transformation):
+                 idx += 1
+                 parent.addchild(child, idx)
+ 
+-        # If the scope we merged the inlined functions symbol table into
++        # If the scope we merged the inlined function's symbol table into
+         # is not a Routine scope then we now merge that symbol table into
+         # the ancestor Routine. This avoids issues like #2424 when
+         # applying ParallelLoopTrans to loops containing inlined calls.
+@@ -223,6 +226,38 @@ class InlineTrans(Transformation):
+             scope.symbol_table.detach()
+             replacement.attach(scope)
+ 
++    def _symbols_to_skip(self, table):
++        '''
++        Constructs a list of those Symbols in the table of the called routine
++        that must be excluded when merging that table with the one at the
++        call site.
++
++        These are:
++         - those Symbols representing routine arguments;
++         - any RoutineSymbol representing the called routine itself.
++
++        :param table: the symbol table of the routine to be inlined.
++        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
++
++        :returns: those Symbols that must be skipped when merging the
++                  supplied table into the one at the call site.
++        :rtype: list[:py:class:`psyclone.psyir.symbols.Symbol`]
++
++        '''
++        # We need to exclude formal arguments and any RoutineSymbol
++        # representing the routine itself.
++        symbols_to_skip = table.argument_list[:]
++        try:
++            # We don't want or need the symbol representing that routine.
++            rsym = table.lookup_with_tag("own_routine_symbol")
++            if isinstance(rsym, RoutineSymbol):
++                # We only want to skip RoutineSymbols, not DataSymbols (which
++                # we may have if we have a Fortran function).
++                symbols_to_skip.append(rsym)
++        except KeyError:
++            pass
++        return symbols_to_skip
++
+     def _replace_formal_arg(self, ref, call_node, formal_args):
+         '''
+         Recursively combines any References to formal arguments in the supplied
+@@ -672,7 +707,9 @@ class InlineTrans(Transformation):
+         # We can't handle a clash between (apparently) different symbols that
+         # share a name but are imported from different containers.
+         try:
+-            table.check_for_clashes(routine_table)
++            table.check_for_clashes(
++                routine_table,
++                symbols_to_skip=self._symbols_to_skip(routine_table))
+         except SymbolError as err:
+             raise TransformationError(
+                 f"One or more symbols from routine '{routine.name}' cannot be "

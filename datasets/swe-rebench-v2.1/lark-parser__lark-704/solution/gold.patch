@@ -1,0 +1,371 @@
+diff --git a/lark-stubs/lark.pyi b/lark-stubs/lark.pyi
+index f538dbb..79437ff 100644
+--- a/lark-stubs/lark.pyi
++++ b/lark-stubs/lark.pyi
+@@ -2,7 +2,7 @@
+ 
+ from typing import (
+     TypeVar, Type, List, Dict, IO, Iterator, Callable, Union, Optional,
+-    Literal, Protocol, Iterable,
++    Literal, Protocol, Tuple,  Iterable,
+ )
+ from .visitors import Transformer
+ from .lexer import Token, Lexer, TerminalDef
+@@ -34,11 +34,25 @@ class LarkOptions:
+     cache: Union[bool, str]
+     g_regex_flags: int
+     use_bytes: bool
++    import_paths: List[Union[str, Callable[[Union[None, str, PackageResource], str], Tuple[str, str]]]]
++    source_path: Optional[str]
++
++
++class PackageResource(object):
++    pkg_name: str
++    path: str
++    
++    def __init__(self, pkg_name: str, path: str):
++
++class FromPackageLoader:
++    def __init__(self, pkg_name: str, search_paths: Tuple[str, ...] = ...): ...
++    
++    def __call__(self, base_path: Union[None, str, PackageResource], grammar_path: str) -> Tuple[PackageResource, str]: ...
+ 
+ 
+ class Lark:
+-    source: str
+-    grammar_source: str
++    source_path: str
++    source_grammar: str
+     options: LarkOptions
+     lexer: Lexer
+     terminals: List[TerminalDef]
+@@ -62,6 +76,8 @@ class Lark:
+         cache: Union[bool, str] = False,
+         g_regex_flags: int = ...,
+         use_bytes: bool = False,
++        import_paths: List[Union[str, Callable[[Union[None, str, PackageResource], str], Tuple[str, str]]]] = ...,
++        source_path: Optional[str]=None,
+     ):
+         ...
+ 
+@@ -71,6 +87,10 @@ class Lark:
+     @classmethod
+     def open(cls: Type[_T], grammar_filename: str, rel_to: Optional[str] = None, **options) -> _T:
+         ...
++    
++    @classmethod
++    def open_from_package(cls: Type[_T], package: str, grammar_path: str, search_paths: Tuple[str, ...] = ..., **options) -> _T:
++        ...
+ 
+     def lex(self, text: str) -> Iterator[Token]:
+         ...
+diff --git a/lark/lark.py b/lark/lark.py
+index ecaa8da..f93c37b 100644
+--- a/lark/lark.py
++++ b/lark/lark.py
+@@ -2,10 +2,10 @@ from __future__ import absolute_import
+ 
+ import sys, os, pickle, hashlib
+ from io import open
+-
++from warnings import warn
+ 
+ from .utils import STRING_TYPE, Serialize, SerializeMemoizer, FS, isascii, logger
+-from .load_grammar import load_grammar
++from .load_grammar import load_grammar, FromPackageLoader
+ from .tree import Tree
+ from .common import LexerConf, ParserConf
+ 
+@@ -90,6 +90,10 @@ class LarkOptions(Serialize):
+             Accept an input of type ``bytes`` instead of ``str`` (Python 3 only).
+     edit_terminals
+             A callback for editing the terminals before parse.
++    import_paths
++            A List of either paths or loader functions to specify from where grammars are imported 
++    source_path
++            Override the source of from where the grammar was loaded. Useful for relative imports and unconventional grammar loading
+ 
+     **=== End Options ===**
+     """
+@@ -115,6 +119,8 @@ class LarkOptions(Serialize):
+         'edit_terminals': None,
+         'g_regex_flags': 0,
+         'use_bytes': False,
++        'import_paths': [],
++        'source_path': None,
+     }
+ 
+     def __init__(self, options_dict):
+@@ -194,10 +200,13 @@ class Lark(Serialize):
+             re_module = re
+ 
+         # Some, but not all file-like objects have a 'name' attribute
+-        try:
+-            self.source = grammar.name
+-        except AttributeError:
+-            self.source = '<string>'
++        if self.options.source_path is None:
++            try:
++                self.source_path = grammar.name
++            except AttributeError:
++                self.source_path = '<string>'
++        else:
++            self.source_path = self.options.source_path
+ 
+         # Drain file-like objects to get their contents
+         try:
+@@ -208,7 +217,7 @@ class Lark(Serialize):
+             grammar = read()
+ 
+         assert isinstance(grammar, STRING_TYPE)
+-        self.grammar_source = grammar
++        self.source_grammar = grammar
+         if self.options.use_bytes:
+             if not isascii(grammar):
+                 raise ValueError("Grammar must be ascii only, when use_bytes=True")
+@@ -274,7 +283,7 @@ class Lark(Serialize):
+         assert self.options.ambiguity in ('resolve', 'explicit', 'forest', 'auto', )
+ 
+         # Parse the grammar file and compose the grammars (TODO)
+-        self.grammar = load_grammar(grammar, self.source, re_module)
++        self.grammar = load_grammar(grammar, self.source_path, re_module, self.options.import_paths)
+ 
+         if self.options.postlex is not None:
+             terminals_to_keep = set(self.options.postlex.always_accept)
+@@ -377,7 +386,7 @@ class Lark(Serialize):
+         options.update(kwargs)
+         self.options = LarkOptions.deserialize(options, memo)
+         self.rules = [Rule.deserialize(r, memo) for r in data['rules']]
+-        self.source = '<deserialized>'
++        self.source_path = '<deserialized>'
+         self._prepare_callbacks()
+         self.parser = self.parser_class.deserialize(
+             data['parser'],
+@@ -411,9 +420,29 @@ class Lark(Serialize):
+             grammar_filename = os.path.join(basepath, grammar_filename)
+         with open(grammar_filename, encoding='utf8') as f:
+             return cls(f, **options)
++    
++    @classmethod
++    def open_from_package(cls, package, grammar_path, search_paths=("",), **options):
++        """Create an instance of Lark with the grammar loaded from within the package `package`.
++        This allows grammar loading from zipapps.
++        
++        Imports in the grammar will use the `package` and `search_paths` provided, through `FromPackageLoader`
++        
++        Example:
++            
++            Lark.open_from_package(__name__, "example.lark", ("grammars",), parser=...)
++        """
++        package = FromPackageLoader(package, search_paths)
++        full_path, text = package([], grammar_path)
++        options.setdefault('source_path', full_path)
++        if 'import_paths' in options:
++            options['import_paths'].append(package)
++        else:
++            options['import_paths'] = [package]
++        return cls(text, **options)
+ 
+     def __repr__(self):
+-        return 'Lark(open(%r), parser=%r, lexer=%r, ...)' % (self.source, self.options.parser, self.options.lexer)
++        return 'Lark(open(%r), parser=%r, lexer=%r, ...)' % (self.source_path, self.options.parser, self.options.lexer)
+ 
+ 
+     def lex(self, text):
+@@ -460,6 +489,24 @@ class Lark(Serialize):
+                         # Prevent infinite loop
+                         raise e2
+                     e = e2
++    
++    @property
++    def source(self):
++        warn("Lark.source attribute has been renamed to Lark.source_path", DeprecationWarning)
++        return self.source_path
++    
++    @source.setter
++    def source(self, value):
++        self.source_path = value
++
++    @property
++    def grammar_source(self):
++        warn("Lark.grammar_source attribute has been renamed to Lark.source_grammar", DeprecationWarning)
++        return self.source_grammar
++    
++    @grammar_source.setter
++    def grammar_source(self, value):
++        self.source_grammar = value
+ 
+ 
+ ###}
+diff --git a/lark/load_grammar.py b/lark/load_grammar.py
+index 1590665..4c0a339 100644
+--- a/lark/load_grammar.py
++++ b/lark/load_grammar.py
+@@ -4,6 +4,7 @@ import os.path
+ import sys
+ from copy import copy, deepcopy
+ from io import open
++import pkgutil
+ 
+ from .utils import bfs, eval_escaping, Py36, logger, classify_bool
+ from .lexer import Token, TerminalDef, PatternStr, PatternRE
+@@ -20,7 +21,7 @@ from .visitors import Transformer, Visitor, v_args, Transformer_InPlace, Transfo
+ inline_args = v_args(inline=True)
+ 
+ __path__ = os.path.dirname(__file__)
+-IMPORT_PATHS = [os.path.join(__path__, 'grammars')]
++IMPORT_PATHS = ['grammars']
+ 
+ EXT = '.lark'
+ 
+@@ -648,17 +649,79 @@ class Grammar:
+         return terminals, compiled_rules, self.ignore
+ 
+ 
++class PackageResource(object):
++    """
++    Represents a path inside a Package. Used by `FromPackageLoader`
++    """
++    def __init__(self, pkg_name, path):
++        self.pkg_name = pkg_name
++        self.path = path
++    
++    def __str__(self):
++        return "<%s: %s>" % (self.pkg_name, self.path)
++    
++    def __repr__(self):
++        return "%s(%r, %r)" % (type(self).__name__, self.pkg_name, self.path)
++
++class FromPackageLoader(object):
++    """
++    Provides a simple way of creating custom import loaders that load from packages via ``pkgutil.get_data`` instead of using `open`.
++    This allows them to be compatible even from within zip files.
++    
++    Relative imports are handled, so you can just freely use them.
++    
++    pkg_name: The name of the package. You can probably provide `__name__` most of the time
++    search_paths: All the path that will be search on absolute imports.
++    """
++    def __init__(self, pkg_name, search_paths=("", )):
++        self.pkg_name = pkg_name
++        self.search_paths = search_paths
++        
++    def __repr__(self):
++        return "%s(%r, %r)" % (type(self).__name__, self.pkg_name, self.search_paths)
++
++    def __call__(self, base_path, grammar_path):
++        if base_path is None:
++            to_try = self.search_paths
++        else:
++            # Check whether or not the importing grammar was loaded by this module.
++            if not isinstance(base_path, PackageResource) or base_path.pkg_name != self.pkg_name:
++                # Technically false, but FileNotFound doesn't exist in python2.7, and this message should never reach the end user anyway
++                raise IOError()
++            to_try = [base_path.path]
++        for path in to_try:
++            full_path = os.path.join(path, grammar_path)
++            try:
++                text = pkgutil.get_data(self.pkg_name, full_path)
++            except IOError:
++                continue
++            else:
++                return PackageResource(self.pkg_name, full_path), text.decode()
++        raise IOError()
++
++stdlib_loader = FromPackageLoader('lark', IMPORT_PATHS)
++
+ 
+ _imported_grammars = {}
+-def import_grammar(grammar_path, re_, base_paths=[]):
++def import_grammar(grammar_path, re_, base_path=None, import_paths=[]):
+     if grammar_path not in _imported_grammars:
+-        import_paths = base_paths + IMPORT_PATHS
+-        for import_path in import_paths:
+-            with suppress(IOError):
+-                joined_path = os.path.join(import_path, grammar_path)
+-                with open(joined_path, encoding='utf8') as f:
+-                    text = f.read()
+-                grammar = load_grammar(text, joined_path, re_)
++        # import_paths take priority over base_path since they should handle relative imports and ignore everything else.
++        # Question: should the stdlib_loader really be pushed to the end?
++        to_try = import_paths + ([base_path] if base_path is not None else []) + [stdlib_loader] 
++        for source in to_try:
++            try:
++                if callable(source):
++                    joined_path, text = source(base_path, grammar_path)
++                else:
++                    joined_path = os.path.join(source, grammar_path)
++                    with open(joined_path, encoding='utf8') as f:
++                        text = f.read()
++            except IOError:
++                continue
++            else:
++                # Don't load the grammar from within the try statement. Otherwise the underlying error message will be swallowed 
++                # and the wrong file will be reported as missing
++                grammar = load_grammar(text, joined_path, re_, import_paths) 
+                 _imported_grammars[grammar_path] = grammar
+                 break
+         else:
+@@ -817,7 +880,7 @@ class GrammarLoader:
+         self.canonize_tree = CanonizeTree()
+         self.re_module = re_module
+ 
+-    def load_grammar(self, grammar_text, grammar_name='<?>'):
++    def load_grammar(self, grammar_text, grammar_name='<?>', import_paths=[]):
+         "Parse grammar_text, verify, and create Grammar object. Display nice messages on error."
+ 
+         try:
+@@ -871,7 +934,7 @@ class GrammarLoader:
+                     aliases = {name: arg1 or name}  # Aliases if exist
+ 
+                 if path_node.data == 'import_lib':  # Import from library
+-                    base_paths = []
++                    base_path = None
+                 else:  # Relative import
+                     if grammar_name == '<string>':  # Import relative to script file path if grammar is coded in script
+                         try:
+@@ -881,16 +944,19 @@ class GrammarLoader:
+                     else:
+                         base_file = grammar_name  # Import relative to grammar file path if external grammar file
+                     if base_file:
+-                        base_paths = [os.path.split(base_file)[0]]
++                        if isinstance(base_file, PackageResource):
++                            base_path = PackageResource(base_file.pkg_name, os.path.split(base_file.path)[0])
++                        else:
++                            base_path = os.path.split(base_file)[0]
+                     else:
+-                        base_paths = [os.path.abspath(os.path.curdir)]
++                        base_path = os.path.abspath(os.path.curdir)
+ 
+                 try:
+-                    import_base_paths, import_aliases = imports[dotted_path]
+-                    assert base_paths == import_base_paths, 'Inconsistent base_paths for %s.' % '.'.join(dotted_path)
++                    import_base_path, import_aliases = imports[dotted_path]
++                    assert base_path == import_base_path, 'Inconsistent base_path for %s.' % '.'.join(dotted_path)
+                     import_aliases.update(aliases)
+                 except KeyError:
+-                    imports[dotted_path] = base_paths, aliases
++                    imports[dotted_path] = base_path, aliases
+ 
+             elif stmt.data == 'declare':
+                 for t in stmt.children:
+@@ -899,9 +965,9 @@ class GrammarLoader:
+                 assert False, stmt
+ 
+         # import grammars
+-        for dotted_path, (base_paths, aliases) in imports.items():
++        for dotted_path, (base_path, aliases) in imports.items():
+             grammar_path = os.path.join(*dotted_path) + EXT
+-            g = import_grammar(grammar_path, self.re_module, base_paths=base_paths)
++            g = import_grammar(grammar_path, self.re_module, base_path=base_path, import_paths=import_paths)
+             new_td, new_rd = import_from_grammar_into_namespace(g, '__'.join(dotted_path), aliases)
+ 
+             term_defs += new_td
+@@ -981,5 +1047,5 @@ class GrammarLoader:
+ 
+ 
+ 
+-def load_grammar(grammar, source, re_):
+-    return GrammarLoader(re_).load_grammar(grammar, source)
++def load_grammar(grammar, source, re_, import_paths):
++    return GrammarLoader(re_).load_grammar(grammar, source, import_paths)

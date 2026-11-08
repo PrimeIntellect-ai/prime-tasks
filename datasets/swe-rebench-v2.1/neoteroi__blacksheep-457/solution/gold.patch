@@ -1,0 +1,217 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 539714a..507f534 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+   for Cython code.
+ - Removes `consts.pxi` because it used a deprecated Cython feature.
+ - Upgrades the versions of Hypercorn and uvicorn for integration tests.
++- Removes the unused "active" property defined in the `Response` class.
++- Fixes #455, reported by @Klavionik. This error caused the WebSocket handler
++  to erroneously return an instance of BlackSheep response to the underlying
++  ASGI server, causing an error to be logged in the console.
++- Update type annotations in the `Application` class code to be more explicit
++  about the fact that certain methods must return None (return in __call__ is
++  used to interrupt code execution and not to return objects).
++- Improve the normalization logic to not normalize the output for WebSocket
++  requests (as ASGI servers do not allow controlling the response for WebSocket
++  handshake requests).
++- Improve the normalization logic to not normalize request handlers that are
++  valid as they are, as asynchronous functions with a single parameter
++  annotated as Request or WebSocket.
+ 
+ ## [2.0.3] - 2023-12-18 :gift:
+ 
+diff --git a/README.md b/README.md
+index 3a9d122..f1ba397 100644
+--- a/README.md
++++ b/README.md
+@@ -203,7 +203,8 @@ Meaning that it is easy to integrate with services such as:
+ * [Azure Active Directory B2C](https://docs.microsoft.com/en-us/azure/active-directory-b2c/overview)
+ * [Okta](https://www.okta.com)
+ 
+-Refer to the documentation for more details and examples.
++Refer to the documentation and to [BlackSheep-Examples](https://github.com/Neoteroi/BlackSheep-Examples)
++for more details and examples.
+ 
+ ## Web framework features
+ 
+@@ -260,8 +261,6 @@ from blacksheep.client import ClientSession
+ async def client_example():
+     async with ClientSession() as client:
+         response = await client.get("https://docs.python.org/3/")
+-
+-        assert response is not None
+         text = await response.text()
+         print(text)
+ 
+diff --git a/blacksheep/messages.pxd b/blacksheep/messages.pxd
+index f64ec2a..d444f05 100644
+--- a/blacksheep/messages.pxd
++++ b/blacksheep/messages.pxd
+@@ -58,7 +58,6 @@ cdef class Request(Message):
+ 
+ cdef class Response(Message):
+     cdef public int status
+-    cdef public bint active
+     cdef dict __dict__
+ 
+     cpdef bint is_redirect(self)
+diff --git a/blacksheep/server/application.py b/blacksheep/server/application.py
+index 54cd4b6..3821565 100644
+--- a/blacksheep/server/application.py
++++ b/blacksheep/server/application.py
+@@ -627,11 +627,11 @@ class Application(BaseApplication):
+ 
+         self.router.sort_routes()
+ 
+-        for route in self.router:
++        for method, route in self.router.iter_with_methods():
+             if route.handler in configured_handlers:
+                 continue
+ 
+-            route.handler = normalize_handler(route, self.services)
++            route.handler = normalize_handler(route, self.services, method)
+             configured_handlers.add(route.handler)
+ 
+         self._normalize_fallback_route()
+@@ -713,7 +713,7 @@ class Application(BaseApplication):
+         await self.on_stop.fire()
+         self.started = False
+ 
+-    async def _handle_lifespan(self, receive, send):
++    async def _handle_lifespan(self, receive, send) -> None:
+         message = await receive()
+         assert message["type"] == "lifespan.startup"
+ 
+@@ -731,7 +731,7 @@ class Application(BaseApplication):
+         await self.stop()
+         await send({"type": "lifespan.shutdown.complete"})
+ 
+-    async def _handle_websocket(self, scope, receive, send):
++    async def _handle_websocket(self, scope, receive, send) -> None:
+         ws = WebSocket(scope, receive, send)
+         # TODO: support filters
+         route = self.router.get_match_by_method_and_path(
+@@ -739,24 +739,27 @@ class Application(BaseApplication):
+         )
+ 
+         if route is None:
+-            return await ws.close()
++            await ws.close()
++            return
+ 
+         ws.route_values = route.values
+ 
+         try:
+-            return await route.handler(ws)
++            # The ASGI protocol does not allow to return any response, not even for the
++            # handshake HTTP request
++            await route.handler(ws)
+         except Exception as exc:
+             logging.exception("Exception while handling WebSocket")
+             # If WebSocket connection accepted, close
+             # the connection using WebSocket Internal error code.
+             if ws.accepted:
+-                return await ws.close(1011, reason=format_reason(str(exc)))
+-
+-            # Otherwise, just close the connection, the ASGI server
+-            # will anyway respond 403 to the client.
+-            return await ws.close()
++                await ws.close(1011, reason=format_reason(str(exc)))
++            else:
++                # Otherwise, just close the connection, the ASGI server
++                # will anyway respond 403 to the client.
++                await ws.close()
+ 
+-    async def _handle_http(self, scope, receive, send):
++    async def _handle_http(self, scope, receive, send) -> None:
+         assert scope["type"] == "http"
+ 
+         request = Request.incoming(
+diff --git a/blacksheep/server/normalization.py b/blacksheep/server/normalization.py
+index 1b8b8b3..4fd8b0f 100644
+--- a/blacksheep/server/normalization.py
++++ b/blacksheep/server/normalization.py
+@@ -22,10 +22,11 @@ from uuid import UUID
+ from guardpost import Identity, User
+ from rodi import ContainerProtocol
+ 
+-from blacksheep import Request, Response
++from blacksheep.messages import Request, Response
+ from blacksheep.normalization import copy_special_attributes
+ from blacksheep.server import responses
+ from blacksheep.server.routing import Route
++from blacksheep.server.websocket import WebSocket
+ 
+ from .bindings import (
+     Binder,
+@@ -522,15 +523,20 @@ def get_async_wrapper(
+     if params_len == 0:
+         # the user defined a request handler with no input
+         @wraps(method)
+-        async def handler(_):
++        async def handler(_):  # type: ignore
+             return await method()
+ 
+         return handler
+ 
+     if params_len == 1:
+         param_name = list(params)[0]
+-        if param_name in ("request", "websocket"):
+-            # no need to wrap the request handler
++        # There is no need to wrap the request handler if it was
++        # defined as asynchronous function accepting a single request or
++        # websocket parameter
++        if param_name in ("request", "websocket") or params[param_name].annotation in {
++            Request,
++            WebSocket,
++        }:
+             return method
+ 
+     binders = get_binders(route, services)
+@@ -559,7 +565,7 @@ def _get_async_wrapper_for_output(
+ 
+ 
+ def normalize_handler(
+-    route: Route, services: ContainerProtocol
++    route: Route, services: ContainerProtocol, http_method: str = ""
+ ) -> Callable[[Request], Awaitable[Response]]:
+     method = route.handler
+ 
+@@ -581,8 +587,11 @@ def normalize_handler(
+     else:
+         normalized = get_sync_wrapper(services, route, method, params, params_len)
+ 
+-    # normalize output
+-    if return_type is _empty or return_type is not Response:
++    # Normalize output. WebSocket handlers must be excluded here because their
++    # response is not handled writing a BlackSheep Response object.
++    if (
++        return_type is _empty or return_type is not Response
++    ) and http_method != "GET_WS":
+         if return_type is not _empty:
+             # this scenario enables a more accurate automatic generation of
+             # OpenAPI Documentation, for responses
+diff --git a/blacksheep/server/routing.py b/blacksheep/server/routing.py
+index 009511f..40b594e 100644
+--- a/blacksheep/server/routing.py
++++ b/blacksheep/server/routing.py
+@@ -681,6 +681,17 @@ class Router(RouterBase):
+         if self._fallback:
+             yield self._fallback
+ 
++    def iter_with_methods(self):
++        """
++        Iters through the routes defined in this Router, yielding each route
++        and its HTTP method.
++        """
++        for method, routes in self.routes.items():
++            for route in routes:
++                yield method.decode(), route
++        if self._fallback:
++            yield "*", self._fallback
++
+     def _is_route_configured(self, method: bytes, route: Route):
+         if isinstance(route, FilterRoute):  # pragma: no cover
+             # The route defines action filters, we cannot determine if the user is

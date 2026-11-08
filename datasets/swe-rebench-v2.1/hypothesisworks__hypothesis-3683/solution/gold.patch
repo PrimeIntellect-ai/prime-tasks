@@ -1,0 +1,180 @@
+diff --git a/hypothesis-python/RELEASE.rst b/hypothesis-python/RELEASE.rst
+new file mode 100644
+index 000000000..f6b140c4e
+--- /dev/null
++++ b/hypothesis-python/RELEASE.rst
+@@ -0,0 +1,4 @@
++RELEASE_TYPE: patch
++
++Fixes occasional recursion-limit-exceeded errors when validating
++deeply nested strategies. Closes: :issue:`3671`
+diff --git a/hypothesis-python/src/hypothesis/core.py b/hypothesis-python/src/hypothesis/core.py
+index 07cf9f897..f6f5940f3 100644
+--- a/hypothesis-python/src/hypothesis/core.py
++++ b/hypothesis-python/src/hypothesis/core.py
+@@ -76,6 +76,7 @@ from hypothesis.internal.compat import (
+ )
+ from hypothesis.internal.conjecture.data import ConjectureData, Status
+ from hypothesis.internal.conjecture.engine import BUFFER_SIZE, ConjectureRunner
++from hypothesis.internal.conjecture.junkdrawer import ensure_free_stackframes
+ from hypothesis.internal.conjecture.shrinker import sort_key
+ from hypothesis.internal.entropy import deterministic_PRNG
+ from hypothesis.internal.escalation import (
+@@ -614,9 +615,10 @@ def process_arguments_to_given(wrapped_test, arguments, kwargs, given_kwargs, pa
+ 
+     arguments = tuple(arguments)
+ 
+-    for k, s in given_kwargs.items():
+-        check_strategy(s, name=k)
+-        s.validate()
++    with ensure_free_stackframes():
++        for k, s in given_kwargs.items():
++            check_strategy(s, name=k)
++            s.validate()
+ 
+     stuff = Stuff(selfy=selfy, args=arguments, kwargs=kwargs, given_kwargs=given_kwargs)
+ 
+diff --git a/hypothesis-python/src/hypothesis/internal/conjecture/engine.py b/hypothesis-python/src/hypothesis/internal/conjecture/engine.py
+index 9e6e19a4e..57a6e0c72 100644
+--- a/hypothesis-python/src/hypothesis/internal/conjecture/engine.py
++++ b/hypothesis-python/src/hypothesis/internal/conjecture/engine.py
+@@ -9,7 +9,6 @@
+ # obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ import math
+-import sys
+ import time
+ from collections import defaultdict
+ from contextlib import contextmanager
+@@ -37,7 +36,7 @@ from hypothesis.internal.conjecture.datatree import (
+     PreviouslyUnseenBehaviour,
+     TreeRecordingObserver,
+ )
+-from hypothesis.internal.conjecture.junkdrawer import clamp, stack_depth_of_caller
++from hypothesis.internal.conjecture.junkdrawer import clamp, ensure_free_stackframes
+ from hypothesis.internal.conjecture.pareto import NO_SCORE, ParetoFront, ParetoOptimiser
+ from hypothesis.internal.conjecture.shrinker import Shrinker, sort_key
+ from hypothesis.internal.healthcheck import fail_health_check
+@@ -133,9 +132,6 @@ class ConjectureRunner:
+         # executed test case.
+         self.__data_cache = LRUReusedCache(CACHE_SIZE)
+ 
+-        # We ensure that the test has this much stack space remaining, no matter
+-        # the size of the stack when called, to de-flake RecursionErrors (#2494).
+-        self.__recursion_limit = sys.getrecursionlimit()
+         self.__pending_call_explanation = None
+ 
+     def explain_next_call_as(self, explanation):
+@@ -169,32 +165,22 @@ class ConjectureRunner:
+         """Run ``self._test_function``, but convert a ``StopTest`` exception
+         into a normal return and avoid raising Flaky for RecursionErrors.
+         """
+-        depth = stack_depth_of_caller()
+-        # Because we add to the recursion limit, to be good citizens we also add
+-        # a check for unbounded recursion.  The default limit is 1000, so this can
+-        # only ever trigger if something really strange is happening and it's hard
+-        # to imagine an intentionally-deeply-recursive use of this code.
+-        assert depth <= 1000, (
+-            "Hypothesis would usually add %d to the stack depth of %d here, "
+-            "but we are already much deeper than expected.  Aborting now, to "
+-            "avoid extending the stack limit in an infinite loop..."
+-            % (self.__recursion_limit, depth)
+-        )
+-        try:
+-            sys.setrecursionlimit(depth + self.__recursion_limit)
+-            self._test_function(data)
+-        except StopTest as e:
+-            if e.testcounter == data.testcounter:
+-                # This StopTest has successfully stopped its test, and can now
+-                # be discarded.
+-                pass
+-            else:
+-                # This StopTest was raised by a different ConjectureData. We
+-                # need to re-raise it so that it will eventually reach the
+-                # correct engine.
+-                raise
+-        finally:
+-            sys.setrecursionlimit(self.__recursion_limit)
++        # We ensure that the test has this much stack space remaining, no
++        # matter the size of the stack when called, to de-flake RecursionErrors
++        # (#2494, #3671).
++        with ensure_free_stackframes():
++            try:
++                self._test_function(data)
++            except StopTest as e:
++                if e.testcounter == data.testcounter:
++                    # This StopTest has successfully stopped its test, and can now
++                    # be discarded.
++                    pass
++                else:
++                    # This StopTest was raised by a different ConjectureData. We
++                    # need to re-raise it so that it will eventually reach the
++                    # correct engine.
++                    raise
+ 
+     def test_function(self, data):
+         if self.__pending_call_explanation is not None:
+diff --git a/hypothesis-python/src/hypothesis/internal/conjecture/junkdrawer.py b/hypothesis-python/src/hypothesis/internal/conjecture/junkdrawer.py
+index dc3d0a0f9..eb0301a3e 100644
+--- a/hypothesis-python/src/hypothesis/internal/conjecture/junkdrawer.py
++++ b/hypothesis-python/src/hypothesis/internal/conjecture/junkdrawer.py
+@@ -14,6 +14,7 @@ anything that lives here, please move it."""
+ 
+ import array
+ import sys
++import warnings
+ from random import Random
+ from typing import (
+     Callable,
+@@ -30,6 +31,8 @@ from typing import (
+     overload,
+ )
+ 
++from hypothesis.errors import HypothesisWarning
++
+ ARRAY_CODES = ["B", "H", "I", "L", "Q", "O"]
+ 
+ 
+@@ -271,6 +274,42 @@ def stack_depth_of_caller() -> int:
+     return size
+ 
+ 
++class ensure_free_stackframes:
++    """Context manager that ensures there are at least N free stackframes. The
++    value of N is chosen to be the recursion limit at import time, or at least
++    500.
++    """
++
++    initial_maxdepth: int = sys.getrecursionlimit()
++
++    def __enter__(self):
++        cur_depth = stack_depth_of_caller()
++        self.old_maxdepth = sys.getrecursionlimit()
++        self.new_maxdepth = cur_depth + max(self.initial_maxdepth, 500)
++        # Because we add to the recursion limit, to be good citizens we
++        # also add a check for unbounded recursion.  The default limit
++        # is 1000, so this can only ever trigger if something really
++        # strange is happening and it's hard to imagine an
++        # intentionally-deeply-recursive use of this code.
++        assert cur_depth <= self.initial_maxdepth, (
++            "Hypothesis would usually add %d to the stack depth of %d here, "
++            "but we are already much deeper than expected.  Aborting now, to "
++            "avoid extending the stack limit in an infinite loop..."
++            % (self.new_maxdepth - self.old_maxdepth, self.old_maxdepth)
++        )
++        sys.setrecursionlimit(self.new_maxdepth)
++
++    def __exit__(self, *args, **kwargs):
++        if self.new_maxdepth == sys.getrecursionlimit():
++            sys.setrecursionlimit(self.old_maxdepth)
++        else:  # pragma: no cover
++            warnings.warn(
++                "The recursion limit will not be reset, since it was changed "
++                "from another thread or during execution of a test.",
++                HypothesisWarning,
++            )
++
++
+ def find_integer(f: Callable[[int], bool]) -> int:
+     """Finds a (hopefully large) integer such that f(n) is True and f(n + 1) is
+     False.

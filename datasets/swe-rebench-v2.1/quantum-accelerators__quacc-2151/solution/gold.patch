@@ -1,0 +1,222 @@
+diff --git a/docs/user/settings/file_management.md b/docs/user/settings/file_management.md
+index 562dcfad..7aed734c 100644
+--- a/docs/user/settings/file_management.md
++++ b/docs/user/settings/file_management.md
+@@ -38,7 +38,14 @@ RESULTS_DIR
+ 
+ ### Job Failure
+ 
+-If the job fails or does not complete, then the `tmp-quacc-2023-12-08-67890` directory will remain in `RESULTS_DIR` so you can inspect the files.
++If the job fails or does not complete, then the file structure looks like:
++
++```text
++RESULTS_DIR
++├── failed-quacc-2023-12-08-67890
++│   ├── INPUT
++    └── OUTPUT
++```
+ 
+ ## Scenario 2: Specifying a `SCRATCH_DIR`
+ 
+@@ -83,4 +90,17 @@ SCRATCH_DIR
+ 
+ ### Job Failure
+ 
+-If the job fails or does not complete, then the `tmp-quacc-2023-12-08-67890` directory will remain in `SCRATCH_DIR` so you can inspect the files. The symbolic link in `RESULTS_DIR` will also remain.
++If the job fails or does not complete, then the file structure looks like:
++
++```text
++RESULTS_DIR
++├── symlink-failed-quacc-2023-12-08-67890
++│
++```
++
++```text
++SCRATCH_DIR
++├── failed-quacc-2023-12-08-67890
++│   ├── INPUT
++    └── OUTPUT
++```
+diff --git a/src/quacc/runners/ase.py b/src/quacc/runners/ase.py
+index 79bd5b8a..9c5ddad7 100644
+--- a/src/quacc/runners/ase.py
++++ b/src/quacc/runners/ase.py
+@@ -16,7 +16,7 @@ from monty.os.path import zpath
+ 
+ from quacc import SETTINGS
+ from quacc.atoms.core import copy_atoms, get_final_atoms_from_dynamics
+-from quacc.runners.prep import calc_cleanup, calc_setup
++from quacc.runners.prep import calc_cleanup, calc_setup, terminate
+ from quacc.utils.dicts import recursive_dict_merge
+ 
+ try:
+@@ -106,10 +106,13 @@ def run_calc(
+     tmpdir, job_results_dir = calc_setup(atoms, copy_files=copy_files)
+ 
+     # Run calculation
+-    if get_forces:
+-        atoms.get_forces()
+-    else:
+-        atoms.get_potential_energy()
++    try:
++        if get_forces:
++            atoms.get_forces()
++        else:
++            atoms.get_potential_energy()
++    except Exception as exception:
++        terminate(tmpdir, exception)
+ 
+     # Most ASE calculators do not update the atoms object in-place with a call
+     # to .get_potential_energy(), which is important if an internal optimizer is
+@@ -233,24 +236,29 @@ def run_opt(
+         atoms = FrechetCellFilter(atoms)
+ 
+     # Run optimization
+-    with traj, optimizer(atoms, **optimizer_kwargs) as dyn:
+-        if optimizer.__name__.startswith("SciPy"):
+-            # https://gitlab.com/ase/ase/-/issues/1475
+-            dyn.run(fmax=fmax, steps=max_steps, **run_kwargs)
+-        else:
+-            for i, _ in enumerate(dyn.irun(fmax=fmax, steps=max_steps, **run_kwargs)):
+-                if store_intermediate_results:
+-                    _copy_intermediate_files(
+-                        tmpdir,
+-                        i,
+-                        files_to_ignore=[
+-                            traj_file,
+-                            optimizer_kwargs["restart"],
+-                            optimizer_kwargs["logfile"],
+-                        ],
+-                    )
+-                if fn_hook:
+-                    fn_hook(dyn)
++    try:
++        with traj, optimizer(atoms, **optimizer_kwargs) as dyn:
++            if optimizer.__name__.startswith("SciPy"):
++                # https://gitlab.com/ase/ase/-/issues/1475
++                dyn.run(fmax=fmax, steps=max_steps, **run_kwargs)
++            else:
++                for i, _ in enumerate(
++                    dyn.irun(fmax=fmax, steps=max_steps, **run_kwargs)
++                ):
++                    if store_intermediate_results:
++                        _copy_intermediate_files(
++                            tmpdir,
++                            i,
++                            files_to_ignore=[
++                                traj_file,
++                                optimizer_kwargs["restart"],
++                                optimizer_kwargs["logfile"],
++                            ],
++                        )
++                    if fn_hook:
++                        fn_hook(dyn)
++    except Exception as exception:
++        terminate(tmpdir, exception)
+ 
+     # Store the trajectory atoms
+     dyn.traj_atoms = read(traj_file, index=":")
+@@ -299,7 +307,10 @@ def run_vib(
+ 
+     # Run calculation
+     vib = Vibrations(atoms, name=str(tmpdir / "vib"), **vib_kwargs)
+-    vib.run()
++    try:
++        vib.run()
++    except Exception as exception:
++        terminate(tmpdir, exception)
+ 
+     # Summarize run
+     vib.summary(log=sys.stdout if SETTINGS.DEBUG else str(tmpdir / "vib_summary.log"))
+diff --git a/src/quacc/runners/prep.py b/src/quacc/runners/prep.py
+index f5a01892..3f328729 100644
+--- a/src/quacc/runners/prep.py
++++ b/src/quacc/runners/prep.py
+@@ -68,9 +68,8 @@ def calc_setup(
+ 
+     # Create a symlink to the tmpdir
+     if os.name != "nt" and SETTINGS.SCRATCH_DIR:
+-        symlink = SETTINGS.RESULTS_DIR / f"symlink-{tmpdir.name}"
+-        symlink.unlink(missing_ok=True)
+-        symlink.symlink_to(tmpdir, target_is_directory=True)
++        symlink_path = SETTINGS.RESULTS_DIR / f"symlink-{tmpdir.name}"
++        symlink_path.symlink_to(tmpdir, target_is_directory=True)
+ 
+     # Copy files to tmpdir and decompress them if needed
+     if copy_files:
+@@ -101,15 +100,13 @@ def calc_cleanup(
+         deleted after the calculation is complete.
+     job_results_dir
+         The path to the job_results_dir, where the files will ultimately be
+-        stored. A symlink to the tmpdir will be made here during the calculation
+-        for convenience.
++        stored.
+ 
+     Returns
+     -------
+     None
+     """
+     job_results_dir, tmpdir = Path(job_results_dir), Path(tmpdir)
+-    logger.info(f"Calculation results stored at {job_results_dir}")
+ 
+     # Safety check
+     if "tmp-" not in str(tmpdir):
+@@ -120,21 +117,51 @@ def calc_cleanup(
+     if atoms is not None:
+         atoms.calc.directory = job_results_dir
+ 
+-    # Make the results directory
+-    job_results_dir.mkdir(parents=True, exist_ok=True)
+-
+     # Gzip files in tmpdir
+     if SETTINGS.GZIP_FILES:
+         gzip_dir(tmpdir)
+ 
+     # Move files from tmpdir to job_results_dir
+-    for file_name in os.listdir(tmpdir):
+-        move(tmpdir / file_name, job_results_dir / file_name)
++    if SETTINGS.CREATE_UNIQUE_DIR:
++        move(tmpdir, job_results_dir)
++    else:
++        for file_name in os.listdir(tmpdir):
++            move(tmpdir / file_name, job_results_dir / file_name)
++        rmtree(tmpdir)
++    logger.info(f"Calculation results stored at {job_results_dir}")
+ 
+     # Remove symlink to tmpdir
+     if os.name != "nt" and SETTINGS.SCRATCH_DIR:
+         symlink_path = SETTINGS.RESULTS_DIR / f"symlink-{tmpdir.name}"
+         symlink_path.unlink(missing_ok=True)
+ 
+-    # Remove the tmpdir
+-    rmtree(tmpdir, ignore_errors=True)
++
++def terminate(tmpdir: Path | str, exception: Exception) -> Exception:
++    """
++    Terminate a calculation and move files to a failed directory.
++
++    Parameters
++    ----------
++    tmpdir
++        The path to the tmpdir, where the calculation was run.
++    exception
++        The exception that caused the calculation to fail.
++
++    Raises
++    -------
++    Exception
++        The exception that caused the calculation to fail.
++    """
++    job_failed_dir = tmpdir.with_name(tmpdir.name.replace("tmp-", "failed-"))
++    tmpdir.rename(job_failed_dir)
++
++    msg = f"Calculation failed! Files stored at {job_failed_dir}"
++    logging.info(msg)
++
++    if os.name != "nt" and SETTINGS.SCRATCH_DIR:
++        old_symlink_path = SETTINGS.RESULTS_DIR / f"symlink-{tmpdir.name}"
++        symlink_path = SETTINGS.RESULTS_DIR / f"symlink-{job_failed_dir.name}"
++        old_symlink_path.unlink(missing_ok=True)
++        symlink_path.symlink_to(job_failed_dir, target_is_directory=True)
++
++    raise exception

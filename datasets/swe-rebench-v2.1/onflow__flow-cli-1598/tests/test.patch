@@ -1,0 +1,246 @@
+diff --git a/internal/dependencymanager/dependencyinstaller_test.go b/internal/dependencymanager/dependencyinstaller_test.go
+index 92d64427..ed2821e1 100644
+--- a/internal/dependencymanager/dependencyinstaller_test.go
++++ b/internal/dependencymanager/dependencyinstaller_test.go
+@@ -20,12 +20,17 @@ package dependencymanager
+ 
+ import (
+ 	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
+ 	"testing"
+ 
++	"github.com/chzyer/readline"
+ 	"github.com/onflow/flow-go-sdk"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/mock"
+ 
++	"github.com/onflow/flowkit"
+ 	"github.com/onflow/flowkit/config"
+ 	"github.com/onflow/flowkit/gateway"
+ 	"github.com/onflow/flowkit/gateway/mocks"
+@@ -35,6 +40,74 @@ import (
+ 	"github.com/onflow/flow-cli/internal/util"
+ )
+ 
++// capturingLogger records log messages so tests can assert on user-visible output.
++type capturingLogger struct {
++	infos []string
++}
++
++func (l *capturingLogger) Debug(string)         {}
++func (l *capturingLogger) Info(msg string)      { l.infos = append(l.infos, msg) }
++func (l *capturingLogger) Error(string)         {}
++func (l *capturingLogger) StartProgress(string) {}
++func (l *capturingLogger) StopProgress()        {}
++
++func (l *capturingLogger) countContaining(substr string) int {
++	count := 0
++	for _, msg := range l.infos {
++		if strings.Contains(msg, substr) {
++			count++
++		}
++	}
++	return count
++}
++
++// newTestDependencyInstaller builds a DependencyInstaller through its public constructor and
++// swaps in mock gateways so no network access is required.
++func newTestDependencyInstaller(
++	t *testing.T,
++	logger output.Logger,
++	state *flowkit.State,
++	gw *mocks.TestGateway,
++	skipDeployments bool,
++	skipAlias bool,
++) *DependencyInstaller {
++	t.Helper()
++
++	di, err := NewDependencyInstaller(logger, state, dependencyManagerFlagsCollection{})
++	assert.NoError(t, err)
++
++	di.SkipDeployments = skipDeployments
++	di.SkipAlias = skipAlias
++
++	di.Gateways = map[string]gateway.Gateway{
++		config.EmulatorNetwork.Name: gw.Mock,
++		config.TestnetNetwork.Name:  gw.Mock,
++		config.MainnetNetwork.Name:  gw.Mock,
++	}
++
++	return di
++}
++
++// silencePrompts points os.Stdin at an empty pipe so interactive prompts return immediately
++// instead of blocking on a terminal. It returns a restore function.
++func silencePrompts(t *testing.T) func() {
++	t.Helper()
++
++	origStdin := os.Stdin
++	origReadlineStdin := readline.Stdin
++	r, w, err := os.Pipe()
++	assert.NoError(t, err)
++	assert.NoError(t, w.Close())
++	os.Stdin = r
++	readline.Stdin = r
++
++	return func() {
++		os.Stdin = origStdin
++		readline.Stdin = origReadlineStdin
++		_ = r.Close()
++	}
++}
++
+ func TestDependencyInstallerInstall(t *testing.T) {
+ 
+ 	logger := output.NewStdoutLogger(output.NoneLog)
+@@ -68,17 +141,7 @@ func TestDependencyInstallerInstall(t *testing.T) {
+ 			gw.GetAccount.Return(acc, nil)
+ 		})
+ 
+-		di := &DependencyInstaller{
+-			Gateways: map[string]gateway.Gateway{
+-				config.EmulatorNetwork.Name: gw.Mock,
+-				config.TestnetNetwork.Name:  gw.Mock,
+-				config.MainnetNetwork.Name:  gw.Mock,
+-			},
+-			Logger:          logger,
+-			State:           state,
+-			SkipDeployments: true,
+-			SkipAlias:       true,
+-		}
++		di := newTestDependencyInstaller(t, logger, state, gw, true, true)
+ 
+ 		err := di.Install()
+ 		assert.NoError(t, err, "Failed to install dependencies")
+@@ -112,17 +175,7 @@ func TestDependencyInstallerAdd(t *testing.T) {
+ 			gw.GetAccount.Return(acc, nil)
+ 		})
+ 
+-		di := &DependencyInstaller{
+-			Gateways: map[string]gateway.Gateway{
+-				config.EmulatorNetwork.Name: gw.Mock,
+-				config.TestnetNetwork.Name:  gw.Mock,
+-				config.MainnetNetwork.Name:  gw.Mock,
+-			},
+-			Logger:          logger,
+-			State:           state,
+-			SkipDeployments: true,
+-			SkipAlias:       true,
+-		}
++		di := newTestDependencyInstaller(t, logger, state, gw, true, true)
+ 
+ 		sourceStr := fmt.Sprintf("emulator://%s.%s", serviceAddress.String(), tests.ContractHelloString.Name)
+ 		err := di.Add(sourceStr, "")
+@@ -134,3 +187,110 @@ func TestDependencyInstallerAdd(t *testing.T) {
+ 		assert.NotNil(t, fileContent)
+ 	})
+ }
++
++// TestDependencyInstallerAsksOncePerDependency verifies that when a contract pulls in the same
++// dependency more than once (directly and transitively), the deployment inquiry is only shown
++// once for that dependency.
++func TestDependencyInstallerAsksOncePerDependency(t *testing.T) {
++	logger := &capturingLogger{}
++	_, state, _ := util.TestMocks(t)
++
++	serviceAcc, _ := state.EmulatorServiceAccount()
++	serviceAddress := serviceAcc.Address
++
++	// Contract A imports B and C; B also imports C, so C is reached twice while installing A.
++	contractA := []byte(`
++import B from 0x0000000000000001
++import C from 0x0000000000000001
++pub contract A {}
++`)
++	contractB := []byte(`
++import C from 0x0000000000000001
++pub contract B {}
++`)
++	contractC := []byte(`
++pub contract C {}
++`)
++
++	dep := config.Dependency{
++		Name: "A",
++		Source: config.Source{
++			NetworkName:  "emulator",
++			Address:      serviceAddress,
++			ContractName: "A",
++		},
++	}
++	state.Dependencies().AddOrUpdate(dep)
++
++	restore := silencePrompts(t)
++	defer restore()
++
++	gw := mocks.DefaultMockGateway()
++	gw.GetAccount.Run(func(args mock.Arguments) {
++		addr := args.Get(1).(flow.Address)
++		acc := tests.NewAccountWithAddress(addr.String())
++		acc.Contracts = map[string][]byte{
++			"A": contractA,
++			"B": contractB,
++			"C": contractC,
++		}
++		gw.GetAccount.Return(acc, nil)
++	})
++
++	di := newTestDependencyInstaller(t, logger, state, gw, false, true)
++
++	err := di.Install()
++	assert.NoError(t, err, "Failed to install dependencies")
++
++	// C is imported by both A and B, but the deployment inquiry must only be shown once.
++	assert.Equal(t, 1, logger.countContaining("C added to emulator deployments"),
++		"expected the deployment inquiry for C to be shown exactly once")
++}
++
++// TestDependencyInstallerSkipsInquiryForExistingDependency verifies that a dependency that is
++// already present in flow.json (and therefore already installed locally) is not inquired about
++// again when dependencies are installed.
++func TestDependencyInstallerSkipsInquiryForExistingDependency(t *testing.T) {
++	logger := &capturingLogger{}
++	_, state, _ := util.TestMocks(t)
++
++	serviceAcc, _ := state.EmulatorServiceAccount()
++	serviceAddress := serviceAcc.Address
++
++	// The dependency is already present in flow.json.
++	dep := config.Dependency{
++		Name: "Hello",
++		Source: config.Source{
++			NetworkName:  "emulator",
++			Address:      serviceAddress,
++			ContractName: "Hello",
++		},
++	}
++	state.Dependencies().AddOrUpdate(dep)
++
++	// ... and its contract file has already been installed locally.
++	filePath := fmt.Sprintf("imports/%s/%s.cdc", serviceAddress.String(), tests.ContractHelloString.Name)
++	assert.NoError(t, state.ReaderWriter().MkdirAll(filepath.Dir(filePath), 0755))
++	assert.NoError(t, state.ReaderWriter().WriteFile(filePath, tests.ContractHelloString.Source, 0644))
++
++	restore := silencePrompts(t)
++	defer restore()
++
++	gw := mocks.DefaultMockGateway()
++	gw.GetAccount.Run(func(args mock.Arguments) {
++		addr := args.Get(1).(flow.Address)
++		acc := tests.NewAccountWithAddress(addr.String())
++		acc.Contracts = map[string][]byte{
++			tests.ContractHelloString.Name: tests.ContractHelloString.Source,
++		}
++		gw.GetAccount.Return(acc, nil)
++	})
++
++	di := newTestDependencyInstaller(t, logger, state, gw, false, true)
++
++	err := di.Install()
++	assert.NoError(t, err, "Failed to install dependencies")
++
++	assert.Equal(t, 0, logger.countContaining("Hello added to emulator deployments"),
++		"expected no deployment inquiry for a dependency already in flow.json")
++}

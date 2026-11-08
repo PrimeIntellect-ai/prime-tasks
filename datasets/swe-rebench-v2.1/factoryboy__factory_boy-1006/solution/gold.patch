@@ -1,0 +1,236 @@
+diff --git a/docs/reference.rst b/docs/reference.rst
+index a7e9be0..9efd1a2 100644
+--- a/docs/reference.rst
++++ b/docs/reference.rst
+@@ -907,21 +907,22 @@ return value of the method:
+ Transformer
+ """""""""""
+ 
+-.. class:: Transformer(transform, value)
++.. class:: Transformer(default_value, *, transform)
+ 
+ A :class:`Transformer` applies a ``transform`` function to the provided value
+ before to set the transformed value on the generated object.
+ 
+-It expects two arguments:
++It expects one positional argument and one keyword argument:
+ 
+-- ``transform``: function taking the value as parameter and returning the
++- ``default_value``: the default value, which passes through the ``transform``
++  function.
++- ``transform``: a function taking the value as parameter and returning the
+   transformed value,
+-- ``value``: the default value.
+ 
+ .. code-block:: python
+ 
+-   class UpperFactory(Factory):
+-       name = Transformer(lambda x: x.upper(), "Joe")
++   class UpperFactory(factory.Factory):
++       name = factory.Transformer("Joe", transform=str.upper)
+ 
+        class Meta:
+            model = Upper
+@@ -933,6 +934,14 @@ It expects two arguments:
+    >>> UpperFactory(name="John").name
+    'JOHN'
+ 
++Disabling
++~~~~~~~~~
++To disable a :class:`Transformer`, wrap the value in ``Transformer.Force``:
++
++.. code-block:: pycon
++
++   >>> UpperFactory(name=factory.Transformer.Force("John")).name
++   'John'
+ 
+ Sequence
+ """"""""
+diff --git a/factory/builder.py b/factory/builder.py
+index 9d810fb..e76e755 100644
+--- a/factory/builder.py
++++ b/factory/builder.py
+@@ -2,7 +2,7 @@
+ 
+ import collections
+ 
+-from . import declarations, enums, errors, utils
++from . import enums, errors, utils
+ 
+ DeclarationWithContext = collections.namedtuple(
+     'DeclarationWithContext',
+@@ -134,6 +134,14 @@ class DeclarationSet:
+         return '<DeclarationSet: %r>' % self.as_dict()
+ 
+ 
++def _captures_overrides(declaration_with_context):
++    declaration = declaration_with_context.declaration
++    if enums.get_builder_phase(declaration) == enums.BuilderPhase.ATTRIBUTE_RESOLUTION:
++        return declaration.CAPTURE_OVERRIDES
++    else:
++        return False
++
++
+ def parse_declarations(decls, base_pre=None, base_post=None):
+     pre_declarations = base_pre.copy() if base_pre else DeclarationSet()
+     post_declarations = base_post.copy() if base_post else DeclarationSet()
+@@ -156,10 +164,6 @@ def parse_declarations(decls, base_pre=None, base_post=None):
+             # Set it as `key__`
+             magic_key = post_declarations.join(k, '')
+             extra_post[magic_key] = v
+-        elif k in pre_declarations and isinstance(
+-            pre_declarations[k].declaration, declarations.Transformer
+-        ):
+-            extra_maybenonpost[k] = pre_declarations[k].declaration.function(v)
+         else:
+             extra_maybenonpost[k] = v
+ 
+@@ -173,6 +177,12 @@ def parse_declarations(decls, base_pre=None, base_post=None):
+     for k, v in extra_maybenonpost.items():
+         if k in post_overrides:
+             extra_post_declarations[k] = v
++        elif k in pre_declarations and _captures_overrides(pre_declarations[k]):
++            # Send the overriding value to the existing declaration.
++            # By symmetry with the behaviour of PostGenerationDeclaration,
++            # we send it as `key__` -- i.e under the '' key.
++            magic_key = pre_declarations.join(k, '')
++            extra_pre_declarations[magic_key] = v
+         else:
+             # Anything else is pre_declarations
+             extra_pre_declarations[k] = v
+diff --git a/factory/declarations.py b/factory/declarations.py
+index 40ae99c..70abe35 100644
+--- a/factory/declarations.py
++++ b/factory/declarations.py
+@@ -20,6 +20,11 @@ class BaseDeclaration(utils.OrderedBase):
+ 
+     FACTORY_BUILDER_PHASE = enums.BuilderPhase.ATTRIBUTE_RESOLUTION
+ 
++    #: Whether this declaration has a special handling for call-time overrides
++    #: (e.g. Tranformer).
++    #: Overridden values will be passed in the `extra` args.
++    CAPTURE_OVERRIDES = False
++
+     #: Whether to unroll the context before evaluating the declaration.
+     #: Set to False on declarations that perform their own unrolling.
+     UNROLL_CONTEXT_BEFORE_EVALUATION = True
+@@ -43,6 +48,20 @@ class BaseDeclaration(utils.OrderedBase):
+         subfactory = factory.base.DictFactory
+         return step.recurse(subfactory, full_context, force_sequence=step.sequence)
+ 
++    def _unwrap_evaluate_pre(self, wrapped, *, instance, step, overrides):
++        """Evaluate a wrapped pre-declaration.
++
++        This is especially useful for declarations wrapping another one,
++        e.g. Maybe or Transformer.
++        """
++        if isinstance(wrapped, BaseDeclaration):
++            return wrapped.evaluate_pre(
++                instance=instance,
++                step=step,
++                overrides=overrides,
++            )
++        return wrapped
++
+     def evaluate_pre(self, instance, step, overrides):
+         context = self.unroll_context(instance, step, overrides)
+         return self.evaluate(instance, step, context)
+@@ -100,20 +119,47 @@ class LazyAttribute(BaseDeclaration):
+         return self.function(instance)
+ 
+ 
+-class Transformer(LazyFunction):
+-    """Transform value using given function.
++class Transformer(BaseDeclaration):
++    CAPTURE_OVERRIDES = True
++    UNROLL_CONTEXT_BEFORE_EVALUATION = False
+ 
+-    Attributes:
+-        transform (function): returns the transformed value.
+-        value: passed as the first argument to the transform function.
+-    """
++    class Force:
++        """
++        Bypass a transformer's transformation.
+ 
+-    def __init__(self, transform, value, *args, **kwargs):
+-        super().__init__(transform, *args, **kwargs)
+-        self.value = value
++        The forced value can be any declaration, and will be evaluated as if it
++        had been passed instead of the Transformer declaration.
++        """
++        def __init__(self, forced_value):
++            self.forced_value = forced_value
+ 
+-    def evaluate(self, instance, step, extra):
+-        return self.function(self.value)
++        def __repr__(self):
++            return f'Transformer.Force({repr(self.forced_value)})'
++
++    def __init__(self, default, *, transform):
++        super().__init__()
++        self.default = default
++        self.transform = transform
++
++    def evaluate_pre(self, instance, step, overrides):
++        # The call-time value, if present, is set under the "" key.
++        value_or_declaration = overrides.pop("", self.default)
++
++        if isinstance(value_or_declaration, self.Force):
++            bypass_transform = True
++            value_or_declaration = value_or_declaration.forced_value
++        else:
++            bypass_transform = False
++
++        value = self._unwrap_evaluate_pre(
++            value_or_declaration,
++            instance=instance,
++            step=step,
++            overrides=overrides,
++        )
++        if bypass_transform:
++            return value
++        return self.transform(value)
+ 
+ 
+ class _UNSPECIFIED:
+@@ -492,16 +538,14 @@ class Maybe(BaseDeclaration):
+     def evaluate_pre(self, instance, step, overrides):
+         choice = self.decider.evaluate(instance=instance, step=step, extra={})
+         target = self.yes if choice else self.no
+-
+-        if isinstance(target, BaseDeclaration):
+-            return target.evaluate_pre(
+-                instance=instance,
+-                step=step,
+-                overrides=overrides,
+-            )
+-        else:
+-            # Flat value (can't be POST_INSTANTIATION, checked in __init__)
+-            return target
++        # The value can't be POST_INSTANTIATION, checked in __init__;
++        # evaluate it as `evaluate_pre`
++        return self._unwrap_evaluate_pre(
++            target,
++            instance=instance,
++            step=step,
++            overrides=overrides,
++        )
+ 
+     def __repr__(self):
+         return f'Maybe({self.decider!r}, yes={self.yes!r}, no={self.no!r})'
+diff --git a/factory/django.py b/factory/django.py
+index dee35d6..87b6fd5 100644
+--- a/factory/django.py
++++ b/factory/django.py
+@@ -192,8 +192,8 @@ class DjangoModelFactory(base.Factory):
+ 
+ 
+ class Password(declarations.Transformer):
+-    def __init__(self, password, *args, **kwargs):
+-        super().__init__(make_password, password, *args, **kwargs)
++    def __init__(self, password, transform=make_password, **kwargs):
++        super().__init__(password, transform=transform, **kwargs)
+ 
+ 
+ class FileField(declarations.BaseDeclaration):

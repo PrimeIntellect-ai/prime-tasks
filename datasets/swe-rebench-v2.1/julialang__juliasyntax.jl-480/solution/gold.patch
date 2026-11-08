@@ -1,0 +1,257 @@
+diff --git a/docs/src/reference.md b/docs/src/reference.md
+index a98662ee..e14866f3 100644
+--- a/docs/src/reference.md
++++ b/docs/src/reference.md
+@@ -48,6 +48,7 @@ the source text more closely.
+ * Docstrings use the `K"doc"` kind, and are not lowered to `Core.@doc` until later (#217)
+ * Juxtaposition uses the `K"juxtapose"` kind rather than lowering immediately to `*` (#220)
+ * `return` without a value has zero children, rather than lowering to `return nothing` (#220)
++* Command syntax `` `foo` `` parses into a `cmdstring` tree node wrapping the string, as `(cmdstring "foo")` (#438). These are lowered to a macro call later rather than by the parser.
+ 
+ ### Containers for string-like constructs
+ 
+diff --git a/src/expr.jl b/src/expr.jl
+index 04561a7e..0808916b 100644
+--- a/src/expr.jl
++++ b/src/expr.jl
+@@ -70,9 +70,7 @@ end
+ 
+ function _leaf_to_Expr(source, txtbuf, head, srcrange, node)
+     k = kind(head)
+-    if k == K"core_@cmd"
+-        return GlobalRef(Core, Symbol("@cmd"))
+-    elseif k == K"MacroName" && view(source, srcrange) == "."
++    if k == K"MacroName" && view(source, srcrange) == "."
+         return Symbol("@__dot__")
+     elseif is_error(k)
+         return k == K"error" ?
+@@ -102,7 +100,7 @@ end
+ #
+ # This function concatenating adjacent string chunks together as done in the
+ # reference parser.
+-function _string_to_Expr(k, args)
++function _string_to_Expr(args)
+     args2 = Any[]
+     i = 1
+     while i <= length(args)
+@@ -140,7 +138,7 @@ function _string_to_Expr(k, args)
+         #   """\n  a\n  b""" ==>  "a\nb"
+         return only(args2)
+     else
+-        # This only happens when k == K"string" or when an error has occurred. 
++        # This only happens when the kind is K"string" or when an error has occurred. 
+         return Expr(:string, args2...)
+     end
+ end
+@@ -212,13 +210,17 @@ function _internal_node_to_Expr(source, srcrange, head, childranges, childheads,
+         # K"var" and K"char" nodes, but this discounts having embedded error
+         # nodes when ignore_errors=true is set.
+         return args[1]
+-    elseif k == K"string" || k == K"cmdstring"
+-        return _string_to_Expr(k, args)
++    elseif k == K"string"
++        return _string_to_Expr(args)
+     end
+ 
+     loc = source_location(LineNumberNode, source, first(srcrange))
+     endloc = source_location(LineNumberNode, source, last(srcrange))
+ 
++    if k == K"cmdstring"
++        return Expr(:macrocall, GlobalRef(Core, Symbol("@cmd")), loc, _string_to_Expr(args))
++    end
++
+     _fixup_Expr_children!(head, loc, args)
+ 
+     headstr = untokenize(head, include_flag_suff=false)
+@@ -229,6 +231,13 @@ function _internal_node_to_Expr(source, srcrange, head, childranges, childheads,
+     if k == K"?"
+         headsym = :if
+     elseif k == K"macrocall"
++        if length(args) == 2 
++            a2 = args[2]
++            if @isexpr(a2, :macrocall) && kind(childheads[1]) == K"CmdMacroName"
++                # Fix up for custom cmd macros like `` foo`x` ``
++                args[2] = a2.args[3]
++            end
++        end
+         do_lambda = _extract_do_lambda!(args)
+         _reorder_parameters!(args, 2)
+         insert!(args, 2, loc)
+diff --git a/src/kinds.jl b/src/kinds.jl
+index 800d9622..30d16e3e 100644
+--- a/src/kinds.jl
++++ b/src/kinds.jl
+@@ -189,35 +189,24 @@ kind(k::Kind) = k
+ #-------------------------------------------------------------------------------
+ # Kinds used by JuliaSyntax
+ register_kinds!(JuliaSyntax, 0, [
+-    "None"         # Placeholder; never emitted by lexer
+-    "EndMarker"    # EOF
++    # Whitespace
+     "Comment"
+     "Whitespace"
+     "NewlineWs"    # newline-containing whitespace
+-    "Identifier"
+-    "@"
+-    ","
+-    ";"
+ 
+-    "BEGIN_ERRORS"
+-        # Tokenization errors
+-        "ErrorEofMultiComment"
+-        "ErrorInvalidNumericConstant"
+-        "ErrorHexFloatMustContainP"
+-        "ErrorAmbiguousNumericConstant"
+-        "ErrorAmbiguousNumericDotMultiply"
+-        "ErrorInvalidInterpolationTerminator"
+-        "ErrorNumericOverflow"
+-        "ErrorInvalidEscapeSequence"
+-        "ErrorOverLongCharacter"
+-        "ErrorInvalidUTF8"
+-        "ErrorInvisibleChar"
+-        "ErrorIdentifierStart"
+-        "ErrorUnknownCharacter"
+-        "ErrorBidiFormatting"
+-        # Generic error
+-        "error"
+-    "END_ERRORS"
++    # Identifiers
++    "BEGIN_IDENTIFIERS"
++        "Identifier"
++        # Macro names are modelled as special kinds of identifiers because the full
++        # macro name may not appear as characters in the source: The `@` may be
++        # detached from the macro name as in `@A.x` (ugh!!), or have a _str or _cmd
++        # suffix appended.
++        "BEGIN_MACRO_NAMES"
++            "MacroName"
++            "StringMacroName"
++            "CmdMacroName"
++        "END_MACRO_NAMES"
++    "END_IDENTIFIERS"
+ 
+     "BEGIN_KEYWORDS"
+         "baremodule"
+@@ -278,6 +267,12 @@ register_kinds!(JuliaSyntax, 0, [
+     "END_LITERAL"
+ 
+     "BEGIN_DELIMITERS"
++        # Punctuation
++        "@"
++        ","
++        ";"
++
++        # Paired delimiters
+         "["
+         "]"
+         "{"
+@@ -1028,45 +1023,6 @@ register_kinds!(JuliaSyntax, 0, [
+     "END_UNICODE_OPS"
+     "END_OPS"
+ 
+-    # The following kinds are emitted by the parser. There's two types of these:
+-
+-    # 1. Implied tokens which have a position but might have zero width in the
+-    #    source text.
+-    #
+-    # In some cases we want to generate parse tree nodes in a standard form,
+-    # but some of the leaf tokens are implied rather than existing in the
+-    # source text, or the lexed tokens need to be re-kinded to represent
+-    # special forms which only the parser can infer. These are "parser tokens".
+-    #
+-    # Some examples:
+-    #
+-    # Docstrings - the macro name is invisible
+-    #   "doc" foo() = 1   ==>  (macrocall (core @doc) . (= (call foo) 1))
+-    #
+-    # String macros - the macro name does not appear in the source text, so we
+-    # need a special kind of token to imply it.
+-    #
+-    # In these cases, we use some special kinds which can be emitted as zero
+-    # width tokens to keep the parse tree more uniform.
+-    "BEGIN_PARSER_TOKENS"
+-
+-        "TOMBSTONE" # Empty placeholder for kind to be filled later
+-
+-        # Macro names are modelled as a special kind of identifier because the
+-        # @ may not be attached to the macro name in the source (or may not be
+-        # associated with a token at all in the case of implied macro calls
+-        # like CORE_DOC_MACRO_NAME)
+-        "BEGIN_MACRO_NAMES"
+-            "MacroName"
+-            "StringMacroName"
+-            "CmdMacroName"
+-            "core_@cmd"
+-            "core_@int128_str"
+-            "core_@uint128_str"
+-            "core_@big_str"
+-        "END_MACRO_NAMES"
+-    "END_PARSER_TOKENS"
+-
+     # 2. Nonterminals which are exposed in the AST, but where the surface
+     #    syntax doesn't have a token corresponding to the node type.
+     "BEGIN_SYNTAX_KINDS"
+@@ -1108,6 +1064,31 @@ register_kinds!(JuliaSyntax, 0, [
+         # Container for a single statement/atom plus any trivia and errors
+         "wrapper"
+     "END_SYNTAX_KINDS"
++
++    # Special tokens
++    "TOMBSTONE"    # Empty placeholder for kind to be filled later
++    "None"         # Placeholder; never emitted by lexer
++    "EndMarker"    # EOF
++
++    "BEGIN_ERRORS"
++        # Tokenization errors
++        "ErrorEofMultiComment"
++        "ErrorInvalidNumericConstant"
++        "ErrorHexFloatMustContainP"
++        "ErrorAmbiguousNumericConstant"
++        "ErrorAmbiguousNumericDotMultiply"
++        "ErrorInvalidInterpolationTerminator"
++        "ErrorNumericOverflow"
++        "ErrorInvalidEscapeSequence"
++        "ErrorOverLongCharacter"
++        "ErrorInvalidUTF8"
++        "ErrorInvisibleChar"
++        "ErrorIdentifierStart"
++        "ErrorUnknownCharacter"
++        "ErrorBidiFormatting"
++        # Generic error
++        "error"
++    "END_ERRORS"
+ ])
+ 
+ #-------------------------------------------------------------------------------
+diff --git a/src/literal_parsing.jl b/src/literal_parsing.jl
+index a027985a..5a744f97 100644
+--- a/src/literal_parsing.jl
++++ b/src/literal_parsing.jl
+@@ -438,8 +438,6 @@ function parse_julia_literal(txtbuf::Vector{UInt8}, head::SyntaxHead, srcrange)
+         Symbol("@$(normalize_identifier(val_str))_str")
+     elseif k == K"CmdMacroName"
+         Symbol("@$(normalize_identifier(val_str))_cmd")
+-    elseif k == K"core_@cmd"
+-        Symbol("core_@cmd")
+     elseif is_syntax_kind(head)
+         nothing
+     elseif is_keyword(k)
+diff --git a/src/parser.jl b/src/parser.jl
+index 2287e8aa..4f97b8d5 100644
+--- a/src/parser.jl
++++ b/src/parser.jl
+@@ -3596,12 +3596,10 @@ function parse_atom(ps::ParseState, check_identifiers=true)
+     elseif is_string_delim(leading_kind)
+         parse_string(ps, false)
+     elseif leading_kind in KSet"` ```"
+-        # ``          ==>  (macrocall core_@cmd (cmdstring-r ""))
+-        # `cmd`       ==>  (macrocall core_@cmd (cmdstring-r "cmd"))
+-        # ```cmd```   ==>  (macrocall core_@cmd (cmdstring-s-r "cmd"))
+-        bump_invisible(ps, K"core_@cmd")
++        # ``          ==>  (cmdstring-r "")
++        # `cmd`       ==>  (cmdstring-r "cmd")
++        # ```cmd```   ==>  (cmdstring-s-r "cmd")
+         parse_string(ps, true)
+-        emit(ps, mark, K"macrocall")
+     elseif is_literal(leading_kind)
+         # 42   ==>  42
+         bump(ps)

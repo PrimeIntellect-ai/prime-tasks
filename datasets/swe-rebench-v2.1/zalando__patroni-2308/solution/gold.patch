@@ -1,0 +1,402 @@
+diff --git a/docs/SETTINGS.rst b/docs/SETTINGS.rst
+index 63e7f1c5..4e9103ec 100644
+--- a/docs/SETTINGS.rst
++++ b/docs/SETTINGS.rst
+@@ -314,7 +314,7 @@ PostgreSQL
+     -  **pg\_ctl\_timeout**: How long should pg_ctl wait when doing ``start``, ``stop`` or ``restart``. Default value is 60 seconds.
+     -  **use\_pg\_rewind**: try to use pg\_rewind on the former leader when it joins cluster as a replica.
+     -  **remove\_data\_directory\_on\_rewind\_failure**: If this option is enabled, Patroni will remove the PostgreSQL data directory and recreate the replica. Otherwise it will try to follow the new leader. Default value is **false**.
+-    -  **remove\_data\_directory\_on\_diverged\_timelines**: Patroni will remove the PostgreSQL data directory and recreate the replica if it notices that timelines are diverging and the former master can not start streaming from the new master. This option is useful when ``pg_rewind`` can not be used. Default value is **false**.
++    -  **remove\_data\_directory\_on\_diverged\_timelines**: Patroni will remove the PostgreSQL data directory and recreate the replica if it notices that timelines are diverging and the former master can not start streaming from the new master. This option is useful when ``pg_rewind`` can not be used. While performing timelines divergence check on PostgreSQL v10 and older Patroni will try to connect with replication credential to the "postgres" database. Hence, such access should be allowed in the  pg_hba.conf. Default value is **false**.
+     -  **replica\_method**: for each create_replica_methods other than basebackup, you would add a configuration section of the same name. At a minimum, this should include "command" with a full path to the actual script to be executed. Other configuration parameters will be passed along to the script in the form "parameter=value".
+     -  **pre\_promote**: a fencing script that executes during a failover after acquiring the leader lock but before promoting the replica. If the script exits with a non-zero code, Patroni does not promote the replica and removes the leader key from DCS.
+ 
+diff --git a/features/environment.py b/features/environment.py
+index 955e2a39..f07e4729 100644
+--- a/features/environment.py
++++ b/features/environment.py
+@@ -186,7 +186,7 @@ class PatroniController(AbstractController):
+         config['postgresql']['parameters'].update({
+             'logging_collector': 'on', 'log_destination': 'csvlog', 'log_directory': self._output_dir,
+             'log_filename': name + '.log', 'log_statement': 'all', 'log_min_messages': 'debug1',
+-            'unix_socket_directories': self._data_dir})
++            'unix_socket_directories': tempfile.gettempdir()})
+ 
+         if 'bootstrap' in config:
+             config['bootstrap']['post_bootstrap'] = 'psql -w -c "SELECT 1"'
+diff --git a/patroni/dcs/kubernetes.py b/patroni/dcs/kubernetes.py
+index 059bd369..3f1c1e51 100644
+--- a/patroni/dcs/kubernetes.py
++++ b/patroni/dcs/kubernetes.py
+@@ -518,6 +518,8 @@ class ObjectCache(Thread):
+         self._condition = condition
+         self._name = name  # name of this pod
+         self._is_ready = False
++        self._response = None  # needs to be accessible from the `kill_stream()` method
++        self._response_lock = Lock()  # protect the `self._response` from concurrent access
+         self._object_cache = {}
+         self._object_cache_lock = Lock()
+         self._annotations_map = {self._dcs.leader_path: self._dcs._LEADER, self._dcs.config_path: self._dcs._CONFIG}
+@@ -558,63 +560,99 @@ class ObjectCache(Thread):
+         with self._object_cache_lock:
+             return self._object_cache.get(name)
+ 
++    def _process_event(self, event):
++        ev_type = event['type']
++        obj = event['object']
++        name = obj['metadata']['name']
++
++        if ev_type in ('ADDED', 'MODIFIED'):
++            obj = K8sObject(obj)
++            success, old_value = self.set(name, obj)
++            if success:
++                new_value = (obj.metadata.annotations or {}).get(self._annotations_map.get(name))
++        elif ev_type == 'DELETED':
++            success, old_value = self.delete(name, obj['metadata']['resourceVersion'])
++            new_value = None
++        else:
++            return logger.warning('Unexpected event type: %s', ev_type)
++
++        if success and obj.get('kind') != 'Pod':
++            if old_value:
++                old_value = (old_value.metadata.annotations or {}).get(self._annotations_map.get(name))
++
++            value_changed = old_value != new_value and \
++                (name != self._dcs.config_path or old_value is not None and new_value is not None)
++
++            if value_changed:
++                logger.debug('%s changed from %s to %s', name, old_value, new_value)
++
++            # Do not wake up HA loop if we run as leader and received leader object update event
++            if value_changed or name == self._dcs.leader_path and self._name != new_value:
++                self._dcs.event.set()
++
++    @staticmethod
++    def _finish_response(response):
++        try:
++            response.close()
++        finally:
++            response.release_conn()
++
++    def _do_watch(self, resource_version):
++        with self._response_lock:
++            self._response = None
++        response = self._watch(resource_version)
++        with self._response_lock:
++            if self._response is None:
++                self._response = response
++
++        if not self._response:
++            return self._finish_response(response)
++
++        for event in iter_response_objects(response):
++            if event['object'].get('code') == 410:
++                break
++            self._process_event(event)
++
+     def _build_cache(self):
+         objects = self._list()
+-        return_type = 'V1' + objects.kind[:-4]
+         with self._object_cache_lock:
+             self._object_cache = {item.metadata.name: item for item in objects.items}
+         with self._condition:
+             self._is_ready = True
+             self._condition.notify()
+ 
+-        response = self._watch(objects.metadata.resource_version)
+         try:
+-            for event in iter_response_objects(response):
+-                obj = event['object']
+-                if obj.get('code') == 410:
+-                    break
+-
+-                ev_type = event['type']
+-                name = obj['metadata']['name']
+-
+-                if ev_type in ('ADDED', 'MODIFIED'):
+-                    obj = K8sObject(obj)
+-                    success, old_value = self.set(name, obj)
+-                    if success:
+-                        new_value = (obj.metadata.annotations or {}).get(self._annotations_map.get(name))
+-                elif ev_type == 'DELETED':
+-                    success, old_value = self.delete(name, obj['metadata']['resourceVersion'])
+-                    new_value = None
+-                else:
+-                    logger.warning('Unexpected event type: %s', ev_type)
+-                    continue
+-
+-                if success and return_type != 'V1Pod':
+-                    if old_value:
+-                        old_value = (old_value.metadata.annotations or {}).get(self._annotations_map.get(name))
+-
+-                    value_changed = old_value != new_value and \
+-                        (name != self._dcs.config_path or old_value is not None and new_value is not None)
+-
+-                    if value_changed:
+-                        logger.debug('%s changed from %s to %s', name, old_value, new_value)
+-
+-                    # Do not wake up HA loop if we run as leader and received leader object update event
+-                    if value_changed or name == self._dcs.leader_path and self._name != new_value:
+-                        self._dcs.event.set()
++            self._do_watch(objects.metadata.resource_version)
+         finally:
+             with self._condition:
+                 self._is_ready = False
+-            response.close()
+-            response.release_conn()
++            with self._response_lock:
++                response, self._response = self._response, None
++            if response:
++                self._finish_response(response)
++
++    def kill_stream(self):
++        sock = None
++        with self._response_lock:
++            if self._response:
++                try:
++                    sock = self._response.connection.sock
++                except Exception:
++                    sock = None
++            else:
++                self._response = False
++        if sock:
++            try:
++                sock.shutdown(socket.SHUT_RDWR)
++                sock.close()
++            except Exception as e:
++                logger.debug('Error on socket.shutdown: %r', e)
+ 
+     def run(self):
+         while True:
+             try:
+                 self._build_cache()
+             except Exception as e:
+-                with self._condition:
+-                    self._is_ready = False
+                 logger.error('ObjectCache.run %r', e)
+ 
+     def is_ready(self):
+@@ -889,7 +927,14 @@ class Kubernetes(AbstractDCS):
+     def patch_or_create(self, name, annotations, resource_version=None, patch=False, retry=True, ips=None):
+         if retry is True:
+             retry = self.retry
+-        return self._patch_or_create(name, annotations, resource_version, patch, retry, ips)
++        try:
++            return self._patch_or_create(name, annotations, resource_version, patch, retry, ips)
++        except k8s_client.rest.ApiException as e:
++            if e.status == 409 and resource_version:  # Conflict in resource_version
++                # Terminate watchers, it could be a sign that K8s API is in a failed state
++                self._kinds.kill_stream()
++                self._pods.kill_stream()
++            raise e
+ 
+     def patch_or_create_config(self, annotations, resource_version=None, patch=False, retry=True):
+         # SCOPE-config endpoint requires corresponding service otherwise it might be "cleaned" by k8s master
+diff --git a/patroni/postgresql/rewind.py b/patroni/postgresql/rewind.py
+index db7055df..481f0b7a 100644
+--- a/patroni/postgresql/rewind.py
++++ b/patroni/postgresql/rewind.py
+@@ -28,13 +28,17 @@ class Rewind(object):
+     def configuration_allows_rewind(data):
+         return data.get('wal_log_hints setting', 'off') == 'on' or data.get('Data page checksum version', '0') != '0'
+ 
++    @property
++    def enabled(self):
++        return self._postgresql.config.get('use_pg_rewind')
++
+     @property
+     def can_rewind(self):
+         """ check if pg_rewind executable is there and that pg_controldata indicates
+             we have either wal_log_hints or checksums turned on
+         """
+         # low-hanging fruit: check if pg_rewind configuration is there
+-        if not self._postgresql.config.get('use_pg_rewind'):
++        if not self.enabled:
+             return False
+ 
+         cmd = [self._postgresql.pgcommand('pg_rewind'), '--help']
+@@ -186,8 +190,14 @@ class Rewind(object):
+         if isinstance(leader, Leader) and leader.member.data.get('role') != 'master':
+             return
+ 
+-        if not self.check_leader_is_not_in_recovery(
+-                self._conn_kwargs(leader, self._postgresql.config.replication)):
++        # We want to use replication credentials when connecting to the "postgres" database in case if
++        # `use_pg_rewind` isn't enabled and only `remove_data_directory_on_diverged_timelines` is set
++        # for Postgresql older than v11 (where Patroni can't use a dedicated user for rewind).
++        # In all other cases we will use rewind or superuser credentials.
++        check_credentials = self._postgresql.config.replication if not self.enabled and\
++            self.should_remove_data_directory_on_diverged_timelines and\
++            self._postgresql.major_version < 110000 else self._postgresql.config.rewind_credentials
++        if not self.check_leader_is_not_in_recovery(self._conn_kwargs(leader, check_credentials)):
+             return
+ 
+         history = need_rewind = None
+@@ -315,15 +325,18 @@ class Rewind(object):
+         restore_command = self._postgresql.config.get('recovery_conf', {}).get('restore_command') \
+             if self._postgresql.major_version < 120000 else self._postgresql.get_guc_value('restore_command')
+ 
+-        # currently, pg_rewind expects postgresql.conf to be inside $PGDATA, which is not the case on e.g. Debian
+-        # Fix this logic if e.g. PG15 receives an update for pg_rewind:
+-        pg_rewind_can_restore = self._postgresql.major_version >= 130000 \
+-            and restore_command \
+-            and self._postgresql.config._config_dir == self._postgresql.data_dir
++        # Until v15 pg_rewind expected postgresql.conf to be inside $PGDATA, which is not the case on e.g. Debian
++        pg_rewind_can_restore = restore_command and (self._postgresql.major_version >= 150000 or
++                                                     (self._postgresql.major_version >= 130000 and
++                                                      self._postgresql.config._config_dir == self._postgresql.data_dir))
+ 
+         cmd = [self._postgresql.pgcommand('pg_rewind')]
+         if pg_rewind_can_restore:
+             cmd.append('--restore-target-wal')
++            if self._postgresql.major_version >= 150000 and\
++                    self._postgresql.config._config_dir != self._postgresql.data_dir:
++                cmd.append('--config-file={0}'.format(self._postgresql.config.postgresql_conf))
++
+         cmd.extend(['-D', self._postgresql.data_dir, '--source-server', dsn])
+ 
+         while True:
+diff --git a/patroni/postgresql/validator.py b/patroni/postgresql/validator.py
+index f6fd3d6e..8922bb85 100644
+--- a/patroni/postgresql/validator.py
++++ b/patroni/postgresql/validator.py
+@@ -99,9 +99,11 @@ class String(namedtuple('String', 'version_from,version_till')):
+ #  key - parameter name
+ #  value - tuple or multiple tuples if something was changing in GUC across postgres versions
+ parameters = CaseInsensitiveDict({
++    'allow_in_place_tablespaces': Bool(150000, None),
+     'allow_system_table_mods': Bool(90300, None),
+     'application_name': String(90300, None),
+     'archive_command': String(90300, None),
++    'archive_library': String(150000, None),
+     'archive_mode': (
+         Bool(90300, 90500),
+         EnumBool(90500, None, ('always',))
+@@ -158,7 +160,10 @@ parameters = CaseInsensitiveDict({
+     'cluster_name': String(90500, None),
+     'commit_delay': Integer(90300, None, 0, 100000, None),
+     'commit_siblings': Integer(90300, None, 0, 1000, None),
+-    'compute_query_id': EnumBool(140000, None, ('auto',)),
++    'compute_query_id': (
++        EnumBool(140000, 150000, ('auto',)),
++        EnumBool(150000, None, ('auto', 'regress'))
++    ),
+     'config_file': String(90300, None),
+     'constraint_exclusion': EnumBool(90300, None, ('partition',)),
+     'cpu_index_tuple_cost': Real(90300, None, 0, 1.79769e+308, None),
+@@ -170,6 +175,7 @@ parameters = CaseInsensitiveDict({
+     'DateStyle': String(90300, None),
+     'db_user_namespace': Bool(90300, None),
+     'deadlock_timeout': Integer(90300, None, 1, 2147483647, 'ms'),
++    'debug_discard_caches': Integer(150000, None, 0, 0, None),
+     'debug_pretty_print': Bool(90300, None),
+     'debug_print_parse': Bool(90300, None),
+     'debug_print_plan': Bool(90300, None),
+@@ -194,12 +200,14 @@ parameters = CaseInsensitiveDict({
+     'enable_async_append': Bool(140000, None),
+     'enable_bitmapscan': Bool(90300, None),
+     'enable_gathermerge': Bool(100000, None),
++    'enable_group_by_reordering': Bool(150000, None),
+     'enable_hashagg': Bool(90300, None),
+     'enable_hashjoin': Bool(90300, None),
+     'enable_incremental_sort': Bool(130000, None),
+     'enable_indexonlyscan': Bool(90300, None),
+     'enable_indexscan': Bool(90300, None),
+     'enable_material': Bool(90300, None),
++    'enable_memoize': Bool(150000, None),
+     'enable_mergejoin': Bool(90300, None),
+     'enable_nestloop': Bool(90300, None),
+     'enable_parallel_append': Bool(110000, None),
+@@ -294,6 +302,7 @@ parameters = CaseInsensitiveDict({
+     'log_replication_commands': Bool(90500, None),
+     'log_rotation_age': Integer(90300, None, 0, 35791394, 'min'),
+     'log_rotation_size': Integer(90300, None, 0, 2097151, 'kB'),
++    'log_startup_progress_interval': Integer(150000, None, 0, 2147483647, 'ms'),
+     'log_statement': Enum(90300, None, ('none', 'ddl', 'mod', 'all')),
+     'log_statement_sample_rate': Real(130000, None, 0, 1, None),
+     'log_statement_stats': Bool(90300, None),
+@@ -368,6 +377,8 @@ parameters = CaseInsensitiveDict({
+     'quote_all_identifiers': Bool(90300, None),
+     'random_page_cost': Real(90300, None, 0, 1.79769e+308, None),
+     'recovery_init_sync_method': Enum(140000, None, ('fsync', 'syncfs')),
++    'recovery_prefetch': EnumBool(150000, None, ('try',)),
++    'recursive_worktable_factor': Real(150000, None, 0.001, 1e+06, None),
+     'remove_temp_files_after_crash': Bool(140000, None),
+     'replacement_sort_tuples': Integer(90600, 110000, 0, 2147483647, None),
+     'restart_after_crash': Bool(90300, None),
+@@ -397,7 +408,8 @@ parameters = CaseInsensitiveDict({
+     'ssl_renegotiation_limit': Integer(90300, 90500, 0, 2147483647, 'kB'),
+     'standard_conforming_strings': Bool(90300, None),
+     'statement_timeout': Integer(90300, None, 0, 2147483647, 'ms'),
+-    'stats_temp_directory': String(90300, None),
++    'stats_fetch_consistency': Enum(150000, None, ('none', 'cache', 'snapshot')),
++    'stats_temp_directory': String(90300, 150000),
+     'superuser_reserved_connections': (
+         Integer(90300, 90600, 0, 8388607, None),
+         Integer(90600, None, 0, 262143, None)
+@@ -463,8 +475,12 @@ parameters = CaseInsensitiveDict({
+     'vacuum_multixact_freeze_min_age': Integer(90300, None, 0, 1000000000, None),
+     'vacuum_multixact_freeze_table_age': Integer(90300, None, 0, 2000000000, None),
+     'wal_buffers': Integer(90300, None, -1, 262143, '8kB'),
+-    'wal_compression': Bool(90500, None),
++    'wal_compression': (
++        Bool(90500, 150000),
++        EnumBool(150000, None, ('pglz', 'lz4', 'zstd'))
++    ),
+     'wal_consistency_checking': String(100000, None),
++    'wal_decode_buffer_size': Integer(150000, None, 65536, 1073741823, 'B'),
+     'wal_init_zero': Bool(120000, None),
+     'wal_keep_segments': Integer(90300, 130000, 0, 2147483647, None),
+     'wal_keep_size': Integer(130000, None, 0, 2147483647, 'MB'),
+diff --git a/patroni/utils.py b/patroni/utils.py
+index 1cfad919..01953d05 100644
+--- a/patroni/utils.py
++++ b/patroni/utils.py
+@@ -362,7 +362,7 @@ def polling_loop(timeout, interval=1):
+ def split_host_port(value, default_port):
+     t = value.rsplit(':', 1)
+     if ':' in t[0]:
+-        t[0] = t[0].strip('[]')
++        t[0] = ','.join([h.strip().strip('[]') for h in t[0].split(',')])
+     t.append(default_port)
+     return t[0], int(t[1])
+ 
+diff --git a/postgres0.yml b/postgres0.yml
+index 4a958ac8..33ead029 100644
+--- a/postgres0.yml
++++ b/postgres0.yml
+@@ -119,7 +119,7 @@ postgresql:
+     # Fully qualified kerberos ticket file for the running user
+     # same as KRB5CCNAME used by the GSS
+ #   krb_server_keyfile: /var/spool/keytabs/postgres
+-    unix_socket_directories: '.'
++    unix_socket_directories: '..'  # parent directory of data_dir
+   # Additional fencing script executed after acquiring the leader lock but before promoting the replica
+   #pre_promote: /path/to/pre_promote.sh
+ 
+diff --git a/postgres1.yml b/postgres1.yml
+index 17ccfdc2..6721a745 100644
+--- a/postgres1.yml
++++ b/postgres1.yml
+@@ -113,7 +113,7 @@ postgresql:
+     # Fully qualified kerberos ticket file for the running user
+     # same as KRB5CCNAME used by the GSS
+ #    krb_server_keyfile: /var/spool/keytabs/postgres
+-    unix_socket_directories: '.'
++    unix_socket_directories: '..'  # parent directory of data_dir
+   basebackup:
+       - verbose
+       - max-rate: 100M
+diff --git a/postgres2.yml b/postgres2.yml
+index c17dd7d0..824afd75 100644
+--- a/postgres2.yml
++++ b/postgres2.yml
+@@ -110,7 +110,7 @@ postgresql:
+     # Fully qualified kerberos ticket file for the running user
+     # same as KRB5CCNAME used by the GSS
+ #    krb_server_keyfile: /var/spool/keytabs/postgres
+-    unix_socket_directories: '.'
++    unix_socket_directories: '..'  # parent directory of data_dir
+ tags:
+     nofailover: false
+     noloadbalance: false

@@ -1,0 +1,210 @@
+diff --git a/bumpversion/bump.py b/bumpversion/bump.py
+index 62359afd..7ad24af3 100644
+--- a/bumpversion/bump.py
++++ b/bumpversion/bump.py
+@@ -79,7 +79,7 @@ def do_bump(
+ 
+     ctx = get_context(config, version, next_version)
+ 
+-    configured_files = resolve_file_config(config.files, config.version_config)
++    configured_files = resolve_file_config(config.files_to_modify, config.version_config)
+     modify_files(configured_files, version, next_version, ctx, dry_run)
+     update_config_file(config_file, config.current_version, next_version_str, dry_run)
+ 
+diff --git a/bumpversion/cli.py b/bumpversion/cli.py
+index deb6e50c..b746b406 100644
+--- a/bumpversion/cli.py
++++ b/bumpversion/cli.py
+@@ -9,7 +9,7 @@ from bumpversion import __version__
+ from bumpversion.aliases import AliasedGroup
+ from bumpversion.bump import do_bump
+ from bumpversion.config import find_config_file, get_configuration
+-from bumpversion.files import modify_files, resolve_file_config
++from bumpversion.files import ConfiguredFile, modify_files
+ from bumpversion.logging import setup_logging
+ from bumpversion.show import do_show, log_list
+ from bumpversion.ui import print_warning
+@@ -300,10 +300,11 @@ def bump(
+         config.scm_info.tool.assert_nondirty()
+ 
+     if no_configured_files:
+-        config.files = []
++        config.excluded_paths = list(config.resolved_filemap.keys())
+ 
+     if files:
+         config.add_files(files)
++        config.included_paths = files
+ 
+     do_bump(version_part, new_version, config, found_config_file, dry_run)
+ 
+@@ -495,13 +496,17 @@ def replace(
+         config.scm_info.tool.assert_nondirty()
+ 
+     if no_configured_files:
+-        config.files = []
++        config.excluded_paths = list(config.resolved_filemap.keys())
+ 
+     if files:
+         config.add_files(files)
++        config.included_paths = files
+ 
+-    version = config.version_config.parse(config.current_version)
++    configured_files = [
++        ConfiguredFile(file_cfg, config.version_config, search, replace) for file_cfg in config.files_to_modify
++    ]
+ 
++    version = config.version_config.parse(config.current_version)
+     if new_version:
+         next_version = config.version_config.parse(new_version)
+     else:
+@@ -509,6 +514,4 @@ def replace(
+ 
+     ctx = get_context(config, version, next_version)
+ 
+-    configured_files = resolve_file_config(config.files, config.version_config, search, replace)
+-
+     modify_files(configured_files, version, next_version, ctx, dry_run)
+diff --git a/bumpversion/config.py b/bumpversion/config.py
+index fc346e72..5e8daa2f 100644
+--- a/bumpversion/config.py
++++ b/bumpversion/config.py
+@@ -1,6 +1,7 @@
+ """Configuration management."""
+ from __future__ import annotations
+ 
++import glob
+ import itertools
+ import logging
+ import re
+@@ -66,6 +67,8 @@ class Config(BaseSettings):
+     scm_info: Optional["SCMInfo"]
+     parts: Dict[str, VersionPartConfig]
+     files: List[FileConfig]
++    included_paths: List[str] = []
++    excluded_paths: List[str] = []
+ 
+     class Config:
+         env_prefix = "bumpversion_"
+@@ -73,7 +76,42 @@ class Config(BaseSettings):
+     def add_files(self, filename: Union[str, List[str]]) -> None:
+         """Add a filename to the list of files."""
+         filenames = [filename] if isinstance(filename, str) else filename
+-        self.files.extend([FileConfig(filename=name) for name in filenames])  # type: ignore[call-arg]
++        for name in filenames:
++            if name in self.resolved_filemap:
++                continue
++            self.files.append(
++                FileConfig(
++                    filename=name,
++                    glob=None,
++                    parse=self.parse,
++                    serialize=self.serialize,
++                    search=self.search,
++                    replace=self.replace,
++                    no_regex=self.no_regex,
++                    ignore_missing_version=self.ignore_missing_version,
++                )
++            )
++
++    @property
++    def resolved_filemap(self) -> Dict[str, FileConfig]:
++        """Return a map of filenames to file configs, expanding any globs."""
++        new_files = []
++        for file_cfg in self.files:
++            if file_cfg.glob:
++                new_files.extend(get_glob_files(file_cfg))
++            else:
++                new_files.append(file_cfg)
++
++        return {file_cfg.filename: file_cfg for file_cfg in new_files}
++
++    @property
++    def files_to_modify(self) -> List[FileConfig]:
++        """Return a list of files to modify."""
++        files_not_excluded = [
++            file_cfg.filename for file_cfg in self.files if file_cfg.filename not in self.excluded_paths
++        ]
++        inclusion_set = set(self.included_paths) | set(files_not_excluded)
++        return [file_cfg for file_cfg in self.files if file_cfg.filename in inclusion_set]
+ 
+     @property
+     def version_config(self) -> "VersionConfig":
+@@ -410,3 +448,22 @@ def update_config_file(
+ 
+     if not dry_run:
+         config_path.write_text(new_config)
++
++
++def get_glob_files(file_cfg: FileConfig) -> List[FileConfig]:
++    """
++    Return a list of files that match the glob pattern.
++
++    Args:
++        file_cfg: The file configuration containing the glob pattern
++
++    Returns:
++        A list of resolved file configurations according to the pattern.
++    """
++    files = []
++    for filename_glob in glob.glob(file_cfg.glob, recursive=True):
++        new_file_cfg = file_cfg.copy()
++        new_file_cfg.filename = filename_glob
++        new_file_cfg.glob = None
++        files.append(new_file_cfg)
++    return files
+diff --git a/bumpversion/files.py b/bumpversion/files.py
+index 254bdfe9..546a07f9 100644
+--- a/bumpversion/files.py
++++ b/bumpversion/files.py
+@@ -1,5 +1,4 @@
+ """Methods for changing files."""
+-import glob
+ import logging
+ import re
+ from copy import deepcopy
+@@ -190,14 +189,7 @@ def resolve_file_config(
+     Returns:
+         A list of ConfiguredFiles
+     """
+-    configured_files = []
+-    for file_cfg in files:
+-        if file_cfg.glob:
+-            configured_files.extend(get_glob_files(file_cfg, version_config))
+-        else:
+-            configured_files.append(ConfiguredFile(file_cfg, version_config, search, replace))
+-
+-    return configured_files
++    return [ConfiguredFile(file_cfg, version_config, search, replace) for file_cfg in files]
+ 
+ 
+ def modify_files(
+@@ -222,29 +214,6 @@ def modify_files(
+         f.replace_version(current_version, new_version, context, dry_run)
+ 
+ 
+-def get_glob_files(
+-    file_cfg: FileConfig, version_config: VersionConfig, search: Optional[str] = None, replace: Optional[str] = None
+-) -> List[ConfiguredFile]:
+-    """
+-    Return a list of files that match the glob pattern.
+-
+-    Args:
+-        file_cfg: The file configuration containing the glob pattern
+-        version_config: The version configuration
+-        search: The search pattern to use instead of any configured search pattern
+-        replace: The replace pattern to use instead of any configured replace pattern
+-
+-    Returns:
+-        A list of resolved files according to the pattern.
+-    """
+-    files = []
+-    for filename_glob in glob.glob(file_cfg.glob, recursive=True):
+-        new_file_cfg = file_cfg.copy()
+-        new_file_cfg.filename = filename_glob
+-        files.append(ConfiguredFile(new_file_cfg, version_config, search, replace))
+-    return files
+-
+-
+ def _check_files_contain_version(
+     files: List[ConfiguredFile], current_version: Version, context: MutableMapping
+ ) -> None:

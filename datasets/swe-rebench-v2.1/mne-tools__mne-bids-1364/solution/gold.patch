@@ -1,0 +1,140 @@
+diff --git a/CITATION.cff b/CITATION.cff
+index 54752f43..790e6d7d 100644
+--- a/CITATION.cff
++++ b/CITATION.cff
+@@ -202,6 +202,10 @@ authors:
+       family-names: O'Reilly
+       affiliation: 'Computer Science and Engineering, University of South Carolina'
+       orcid: 'https://orcid.org/0000-0002-3149-4934'
++    - given-names: Berk
++      family-names: Gerçek
++      affiliation: 'University of Geneva, Department of Fundamental Neuroscience'
++      orcid: 'https://orcid.org/0000-0003-1063-6769'
+     - given-names: Alexandre
+       family-names: Gramfort
+       affiliation: 'Université Paris-Saclay, Inria, CEA, Palaiseau, France'
+diff --git a/doc/authors.rst b/doc/authors.rst
+index 03192410..cc061b1e 100644
+--- a/doc/authors.rst
++++ b/doc/authors.rst
+@@ -6,6 +6,7 @@
+ .. _Anand Saini: https://github.com/anandsaini024
+ .. _Ariel Rokem: https://github.com/arokem
+ .. _Austin Hurst: https://github.com/a-hurst
++.. _Berk Gerçek: https://github.com/berkgercek
+ .. _Bruno Hebling Vieira: https://github.com/bhvieira
+ .. _Chris Holdgraf: https://bids.berkeley.edu/people/chris-holdgraf
+ .. _Clemens Brunner: https://github.com/cbrnr
+diff --git a/doc/whats_new.rst b/doc/whats_new.rst
+index 17039eeb..fcf11063 100644
+--- a/doc/whats_new.rst
++++ b/doc/whats_new.rst
+@@ -18,6 +18,7 @@ Version 0.17 (unreleased)
+ The following authors contributed for the first time. Thank you so much! 🤩
+ 
+ * `Christian O'Reilly`_
++* `Berk Gerçek`_
+ 
+ The following authors had contributed before. Thank you for sticking around! 🤘
+ 
+@@ -33,6 +34,7 @@ Detailed list of changes
+ 
+ - :func:`mne_bids.write_raw_bids()` can now handle mne `Raw` objects with `eyegaze` and `pupil` channels, by `Christian O'Reilly`_ (:gh:`1344`)
+ - :func:`mne_bids.get_entity_vals()` has a new parameter ``ignore_suffixes`` to easily ignore sidecar files, by `Daniel McCloy`_ (:gh:`1362`)
++- Empty-room matching now preferentially finds recordings in the subject directory tagged as `task-noise` before looking in the `sub-emptyroom` directories. This adds support for a part of the BIDS specification for ER recordings, by `Berk Gerçek`_ (:gh:`1364`)
+ 
+ 
+ 🧐 API and behavior changes
+diff --git a/mne_bids/path.py b/mne_bids/path.py
+index d0471a0a..a824ba50 100644
+--- a/mne_bids/path.py
++++ b/mne_bids/path.py
+@@ -56,12 +56,62 @@ def _find_empty_room_candidates(bids_path):
+     datatype = "meg"  # We're only concerned about MEG data here
+     bids_fname = bids_path.update(suffix=datatype).fpath
+     _, ext = _parse_ext(bids_fname)
++    # Create a path for the empty-room directory to be used for matching.
+     emptyroom_dir = BIDSPath(root=bids_root, subject="emptyroom").directory
+ 
+-    if not emptyroom_dir.exists():
++    # Find matching "task-noise" files in the same directory as the recording.
++    noisetask_path = bids_path.update(
++        split=None, run=None, task="noise", datatype=datatype, suffix=datatype
++    )
++
++    allowed_extensions = list(reader.keys())
++    # `.pdf` is just a "virtual" extension for BTi data (which is stored inside
++    # a dedicated directory that doesn't have an extension)
++    del allowed_extensions[allowed_extensions.index(".pdf")]
++
++    # Get possible noise task files in the same directory as the recording.
++    noisetask_tmp = [
++        candidate
++        for candidate in noisetask_path.match()
++        if candidate.extension in allowed_extensions
++    ]
++    # For some reason a single file can produce multiple hits in the match function.
++    # Remove dups
++    noisetask_fns = []
++    for i in range(len(noisetask_tmp)):
++        fn = noisetask_tmp.pop()
++        if len(noisetask_tmp) == 0 or not any(
++            fn.fpath == f.fpath for f in noisetask_fns
++        ):
++            noisetask_fns.append(fn)
++
++    # If we have more than one noise task file, we need to disambiguate.
++    # It might be that it's a
++    # split recording.
++    if len(noisetask_fns) > 1 and any(path.split is not None for path in noisetask_fns):
++        noisetask_path.update(split="01")
++        noisetask_fns = [
++            candidate
++            for candidate in noisetask_path.match()
++            if candidate.extension in allowed_extensions
++        ]
++
++    # If it wasn't a split recording, warn the user that something is wonky,
++    # then resort to looking for sub-emptyroom recordings and date-matching.
++    if len(noisetask_fns) > 1:
++        msg = (
++            "Found more than one matching noise task file."
++            " Falling back to looking for sub-emptyroom recordings and date-matching."
++        )
++        warn(msg)
++        noisetask_fns = []
++    elif len(noisetask_fns) == 1:
++        return noisetask_fns[0]
++
++    if not emptyroom_dir.exists() and not noisetask_fns:
+         return list()
+ 
+-    # Find the empty-room recording sessions.
++    # Check the 'emptyroom' subject for empty-room recording sessions.
+     emptyroom_session_dirs = [
+         x
+         for x in emptyroom_dir.iterdir()
+@@ -71,12 +121,6 @@ def _find_empty_room_candidates(bids_path):
+         emptyroom_session_dirs = [emptyroom_dir]
+ 
+     # Now try to discover all recordings inside the session directories.
+-
+-    allowed_extensions = list(reader.keys())
+-    # `.pdf` is just a "virtual" extension for BTi data (which is stored inside
+-    # a dedicated directory that doesn't have an extension)
+-    del allowed_extensions[allowed_extensions.index(".pdf")]
+-
+     candidate_er_fnames = []
+     for session_dir in emptyroom_session_dirs:
+         dir_contents = glob.glob(
+@@ -105,6 +149,10 @@ def _find_matched_empty_room(bids_path):
+     from mne_bids import read_raw_bids  # avoid circular import.
+ 
+     candidates = _find_empty_room_candidates(bids_path)
++    # If a single candidate is returned, then there's a same-session noise
++    # task recording that takes priority.
++    if not isinstance(candidates, list):
++        return candidates
+ 
+     # Walk through recordings, trying to extract the recording date:
+     # First, from the filename; and if that fails, from `info['meas_date']`.

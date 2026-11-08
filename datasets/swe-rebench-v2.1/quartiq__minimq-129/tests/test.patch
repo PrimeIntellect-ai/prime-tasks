@@ -1,0 +1,286 @@
+diff --git a/tests/exactly_once_subscription.rs b/tests/exactly_once_subscription.rs
+new file mode 100644
+index 0000000..08016a7
+--- /dev/null
++++ b/tests/exactly_once_subscription.rs
+@@ -0,0 +1,280 @@
++use std::io::{Read, Write};
++use std::net::{TcpListener, TcpStream};
++use std::time::{Duration, Instant};
++
++use minimq::{
++    types::{SubscriptionOptions, TopicFilter},
++    Minimq, Publication, QoS,
++};
++
++use embedded_nal::{self, IpAddr, Ipv4Addr};
++use std_embedded_time::StandardClock;
++
++#[test]
++fn main() -> std::io::Result<()> {
++    env_logger::init();
++
++    let stack = std_embedded_nal::Stack::default();
++    let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
++    let mut mqtt =
++        Minimq::<_, _, 256, 16>::new(localhost, "", stack, StandardClock::default()).unwrap();
++
++    // Use a keepalive interval for the client.
++    mqtt.client().set_keepalive_interval(60).unwrap();
++
++    let mut published = false;
++    let mut subscribed = false;
++    let mut received_messages = 0;
++
++    loop {
++        // Continually process the client until no more data is received.
++        while let Some(count) = mqtt
++            .poll(|_client, _topic, _payload, _properties| 1)
++            .unwrap()
++        {
++            log::info!("Received a message");
++            received_messages += count;
++        }
++
++        if !mqtt.client().is_connected() {
++            continue;
++        }
++
++        if !subscribed {
++            let topic_filter = TopicFilter::new("data")
++                .options(SubscriptionOptions::default().maximum_qos(QoS::ExactlyOnce));
++            mqtt.client().subscribe(&[topic_filter], &[]).unwrap();
++            subscribed = true;
++        }
++
++        if mqtt.client().subscriptions_pending() {
++            continue;
++        }
++
++        if !published && mqtt.client().can_publish(QoS::ExactlyOnce) {
++            mqtt.client()
++                .publish(
++                    Publication::new("Ping".as_bytes())
++                        .topic("data")
++                        .qos(QoS::ExactlyOnce)
++                        .finish()
++                        .unwrap(),
++                )
++                .unwrap();
++            log::info!("Publishing message");
++            published = true;
++        }
++
++        if received_messages > 0 && mqtt.client().pending_messages(QoS::ExactlyOnce) == 0 {
++            assert!(published);
++            log::info!("Reception Complete");
++            break;
++        }
++    }
++
++    Ok(())
++}
++
++/// Read a single MQTT control packet from the stream.
++///
++/// Returns the fixed header byte and the variable header/payload bytes.
++fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
++    let mut header = [0u8; 1];
++    stream.read_exact(&mut header)?;
++
++    let mut remaining = 0usize;
++    let mut multiplier = 1usize;
++    loop {
++        let mut byte = [0u8; 1];
++        stream.read_exact(&mut byte)?;
++        remaining += (byte[0] as usize & 0x7f) * multiplier;
++        if byte[0] & 0x80 == 0 {
++            break;
++        }
++        multiplier *= 128;
++    }
++
++    let mut body = vec![0u8; remaining];
++    stream.read_exact(&mut body)?;
++
++    Ok((header[0], body))
++}
++
++/// Serialize a server-originated PUBLISH packet for the given QoS.
++fn publish_packet(qos: QoS, packet_id: u16, topic: &[u8], payload: &[u8]) -> Vec<u8> {
++    let mut body = Vec::new();
++    body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
++    body.extend_from_slice(topic);
++    if qos > QoS::AtMostOnce {
++        body.extend_from_slice(&packet_id.to_be_bytes());
++    }
++    body.push(0x00); // No properties.
++    body.extend_from_slice(payload);
++
++    let mut packet = vec![0x30 | ((qos as u8) << 1)];
++    packet.push(body.len() as u8);
++    packet.extend_from_slice(&body);
++    packet
++}
++
++/// A server-originated QoS 1 publication must be acknowledged with a PUBACK.
++#[test]
++fn acknowledges_qos1_server_publication() {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let port = listener.local_addr().unwrap().port();
++
++    let broker = std::thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        stream
++            .set_read_timeout(Some(Duration::from_secs(15)))
++            .unwrap();
++
++        // Receive the CONNECT request.
++        let (header, _) = read_packet(&mut stream).unwrap();
++        assert_eq!(header >> 4, 1, "Expected a CONNECT packet");
++
++        // Acknowledge the connection.
++        stream.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00]).unwrap();
++
++        // Receive the SUBSCRIBE request.
++        let (header, body) = read_packet(&mut stream).unwrap();
++        assert_eq!(header >> 4, 8, "Expected a SUBSCRIBE packet");
++        let subscription_id = u16::from_be_bytes([body[0], body[1]]);
++
++        // Acknowledge the subscription, granting QoS 1.
++        stream
++            .write_all(&[
++                0x90,
++                0x04,
++                (subscription_id >> 8) as u8,
++                subscription_id as u8,
++                0x00,
++                0x01,
++            ])
++            .unwrap();
++
++        // Deliver a QoS 1 publication from the server.
++        stream
++            .write_all(&publish_packet(QoS::AtLeastOnce, 1, b"data", b"Ping"))
++            .unwrap();
++
++        // The client must acknowledge the QoS 1 publication with a PUBACK.
++        let (header, body) = read_packet(&mut stream).unwrap();
++        assert_eq!(header >> 4, 4, "Expected a PUBACK packet");
++        assert_eq!(u16::from_be_bytes([body[0], body[1]]), 1);
++    });
++
++    run_client(port, QoS::AtLeastOnce, broker);
++}
++
++/// A server-originated QoS 2 publication must complete the PUBREC/PUBREL/PUBCOMP exchange.
++#[test]
++fn acknowledges_qos2_server_publication() {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let port = listener.local_addr().unwrap().port();
++
++    let broker = std::thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        stream
++            .set_read_timeout(Some(Duration::from_secs(15)))
++            .unwrap();
++
++        // Receive the CONNECT request.
++        let (header, _) = read_packet(&mut stream).unwrap();
++        assert_eq!(header >> 4, 1, "Expected a CONNECT packet");
++
++        // Acknowledge the connection.
++        stream.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00]).unwrap();
++
++        // Receive the SUBSCRIBE request.
++        let (header, body) = read_packet(&mut stream).unwrap();
++        assert_eq!(header >> 4, 8, "Expected a SUBSCRIBE packet");
++        let subscription_id = u16::from_be_bytes([body[0], body[1]]);
++
++        // The subscription requests QoS 2 in its options byte.
++        assert_eq!(body.last().copied().unwrap() & 0b11, QoS::ExactlyOnce as u8);
++
++        // Acknowledge the subscription, granting QoS 2.
++        stream
++            .write_all(&[
++                0x90,
++                0x04,
++                (subscription_id >> 8) as u8,
++                subscription_id as u8,
++                0x00,
++                0x02,
++            ])
++            .unwrap();
++
++        // Deliver a QoS 2 publication from the server.
++        stream
++            .write_all(&publish_packet(QoS::ExactlyOnce, 1, b"data", b"Ping"))
++            .unwrap();
++
++        // Retry the PUBLISH before receiving PUBREC, as a server may do if the
++        // acknowledgment was lost. The application must still see one message.
++        let mut duplicate = publish_packet(QoS::ExactlyOnce, 1, b"data", b"Ping");
++        duplicate[0] |= 0b0000_1000;
++        stream.write_all(&duplicate).unwrap();
++
++        // Both deliveries of the PUBLISH are acknowledged with PUBREC.
++        for _ in 0..2 {
++            let (header, body) = read_packet(&mut stream).unwrap();
++            assert_eq!(header >> 4, 5, "Expected a PUBREC packet");
++            assert_eq!(u16::from_be_bytes([body[0], body[1]]), 1);
++        }
++
++        // Release the publication.
++        stream.write_all(&[0x62, 0x02, 0x00, 0x01]).unwrap();
++
++        // The client must complete the exchange with a PUBCOMP.
++        let (header, body) = read_packet(&mut stream).unwrap();
++        assert_eq!(header >> 4, 7, "Expected a PUBCOMP packet");
++        assert_eq!(u16::from_be_bytes([body[0], body[1]]), 1);
++    });
++
++    run_client(port, QoS::ExactlyOnce, broker);
++}
++
++/// Drive a client against a mock broker until the broker has finished its exchange.
++fn run_client(port: u16, qos: QoS, broker: std::thread::JoinHandle<()>) {
++    let stack = std_embedded_nal::Stack::default();
++    let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
++    let mut mqtt =
++        Minimq::<_, _, 256, 16>::new(localhost, "", stack, StandardClock::default()).unwrap();
++    mqtt.client().set_broker_port(port).unwrap();
++    mqtt.client().set_keepalive_interval(60).unwrap();
++
++    let mut subscribed = false;
++    let mut received = 0;
++
++    let deadline = Instant::now() + Duration::from_secs(20);
++    while !broker.is_finished() {
++        if Instant::now() > deadline {
++            panic!("Timed out waiting for the server publication exchange");
++        }
++
++        match mqtt.poll(|_client, _topic, _payload, _properties| {
++            received += 1;
++        }) {
++            Ok(Some(_)) => {}
++            Ok(None) => {}
++            Err(_) => break,
++        }
++
++        if !mqtt.client().is_connected() {
++            continue;
++        }
++
++        if !subscribed {
++            let topic_filter =
++                TopicFilter::new("data").options(SubscriptionOptions::default().maximum_qos(qos));
++            mqtt.client().subscribe(&[topic_filter], &[]).unwrap();
++            subscribed = true;
++        }
++    }
++
++    assert_eq!(received, 1, "The server publication must be delivered exactly once");
++
++    broker.join().unwrap();
++}

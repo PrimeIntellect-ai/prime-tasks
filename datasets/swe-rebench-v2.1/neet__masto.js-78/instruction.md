@@ -1,0 +1,1 @@
+fetchNotifications should be paginated

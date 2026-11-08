@@ -1,0 +1,222 @@
+diff --git a/config/config_test.go b/config/config_test.go
+index 181058d..694aed1 100644
+--- a/config/config_test.go
++++ b/config/config_test.go
+@@ -1,9 +1,12 @@
+ package config_test
+ 
+ import (
++	"errors"
+ 	"flag"
+-	"io/ioutil"
++	"fmt"
++	"io"
+ 	"math/big"
++	"net"
+ 	"os"
+ 	"reflect"
+ 	"strings"
+@@ -12,6 +15,7 @@ import (
+ 
+ 	"github.com/0xPolygonHermez/zkevm-node/config"
+ 	"github.com/0xPolygonHermez/zkevm-node/config/types"
++	"github.com/0xPolygonHermez/zkevm-node/jsonrpc"
+ 	"github.com/0xPolygonHermez/zkevm-node/pricegetter"
+ 	"github.com/0xPolygonHermez/zkevm-node/sequencer"
+ 	"github.com/stretchr/testify/require"
+@@ -268,7 +272,7 @@ func Test_Defaults(t *testing.T) {
+ 			expectedValue: 61090,
+ 		},
+ 	}
+-	file, err := ioutil.TempFile("", "genesisConfig")
++	file, err := os.CreateTemp("", "genesisConfig")
+ 	require.NoError(t, err)
+ 	defer func() {
+ 		require.NoError(t, os.Remove(file.Name()))
+@@ -290,6 +294,11 @@ func Test_Defaults(t *testing.T) {
+ 			require.Equal(t, tc.expectedValue, actual)
+ 		})
+ 	}
++	for _, key := range []string{"ReadTimeoutInSec", "WriteTimeoutInSec"} {
++		t.Run("RPC default "+key, func(t *testing.T) {
++			require.Equal(t, int64(60), secondsFromConfigTag(t, cfg.RPC, key))
++		})
++	}
+ }
+ 
+ func getValueFromStruct(path string, object interface{}) interface{} {
+@@ -305,3 +314,161 @@ func getValueFromStruct(path string, object interface{}) interface{} {
+ 	}
+ 	return v.Interface()
+ }
++
++// loadRPCConfig loads RPC settings using the public TOML configuration keys.
++func loadRPCConfig(t *testing.T, rpcSettings string) jsonrpc.Config {
++	t.Helper()
++	configFile, err := os.CreateTemp("", "rpc-config-*.toml")
++	require.NoError(t, err)
++	defer os.Remove(configFile.Name())
++	_, err = fmt.Fprintf(configFile, "[RPC]\n%s", rpcSettings)
++	require.NoError(t, err)
++	require.NoError(t, configFile.Close())
++
++	genesisFile, err := os.CreateTemp("", "genesis-config-*")
++	require.NoError(t, err)
++	defer os.Remove(genesisFile.Name())
++	require.NoError(t, os.WriteFile(genesisFile.Name(), []byte("{}"), 0600))
++
++	flagSet := flag.NewFlagSet("", flag.PanicOnError)
++	flagSet.String(config.FlagCfg, configFile.Name(), "")
++	flagSet.String(config.FlagGenesisFile, genesisFile.Name(), "")
++	ctx := cli.NewContext(cli.NewApp(), flagSet, nil)
++	loaded, err := config.Load(ctx)
++	require.NoError(t, err)
++	return loaded.RPC
++}
++
++// secondsFromConfigTag reads a timeout setting in its public unit, regardless
++// of whether the configuration stores seconds directly or an actual duration.
++func secondsFromConfigTag(t *testing.T, object interface{}, key string) int64 {
++	t.Helper()
++	value := reflect.ValueOf(object)
++	for i := 0; i < value.NumField(); i++ {
++		field := value.Type().Field(i)
++		if strings.Split(field.Tag.Get("mapstructure"), ",")[0] != key {
++			continue
++		}
++		actual := value.Field(i)
++		switch actual.Kind() {
++		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++			seconds := actual.Int()
++			// A duration holding an actual timeout is measured in nanoseconds.
++			// The baseline also uses time.Duration as a seconds-valued setting,
++			// so preserve that representation when the value is below one second.
++			if actual.Type() == reflect.TypeOf(time.Duration(0)) && seconds >= int64(time.Second) && seconds%int64(time.Second) == 0 {
++				return seconds / int64(time.Second)
++			}
++			return seconds
++		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
++			return int64(actual.Uint())
++		}
++		t.Fatalf("configuration value %s is not an integer number of seconds", key)
++	}
++	t.Fatalf("configuration key %s was not loaded", key)
++	return 0
++}
++
++// Test_RPCServerTimeoutIsConfigurable verifies that the RPC server's HTTP read
++// timeout is driven by the configured value. It configures a one second read
++// timeout, starts the server and checks that an incomplete request is closed by
++// the server instead of being kept open indefinitely.
++func Test_RPCServerTimeoutIsConfigurable(t *testing.T) {
++	cfg := loadRPCConfig(t, "ReadTimeoutInSec = 1\nWriteTimeoutInSec = 5\n")
++
++	cfg.Host = "127.0.0.1"
++	cfg.Port = getFreePort(t)
++	cfg.MaxRequestsPerIPAndSecond = 1000
++
++	srv := jsonrpc.NewServer(cfg, nil, nil, nil, nil, map[string]bool{})
++	go func() {
++		_ = srv.Start()
++	}()
++	defer func() {
++		_ = srv.Stop()
++	}()
++
++	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
++	waitForRPCServer(t, addr)
++
++	conn, err := net.Dial("tcp", addr)
++	require.NoError(t, err)
++	defer func() {
++		_ = conn.Close()
++	}()
++
++	// Send an incomplete HTTP request and never finish it. With a one second
++	// read timeout the server must close the connection on its own.
++	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n"))
++	require.NoError(t, err)
++
++	require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
++	_, err = io.ReadAll(conn)
++	var netErr net.Error
++	require.False(t, errors.As(err, &netErr) && netErr.Timeout(), "the RPC server must close the connection before the client deadline")
++}
++
++func getFreePort(t *testing.T) int {
++	t.Helper()
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer func() {
++		_ = l.Close()
++	}()
++	return l.Addr().(*net.TCPAddr).Port
++}
++
++func waitForRPCServer(t *testing.T, addr string) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
++		if err == nil {
++			_ = conn.Close()
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatalf("RPC server did not start listening on %s", addr)
++}
++
++func Test_RPCServerWriteTimeoutIsConfigurable(t *testing.T) {
++	cfg := loadRPCConfig(t, "ReadTimeoutInSec = 5\nWriteTimeoutInSec = 1\n")
++
++	cfg.Host = "127.0.0.1"
++	cfg.Port = getFreePort(t)
++	cfg.MaxRequestsPerIPAndSecond = 1000
++
++	srv := jsonrpc.NewServer(cfg, nil, nil, nil, nil, map[string]bool{})
++	go func() {
++		_ = srv.Start()
++	}()
++	defer func() {
++		_ = srv.Stop()
++	}()
++
++	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
++	waitForRPCServer(t, addr)
++
++	conn, err := net.Dial("tcp", addr)
++	require.NoError(t, err)
++	defer func() {
++		_ = conn.Close()
++	}()
++
++	body := `{"jsonrpc":"2.0","method":"unknown","id":1}`
++	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
++	require.NoError(t, err)
++
++	// The request remains incomplete beyond the configured write deadline,
++	// while staying within the longer read deadline.
++	time.Sleep(1200 * time.Millisecond)
++	_, err = io.WriteString(conn, body)
++	require.NoError(t, err)
++
++	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
++	response, err := io.ReadAll(conn)
++	var netErr net.Error
++	require.False(t, errors.As(err, &netErr) && netErr.Timeout(), "the RPC server must close the connection before the client deadline")
++	require.Empty(t, response, "the RPC server must not send a response after its configured write timeout")
++}
+diff --git a/test/config/test.node.config.toml b/test/config/test.node.config.toml
+index c8f3a57..df9981c 100644
+--- a/test/config/test.node.config.toml
++++ b/test/config/test.node.config.toml
+@@ -39,6 +39,8 @@ PercentageToIncreaseGasLimit = 10
+ [RPC]
+ Host = "0.0.0.0"
+ Port = 8123
++ReadTimeoutInSec = 60
++WriteTimeoutInSec = 60
+ MaxRequestsPerIPAndSecond = 5000
+ SequencerNodeURI = ""
+ BroadcastURI = "127.0.0.1:61090"

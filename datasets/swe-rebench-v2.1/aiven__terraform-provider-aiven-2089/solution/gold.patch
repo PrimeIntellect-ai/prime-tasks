@@ -1,0 +1,716 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index adedfae0..9ac3670a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ nav_order: 1
+ 
+ ## [MAJOR.MINOR.PATCH] - YYYY-MM-DD
+ 
++- Fix `terraform import` for various resources
+ - Improve `aiven_organiztion_permission`: use `PermissionsSet` endpoint to set permissions
+ - Add `aiven_organization_application_user_token` resource field `ip_allowlist`: List of allowed IP ranges.
+ - Change `aiven_account_team_project` field `team_type` (enum): add `organization:billing:read`, `organization:billing:write`
+diff --git a/internal/schemautil/schemautil.go b/internal/schemautil/schemautil.go
+index 0daca34b..de2c9775 100644
+--- a/internal/schemautil/schemautil.go
++++ b/internal/schemautil/schemautil.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/aiven/go-client-codegen/handler/service"
+ 	"github.com/docker/go-units"
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
++	"github.com/samber/lo"
+ )
+ 
+ // OptionalStringPointer retrieves a string pointer to a field, empty string
+@@ -353,7 +354,7 @@ func CopyServiceUserGenPropertiesFromAPIResponseToTerraform(
+ //
+ // Warning: doesn't support nested sets.
+ // Warning: not tested with nested objects.
+-func ResourceDataGet(d ResourceData, dto any, fns ...KVModifier) error {
++func ResourceDataGet(d ResourceData, dto any, fns ...MapModifier) error {
+ 	rawConfig := d.GetRawConfig()
+ 	if rawConfig.IsNull() {
+ 		return nil
+@@ -373,13 +374,15 @@ func ResourceDataGet(d ResourceData, dto any, fns ...KVModifier) error {
+ 			value = set.List()
+ 		}
+ 
+-		for _, f := range fns {
+-			k, value = f(k, value)
+-		}
+-
+ 		m[k] = serializeGet(value)
+ 	}
+ 
++	for _, f := range fns {
++		if err := f(d, m); err != nil {
++			return err
++		}
++	}
++
+ 	return Remarshal(&m, dto)
+ }
+ 
+@@ -400,8 +403,13 @@ func serializeGet(value any) any {
+ 	return value
+ }
+ 
+-// KVModifier modifier for key/value pair
+-type KVModifier func(k string, v any) (string, any)
++// MapModifier modifier for key/value pair
++type MapModifier func(d ResourceData, dto map[string]any) error
++
++// errMissingForceNew `terraform import` requires all ForceNew fields to be set
++// otherwise it will output "replace" plan.
++// All ForceNew fields must be set.
++var errMissingForceNew = fmt.Errorf("missing required ForceNew field")
+ 
+ // ResourceDataSet Sets the given dto values to schema.ResourceData
+ // Instead of setting every field individually and dealing with pointers,
+@@ -417,8 +425,8 @@ type KVModifier func(k string, v any) (string, any)
+ //
+ // Use:
+ //
+-//	err := ResourceDataSet(s, d, dto)
+-func ResourceDataSet(s map[string]*schema.Schema, d ResourceData, dto any, fns ...KVModifier) error {
++//	err := ResourceDataSet(d, dto, s)
++func ResourceDataSet(d ResourceData, dto any, s map[string]*schema.Schema, fns ...MapModifier) error {
+ 	var m map[string]any
+ 	err := Remarshal(dto, &m)
+ 	if err != nil {
+@@ -426,28 +434,41 @@ func ResourceDataSet(s map[string]*schema.Schema, d ResourceData, dto any, fns .
+ 	}
+ 
+ 	for _, f := range fns {
+-		for k, v := range m {
+-			delete(m, k) // remove the old key in case it is replaced
+-			k, v = f(k, v)
+-			m[k] = v
++		if err := f(d, m); err != nil {
++			return err
+ 		}
+ 	}
+ 
+-	m = serializeSet(s, m)
+-	for k := range s {
+-		if v, ok := m[k]; ok {
+-			if err = d.Set(k, v); err != nil {
+-				return err
+-			}
++	if err = serializeSet(s, m); err != nil {
++		return err
++	}
++
++	for k, v := range m {
++		if err := d.Set(k, v); err != nil {
++			return err
+ 		}
+ 	}
++
+ 	return nil
+ }
+ 
+-func serializeSet(s map[string]*schema.Schema, m map[string]any) map[string]any {
+-	for k, prop := range s {
++func serializeSet(s map[string]*schema.Schema, m map[string]any) error {
++	keys := lo.Uniq(append(lo.Keys(m), lo.Keys(s)...))
++	for _, k := range keys {
++		prop, ok := s[k]
++		if !ok {
++			// The field not in the schema, removes it.
++			delete(m, k)
++			continue
++		}
++
+ 		value, ok := m[k]
+ 		if !ok {
++			if prop.ForceNew && prop.Required {
++				return fmt.Errorf("%w: %q", errMissingForceNew, k)
++			}
++
++			// The field is not in the dto, moves on.
+ 			continue
+ 		}
+ 
+@@ -458,25 +479,32 @@ func serializeSet(s map[string]*schema.Schema, m map[string]any) map[string]any
+ 
+ 		// When we have an object, we need to convert it to a list.
+ 		// So there is no difference between a single object and a list of objects.
+-		var items []any
+-		switch element := value.(type) {
+-		case map[string]any:
+-			items = append(items, serializeSet(res.Schema, element))
+-		case []any:
+-			for _, v := range element {
+-				items = append(items, serializeSet(res.Schema, v.(map[string]any)))
+-			}
++		var list []any
++		if v, ok := value.([]any); ok {
++			list = v
++		} else {
++			list = append(list, value)
+ 		}
+ 
+-		m[k] = items
++		m[k] = list
++		for _, v := range list {
++			o, ok := v.(map[string]any)
++			if !ok {
++				return fmt.Errorf("expected object for field %q, got type %T", k, v)
++			}
++
++			if err := serializeSet(res.Schema, o); err != nil {
++				return fmt.Errorf("failed to serialize object %q: %w", k, err)
++			}
++		}
+ 	}
+ 
+-	return m
++	return nil
+ }
+ 
+ // RenameAlias renames field names terraform name -> dto name
+ // Example: RenameAlias("hasFoo", "wantBar", "hasBaz", "wantEgg")
+-func RenameAlias(keys ...string) KVModifier {
++func RenameAlias(keys ...string) MapModifier {
+ 	m := make(map[string]string, len(keys)/2)
+ 	for i := 0; i < len(keys); i += 2 {
+ 		m[keys[i]] = keys[i+1]
+@@ -485,18 +513,21 @@ func RenameAlias(keys ...string) KVModifier {
+ }
+ 
+ // RenameAliases renames field names terraform name -> dto name
+-func RenameAliases(aliases map[string]string) KVModifier {
+-	return func(k string, v any) (string, any) {
+-		alias, ok := aliases[k]
+-		if ok {
+-			return alias, v
++func RenameAliases(aliases map[string]string) MapModifier {
++	return func(_ ResourceData, dto map[string]any) error {
++		for k, v := range dto {
++			alias, ok := aliases[k]
++			if ok {
++				dto[alias] = v
++				delete(dto, k)
++			}
+ 		}
+-		return k, v
++		return nil
+ 	}
+ }
+ 
+ // RenameAliasesReverse reverse version of RenameAliases
+-func RenameAliasesReverse(aliases map[string]string) KVModifier {
++func RenameAliasesReverse(aliases map[string]string) MapModifier {
+ 	m := make(map[string]string, len(aliases))
+ 	for k, v := range aliases {
+ 		m[v] = k
+@@ -504,6 +535,14 @@ func RenameAliasesReverse(aliases map[string]string) KVModifier {
+ 	return RenameAliases(m)
+ }
+ 
++// SetForceNew sets missing ForceNew fields to the DTO which are required by `terraform import`
++func SetForceNew(key string, value any) MapModifier {
++	return func(_ ResourceData, dto map[string]any) error {
++		dto[key] = value
++		return nil
++	}
++}
++
+ // Remarshal marshals "in" object to "out" through json
+ func Remarshal(in, out any) error {
+ 	b, err := json.Marshal(in)
+diff --git a/internal/sdkprovider/service/account/account.go b/internal/sdkprovider/service/account/account.go
+index aaa3f686..f86fdb5a 100644
+--- a/internal/sdkprovider/service/account/account.go
++++ b/internal/sdkprovider/service/account/account.go
+@@ -111,9 +111,7 @@ func resourceAccountRead(ctx context.Context, d *schema.ResourceData, client avn
+ 	}
+ 
+ 	if err = schemautil.ResourceDataSet(
+-		aivenAccountSchema,
+-		d,
+-		resp,
++		d, resp, aivenAccountSchema,
+ 		schemautil.RenameAliases(map[string]string{
+ 			"account_name":          "name",
+ 			"account_owner_team_id": "owner_team_id",
+diff --git a/internal/sdkprovider/service/account/account_team.go b/internal/sdkprovider/service/account/account_team.go
+index 62bb22fd..89c4e6dd 100644
+--- a/internal/sdkprovider/service/account/account_team.go
++++ b/internal/sdkprovider/service/account/account_team.go
+@@ -104,10 +104,9 @@ func resourceAccountTeamRead(ctx context.Context, d *schema.ResourceData, client
+ 	}
+ 
+ 	if err = schemautil.ResourceDataSet(
+-		aivenAccountTeamSchema,
+-		d,
+-		resp,
++		d, resp, aivenAccountTeamSchema,
+ 		schemautil.RenameAlias("team_name", "name"),
++		schemautil.SetForceNew("account_id", accountID),
+ 	); err != nil {
+ 		return err
+ 	}
+diff --git a/internal/sdkprovider/service/account/account_team_member.go b/internal/sdkprovider/service/account/account_team_member.go
+index dc233b94..9bb70641 100644
+--- a/internal/sdkprovider/service/account/account_team_member.go
++++ b/internal/sdkprovider/service/account/account_team_member.go
+@@ -110,18 +110,12 @@ func resourceAccountTeamMemberRead(ctx context.Context, d *schema.ResourceData,
+ 	for _, invite := range resp {
+ 		if invite.UserEmail == userEmail {
+ 			if err = schemautil.ResourceDataSet(
+-				aivenAccountTeamMemberSchema,
+-				d,
+-				invite,
+-				schemautil.RenameAliases(map[string]string{}),
++				d, invite, aivenAccountTeamMemberSchema,
++				schemautil.SetForceNew("account_id", accountID),
+ 			); err != nil {
+ 				return err
+ 			}
+ 
+-			if err = d.Set("account_id", accountID); err != nil {
+-				return err
+-			}
+-
+ 			// if a user is in the invitations list, it means invitation was sent but not yet accepted
+ 			if err = d.Set("accepted", false); err != nil {
+ 				return err
+@@ -139,17 +133,12 @@ func resourceAccountTeamMemberRead(ctx context.Context, d *schema.ResourceData,
+ 	for _, member := range respTI {
+ 		if member.UserEmail == userEmail {
+ 			if err = schemautil.ResourceDataSet(
+-				aivenAccountTeamMemberSchema,
+-				d,
+-				member,
++				d, member, aivenAccountTeamMemberSchema,
++				schemautil.SetForceNew("account_id", accountID),
+ 			); err != nil {
+ 				return err
+ 			}
+ 
+-			if err = d.Set("account_id", accountID); err != nil {
+-				return err
+-			}
+-
+ 			// when a user accepts an invitation, it will appear in the member's list
+ 			// and disappear from invitations list
+ 			if err = d.Set("accepted", true); err != nil {
+diff --git a/internal/sdkprovider/service/alloydbomni/alloydbomni_database.go b/internal/sdkprovider/service/alloydbomni/alloydbomni_database.go
+index 83fbc931..3a8e60b3 100644
+--- a/internal/sdkprovider/service/alloydbomni/alloydbomni_database.go
++++ b/internal/sdkprovider/service/alloydbomni/alloydbomni_database.go
+@@ -91,7 +91,11 @@ func resourceAlloyDBOmniDatabaseRead(ctx context.Context, d *schema.ResourceData
+ 		return err
+ 	}
+ 
+-	return schemautil.ResourceDataSet(aivenAlloyDBOmniDatabaseSchema, d, db)
++	return schemautil.ResourceDataSet(
++		d, db, aivenAlloyDBOmniDatabaseSchema,
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
++	)
+ }
+ 
+ func resourceAlloyDBOmniDatabaseDelete(ctx context.Context, d *schema.ResourceData, client avngen.Client) error {
+diff --git a/internal/sdkprovider/service/flink/flink_jar_application.go b/internal/sdkprovider/service/flink/flink_jar_application.go
+index 4d00df55..4420c546 100644
+--- a/internal/sdkprovider/service/flink/flink_jar_application.go
++++ b/internal/sdkprovider/service/flink/flink_jar_application.go
+@@ -45,12 +45,12 @@ func flinkJarApplicationCreate(ctx context.Context, d *schema.ResourceData, clie
+ }
+ 
+ func flinkJarApplicationRead(ctx context.Context, d *schema.ResourceData, client avngen.Client) error {
+-	project, serviceName, applicationID, err := schemautil.SplitResourceID3(d.Id())
++	projectName, serviceName, applicationID, err := schemautil.SplitResourceID3(d.Id())
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	rsp, err := client.ServiceFlinkGetJarApplication(ctx, project, serviceName, applicationID)
++	rsp, err := client.ServiceFlinkGetJarApplication(ctx, projectName, serviceName, applicationID)
+ 	if err != nil {
+ 		return schemautil.ResourceReadHandleNotFound(err, d)
+ 	}
+@@ -63,8 +63,10 @@ func flinkJarApplicationRead(ctx context.Context, d *schema.ResourceData, client
+ 	}
+ 
+ 	return schemautil.ResourceDataSet(
+-		flinkJarApplicationSchema(), d, rsp,
++		d, rsp, flinkJarApplicationSchema(),
+ 		schemautil.RenameAliasesReverse(flinkJarApplicationRename()),
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
+ 	)
+ }
+ 
+diff --git a/internal/sdkprovider/service/flink/flink_jar_application_deployment.go b/internal/sdkprovider/service/flink/flink_jar_application_deployment.go
+index edd87e33..ba9f1022 100644
+--- a/internal/sdkprovider/service/flink/flink_jar_application_deployment.go
++++ b/internal/sdkprovider/service/flink/flink_jar_application_deployment.go
+@@ -84,18 +84,21 @@ func flinkApplicationDeploymentDelete(ctx context.Context, d *schema.ResourceDat
+ }
+ 
+ func flinkApplicationDeploymentRead(ctx context.Context, d *schema.ResourceData, client avngen.Client) error {
+-	project, serviceName, applicationID, deploymentID, err := schemautil.SplitResourceID4(d.Id())
++	projectName, serviceName, applicationID, deploymentID, err := schemautil.SplitResourceID4(d.Id())
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	rsp, err := client.ServiceFlinkGetJarApplicationDeployment(ctx, project, serviceName, applicationID, deploymentID)
++	rsp, err := client.ServiceFlinkGetJarApplicationDeployment(ctx, projectName, serviceName, applicationID, deploymentID)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+ 	return schemautil.ResourceDataSet(
+-		flinkJarApplicationDeploymentSchema(), d, rsp,
++		d, rsp, flinkJarApplicationDeploymentSchema(),
+ 		schemautil.RenameAliasesReverse(flinkJarApplicationDeploymentRename()),
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
++		schemautil.SetForceNew("application_id", applicationID),
+ 	)
+ }
+diff --git a/internal/sdkprovider/service/flink/flink_jar_application_version.go b/internal/sdkprovider/service/flink/flink_jar_application_version.go
+index 6005d090..b5668118 100644
+--- a/internal/sdkprovider/service/flink/flink_jar_application_version.go
++++ b/internal/sdkprovider/service/flink/flink_jar_application_version.go
+@@ -117,12 +117,12 @@ func flinkJarApplicationVersionCreate(ctx context.Context, d *schema.ResourceDat
+ }
+ 
+ func flinkJarApplicationVersionRead(ctx context.Context, d *schema.ResourceData, client avngen.Client) error {
+-	project, serviceName, applicationID, version, err := schemautil.SplitResourceID4(d.Id())
++	projectName, serviceName, applicationID, version, err := schemautil.SplitResourceID4(d.Id())
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	rsp, err := client.ServiceFlinkGetJarApplicationVersion(ctx, project, serviceName, applicationID, version)
++	rsp, err := client.ServiceFlinkGetJarApplicationVersion(ctx, projectName, serviceName, applicationID, version)
+ 	if err != nil {
+ 		return schemautil.ResourceReadHandleNotFound(err, d)
+ 	}
+@@ -134,8 +134,11 @@ func flinkJarApplicationVersionRead(ctx context.Context, d *schema.ResourceData,
+ 	}
+ 
+ 	return schemautil.ResourceDataSet(
+-		flinkJarApplicationVersionSchema(), d, rsp,
++		d, rsp, flinkJarApplicationVersionSchema(),
+ 		schemautil.RenameAliasesReverse(flinkJarApplicationVersionRename()),
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
++		schemautil.SetForceNew("application_id", applicationID),
+ 	)
+ }
+ 
+diff --git a/internal/sdkprovider/service/kafka/kafka_native_acl.go b/internal/sdkprovider/service/kafka/kafka_native_acl.go
+index f2484bae..38f5ac4c 100644
+--- a/internal/sdkprovider/service/kafka/kafka_native_acl.go
++++ b/internal/sdkprovider/service/kafka/kafka_native_acl.go
+@@ -91,12 +91,12 @@ func resourceKafkaNativeACLCreate(ctx context.Context, d *schema.ResourceData, c
+ 		return err
+ 	}
+ 
+-	project := d.Get("project").(string)
++	projectName := d.Get("project").(string)
+ 	serviceName := d.Get("service_name").(string)
+ 
+ 	acl, err := client.ServiceKafkaNativeAclAdd(
+ 		ctx,
+-		project,
++		projectName,
+ 		serviceName,
+ 		&req,
+ 	)
+@@ -104,24 +104,28 @@ func resourceKafkaNativeACLCreate(ctx context.Context, d *schema.ResourceData, c
+ 		return err
+ 	}
+ 
+-	err = schemautil.ResourceDataSet(aivenKafkaNativeACLSchema, d, acl)
++	err = schemautil.ResourceDataSet(
++		d, acl, aivenKafkaNativeACLSchema,
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
++	)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	d.SetId(schemautil.BuildResourceID(project, serviceName, acl.Id))
++	d.SetId(schemautil.BuildResourceID(projectName, serviceName, acl.Id))
+ 	return resourceKafkaNativeACLRead(ctx, d, client)
+ }
+ 
+ func resourceKafkaNativeACLRead(ctx context.Context, d *schema.ResourceData, client avngen.Client) error {
+-	project, serviceName, aclID, err := schemautil.SplitResourceID3(d.Id())
++	projectName, serviceName, aclID, err := schemautil.SplitResourceID3(d.Id())
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+ 	acl, err := client.ServiceKafkaNativeAclGet(
+ 		ctx,
+-		project,
++		projectName,
+ 		serviceName,
+ 		aclID,
+ 	)
+@@ -129,7 +133,11 @@ func resourceKafkaNativeACLRead(ctx context.Context, d *schema.ResourceData, cli
+ 		return err
+ 	}
+ 
+-	err = schemautil.ResourceDataSet(aivenKafkaNativeACLSchema, d, acl)
++	err = schemautil.ResourceDataSet(
++		d, acl, aivenKafkaNativeACLSchema,
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
++	)
+ 	return err
+ }
+ 
+diff --git a/internal/sdkprovider/service/kafka/kafka_quota.go b/internal/sdkprovider/service/kafka/kafka_quota.go
+index 8c4687cc..9a895764 100644
+--- a/internal/sdkprovider/service/kafka/kafka_quota.go
++++ b/internal/sdkprovider/service/kafka/kafka_quota.go
+@@ -151,7 +151,7 @@ func resourceKafkaQuotaUpdate(ctx context.Context, d *schema.ResourceData, clien
+ }
+ 
+ func resourceKafkaQuotaRead(ctx context.Context, d *schema.ResourceData, client avngen.Client) error {
+-	project, serviceName, clientID, user, err := schemautil.SplitResourceID4(d.Id())
++	projectName, serviceName, clientID, user, err := schemautil.SplitResourceID4(d.Id())
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -171,7 +171,7 @@ func resourceKafkaQuotaRead(ctx context.Context, d *schema.ResourceData, client
+ 
+ 	resp, err := client.ServiceKafkaQuotaDescribe(
+ 		ctx,
+-		project,
++		projectName,
+ 		serviceName,
+ 		params...,
+ 	)
+@@ -180,10 +180,10 @@ func resourceKafkaQuotaRead(ctx context.Context, d *schema.ResourceData, client
+ 	}
+ 
+ 	return schemautil.ResourceDataSet(
+-		aivenKafkaQuotaSchema,
+-		d,
+-		resp,
++		d, resp, aivenKafkaQuotaSchema,
+ 		schemautil.RenameAliasesReverse(quotaFieldsAliases),
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
+ 	)
+ }
+ 
+diff --git a/internal/sdkprovider/service/kafka/mirrormaker_replication_flow.go b/internal/sdkprovider/service/kafka/mirrormaker_replication_flow.go
+index 9872eb74..c89987cd 100644
+--- a/internal/sdkprovider/service/kafka/mirrormaker_replication_flow.go
++++ b/internal/sdkprovider/service/kafka/mirrormaker_replication_flow.go
+@@ -2,6 +2,7 @@ package kafka
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"strings"
+ 
+ 	avngen "github.com/aiven/go-client-codegen"
+@@ -181,25 +182,26 @@ func resourceMirrorMakerReplicationFlowRead(ctx context.Context, d *schema.Resou
+ 		return schemautil.ResourceReadHandleNotFound(err, d)
+ 	}
+ 
+-	if err := d.Set("project", project); err != nil {
+-		return err
+-	}
+-	if err := d.Set("service_name", serviceName); err != nil {
+-		return err
+-	}
+-
+ 	err = schemautil.ResourceDataSet(
+-		aivenMirrorMakerReplicationFlowSchema, d, dto, schemautil.RenameAliasesReverse(dtoFieldsAliases),
+-		func(k string, v any) (string, any) {
+-			if k == configPropsKey {
++		d, dto, aivenMirrorMakerReplicationFlowSchema,
++		schemautil.SetForceNew("project", project),
++		schemautil.SetForceNew("service_name", serviceName),
++		schemautil.RenameAliasesReverse(dtoFieldsAliases),
++		func(_ schemautil.ResourceData, m map[string]any) error {
++			if v, ok := m[configPropsKey]; ok {
+ 				// This field is received as a string
+-				s := v.(string)
++				s, ok := v.(string)
++				if !ok {
++					return fmt.Errorf("unexpected type %T for %s", v, configPropsKey)
++				}
++
+ 				v = make([]any, 0)
+ 				if s != "" {
+ 					v = strings.Split(s, ",")
+ 				}
++				m[configPropsKey] = v
+ 			}
+-			return k, v
++			return nil
+ 		},
+ 	)
+ 
+@@ -239,12 +241,12 @@ func resourceMirrorMakerReplicationFlowDelete(ctx context.Context, d *schema.Res
+ func marshalFlow(d *schema.ResourceData, dto any) error {
+ 	return schemautil.ResourceDataGet(
+ 		d, dto, schemautil.RenameAliases(dtoFieldsAliases),
+-		func(k string, v any) (string, any) {
++		func(_ schemautil.ResourceData, m map[string]any) error {
+ 			// This field is sent as a string
+-			if k == configPropsKey {
+-				v = strings.Join(schemautil.FlattenToString(v.([]any)), ",")
++			if v, ok := m[configPropsKey]; ok {
++				m[configPropsKey] = strings.Join(schemautil.FlattenToString(v.([]any)), ",")
+ 			}
+-			return k, v
++			return nil
+ 		},
+ 	)
+ }
+diff --git a/internal/sdkprovider/service/organization/organization_application_user.go b/internal/sdkprovider/service/organization/organization_application_user.go
+index 54a44f0a..a3668751 100644
+--- a/internal/sdkprovider/service/organization/organization_application_user.go
++++ b/internal/sdkprovider/service/organization/organization_application_user.go
+@@ -106,21 +106,15 @@ func resourceOrganizationApplicationUserRead(ctx context.Context, d *schema.Reso
+ 	}
+ 
+ 	// Sets name and user_id
+-	err = schemautil.ResourceDataSet(aivenOrganizationApplicationUserSchema, d, user)
++	err = schemautil.ResourceDataSet(
++		d, user, aivenOrganizationApplicationUserSchema,
++		schemautil.RenameAlias("user_email", "email"),
++		schemautil.SetForceNew("organization_id", orgID),
++	)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	// This field has "email" in the schema and "user_email" in the request
+-	if err = d.Set("email", user.UserEmail); err != nil {
+-		return err
+-	}
+-
+-	// This is for import command
+-	if err = d.Set("organization_id", orgID); err != nil {
+-		return err
+-	}
+-
+ 	return nil
+ }
+ 
+diff --git a/internal/sdkprovider/service/organization/organization_application_user_token.go b/internal/sdkprovider/service/organization/organization_application_user_token.go
+index 45e68001..51a6fa80 100644
+--- a/internal/sdkprovider/service/organization/organization_application_user_token.go
++++ b/internal/sdkprovider/service/organization/organization_application_user_token.go
+@@ -151,7 +151,11 @@ func resourceOrganizationApplicationUserTokenCreate(ctx context.Context, d *sche
+ 		return err
+ 	}
+ 
+-	err = schemautil.ResourceDataSet(aivenOrganizationApplicationUserTokenSchema, d, token)
++	err = schemautil.ResourceDataSet(
++		d, token, aivenOrganizationApplicationUserTokenSchema,
++		schemautil.SetForceNew("organization_id", orgID),
++		schemautil.SetForceNew("user_id", userID),
++	)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -183,7 +187,11 @@ func resourceOrganizationApplicationUserTokenRead(ctx context.Context, d *schema
+ 		return fmt.Errorf("application user token not found")
+ 	}
+ 
+-	err = schemautil.ResourceDataSet(aivenOrganizationApplicationUserTokenSchema, d, token)
++	err = schemautil.ResourceDataSet(
++		d, token, aivenOrganizationApplicationUserTokenSchema,
++		schemautil.SetForceNew("organization_id", orgID),
++		schemautil.SetForceNew("user_id", userID),
++	)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/internal/sdkprovider/service/organization/organization_user_group.go b/internal/sdkprovider/service/organization/organization_user_group.go
+index a82cfa3f..047d13ed 100644
+--- a/internal/sdkprovider/service/organization/organization_user_group.go
++++ b/internal/sdkprovider/service/organization/organization_user_group.go
+@@ -100,22 +100,14 @@ func resourceOrganizationUserGroupRead(ctx context.Context, d *schema.ResourceDa
+ 	}
+ 
+ 	if err = schemautil.ResourceDataSet(
+-		aivenOrganizationUserGroupSchema,
+-		d,
+-		resp,
+-		schemautil.RenameAliases(map[string]string{
+-			"user_group_name": "name",
+-			"user_group_id":   "group_id",
+-		}),
++		d, resp, aivenOrganizationUserGroupSchema,
++		schemautil.RenameAlias("user_group_name", "name"),
++		schemautil.RenameAlias("user_group_id", "group_id"),
++		schemautil.SetForceNew("organization_id", orgID),
+ 	); err != nil {
+ 		return err
+ 	}
+ 
+-	// set the organization_id directly as it is not returned by the API and may not be set in case of import
+-	if err = d.Set("organization_id", orgID); err != nil {
+-		return err
+-	}
+-
+ 	return nil
+ }
+ 
+diff --git a/internal/sdkprovider/service/organization/organization_user_list_data_source.go b/internal/sdkprovider/service/organization/organization_user_list_data_source.go
+index fce85251..c2118465 100644
+--- a/internal/sdkprovider/service/organization/organization_user_list_data_source.go
++++ b/internal/sdkprovider/service/organization/organization_user_list_data_source.go
+@@ -151,7 +151,7 @@ func datasourceOrganizationUserListRead(ctx context.Context, d *schema.ResourceD
+ 
+ 	d.SetId(organizationID)
+ 	users := map[string]any{"users": list}
+-	return schemautil.ResourceDataSet(datasourceOrganizationUserListSchema(), d, users)
++	return schemautil.ResourceDataSet(d, users, datasourceOrganizationUserListSchema())
+ }
+ 
+ func GetOrganizationByName(ctx context.Context, client avngen.Client, name string) (string, error) {
+diff --git a/internal/sdkprovider/service/organization/organizational_unit.go b/internal/sdkprovider/service/organization/organizational_unit.go
+index 5e55015d..aefb3ca4 100644
+--- a/internal/sdkprovider/service/organization/organizational_unit.go
++++ b/internal/sdkprovider/service/organization/organizational_unit.go
+@@ -109,11 +109,7 @@ func resourceOrganizationalUnitRead(ctx context.Context, d *schema.ResourceData,
+ 		}
+ 	}
+ 
+-	if err = schemautil.ResourceDataSet(
+-		aivenOrganizationalUnitSchema,
+-		d,
+-		resp,
+-	); err != nil {
++	if err = schemautil.ResourceDataSet(d, resp, aivenOrganizationalUnitSchema); err != nil {
+ 		return err
+ 	}
+ 
+diff --git a/internal/sdkprovider/service/pg/pg_user.go b/internal/sdkprovider/service/pg/pg_user.go
+index 2473cb29..2d918e35 100644
+--- a/internal/sdkprovider/service/pg/pg_user.go
++++ b/internal/sdkprovider/service/pg/pg_user.go
+@@ -190,7 +190,11 @@ func ResourcePGUserRead(ctx context.Context, d schemautil.ResourceData, client a
+ 		return schemautil.ResourceReadHandleNotFound(err, d)
+ 	}
+ 
+-	err = schemautil.ResourceDataSet(ResourcePGUserSchema, d, user)
++	err = schemautil.ResourceDataSet(
++		d, user, ResourcePGUserSchema,
++		schemautil.SetForceNew("project", projectName),
++		schemautil.SetForceNew("service_name", serviceName),
++	)
+ 	if err != nil {
+ 		return err
+ 	}

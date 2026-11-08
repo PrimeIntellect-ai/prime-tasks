@@ -1,0 +1,149 @@
+diff --git a/backend/instancemgmt/instance_manager_test.go b/backend/instancemgmt/instance_manager_test.go
+index e86e67c..f1432d5 100644
+--- a/backend/instancemgmt/instance_manager_test.go
++++ b/backend/instancemgmt/instance_manager_test.go
+@@ -11,6 +11,11 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// disposeWaitTimeout is the maximum time a test waits for a deferred disposal
++// to happen. Disposal is expected to be deferred (not performed synchronously
++// while the instance may still be in use), so tests must wait for it.
++const disposeWaitTimeout = 10 * time.Second
++
+ func TestInstanceManager(t *testing.T) {
+ 	ctx := context.Background()
+ 	pCtx := backend.PluginContext{
+@@ -56,13 +61,45 @@ func TestInstanceManager(t *testing.T) {
+ 				require.NotSame(t, instance, newInstance)
+ 			})
+ 
++			t.Run("Old instance should not be disposed immediately", func(t *testing.T) {
++				require.False(t, instance.(*testInstance).disposed.Load())
++			})
++
+ 			t.Run("Old instance should be disposed", func(t *testing.T) {
+-				require.True(t, instance.(*testInstance).disposed)
++				instance.(*testInstance).waitDisposed(t, disposeWaitTimeout)
++				require.True(t, instance.(*testInstance).disposed.Load())
++				require.Equal(t, int64(1), instance.(*testInstance).disposedTimes.Load())
+ 			})
+ 		})
+ 	})
+ }
+ 
++func TestDisposeTTLControlsDeferredDisposal(t *testing.T) {
++	previousTTL := disposeTTL
++	disposeTTL = 200 * time.Millisecond
++	defer func() { disposeTTL = previousTTL }()
++
++	ctx := context.Background()
++	pluginContext := backend.PluginContext{
++		OrgID: 1,
++		AppInstanceSettings: &backend.AppInstanceSettings{Updated: time.Now()},
++	}
++	im := New(&testInstanceProvider{})
++	oldInstance, err := im.Get(ctx, pluginContext)
++	require.NoError(t, err)
++
++	updatedContext := backend.PluginContext{
++		OrgID: 1,
++		AppInstanceSettings: &backend.AppInstanceSettings{Updated: time.Now().Add(time.Second)},
++	}
++	_, err = im.Get(ctx, updatedContext)
++	require.NoError(t, err)
++
++	old := oldInstance.(*testInstance)
++	old.waitDisposed(t, 2*time.Second)
++	require.Equal(t, int64(1), old.disposedTimes.Load())
++}
++
+ func TestInstanceManagerConcurrency(t *testing.T) {
+ 	t.Run("Check possible race condition issues when initially creating instance", func(t *testing.T) {
+ 		ctx := context.Background()
+@@ -95,8 +132,9 @@ func TestInstanceManagerConcurrency(t *testing.T) {
+ 		t.Run("All created instances should be either disposed or exist in cache for later disposing", func(t *testing.T) {
+ 			cachedInstance, _ := im.Get(ctx, pCtx)
+ 			for _, instance := range createdInstances {
+-				if cachedInstance.(*testInstance) != instance && instance.disposedTimes < 1 {
+-					require.FailNow(t, "Found lost reference to un-disposed instance")
++				if cachedInstance.(*testInstance) != instance {
++					instance.waitDisposed(t, disposeWaitTimeout)
++					require.GreaterOrEqual(t, instance.disposedTimes.Load(), int64(1), "replaced instance should be disposed")
+ 				}
+ 			}
+ 		})
+@@ -140,14 +178,19 @@ func TestInstanceManagerConcurrency(t *testing.T) {
+ 		}
+ 		wg.Wait()
+ 
++		t.Run("Initial instance should not be disposed immediately", func(t *testing.T) {
++			require.False(t, instanceToDispose.(*testInstance).disposed.Load())
++		})
+ 		t.Run("Initial instance should be disposed only once", func(t *testing.T) {
+-			require.Equal(t, int64(1), instanceToDispose.(*testInstance).disposedTimes, "Instance should be disposed only once")
++			instanceToDispose.(*testInstance).waitDisposed(t, disposeWaitTimeout)
++			require.Equal(t, int64(1), instanceToDispose.(*testInstance).disposedTimes.Load(), "Instance should be disposed only once")
+ 		})
+ 		t.Run("All created instances should be either disposed or exist in cache for later disposing", func(t *testing.T) {
+ 			cachedInstance, _ := im.Get(ctx, updatedPCtx)
+ 			for _, instance := range createdInstances {
+-				if cachedInstance.(*testInstance) != instance && instance.disposedTimes < 1 {
+-					require.FailNow(t, "Found lost reference to un-disposed instance")
++				if cachedInstance.(*testInstance) != instance {
++					instance.waitDisposed(t, disposeWaitTimeout)
++					require.GreaterOrEqual(t, instance.disposedTimes.Load(), int64(1), "replaced instance should be disposed")
+ 				}
+ 			}
+ 		})
+@@ -204,13 +247,31 @@ func TestInstanceManagerConcurrency(t *testing.T) {
+ type testInstance struct {
+ 	orgID         int64
+ 	updated       time.Time
+-	disposed      bool
+-	disposedTimes int64
++	disposed      atomic.Bool
++	disposedTimes atomic.Int64
++	wg            sync.WaitGroup
+ }
+ 
+ func (ti *testInstance) Dispose() {
+-	ti.disposed = true
+-	atomic.AddInt64(&ti.disposedTimes, 1)
++	ti.disposed.Store(true)
++	ti.disposedTimes.Add(1)
++	ti.wg.Done()
++}
++
++// waitDisposed blocks until the instance has been disposed or the timeout
++// elapses, in which case the test fails.
++func (ti *testInstance) waitDisposed(t *testing.T, timeout time.Duration) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		ti.wg.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(timeout):
++		t.Fatalf("instance was not disposed within %s", timeout)
++	}
+ }
+ 
+ type testInstanceProvider struct {
+@@ -231,8 +292,12 @@ func (tip *testInstanceProvider) NewInstance(_ context.Context, pluginContext ba
+ 	if tip.delay > 0 {
+ 		time.Sleep(tip.delay)
+ 	}
+-	return &testInstance{
++
++	ti := &testInstance{
+ 		orgID:   pluginContext.OrgID,
+ 		updated: pluginContext.AppInstanceSettings.Updated,
+-	}, nil
++	}
++	ti.wg.Add(1)
++
++	return ti, nil
+ }

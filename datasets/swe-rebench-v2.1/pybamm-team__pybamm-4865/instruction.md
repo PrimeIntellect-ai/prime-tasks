@@ -1,0 +1,51 @@
+[Bug]: incorrect error message for multiple input params
+### PyBaMM Version
+
+develop
+
+### Python Version
+
+3.10
+
+### Describe the bug
+
+Say you want to create an input parameter but forget to pass the updated params to the simulation class:
+
+```python
+import pybamm
+import numpy as np
+
+model = pybamm.lithium_ion.SPM()
+params = model.default_parameter_values
+params.update({
+    "Current function [A]": "[input]",
+})
+solver = pybamm.IDAKLUSolver()
+sim = pybamm.Simulation(pybamm.lithium_ion.SPM(), solver=solver)
+sol = sim.solve([0, 3600], inputs=[{"Current function [A]": 1}, {"Current function [A]": 2}])
+```
+
+This produces the following error:
+
+```
+Traceback (most recent call last):
+  File "/home/mrobins/git/PyBaMM/test.py", line 11, in <module>
+    sol = sim.solve([0, 3600], inputs=[{"Current function [A]": 1}, {"Current function [A]": 2}])
+  File "/home/mrobins/git/PyBaMM/env/lib/python3.10/site-packages/pybamm/simulation.py", line 542, in solve
+    self._solution = solver.solve(
+  File "/home/mrobins/git/PyBaMM/env/lib/python3.10/site-packages/pybamm/solvers/base_solver.py", line 824, in solve
+    raise pybamm.SolverError(
+pybamm.expression_tree.exceptions.SolverError: Input parameters cannot appear in expression for initial conditions.
+```
+
+Which is incorrect. The correct response should be to not error and carry on the simulation, as the solver has all the input parameters it needs (since there are none in the model)
+
+### Steps to Reproduce
+
+see above
+
+### Relevant log output
+
+```shell
+
+```

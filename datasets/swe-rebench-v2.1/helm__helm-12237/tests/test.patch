@@ -1,0 +1,116 @@
+diff --git a/pkg/action/install_test.go b/pkg/action/install_test.go
+index 5e3ae79c..dd0cdb54 100644
+--- a/pkg/action/install_test.go
++++ b/pkg/action/install_test.go
+@@ -254,7 +254,7 @@ func TestInstallRelease_DryRun(t *testing.T) {
+ 	is.Equal(res.Info.Description, "Dry run complete")
+ }
+ 
+-// Regression test for #7955
++// Regression test for #7955: Lookup must not connect to Kubernetes on a dry-run.
+ func TestInstallRelease_DryRun_Lookup(t *testing.T) {
+ 	is := assert.New(t)
+ 	instAction := installAction(t)
+diff --git a/pkg/registry/util_test.go b/pkg/registry/util_test.go
+index fdf09360..4b2844a9 100644
+--- a/pkg/registry/util_test.go
++++ b/pkg/registry/util_test.go
+@@ -17,7 +17,17 @@ limitations under the License.
+ package registry // import "helm.sh/helm/v3/pkg/registry"
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
+ 	"reflect"
++	"strings"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -238,3 +248,80 @@ func TestGenerateOCICreatedAnnotations(t *testing.T) {
+ 	}
+ 
+ }
++
++func TestPushUsesCredentialsFromLogin(t *testing.T) {
++	const username = "registry-user"
++	const password = "registry-password"
++	var loggedIn atomic.Bool
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotUser, gotPassword, hasBasicAuth := r.BasicAuth()
++		validCredentials := hasBasicAuth && gotUser == username && gotPassword == password
++
++		if r.URL.Path == "/v2/" {
++			if validCredentials {
++				loggedIn.Store(true)
++				w.WriteHeader(http.StatusOK)
++				return
++			}
++			if loggedIn.Load() {
++				w.WriteHeader(http.StatusOK)
++				return
++			}
++			w.Header().Set("WWW-Authenticate", `Basic realm="registry"`)
++			w.WriteHeader(http.StatusUnauthorized)
++			return
++		}
++
++		if !validCredentials {
++			w.WriteHeader(http.StatusForbidden)
++			return
++		}
++
++		switch {
++		case r.Method == http.MethodHead:
++			w.WriteHeader(http.StatusNotFound)
++		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/blobs/uploads/"):
++			w.Header().Set("Location", strings.TrimSuffix(r.URL.Path, "/")+"/upload-id")
++			w.Header().Set("Docker-Upload-UUID", "upload-id")
++			w.WriteHeader(http.StatusAccepted)
++		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/blobs/uploads/"):
++			w.Header().Set("Location", r.URL.Path)
++			w.Header().Set("Docker-Upload-UUID", "upload-id")
++			w.WriteHeader(http.StatusAccepted)
++		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/blobs/uploads/"):
++			w.Header().Set("Docker-Content-Digest", r.URL.Query().Get("digest"))
++			w.WriteHeader(http.StatusCreated)
++		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/manifests/"):
++			body, err := io.ReadAll(r.Body)
++			if err != nil {
++				w.WriteHeader(http.StatusInternalServerError)
++				return
++			}
++			digest := sha256.Sum256(body)
++			w.Header().Set("Docker-Content-Digest", "sha256:"+hex.EncodeToString(digest[:]))
++			w.WriteHeader(http.StatusCreated)
++		default:
++			w.WriteHeader(http.StatusNotFound)
++		}
++	}))
++	defer server.Close()
++
++	credentialsFile := filepath.Join(t.TempDir(), "config.json")
++	client, err := NewClient(ClientOptCredentialsFile(credentialsFile))
++	if err != nil {
++		t.Fatalf("create registry client: %v", err)
++	}
++	host := strings.TrimPrefix(server.URL, "http://")
++	if err := client.Login(host, LoginOptBasicAuth(username, password), LoginOptInsecure(true)); err != nil {
++		t.Fatalf("login: %v", err)
++	}
++
++	chartData, err := os.ReadFile(filepath.Join("..", "repo", "repotest", "testdata", "examplechart-0.1.0.tgz"))
++	if err != nil {
++		t.Fatalf("read chart fixture: %v", err)
++	}
++	if _, err := client.Push(chartData, fmt.Sprintf("%s/charts/examplechart:0.1.0", host), PushOptTest(true)); err != nil {
++		t.Fatalf("push after successful login: %v", err)
++	}
++}

@@ -1,0 +1,192 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2ea515708..a64926a57 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Features
+ 
++- Creates `BaseProcessedVariable` to enable object combination when adding solutions together ([#5076](https://github.com/pybamm-team/PyBaMM/pull/5076))
+ - Added a `Constant` symbol for named constants. This is a subclass of `Scalar` and is used to represent named constants such as the gas constant. This avoids constants being simplified out when constructing expressions. ([#5070](https://github.com/pybamm-team/PyBaMM/pull/5070))
+ - Generalise `pybamm.DiscreteTimeSum` to allow it to be embedded in other expressions ([#5044](https://github.com/pybamm-team/PyBaMM/pull/5044))
+ - Adds `all` key-value pair to `output_variables` sensitivity dictionaries, accessible through `solution[var].sensitivities['all']`. Aligns shape with conventional solution sensitivities object. ([#5067](https://github.com/pybamm-team/PyBaMM/pull/5067))
+diff --git a/src/pybamm/solvers/base_processed_variable.py b/src/pybamm/solvers/base_processed_variable.py
+new file mode 100644
+index 000000000..389847b48
+--- /dev/null
++++ b/src/pybamm/solvers/base_processed_variable.py
+@@ -0,0 +1,28 @@
++from __future__ import annotations
++
++import abc
++
++import pybamm
++
++
++class BaseProcessedVariable(abc.ABC):
++    """
++    Shared API for both 'on-demand' and 'computed' processed variables.
++    """
++
++    @abc.abstractmethod
++    def __call__(self, **coords): ...
++
++    @abc.abstractmethod
++    def as_computed(self) -> pybamm.ProcessedVariableComputed: ...
++
++    def update(
++        self,
++        other: BaseProcessedVariable,
++        new_sol: pybamm.Solution,
++    ) -> pybamm.ProcessedVariableComputed:
++        """
++        Return a *new* CPV that is `self` followed by `other`.
++        Works no matter which concrete types we start with.
++        """
++        return self.as_computed()._concat(other.as_computed(), new_sol)
+diff --git a/src/pybamm/solvers/processed_variable.py b/src/pybamm/solvers/processed_variable.py
+index 0685b9a52..e1b19be32 100644
+--- a/src/pybamm/solvers/processed_variable.py
++++ b/src/pybamm/solvers/processed_variable.py
+@@ -7,8 +7,10 @@ from pybammsolvers import idaklu
+ 
+ import pybamm
+ 
++from .base_processed_variable import BaseProcessedVariable
+ 
+-class ProcessedVariable:
++
++class ProcessedVariable(BaseProcessedVariable):
+     """
+     An object that can be evaluated at arbitrary (scalars or vectors) t and x, and
+     returns the (interpolated) value of the base variable at that t and x.
+@@ -494,6 +496,58 @@ class ProcessedVariable:
+     def hermite_interpolation(self):
+         return self.all_yps is not None
+ 
++    def as_computed(self):
++        """
++        Allows a ProcessedVariable to be converted to a ComputedProcessedVariable for
++        use together, e.g. when using a last state solution with a new simulation running
++        with output variables in the solver.
++        """
++
++        def _stub_solution(self):
++            """
++            Return a lightweight object that looks like the parts of
++            `pybamm.Solution` required by ProcessedVariableComputed, but without
++            keeping the full state vector in memory.
++            """
++
++            class StubSolution:
++                def __init__(self, ts, ys, inputs, inputs_casadi, sensitivities, t_pts):
++                    self.all_ts = ts
++                    self.all_ys = ys
++                    self.all_inputs = inputs
++                    self.all_inputs_casadi = inputs_casadi
++                    self.sensitivities = sensitivities
++                    self.t = t_pts
++
++            return StubSolution(
++                self.all_ts,
++                self.all_ys,
++                self.all_inputs,
++                self.all_inputs_casadi,
++                self.sensitivities,
++                self.t_pts,
++            )
++
++        entries = self.entries  # shape: (..., n_t)
++
++        # Move time to axis 0, then flatten spatial dims per timestep
++        reshaped = np.moveaxis(entries, -1, 0)  # shape: (n_t, ...)
++        base_data = [reshaped.reshape(reshaped.shape[0], -1)]  # (n_t, n_vars)
++
++        cpv = pybamm.ProcessedVariableComputed(
++            self.base_variables,
++            self.base_variables_casadi,
++            base_data,
++            _stub_solution(self),
++        )
++
++        # add sensitivities if they exist
++        if self.sensitivities:
++            # TODO: test once #5058 is fixed
++            cpv._sensitivities = self.sensitivities  # pragma: no cover
++
++        return cpv
++
+ 
+ class ProcessedVariable0D(ProcessedVariable):
+     def __init__(
+diff --git a/src/pybamm/solvers/processed_variable_computed.py b/src/pybamm/solvers/processed_variable_computed.py
+index dd6e09ba4..b3a47b434 100644
+--- a/src/pybamm/solvers/processed_variable_computed.py
++++ b/src/pybamm/solvers/processed_variable_computed.py
+@@ -10,8 +10,10 @@ from scipy.integrate import cumulative_trapezoid
+ 
+ import pybamm
+ 
++from .base_processed_variable import BaseProcessedVariable
+ 
+-class ProcessedVariableComputed:
++
++class ProcessedVariableComputed(BaseProcessedVariable):
+     """
+     An object that can be evaluated at arbitrary (scalars or vectors) t and x, and
+     returns the (interpolated) value of the base variable at that t and x.
+@@ -133,6 +135,9 @@ class ProcessedVariableComputed:
+ 
+         raise NotImplementedError(f"Shape not recognized for {base_variables[0]}")
+ 
++    def as_computed(self) -> ProcessedVariableComputed:
++        return self
++
+     def add_sensitivity(self, param, data):
+         # unroll from sparse representation into n-d matrix
+         # then flatten for consistency with full state-vector
+@@ -694,7 +699,7 @@ class ProcessedVariableComputed:
+             return {}
+         return self._sensitivities
+ 
+-    def _update(
++    def _concat(
+         self, other: pybamm.ProcessedVariableComputed, new_sol: pybamm.Solution
+     ) -> pybamm.ProcessedVariableComputed:
+         """
+@@ -716,4 +721,9 @@ class ProcessedVariableComputed:
+ 
+         new_var = self.__class__(bv, bvc, bvd, new_sol)
+ 
++        new_var._sensitivities = {
++            k: np.concatenate((self.sensitivities[k], other.sensitivities[k]))
++            for k in self.sensitivities.keys()
++        }
++
+         return new_var
+diff --git a/src/pybamm/solvers/solution.py b/src/pybamm/solvers/solution.py
+index 01f614ef9..b958932f0 100644
+--- a/src/pybamm/solvers/solution.py
++++ b/src/pybamm/solvers/solution.py
+@@ -801,17 +801,10 @@ class Solution:
+         new_sol._sub_solutions = self.sub_solutions + other.sub_solutions
+ 
+         # update variables which were derived at the solver stage
+-        if other._variables and all(
+-            isinstance(v, pybamm.ProcessedVariableComputed)
+-            for v in other._variables.values()
+-        ):
+-            if not self._variables:
+-                new_sol._variables = other._variables.copy()
+-            else:
+-                new_sol._variables = {
+-                    v: self._variables[v]._update(other._variables[v], new_sol)
+-                    for v in self._variables.keys()
+-                }
++        if any([self.variables_returned, other.variables_returned]):
++            vars = {*self._variables.keys(), *other._variables.keys()}
++            new_sol._variables = {v: self[v].update(other[v], new_sol) for v in vars}
++            new_sol.variables_returned = True
+ 
+         return new_sol
+ 

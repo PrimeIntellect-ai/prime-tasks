@@ -1,0 +1,144 @@
+diff --git a/dask/array/creation.py b/dask/array/creation.py
+index 7a1edb2a0..b906bc405 100644
+--- a/dask/array/creation.py
++++ b/dask/array/creation.py
+@@ -452,7 +452,7 @@ def arange(
+         blockstop = start + ((elem_count + bs) * step)
+         task = Task(
+             (name, i),
+-            partial(chunk.arange, like=like),
++            partial(chunk.arange, like=meta),
+             blockstart,
+             blockstop,
+             step,
+diff --git a/dask/dataframe/dask_expr/_collection.py b/dask/dataframe/dask_expr/_collection.py
+index 8335aba4d..4a2656bc5 100644
+--- a/dask/dataframe/dask_expr/_collection.py
++++ b/dask/dataframe/dask_expr/_collection.py
+@@ -397,6 +397,8 @@ class FrameBase(DaskMethodsMixin):
+ 
+     def __getitem__(self, other):
+         if isinstance(other, FrameBase):
++            if not expr.are_co_aligned(self.expr, other.expr):
++                return new_collection(expr.FilterAlign(self, other))
+             return new_collection(self.expr.__getitem__(other.expr))
+         elif isinstance(other, slice):
+             from pandas.api.types import is_float_dtype
+diff --git a/dask/dataframe/dask_expr/_expr.py b/dask/dataframe/dask_expr/_expr.py
+index 7093e7235..763f07a1b 100644
+--- a/dask/dataframe/dask_expr/_expr.py
++++ b/dask/dataframe/dask_expr/_expr.py
+@@ -178,8 +178,6 @@ class Expr(core.Expr):
+ 
+     def __getitem__(self, other):
+         if isinstance(other, Expr):
+-            if not are_co_aligned(self, other):
+-                return FilterAlign(self, other)
+             return Filter(self, other)
+         else:
+             return Projection(self, other)  # df[["a", "b", "c"]]
+@@ -522,7 +520,9 @@ class Expr(core.Expr):
+     def _filter_simplification(self, parent, predicate=None):
+         if predicate is None:
+             predicate = parent.predicate.substitute(self, self.frame)
+-        return type(self)(self.frame[predicate], *self.operands[1:])
++        if are_co_aligned(self.frame, predicate):
++            # Only do this if we are aligned
++            return type(self)(self.frame[predicate], *self.operands[1:])
+ 
+     def fuse(self):
+         return optimize_blockwise_fusion(self)
+@@ -1631,14 +1631,26 @@ class Where(Elemwise):
+ 
+ 
+ def _check_divisions(df, i, division_min, division_max, last):
++    if not len(df):
++        return df
++    if is_index_like(df):
++        index = df
++    else:
++        try:
++            index = df.index.get_level_values(0)
++        except AttributeError:
++            index = df.index
+     # Check divisions
+-    real_min = df.index.min()
+-    real_max = df.index.max()
++    real_min = index.min()
++    real_max = index.max()
+     # Upper division of the last partition is often set to
+     # the max value. For all other partitions, the upper
+     # division should be greater than the maximum value.
+-    valid_min = real_min >= division_min
+-    valid_max = (real_max <= division_max) if last else (real_max < division_max)
++    valid_min = valid_max = True
++    if not pd.isna(division_min):
++        valid_min = real_min >= division_min
++    if not pd.isna(division_max):
++        valid_max = (real_max <= division_max) if last else (real_max < division_max)
+     if not (valid_min and valid_max):
+         raise RuntimeError(
+             f"`enforce_runtime_divisions` failed for partition {i}."
+@@ -1665,7 +1677,7 @@ class EnforceRuntimeDivisions(Blockwise):
+             self.divisions[index + 1],
+             index == (self.npartitions - 1),
+         ]
+-        return (self.operation,) + tuple(args)  # type: ignore
++        return Task(name, self.operation, *args)
+ 
+ 
+ class Abs(Elemwise):
+diff --git a/dask/dataframe/dask_expr/_repartition.py b/dask/dataframe/dask_expr/_repartition.py
+index fe13dd362..d5a9dd5d7 100644
+--- a/dask/dataframe/dask_expr/_repartition.py
++++ b/dask/dataframe/dask_expr/_repartition.py
+@@ -149,6 +149,10 @@ class Repartition(Expr):
+         if isinstance(parent, Filter) and self._filter_passthrough_available(
+             parent, dependents
+         ):
++            if self._name == parent.predicate._name:
++                # We shouldn't push through the predicate, these pushdowns should
++                # always come from frame.
++                return
+             return self._filter_simplification(parent)
+         if isinstance(parent, Projection):
+             return plain_column_projection(self, parent, dependents)
+diff --git a/dask/dataframe/utils.py b/dask/dataframe/utils.py
+index 9e156c41c..7260ae0d6 100644
+--- a/dask/dataframe/utils.py
++++ b/dask/dataframe/utils.py
+@@ -15,7 +15,7 @@ import pandas as pd
+ from pandas.api.types import is_dtype_equal
+ 
+ import dask
+-from dask.base import get_scheduler, is_dask_collection
++from dask.base import is_dask_collection
+ from dask.core import get_deps
+ from dask.dataframe._compat import tm  # noqa: F401
+ from dask.dataframe.dispatch import (  # noqa : F401
+@@ -603,24 +603,7 @@ def assert_divisions(ddf, scheduler=None):
+     if not getattr(ddf, "known_divisions", False):
+         return
+ 
+-    def index(x):
+-        if is_index_like(x):
+-            return x
+-        try:
+-            return x.index.get_level_values(0)
+-        except AttributeError:
+-            return x.index
+-
+-    get = get_scheduler(scheduler=scheduler, collections=[type(ddf)])
+-    results = get(ddf.dask, ddf.__dask_keys__())
+-    for i, df in enumerate(results[:-1]):
+-        if len(df):
+-            assert index(df).min() >= ddf.divisions[i]
+-            assert index(df).max() < ddf.divisions[i + 1]
+-
+-    if len(results[-1]):
+-        assert index(results[-1]).min() >= ddf.divisions[-2]
+-        assert index(results[-1]).max() <= ddf.divisions[-1]
++    ddf.enforce_runtime_divisions().compute(scheduler=scheduler)
+ 
+ 
+ def assert_sane_keynames(ddf):

@@ -1,0 +1,332 @@
+diff --git a/ChangeLog.rst b/ChangeLog.rst
+index cc6b5e4..d39e76b 100644
+--- a/ChangeLog.rst
++++ b/ChangeLog.rst
+@@ -5,21 +5,25 @@ Release Date: TBD
+ 
+ 
+ Important changes
+-------------------
++-----------------
+ 
+-Extension modules are merged.  There is ``msgpack._msgpack`` instead of
+-``msgpack._packer`` and ``msgpack._unpacker``. (#314)
++* unpacker: Default size limits is smaller than before to avoid DoS attack.
++  If you need to handle large data, you need to specify limits manually. (#319)
+ 
+-unpacker: Default size limits is smaller than before to avoid DoS attack.
+-If you need to handle large data, you need to specify limits manually.
+ 
++Other changes
++-------------
+ 
++* Extension modules are merged.  There is ``msgpack._msgpack`` instead of
++  ``msgpack._packer`` and ``msgpack._unpacker``. (#314)
+ 
+-Other changes
+---------------
++* Add ``Unpacker.getbuffer()`` method. (#320)
+ 
+-Add ``Unpacker.getbuffer()`` method.
++* unpacker: ``msgpack.StackError`` is raised when input data contains too
++  nested data. (#331)
+ 
++* unpacker: ``msgpack.FormatError`` is raised when input data is not valid
++  msgpack format. (#331)
+ 
+ 
+ 0.5.6
+diff --git a/Makefile b/Makefile
+index b65aa85..5828ed4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,8 @@ cython:
+ 	cython --cplus msgpack/_cmsgpack.pyx
+ 
+ .PHONY: test
+-test:
++test: cython
++	pip install -e .
+ 	pytest -v test
+ 	MSGPACK_PUREPYTHON=1 pytest -v test
+ 
+diff --git a/msgpack/_unpacker.pyx b/msgpack/_unpacker.pyx
+index aeebe2a..69330d3 100644
+--- a/msgpack/_unpacker.pyx
++++ b/msgpack/_unpacker.pyx
+@@ -16,6 +16,8 @@ from msgpack.exceptions import (
+     BufferFull,
+     OutOfData,
+     ExtraData,
++    FormatError,
++    StackError,
+ )
+ from msgpack import ExtType
+ 
+@@ -149,7 +151,11 @@ def unpackb(object packed, object object_hook=None, object list_hook=None,
+     """
+     Unpack packed_bytes to object. Returns an unpacked object.
+ 
+-    Raises `ValueError` when `packed` contains extra bytes.
++    Raises ``ExtraData`` when *packed* contains extra bytes.
++    Raises ``ValueError`` when *packed* is incomplete.
++    Raises ``FormatError`` when *packed* is not valid msgpack.
++    Raises ``StackError`` when *packed* contains too nested.
++    Other exceptions can be raised during unpacking.
+ 
+     See :class:`Unpacker` for options.
+     """
+@@ -187,6 +193,12 @@ def unpackb(object packed, object object_hook=None, object list_hook=None,
+             raise ExtraData(obj, PyBytes_FromStringAndSize(buf+off, buf_len-off))
+         return obj
+     unpack_clear(&ctx)
++    if ret == 0:
++        raise ValueError("Unpack failed: incomplete input")
++    elif ret == -2:
++        raise FormatError
++    elif ret == -3:
++        raise StackError
+     raise ValueError("Unpack failed: error = %d" % (ret,))
+ 
+ 
+@@ -201,7 +213,7 @@ def unpack(object stream, **kwargs):
+ cdef class Unpacker(object):
+     """Streaming unpacker.
+ 
+-    arguments:
++    Arguments:
+ 
+     :param file_like:
+         File-like object having `.read(n)` method.
+@@ -279,6 +291,12 @@ cdef class Unpacker(object):
+             unpacker.feed(buf)
+             for o in unpacker:
+                 process(o)
++
++    Raises ``ExtraData`` when *packed* contains extra bytes.
++    Raises ``OutOfData`` when *packed* is incomplete.
++    Raises ``FormatError`` when *packed* is not valid msgpack.
++    Raises ``StackError`` when *packed* contains too nested.
++    Other exceptions can be raised during unpacking.
+     """
+     cdef unpack_context ctx
+     cdef char* buf
+@@ -451,6 +469,10 @@ cdef class Unpacker(object):
+                     raise StopIteration("No more data to unpack.")
+                 else:
+                     raise OutOfData("No more data to unpack.")
++            elif ret == -2:
++                raise FormatError
++            elif ret == -3:
++                raise StackError
+             else:
+                 raise ValueError("Unpack failed: error = %d" % (ret,))
+ 
+diff --git a/msgpack/exceptions.py b/msgpack/exceptions.py
+index 5bee5b2..d6d2615 100644
+--- a/msgpack/exceptions.py
++++ b/msgpack/exceptions.py
+@@ -6,6 +6,7 @@ class UnpackException(Exception):
+     Exception instead.
+     """
+ 
++
+ class BufferFull(UnpackException):
+     pass
+ 
+@@ -14,6 +15,14 @@ class OutOfData(UnpackException):
+     pass
+ 
+ 
++class FormatError(ValueError, UnpackException):
++    """Invalid msgpack format"""
++
++
++class StackError(ValueError, UnpackException):
++    """Too nested"""
++
++
+ # Deprecated.  Use ValueError instead
+ UnpackValueError = ValueError
+ 
+@@ -24,6 +33,7 @@ class ExtraData(UnpackValueError):
+     This exception is raised while only one-shot (not streaming)
+     unpack.
+     """
++
+     def __init__(self, unpacked, extra):
+         self.unpacked = unpacked
+         self.extra = extra
+@@ -32,7 +42,7 @@ class ExtraData(UnpackValueError):
+         return "unpack(b) received extra data."
+ 
+ 
+-#Deprecated.  Use Exception instead to catch all exception during packing.
++# Deprecated.  Use Exception instead to catch all exception during packing.
+ PackException = Exception
+ PackValueError = ValueError
+ PackOverflowError = OverflowError
+diff --git a/msgpack/fallback.py b/msgpack/fallback.py
+index 04fb5b9..9c767a7 100644
+--- a/msgpack/fallback.py
++++ b/msgpack/fallback.py
+@@ -18,6 +18,16 @@ else:
+     def dict_iteritems(d):
+         return d.iteritems()
+ 
++if sys.version_info < (3, 5):
++    # Ugly hack...
++    RecursionError = RuntimeError
++
++    def _is_recursionerror(e):
++        return len(e.args) == 1 and isinstance(e.args[0], str) and \
++            e.args[0].startswith('maximum recursion depth exceeded')
++else:
++    def _is_recursionerror(e):
++        return True
+ 
+ if hasattr(sys, 'pypy_version_info'):
+     # cStringIO is slow on PyPy, StringIO is faster.  However: PyPy's own
+@@ -52,7 +62,10 @@ else:
+ from msgpack.exceptions import (
+     BufferFull,
+     OutOfData,
+-    ExtraData)
++    ExtraData,
++    FormatError,
++    StackError,
++)
+ 
+ from msgpack import ExtType
+ 
+@@ -109,7 +122,12 @@ def unpackb(packed, **kwargs):
+     """
+     Unpack an object from `packed`.
+ 
+-    Raises `ExtraData` when `packed` contains extra bytes.
++    Raises ``ExtraData`` when *packed* contains extra bytes.
++    Raises ``ValueError`` when *packed* is incomplete.
++    Raises ``FormatError`` when *packed* is not valid msgpack.
++    Raises ``StackError`` when *packed* contains too nested.
++    Other exceptions can be raised during unpacking.
++
+     See :class:`Unpacker` for options.
+     """
+     unpacker = Unpacker(None, **kwargs)
+@@ -117,7 +135,11 @@ def unpackb(packed, **kwargs):
+     try:
+         ret = unpacker._unpack()
+     except OutOfData:
+-        raise ValueError("Data is not enough.")
++        raise ValueError("Unpack failed: incomplete input")
++    except RecursionError as e:
++        if _is_recursionerror(e):
++            raise StackError
++        raise
+     if unpacker._got_extradata():
+         raise ExtraData(ret, unpacker._get_extradata())
+     return ret
+@@ -211,6 +233,12 @@ class Unpacker(object):
+             unpacker.feed(buf)
+             for o in unpacker:
+                 process(o)
++
++    Raises ``ExtraData`` when *packed* contains extra bytes.
++    Raises ``OutOfData`` when *packed* is incomplete.
++    Raises ``FormatError`` when *packed* is not valid msgpack.
++    Raises ``StackError`` when *packed* contains too nested.
++    Other exceptions can be raised during unpacking.
+     """
+ 
+     def __init__(self, file_like=None, read_size=0, use_list=True, raw=True,
+@@ -561,7 +589,7 @@ class Unpacker(object):
+                 raise ValueError("%s exceeds max_map_len(%s)", n, self._max_map_len)
+             typ = TYPE_MAP
+         else:
+-            raise ValueError("Unknown header: 0x%x" % b)
++            raise FormatError("Unknown header: 0x%x" % b)
+         return typ, n, obj
+ 
+     def _unpack(self, execute=EX_CONSTRUCT):
+@@ -637,6 +665,8 @@ class Unpacker(object):
+         except OutOfData:
+             self._consume()
+             raise StopIteration
++        except RecursionError:
++            raise StackError
+ 
+     next = __next__
+ 
+@@ -645,7 +675,10 @@ class Unpacker(object):
+         self._consume()
+ 
+     def unpack(self):
+-        ret = self._unpack(EX_CONSTRUCT)
++        try:
++            ret = self._unpack(EX_CONSTRUCT)
++        except RecursionError:
++            raise StackError
+         self._consume()
+         return ret
+ 
+diff --git a/msgpack/unpack_template.h b/msgpack/unpack_template.h
+index 525dea2..a78b7fa 100644
+--- a/msgpack/unpack_template.h
++++ b/msgpack/unpack_template.h
+@@ -123,7 +123,7 @@ static inline int unpack_execute(unpack_context* ctx, const char* data, Py_ssize
+     goto _fixed_trail_again
+ 
+ #define start_container(func, count_, ct_) \
+-    if(top >= MSGPACK_EMBED_STACK_SIZE) { goto _failed; } /* FIXME */ \
++    if(top >= MSGPACK_EMBED_STACK_SIZE) { ret = -3; goto _end; } \
+     if(construct_cb(func)(user, count_, &stack[top].obj) < 0) { goto _failed; } \
+     if((count_) == 0) { obj = stack[top].obj; \
+         if (construct_cb(func##_end)(user, &obj) < 0) { goto _failed; } \
+@@ -132,27 +132,6 @@ static inline int unpack_execute(unpack_context* ctx, const char* data, Py_ssize
+     stack[top].size  = count_; \
+     stack[top].count = 0; \
+     ++top; \
+-    /*printf("container %d count %d stack %d\n",stack[top].obj,count_,top);*/ \
+-    /*printf("stack push %d\n", top);*/ \
+-    /* FIXME \
+-    if(top >= stack_size) { \
+-        if(stack_size == MSGPACK_EMBED_STACK_SIZE) { \
+-            size_t csize = sizeof(unpack_stack) * MSGPACK_EMBED_STACK_SIZE; \
+-            size_t nsize = csize * 2; \
+-            unpack_stack* tmp = (unpack_stack*)malloc(nsize); \
+-            if(tmp == NULL) { goto _failed; } \
+-            memcpy(tmp, ctx->stack, csize); \
+-            ctx->stack = stack = tmp; \
+-            ctx->stack_size = stack_size = MSGPACK_EMBED_STACK_SIZE * 2; \
+-        } else { \
+-            size_t nsize = sizeof(unpack_stack) * ctx->stack_size * 2; \
+-            unpack_stack* tmp = (unpack_stack*)realloc(ctx->stack, nsize); \
+-            if(tmp == NULL) { goto _failed; } \
+-            ctx->stack = stack = tmp; \
+-            ctx->stack_size = stack_size = stack_size * 2; \
+-        } \
+-    } \
+-    */ \
+     goto _header_again
+ 
+ #define NEXT_CS(p)  ((unsigned int)*p & 0x1f)
+@@ -229,7 +208,8 @@ static inline int unpack_execute(unpack_context* ctx, const char* data, Py_ssize
+                 case 0xdf:  // map 32
+                     again_fixed_trail(NEXT_CS(p), 2 << (((unsigned int)*p) & 0x01));
+                 default:
+-                    goto _failed;
++                    ret = -2;
++                    goto _end;
+                 }
+             SWITCH_RANGE(0xa0, 0xbf)  // FixRaw
+                 again_fixed_trail_if_zero(ACS_RAW_VALUE, ((unsigned int)*p & 0x1f), _raw_zero);
+@@ -239,7 +219,8 @@ static inline int unpack_execute(unpack_context* ctx, const char* data, Py_ssize
+                 start_container(_map, ((unsigned int)*p) & 0x0f, CT_MAP_KEY);
+ 
+             SWITCH_RANGE_DEFAULT
+-                goto _failed;
++                ret = -2;
++                goto _end;
+             SWITCH_RANGE_END
+             // end CS_HEADER
+ 

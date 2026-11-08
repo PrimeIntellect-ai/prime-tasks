@@ -1,0 +1,438 @@
+diff --git a/amaranth/back/rtlil.py b/amaranth/back/rtlil.py
+index 1f934da..e046d15 100644
+--- a/amaranth/back/rtlil.py
++++ b/amaranth/back/rtlil.py
+@@ -106,21 +106,22 @@ class _Builder(_BufferedBuilder, _Namer):
+         super().__init__()
+         self.emit_src = emit_src
+ 
+-    def module(self, name=None, attrs={}):
++    def module(self, name=None, attrs={}, *, src=None):
+         name = self._make_name(name, local=False)
+-        return _ModuleBuilder(self, name, attrs)
++        return _ModuleBuilder(self, name, attrs, src=src)
+ 
+ 
+ class _ModuleBuilder(_AttrBuilder, _BufferedBuilder, _Namer):
+-    def __init__(self, rtlil, name, attrs):
++    def __init__(self, rtlil, name, attrs, *, src=None):
+         super().__init__(emit_src=rtlil.emit_src)
+         self.rtlil = rtlil
+         self.name  = name
++        self.src   = src
+         self.attrs = {"generator": "Amaranth"}
+         self.attrs.update(attrs)
+ 
+     def __enter__(self):
+-        self._attributes(self.attrs)
++        self._attributes(self.attrs, src=self.src)
+         self._append("module {}\n", self.name)
+         return self
+ 
+@@ -512,7 +513,7 @@ class ModuleEmitter:
+                 self.builder.cell(f"\\{dotted_name}", submodule.name[-1], ports={
+                     name: self.sigspec(value)
+                     for name, (value, _flow) in submodule.ports.items()
+-                })
++                }, src=_src(submodule.cell_src_loc))
+ 
+     def emit_assignment_list(self, cell_idx, cell):
+         def emit_assignments(case, cond):
+@@ -997,8 +998,10 @@ def convert_fragment(fragment, name="top", *, emit_src=True):
+     for module_idx, module in enumerate(netlist.modules):
+         if empty_checker.is_empty(module_idx):
+             continue
+-        attrs = {"top": 1} if module_idx == 0 else {}
+-        with builder.module(".".join(module.name), attrs=attrs) as module_builder:
++        attrs = {}
++        if module_idx == 0:
++            attrs["top"] = 1
++        with builder.module(".".join(module.name), attrs=attrs, src=_src(module.src_loc)) as module_builder:
+             ModuleEmitter(module_builder, netlist, module, name_map,
+                           empty_checker=empty_checker).emit()
+     return str(builder), name_map
+diff --git a/amaranth/hdl/_dsl.py b/amaranth/hdl/_dsl.py
+index 9629fe2..0201ea7 100644
+--- a/amaranth/hdl/_dsl.py
++++ b/amaranth/hdl/_dsl.py
+@@ -82,15 +82,18 @@ class _ModuleBuilderSubmodules:
+         object.__setattr__(self, "_builder", builder)
+ 
+     def __iadd__(self, modules):
++        src_loc = tracer.get_src_loc()
+         for module in flatten([modules]):
+-            self._builder._add_submodule(module)
++            self._builder._add_submodule(module, src_loc=src_loc)
+         return self
+ 
+     def __setattr__(self, name, submodule):
+-        self._builder._add_submodule(submodule, name)
++        src_loc = tracer.get_src_loc()
++        self._builder._add_submodule(submodule, name, src_loc=src_loc)
+ 
+-    def __setitem__(self, name, value):
+-        return self.__setattr__(name, value)
++    def __setitem__(self, name, submodule):
++        src_loc = tracer.get_src_loc()
++        self._builder._add_submodule(submodule, name, src_loc=src_loc)
+ 
+     def __getattr__(self, name):
+         return self._builder._get_submodule(name)
+@@ -175,6 +178,7 @@ class Module(_ModuleBuilderRoot, Elaboratable):
+         self._anon_submodules  = []
+         self._domains      = {}
+         self._generated    = {}
++        self._src_loc      = tracer.get_src_loc()
+ 
+     def _check_context(self, construct, context):
+         if self._ctrl_context != context:
+@@ -546,20 +550,21 @@ class Module(_ModuleBuilderRoot, Elaboratable):
+ 
+             self._statements.setdefault(domain, []).append(stmt)
+ 
+-    def _add_submodule(self, submodule, name=None):
++    def _add_submodule(self, submodule, name=None, src_loc=None):
+         if not hasattr(submodule, "elaborate"):
+             raise TypeError("Trying to add {!r}, which does not implement .elaborate(), as "
+                             "a submodule".format(submodule))
+         if name == None:
+-            self._anon_submodules.append(submodule)
++            self._anon_submodules.append((submodule, src_loc))
+         else:
+             if name in self._named_submodules:
+                 raise NameError(f"Submodule named '{name}' already exists")
+-            self._named_submodules[name] = submodule
++            self._named_submodules[name] = (submodule, src_loc)
+ 
+     def _get_submodule(self, name):
+         if name in self._named_submodules:
+-            return self._named_submodules[name]
++            submodule, _src_loc = self._named_submodules[name]
++            return submodule
+         else:
+             raise AttributeError(f"No submodule named '{name}' exists")
+ 
+@@ -575,11 +580,11 @@ class Module(_ModuleBuilderRoot, Elaboratable):
+     def elaborate(self, platform):
+         self._flush()
+ 
+-        fragment = Fragment()
+-        for name in self._named_submodules:
+-            fragment.add_subfragment(Fragment.get(self._named_submodules[name], platform), name)
+-        for submodule in self._anon_submodules:
+-            fragment.add_subfragment(Fragment.get(submodule, platform), None)
++        fragment = Fragment(src_loc=self._src_loc)
++        for name, (submodule, src_loc) in self._named_submodules.items():
++            fragment.add_subfragment(Fragment.get(submodule, platform), name, src_loc=src_loc)
++        for submodule, src_loc in self._anon_submodules:
++            fragment.add_subfragment(Fragment.get(submodule, platform), None, src_loc=src_loc)
+         for domain, statements in self._statements.items():
+             fragment.add_statements(domain, statements)
+         for signal, domain in self._driving.items():
+diff --git a/amaranth/hdl/_ir.py b/amaranth/hdl/_ir.py
+index f68a3ad..8575e89 100644
+--- a/amaranth/hdl/_ir.py
++++ b/amaranth/hdl/_ir.py
+@@ -60,7 +60,7 @@ class Fragment:
+                     lineno=code.co_firstlineno)
+             obj = new_obj
+ 
+-    def __init__(self):
++    def __init__(self, *, src_loc=None):
+         self.ports = _ast.SignalDict()
+         self.drivers = OrderedDict()
+         self.statements = {}
+@@ -69,6 +69,7 @@ class Fragment:
+         self.attrs = OrderedDict()
+         self.generated = OrderedDict()
+         self.flatten = False
++        self.src_loc = src_loc
+ 
+     def add_ports(self, *ports, dir):
+         assert dir in ("i", "o", "io")
+@@ -132,18 +133,18 @@ class Fragment:
+             stmt._MustUse__used = True
+             self.statements.setdefault(domain, _ast._StatementList()).append(stmt)
+ 
+-    def add_subfragment(self, subfragment, name=None):
++    def add_subfragment(self, subfragment, name=None, *, src_loc=None):
+         assert isinstance(subfragment, Fragment)
+-        self.subfragments.append((subfragment, name))
++        self.subfragments.append((subfragment, name, src_loc))
+ 
+     def find_subfragment(self, name_or_index):
+         if isinstance(name_or_index, int):
+             if name_or_index < len(self.subfragments):
+-                subfragment, name = self.subfragments[name_or_index]
++                subfragment, name, src_loc = self.subfragments[name_or_index]
+                 return subfragment
+             raise NameError(f"No subfragment at index #{name_or_index}")
+         else:
+-            for subfragment, name in self.subfragments:
++            for subfragment, name, src_loc in self.subfragments:
+                 if name == name_or_index:
+                     return subfragment
+             raise NameError(f"No subfragment with name '{name_or_index}'")
+@@ -172,7 +173,7 @@ class Fragment:
+ 
+         # Remove the merged subfragment.
+         found = False
+-        for i, (check_subfrag, check_name) in enumerate(self.subfragments): # :nobr:
++        for i, (check_subfrag, check_name, check_src_loc) in enumerate(self.subfragments): # :nobr:
+             if subfragment == check_subfrag:
+                 del self.subfragments[i]
+                 found = True
+@@ -204,7 +205,7 @@ class Fragment:
+             add_subfrag(driver_subfrags, signal, (None, hierarchy))
+ 
+         flatten_subfrags = set()
+-        for i, (subfrag, name) in enumerate(self.subfragments):
++        for i, (subfrag, name, src_loc) in enumerate(self.subfragments):
+             if name is None:
+                 name = f"<unnamed #{i}>"
+             subfrag_hierarchy = hierarchy + (name,)
+@@ -270,7 +271,7 @@ class Fragment:
+         domain_subfrags = defaultdict(set)
+ 
+         # For each domain defined by a subfragment, determine which subfragments define it.
+-        for i, (subfrag, name) in enumerate(self.subfragments):
++        for i, (subfrag, name, src_loc) in enumerate(self.subfragments):
+             # First, recurse into subfragments and let them propagate domains up as well.
+             hier_name = name
+             if hier_name is None:
+@@ -281,7 +282,7 @@ class Fragment:
+             for domain_name, domain in subfrag.domains.items():
+                 if domain.local:
+                     continue
+-                domain_subfrags[domain_name].add((subfrag, name, i))
++                domain_subfrags[domain_name].add((subfrag, name, src_loc, i))
+ 
+         # For each domain defined by more than one subfragment, rename the domain in each
+         # of the subfragments such that they no longer conflict.
+@@ -289,29 +290,29 @@ class Fragment:
+             if len(subfrags) == 1:
+                 continue
+ 
+-            names = [n for f, n, i in subfrags]
++            names = [n for f, n, s, i in subfrags]
+             if not all(names):
+                 names = sorted(f"<unnamed #{i}>" if n is None else f"'{n}'"
+-                               for f, n, i in subfrags)
++                               for f, n, s, i in subfrags)
+                 raise _cd.DomainError(
+                     "Domain '{}' is defined by subfragments {} of fragment '{}'; it is necessary "
+                     "to either rename subfragment domains explicitly, or give names to subfragments"
+                     .format(domain_name, ", ".join(names), ".".join(hierarchy)))
+ 
+             if len(names) != len(set(names)):
+-                names = sorted(f"#{i}" for f, n, i in subfrags)
++                names = sorted(f"#{i}" for f, n, s, i in subfrags)
+                 raise _cd.DomainError(
+                     "Domain '{}' is defined by subfragments {} of fragment '{}', some of which "
+                     "have identical names; it is necessary to either rename subfragment domains "
+                     "explicitly, or give distinct names to subfragments"
+                     .format(domain_name, ", ".join(names), ".".join(hierarchy)))
+ 
+-            for subfrag, name, i in subfrags:
++            for subfrag, name, src_loc, i in subfrags:
+                 domain_name_map = {domain_name: f"{name}_{domain_name}"}
+-                self.subfragments[i] = (DomainRenamer(domain_name_map)(subfrag), name)
++                self.subfragments[i] = (DomainRenamer(domain_name_map)(subfrag), name, src_loc)
+ 
+         # Finally, collect the (now unique) subfragment domains, and merge them into our domains.
+-        for subfrag, name in self.subfragments:
++        for subfrag, name, src_loc in self.subfragments:
+             for domain_name, domain in subfrag.domains.items():
+                 if domain.local:
+                     continue
+@@ -319,7 +320,7 @@ class Fragment:
+ 
+     def _propagate_domains_down(self):
+         # For each domain defined in this fragment, ensure it also exists in all subfragments.
+-        for subfrag, name in self.subfragments:
++        for subfrag, name, src_loc in self.subfragments:
+             for domain in self.iter_domains():
+                 if domain in subfrag.domains:
+                     assert self.domains[domain] is subfrag.domains[domain]
+@@ -403,7 +404,7 @@ class Fragment:
+                 add_uses(cd.rst)
+ 
+         # Repeat for subfragments.
+-        for subfrag, name in self.subfragments:
++        for subfrag, name, src_loc in self.subfragments:
+             if isinstance(subfrag, Instance):
+                 for port_name, (value, dir) in subfrag.named_ports.items():
+                     if dir == "i":
+@@ -627,7 +628,7 @@ class Fragment:
+         _names[self] = hierarchy
+ 
+         signal_names = set(self._assign_names_to_signals().values())
+-        for subfragment_index, (subfragment, subfragment_name) in enumerate(self.subfragments):
++        for subfragment_index, (subfragment, subfragment_name, subfragment_src_loc) in enumerate(self.subfragments):
+             if subfragment_name is None:
+                 subfragment_name = f"U${subfragment_index}"
+             elif subfragment_name in signal_names:
+@@ -641,12 +642,11 @@ class Fragment:
+ 
+ class Instance(Fragment):
+     def __init__(self, type, *args, src_loc=None, src_loc_at=0, **kwargs):
+-        super().__init__()
++        super().__init__(src_loc=src_loc or tracer.get_src_loc(src_loc_at))
+ 
+         self.type        = type
+         self.parameters  = OrderedDict()
+         self.named_ports = OrderedDict()
+-        self.src_loc     = src_loc or tracer.get_src_loc(src_loc_at)
+ 
+         for (kind, name, value) in args:
+             if kind == "a":
+@@ -1064,7 +1064,7 @@ class NetlistEmitter:
+             init=fragment._init,
+             name=name,
+             attributes=fragment._attrs,
+-            src_loc=fragment._src_loc,
++            src_loc=fragment.src_loc,
+         )
+         return self.netlist.add_cell(cell)
+ 
+@@ -1205,7 +1205,7 @@ class NetlistEmitter:
+                 if net.is_late and net not in self.netlist.connections:
+                     self.netlist.connections[net] = _nir.Net.from_const((signal.init >> bit) & 1)
+ 
+-    def emit_fragment(self, fragment: _ir.Fragment, parent_module_idx: 'int | None'):
++    def emit_fragment(self, fragment: _ir.Fragment, parent_module_idx: 'int | None', *, cell_src_loc=None):
+         from . import _mem
+ 
+         fragment_name = self.fragment_names[fragment]
+@@ -1224,7 +1224,7 @@ class NetlistEmitter:
+             for port in fragment._read_ports:
+                 self.emit_read_port(parent_module_idx, fragment, port, memory, write_ports)
+         elif type(fragment) is _ir.Fragment:
+-            module_idx = self.netlist.add_module(parent_module_idx, fragment_name)
++            module_idx = self.netlist.add_module(parent_module_idx, fragment_name, src_loc=fragment.src_loc, cell_src_loc=cell_src_loc)
+             signal_names = fragment._assign_names_to_signals()
+             self.netlist.modules[module_idx].signal_names = signal_names
+             if parent_module_idx is None:
+@@ -1234,8 +1234,8 @@ class NetlistEmitter:
+             for domain, stmts in fragment.statements.items():
+                 for stmt in stmts:
+                     self.emit_stmt(module_idx, fragment, domain, stmt, _nir.Net.from_const(1))
+-            for subfragment, _name in fragment.subfragments:
+-                self.emit_fragment(subfragment, module_idx)
++            for subfragment, _name, sub_src_loc in fragment.subfragments:
++                self.emit_fragment(subfragment, module_idx, cell_src_loc=sub_src_loc)
+             if parent_module_idx is None:
+                 self.emit_drivers()
+         else:
+diff --git a/amaranth/hdl/_mem.py b/amaranth/hdl/_mem.py
+index 8be78fe..b8bca04 100644
+--- a/amaranth/hdl/_mem.py
++++ b/amaranth/hdl/_mem.py
+@@ -65,7 +65,7 @@ class MemoryInstance(Fragment):
+ 
+ 
+     def __init__(self, *, identity, width, depth, init=None, attrs=None, src_loc=None):
+-        super().__init__()
++        super().__init__(src_loc=src_loc)
+         assert isinstance(identity, MemoryIdentity)
+         self._identity = identity
+         self._width = operator.index(width)
+@@ -76,7 +76,6 @@ class MemoryInstance(Fragment):
+         for x in self._init:
+             assert isinstance(x, int)
+         self._attrs = attrs or {}
+-        self._src_loc = src_loc
+         self._read_ports = []
+         self._write_ports = []
+ 
+diff --git a/amaranth/hdl/_nir.py b/amaranth/hdl/_nir.py
+index 7ca4140..f81fa2f 100644
+--- a/amaranth/hdl/_nir.py
++++ b/amaranth/hdl/_nir.py
+@@ -211,9 +211,9 @@ class Netlist:
+             result.append(f"(cell {cell_idx} {cell.module_idx} {cell!r})")
+         return "\n".join(result)
+ 
+-    def add_module(self, parent, name: str):
++    def add_module(self, parent, name: str, *, src_loc=None, cell_src_loc=None):
+         module_idx = len(self.modules)
+-        self.modules.append(Module(parent, name))
++        self.modules.append(Module(parent, name, src_loc=src_loc, cell_src_loc=cell_src_loc))
+         if module_idx == 0:
+             self.modules[0].cells.append(0)
+         if parent is not None:
+@@ -276,15 +276,18 @@ class Module:
+ 
+     parent: index of parent module, or ``None`` for top module
+     name: a tuple of str, hierarchical name of this module (top has empty tuple)
++    src_loc: str
+     submodules: a list of nested module indices
+     signal_names: a SignalDict from Signal to str, signal names visible in this module
+     net_flow: a dict from Net to NetFlow, describes how a net is used within this module
+     ports: a dict from port name to (Value, NetFlow) pair
+     cells: a list of cell indices that belong to this module
+     """
+-    def __init__(self, parent, name):
++    def __init__(self, parent, name, *, src_loc, cell_src_loc):
+         self.parent = parent
+         self.name = name
++        self.src_loc = src_loc
++        self.cell_src_loc = cell_src_loc
+         self.submodules = []
+         self.signal_names = SignalDict()
+         self.net_flow = {}
+diff --git a/amaranth/hdl/_xfrm.py b/amaranth/hdl/_xfrm.py
+index 1356f35..e3050e4 100644
+--- a/amaranth/hdl/_xfrm.py
++++ b/amaranth/hdl/_xfrm.py
+@@ -206,8 +206,8 @@ class StatementTransformer(StatementVisitor):
+ 
+ class FragmentTransformer:
+     def map_subfragments(self, fragment, new_fragment):
+-        for subfragment, name in fragment.subfragments:
+-            new_fragment.add_subfragment(self(subfragment), name)
++        for subfragment, name, src_loc in fragment.subfragments:
++            new_fragment.add_subfragment(self(subfragment), name, src_loc=src_loc)
+ 
+     def map_ports(self, fragment, new_fragment):
+         for port, dir in fragment.ports.items():
+@@ -255,7 +255,7 @@ class FragmentTransformer:
+                 depth=fragment._depth,
+                 init=fragment._init,
+                 attrs=fragment._attrs,
+-                src_loc=fragment._src_loc
++                src_loc=fragment.src_loc
+             )
+             new_fragment._read_ports = [
+                 MemoryInstance._ReadPort(
+@@ -282,7 +282,7 @@ class FragmentTransformer:
+             new_fragment.parameters = OrderedDict(fragment.parameters)
+             self.map_named_ports(fragment, new_fragment)
+         else:
+-            new_fragment = Fragment()
++            new_fragment = Fragment(src_loc=fragment.src_loc)
+             new_fragment.flatten = fragment.flatten
+         new_fragment.attrs = OrderedDict(fragment.attrs)
+         self.map_ports(fragment, new_fragment)
+@@ -417,7 +417,7 @@ class DomainCollector(ValueVisitor, StatementVisitor):
+         for domain_name, statements in fragment.statements.items():
+             self._add_used_domain(domain_name)
+             self.on_statements(statements)
+-        for subfragment, name in fragment.subfragments:
++        for subfragment, name, src_loc in fragment.subfragments:
+             self.on_fragment(subfragment)
+ 
+         self._local_domains = old_local_domains
+diff --git a/amaranth/sim/_pyrtl.py b/amaranth/sim/_pyrtl.py
+index 2665bf0..d9d11fc 100644
+--- a/amaranth/sim/_pyrtl.py
++++ b/amaranth/sim/_pyrtl.py
+@@ -535,7 +535,7 @@ class _FragmentCompiler:
+ 
+             processes.add(domain_process)
+ 
+-        for subfragment_index, (subfragment, subfragment_name) in enumerate(fragment.subfragments):
++        for subfragment_index, (subfragment, subfragment_name, _src_loc) in enumerate(fragment.subfragments):
+             if subfragment_name is None:
+                 subfragment_name = f"U${subfragment_index}"
+             processes.update(self(subfragment))

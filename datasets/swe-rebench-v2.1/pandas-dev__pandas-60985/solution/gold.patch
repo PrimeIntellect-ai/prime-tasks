@@ -1,0 +1,424 @@
+diff --git a/doc/source/whatsnew/v2.3.0.rst b/doc/source/whatsnew/v2.3.0.rst
+index 230332319e..ac74e6a8e5 100644
+--- a/doc/source/whatsnew/v2.3.0.rst
++++ b/doc/source/whatsnew/v2.3.0.rst
+@@ -119,6 +119,7 @@ Conversion
+ 
+ Strings
+ ^^^^^^^
++- Bug in :meth:`.DataFrameGroupBy.min`, :meth:`.DataFrameGroupBy.max`, :meth:`.Resampler.min`, :meth:`.Resampler.max` on string input of all NA values would return float dtype; now returns string (:issue:`60810`)
+ - Bug in :meth:`DataFrame.sum` with ``axis=1``, :meth:`.DataFrameGroupBy.sum` or :meth:`.SeriesGroupBy.sum` with ``skipna=True``, and :meth:`.Resampler.sum` on :class:`StringDtype` with all NA values resulted in ``0`` and is now the empty string ``""`` (:issue:`60229`)
+ - Bug in :meth:`Series.__pos__` and :meth:`DataFrame.__pos__` did not raise for :class:`StringDtype` with ``storage="pyarrow"`` (:issue:`60710`)
+ - Bug in :meth:`Series.rank` for :class:`StringDtype` with ``storage="pyarrow"`` incorrectly returning integer results in case of ``method="average"`` and raising an error if it would truncate results (:issue:`59768`)
+diff --git a/doc/source/whatsnew/v3.0.0.rst b/doc/source/whatsnew/v3.0.0.rst
+index 2d74be6f50..b03b230517 100644
+--- a/doc/source/whatsnew/v3.0.0.rst
++++ b/doc/source/whatsnew/v3.0.0.rst
+@@ -769,6 +769,7 @@ Plotting
+ - Bug in :meth:`DataFrame.plot.bar` with ``stacked=True`` where labels on stacked bars with zero-height segments were incorrectly positioned at the base instead of the label position of the previous segment (:issue:`59429`)
+ - Bug in :meth:`DataFrame.plot.line` raising ``ValueError`` when set both color and a ``dict`` style (:issue:`59461`)
+ - Bug in :meth:`DataFrame.plot` that causes a shift to the right when the frequency multiplier is greater than one. (:issue:`57587`)
++- Bug in :meth:`Series.plot` preventing a line and bar from being aligned on the same plot (:issue:`61161`)
+ - Bug in :meth:`Series.plot` preventing a line and scatter plot from being aligned (:issue:`61005`)
+ - Bug in :meth:`Series.plot` with ``kind="pie"`` with :class:`ArrowDtype` (:issue:`59192`)
+ 
+diff --git a/pandas/core/groupby/groupby.py b/pandas/core/groupby/groupby.py
+index 7d58d8f867..f74c20eaa0 100644
+--- a/pandas/core/groupby/groupby.py
++++ b/pandas/core/groupby/groupby.py
+@@ -81,6 +81,7 @@ from pandas.core.dtypes.common import (
+     is_numeric_dtype,
+     is_object_dtype,
+     is_scalar,
++    is_string_dtype,
+     needs_i8_conversion,
+     pandas_dtype,
+ )
+@@ -1724,8 +1725,13 @@ class GroupBy(BaseGroupBy[NDFrameT]):
+             # preserve the kind of exception that raised
+             raise type(err)(msg) from err
+ 
+-        if ser.dtype == object:
++        dtype = ser.dtype
++        if dtype == object:
+             res_values = res_values.astype(object, copy=False)
++        elif is_string_dtype(dtype):
++            # mypy doesn't infer dtype is an ExtensionDtype
++            string_array_cls = dtype.construct_array_type()  # type: ignore[union-attr]
++            res_values = string_array_cls._from_sequence(res_values, dtype=dtype)
+ 
+         # If we are DataFrameGroupBy and went through a SeriesGroupByPath
+         # then we need to reshape
+diff --git a/pandas/io/excel/_base.py b/pandas/io/excel/_base.py
+index ebcafce8f4..1dc6c1f08b 100644
+--- a/pandas/io/excel/_base.py
++++ b/pandas/io/excel/_base.py
+@@ -89,7 +89,7 @@ if TYPE_CHECKING:
+     )
+ _read_excel_doc = (
+     """
+-Read an Excel file into a ``pandas`` ``DataFrame``.
++Read an Excel file into a ``DataFrame``.
+ 
+ Supports `xls`, `xlsx`, `xlsm`, `xlsb`, `odf`, `ods` and `odt` file extensions
+ read from a local filesystem or URL. Supports an option to read
+diff --git a/pandas/io/pytables.py b/pandas/io/pytables.py
+index b83b5aba3c..c58b4a4be6 100644
+--- a/pandas/io/pytables.py
++++ b/pandas/io/pytables.py
+@@ -39,6 +39,7 @@ from pandas._libs import (
+ )
+ from pandas._libs.lib import is_string_array
+ from pandas._libs.tslibs import timezones
++from pandas.compat import HAS_PYARROW
+ from pandas.compat._optional import import_optional_dependency
+ from pandas.compat.pickle_compat import patch_pickle
+ from pandas.errors import (
+@@ -381,6 +382,13 @@ def read_hdf(
+     DataFrame.to_hdf : Write a HDF file from a DataFrame.
+     HDFStore : Low-level access to HDF files.
+ 
++    Notes
++    -----
++    When ``errors="surrogatepass"``, ``pd.options.future.infer_string`` is true,
++    and PyArrow is installed, if a UTF-16 surrogate is encountered when decoding
++    to UTF-8, the resulting dtype will be
++    ``pd.StringDtype(storage="python", na_value=np.nan)``.
++
+     Examples
+     --------
+     >>> df = pd.DataFrame([[1, 1.0, "a"]], columns=["x", "y", "z"])  # doctest: +SKIP
+@@ -2257,6 +2265,20 @@ class IndexCol:
+         # making an Index instance could throw a number of different errors
+         try:
+             new_pd_index = factory(values, **kwargs)
++        except UnicodeEncodeError as err:
++            if (
++                errors == "surrogatepass"
++                and get_option("future.infer_string")
++                and str(err).endswith("surrogates not allowed")
++                and HAS_PYARROW
++            ):
++                new_pd_index = factory(
++                    values,
++                    dtype=StringDtype(storage="python", na_value=np.nan),
++                    **kwargs,
++                )
++            else:
++                raise
+         except ValueError:
+             # if the output freq is different that what we recorded,
+             # it should be None (see also 'doc example part 2')
+@@ -3170,12 +3192,29 @@ class GenericFixed(Fixed):
+                 **kwargs,
+             )
+         else:
+-            index = factory(
+-                _unconvert_index(
+-                    data, kind, encoding=self.encoding, errors=self.errors
+-                ),
+-                **kwargs,
+-            )
++            try:
++                index = factory(
++                    _unconvert_index(
++                        data, kind, encoding=self.encoding, errors=self.errors
++                    ),
++                    **kwargs,
++                )
++            except UnicodeEncodeError as err:
++                if (
++                    self.errors == "surrogatepass"
++                    and get_option("future.infer_string")
++                    and str(err).endswith("surrogates not allowed")
++                    and HAS_PYARROW
++                ):
++                    index = factory(
++                        _unconvert_index(
++                            data, kind, encoding=self.encoding, errors=self.errors
++                        ),
++                        dtype=StringDtype(storage="python", na_value=np.nan),
++                        **kwargs,
++                    )
++                else:
++                    raise
+ 
+         index.name = name
+ 
+@@ -3311,13 +3350,24 @@ class SeriesFixed(GenericFixed):
+         self.validate_read(columns, where)
+         index = self.read_index("index", start=start, stop=stop)
+         values = self.read_array("values", start=start, stop=stop)
+-        result = Series(values, index=index, name=self.name, copy=False)
+-        if (
+-            using_string_dtype()
+-            and isinstance(values, np.ndarray)
+-            and is_string_array(values, skipna=True)
+-        ):
+-            result = result.astype(StringDtype(na_value=np.nan))
++        try:
++            result = Series(values, index=index, name=self.name, copy=False)
++        except UnicodeEncodeError as err:
++            if (
++                self.errors == "surrogatepass"
++                and get_option("future.infer_string")
++                and str(err).endswith("surrogates not allowed")
++                and HAS_PYARROW
++            ):
++                result = Series(
++                    values,
++                    index=index,
++                    name=self.name,
++                    copy=False,
++                    dtype=StringDtype(storage="python", na_value=np.nan),
++                )
++            else:
++                raise
+         return result
+ 
+     def write(self, obj, **kwargs) -> None:
+@@ -4764,7 +4814,24 @@ class AppendableFrameTable(AppendableTable):
+                 values = values.reshape((1, values.shape[0]))
+ 
+             if isinstance(values, (np.ndarray, DatetimeArray)):
+-                df = DataFrame(values.T, columns=cols_, index=index_, copy=False)
++                try:
++                    df = DataFrame(values.T, columns=cols_, index=index_, copy=False)
++                except UnicodeEncodeError as err:
++                    if (
++                        self.errors == "surrogatepass"
++                        and get_option("future.infer_string")
++                        and str(err).endswith("surrogates not allowed")
++                        and HAS_PYARROW
++                    ):
++                        df = DataFrame(
++                            values.T,
++                            columns=cols_,
++                            index=index_,
++                            copy=False,
++                            dtype=StringDtype(storage="python", na_value=np.nan),
++                        )
++                    else:
++                        raise
+             elif isinstance(values, Index):
+                 df = DataFrame(values, columns=cols_, index=index_)
+             else:
+@@ -4774,23 +4841,10 @@ class AppendableFrameTable(AppendableTable):
+                 assert (df.dtypes == values.dtype).all(), (df.dtypes, values.dtype)
+ 
+             # If str / string dtype is stored in meta, use that.
+-            converted = False
+             for column in cols_:
+                 dtype = getattr(self.table.attrs, f"{column}_meta", None)
+                 if dtype in ["str", "string"]:
+                     df[column] = df[column].astype(dtype)
+-                    converted = True
+-            # Otherwise try inference.
+-            if (
+-                not converted
+-                and using_string_dtype()
+-                and isinstance(values, np.ndarray)
+-                and is_string_array(
+-                    values,
+-                    skipna=True,
+-                )
+-            ):
+-                df = df.astype(StringDtype(na_value=np.nan))
+             frames.append(df)
+ 
+         if len(frames) == 1:
+@@ -5224,7 +5278,7 @@ def _convert_string_array(data: np.ndarray, encoding: str, errors: str) -> np.nd
+     # encode if needed
+     if len(data):
+         data = (
+-            Series(data.ravel(), copy=False)
++            Series(data.ravel(), copy=False, dtype="object")
+             .str.encode(encoding, errors)
+             ._values.reshape(data.shape)
+         )
+@@ -5264,7 +5318,9 @@ def _unconvert_string_array(
+         dtype = f"U{itemsize}"
+ 
+         if isinstance(data[0], bytes):
+-            ser = Series(data, copy=False).str.decode(encoding, errors=errors)
++            ser = Series(data, copy=False).str.decode(
++                encoding, errors=errors, dtype="object"
++            )
+             data = ser.to_numpy()
+             data.flags.writeable = True
+         else:
+diff --git a/pandas/plotting/_matplotlib/converter.py b/pandas/plotting/_matplotlib/converter.py
+index 4c00049075..774062e0f0 100644
+--- a/pandas/plotting/_matplotlib/converter.py
++++ b/pandas/plotting/_matplotlib/converter.py
+@@ -225,16 +225,20 @@ class TimeFormatter(mpl.ticker.Formatter):  # pyright: ignore[reportAttributeAcc
+ class PeriodConverter(mdates.DateConverter):
+     @staticmethod
+     def convert(values, units, axis):
++        if not hasattr(axis, "freq"):
++            raise TypeError("Axis must have `freq` set to convert to Periods")
++        return PeriodConverter.convert_from_freq(values, axis.freq)
++
++    @staticmethod
++    def convert_from_freq(values, freq):
+         if is_nested_list_like(values):
+-            values = [PeriodConverter._convert_1d(v, units, axis) for v in values]
++            values = [PeriodConverter._convert_1d(v, freq) for v in values]
+         else:
+-            values = PeriodConverter._convert_1d(values, units, axis)
++            values = PeriodConverter._convert_1d(values, freq)
+         return values
+ 
+     @staticmethod
+-    def _convert_1d(values, units, axis):
+-        if not hasattr(axis, "freq"):
+-            raise TypeError("Axis must have `freq` set to convert to Periods")
++    def _convert_1d(values, freq):
+         valid_types = (str, datetime, Period, pydt.date, pydt.time, np.datetime64)
+         with warnings.catch_warnings():
+             warnings.filterwarnings(
+@@ -248,17 +252,17 @@ class PeriodConverter(mdates.DateConverter):
+                 or is_integer(values)
+                 or is_float(values)
+             ):
+-                return get_datevalue(values, axis.freq)
++                return get_datevalue(values, freq)
+             elif isinstance(values, PeriodIndex):
+-                return values.asfreq(axis.freq).asi8
++                return values.asfreq(freq).asi8
+             elif isinstance(values, Index):
+-                return values.map(lambda x: get_datevalue(x, axis.freq))
++                return values.map(lambda x: get_datevalue(x, freq))
+             elif lib.infer_dtype(values, skipna=False) == "period":
+                 # https://github.com/pandas-dev/pandas/issues/24304
+                 # convert ndarray[period] -> PeriodIndex
+-                return PeriodIndex(values, freq=axis.freq).asi8
++                return PeriodIndex(values, freq=freq).asi8
+             elif isinstance(values, (list, tuple, np.ndarray, Index)):
+-                return [get_datevalue(x, axis.freq) for x in values]
++                return [get_datevalue(x, freq) for x in values]
+         return values
+ 
+ 
+diff --git a/pandas/plotting/_matplotlib/core.py b/pandas/plotting/_matplotlib/core.py
+index 24aa848de1..2cf90a06cd 100644
+--- a/pandas/plotting/_matplotlib/core.py
++++ b/pandas/plotting/_matplotlib/core.py
+@@ -59,7 +59,10 @@ from pandas.util.version import Version
+ 
+ from pandas.io.formats.printing import pprint_thing
+ from pandas.plotting._matplotlib import tools
+-from pandas.plotting._matplotlib.converter import register_pandas_matplotlib_converters
++from pandas.plotting._matplotlib.converter import (
++    PeriodConverter,
++    register_pandas_matplotlib_converters,
++)
+ from pandas.plotting._matplotlib.groupby import reconstruct_data_with_by
+ from pandas.plotting._matplotlib.misc import unpack_single_str_list
+ from pandas.plotting._matplotlib.style import get_standard_colors
+@@ -1858,7 +1861,6 @@ class BarPlot(MPLPlot):
+         self.bar_width = width
+         self._align = align
+         self._position = position
+-        self.tick_pos = np.arange(len(data))
+ 
+         if is_list_like(bottom):
+             bottom = np.array(bottom)
+@@ -1871,6 +1873,16 @@ class BarPlot(MPLPlot):
+ 
+         MPLPlot.__init__(self, data, **kwargs)
+ 
++        if self._is_ts_plot():
++            self.tick_pos = np.array(
++                PeriodConverter.convert_from_freq(
++                    self._get_xticks(),
++                    data.index.freq,
++                )
++            )
++        else:
++            self.tick_pos = np.arange(len(data))
++
+     @cache_readonly
+     def ax_pos(self) -> np.ndarray:
+         return self.tick_pos - self.tickoffset
+@@ -1900,6 +1912,7 @@ class BarPlot(MPLPlot):
+ 
+     # error: Signature of "_plot" incompatible with supertype "MPLPlot"
+     @classmethod
++    @register_pandas_matplotlib_converters
+     def _plot(  # type: ignore[override]
+         cls,
+         ax: Axes,
+diff --git a/web/pandas/community/benchmarks.md b/web/pandas/community/benchmarks.md
+index 5a8198a979..ddfcbd57d3 100644
+--- a/web/pandas/community/benchmarks.md
++++ b/web/pandas/community/benchmarks.md
+@@ -11,7 +11,7 @@ kinds of benchmarks relevant to pandas:
+ 
+ pandas benchmarks are implemented in the [asv_bench](https://github.com/pandas-dev/pandas/tree/main/asv_bench)
+ directory of our repository. The benchmarks are implemented for the
+-[airspeed velocity](https://asv.readthedocs.io/en/v0.6.1/) (asv for short) framework.
++[airspeed velocity](https://asv.readthedocs.io/en/latest/) (asv for short) framework.
+ 
+ The benchmarks can be run locally by any pandas developer. This can be done
+ with the `asv run` command, and it can be useful to detect if local changes have
+@@ -22,53 +22,15 @@ More information on running the performance test suite is found
+ Note that benchmarks are not deterministic, and running in different hardware or
+ running in the same hardware with different levels of stress have a big impact in
+ the result. Even running the benchmarks with identical hardware and almost identical
+-conditions produces significant differences when running the same exact code.
++conditions can produce significant differences when running the same exact code.
+ 
+-## pandas benchmarks servers
++## Automated benchmark runner
+ 
+-We currently have two physical servers running the benchmarks of pandas for every
+-(or almost every) commit to the `main` branch. The servers run independently from
+-each other. The original server has been running for a long time, and it is physically
+-located with one of the pandas maintainers. The newer server is in a datacenter
+-kindly sponsored by [OVHCloud](https://www.ovhcloud.com/). More information about
+-pandas sponsors, and how your company can support the development of pandas is
+-available at the [pandas sponsors]({{ base_url }}about/sponsors.html) page.
++The [asv-runner](https://github.com/pandas-dev/asv-runner/) repository automatically runs the pandas asv benchmark suite
++for every (or almost every) commit to the `main` branch. It is run on GitHub actions.
++See the linked repository for more details. The results are available at:
+ 
+-Results of the benchmarks are available at:
+-
+-- GitHub Actions results: [asv](https://pandas-dev.github.io/asv-runner/)
+-- OVH server: [asv](https://pandas.pydata.org/benchmarks/asv/)
+-
+-### Original server configuration
+-
+-The machine can be configured with the Ansible playbook in
+-[tomaugspurger/asv-runner](https://github.com/tomaugspurger/asv-runner).
+-The results are published to another GitHub repository,
+-[tomaugspurger/asv-collection](https://github.com/tomaugspurger/asv-collection).
+-
+-The benchmarks are scheduled by [Airflow](https://airflow.apache.org/).
+-It has a dashboard for viewing and debugging the results.
+-You’ll need to setup an SSH tunnel to view them:
+-
+-```
+-ssh -L 8080:localhost:8080 pandas@panda.likescandy.com
+-```
+-
+-### OVH server configuration
+-
+-The server used to run the benchmarks has been configured to reduce system
+-noise and maximize the stability of the benchmarks times.
+-
+-The details on how the server is configured can be found in the
+-[pandas-benchmarks repository](https://github.com/pandas-dev/pandas-benchmarks).
+-There is a quick summary here:
+-
+-- CPU isolation: Avoid user space tasks to execute in the same CPU as benchmarks, possibly interrupting them during the execution (include all virtual CPUs using a physical core)
+-- NoHZ: Stop the kernel tick that enables context switching in the isolated CPU
+-- IRQ affinity: Ban benchmarks CPU to avoid many (but not all) kernel interruption in the isolated CPU
+-- TurboBoost: Disable CPU scaling based on high CPU demand
+-- P-States: Use "performance" governor to disable P-States and CPU frequency changes based on them
+-- C-States: Set C-State to 0 and disable changes to avoid slower CPU after system inactivity
++https://pandas-dev.github.io/asv-runner/
+ 
+ ## Community benchmarks
+ 

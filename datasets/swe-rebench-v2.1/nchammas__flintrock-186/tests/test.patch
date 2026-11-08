@@ -1,0 +1,207 @@
+diff --git a/tests/test_ec2.py b/tests/test_ec2.py
+new file mode 100644
+index 0000000..f67282b
+--- /dev/null
++++ b/tests/test_ec2.py
+@@ -0,0 +1,201 @@
++import os
++import tempfile
++from unittest import mock
++
++import pytest
++import click
++
++from flintrock import ec2 as ec2_module
++from flintrock.exceptions import ClusterNotFound
++
++
++def test_validate_tags():
++    from flintrock.ec2 import validate_tags
++
++    # List of test cases; each test case is a tuple, with first element
++    # the input and the second element the expected output
++    positive_test_cases = [
++        # basic case
++        (['k1,v1'], [{'Key': 'k1', 'Value': 'v1'}]),
++        # strips whitespace?
++        (['  k2  , v2 '], [{'Key': 'k2', 'Value': 'v2'}]),
++        # empty Value
++        (['k3,'], [{'Key': 'k3', 'Value': ''}]),
++        # multiple tags
++        (['k4,v4', 'k5,v5'],
++         [{'Key': 'k4', 'Value': 'v4'}, {'Key': 'k5', 'Value': 'v5'}])]
++
++    for test_case in positive_test_cases:
++        ec2_tags = validate_tags(test_case[0])
++        assert ec2_tags == test_case[1]
++
++    negative_test_cases = [["k1"], ["k2,v2,"], ["k3,,v3"], [",v4"], ["  ,v5"]]
++    for test_case in negative_test_cases:
++        with pytest.raises(click.BadParameter):
++            validate_tags(test_case)
++
++
++class _FakeInstance:
++    def __init__(self, instance_id):
++        self.id = instance_id
++        self.state = {'Name': 'running'}
++        self.public_ip_address = '10.0.0.1'
++        self.public_dns_name = 'host'
++        self.tags = []
++
++    def create_tags(self, Tags):
++        self.tags.extend(Tags)
++
++
++class _FakeFilteredInstances:
++    def __init__(self, instances):
++        self._instances = instances
++
++    def create_tags(self, Tags):
++        for instance in self._instances:
++            instance.tags.extend(Tags)
++
++
++class _FakeInstances:
++    def __init__(self, ec2):
++        self._ec2 = ec2
++
++    def filter(self, Filters):
++        instance_ids = []
++        for f in Filters:
++            if f['Name'] == 'instance-id':
++                instance_ids = f['Values']
++        return _FakeFilteredInstances(
++            [self._ec2._instances[i] for i in instance_ids])
++
++
++class _FakeEC2:
++    def __init__(self):
++        self._instances = {}
++        self._counter = 0
++        self.instances = _FakeInstances(self)
++
++    def create_instances(self, MinCount, MaxCount, **kwargs):
++        instances = []
++        for _ in range(MinCount):
++            instance_id = 'i-{n}'.format(n=self._counter)
++            self._counter += 1
++            instance = _FakeInstance(instance_id)
++            for spec in kwargs.get('TagSpecifications', []):
++                if spec.get('ResourceType') == 'instance':
++                    instance.tags.extend(spec.get('Tags', []))
++            self._instances[instance_id] = instance
++            instances.append(instance)
++        return instances
++
++    def create_tags(self, Resources, Tags):
++        for resource in Resources:
++            instance_id = getattr(resource, 'id', resource)
++            self._instances[instance_id].tags.extend(Tags)
++
++
++def _launch_args(identity_file):
++    return [
++        'launch', 'test-cluster',
++        '--num-slaves', '1',
++        '--ec2-key-name', 'key',
++        '--ec2-identity-file', identity_file,
++        '--ec2-instance-type', 't2.micro',
++        '--ec2-region', 'us-east-1',
++        '--ec2-ami', 'ami-1',
++        '--ec2-user', 'ec2-user']
++
++
++def test_launch_attaches_custom_tags_to_instances():
++    from click.testing import CliRunner
++    from flintrock.flintrock import cli
++
++    fake_ec2 = _FakeEC2()
++
++    def fake_resource(service_name, region_name):
++        if service_name == 'ec2':
++            return fake_ec2
++        return mock.MagicMock()
++
++    identity_file = tempfile.NamedTemporaryFile(delete=False)
++    identity_file.close()
++    try:
++        with mock.patch.object(ec2_module, 'get_default_vpc') as mock_vpc, \
++                mock.patch.object(ec2_module, 'get_cluster',
++                                  side_effect=ClusterNotFound('no cluster')), \
++                mock.patch.object(ec2_module, 'get_or_create_flintrock_security_groups',
++                                  return_value=[]), \
++                mock.patch.object(ec2_module, 'get_security_groups', return_value=[]), \
++                mock.patch.object(ec2_module, 'get_ec2_block_device_mappings', return_value=[]), \
++                mock.patch.object(ec2_module, 'boto3') as mock_boto3, \
++                mock.patch.object(ec2_module, 'generate_ssh_key_pair', return_value=None), \
++                mock.patch.object(ec2_module, 'provision_cluster'), \
++                mock.patch.object(ec2_module.time, 'sleep'), \
++                mock.patch('flintrock.flintrock.check_external_dependency'):
++            mock_vpc.return_value.id = 'vpc-1'
++            mock_boto3.resource.side_effect = fake_resource
++
++            runner = CliRunner()
++            result = runner.invoke(
++                cli,
++                _launch_args(identity_file.name) + [
++                    '--ec2-tag', 'k1,v1',
++                    '--ec2-tag', 'k2,v2'],
++                obj={})
++        assert result.exit_code == 0
++    finally:
++        os.remove(identity_file.name)
++
++    instances = list(fake_ec2._instances.values())
++    assert len(instances) == 2
++    roles = []
++    for instance in instances:
++        tags = {tag['Key']: tag['Value'] for tag in instance.tags}
++        roles.append(tags['flintrock-role'])
++        assert tags['k1'] == 'v1'
++        assert tags['k2'] == 'v2'
++        if tags['flintrock-role'] == 'master':
++            assert tags['Name'] == 'test-cluster-master'
++        else:
++            assert tags['Name'] == 'test-cluster-slave'
++    assert sorted(roles) == ['master', 'slave']
++
++
++@pytest.mark.parametrize('tag', ['not-a-pair', '  ,value'])
++def test_launch_cli_rejects_invalid_ec2_tag(tag):
++    from click.testing import CliRunner
++    from flintrock.flintrock import cli
++
++    fake_ec2 = _FakeEC2()
++
++    def fake_resource(service_name, region_name):
++        if service_name == 'ec2':
++            return fake_ec2
++        return mock.MagicMock()
++
++    identity_file = tempfile.NamedTemporaryFile(delete=False)
++    identity_file.close()
++    try:
++        runner = CliRunner()
++        with mock.patch.object(ec2_module, 'get_default_vpc') as mock_vpc, \
++                mock.patch.object(ec2_module, 'get_cluster',
++                                  side_effect=ClusterNotFound('no cluster')), \
++                mock.patch.object(ec2_module, 'get_or_create_flintrock_security_groups',
++                                  return_value=[]), \
++                mock.patch.object(ec2_module, 'get_security_groups', return_value=[]), \
++                mock.patch.object(ec2_module, 'get_ec2_block_device_mappings', return_value=[]), \
++                mock.patch.object(ec2_module, 'boto3') as mock_boto3, \
++                mock.patch.object(ec2_module, 'generate_ssh_key_pair', return_value=None), \
++                mock.patch.object(ec2_module, 'provision_cluster'), \
++                mock.patch.object(ec2_module.time, 'sleep'), \
++                mock.patch('flintrock.flintrock.check_external_dependency'):
++            mock_vpc.return_value.id = 'vpc-1'
++            mock_boto3.resource.side_effect = fake_resource
++            result = runner.invoke(
++                cli,
++                _launch_args(identity_file.name) + ['--ec2-tag', tag],
++                obj={})
++        assert result.exit_code != 0
++        assert 'no such option' not in result.output
++    finally:
++        os.remove(identity_file.name)

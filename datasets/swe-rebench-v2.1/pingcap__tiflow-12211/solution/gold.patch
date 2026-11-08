@@ -1,0 +1,259 @@
+diff --git a/cdc/model/mounter.go b/cdc/model/mounter.go
+index df4c47a48..e8292b6ef 100644
+--- a/cdc/model/mounter.go
++++ b/cdc/model/mounter.go
+@@ -16,6 +16,7 @@ package model
+ import (
+ 	"context"
+ 	"math"
++	"sort"
+ 
+ 	"github.com/pingcap/log"
+ 	"github.com/pingcap/tidb/pkg/types"
+@@ -24,8 +25,53 @@ import (
+ 
+ // RowChangedDatums is used to store the changed datums of a row.
+ type RowChangedDatums struct {
+-	RowDatums    []types.Datum
+-	PreRowDatums []types.Datum
++	RowDatums    []types.Datum // row datums (excluding virtual columns)
++	PreRowDatums []types.Datum // pre row datums (excluding virtual columns)
++}
++
++// mergeDatumWithVirtualCols returns a slice of row datums with placeholders for virtual columns placed at the specified offset.
++func mergeDatumWithVirtualCols(datums []types.Datum, virtualColsOffset []int) []types.Datum {
++	if len(virtualColsOffset) == 0 {
++		return datums
++	}
++	if !sort.IntsAreSorted(virtualColsOffset) {
++		log.Panic("virtual column offsets must be sorted",
++			zap.Ints("virtualColsOffset", virtualColsOffset))
++	}
++
++	// checks if virtual column offsets are within valid range.
++	maxAllowedIndex := len(datums) + len(virtualColsOffset)
++	for _, idx := range virtualColsOffset {
++		if idx < 0 || idx >= maxAllowedIndex {
++			log.Panic("invalid virtual column index",
++				zap.Int("index", idx),
++				zap.Int("maxAllowedIndex", maxAllowedIndex-1))
++		}
++	}
++
++	result := make([]types.Datum, 0, maxAllowedIndex)
++	originalIdx := 0
++	virtualIdx := 0
++	for originalIdx < len(datums) || virtualIdx < len(virtualColsOffset) {
++		if virtualIdx < len(virtualColsOffset) && virtualColsOffset[virtualIdx] == len(result) {
++			result = append(result, types.Datum{})
++			virtualIdx++
++		} else if originalIdx < len(datums) {
++			result = append(result, datums[originalIdx])
++			originalIdx++
++		}
++	}
++	return result
++}
++
++// RowDatumsWithVirtualCols returns the row datums with placeholders for virtual columns placed at the specified offset.
++func (r *RowChangedDatums) RowDatumsWithVirtualCols(virtualColsOffset []int) []types.Datum {
++	return mergeDatumWithVirtualCols(r.RowDatums, virtualColsOffset)
++}
++
++// PreRowDatumsWithVirtualCols returns the pre row datums with placeholders for virtual columns placed at the specified offset.
++func (r *RowChangedDatums) PreRowDatumsWithVirtualCols(virtualColsOffset []int) []types.Datum {
++	return mergeDatumWithVirtualCols(r.PreRowDatums, virtualColsOffset)
+ }
+ 
+ // IsEmpty returns true if the RowChangeDatums is empty.
+diff --git a/cdc/model/schema_storage.go b/cdc/model/schema_storage.go
+index 48a3364a4..dad065a01 100644
+--- a/cdc/model/schema_storage.go
++++ b/cdc/model/schema_storage.go
+@@ -90,8 +90,12 @@ type TableInfo struct {
+ 	// only for new row format decoder
+ 	handleColID []int64
+ 
+-	// number of virtual columns
+-	virtualColumnCount int
++	// offset of virtual columns in TableInfo.Columns
++	// for example:
++	// Table has 4 columns: a (physical), b (physical), c (virtual), d (virtual)
++	// TableInfo.Columns order: a, b, c, d
++	// VirtualColumnsOffset will be [2, 3] (indices of virtual columns c and d)
++	VirtualColumnsOffset []int
+ 	// rowColInfosWithoutVirtualCols is the same as rowColInfos, but without virtual columns
+ 	rowColInfosWithoutVirtualCols *[]rowcodec.ColInfo
+ }
+@@ -121,7 +125,6 @@ func WrapTableInfo(schemaID int64, schemaName string, version uint64, info *mode
+ 
+ 	rowColumnsCurrentOffset := 0
+ 
+-	ti.virtualColumnCount = 0
+ 	for i, col := range ti.Columns {
+ 		ti.columnsOffset[col.ID] = i
+ 		pkIsHandle := false
+@@ -146,7 +149,7 @@ func WrapTableInfo(schemaID int64, schemaName string, version uint64, info *mode
+ 				}
+ 			}
+ 		} else {
+-			ti.virtualColumnCount += 1
++			ti.VirtualColumnsOffset = append(ti.VirtualColumnsOffset, i)
+ 		}
+ 		ti.rowColInfos[i] = rowcodec.ColInfo{
+ 			ID:            col.ID,
+@@ -182,21 +185,21 @@ func WrapTableInfo(schemaID int64, schemaName string, version uint64, info *mode
+ }
+ 
+ func (ti *TableInfo) initRowColInfosWithoutVirtualCols() {
+-	if ti.virtualColumnCount == 0 {
++	if len(ti.VirtualColumnsOffset) == 0 {
+ 		ti.rowColInfosWithoutVirtualCols = &ti.rowColInfos
+ 		return
+ 	}
+-	colInfos := make([]rowcodec.ColInfo, 0, len(ti.rowColInfos)-ti.virtualColumnCount)
++	colInfos := make([]rowcodec.ColInfo, 0, len(ti.rowColInfos)-len(ti.VirtualColumnsOffset))
+ 	for i, col := range ti.Columns {
+ 		if IsColCDCVisible(col) {
+ 			colInfos = append(colInfos, ti.rowColInfos[i])
+ 		}
+ 	}
+-	if len(colInfos) != len(ti.rowColInfos)-ti.virtualColumnCount {
++	if len(colInfos) != len(ti.rowColInfos)-len(ti.VirtualColumnsOffset) {
+ 		log.Panic("invalid rowColInfosWithoutVirtualCols",
+ 			zap.Int("len(colInfos)", len(colInfos)),
+ 			zap.Int("len(ti.rowColInfos)", len(ti.rowColInfos)),
+-			zap.Int("ti.virtualColumnCount", ti.virtualColumnCount))
++			zap.Any("ti.VirtualColumnsOffset", ti.VirtualColumnsOffset))
+ 	}
+ 	ti.rowColInfosWithoutVirtualCols = &colInfos
+ }
+@@ -388,7 +391,7 @@ func (ti *TableInfo) HasUniqueColumn() bool {
+ 
+ // HasVirtualColumns returns whether the table has virtual columns
+ func (ti *TableInfo) HasVirtualColumns() bool {
+-	return ti.virtualColumnCount > 0
++	return len(ti.VirtualColumnsOffset) > 0
+ }
+ 
+ // IsEligible returns whether the table is a eligible table
+diff --git a/pkg/filter/expr_filter.go b/pkg/filter/expr_filter.go
+index 5ff6a58b3..ceb6eb06d 100644
+--- a/pkg/filter/expr_filter.go
++++ b/pkg/filter/expr_filter.go
+@@ -21,7 +21,9 @@ import (
+ 	"github.com/pingcap/log"
+ 	"github.com/pingcap/tidb/pkg/expression"
+ 	"github.com/pingcap/tidb/pkg/parser"
++	"github.com/pingcap/tidb/pkg/parser/ast"
+ 	"github.com/pingcap/tidb/pkg/sessionctx"
++	"github.com/pingcap/tidb/pkg/table"
+ 	"github.com/pingcap/tidb/pkg/types"
+ 	"github.com/pingcap/tidb/pkg/util/chunk"
+ 	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
+@@ -274,8 +276,9 @@ func (r *dmlExprFilterRule) shouldSkipDML(
+ 			return false, err
+ 		}
+ 		return r.skipDMLByExpression(
+-			rawRow.RowDatums,
++			rawRow.RowDatumsWithVirtualCols(ti.VirtualColumnsOffset),
+ 			exprs,
++			ti,
+ 		)
+ 	case row.IsUpdate():
+ 		oldExprs, err := r.getUpdateOldExpr(ti)
+@@ -287,15 +290,17 @@ func (r *dmlExprFilterRule) shouldSkipDML(
+ 			return false, err
+ 		}
+ 		ignoreOld, err := r.skipDMLByExpression(
+-			rawRow.PreRowDatums,
++			rawRow.PreRowDatumsWithVirtualCols(ti.VirtualColumnsOffset),
+ 			oldExprs,
++			ti,
+ 		)
+ 		if err != nil {
+ 			return false, err
+ 		}
+ 		ignoreNew, err := r.skipDMLByExpression(
+-			rawRow.RowDatums,
++			rawRow.RowDatumsWithVirtualCols(ti.VirtualColumnsOffset),
+ 			newExprs,
++			ti,
+ 		)
+ 		if err != nil {
+ 			return false, err
+@@ -307,8 +312,9 @@ func (r *dmlExprFilterRule) shouldSkipDML(
+ 			return false, err
+ 		}
+ 		return r.skipDMLByExpression(
+-			rawRow.PreRowDatums,
++			rawRow.PreRowDatumsWithVirtualCols(ti.VirtualColumnsOffset),
+ 			exprs,
++			ti,
+ 		)
+ 	default:
+ 		log.Warn("unknown row changed event type")
+@@ -316,16 +322,60 @@ func (r *dmlExprFilterRule) shouldSkipDML(
+ 	}
+ }
+ 
++func (r *dmlExprFilterRule) buildRowWithVirtualColumns(
++	rowData []types.Datum,
++	tableInfo *model.TableInfo,
++) (chunk.Row, error) {
++	row := chunk.MutRowFromDatums(rowData).ToRow()
++	if len(tableInfo.VirtualColumnsOffset) == 0 {
++		// If there is no virtual column, we can return the row directly.
++		return row, nil
++	}
++
++	columns, _, err := expression.ColumnInfos2ColumnsAndNames(r.sessCtx.GetExprCtx(),
++		ast.CIStr{} /* unused */, tableInfo.Name, tableInfo.Columns, tableInfo.TableInfo)
++	if err != nil {
++		return chunk.Row{}, err
++	}
++	var fts []*types.FieldType
++	for _, col := range columns {
++		fts = append(fts, col.GetType(r.sessCtx.GetExprCtx().GetEvalCtx()))
++	}
++	ch := chunk.NewEmptyChunk(fts)
++	ch.AppendRow(row)
++
++	vColOffsets, vColFts := collectVirtualColumnOffsetsAndTypes(r.sessCtx.GetExprCtx().GetEvalCtx(), columns)
++	err = table.FillVirtualColumnValue(vColFts, vColOffsets, columns, tableInfo.Columns, r.sessCtx.GetExprCtx(), ch)
++	if err != nil {
++		return chunk.Row{}, err
++	}
++	return ch.GetRow(0), nil
++}
++
++func collectVirtualColumnOffsetsAndTypes(ctx expression.EvalContext, cols []*expression.Column) ([]int, []*types.FieldType) {
++	var offsets []int
++	var fts []*types.FieldType
++	for i, col := range cols {
++		if col.VirtualExpr != nil {
++			offsets = append(offsets, i)
++			fts = append(fts, col.GetType(ctx))
++		}
++	}
++	return offsets, fts
++}
++
+ func (r *dmlExprFilterRule) skipDMLByExpression(
+ 	rowData []types.Datum,
+ 	expr expression.Expression,
++	tableInfo *model.TableInfo,
+ ) (bool, error) {
+ 	if len(rowData) == 0 || expr == nil {
+ 		return false, nil
+ 	}
+-
+-	row := chunk.MutRowFromDatums(rowData).ToRow()
+-
++	row, err := r.buildRowWithVirtualColumns(rowData, tableInfo)
++	if err != nil {
++		return false, errors.Trace(err)
++	}
+ 	d, err := expr.Eval(r.sessCtx.GetExprCtx().GetEvalCtx(), row)
+ 	if err != nil {
+ 		log.Error("failed to eval expression", zap.Error(err))

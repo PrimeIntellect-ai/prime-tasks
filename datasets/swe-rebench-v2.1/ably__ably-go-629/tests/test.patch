@@ -1,0 +1,342 @@
+diff --git a/ably/ably_test.go b/ably/ably_test.go
+index 55f65d5..3f35722 100644
+--- a/ably/ably_test.go
++++ b/ably/ably_test.go
+@@ -7,7 +7,9 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"net/http/httptest"
+ 	"net/url"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -15,6 +17,7 @@ import (
+ 	"github.com/ably/ably-go/ably"
+ 	"github.com/ably/ably-go/ably/internal/ablyutil"
+ 	"github.com/ably/ably-go/ablytest"
++	"github.com/stretchr/testify/assert"
+ )
+ 
+ type Result interface {
+@@ -191,7 +194,7 @@ func (pc pipeConn) Close() error {
+ // MessageRecorder
+ type MessageRecorder struct {
+ 	mu       sync.Mutex
+-	url      []*url.URL
++	urls     []*url.URL
+ 	sent     []*ably.ProtocolMessage
+ 	received []*ably.ProtocolMessage
+ }
+@@ -207,7 +210,7 @@ func NewMessageRecorder() *MessageRecorder {
+ // Reset resets the recorded urls, sent and received messages
+ func (rec *MessageRecorder) Reset() {
+ 	rec.mu.Lock()
+-	rec.url = nil
++	rec.urls = nil
+ 	rec.sent = nil
+ 	rec.received = nil
+ 	rec.mu.Unlock()
+@@ -216,7 +219,7 @@ func (rec *MessageRecorder) Reset() {
+ // Dial
+ func (rec *MessageRecorder) Dial(proto string, u *url.URL, timeout time.Duration) (ably.Conn, error) {
+ 	rec.mu.Lock()
+-	rec.url = append(rec.url, u)
++	rec.urls = append(rec.urls, u)
+ 	rec.mu.Unlock()
+ 	conn, err := ably.DialWebsocket(proto, u, timeout)
+ 	if err != nil {
+@@ -229,11 +232,11 @@ func (rec *MessageRecorder) Dial(proto string, u *url.URL, timeout time.Duration
+ }
+ 
+ // URL
+-func (rec *MessageRecorder) URL() []*url.URL {
++func (rec *MessageRecorder) URLs() []*url.URL {
+ 	rec.mu.Lock()
+ 	defer rec.mu.Unlock()
+-	newUrl := make([]*url.URL, len(rec.url))
+-	copy(newUrl, rec.url)
++	newUrl := make([]*url.URL, len(rec.urls))
++	copy(newUrl, rec.urls)
+ 	return newUrl
+ }
+ 
+@@ -522,3 +525,79 @@ var canceledCtx context.Context = func() context.Context {
+ 	cancel()
+ 	return ctx
+ }()
++
++func assertSubset(t *testing.T, set []string, subset []string) {
++	t.Helper()
++	allowed := make(map[string]struct{}, len(set))
++	for _, item := range set {
++		allowed[item] = struct{}{}
++	}
++	for _, item := range subset {
++		if _, ok := allowed[item]; !ok {
++			t.Errorf("expected %s got be in %s", item, set)
++		}
++	}
++}
++
++func assertUnique(t *testing.T, list []string) {
++	t.Helper()
++	seen := make(map[string]struct{}, len(list))
++	for _, item := range list {
++		if _, ok := seen[item]; ok {
++			t.Errorf("duplicate item %s", item)
++		} else {
++			seen[item] = struct{}{}
++		}
++	}
++}
++
++// TestRest_RSC15_HostFallbackOnTimeout verifies RSC15l2: when a request times
++// out, the client must retry against the fallback hosts (not keep retrying the
++// primary endpoint), and the returned error must report the client timeout.
++func TestRest_RSC15_HostFallbackOnTimeout(t *testing.T) {
++	var mtx sync.Mutex
++	var retryCount int
++	var hosts []string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mtx.Lock()
++		hosts = append(hosts, strings.Split(r.Host, ":")[0])
++		retryCount++
++		mtx.Unlock()
++		time.Sleep(2 * time.Second)
++		w.WriteHeader(http.StatusInternalServerError)
++	}))
++	defer server.Close()
++
++	httpClientMock := &http.Client{
++		Timeout: 1 * time.Second,
++		Transport: &http.Transport{
++			Proxy: func(*http.Request) (*url.URL, error) { return url.Parse(server.URL) },
++		},
++	}
++
++	options := []ably.ClientOption{
++		ably.WithKey("xxxxxxx.yyyyyyy:zzzzzzz"),
++		ably.WithFallbackHosts(ably.DefaultFallbackHosts()),
++		ably.WithTLS(false),
++		ably.WithEnvironment(""), // remove default sandbox env
++		ably.WithHTTPMaxRetryCount(10),
++		ably.WithUseTokenAuth(true),
++		ably.WithHTTPClient(httpClientMock),
++	}
++	client, err := ably.NewREST(options...)
++	assert.NoError(t, err)
++
++	err = client.Channels.Get("test").Publish(context.Background(), "ping", "pong")
++	assert.Error(t, err, "expected an error")
++	assert.Contains(t, err.Error(), "context deadline exceeded (Client.Timeout exceeded while awaiting headers)")
++
++	mtx.Lock()
++	gotRetryCount := retryCount
++	gotHosts := append([]string(nil), hosts...)
++	mtx.Unlock()
++
++	assert.Equal(t, 6, gotRetryCount)                          // 1 primary and 5 default fallback hosts
++	assert.Equal(t, "rest.ably.io", gotHosts[0])               // primary host
++	assertSubset(t, ably.DefaultFallbackHosts(), gotHosts[1:]) // remaining fallback hosts
++	assertUnique(t, gotHosts)                                  // ensure all picked fallbacks are unique
++}
+diff --git a/ably/auth_integration_test.go b/ably/auth_integration_test.go
+index 498b453..6803b1d 100644
+--- a/ably/auth_integration_test.go
++++ b/ably/auth_integration_test.go
+@@ -606,7 +606,7 @@ func TestAuth_RealtimeAccessToken(t *testing.T) {
+ 	err = ablytest.FullRealtimeCloser(client).Close()
+ 	assert.NoError(t, err,
+ 		"Close()=%v", err)
+-	recUrls := rec.URL()
++	recUrls := rec.URLs()
+ 	assert.NotEqual(t, 0, len(recUrls),
+ 		"want urls to be non-empty")
+ 	for _, recUrl := range recUrls {
+diff --git a/ably/http_paginated_response_integration_test.go b/ably/http_paginated_response_integration_test.go
+index ed196ac..d47285b 100644
+--- a/ably/http_paginated_response_integration_test.go
++++ b/ably/http_paginated_response_integration_test.go
+@@ -20,7 +20,9 @@ func TestHTTPPaginatedFallback(t *testing.T) {
+ 	app, err := ablytest.NewSandbox(nil)
+ 	assert.NoError(t, err)
+ 	defer app.Close()
+-	opts := app.Options(ably.WithUseBinaryProtocol(false), ably.WithRESTHost("ably.invalid"), ably.WithFallbackHostsUseDefault(true))
++	opts := app.Options(ably.WithUseBinaryProtocol(false),
++		ably.WithRESTHost("ably.invalid"),
++		ably.WithFallbackHosts(nil))
+ 	client, err := ably.NewREST(opts...)
+ 	assert.NoError(t, err)
+ 	t.Run("request_time", func(t *testing.T) {
+diff --git a/ably/realtime_channel_integration_test.go b/ably/realtime_channel_integration_test.go
+index 88dadd5..aa4ba03 100644
+--- a/ably/realtime_channel_integration_test.go
++++ b/ably/realtime_channel_integration_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"fmt"
+ 	"net/url"
+ 	"reflect"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -320,7 +321,7 @@ func TestRealtimeChannel_ShouldReturnErrorIfReadLimitExceeded(t *testing.T) {
+ 	assert.NoError(t, err, "client2:.Subscribe(context.Background())=%v", err)
+ 	defer unsub2()
+ 
+-	messageWith2MbSize := ablytest.GenerateRandomString(2048)
++	messageWith2MbSize := strings.Repeat("x", 2048)
+ 	err = channel1.Publish(context.Background(), "hello", messageWith2MbSize)
+ 	assert.NoError(t, err, "client1: Publish()=%v", err)
+ 
+diff --git a/ably/rest_client_integration_test.go b/ably/rest_client_integration_test.go
+index 597c231..67f71a1 100644
+--- a/ably/rest_client_integration_test.go
++++ b/ably/rest_client_integration_test.go
+@@ -17,6 +17,7 @@ import (
+ 	"net/url"
+ 	"regexp"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -320,7 +321,7 @@ func TestRest_RSC7_AblyAgent(t *testing.T) {
+ 	})
+ }
+ 
+-func TestRest_hostfallback(t *testing.T) {
++func TestRest_RSC15_HostFallback(t *testing.T) {
+ 
+ 	app, err := ablytest.NewSandbox(nil)
+ 	assert.NoError(t, err)
+@@ -329,7 +330,7 @@ func TestRest_hostfallback(t *testing.T) {
+ 		var retryCount int
+ 		var hosts []string
+ 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			hosts = append(hosts, r.Host)
++			hosts = append(hosts, strings.Split(r.Host, ":")[0])
+ 			retryCount++
+ 			w.WriteHeader(http.StatusInternalServerError)
+ 		}))
+@@ -337,37 +338,72 @@ func TestRest_hostfallback(t *testing.T) {
+ 		client, err := ably.NewREST(app.Options(append(options, ably.WithHTTPClient(newHTTPClientMock(server)))...)...)
+ 		assert.NoError(t, err)
+ 		err = client.Channels.Get("test").Publish(context.Background(), "ping", "pong")
+-		assert.Error(t, err,
+-			"expected an error")
++		assert.Error(t, err, "expected an error")
+ 		return retryCount, hosts
+ 	}
+-	t.Run("RSC15d RSC15a must use alternative host", func(t *testing.T) {
+ 
++	t.Run("RSC15a, RSC15b, RSC15d, RSC15g3: must use alternative host", func(t *testing.T) {
+ 		options := []ably.ClientOption{
+ 			ably.WithFallbackHosts(ably.DefaultFallbackHosts()),
+ 			ably.WithTLS(false),
++			ably.WithEnvironment(""), // remove default sandbox env
++			ably.WithHTTPMaxRetryCount(10),
+ 			ably.WithUseTokenAuth(true),
+ 		}
+ 		retryCount, hosts := runTestServer(t, options)
+-		assert.Equal(t, 4, retryCount,
+-			"expected 4 http calls got %d", retryCount)
+-		// make sure the host header is set. Since we are using defaults from the spec
+-		// the hosts should be in [a..e].ably-realtime.com
+-		expect := strings.Join(ably.DefaultFallbackHosts(), ", ")
+-		for _, host := range hosts[1:] {
+-			assert.Contains(t, expect, host,
+-				"expected %s got be in %s", host, expect)
++		assert.Equal(t, 6, retryCount)                          // 1 primary and 5 default fallback hosts
++		assert.Equal(t, "rest.ably.io", hosts[0])               // primary host
++		assertSubset(t, ably.DefaultFallbackHosts(), hosts[1:]) // remaining fallback hosts
++		assertUnique(t, hosts)                                  // ensure all picked fallbacks are unique
++	})
++
++	runTestServerWithRequestTimeout := func(t *testing.T, options []ably.ClientOption) (int, []string) {
++		var retryCount int
++		var hosts []string
++		allHostsTried := make(chan struct{}, 1)
++		var mtx sync.Mutex
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			mtx.Lock()
++			defer mtx.Unlock()
++			hosts = append(hosts, strings.Split(r.Host, ":")[0])
++			retryCount++
++			time.Sleep(2 * time.Second)
++			if retryCount == 6 {
++				allHostsTried <- struct{}{}
++			}
++			w.WriteHeader(http.StatusInternalServerError)
++		}))
++		defer server.Close()
++		httpClientMock := &http.Client{
++			Timeout: 1 * time.Second,
++			Transport: &http.Transport{
++				Proxy: func(*http.Request) (*url.URL, error) { return url.Parse(server.URL) },
++			},
+ 		}
++		client, err := ably.NewREST(app.Options(append(options, ably.WithHTTPClient(httpClientMock))...)...)
++		assert.NoError(t, err)
++		err = client.Channels.Get("test").Publish(context.Background(), "ping", "pong")
++		<-allHostsTried
++		assert.Contains(t, err.Error(), "context deadline exceeded (Client.Timeout exceeded while awaiting headers)")
++		return retryCount, hosts
++	}
+ 
+-		// ensure all picked fallbacks are unique
+-		uniq := make(map[string]bool)
+-		for _, h := range hosts {
+-			_, ok := uniq[h]
+-			assert.False(t, ok,
+-				"duplicate fallback %s", h)
+-			uniq[h] = true
++	t.Run("RSC15l2 must use alternative host on timeout", func(t *testing.T) {
++
++		options := []ably.ClientOption{
++			ably.WithFallbackHosts(ably.DefaultFallbackHosts()),
++			ably.WithTLS(false),
++			ably.WithEnvironment(""), // remove default sandbox env
++			ably.WithHTTPMaxRetryCount(10),
++			ably.WithUseTokenAuth(true),
+ 		}
++		retryCount, hosts := runTestServerWithRequestTimeout(t, options)
++		assert.Equal(t, 6, retryCount)                          // 1 primary and 5 default fallback hosts
++		assert.Equal(t, "rest.ably.io", hosts[0])               // primary host
++		assertSubset(t, ably.DefaultFallbackHosts(), hosts[1:]) // remaining fallback hosts
++		assertUnique(t, hosts)                                  // ensure all picked fallbacks are unique
+ 	})
++
+ 	t.Run("rsc15b", func(t *testing.T) {
+ 		t.Run("must not occur when default rest.ably.io is overridden", func(t *testing.T) {
+ 
+diff --git a/ablytest/ablytest.go b/ablytest/ablytest.go
+index dba905a..fc7b836 100644
+--- a/ablytest/ablytest.go
++++ b/ablytest/ablytest.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"math/rand"
+ 	"net/http"
+ 	"os"
+ 	"reflect"
+@@ -210,15 +209,3 @@ func TimeFuncs(afterCalls chan<- AfterCall) (
+ 
+ 	return now, after
+ }
+-
+-const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+-
+-var seededRand *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+-
+-func GenerateRandomString(length int) string {
+-	b := make([]byte, length)
+-	for i := range b {
+-		b[i] = charset[seededRand.Intn(len(charset))]
+-	}
+-	return string(b)
+-}

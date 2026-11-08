@@ -1,0 +1,623 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 4fa7527..25ef7f5 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -8,7 +8,7 @@ jobs:
+     strategy:
+       matrix:
+         python-version: ["3.8", "3.9", "3.10", "3.11"]
+-        jsonschema-version: ["3.0", "4.17"]
++        jsonschema-version: ["3.0", "latest"]
+     name: py ${{ matrix.python-version }} js ${{ matrix.jsonschema-version }}
+     steps:
+       - uses: actions/checkout@v3
+@@ -24,10 +24,14 @@ jobs:
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+-          pip install jsonschema==${{ matrix.jsonschema-version }}
+           pip install .[dev]
+           # pip install "selenium<4.3.0"
+           # pip install altair_saver
++      - name: Install specific jsonschema
++        # Only have to execute this if we don't want the latest jsonschema version
++        if: ${{ matrix.jsonschema-version != 'latest' }}
++        run: |
++          pip install jsonschema==${{ matrix.jsonschema-version }}
+       - name: Maybe uninstall optional dependencies
+         # We uninstall pyarrow and vegafusion for one job to test that we have not
+         # accidentally introduced a hard dependency on these libraries.
+diff --git a/altair/utils/schemapi.py b/altair/utils/schemapi.py
+index 5357e52..f384246 100644
+--- a/altair/utils/schemapi.py
++++ b/altair/utils/schemapi.py
+@@ -2,6 +2,7 @@
+ # tools/generate_schema_wrapper.py. Do not modify directly.
+ import collections
+ import contextlib
++import copy
+ import inspect
+ import json
+ import sys
+@@ -23,13 +24,19 @@ from typing import (
+     TypeVar,
+ )
+ from itertools import zip_longest
++from importlib.metadata import version as importlib_version
++from typing import Final
+ 
+ import jsonschema
+ import jsonschema.exceptions
+ import jsonschema.validators
+ import numpy as np
+ import pandas as pd
++from packaging.version import Version
+ 
++# This leads to circular imports with the vegalite module. Currently, this works
++# but be aware that when you access it in this script, the vegalite module might
++# not yet be fully instantiated in case your code is being executed during import time
+ from altair import vegalite
+ 
+ if sys.version_info >= (3, 11):
+@@ -42,6 +49,20 @@ _TSchemaBase = TypeVar("_TSchemaBase", bound="SchemaBase")
+ ValidationErrorList = List[jsonschema.exceptions.ValidationError]
+ GroupedValidationErrors = Dict[str, ValidationErrorList]
+ 
++# This URI is arbitrary and could be anything else. It just cannot be an empty
++# string as we need to reference the schema registered in
++# the referencing.Registry.
++_VEGA_LITE_ROOT_URI: Final = "urn:vega-lite-schema"
++
++# Ideally, jsonschema specification would be parsed from the current Vega-Lite
++# schema instead of being hardcoded here as a default value.
++# However, due to circular imports between this module and the altair.vegalite
++# modules, this information is not yet available at this point as altair.vegalite
++# is only partially loaded. The draft version which is used is unlikely to
++# change often so it's ok to keep this. There is also a test which validates
++# that this value is always the same as in the Vega-Lite schema.
++_DEFAULT_JSON_SCHEMA_DRAFT_URL: Final = "http://json-schema.org/draft-07/schema#"
++
+ 
+ # If DEBUG_MODE is True, then schema objects are converted to dict and
+ # validated at creation time. This slows things down, particularly for
+@@ -149,22 +170,102 @@ def _get_errors_from_spec(
+     # e.g. '#/definitions/ValueDefWithCondition<MarkPropFieldOrDatumDef,
+     # (Gradient|string|null)>' would be a valid $ref in a Vega-Lite schema but
+     # it is not a valid URI reference due to the characters such as '<'.
+-    if rootschema is not None:
+-        validator_cls = jsonschema.validators.validator_for(rootschema)
+-        resolver = jsonschema.RefResolver.from_schema(rootschema)
+-    else:
+-        validator_cls = jsonschema.validators.validator_for(schema)
+-        # No resolver is necessary if the schema is already the full schema
+-        resolver = None
+ 
+-    validator_kwargs = {"resolver": resolver}
++    json_schema_draft_url = _get_json_schema_draft_url(rootschema or schema)
++    validator_cls = jsonschema.validators.validator_for(
++        {"$schema": json_schema_draft_url}
++    )
++    validator_kwargs: Dict[str, Any] = {}
+     if hasattr(validator_cls, "FORMAT_CHECKER"):
+         validator_kwargs["format_checker"] = validator_cls.FORMAT_CHECKER
++
++    if _use_referencing_library():
++        schema = _prepare_references_in_schema(schema)
++        validator_kwargs["registry"] = _get_referencing_registry(
++            rootschema or schema, json_schema_draft_url
++        )
++
++    else:
++        # No resolver is necessary if the schema is already the full schema
++        validator_kwargs["resolver"] = (
++            jsonschema.RefResolver.from_schema(rootschema)
++            if rootschema is not None
++            else None
++        )
++
+     validator = validator_cls(schema, **validator_kwargs)
+     errors = list(validator.iter_errors(spec))
+     return errors
+ 
+ 
++def _get_json_schema_draft_url(schema: dict) -> str:
++    return schema.get("$schema", _DEFAULT_JSON_SCHEMA_DRAFT_URL)
++
++
++def _use_referencing_library() -> bool:
++    """In version 4.18.0, the jsonschema package deprecated RefResolver in
++    favor of the referencing library."""
++    jsonschema_version_str = importlib_version("jsonschema")
++    return Version(jsonschema_version_str) >= Version("4.18")
++
++
++def _prepare_references_in_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
++    # Create a copy so that $ref is not modified in the original schema in case
++    # that it would still reference a dictionary which might be attached to
++    # an Altair class _schema attribute
++    schema = copy.deepcopy(schema)
++
++    def _prepare_refs(d: Dict[str, Any]) -> Dict[str, Any]:
++        """Add _VEGA_LITE_ROOT_URI in front of all $ref values. This function
++        recursively iterates through the whole dictionary."""
++        for key, value in d.items():
++            if key == "$ref":
++                d[key] = _VEGA_LITE_ROOT_URI + d[key]
++            else:
++                # $ref values can only be nested in dictionaries or lists
++                # as the passed in `d` dictionary comes from the Vega-Lite json schema
++                # and in json we only have arrays (-> lists in Python) and objects
++                # (-> dictionaries in Python) which we need to iterate through.
++                if isinstance(value, dict):
++                    d[key] = _prepare_refs(value)
++                elif isinstance(value, list):
++                    prepared_values = []
++                    for v in value:
++                        if isinstance(v, dict):
++                            v = _prepare_refs(v)
++                        prepared_values.append(v)
++                    d[key] = prepared_values
++        return d
++
++    schema = _prepare_refs(schema)
++    return schema
++
++
++# We do not annotate the return value here as the referencing library is not always
++# available and this function is only executed in those cases.
++def _get_referencing_registry(
++    rootschema: Dict[str, Any], json_schema_draft_url: Optional[str] = None
++):
++    # Referencing is a dependency of newer jsonschema versions, starting with the
++    # version that is specified in _use_referencing_library and we therefore
++    # can expect that it is installed if the function returns True.
++    # We ignore 'import' mypy errors which happen when the referencing library
++    # is not installed. That's ok as in these cases this function is not called.
++    # We also have to ignore 'unused-ignore' errors as mypy raises those in case
++    # referencing is installed.
++    import referencing  # type: ignore[import,unused-ignore]
++    import referencing.jsonschema  # type: ignore[import,unused-ignore]
++
++    if json_schema_draft_url is None:
++        json_schema_draft_url = _get_json_schema_draft_url(rootschema)
++
++    specification = referencing.jsonschema.specification_with(json_schema_draft_url)
++    resource = specification.create_resource(rootschema)
++    return referencing.Registry().with_resource(
++        uri=_VEGA_LITE_ROOT_URI, resource=resource
++    )
++
++
+ def _json_path(err: jsonschema.exceptions.ValidationError) -> str:
+     """Drop in replacement for the .json_path property of the jsonschema
+     ValidationError class, which is not available as property for
+@@ -384,12 +485,27 @@ def _todict(obj: Any, context: Optional[Dict[str, Any]]) -> Any:
+         return obj
+ 
+ 
+-def _resolve_references(schema: dict, root: Optional[dict] = None) -> dict:
+-    """Resolve schema references."""
+-    resolver = jsonschema.RefResolver.from_schema(root or schema)
+-    while "$ref" in schema:
+-        with resolver.resolving(schema["$ref"]) as resolved:
+-            schema = resolved
++def _resolve_references(
++    schema: Dict[str, Any], rootschema: Optional[Dict[str, Any]] = None
++) -> Dict[str, Any]:
++    """Resolve schema references until there is no $ref anymore
++    in the top-level of the dictionary.
++    """
++    if _use_referencing_library():
++        registry = _get_referencing_registry(rootschema or schema)
++        # Using a different variable name to show that this is not the
++        # jsonschema.RefResolver but instead a Resolver from the referencing
++        # library
++        referencing_resolver = registry.resolver()
++        while "$ref" in schema:
++            schema = referencing_resolver.lookup(
++                _VEGA_LITE_ROOT_URI + schema["$ref"]
++            ).contents
++    else:
++        resolver = jsonschema.RefResolver.from_schema(rootschema or schema)
++        while "$ref" in schema:
++            with resolver.resolving(schema["$ref"]) as resolved:
++                schema = resolved
+     return schema
+ 
+ 
+@@ -1010,7 +1126,7 @@ class SchemaBase:
+         assert schema_to_pass is not None
+         return _resolve_references(
+             schema=schema_to_pass,
+-            root=(cls._rootschema or cls._schema or schema),
++            rootschema=(cls._rootschema or cls._schema or schema),
+         )
+ 
+     @classmethod
+diff --git a/doc/releases/changes.rst b/doc/releases/changes.rst
+index dad0fb6..9030af7 100644
+--- a/doc/releases/changes.rst
++++ b/doc/releases/changes.rst
+@@ -11,6 +11,7 @@ Enhancements
+ - Add ``chart.transformed_data()`` method to extract transformed chart data using VegaFusion (#3081, #3084, #3102)
+ - Add ``"vegafusion"`` data transformer with mime renderer, save, and ``to_dict``/``to_json`` integration (#3094, #3107)
+ - Support field encoding inference for objects that support the DataFrame Interchange Protocol (#3114)
++- Add support for new referencing logic in version 4.18 of the jsonschema package
+ 
+ Bug Fixes
+ ~~~~~~~~~
+@@ -25,7 +26,7 @@ Version 5.0.1 (released May 26, 2023)
+ -------------------------------------
+ 
+ - Remove unwanted files during build to avoid littering site-packages folder (#3057).
+-- Deprecate the ``.ref()`` function for selections, instead of removing it (#3063). 
++- Deprecate the ``.ref()`` function for selections, instead of removing it (#3063).
+ - Fix bug in reconstructing layered charts with ``Chart.from_json()``/``Chart.from_dict()`` (#3068).
+ 
+ Version 5.0.0 (released May 9, 2023)
+@@ -118,7 +119,7 @@ Enhancements
+ 
+ - Pie charts are now supported through the use of ``mark_arc``. (Examples: eg.
+   :ref:`gallery_pie_chart` and :ref:`gallery_radial_chart`.)
+-- Support for the ``datum`` encoding specifications from Vega-Lite; see 
++- Support for the ``datum`` encoding specifications from Vega-Lite; see
+   `Vega-Lite Datum Definition <https://vega.github.io/vega-lite/docs/encoding.html#datum-def>`_.
+   (Examples: :ref:`gallery_line_chart_with_datum` and :ref:`gallery_line_chart_with_color_datum`.)
+ - ``angle`` encoding can now be used to control point styles (Example: :ref:`gallery_wind_vector_map`)
+diff --git a/pyproject.toml b/pyproject.toml
+index 1bd28d5..8d6ac93 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -14,7 +14,7 @@ build-backend = "hatchling.build"
+ 
+ [project]
+ name = "altair"
+-authors = [ {name = "Vega-Altair Contributors"} ]
++authors = [{ name = "Vega-Altair Contributors" }]
+ dependencies = [
+     "typing_extensions>=4.0.1; python_version<\"3.11\"",
+     "jinja2",
+@@ -39,7 +39,7 @@ keywords = [
+ requires-python = ">=3.8"
+ dynamic = ["version"]
+ license-files = { paths = ["LICENSE"] }
+-classifiers= [
++classifiers = [
+     "Development Status :: 5 - Production/Stable",
+     "Environment :: Console",
+     "Intended Audience :: Science/Research",
+@@ -87,7 +87,7 @@ doc = [
+     "geopandas",
+     "myst-parser",
+     "sphinx_copybutton",
+-    "sphinx-design"
++    "sphinx-design",
+ ]
+ 
+ [tool.hatch.version]
+@@ -108,7 +108,7 @@ test = [
+     "black --diff --color --check .",
+     "ruff check .",
+     "mypy altair tests",
+-    "python -m pytest --pyargs --doctest-modules tests"
++    "python -m pytest --pyargs --doctest-modules tests",
+ ]
+ test-coverage = "python -m pytest --pyargs --doctest-modules --cov=altair --cov-report term altair"
+ test-coverage-html = "python -m pytest --pyargs --doctest-modules --cov=altair --cov-report html altair"
+@@ -118,15 +118,8 @@ features = ["dev", "doc"]
+ 
+ [tool.hatch.envs.doc.scripts]
+ clean = "rm -rf doc/_build"
+-clean-generated = [
+-    "rm -rf doc/user_guide/generated",
+-    "rm -rf doc/gallery"
+-]
+-clean-all = [
+-    "clean",
+-    "clean-generated",
+-    "rm -rf doc/_images"
+-]
++clean-generated = ["rm -rf doc/user_guide/generated", "rm -rf doc/gallery"]
++clean-all = ["clean", "clean-generated", "rm -rf doc/_images"]
+ clean-win = "if exist doc\\_build rd /s /q doc\\_build"
+ clean-generated-win = [
+     "if exist doc\\user_guide\\generated rd /s /q doc\\user_guide\\generated",
+@@ -139,11 +132,11 @@ clean-all-win = [
+ ]
+ build-html = [
+     "mkdir -p doc/_images",
+-    "sphinx-build -b html -d doc/_build/doctrees doc doc/_build/html"
++    "sphinx-build -b html -d doc/_build/doctrees doc doc/_build/html",
+ ]
+ build-html-win = [
+     "if not exist doc\\_images md doc\\_images",
+-    "sphinx-build -b html -d doc\\_build\\doctrees doc doc\\_build\\html"
++    "sphinx-build -b html -d doc\\_build\\doctrees doc doc\\_build\\html",
+ ]
+ doctest = "sphinx-build -b doctest -d doc/_build/doctrees doc doc/_build/doctest"
+ coverage = "sphinx-build -b coverage -d doc/_build/doctrees doc doc/_build/coverage"
+@@ -151,7 +144,7 @@ serve = "(cd doc/_build/html && python -m http.server)"
+ publish-clean-build = [
+     "clean-all",
+     "build-html",
+-    "(cd doc && bash sync_website.sh)"
++    "(cd doc && bash sync_website.sh)",
+ ]
+ 
+ [tool.black]
+@@ -187,10 +180,10 @@ select = [
+     # pyflakes
+     "F",
+     # flake8-tidy-imports
+-    "TID"
++    "TID",
+ ]
+ ignore = [
+-    # E203, E266, W503 not yet supported by ruff, 
++    # E203, E266, W503 not yet supported by ruff,
+     # see https://github.com/charliermarsh/ruff/issues/2402
+     # Whitespace before ':'
+     # "E203",
+@@ -199,12 +192,12 @@ ignore = [
+     # Line break occurred before a binary operator
+     # "W503",
+     # Line too long
+-    "E501", 
++    "E501",
+     # Relative imports are banned
+     "TID252",
+     # zip() without an explicit strict= parameter set.
+     # python>=3.10 only
+-    "B905"
++    "B905",
+ ]
+ exclude = [
+     ".git",
+@@ -237,12 +230,10 @@ module = [
+     "vl_convert.*",
+     "pandas.lib.*",
+     "nbformat.*",
+-    "ipykernel.*"
++    "ipykernel.*",
+ ]
+ ignore_missing_imports = true
+ 
+ [[tool.mypy.overrides]]
+-module = [
+-    "altair.vegalite.v5.schema.*"
+-]
++module = ["altair.vegalite.v5.schema.*"]
+ ignore_errors = true
+diff --git a/tools/schemapi/schemapi.py b/tools/schemapi/schemapi.py
+index 5e82454..af98fbe 100644
+--- a/tools/schemapi/schemapi.py
++++ b/tools/schemapi/schemapi.py
+@@ -1,5 +1,6 @@
+ import collections
+ import contextlib
++import copy
+ import inspect
+ import json
+ import sys
+@@ -21,13 +22,19 @@ from typing import (
+     TypeVar,
+ )
+ from itertools import zip_longest
++from importlib.metadata import version as importlib_version
++from typing import Final
+ 
+ import jsonschema
+ import jsonschema.exceptions
+ import jsonschema.validators
+ import numpy as np
+ import pandas as pd
++from packaging.version import Version
+ 
++# This leads to circular imports with the vegalite module. Currently, this works
++# but be aware that when you access it in this script, the vegalite module might
++# not yet be fully instantiated in case your code is being executed during import time
+ from altair import vegalite
+ 
+ if sys.version_info >= (3, 11):
+@@ -40,6 +47,20 @@ _TSchemaBase = TypeVar("_TSchemaBase", bound="SchemaBase")
+ ValidationErrorList = List[jsonschema.exceptions.ValidationError]
+ GroupedValidationErrors = Dict[str, ValidationErrorList]
+ 
++# This URI is arbitrary and could be anything else. It just cannot be an empty
++# string as we need to reference the schema registered in
++# the referencing.Registry.
++_VEGA_LITE_ROOT_URI: Final = "urn:vega-lite-schema"
++
++# Ideally, jsonschema specification would be parsed from the current Vega-Lite
++# schema instead of being hardcoded here as a default value.
++# However, due to circular imports between this module and the altair.vegalite
++# modules, this information is not yet available at this point as altair.vegalite
++# is only partially loaded. The draft version which is used is unlikely to
++# change often so it's ok to keep this. There is also a test which validates
++# that this value is always the same as in the Vega-Lite schema.
++_DEFAULT_JSON_SCHEMA_DRAFT_URL: Final = "http://json-schema.org/draft-07/schema#"
++
+ 
+ # If DEBUG_MODE is True, then schema objects are converted to dict and
+ # validated at creation time. This slows things down, particularly for
+@@ -147,22 +168,102 @@ def _get_errors_from_spec(
+     # e.g. '#/definitions/ValueDefWithCondition<MarkPropFieldOrDatumDef,
+     # (Gradient|string|null)>' would be a valid $ref in a Vega-Lite schema but
+     # it is not a valid URI reference due to the characters such as '<'.
+-    if rootschema is not None:
+-        validator_cls = jsonschema.validators.validator_for(rootschema)
+-        resolver = jsonschema.RefResolver.from_schema(rootschema)
+-    else:
+-        validator_cls = jsonschema.validators.validator_for(schema)
+-        # No resolver is necessary if the schema is already the full schema
+-        resolver = None
+ 
+-    validator_kwargs = {"resolver": resolver}
++    json_schema_draft_url = _get_json_schema_draft_url(rootschema or schema)
++    validator_cls = jsonschema.validators.validator_for(
++        {"$schema": json_schema_draft_url}
++    )
++    validator_kwargs: Dict[str, Any] = {}
+     if hasattr(validator_cls, "FORMAT_CHECKER"):
+         validator_kwargs["format_checker"] = validator_cls.FORMAT_CHECKER
++
++    if _use_referencing_library():
++        schema = _prepare_references_in_schema(schema)
++        validator_kwargs["registry"] = _get_referencing_registry(
++            rootschema or schema, json_schema_draft_url
++        )
++
++    else:
++        # No resolver is necessary if the schema is already the full schema
++        validator_kwargs["resolver"] = (
++            jsonschema.RefResolver.from_schema(rootschema)
++            if rootschema is not None
++            else None
++        )
++
+     validator = validator_cls(schema, **validator_kwargs)
+     errors = list(validator.iter_errors(spec))
+     return errors
+ 
+ 
++def _get_json_schema_draft_url(schema: dict) -> str:
++    return schema.get("$schema", _DEFAULT_JSON_SCHEMA_DRAFT_URL)
++
++
++def _use_referencing_library() -> bool:
++    """In version 4.18.0, the jsonschema package deprecated RefResolver in
++    favor of the referencing library."""
++    jsonschema_version_str = importlib_version("jsonschema")
++    return Version(jsonschema_version_str) >= Version("4.18")
++
++
++def _prepare_references_in_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
++    # Create a copy so that $ref is not modified in the original schema in case
++    # that it would still reference a dictionary which might be attached to
++    # an Altair class _schema attribute
++    schema = copy.deepcopy(schema)
++
++    def _prepare_refs(d: Dict[str, Any]) -> Dict[str, Any]:
++        """Add _VEGA_LITE_ROOT_URI in front of all $ref values. This function
++        recursively iterates through the whole dictionary."""
++        for key, value in d.items():
++            if key == "$ref":
++                d[key] = _VEGA_LITE_ROOT_URI + d[key]
++            else:
++                # $ref values can only be nested in dictionaries or lists
++                # as the passed in `d` dictionary comes from the Vega-Lite json schema
++                # and in json we only have arrays (-> lists in Python) and objects
++                # (-> dictionaries in Python) which we need to iterate through.
++                if isinstance(value, dict):
++                    d[key] = _prepare_refs(value)
++                elif isinstance(value, list):
++                    prepared_values = []
++                    for v in value:
++                        if isinstance(v, dict):
++                            v = _prepare_refs(v)
++                        prepared_values.append(v)
++                    d[key] = prepared_values
++        return d
++
++    schema = _prepare_refs(schema)
++    return schema
++
++
++# We do not annotate the return value here as the referencing library is not always
++# available and this function is only executed in those cases.
++def _get_referencing_registry(
++    rootschema: Dict[str, Any], json_schema_draft_url: Optional[str] = None
++):
++    # Referencing is a dependency of newer jsonschema versions, starting with the
++    # version that is specified in _use_referencing_library and we therefore
++    # can expect that it is installed if the function returns True.
++    # We ignore 'import' mypy errors which happen when the referencing library
++    # is not installed. That's ok as in these cases this function is not called.
++    # We also have to ignore 'unused-ignore' errors as mypy raises those in case
++    # referencing is installed.
++    import referencing  # type: ignore[import,unused-ignore]
++    import referencing.jsonschema  # type: ignore[import,unused-ignore]
++
++    if json_schema_draft_url is None:
++        json_schema_draft_url = _get_json_schema_draft_url(rootschema)
++
++    specification = referencing.jsonschema.specification_with(json_schema_draft_url)
++    resource = specification.create_resource(rootschema)
++    return referencing.Registry().with_resource(
++        uri=_VEGA_LITE_ROOT_URI, resource=resource
++    )
++
++
+ def _json_path(err: jsonschema.exceptions.ValidationError) -> str:
+     """Drop in replacement for the .json_path property of the jsonschema
+     ValidationError class, which is not available as property for
+@@ -382,12 +483,27 @@ def _todict(obj: Any, context: Optional[Dict[str, Any]]) -> Any:
+         return obj
+ 
+ 
+-def _resolve_references(schema: dict, root: Optional[dict] = None) -> dict:
+-    """Resolve schema references."""
+-    resolver = jsonschema.RefResolver.from_schema(root or schema)
+-    while "$ref" in schema:
+-        with resolver.resolving(schema["$ref"]) as resolved:
+-            schema = resolved
++def _resolve_references(
++    schema: Dict[str, Any], rootschema: Optional[Dict[str, Any]] = None
++) -> Dict[str, Any]:
++    """Resolve schema references until there is no $ref anymore
++    in the top-level of the dictionary.
++    """
++    if _use_referencing_library():
++        registry = _get_referencing_registry(rootschema or schema)
++        # Using a different variable name to show that this is not the
++        # jsonschema.RefResolver but instead a Resolver from the referencing
++        # library
++        referencing_resolver = registry.resolver()
++        while "$ref" in schema:
++            schema = referencing_resolver.lookup(
++                _VEGA_LITE_ROOT_URI + schema["$ref"]
++            ).contents
++    else:
++        resolver = jsonschema.RefResolver.from_schema(rootschema or schema)
++        while "$ref" in schema:
++            with resolver.resolving(schema["$ref"]) as resolved:
++                schema = resolved
+     return schema
+ 
+ 
+@@ -1008,7 +1124,7 @@ class SchemaBase:
+         assert schema_to_pass is not None
+         return _resolve_references(
+             schema=schema_to_pass,
+-            root=(cls._rootschema or cls._schema or schema),
++            rootschema=(cls._rootschema or cls._schema or schema),
+         )
+ 
+     @classmethod
+diff --git a/tools/schemapi/utils.py b/tools/schemapi/utils.py
+index 6152971..e05cac9 100644
+--- a/tools/schemapi/utils.py
++++ b/tools/schemapi/utils.py
+@@ -5,21 +5,12 @@ import re
+ import textwrap
+ import urllib
+ 
+-import jsonschema
++from .schemapi import _resolve_references as resolve_references
+ 
+ 
+ EXCLUDE_KEYS = ("definitions", "title", "description", "$schema", "id")
+ 
+ 
+-def resolve_references(schema, root=None):
+-    """Resolve References within a JSON schema"""
+-    resolver = jsonschema.RefResolver.from_schema(root or schema)
+-    while "$ref" in schema:
+-        with resolver.resolving(schema["$ref"]) as resolved:
+-            schema = resolved
+-    return schema
+-
+-
+ def get_valid_identifier(
+     prop, replacement_character="", allow_unicode=False, url_decode=True
+ ):

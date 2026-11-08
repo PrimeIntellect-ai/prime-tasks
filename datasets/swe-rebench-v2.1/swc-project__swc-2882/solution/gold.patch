@@ -1,0 +1,179 @@
+diff --git a/crates/swc_ecma_transforms_compat/src/es2015/arrow.rs b/crates/swc_ecma_transforms_compat/src/es2015/arrow.rs
+index 6928ca3d64..c79cb24a14 100644
+--- a/crates/swc_ecma_transforms_compat/src/es2015/arrow.rs
++++ b/crates/swc_ecma_transforms_compat/src/es2015/arrow.rs
+@@ -3,7 +3,7 @@ use std::mem;
+ use swc_common::{util::take::Take, Spanned, DUMMY_SP};
+ use swc_ecma_ast::*;
+ use swc_ecma_utils::{
+-    function::{FunctionWrapper, WrapperState},
++    function::{init_this, FunctionWrapper, WrapperState},
+     prepend,
+ };
+ use swc_ecma_visit::{as_folder, noop_visit_mut_type, Fold, InjectVars, VisitMut, VisitMutWith};
+@@ -62,6 +62,7 @@ pub fn arrow() -> impl Fold + VisitMut + InjectVars {
+ 
+ #[derive(Default)]
+ struct Arrow {
++    in_subclass: bool,
+     state: WrapperState,
+ }
+ 
+@@ -69,7 +70,38 @@ impl VisitMut for Arrow {
+     noop_visit_mut_type!();
+ 
+     fn visit_mut_constructor(&mut self, c: &mut Constructor) {
++        c.params.visit_mut_children_with(self);
++
++        if let Some(BlockStmt { span: _, stmts }) = &mut c.body {
++            let old_rep = self.state.take();
++
++            stmts.visit_mut_children_with(self);
++
++            if self.in_subclass {
++                let (decl, this_id) = mem::replace(&mut self.state, old_rep).to_stmt_in_subclass();
++
++                if let Some(stmt) = decl {
++                    if let Some(this_id) = this_id {
++                        init_this(stmts, &this_id)
++                    }
++                    prepend(stmts, stmt);
++                }
++            } else {
++                let decl = mem::replace(&mut self.state, old_rep).to_stmt();
++
++                if let Some(stmt) = decl {
++                    prepend(stmts, stmt);
++                }
++            }
++        }
++    }
++
++    fn visit_mut_class(&mut self, c: &mut Class) {
++        if c.super_class.is_some() {
++            self.in_subclass = true;
++        }
+         c.visit_mut_children_with(self);
++        self.in_subclass = false;
+     }
+ 
+     fn visit_mut_expr(&mut self, expr: &mut Expr) {
+diff --git a/crates/swc_ecma_transforms_compat/src/es2017/async_to_generator.rs b/crates/swc_ecma_transforms_compat/src/es2017/async_to_generator.rs
+index cff974d49a..bcd08228f7 100644
+--- a/crates/swc_ecma_transforms_compat/src/es2017/async_to_generator.rs
++++ b/crates/swc_ecma_transforms_compat/src/es2017/async_to_generator.rs
+@@ -559,6 +559,7 @@ impl VisitMut for MethodFolder {
+ 
+     fn visit_mut_expr(&mut self, expr: &mut Expr) {
+         match expr {
++            // TODO: handle arrow with this in constructor once we remove all this bind
+             Expr::Arrow(ArrowExpr { body, .. }) => {
+                 body.visit_mut_with(&mut FunctionWrapper::new(&mut self.scope_ident));
+             }
+diff --git a/crates/swc_ecma_utils/src/function.rs b/crates/swc_ecma_utils/src/function.rs
+index 520168e1da..d61194b0f9 100644
+--- a/crates/swc_ecma_utils/src/function.rs
++++ b/crates/swc_ecma_utils/src/function.rs
+@@ -52,6 +52,45 @@ impl WrapperState {
+             })))
+         }
+     }
++
++    pub fn to_stmt_in_subclass(self) -> (Option<Stmt>, Option<Ident>) {
++        let Self { this, args } = self;
++
++        let mut decls = Vec::with_capacity(2);
++        if let Some(this_id) = &this {
++            decls.push(VarDeclarator {
++                span: DUMMY_SP,
++                name: Pat::Ident(this_id.clone().into()),
++                init: None,
++                definite: false,
++            });
++        }
++        if let Some(id) = args {
++            decls.push(VarDeclarator {
++                span: DUMMY_SP,
++                name: Pat::Ident(id.into()),
++                init: Some(Box::new(Expr::Ident(Ident::new(
++                    js_word!("arguments"),
++                    DUMMY_SP,
++                )))),
++                definite: false,
++            });
++        }
++
++        if decls.is_empty() {
++            (None, None)
++        } else {
++            (
++                Some(Stmt::Decl(Decl::Var(VarDecl {
++                    span: DUMMY_SP,
++                    kind: VarDeclKind::Var,
++                    declare: false,
++                    decls,
++                }))),
++                this.clone(),
++            )
++        }
++    }
+ }
+ 
+ impl Take for WrapperState {
+@@ -127,3 +166,56 @@ impl<'a> VisitMut for FunctionWrapper<'a> {
+         }
+     }
+ }
++
++pub fn init_this(stmts: &mut Vec<Stmt>, this_id: &Ident) {
++    stmts.visit_mut_children_with(&mut InitThis { this_id })
++}
++
++struct InitThis<'a> {
++    this_id: &'a Ident,
++}
++
++// babel is skip function and class property
++impl<'a> VisitMut for InitThis<'a> {
++    noop_visit_mut_type!();
++
++    fn visit_mut_class(&mut self, _: &mut Class) {}
++
++    // babel will transform super() to super(); _this = this
++    // hopefully it will be meaningless
++    // fn visit_mut_stmts(&mut self, stmt: &mut Vec<Stmt>) {}
++
++    fn visit_mut_expr(&mut self, expr: &mut Expr) {
++        expr.visit_mut_children_with(self);
++
++        match expr {
++            Expr::Call(CallExpr {
++                callee: ExprOrSuper::Super(Super { span: super_span }),
++                span,
++                ..
++            }) => {
++                *expr = Expr::Paren(ParenExpr {
++                    span: *span,
++                    expr: Box::new(Expr::Seq(SeqExpr {
++                        span: *span,
++                        exprs: vec![
++                            Box::new(Expr::Call(CallExpr {
++                                span: *span,
++                                callee: ExprOrSuper::Super(Super { span: *super_span }),
++                                args: Vec::new(),
++                                type_args: None,
++                            })),
++                            Box::new(Expr::Assign(AssignExpr {
++                                span: DUMMY_SP,
++                                left: PatOrExpr::Pat(Box::new(self.this_id.clone().into())),
++                                op: AssignOp::Assign,
++                                right: Box::new(Expr::This(ThisExpr { span: DUMMY_SP })),
++                            })),
++                        ],
++                    })),
++                })
++            }
++            _ => (),
++        }
++    }
++}

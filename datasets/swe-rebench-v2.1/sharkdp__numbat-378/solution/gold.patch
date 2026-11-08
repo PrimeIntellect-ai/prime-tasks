@@ -1,0 +1,213 @@
+diff --git a/numbat/src/datetime.rs b/numbat/src/datetime.rs
+index 6e5836a..facd4a2 100644
+--- a/numbat/src/datetime.rs
++++ b/numbat/src/datetime.rs
+@@ -6,6 +6,10 @@ pub fn get_local_timezone() -> Option<Tz> {
+     tz_str.parse().ok()
+ }
+ 
++pub fn get_local_timezone_or_utc() -> Tz {
++    get_local_timezone().unwrap_or(chrono_tz::UTC)
++}
++
+ /// We use this function to get the UTC offset corresponding to
+ /// the local timezone *at the specific instant in time* specified
+ /// by 'dt', which might be different from the *current* UTC offset.
+diff --git a/numbat/src/ffi.rs b/numbat/src/ffi.rs
+index c9870f9..d6a51bb 100644
+--- a/numbat/src/ffi.rs
++++ b/numbat/src/ffi.rs
+@@ -2,9 +2,8 @@ use std::collections::HashMap;
+ 
+ use std::sync::OnceLock;
+ 
+-use chrono::Offset;
+-
+ use crate::currency::ExchangeRatesCache;
++use crate::datetime;
+ use crate::interpreter::RuntimeError;
+ use crate::pretty_print::PrettyPrint;
+ use crate::value::{FunctionReference, Value};
+@@ -834,11 +833,9 @@ fn chr(args: &[Value]) -> Result<Value> {
+ 
+ fn now(args: &[Value]) -> Result<Value> {
+     assert!(args.is_empty());
+-    let now = chrono::Utc::now();
+-
+-    let offset = now.with_timezone(&chrono::Local).offset().fix();
++    let now = chrono::Local::now().fixed_offset();
+ 
+-    Ok(Value::DateTime(now, offset))
++    Ok(Value::DateTime(now))
+ }
+ 
+ fn datetime(args: &[Value]) -> Result<Value> {
+@@ -846,13 +843,12 @@ fn datetime(args: &[Value]) -> Result<Value> {
+ 
+     let input = args[0].unsafe_as_string();
+ 
+-    let output = crate::datetime::parse_datetime(input)
++    let output = datetime::parse_datetime(input)
+         .map_err(RuntimeError::DateParsingError)?
+-        .ok_or(RuntimeError::DateParsingErrorUnknown)?;
+-
+-    let offset = crate::datetime::local_offset_for_datetime(&output);
++        .ok_or(RuntimeError::DateParsingErrorUnknown)?
++        .fixed_offset();
+ 
+-    Ok(Value::DateTime(output.into(), offset))
++    Ok(Value::DateTime(output))
+ }
+ 
+ fn format_datetime(args: &[Value]) -> Result<Value> {
+@@ -869,9 +865,7 @@ fn format_datetime(args: &[Value]) -> Result<Value> {
+ fn get_local_timezone(args: &[Value]) -> Result<Value> {
+     assert!(args.is_empty());
+ 
+-    let local_tz = crate::datetime::get_local_timezone()
+-        .unwrap_or(chrono_tz::Tz::UTC)
+-        .to_string();
++    let local_tz = datetime::get_local_timezone_or_utc().to_string();
+ 
+     Ok(Value::String(local_tz))
+ }
+@@ -901,8 +895,10 @@ fn from_unixtime(args: &[Value]) -> Result<Value> {
+ 
+     let timestamp = args[0].unsafe_as_quantity().unsafe_value().to_f64() as i64;
+ 
+-    let dt = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
+-    let offset = dt.offset().fix();
++    let dt = chrono::DateTime::from_timestamp(timestamp, 0)
++        .ok_or(RuntimeError::DateTimeOutOfRange)?
++        .with_timezone(&datetime::get_local_timezone_or_utc())
++        .fixed_offset();
+ 
+-    Ok(Value::DateTime(dt, offset))
++    Ok(Value::DateTime(dt))
+ }
+diff --git a/numbat/src/value.rs b/numbat/src/value.rs
+index 123e262..c1e461b 100644
+--- a/numbat/src/value.rs
++++ b/numbat/src/value.rs
+@@ -26,7 +26,7 @@ pub enum Value {
+     Boolean(bool),
+     String(String),
+     /// A DateTime with an associated offset used when pretty printing
+-    DateTime(chrono::DateTime<chrono::Utc>, chrono::FixedOffset),
++    DateTime(chrono::DateTime<chrono::FixedOffset>),
+     FunctionReference(FunctionReference),
+ }
+ 
+@@ -59,8 +59,8 @@ impl Value {
+     }
+ 
+     #[track_caller]
+-    pub fn unsafe_as_datetime(&self) -> &chrono::DateTime<chrono::Utc> {
+-        if let Value::DateTime(dt, _) = self {
++    pub fn unsafe_as_datetime(&self) -> &chrono::DateTime<chrono::FixedOffset> {
++        if let Value::DateTime(dt) = self {
+             dt
+         } else {
+             panic!("Expected value to be a string");
+@@ -83,7 +83,7 @@ impl std::fmt::Display for Value {
+             Value::Quantity(q) => write!(f, "{}", q),
+             Value::Boolean(b) => write!(f, "{}", b),
+             Value::String(s) => write!(f, "\"{}\"", s),
+-            Value::DateTime(dt, _) => write!(f, "datetime(\"{}\")", dt),
++            Value::DateTime(dt) => write!(f, "datetime(\"{}\")", dt),
+             Value::FunctionReference(r) => write!(f, "{}", r),
+         }
+     }
+@@ -95,11 +95,7 @@ impl PrettyPrint for Value {
+             Value::Quantity(q) => q.pretty_print(),
+             Value::Boolean(b) => b.pretty_print(),
+             Value::String(s) => s.pretty_print(),
+-            Value::DateTime(dt, offset) => {
+-                let l: chrono::DateTime<chrono::FixedOffset> =
+-                    chrono::DateTime::from_naive_utc_and_offset(dt.naive_utc(), *offset);
+-                crate::markup::string(l.to_rfc2822())
+-            }
++            Value::DateTime(dt) => crate::markup::string(dt.to_rfc2822()),
+             Value::FunctionReference(r) => crate::markup::string(r.to_string()),
+         }
+     }
+diff --git a/numbat/src/vm.rs b/numbat/src/vm.rs
+index e70f96c..8f5cb7e 100644
+--- a/numbat/src/vm.rs
++++ b/numbat/src/vm.rs
+@@ -1,7 +1,5 @@
+ use std::{cmp::Ordering, fmt::Display};
+ 
+-use chrono::Offset;
+-
+ use crate::{
+     ffi::{self, ArityRange, Callable, ForeignFunction},
+     interpreter::{InterpreterResult, PrintFunction, Result, RuntimeError},
+@@ -533,9 +531,9 @@ impl Vm {
+     }
+ 
+     #[track_caller]
+-    fn pop_datetime(&mut self) -> chrono::DateTime<chrono::Utc> {
++    fn pop_datetime(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
+         match self.pop() {
+-            Value::DateTime(q, _) => q,
++            Value::DateTime(q) => q,
+             _ => panic!("Expected datetime to be on the top of the stack"),
+         }
+     }
+@@ -664,18 +662,15 @@ impl Vm {
+                             (seconds_f.fract() * 1_000_000_000f64).round() as i64,
+                         );
+ 
+-                    self.push(Value::DateTime(
+-                        match op {
+-                            Op::AddToDateTime => lhs
+-                                .checked_add_signed(duration)
+-                                .ok_or(RuntimeError::DateTimeOutOfRange)?,
+-                            Op::SubFromDateTime => lhs
+-                                .checked_sub_signed(duration)
+-                                .ok_or(RuntimeError::DateTimeOutOfRange)?,
+-                            _ => unreachable!(),
+-                        },
+-                        chrono::Local::now().offset().fix(),
+-                    ));
++                    self.push(Value::DateTime(match op {
++                        Op::AddToDateTime => lhs
++                            .checked_add_signed(duration)
++                            .ok_or(RuntimeError::DateTimeOutOfRange)?,
++                        Op::SubFromDateTime => lhs
++                            .checked_sub_signed(duration)
++                            .ok_or(RuntimeError::DateTimeOutOfRange)?,
++                        _ => unreachable!(),
++                    }));
+                 }
+                 Op::DiffDateTime => {
+                     let unit = self.pop_quantity();
+@@ -852,9 +847,9 @@ impl Vm {
+                                 .parse()
+                                 .map_err(|_| RuntimeError::UnknownTimezone(tz_name.into()))?;
+ 
+-                            let offset = dt.with_timezone(&tz).offset().fix();
++                            let dt = dt.with_timezone(&tz).fixed_offset();
+ 
+-                            self.push(Value::DateTime(dt, offset));
++                            self.push(Value::DateTime(dt));
+                         }
+                     }
+                 }
+@@ -871,14 +866,7 @@ impl Vm {
+                             Value::Quantity(q) => q.to_string(),
+                             Value::Boolean(b) => b.to_string(),
+                             Value::String(s) => s,
+-                            Value::DateTime(dt, offset) => {
+-                                let l: chrono::DateTime<chrono::FixedOffset> =
+-                                    chrono::DateTime::from_naive_utc_and_offset(
+-                                        dt.naive_utc(),
+-                                        offset,
+-                                    );
+-                                l.to_rfc2822()
+-                            }
++                            Value::DateTime(dt) => dt.to_rfc2822(),
+                             Value::FunctionReference(r) => r.to_string(),
+                         };
+                         joined = part + &joined; // reverse order

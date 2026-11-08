@@ -1,0 +1,262 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 31e1397..05cdc99 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,9 @@
+ ### Changed
+ - Support for Python3.6 removed.
+ 
++### Fixed
++- Fixed support for stream / source that are not `seekable`.
++
+ ---
+   
+ ## 2.1.2
+diff --git a/laspy/header.py b/laspy/header.py
+index 1e03c99..829123c 100644
+--- a/laspy/header.py
++++ b/laspy/header.py
+@@ -518,15 +518,15 @@ class LasHeader:
+         self.are_points_compressed = state
+ 
+     @classmethod
+-    def read_from(cls, stream: BinaryIO, seekable=True) -> "LasHeader":
++    def read_from(cls, stream: BinaryIO) -> "LasHeader":
+         little_endian = "little"
+         header = cls()
+ 
+-        file_sig = stream.read(len(LAS_FILE_SIGNATURE))
+-        if not file_sig:
+-            raise LaspyException(f"Source is empty")
+-        if file_sig != LAS_FILE_SIGNATURE:
+-            raise LaspyException(f'Invalid file signature "{file_sig}"')
++        stream = io.BytesIO(cls._prefetch_header_data(stream))
++
++        file_sig = stream.read(4)
++        # This should not be possible as _prefetch already checks this
++        assert file_sig == LAS_FILE_SIGNATURE
+ 
+         header.file_source_id = int.from_bytes(
+             stream.read(2), little_endian, signed=False
+@@ -595,10 +595,7 @@ class LasHeader:
+                     stream.read(8), little_endian, signed=False
+                 )
+ 
+-        if seekable:
+-            current_pos = stream.tell()
+-        else:
+-            current_pos = LAS_HEADERS_SIZE[str(header.version)]
++        current_pos = stream.tell()
+         if current_pos < header_size:
+             header.extra_header_bytes = stream.read(header_size - current_pos)
+         elif current_pos > header_size:
+@@ -606,14 +603,13 @@ class LasHeader:
+ 
+         header._vlrs = VLRList.read_from(stream, num_to_read=number_of_vlrs)
+ 
+-        if seekable:
+-            current_pos = stream.tell()
+-            if current_pos < header.offset_to_point_data:
+-                header.extra_vlr_bytes = stream.read(
+-                    header.offset_to_point_data - current_pos
+-                )
+-            elif current_pos > header.offset_to_point_data:
+-                raise LaspyException("Incoherent offset to point data")
++        current_pos = stream.tell()
++        if current_pos < header.offset_to_point_data:
++            header.extra_vlr_bytes = stream.read(
++                header.offset_to_point_data - current_pos
++            )
++        elif current_pos > header.offset_to_point_data:
++            raise LaspyException("Incoherent offset to point data")
+ 
+         header.are_points_compressed = is_point_format_compressed(point_format_id)
+         point_format_id = compressed_id_to_uncompressed(point_format_id)
+@@ -803,6 +799,38 @@ class LasHeader:
+ 
+         return None
+ 
++    @staticmethod
++    def _prefetch_header_data(source) -> bytes:
++        """
++        reads (and returns) from the source all the bytes that
++        are between the beginning of the file and the start of point data
++        (which corresponds to Header + VLRS).
++
++        It is done in two calls to the source's `read` method
++
++        This is done because `LasHeader.read_from`
++        does a bunch of read to the source, so we prefer to
++        prefetch data in memory in case the original source
++        is not buffered (like a http source could be)
++        """
++        header_bytes = source.read(LAS_HEADERS_SIZE["1.1"])
++
++        file_sig = header_bytes[: len(LAS_FILE_SIGNATURE)]
++        if not file_sig:
++            raise LaspyException(f"Source is empty")
++        if file_sig != LAS_FILE_SIGNATURE:
++            raise LaspyException(f'Invalid file signature "{file_sig}"')
++        if len(header_bytes) < LAS_HEADERS_SIZE["1.1"]:
++            raise LaspyException("File is to small to be a valid LAS")
++
++        offset_to_data = int.from_bytes(
++            header_bytes[96 : 96 + 4], byteorder="little", signed=False
++        )
++
++        rest = source.read(offset_to_data - len(header_bytes))
++
++        return header_bytes + rest
++
+     def _sync_extra_bytes_vlr(self) -> None:
+         try:
+             self._vlrs.extract("ExtraBytesVlr")
+diff --git a/laspy/lasreader.py b/laspy/lasreader.py
+index dfe09fc..b3ec4be 100644
+--- a/laspy/lasreader.py
++++ b/laspy/lasreader.py
+@@ -1,7 +1,7 @@
+ import abc
+ import io
+ import logging
+-from typing import Optional, BinaryIO, Iterable, Union
++from typing import Optional, BinaryIO, Iterable, Union, List, Tuple
+ 
+ from . import errors
+ from .compression import LazBackend
+@@ -104,22 +104,67 @@ class LasReader:
+         return points
+ 
+     def read(self) -> LasData:
+-        """Reads all the points not read and returns a LasData object"""
++        """
++        Reads all the points that are not read and returns a LasData object
++
++        .. note::
++            If the source file object is not seekable and the FILE contains
++            EVLRs,
++
++        """
+         points = self.read_points(-1)
+         las_data = LasData(header=self.header, points=points)
+ 
+         if self.header.version.minor >= 4:
+-            if (
+-                self.header.are_points_compressed
+-                and not self.point_source.source.seekable()
+-            ):
+-                # We explicitly require seekable stream because we have to seek
+-                # past the chunk table of LAZ file
+-                raise errors.LaspyException(
+-                    "source must be seekable, to read evlrs form LAZ file"
++            source = self.point_source.source
++            if self.header.number_of_evlrs == 0:
++                las_data.evlrs = VLRList()
++            elif source.seekable():
++                source.seek(self.header.start_of_first_evlr, io.SEEK_SET)
++                las_data.evlrs = VLRList.read_from(
++                    source, self.header.number_of_evlrs, extended=True
++                )
++            elif self.header.are_points_compressed:
++                if isinstance(self.point_source, LazrsPointReader):
++                    # Few things: If the stream is non seekable, only a LazrsPointReader
++                    # could have been created (parallel requires ability to seek)
++                    #
++                    # Also, to work, the next lines of code assumes that:
++                    # 1) We actually are just after the last point
++                    # 2) The chunk table _starts_ just after the last point
++                    # 3) The first EVLR starts just after the chunk table
++                    # These assumptions should be fine for most of the cases
++                    # and non seekable sources are probably not that common
++                    _ = self.point_source.read_chunk_table_only()
++
++                    # Since the LazrsDecompressor uses a buffered reader
++                    # the python file object's position is not at the position we
++                    # think it is.
++                    # So we have to read data from the decompressor's
++                    # buffered stream.
++                    class LocalReader:
++                        def __init__(self, source: LazrsPointReader) -> None:
++                            self.source = source
++
++                        def read(self, n: int) -> bytes:
++                            return self.source.read_raw_bytes(n)
++
++                    las_data.evlrs = VLRList.read_from(
++                        LocalReader(self.point_source),
++                        self.header.number_of_evlrs,
++                        extended=True,
++                    )
++                else:
++                    raise errors.LaspyException(
++                        "Reading EVLRs from a LAZ in a non-seekable stream "
++                        "can only be done with lazrs backend"
++                    )
++            else:
++                # For this to work, we assume that the first evlr
++                # start kust after the last point
++                las_data.evlrs = VLRList.read_from(
++                    source, self.header.number_of_evlrs, extended=True
+                 )
+-            self.point_source.source.seek(self.header.start_of_first_evlr, io.SEEK_SET)
+-            las_data.evlrs = self._read_evlrs(self.point_source.source, seekable=True)
+ 
+         return las_data
+ 
+@@ -217,20 +262,6 @@ class LasReader:
+ 
+         raise last_error
+ 
+-    def _read_evlrs(self, source, seekable=False) -> Optional[VLRList]:
+-        """Reads the EVLRs of the file, will fail if the file version
+-        does not support evlrs
+-        """
+-        if (
+-            self.header.version.minor >= 4
+-            and self.points_read == self.header.point_count
+-        ):
+-            if seekable:
+-                source.seek(self.header.start_of_first_evlr)
+-            return VLRList.read_from(source, self.header.number_of_evlrs, extended=True)
+-        else:
+-            return None
+-
+     def __enter__(self):
+         return self
+ 
+@@ -354,6 +385,22 @@ class LazrsPointReader(IPointReader):
+     def close(self) -> None:
+         self.source.close()
+ 
++    def read_chunk_table_only(self) -> List[Tuple[int, int]]:
++        """
++        This function requires the source to be at the start of the chunk table
++        """
++        assert isinstance(self.decompressor, lazrs.LasZipDecompressor)
++        return self.decompressor.read_chunk_table_only()
++
++    def read_raw_bytes(self, n: int) -> bytes:
++        """
++        reads and returns exactly `n` bytes from the source used by
++        this point reader.
++        """
++        b = bytearray(n)
++        self.decompressor.read_raw_bytes_into(b)
++        return bytes(b)
++
+ 
+ class EmptyPointReader(IPointReader):
+     """Does nothing but returning empty bytes.
+diff --git a/setup.py b/setup.py
+index bf1cc27..dd601a2 100644
+--- a/setup.py
++++ b/setup.py
+@@ -33,7 +33,7 @@ setup(
+             "pytest-benchmark",
+             "m2r2",
+         ],
+-        "lazrs": ["lazrs>=0.4.0, < 0.5.0"],
++        "lazrs": ["lazrs>=0.4.3, < 0.5.0"],
+         "laszip": ["laszip >= 0.1.0, < 0.2.0"],
+         "pyproj": ["pyproj"],
+     },

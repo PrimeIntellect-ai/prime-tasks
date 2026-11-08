@@ -1,0 +1,172 @@
+diff --git a/src/components/RegionInput.test.js b/src/components/RegionInput.test.js
+index 2c6449b..79130b2 100644
+--- a/src/components/RegionInput.test.js
++++ b/src/components/RegionInput.test.js
+@@ -1,4 +1,7 @@
+ import { render, fireEvent, screen } from "@testing-library/react";
++import http from "http";
++import { ReadableStream } from "stream/web";
++import { TextDecoder, TextEncoder } from "util";
+ import userEvent from "@testing-library/user-event";
+ import RegionInput from "./RegionInput";
+ import "@testing-library/jest-dom";
+@@ -60,5 +63,158 @@ test("it calls handleRegionChange when region is changed with new region", async
+   await userEvent.clear(input);
+   await userEvent.type(input, NEW_REGION);
+ 
+-  expect(handleRegionChangeMock).toHaveBeenLastCalledWith(NEW_REGION, null);
++
++  expect(handleRegionChangeMock.mock.calls.at(-1)[0]).toBe(NEW_REGION);
++});
++
++// Runs `run` against a live API server whose outbound fetches are mocked.
++// The BED file has 25 premade regions, each with its own chunk. Provides a
++// helper to POST JSON and a record of which chunks were requested remotely.
++const withRemoteBed = async (run) => {
++  const remoteRequests = [];
++  const requestedChunks = () =>
++    Array.from(
++      new Set(
++        remoteRequests.flatMap((path) => {
++          const match = path.match(/^\/(chunk-\d+)\//);
++          return match ? [match[1]] : [];
++        })
++      )
++    );
++  const bedLines = Array.from(
++    { length: 25 },
++    (_, index) => `chr${index}\t0\t10\tregion${index}\tchunk-${index}`
++  );
++  const bedURL = "https://bed.example/regions.bed";
++  const originalBlob = global.Blob;
++  const originalResponse = global.Response;
++  class TestBlob {
++    constructor(parts) {
++      this.parts = parts.map((part) => Buffer.from(part));
++      this.size = this.parts.reduce((size, part) => size + part.byteLength, 0);
++    }
++  }
++  class TestResponse {
++    constructor(blob, options = {}) {
++      this.status = options.status || 200;
++      this.ok = this.status >= 200 && this.status < 300;
++      this.headers = options.headers || new Headers();
++      this.parts = blob.parts;
++      this.body = new ReadableStream({
++        start(controller) {
++          for (const part of blob.parts) {
++            controller.enqueue(part);
++          }
++          controller.close();
++        },
++      });
++    }
++
++    async text() {
++      return new TextDecoder().decode(Buffer.concat(this.parts));
++    }
++  }
++  global.Blob = TestBlob;
++  global.Response = TestResponse;
++  const fetchMock = jest.spyOn(global, "fetch").mockImplementation(async (url) => {
++    const path = new URL(url).pathname;
++    remoteRequests.push(path);
++    const body =
++      path === "/regions.bed"
++        ? bedLines.join("\n")
++        : path.endsWith("/chunk_contents.txt")
++          ? "tracks.json\n"
++          : "[]";
++    const bytes = new TextEncoder().encode(body);
++    return {
++      ok: true,
++      status: 200,
++      headers: new Headers({ "Content-Length": String(bytes.length) }),
++      body: new ReadableStream({
++        start(controller) {
++          controller.enqueue(bytes);
++          controller.close();
++        },
++      }),
++    };
++  });
++
++  const previousPort = process.env.SERVER_PORT;
++  process.env.SERVER_PORT = "0";
++  let apiServer;
++  try {
++    const { start } = await import("../server.mjs");
++    apiServer = await start();
++    const postJSON = (url, body) =>
++      new Promise((resolve, reject) => {
++        const request = http.request(
++          new URL(url),
++          {
++            method: "POST",
++            headers: { "Content-Type": "application/json" },
++          },
++          (response) => {
++            let data = "";
++            response.setEncoding("utf8");
++            response.on("data", (part) => (data += part));
++            response.on("end", () => {
++              let parsed = null;
++              try {
++                parsed = JSON.parse(data);
++              } catch (e) {
++                parsed = null;
++              }
++              resolve({ status: response.statusCode, body: parsed });
++            });
++          }
++        );
++        request.on("error", reject);
++        request.end(JSON.stringify(body));
++      });
++
++    await run({ apiServer, postJSON, bedURL, requestedChunks });
++  } finally {
++    fetchMock.mockRestore();
++    global.Blob = originalBlob;
++    global.Response = originalResponse;
++    if (apiServer) {
++      await apiServer.close();
++    }
++    if (previousPort === undefined) {
++      delete process.env.SERVER_PORT;
++    } else {
++      process.env.SERVER_PORT = previousPort;
++    }
++  }
++};
++
++test("does not fetch URL BED chunk metadata while loading regions", async () => {
++  await withRemoteBed(async ({ apiServer, postJSON, bedURL, requestedChunks }) => {
++    const loaded = await postJSON(`${apiServer.getApiUrl()}/getBedRegions`, {
++      bedFile: bedURL,
++    });
++    expect(loaded.body.bedRegions.desc).toHaveLength(25);
++    expect(requestedChunks()).toEqual([]);
++  });
++});
++
++test("fetches chunk metadata for a URL BED region only when that region is accessed", async () => {
++  await withRemoteBed(async ({ apiServer, postJSON, bedURL, requestedChunks }) => {
++    const loaded = await postJSON(`${apiServer.getApiUrl()}/getBedRegions`, {
++      bedFile: bedURL,
++    });
++    expect(loaded.body.bedRegions.desc).toHaveLength(25);
++    expect(requestedChunks()).toEqual([]);
++
++    // Accessing one region should request metadata for that region's chunk.
++    // The downstream rendering step may fail in this environment; only the
++    // remote requests matter here.
++    await postJSON(`${apiServer.getApiUrl()}/getChunkedData`, {
++      bedFile: bedURL,
++      region: "chr3:0-10",
++      tracks: {},
++    });
++    expect(requestedChunks()).toContain("chunk-3");
++    expect(requestedChunks().every((chunk) => chunk === "chunk-3")).toBe(true);
++  });
+ });

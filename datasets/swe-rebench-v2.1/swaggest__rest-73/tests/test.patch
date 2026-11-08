@@ -1,0 +1,242 @@
+diff --git a/_examples/advanced-generic/_testdata/openapi.json b/_examples/advanced-generic/_testdata/openapi.json
+index 6693f83..e842594 100644
+--- a/_examples/advanced-generic/_testdata/openapi.json
++++ b/_examples/advanced-generic/_testdata/openapi.json
+@@ -19,7 +19,17 @@
+           },
+           "400":{
+             "description":"Bad Request",
+-            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/AdvancedCustomErr"}}}
++            "content":{
++              "application/json":{
++                "schema":{
++                  "anyOf":[
++                    {"$ref":"#/components/schemas/AdvancedCustomErr"},
++                    {"$ref":"#/components/schemas/AdvancedAnotherErr"},
++                    {"$ref":"#/components/schemas/AdvancedCustomErr"}
++                  ]
++                }
++              }
++            }
+           },
+           "409":{
+             "description":"Conflict",
+@@ -412,6 +422,7 @@
+   },
+   "components":{
+     "schemas":{
++      "AdvancedAnotherErr":{"type":"object","properties":{"foo":{"type":"integer"}}},
+       "AdvancedCustomErr":{"type":"object","properties":{"details":{"type":"object","additionalProperties":{}},"msg":{"type":"string"}}},
+       "AdvancedGzipPassThroughStruct":{
+         "type":"object",
+diff --git a/_examples/advanced/_testdata/openapi.json b/_examples/advanced/_testdata/openapi.json
+index dee02e8..4badc8d 100644
+--- a/_examples/advanced/_testdata/openapi.json
++++ b/_examples/advanced/_testdata/openapi.json
+@@ -19,7 +19,17 @@
+           },
+           "400":{
+             "description":"Bad Request",
+-            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/AdvancedCustomErr"}}}
++            "content":{
++              "application/json":{
++                "schema":{
++                  "anyOf":[
++                    {"$ref":"#/components/schemas/AdvancedCustomErr"},
++                    {"$ref":"#/components/schemas/AdvancedAnotherErr"},
++                    {"$ref":"#/components/schemas/AdvancedCustomErr"}
++                  ]
++                }
++              }
++            }
+           },
+           "409":{
+             "description":"Conflict",
+@@ -408,6 +418,7 @@
+   },
+   "components":{
+     "schemas":{
++      "AdvancedAnotherErr":{"type":"object","properties":{"foo":{"type":"integer"}}},
+       "AdvancedCustomErr":{"type":"object","properties":{"details":{"type":"object","additionalProperties":{}},"msg":{"type":"string"}}},
+       "AdvancedGzipPassThroughStruct":{
+         "type":"object",
+diff --git a/openapi/collector_test.go b/openapi/collector_test.go
+index df84406..f679851 100644
+--- a/openapi/collector_test.go
++++ b/openapi/collector_test.go
+@@ -1,10 +1,14 @@
+ package openapi_test
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"errors"
+ 	"mime/multipart"
+ 	"net/http"
+ 	"net/http/httptest"
++	"reflect"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -186,3 +190,160 @@ func TestCollector_Collect_requestMapping(t *testing.T) {
+ 	}
+ 	assert.NoError(t, collector.ProvideRequestJSONSchemas(http.MethodPost, new(input), mapping, val))
+ }
++
++// collectorCombineErrorsAnotherErr is another custom error.
++type collectorCombineErrorsAnotherErr struct {
++	Foo int `json:"foo"`
++}
++
++func (collectorCombineErrorsAnotherErr) Error() string {
++	return "foo happened"
++}
++
++func TestCollector_Collect_CombineErrorsAlternatives(t *testing.T) {
++	u := usecase.IOInteractor{}
++
++	u.SetTitle("Title")
++	u.SetName("name")
++	u.SetExpectedErrors(status.InvalidArgument, collectorCombineErrorsAnotherErr{}, status.FailedPrecondition, status.AlreadyExists)
++
++	h := rest.HandlerTrait{}
++	h.MakeErrResp = func(ctx context.Context, err error) (int, interface{}) {
++		code, er := rest.Err(err)
++
++		var ae collectorCombineErrorsAnotherErr
++
++		if errors.As(err, &ae) {
++			return http.StatusBadRequest, ae
++		}
++
++		return code, er
++	}
++
++	collector := openapi.Collector{}
++	combineErrors := reflect.ValueOf(&collector).Elem().FieldByName("CombineErrors")
++	if combineErrors.IsValid() && combineErrors.CanSet() {
++		combineErrors.SetString("oneOf")
++	}
++
++	require.NoError(t, collector.Collect(http.MethodPost, "/test", u, h))
++
++	specJSON, err := json.Marshal(collector.Reflector().SpecEns())
++	require.NoError(t, err)
++
++	var spec map[string]interface{}
++	require.NoError(t, json.Unmarshal(specJSON, &spec))
++	paths := spec["paths"].(map[string]interface{})
++	path := paths["/test"].(map[string]interface{})
++	post := path["post"].(map[string]interface{})
++	responses := post["responses"].(map[string]interface{})
++	badRequest := responses["400"].(map[string]interface{})
++	content := badRequest["content"].(map[string]interface{})
++	mediaType := content["application/json"].(map[string]interface{})
++	responseSchema := mediaType["schema"].(map[string]interface{})
++	alternatives, ok := responseSchema["oneOf"].([]interface{})
++	require.True(t, ok, "same-status errors should be documented as oneOf alternatives")
++	require.Len(t, alternatives, 3, "each supplied error should retain an alternative")
++
++	components := spec["components"].(map[string]interface{})
++	schemas := components["schemas"].(map[string]interface{})
++	resolve := func(schema interface{}) interface{} {
++		value := schema.(map[string]interface{})
++		ref, ok := value["$ref"].(string)
++		if !ok {
++			return value
++		}
++		name := ref[strings.LastIndex(ref, "/")+1:]
++		return schemas[name]
++	}
++	responseShape := func(schema interface{}) map[string]interface{} {
++		resolved := resolve(schema).(map[string]interface{})
++		properties := resolved["properties"].(map[string]interface{})
++		shape := make(map[string]interface{}, len(properties))
++		for name, rawProperty := range properties {
++			property := rawProperty.(map[string]interface{})
++			shape[name] = property["type"]
++		}
++		return shape
++	}
++	firstShape := responseShape(alternatives[0])
++	secondShape := responseShape(alternatives[1])
++	thirdShape := responseShape(alternatives[2])
++	assert.Equal(t, firstShape, thirdShape, "the first and third supplied errors have equivalent response shapes")
++	assert.NotEqual(t, firstShape, secondShape, "the second supplied error has a different response shape")
++	assert.Contains(t, firstShape, "error", "the status errors retain the default error response schema")
++	foo, ok := secondShape["foo"]
++	require.True(t, ok, "the custom error response schema should include the custom error field")
++	assert.Equal(t, "integer", foo, "the custom error response should retain its field type")
++}
++
++// collectorDefaultErrHTTPStatus is an expected error that exposes its own HTTP status.
++type collectorDefaultErrHTTPStatus struct{}
++
++func (collectorDefaultErrHTTPStatus) Error() string {
++	return "unprocessable"
++}
++
++func (collectorDefaultErrHTTPStatus) HTTPStatus() int {
++	return http.StatusUnprocessableEntity
++}
++
++func TestCollector_Collect_expectedErrorsWithoutMakeErrResp(t *testing.T) {
++	u := usecase.IOInteractor{}
++
++	u.SetTitle("Title")
++	u.SetName("name")
++	u.SetExpectedErrors(status.NotFound, errors.New("plain failure"), collectorDefaultErrHTTPStatus{})
++
++	collector := openapi.Collector{}
++
++	require.NoError(t, collector.Collect(http.MethodPost, "/test", u, rest.HandlerTrait{}))
++
++	specJSON, err := json.Marshal(collector.Reflector().SpecEns())
++	require.NoError(t, err)
++
++	var spec map[string]interface{}
++	require.NoError(t, json.Unmarshal(specJSON, &spec))
++	paths := spec["paths"].(map[string]interface{})
++	post := paths["/test"].(map[string]interface{})["post"].(map[string]interface{})
++	responses := post["responses"].(map[string]interface{})
++	components := spec["components"].(map[string]interface{})
++	schemas := components["schemas"].(map[string]interface{})
++
++	// Status comes from rest.Err: canonical status, HTTPStatus() and the HTTP 500 fallback.
++	for code, name := range map[string]string{
++		"404": "canonical status error",
++		"422": "error with HTTPStatus",
++		"500": "plain error",
++	} {
++		response, ok := responses[code].(map[string]interface{})
++		require.True(t, ok, "%s should be documented with status %s", name, code)
++
++		content := response["content"].(map[string]interface{})
++		mediaType := content["application/json"].(map[string]interface{})
++		schema := mediaType["schema"].(map[string]interface{})
++
++		if ref, isRef := schema["$ref"].(string); isRef {
++			schema = schemas[ref[strings.LastIndex(ref, "/")+1:]].(map[string]interface{})
++		}
++
++		properties, ok := schema["properties"].(map[string]interface{})
++		require.True(t, ok, "%s should document a response object", name)
++		assert.Contains(t, properties, "error", "%s should document the ErrResponse error field", name)
++		assert.Contains(t, properties, "status", "%s should document the ErrResponse status field", name)
++	}
++}
++
++func TestCollector_Collect_expectedErrorsAreErrors(t *testing.T) {
++	u := usecase.IOInteractor{}
++
++	// Every value passed to SetExpectedErrors must implement error: the variadic parameter must be an error type.
++	method, ok := reflect.TypeOf(&u).MethodByName("SetExpectedErrors")
++	require.True(t, ok, "SetExpectedErrors should be available on use case interactors")
++	require.True(t, method.Type.IsVariadic(), "SetExpectedErrors should accept variadic errors")
++
++	errType := reflect.TypeOf((*error)(nil)).Elem()
++	elemType := method.Type.In(method.Type.NumIn() - 1).Elem()
++	assert.True(t, elemType.Implements(errType),
++		"SetExpectedErrors parameters should implement error, got %s", elemType)
++}

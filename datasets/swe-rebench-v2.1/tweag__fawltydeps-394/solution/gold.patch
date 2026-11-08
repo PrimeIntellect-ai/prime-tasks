@@ -1,0 +1,344 @@
+diff --git a/README.md b/README.md
+index 293f776..190a91b 100644
+--- a/README.md
++++ b/README.md
+@@ -161,9 +161,10 @@ customization options are summarized in the table below:
+ | Priority | Mapping strategy        | Options |
+ |----------|----------------------|------------|
+ | 1        | User-defined mapping | Provide a custom mapping in TOML format via `--custom-mapping-file` or a `[tool.fawltydeps.custom_mapping]` section in `pyproject.toml`. <br /> Default: No custom mapping|
+-| 2        | Mapping from installed packages | Point to one or more environments via `--pyenv`.<br />Default: auto-discovery of Python environments under the project’s basepath. If none are found, default to the Python environment in which FawltyDeps itself is installed.|
+-| 3a       | Mapping via temporary installation of packages  | Activated with the `--install-deps` option.|
+-| 3b       | Identity mapping | Active by default. Deactivated when `--install-deps` is used. |
++| 2        | Mapping from installed packages found inside project | Point to one or more environments with `--pyenv`.<br />Default: auto-discovery of Python environments under the project’s basepath.|
++| 3        | Mapping from packages installed in `sys.path` | Active by default. No CLI option. This finds packages installed in the Python environment in which FawltyDeps itself runs.|
++| 4a       | Mapping via temporary installation of packages  | Activated with the `--install-deps` option.|
++| 4b       | Identity mapping | Active by default. Deactivated when `--install-deps` is used. |
+ 
+ 
+ #### Local Python environment mapping
+@@ -193,19 +194,20 @@ If `--pyenv` is not used, FawltyDeps will look for _Python environments_
+ (virtualenvs or similar directories like `.venv` or `__pypackages__`.) inside
+ your project (i.e. under `basepath`, if given, or the current directory).
+ 
+-If no Python environments are found within your project, FawltyDeps will fall
+-back to looking at your _current Python environment_: This is the environment
+-in which FawltyDeps itself is installed.
+-
+-This works well when you, for example, `pip install fawltydeps` into the same
+-virtualenv as your project dependencies.
+-
+ You can use `--pyenv` multiple times to have FawltyDeps look for packages in
+ multiple Python environments. In this case (or when multiple Python environments
+ are found inside your project) FawltyDeps will use the union (superset) of all
+ imports provided by all matching packages across those Python environments as
+ valid import names for that dependency.
+ 
++#### Current Python environment
++
++In addition to the local Python environments found above, FawltyDeps will also
++look at your _current Python environment_, i.e. the environment in which
++FawltyDeps itself is installed. This works well when you, for example,
++`pip install fawltydeps` into the same virtualenv as your project dependencies,
++no matter where this virtualenv may be located.
++
+ #### Identity mapping
+ 
+ When unable to find an installed package that corresponds to a declared
+@@ -364,8 +366,7 @@ Here is a complete list of configuration directives we support:
+ - `pyenvs`: Where to look for Python environments (directories like `.venv`,
+   `__pypackages__`, or similar) to be used for resolving project dependencies
+   into provided import names. Defaults to looking for Python environments under
+-  the current directory, i.e. like `pyenvs = ["."]`. If none are found, use the
+-  Python environment where FawltyDeps is installed (aka. `sys.path`).
++  the current directory, i.e. like `pyenvs = ["."]`.
+ - `ignore_undeclared`: A list of specific dependencies to ignore when reporting
+   undeclared dependencies, for example: `["some_module", "some_other_module"]`.
+   The default is the empty list: `ignore_undeclared = []`.
+@@ -537,10 +538,10 @@ To solve this, FawltyDeps looks at the packages installed in your Python
+ environment to correctly map dependencies (package names) into the imports that
+ they provide. This is:
+ 
+-- any Python environment found via the `--pyenv` option, or
+-- any Python environment found within your project (`basepath` or the current
+-  directory).
+-- Failing that, FawltyDeps will use the _current Python environment_,
++- any Python environment found via the `--pyenv` option,
++- or if `--pyenv` is not given: any Python environment found within your
++  project (`basepath` or the current directory).
++- In addition, FawltyDeps will use the _current Python environment_,
+   i.e. the one in which FawltyDeps itself is running.
+ 
+ As a final resort, when an installed package is not found for a declared
+diff --git a/fawltydeps/cli_parser.py b/fawltydeps/cli_parser.py
+index 8369ef1..dd44755 100644
+--- a/fawltydeps/cli_parser.py
++++ b/fawltydeps/cli_parser.py
+@@ -177,8 +177,7 @@ def populate_parser_paths_options(parser: argparse._ActionsContainer) -> None:
+         help=(
+             "Where to search for Python environments that have project"
+             " dependencies installed. Defaults to searching under basepaths"
+-            " (see above). If no environments are found, fall back to using the"
+-            " Python environment where FawltyDeps is installed."
++            " (see above)."
+         ),
+     )
+     parser.add_argument(
+diff --git a/fawltydeps/main.py b/fawltydeps/main.py
+index 1b96926..0a1661c 100644
+--- a/fawltydeps/main.py
++++ b/fawltydeps/main.py
+@@ -140,14 +140,14 @@ class Analysis:  # pylint: disable=too-many-instance-attributes
+     @calculated_once
+     def resolved_deps(self) -> Dict[str, Package]:
+         """The resolved mapping of dependency names to provided import names."""
++        pyenv_srcs = {src for src in self.sources if isinstance(src, PyEnvSource)}
+         return resolve_dependencies(
+             (dep.name for dep in self.declared_deps),
+             setup_resolvers(
+                 custom_mapping_files=self.settings.custom_mapping_file,
+                 custom_mapping=self.settings.custom_mapping,
+-                pyenv_srcs={
+-                    src for src in self.sources if isinstance(src, PyEnvSource)
+-                },
++                pyenv_srcs=pyenv_srcs,
++                use_current_env=True,
+                 install_deps=self.settings.install_deps,
+             ),
+         )
+diff --git a/fawltydeps/packages.py b/fawltydeps/packages.py
+index f4ae3a0..e454c39 100644
+--- a/fawltydeps/packages.py
++++ b/fawltydeps/packages.py
+@@ -205,21 +205,109 @@ class UserDefinedMapping(BasePackageResolver):
+         }
+ 
+ 
+-class LocalPackageResolver(BasePackageResolver):
++class InstalledPackageResolver(BasePackageResolver):
+     """Lookup imports exposed by packages installed in a Python environment."""
+ 
++    def __init__(self) -> None:
++        """Lookup packages installed in some Python environments.
++
++        Uses importlib_metadata to look up the mapping between packages and
++        their provided import names.
++        """
++        # We enumerate packages _once_ and cache the result here:
++        self._packages: Optional[Dict[str, Package]] = None
++
++    def _from_one_env(
++        self, env_paths: List[str]
++    ) -> Iterator[Tuple[CustomMapping, str]]:
++        """Return package-name-to-import-names mapping from one Python env.
++
++        This is roughly equivalent to calling importlib_metadata's
++        packages_distributions(), except that instead of implicitly querying
++        sys.path, we query the given env_paths instead.
++
++        Also, we are able to return packages that map to zero import names,
++        whereas packages_distributions() cannot.
++        """
++        seen = set()  # Package names (normalized) seen earlier in env_paths
++
++        # We're reaching into the internals of importlib_metadata here, which
++        # Mypy is not overly fond of, hence lots of "type: ignore"...
++        context = DistributionFinder.Context(path=env_paths)  # type: ignore
++        for dist in MetadataPathFinder().find_distributions(context):
++            normalized_name = Package.normalize_name(dist.name)
++            parent_dir = dist.locate_file("")
++            if normalized_name in seen:
++                # We already found another instance of this package earlier in
++                # env_paths. Assume that the earlier package is what Python's
++                # import machinery will choose, and that this later package is
++                # not interesting.
++                logger.debug(f"Skip {dist.name} {dist.version} under {parent_dir}")
++                continue
++
++            logger.debug(f"Found {dist.name} {dist.version} under {parent_dir}")
++            seen.add(normalized_name)
++            imports = list(
++                _top_level_declared(dist)  # type: ignore
++                or _top_level_inferred(dist)  # type: ignore
++            )
++            yield {dist.name: imports}, str(parent_dir)
++
++    @property
++    @abstractmethod
++    def packages(self) -> Dict[str, Package]:
++        """Return mapping of package names to Package objects."""
++        raise NotImplementedError
++
++    def lookup_packages(self, package_names: Set[str]) -> Dict[str, Package]:
++        """Convert package names to locally available Package objects.
++
++        (Although this function generally works with _all_ locally available
++        packages, we apply it only to the subset that is the dependencies of
++        the current project.)
++
++        Return a dict mapping package names to the Package objects that
++        encapsulate the package-name-to-import-names mappings.
++
++        Only return dict entries for the packages that we manage to find in the
++        local environment. Omit any packages for which we're unable to determine
++        what imports names they provide. This applies to packages that are
++        missing from the local environment, or packages where we fail to
++        determine its provided import names.
++        """
++        return {
++            name: self.packages[Package.normalize_name(name)]
++            for name in package_names
++            if Package.normalize_name(name) in self.packages
++        }
++
++
++class SysPathPackageResolver(InstalledPackageResolver):
++    """Lookup imports exposed by packages installed in sys.path."""
++
++    @property
++    @calculated_once
++    def packages(self) -> Dict[str, Package]:
++        """Return mapping of package names to Package objects.
++
++        This enumerates the available packages in the current Python environment
++        (aka. sys.path) _once_, and caches the result for the remainder of this
++        object's life.
++        """
++        return accumulate_mappings(self.__class__, self._from_one_env(sys.path))
++
++
++class LocalPackageResolver(InstalledPackageResolver):
++    """Lookup imports packages installed in the given Python environments."""
++
+     def __init__(self, srcs: AbstractSet[PyEnvSource] = frozenset()) -> None:
+         """Lookup packages installed in the given Python environments.
+ 
+-        Default to the current python environment (aka. sys.path) if `srcs` is
+-        empty (the default).
+-
+         Use importlib_metadata to look up the mapping between packages and their
+         provided import names.
+         """
++        super().__init__()
+         self.package_dirs: Set[Path] = set(src.path for src in srcs)
+-        # We enumerate packages for pyenv_path _once_ and cache the result here:
+-        self._packages: Optional[Dict[str, Package]] = None
+ 
+     @classmethod
+     def find_package_dirs(cls, path: Path) -> Iterator[Path]:
+@@ -265,42 +353,6 @@ class LocalPackageResolver(BasePackageResolver):
+                     package_dir.relative_to(path)  # ValueError if not relative
+                     yield package_dir
+ 
+-    def _from_one_env(
+-        self, env_paths: List[str]
+-    ) -> Iterator[Tuple[CustomMapping, str]]:
+-        """Return package-name-to-import-names mapping from one Python env.
+-
+-        This is roughly equivalent to calling importlib_metadata's
+-        packages_distributions(), except that instead of implicitly querying
+-        sys.path, we query env_paths instead.
+-
+-        Also, we are able to return packages that map to zero import names,
+-        whereas packages_distributions() cannot.
+-        """
+-        seen = set()  # Package names (normalized) seen earlier in env_paths
+-
+-        # We're reaching into the internals of importlib_metadata here, which
+-        # Mypy is not overly fond of, hence lots of "type: ignore"...
+-        context = DistributionFinder.Context(path=env_paths)  # type: ignore
+-        for dist in MetadataPathFinder().find_distributions(context):
+-            normalized_name = Package.normalize_name(dist.name)
+-            parent_dir = dist.locate_file("")
+-            if normalized_name in seen:
+-                # We already found another instance of this package earlier in
+-                # env_paths. Assume that the earlier package is what Python's
+-                # import machinery will choose, and that this later package is
+-                # not interesting.
+-                logger.debug(f"Skip {dist.name} {dist.version} under {parent_dir}")
+-                continue
+-
+-            logger.debug(f"Found {dist.name} {dist.version} under {parent_dir}")
+-            seen.add(normalized_name)
+-            imports = list(
+-                _top_level_declared(dist)  # type: ignore
+-                or _top_level_inferred(dist)  # type: ignore
+-            )
+-            yield {dist.name: imports}, str(parent_dir)
+-
+     @property
+     @calculated_once
+     def packages(self) -> Dict[str, Package]:
+@@ -312,36 +364,11 @@ class LocalPackageResolver(BasePackageResolver):
+         """
+ 
+         def _pyenvs() -> Iterator[Tuple[CustomMapping, str]]:
+-            if not self.package_dirs:  # No pyenvs given, fall back to sys.path
+-                yield from self._from_one_env(sys.path)
+-            else:
+-                for package_dir in self.package_dirs:
+-                    yield from self._from_one_env([str(package_dir)])
++            for package_dir in self.package_dirs:
++                yield from self._from_one_env([str(package_dir)])
+ 
+         return accumulate_mappings(self.__class__, _pyenvs())
+ 
+-    def lookup_packages(self, package_names: Set[str]) -> Dict[str, Package]:
+-        """Convert package names to locally available Package objects.
+-
+-        (Although this function generally works with _all_ locally available
+-        packages, we apply it only to the subset that is the dependencies of
+-        the current project.)
+-
+-        Return a dict mapping package names to the Package objects that
+-        encapsulate the package-name-to-import-names mappings.
+-
+-        Only return dict entries for the packages that we manage to find in the
+-        local environment. Omit any packages for which we're unable to determine
+-        what imports names they provide. This applies to packages that are
+-        missing from the local environment, or packages where we fail to
+-        determine its provided import names.
+-        """
+-        return {
+-            name: self.packages[Package.normalize_name(name)]
+-            for name in package_names
+-            if Package.normalize_name(name) in self.packages
+-        }
+-
+ 
+ def pyenv_sources(*pyenv_paths: Path) -> Set[PyEnvSource]:
+     """Helper for converting Python environment paths into PyEnvSources.
+@@ -485,9 +512,11 @@ class IdentityMapping(BasePackageResolver):
+ 
+ 
+ def setup_resolvers(
++    *,
+     custom_mapping_files: Optional[Set[Path]] = None,
+     custom_mapping: Optional[CustomMapping] = None,
+     pyenv_srcs: AbstractSet[PyEnvSource] = frozenset(),
++    use_current_env: bool = False,
+     install_deps: bool = False,
+ ) -> Iterator[BasePackageResolver]:
+     """Configure a sequence of resolvers according to the given arguments.
+@@ -501,6 +530,9 @@ def setup_resolvers(
+ 
+     yield LocalPackageResolver(pyenv_srcs)
+ 
++    if use_current_env:
++        yield SysPathPackageResolver()
++
+     if install_deps:
+         yield TemporaryPipInstallResolver()
+     else:
+diff --git a/noxfile.py b/noxfile.py
+index ad52910..9c9d7ab 100644
+--- a/noxfile.py
++++ b/noxfile.py
+@@ -88,7 +88,7 @@ def self_test(session):
+     install_groups(session, include=["nox", "test", "lint", "format", "dev"])
+     # For --pyenv, use Nox's virtualenv, or fall back to current virtualenv
+     venv_path = getattr(session.virtualenv, "location", sys.prefix)
+-    session.run("fawltydeps", f"--pyenv={venv_path}")
++    session.run("fawltydeps")
+ 
+ 
+ @nox.session(python=python_versions)

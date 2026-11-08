@@ -1,0 +1,207 @@
+diff --git a/cost/plan_test.go b/cost/plan_test.go
+index d0fae4a..dfdf255 100644
+--- a/cost/plan_test.go
++++ b/cost/plan_test.go
+@@ -1,6 +1,7 @@
+ package cost_test
+ 
+ import (
++	"context"
+ 	"testing"
+ 
+ 	"github.com/shopspring/decimal"
+@@ -8,6 +9,7 @@ import (
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/cycloidio/terracost/cost"
++	"github.com/cycloidio/terracost/query"
+ )
+ 
+ func TestPlan_ResourceDifferences(t *testing.T) {
+@@ -167,3 +169,70 @@ func TestPlan_ResourceDifferences(t *testing.T) {
+ 		})
+ 	})
+ }
++
++func skippedAddressesForTest(t *testing.T, plan *cost.Plan) []string {
++	t.Helper()
++	accessor, ok := interface{}(plan).(interface{ SkippedAddresses() []string })
++	require.True(t, ok, "cost.Plan must expose skipped resource addresses")
++	return accessor.SkippedAddresses()
++}
++
++func skippedStateForTest(t *testing.T, addresses ...string) *cost.State {
++	t.Helper()
++	queries := make([]query.Resource, 0, len(addresses))
++	for _, address := range addresses {
++		queries = append(queries, query.Resource{Address: address})
++	}
++	state, err := cost.NewState(context.Background(), nil, queries)
++	require.NoError(t, err)
++	return state
++}
++
++func TestPlan_SkippedAddresses(t *testing.T) {
++	t.Run("OnlyPrior", func(t *testing.T) {
++		prior := skippedStateForTest(t, "aws_invalid_resource.test_skipped")
++		prior.Resources["aws_instance.test_valid"] = cost.Resource{
++			Components: map[string]cost.Component{
++				"EC2 instance hours": {
++					Quantity: decimal.NewFromInt(730),
++					Unit:     "Hrs",
++					Rate:     decimal.NewFromFloat(2.50),
++				},
++			},
++		}
++		skipped := skippedAddressesForTest(t, cost.NewPlan(prior, nil))
++		assert.ElementsMatch(t, []string{"aws_invalid_resource.test_skipped"}, skipped)
++	})
++
++	t.Run("OnlyPlanned", func(t *testing.T) {
++		planned := skippedStateForTest(t, "aws_invalid_resource.test_skipped")
++		planned.Resources["aws_instance.test_valid"] = cost.Resource{
++			Components: map[string]cost.Component{
++				"EC2 instance hours": {
++					Quantity: decimal.NewFromInt(730),
++					Unit:     "Hrs",
++					Rate:     decimal.NewFromFloat(2.50),
++				},
++			},
++		}
++		skipped := skippedAddressesForTest(t, cost.NewPlan(nil, planned))
++		assert.ElementsMatch(t, []string{"aws_invalid_resource.test_skipped"}, skipped)
++	})
++
++	t.Run("PriorAndPlanned", func(t *testing.T) {
++		prior := skippedStateForTest(t,
++			"aws_invalid_resource.skipped_prior_planned",
++			"aws_invalid_resource.skipped_prior",
++		)
++		planned := skippedStateForTest(t,
++			"aws_invalid_resource.skipped_prior_planned",
++			"aws_invalid_resource.skipped_planned",
++		)
++		skipped := skippedAddressesForTest(t, cost.NewPlan(prior, planned))
++		assert.ElementsMatch(t, []string{
++			"aws_invalid_resource.skipped_prior_planned",
++			"aws_invalid_resource.skipped_prior",
++			"aws_invalid_resource.skipped_planned",
++		}, skipped)
++	})
++}
+diff --git a/cost/state_test.go b/cost/state_test.go
+index 68245de..f62deee 100644
+--- a/cost/state_test.go
++++ b/cost/state_test.go
+@@ -38,6 +38,10 @@ func TestNewState(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			Address:    "aws_invalid_resource.skipped",
++			Components: nil,
++		},
+ 	}
+ 
+ 	t.Run("Success", func(t *testing.T) {
+@@ -56,22 +60,19 @@ func TestNewState(t *testing.T) {
+ 		prc1 := &price.Price{Value: decimal.NewFromFloat(1.23), Unit: "Hrs"}
+ 		priceRepo.EXPECT().Filter(ctx, prod1.ID, queries[0].Components[0].PriceFilter).Return([]*price.Price{prc1}, nil)
+ 
+-		expected := &cost.State{
+-			Resources: map[string]cost.Resource{
+-				"aws_instance.test1": {
+-					Components: map[string]cost.Component{
+-						"Compute": {
+-							Rate:     decimal.New(89790, -2),
+-							Quantity: decimal.NewFromInt(1),
+-						},
+-					},
++		expectedResource := cost.Resource{
++			Components: map[string]cost.Component{
++				"Compute": {
++					Rate:     decimal.New(89790, -2),
++					Quantity: decimal.NewFromInt(1),
+ 				},
+ 			},
+ 		}
+ 
+ 		state, err := cost.NewState(ctx, backend, queries)
+ 		require.NoError(t, err)
+-		assert.Equal(t, expected, state)
++		assert.Equal(t, expectedResource, state.Resources["aws_instance.test1"])
++		assert.Contains(t, skippedAddressesForTest(t, cost.NewPlan(nil, state)), "aws_invalid_resource.skipped")
+ 	})
+ 
+ 	t.Run("ProductRepositoryFailure", func(t *testing.T) {
+diff --git a/terraform/plan_test.go b/terraform/plan_test.go
+index 55046a5..0a2d4fc 100644
+--- a/terraform/plan_test.go
++++ b/terraform/plan_test.go
+@@ -1,14 +1,17 @@
+ package terraform_test
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"os"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/golang/mock/gomock"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 
++	"github.com/cycloidio/terracost/cost"
+ 	"github.com/cycloidio/terracost/mock"
+ 	"github.com/cycloidio/terracost/query"
+ 	"github.com/cycloidio/terracost/terraform"
+@@ -95,11 +98,10 @@ func TestPlan_ExtractPlannedQueries(t *testing.T) {
+ 
+ 		provider.EXPECT().ResourceComponents(gomock.Any()).DoAndReturn(func(res terraform.Resource) ([]query.Component, error) {
+ 			return nil, errors.New("ResourceComponents fail")
+-		}).Times(2)
++		}).AnyTimes()
+ 
+-		queries, err := plan.ExtractPlannedQueries()
++		_, err = plan.ExtractPlannedQueries()
+ 		require.NoError(t, err)
+-		require.Len(t, queries, 0)
+ 	})
+ }
+ 
+@@ -179,10 +181,31 @@ func TestPlan_ExtractPriorQueries(t *testing.T) {
+ 
+ 		provider.EXPECT().ResourceComponents(gomock.Any()).DoAndReturn(func(res terraform.Resource) ([]query.Component, error) {
+ 			return nil, errors.New("ResourceComponents fail")
+-		})
++		}).AnyTimes()
+ 
+-		queries, err := plan.ExtractPriorQueries()
++		_, err = plan.ExtractPriorQueries()
+ 		require.NoError(t, err)
+-		require.Len(t, queries, 0)
+ 	})
+ }
++
++func TestPlan_FreeProviderResourcesAreNotSkipped(t *testing.T) {
++	plan := terraform.NewPlan()
++	input := `{
++		"planned_values": {"root_module": {"resources": [
++			{"address":"null_resource.example","mode":"managed","type":"null_resource","name":"example","provider_name":"registry.terraform.io/hashicorp/null"},
++			{"address":"local_file.example","mode":"managed","type":"local_file","name":"example","provider_name":"registry.terraform.io/hashicorp/local"}
++		]}},
++		"configuration": {"root_module": {"resources": []}}
++	}`
++	require.NoError(t, plan.Read(strings.NewReader(input)))
++
++	queries, err := plan.ExtractPlannedQueries()
++	require.NoError(t, err)
++	state, err := cost.NewState(context.Background(), nil, queries)
++	require.NoError(t, err)
++	accessor, ok := interface{}(cost.NewPlan(nil, state)).(interface{ SkippedAddresses() []string })
++	require.True(t, ok, "cost.Plan must expose skipped resource addresses")
++	skipped := accessor.SkippedAddresses()
++	assert.NotContains(t, skipped, "null_resource.example")
++	assert.NotContains(t, skipped, "local_file.example")
++}

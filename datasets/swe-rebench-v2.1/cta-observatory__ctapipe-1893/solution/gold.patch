@@ -1,0 +1,266 @@
+diff --git a/ctapipe/containers.py b/ctapipe/containers.py
+index 6c869260..a4a8c99f 100644
+--- a/ctapipe/containers.py
++++ b/ctapipe/containers.py
+@@ -494,7 +494,7 @@ class SimulatedCameraContainer(Container):
+     container_prefix = ""
+ 
+     true_image_sum = Field(
+-        np.nan, "Sum of the detected Cherenkov photons in the camera"
++        np.int32(-1), "Total number of detected Cherenkov photons in the camera"
+     )
+     true_image = Field(
+         None,
+diff --git a/ctapipe/core/tool.py b/ctapipe/core/tool.py
+index 2d4118bf..d934da4c 100644
+--- a/ctapipe/core/tool.py
++++ b/ctapipe/core/tool.py
+@@ -175,7 +175,6 @@ class Tool(Application):
+             "log-level": "Tool.log_level",
+             ("l", "log-file"): "Tool.log_file",
+             "log-file-level": "Tool.log_file_level",
+-            "provenance-log": "Tool.provenance_log",
+         }
+         # makes sure user defined aliases override default aliases
+         self.aliases = {**aliases, **self.aliases}
+diff --git a/ctapipe/io/astropy_helpers.py b/ctapipe/io/astropy_helpers.py
+index cc12d413..cab045a7 100644
+--- a/ctapipe/io/astropy_helpers.py
++++ b/ctapipe/io/astropy_helpers.py
+@@ -76,6 +76,8 @@ def read_table(
+         # methods
+         path = os.path.join("/", path)
+         table = h5file.get_node(path)
++        if not isinstance(table, tables.Table):
++            raise IOError(f"Node {path} is a {table.__class__.__name__}, must be a Table")
+         transforms, descriptions, meta = _parse_hdf5_attrs(table)
+ 
+         if condition is None:
+diff --git a/ctapipe/io/datawriter.py b/ctapipe/io/datawriter.py
+index ed8d811e..fdac4548 100644
+--- a/ctapipe/io/datawriter.py
++++ b/ctapipe/io/datawriter.py
+@@ -405,7 +405,10 @@ class DataWriter(Component):
+         writer.exclude("/dl1/monitoring/telescope/pointing/.*", "trigger_pixels")
+         writer.exclude("/dl1/monitoring/event/pointing/.*", "event_type")
+ 
+-        if self.write_parameters is False:
++        if not self.write_images:
++            writer.exclude("/simulation/event/telescope/images/.*", "true_image")
++
++        if not self.write_parameters:
+             writer.exclude("/dl1/event/telescope/images/.*", "image_mask")
+ 
+         if self._is_simulation:
+@@ -626,46 +629,44 @@ class DataWriter(Component):
+ 
+             table_name = self.table_name(tel_id, str(telescope))
+ 
+-            has_sim_camera = self._is_simulation and (
+-                tel_id in event.simulation.tel
+-                and event.simulation.tel[tel_id].true_image is not None
+-            )
+-
+             if self.write_parameters:
+                 writer.write(
+                     table_name=f"dl1/event/telescope/parameters/{table_name}",
+                     containers=[tel_index, *dl1_camera.parameters.values()],
+                 )
+ 
+-                if has_sim_camera:
+-                    writer.write(
+-                        f"simulation/event/telescope/parameters/{table_name}",
+-                        [
+-                            tel_index,
+-                            *event.simulation.tel[tel_id].true_parameters.values(),
+-                        ],
+-                    )
+-
+             if self.write_images:
+                 if dl1_camera.image is None:
+                     raise ValueError(
+                         "DataWriter.write_images is True but event does not contain image"
+                     )
+-                # note that we always write the image, even if the image quality
+-                # criteria are not met (those are only to determine if the parameters
+-                # can be computed).
+-                self.log.debug("WRITING IMAGES")
++
+                 writer.write(
+                     table_name=f"dl1/event/telescope/images/{table_name}",
+                     containers=[tel_index, dl1_camera],
+                 )
+ 
+-                if self._is_simulation and has_sim_camera:
++            if self._is_simulation:
++                # always write this, so that at least the sum is included
++                writer.write(
++                    f"simulation/event/telescope/images/{table_name}",
++                    [tel_index, event.simulation.tel[tel_id]],
++                )
++
++                has_sim_image = (
++                    tel_id in event.simulation.tel
++                    and event.simulation.tel[tel_id].true_image is not None
++                )
++                if self.write_parameters and has_sim_image:
+                     writer.write(
+-                        f"simulation/event/telescope/images/{table_name}",
+-                        [tel_index, event.simulation.tel[tel_id]],
++                        f"simulation/event/telescope/parameters/{table_name}",
++                        [
++                            tel_index,
++                            *event.simulation.tel[tel_id].true_parameters.values(),
++                        ],
+                     )
+ 
++
+     def _write_dl2_telescope_events(
+         self, writer: TableWriter, event: ArrayEventContainer
+     ):
+diff --git a/ctapipe/tools/merge.py b/ctapipe/tools/merge.py
+index e1e64cb8..8cce3186 100644
+--- a/ctapipe/tools/merge.py
++++ b/ctapipe/tools/merge.py
+@@ -11,6 +11,8 @@ import tables
+ import numpy as np
+ from tqdm.auto import tqdm
+ 
++from ctapipe.utils.arrays import recarray_drop_columns
++
+ from ..io import metadata as meta, HDF5EventSource, get_hdf5_datalevels
+ from ..io import HDF5TableWriter
+ from ..core import Provenance, Tool, traits
+@@ -58,13 +60,16 @@ nodes_with_tels = {
+     "/simulation/event/telescope/parameters",
+     "/simulation/event/telescope/images",
+ }
+-image_nodes = {"/simulation/event/telescope/images", "/dl1/event/telescope/images"}
++image_nodes = {
++    "/dl1/event/telescope/images",
++}
+ parameter_nodes = {
+     "/simulation/event/telescope/parameters",
+     "/dl1/event/telescope/parameters",
+ }
+ 
+-simulation_images = {"/simulation/event/telescope/images"}
++SIMULATED_IMAGE_GROUP = "/simulation/event/telescope/images"
++simulation_images = {SIMULATED_IMAGE_GROUP}
+ 
+ dl2_subarray_nodes = {"/dl2/event/subarray/geometry"}
+ 
+@@ -235,13 +240,13 @@ class MergeTool(Tool):
+         # setup required nodes
+         self.usable_nodes = all_nodes.copy()
+ 
+-        if self.skip_simu_images is True:
++        if self.skip_simu_images:
+             self.usable_nodes -= simulation_images
+ 
+-        if self.skip_images is True:
++        if self.skip_images:
+             self.usable_nodes -= image_nodes
+ 
+-        if self.skip_parameters is True:
++        if self.skip_parameters:
+             self.usable_nodes -= parameter_nodes
+ 
+         # Use first file as reference to setup nodes to merge
+@@ -344,7 +349,7 @@ class MergeTool(Tool):
+                 if node in file:
+                     file.copy_node(node, newparent=target_group)
+ 
+-    def _merge_tel_group(self, file, input_node):
++    def _merge_tel_group(self, file, input_node, filter_columns=None):
+         """Add a group that has one child table per telescope (type) to outputfile"""
+         if not isinstance(input_node, tables.Group):
+             raise TypeError(f"node must be a `tables.Group`, got {input_node}")
+@@ -356,23 +361,35 @@ class MergeTool(Tool):
+ 
+         for tel_name, table in input_node._v_children.items():
+             if not self.allowed_tels or tel_name in self.allowed_tel_names:
+-                self._merge_table(file, table)
++                self._merge_table(file, table, filter_columns=filter_columns)
+ 
+-    def _merge_table(self, file, input_node):
++    def _merge_table(self, file, input_node, filter_columns=None):
+         if not isinstance(input_node, tables.Table):
+             raise TypeError(f"node must be a `tables.Table`, got {input_node}")
+ 
+         node_path = input_node._v_pathname
+         if node_path in self.output_file:
+             output_table = self.output_file.get_node(node_path)
+-            output_table.append(input_node[:].astype(output_table.dtype))
++            input_table = input_node[:]
++            if filter_columns is not None:
++                input_table = recarray_drop_columns(input_table, filter_columns)
++            output_table.append(input_table.astype(output_table.dtype))
+         else:
+             group_path, _ = os.path.split(node_path)
+             if group_path not in self.output_file:
+                 self._create_group(group_path)
+ 
+             target_group = self.output_file.root[group_path]
+-            file.copy_node(node_path, newparent=target_group)
++            if filter_columns is None:
++                file.copy_node(node_path, newparent=target_group)
++            else:
++                input_table = recarray_drop_columns(input_node[:], filter_columns)
++                where, name = os.path.split(node_path)
++                self.output_file.create_table(
++                    where, name, filters=input_node.filters,
++                    createparents=True,
++                    obj=input_table,
++                )
+ 
+     def merge_tables(self, file):
+         """Go over all mergeable nodes and append to outputfile"""
+@@ -387,7 +404,11 @@ class MergeTool(Tool):
+ 
+                 # nodes with child tables per telescope (type)
+                 if node_path in nodes_with_tels:
+-                    self._merge_tel_group(file, node)
++                    if node_path == SIMULATED_IMAGE_GROUP and self.skip_images:
++                        filter_columns = ["true_image"]
++                    else:
++                        filter_columns = None
++                    self._merge_tel_group(file, node, filter_columns=filter_columns)
+ 
+                 # groups of tables (e.g. dl2)
+                 elif isinstance(node, tables.Group):
+diff --git a/ctapipe/utils/arrays.py b/ctapipe/utils/arrays.py
+new file mode 100644
+index 00000000..2f6af42c
+--- /dev/null
++++ b/ctapipe/utils/arrays.py
+@@ -0,0 +1,29 @@
++'''
++Some utility functions to work with numpy (rec) arrays
++'''
++import numpy as np
++from numpy.lib.recfunctions import repack_fields
++
++
++def recarray_drop_columns(array, columns):
++    '''
++    Remove columns from rec array
++    '''
++    to_use = [col for col in array.dtype.names if col not in columns]
++    subset = array.view(subset_dtype(array.dtype, to_use))
++    return repack_fields(subset)
++
++
++def subset_dtype(dtype, names):
++    '''
++    Create a new dtype only containing a subset of the columns
++    '''
++    formats = [dtype.fields[name][0] for name in names]
++    offsets = [dtype.fields[name][1] for name in names]
++    itemsize = dtype.itemsize
++    return np.dtype(dict(
++        names=names,
++        formats=formats,
++        offsets=offsets,
++        itemsize=itemsize
++    ))

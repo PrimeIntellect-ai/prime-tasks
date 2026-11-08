@@ -1,0 +1,2 @@
+Micrometer adapter does not pass tags to open connections gauge
+In [`MicrometerApnsClientMetricsListener:163`](https://github.com/relayrides/pushy/blob/ddd6c9054c1c026b0aa55eeb8f200e1a7dcc90eb/micrometer-metrics-listener/src/main/java/com/turo/pushy/apns/metrics/micrometer/MicrometerApnsClientMetricsListener.java#L163), the tags given to the constructor does not get passed into `meterRegistry.gauge(...)`. This might be an issue when there are more than one `ApnsClient` instances, especially when the metrics are tagged with a unique string.

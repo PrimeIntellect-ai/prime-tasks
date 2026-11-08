@@ -1,0 +1,180 @@
+diff --git a/doc/reference/elem.valuerep.rst b/doc/reference/elem.valuerep.rst
+index d5c6c091f..295f43a07 100644
+--- a/doc/reference/elem.valuerep.rst
++++ b/doc/reference/elem.valuerep.rst
+@@ -19,6 +19,7 @@ or TM and utilities.
+    DSfloat
+    DT
+    IS
++   ISfloat
+    MultiString
+    PersonName
+    PersonNameUnicode
+diff --git a/doc/release_notes/v2.4.0.rst b/doc/release_notes/v2.4.0.rst
+index 151e45479..9c5dd34ce 100644
+--- a/doc/release_notes/v2.4.0.rst
++++ b/doc/release_notes/v2.4.0.rst
+@@ -14,6 +14,8 @@ Enhancements
+ * CLI commands now accept *pydicom* charset test files and CLI help shows
+   Python Version (:pr:`1674`)
+ * Added support for Python 3.11 (:issue:`1658`)
++* Added :class:`~pydicom.valuerep.ISfloat` to allow non-strict reading of
++  existing files with float IS values (:issue:`1661`)
+ 
+ Fixes
+ -----
+diff --git a/pydicom/config.py b/pydicom/config.py
+index 25250c8b8..d64350583 100644
+--- a/pydicom/config.py
++++ b/pydicom/config.py
+@@ -268,6 +268,18 @@ def disable_value_validation() -> Generator:
+         settings._writing_validation_mode = writing_mode
+ 
+ 
++@contextmanager
++def strict_reading() -> Generator:
++    """Context manager to temporarily enably strict value validation
++    for reading."""
++    original_reading_mode = settings._reading_validation_mode
++    try:
++        settings.reading_validation_mode = RAISE
++        yield
++    finally:
++        settings._reading_validation_mode = original_reading_mode
++
++
+ convert_wrong_length_to_UN = False
+ """Convert a field VR to "UN" and return bytes if bytes length is invalid.
+ Default ``False``.
+diff --git a/pydicom/dataset.py b/pydicom/dataset.py
+index a6f887966..7e0d5be5e 100644
+--- a/pydicom/dataset.py
++++ b/pydicom/dataset.py
+@@ -16,6 +16,7 @@ Dataset (dict subclass)
+ """
+ import copy
+ from bisect import bisect_left
++from contextlib import nullcontext
+ import io
+ from importlib.util import find_spec as have_package
+ import inspect  # for __dir__
+@@ -2490,18 +2491,23 @@ class Dataset:
+             :class:`Dataset` representation based on the DICOM JSON Model.
+         """
+         json_dataset = {}
+-        for key in self.keys():
+-            json_key = '{:08X}'.format(key)
+-            try:
+-                data_element = self[key]
+-                json_dataset[json_key] = data_element.to_json_dict(
+-                    bulk_data_element_handler=bulk_data_element_handler,
+-                    bulk_data_threshold=bulk_data_threshold
+-                )
+-            except Exception as exc:
+-                logger.error(f"Error while processing tag {json_key}")
+-                if not suppress_invalid_tags:
+-                    raise exc
++        context = (
++            config.strict_reading() if suppress_invalid_tags
++            else nullcontext()
++        )
++        with context:
++            for key in self.keys():
++                json_key = '{:08X}'.format(key)
++                try:
++                    data_element = self[key]
++                    json_dataset[json_key] = data_element.to_json_dict(
++                        bulk_data_element_handler=bulk_data_element_handler,
++                        bulk_data_threshold=bulk_data_threshold
++                    )
++                except Exception as exc:
++                    logger.error(f"Error while processing tag {json_key}")
++                    if not suppress_invalid_tags:
++                        raise exc
+ 
+         return json_dataset
+ 
+diff --git a/pydicom/valuerep.py b/pydicom/valuerep.py
+index 6a1bf8efb..c637ae0f8 100644
+--- a/pydicom/valuerep.py
++++ b/pydicom/valuerep.py
+@@ -1248,6 +1248,48 @@ def DS(
+     return DSfloat(val, auto_format, validation_mode)
+ 
+ 
++class ISfloat(float):
++    """Store value for an element with VR **IS** as :class:`float`.
++
++    Stores original integer string for exact rewriting of the string
++    originally read or stored.
++
++    Note: By the DICOM standard, IS can only be an :class:`int`,
++    however, it is not uncommon to see float IS values.  This class
++    is used if the config settings allow non-strict reading.
++
++    Generally, use :class:`~pydicom.valuerep.IS` to create IS values,
++    this is returned instead if the value cannot be represented as an
++    :class:`int`.  See :class:`~pydicom.valuerep.IS` for details of the
++    parameters and return values.
++    """
++    def __new__(  # type: ignore[misc]
++            cls: Type["ISfloat"], val: Union[str, float, Decimal],
++            validation_mode: int = None
++    ) -> float:
++        return super().__new__(cls, val)
++
++    def __init__(self, val: Union[str, float, Decimal],
++                 validation_mode: int = None) -> None:
++        # If a string passed, then store it
++        if isinstance(val, str):
++            self.original_string = val.strip()
++        elif isinstance(val, (IS, ISfloat)) and hasattr(val, 'original_string'):
++            self.original_string = val.original_string
++        if validation_mode:
++            msg = (
++                f'Value "{str(self)}" is not valid for elements with a VR '
++                'of IS'
++            )
++            if validation_mode == config.WARN:
++                warnings.warn(msg)
++            elif validation_mode == config.RAISE:
++                msg += (
++                    "\nSet reading_validation_mode to WARN or IGNORE to bypass"
++                )
++                raise TypeError(msg)
++
++
+ class IS(int):
+     """Store value for an element with VR **IS** as :class:`int`.
+ 
+@@ -1258,7 +1300,7 @@ class IS(int):
+     def __new__(  # type: ignore[misc]
+             cls: Type["IS"], val: Union[None, str, int, float, Decimal],
+             validation_mode: int = None
+-    ) -> Optional[Union[str, "IS"]]:
++    ) -> Optional[Union[str, "IS", "ISfloat"]]:
+         """Create instance if new integer string"""
+         if val is None:
+             return val
+@@ -1272,16 +1314,16 @@ class IS(int):
+             validate_value("IS", val, validation_mode)
+ 
+         try:
+-            newval = super().__new__(cls, val)
++            newval: Union[IS, ISfloat] = super().__new__(cls, val)
+         except ValueError:
+             # accept float strings when no integer loss, e.g. "1.0"
+             newval = super().__new__(cls, float(val))
+ 
+-        # check if a float or Decimal passed in, then could have lost info,
+-        # and will raise error. E.g. IS(Decimal('1')) is ok, but not IS(1.23)
+-        #   IS('1.23') will raise ValueError
++        # If a float or Decimal was passed in, check for non-integer,
++        # i.e. could lose info if converted to int
++        # If so, create an ISfloat instead (if allowed by settings)
+         if isinstance(val, (float, Decimal, str)) and newval != float(val):
+-            raise TypeError("Could not convert value to integer without loss")
++            newval = ISfloat(val, validation_mode)
+ 
+         # Checks in case underlying int is >32 bits, DICOM does not allow this
+         if (not -2**31 <= newval < 2**31 and

@@ -1,0 +1,194 @@
+diff --git a/server/clustering_test.go b/server/clustering_test.go
+index 287b585..4faddfd 100644
+--- a/server/clustering_test.go
++++ b/server/clustering_test.go
+@@ -8031,3 +8031,40 @@ func TestClusteringAddRemoveClusterNodesWithBootstrap(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestClusteringDurableReplaced(t *testing.T) {
++	cleanupDatastore(t)
++	defer cleanupDatastore(t)
++	cleanupRaftLog(t)
++	defer cleanupRaftLog(t)
++
++	// For this test, use a central NATS server.
++	ns := natsdTest.RunDefaultServer()
++	defer ns.Shutdown()
++
++	// Configure first server
++	s1sOpts := getTestDefaultOptsForClustering("a", true)
++	enableReplaceDurable(t, s1sOpts)
++	s1 := runServerWithOpts(t, s1sOpts, nil)
++	defer s1.Shutdown()
++
++	// Wait for it to bootstrap
++	getLeader(t, 10*time.Second, s1)
++
++	// Configure second server.
++	s2sOpts := getTestDefaultOptsForClustering("b", false)
++	enableReplaceDurable(t, s2sOpts)
++	s2 := runServerWithOpts(t, s2sOpts, nil)
++	defer s2.Shutdown()
++
++	// Configure third server.
++	s3sOpts := getTestDefaultOptsForClustering("c", false)
++	enableReplaceDurable(t, s3sOpts)
++	s3 := runServerWithOpts(t, s3sOpts, nil)
++	defer s3.Shutdown()
++
++	testDurableReplaced(t)
++
++	s1.Shutdown()
++	getLeader(t, 2*time.Second, s2, s3)
++}
+diff --git a/server/conf_test.go b/server/conf_test.go
+index 8636191..4a25f92 100644
+--- a/server/conf_test.go
++++ b/server/conf_test.go
+@@ -440,6 +440,7 @@ func TestParseWrongTypes(t *testing.T) {
+ 	expectFailureFor(t, "ft_group: 123", wrongTypeErr)
+ 	expectFailureFor(t, "partitioning: 123", wrongTypeErr)
+ 	expectFailureFor(t, "syslog_name: 123", wrongTypeErr)
++	expectFailureFor(t, "replace_durable: 123", wrongTypeErr)
+ 	expectFailureFor(t, "store_limits:{max_channels:false}", wrongTypeErr)
+ 	expectFailureFor(t, "store_limits:{max_msgs:false}", wrongTypeErr)
+ 	expectFailureFor(t, "store_limits:{max_bytes:false}", wrongTypeErr)
+diff --git a/server/partitions_test.go b/server/partitions_test.go
+index 278bea8..7da180b 100644
+--- a/server/partitions_test.go
++++ b/server/partitions_test.go
+@@ -1027,3 +1027,36 @@ func TestPartitionsCleanInvalidConns(t *testing.T) {
+ 		t.Fatalf("Should not be more than %v, got %v", maxKnownInvalidConns, mlen)
+ 	}
+ }
++
++func TestPartitionsDurableReplaced(t *testing.T) {
++	setPartitionsVarsForTest()
++	defer resetDefaultPartitionsVars()
++
++	clientCheckTimeout = 150 * time.Millisecond
++	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
++
++	// For this test, create a single NATS server to which both servers connect to.
++	ns := natsdTest.RunDefaultServer()
++	defer ns.Shutdown()
++
++	fooSubj := "foo"
++	barSubj := "bar"
++
++	opts1 := GetDefaultOptions()
++	opts1.NATSServerURL = "nats://127.0.0.1:4222"
++	opts1.Partitioning = true
++	enableReplaceDurable(t, opts1)
++	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
++	s1 := runServerWithOpts(t, opts1, nil)
++	defer s1.Shutdown()
++
++	opts2 := GetDefaultOptions()
++	opts2.NATSServerURL = "nats://127.0.0.1:4222"
++	opts2.Partitioning = true
++	enableReplaceDurable(t, opts2)
++	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
++	s2 := runServerWithOpts(t, opts2, nil)
++	defer s2.Shutdown()
++
++	testDurableReplaced(t)
++}
+diff --git a/server/server_durable_test.go b/server/server_durable_test.go
+index f1b6018..041c76c 100644
+--- a/server/server_durable_test.go
++++ b/server/server_durable_test.go
+@@ -15,6 +15,9 @@ package server
+ 
+ import (
+ 	"fmt"
++	"os"
++	"reflect"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -918,3 +921,81 @@ func TestPersistentStoreDurableClosedStatusOnRestart(t *testing.T) {
+ 	// Restart one last time
+ 	dur = restartDurable()
+ }
++
++func TestDurableReplacedDeliversToNewSubscription(t *testing.T) {
++	opts := GetDefaultOptions()
++	enableReplaceDurable(t, opts)
++	s := runServerWithOpts(t, opts, nil)
++	defer s.Shutdown()
++
++	testDurableReplaced(t)
++}
++
++func TestDurableReplacedUsingPublicOption(t *testing.T) {
++	opts := GetDefaultOptions()
++	replaceDurable := reflect.ValueOf(opts).Elem().FieldByName("ReplaceDurable")
++	if !replaceDurable.IsValid() || replaceDurable.Kind() != reflect.Bool || !replaceDurable.CanSet() {
++		t.Fatal("Options must expose a public boolean ReplaceDurable field")
++	}
++	replaceDurable.SetBool(true)
++	s := runServerWithOpts(t, opts, nil)
++	defer s.Shutdown()
++
++	testDurableReplaced(t)
++}
++
++func TestDurableReplacedDisabledByDefault(t *testing.T) {
++	s := runServer(t, clusterName)
++	defer s.Shutdown()
++	sc := NewDefaultConnection(t)
++	defer sc.Close()
++
++	if _, err := sc.Subscribe("foo", func(*stan.Msg) {}, stan.DurableName("dur")); err != nil {
++		t.Fatalf("Unable to start durable: %v", err)
++	}
++	if _, err := sc.Subscribe("foo", func(*stan.Msg) {}, stan.DurableName("dur")); err == nil || !strings.Contains(err.Error(), "duplicate durable") {
++		t.Fatalf("Expected duplicate durable error with default options, got %v", err)
++	}
++}
++
++// enableReplaceDurable turns on the replace-durable behavior through the
++// public configuration-file key.
++func enableReplaceDurable(t *testing.T, opts *Options) {
++	t.Helper()
++	confFile := createConfFile(t, []byte("replace_durable: true"))
++	defer os.Remove(confFile)
++	if err := ProcessConfigFile(confFile, opts); err != nil {
++		t.Fatalf("Error processing config file: %v", err)
++	}
++}
++
++func testDurableReplaced(t *testing.T) {
++	sc := NewDefaultConnection(t)
++	defer sc.Close()
++
++	oldDelivered := make(chan *stan.Msg, 1)
++	newDelivered := make(chan *stan.Msg, 1)
++	dur1, err := sc.Subscribe("foo", func(m *stan.Msg) { oldDelivered <- m }, stan.DurableName("dur"))
++	if err != nil {
++		t.Fatalf("Unable to start durable: %v", err)
++	}
++	_ = dur1
++
++	if _, err = sc.Subscribe("foo", func(m *stan.Msg) { newDelivered <- m }, stan.DurableName("dur")); err != nil {
++		t.Fatalf("Unable to replace durable: %v", err)
++	}
++	if err := sc.Publish("foo", []byte("msg")); err != nil {
++		t.Fatalf("Unable to publish: %v", err)
++	}
++
++	select {
++	case <-newDelivered:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Replacement durable did not receive the message")
++	}
++	select {
++	case <-oldDelivered:
++		t.Fatal("Replaced durable received the message")
++	case <-time.After(200 * time.Millisecond):
++	}
++}

@@ -1,0 +1,198 @@
+diff --git a/internal/controller/workspace/workspace_test.go b/internal/controller/workspace/workspace_test.go
+index 2d21e47..2f05c97 100644
+--- a/internal/controller/workspace/workspace_test.go
++++ b/internal/controller/workspace/workspace_test.go
+@@ -18,17 +18,22 @@ package workspace
+ 
+ import (
+ 	"context"
++	"encoding/json"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/pkg/errors"
+ 	"github.com/spf13/afero"
+ 	corev1 "k8s.io/api/core/v1"
++	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/yaml"
+ 
+ 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+ 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
+@@ -522,6 +527,170 @@ func TestConnect(t *testing.T) {
+ 	}
+ }
+ 
++func TestConnectEntrypoint(t *testing.T) {
++	uid := types.UID("entrypoint-uid")
++	checkout := filepath.Join(tfDir, string(uid))
++
++	// Build a local module source that mimics a remote checkout containing a
++	// module which references a sibling module through a relative path.
++	src, err := os.MkdirTemp("", "tf-module")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(src)
++	if err := os.MkdirAll(filepath.Join(src, "relative-path-iam"), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Join(src, "iam"), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(src, "relative-path-iam", "main.tf"), []byte(`module "iam" { source = "../iam" }`), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(src, "iam", "main.tf"), []byte(`variable "iamRole" {}`), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	cases := map[string]struct {
++		reason         string
++		entrypoint     string
++		omitEntrypoint bool
++		wantDir        string
++	}{
++		"EntrypointSubdirectory": {
++			reason:     "Terraform should be initialized in the entrypoint subdirectory of the checked out module",
++			entrypoint: "relative-path-iam",
++			wantDir:    filepath.Join(checkout, "relative-path-iam"),
++		},
++		"NoEntrypoint": {
++			reason:         "Terraform should be initialized in the root of the checked out module when entrypoint is omitted",
++			omitEntrypoint: true,
++			wantDir:        checkout,
++		},
++	}
++
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			// The remote checkout is written to the real filesystem, so make
++			// sure we start from a clean slate and clean up afterwards.
++			os.RemoveAll(checkout)
++			defer os.RemoveAll(checkout)
++
++			// Stand in for the terraform binary. It records the directory it
++			// runs in, honouring a leading -chdir option the way terraform does.
++			record := filepath.Join(t.TempDir(), "cwd")
++			bin := filepath.Join(t.TempDir(), "terraform")
++			script := fmt.Sprintf(`#!/bin/sh
++while [ $# -gt 0 ]; do
++  case "$1" in
++    -chdir=*) cd "${1#-chdir=}" || exit 1 ;;
++    *) break ;;
++  esac
++  shift
++done
++pwd > '%s'
++`, record)
++			if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
++				t.Fatal(err)
++			}
++
++			c := connector{
++				kube:  &test.MockClient{MockGet: test.NewMockGetFn(nil)},
++				usage: resource.TrackerFn(func(_ context.Context, _ resource.Managed) error { return nil }),
++				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
++				terraform: func(dir string) tfclient {
++					return terraform.Harness{Path: bin, Dir: dir}
++				},
++			}
++			mg := &v1alpha1.Workspace{
++				ObjectMeta: metav1.ObjectMeta{UID: uid},
++				Spec: v1alpha1.WorkspaceSpec{
++					ResourceSpec: xpv1.ResourceSpec{ProviderConfigReference: &xpv1.Reference{}},
++					ForProvider: v1alpha1.WorkspaceParameters{
++						Module: src,
++						Source: v1alpha1.ModuleSourceRemote,
++					},
++				},
++			}
++			forProvider := map[string]interface{}{}
++			if !tc.omitEntrypoint {
++				forProvider["entrypoint"] = tc.entrypoint
++			}
++			entrypointJSON, err := json.Marshal(map[string]interface{}{
++				"spec": map[string]interface{}{
++					"forProvider": forProvider,
++				},
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := json.Unmarshal(entrypointJSON, mg); err != nil {
++				t.Fatal(err)
++			}
++			if _, err := c.Connect(context.Background(), mg); err != nil {
++				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
++			}
++
++			got, err := os.ReadFile(record)
++			if err != nil {
++				t.Fatalf("%s: terraform was not run: %v", tc.reason, err)
++			}
++			gotDir := strings.TrimSpace(string(got))
++			// The checkout may be a symlink to the local module source, so
++			// compare physical paths.
++			wantDir, err := filepath.EvalSymlinks(tc.wantDir)
++			if err != nil {
++				t.Fatalf("%s: expected directory is not available: %v", tc.reason, err)
++			}
++			if gotDir != wantDir {
++				t.Fatalf("%s: terraform ran in %q, want %q", tc.reason, gotDir, wantDir)
++			}
++
++			if tc.entrypoint != "" {
++				if _, err := os.Stat(filepath.Join(gotDir, "main.tf")); err != nil {
++					t.Errorf("%s: entrypoint configuration is not in terraform's working directory: %v", tc.reason, err)
++				}
++				siblingModule := filepath.Join(gotDir, "..", "iam", "main.tf")
++				if _, err := os.Stat(siblingModule); err != nil {
++					t.Errorf("%s: sibling module is not available relative to the entrypoint: %v", tc.reason, err)
++				}
++			} else {
++				for _, moduleFile := range []string{"relative-path-iam/main.tf", "iam/main.tf"} {
++					if _, err := os.Stat(filepath.Join(gotDir, moduleFile)); err != nil {
++						t.Errorf("%s: checked-out module file %q is not available from terraform's working directory: %v", tc.reason, moduleFile, err)
++					}
++				}
++			}
++		})
++	}
++}
++
++func TestEntrypointOptionalInSchema(t *testing.T) {
++	data, err := os.ReadFile(filepath.Join("..", "..", "..", "package", "crds", "tf.crossplane.io_workspaces.yaml"))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	crd := apiextensionsv1.CustomResourceDefinition{}
++	if err := yaml.Unmarshal(data, &crd); err != nil {
++		t.Fatal(err)
++	}
++	for _, version := range crd.Spec.Versions {
++		if version.Name != "v1alpha1" || version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
++			continue
++		}
++		workspaceSpec := version.Schema.OpenAPIV3Schema.Properties["spec"]
++		parameters := workspaceSpec.Properties["forProvider"]
++		for _, required := range parameters.Required {
++			if required == "entrypoint" {
++				t.Fatal("entrypoint must not be required in Workspace parameters")
++			}
++		}
++		return
++	}
++	t.Fatal("Workspace v1alpha1 schema was not found")
++}
++
+ func TestObserve(t *testing.T) {
+ 	errBoom := errors.New("boom")
+ 	now := metav1.Now()

@@ -1,0 +1,193 @@
+diff --git a/README.md b/README.md
+index 0d0c3d4..61e1fb8 100644
+--- a/README.md
++++ b/README.md
+@@ -5,7 +5,7 @@
+   [![Release](https://img.shields.io/pypi/v/circuit-knitting-toolbox.svg?label=Release)](https://github.com/Qiskit-Extensions/circuit-knitting-toolbox/releases)
+   ![Platform](https://img.shields.io/badge/%F0%9F%92%BB%20Platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)
+   [![Python](https://img.shields.io/pypi/pyversions/circuit-knitting-toolbox?label=Python&logo=python)](https://www.python.org/)
+-  [![Qiskit](https://img.shields.io/badge/Qiskit%20-%20%3E%3D0.46%20-%20%236133BD?logo=Qiskit)](https://github.com/Qiskit/qiskit)
++  [![Qiskit](https://img.shields.io/badge/Qiskit%20-%20%3E%3D1.0%20-%20%236133BD?logo=Qiskit)](https://github.com/Qiskit/qiskit)
+ <br />
+   [![Docs (stable)](https://img.shields.io/badge/%F0%9F%93%84%20Docs-stable-blue.svg)](https://qiskit-extensions.github.io/circuit-knitting-toolbox/)
+   [![DOI](https://zenodo.org/badge/543181258.svg)](https://zenodo.org/badge/latestdoi/543181258)
+diff --git a/circuit_knitting/cutting/cutting_reconstruction.py b/circuit_knitting/cutting/cutting_reconstruction.py
+index 40094a1..ca1d80d 100644
+--- a/circuit_knitting/cutting/cutting_reconstruction.py
++++ b/circuit_knitting/cutting/cutting_reconstruction.py
+@@ -17,7 +17,10 @@ from collections.abc import Sequence, Hashable
+ 
+ import numpy as np
+ from qiskit.quantum_info import PauliList
+-from qiskit.primitives import SamplerResult
++from qiskit.primitives import (
++    SamplerResult,  # for SamplerV1
++    PrimitiveResult,  # for SamplerV2
++)
+ 
+ from ..utils.observable_grouping import CommutingObservableGroup, ObservableCollection
+ from ..utils.bitwise import bit_count
+@@ -27,7 +30,11 @@ from .qpd import WeightType
+ 
+ 
+ def reconstruct_expectation_values(
+-    results: SamplerResult | dict[Hashable, SamplerResult],
++    results: (
++        SamplerResult
++        | PrimitiveResult
++        | dict[Hashable, SamplerResult | PrimitiveResult]
++    ),
+     coefficients: Sequence[tuple[float, WeightType]],
+     observables: PauliList | dict[Hashable, PauliList],
+ ) -> list[float]:
+@@ -68,9 +75,11 @@ def reconstruct_expectation_values(
+         ValueError: ``observables`` and ``results`` are of incompatible types.
+         ValueError: An input observable has a phase not equal to 1.
+     """
+-    if isinstance(observables, PauliList) and not isinstance(results, SamplerResult):
++    if isinstance(observables, PauliList) and not isinstance(
++        results, (SamplerResult, PrimitiveResult)
++    ):
+         raise ValueError(
+-            "If observables is a PauliList, results must be a SamplerResult instance."
++            "If observables is a PauliList, results must be a SamplerResult or PrimitiveResult instance."
+         )
+     if isinstance(observables, dict) and not isinstance(results, dict):
+         raise ValueError(
+@@ -84,7 +93,7 @@ def reconstruct_expectation_values(
+         subobservables_by_subsystem = decompose_observables(
+             observables, "A" * len(observables[0])
+         )
+-        results_dict: dict[Hashable, SamplerResult] = {"A": results}
++        results_dict: dict[Hashable, SamplerResult | PrimitiveResult] = {"A": results}
+         expvals = np.zeros(len(observables))
+ 
+     else:
+@@ -107,10 +116,28 @@ def reconstruct_expectation_values(
+             subsystem_expvals = [
+                 np.zeros(len(cog.commuting_observables)) for cog in so.groups
+             ]
++            current_result = results_dict[label]
+             for k, cog in enumerate(so.groups):
+-                quasi_probs = results_dict[label].quasi_dists[i * len(so.groups) + k]
+-                for outcome, quasi_prob in quasi_probs.items():
+-                    subsystem_expvals[k] += quasi_prob * _process_outcome(cog, outcome)
++                idx = i * len(so.groups) + k
++                if isinstance(current_result, SamplerResult):
++                    # SamplerV1 provides a SamplerResult
++                    quasi_probs = current_result.quasi_dists[idx]
++                    for outcome, quasi_prob in quasi_probs.items():
++                        subsystem_expvals[k] += quasi_prob * _process_outcome(
++                            cog, outcome
++                        )
++                else:
++                    # SamplerV2 provides a PrimitiveResult
++                    data_pub = current_result[idx].data
++                    obs_array = data_pub.observable_measurements.array
++                    qpd_array = data_pub.qpd_measurements.array
++                    shots = qpd_array.shape[0]
++                    for j in range(shots):
++                        obs_outcomes = int.from_bytes(obs_array[j], "big")
++                        qpd_outcomes = int.from_bytes(qpd_array[j], "big")
++                        subsystem_expvals[k] += (1 / shots) * _process_outcome_v2(
++                            cog, obs_outcomes, qpd_outcomes
++                        )
+ 
+             for k, subobservable in enumerate(subobservables_by_subsystem[label]):
+                 current_expvals[k] *= np.mean(
+@@ -140,19 +167,38 @@ def _process_outcome(
+     num_meas_bits = len(_get_pauli_indices(cog))
+ 
+     outcome = _outcome_to_int(outcome)
+-    meas_outcomes = outcome & ((1 << num_meas_bits) - 1)
++    obs_outcomes = outcome & ((1 << num_meas_bits) - 1)
+     qpd_outcomes = outcome >> num_meas_bits
+ 
++    return _process_outcome_v2(cog, obs_outcomes, qpd_outcomes)
++
++
++def _process_outcome_v2(
++    cog: CommutingObservableGroup, obs_outcomes: int, qpd_outcomes: int, /
++) -> np.typing.NDArray[np.float64]:
++    """
++    Process a single outcome of a QPD experiment with observables.
++
++    Args:
++        cog: The observable set being measured by the current experiment
++        obs_outcomes: An integer containing the outcome bits of the ``observable_measurements`` register
++        qpd_outcomes: An integer containing the outcome bits of the ``qpd_measurements`` register
++
++    Returns:
++        A 1D array of the observable measurements.  The elements of
++        this vector correspond to the elements of ``cog.commuting_observables``,
++        and each result will be either +1 or -1.
++    """
+     # qpd_factor will be -1 or +1, depending on the overall parity of qpd
+     # measurements.
+     qpd_factor = 1 - 2 * (bit_count(qpd_outcomes) & 1)
+ 
+     rv = np.zeros(len(cog.pauli_bitmasks))
+     for i, mask in enumerate(cog.pauli_bitmasks):
+-        # meas will be -1 or +1, depending on the measurement
++        # obs will be -1 or +1, depending on the measurement
+         # of the current operator.
+-        meas = 1 - 2 * (bit_count(meas_outcomes & mask) & 1)
+-        rv[i] = qpd_factor * meas
++        obs = 1 - 2 * (bit_count(obs_outcomes & mask) & 1)
++        rv[i] = qpd_factor * obs
+ 
+     return rv
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 286aab4..af48923 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -30,9 +30,9 @@ dependencies = [
+     "numpy>=1.23.0",
+     "scipy>=1.5.2",
+     "rustworkx>=0.14.0",
+-    "qiskit-aer>=0.12.0",
+-    "qiskit>=0.46.0, <2.0",
+-    "qiskit-ibm-runtime>=0.12.2",
++    "qiskit-aer>=0.13.3",
++    "qiskit>=1.0.0, <2.0",
++    "qiskit-ibm-runtime>=0.21.0",
+ ]
+ 
+ [project.optional-dependencies]
+@@ -55,7 +55,7 @@ test = [
+ ]
+ nbtest = [
+     "circuit-knitting-toolbox[basetest]",
+-    "nbmake>=1.3.4"
++    "nbmake>=1.4.3"
+ ]
+ style = [
+     "autoflake==2.3.0",
+diff --git a/releasenotes/notes/bump-dependency-versions-d5dc3b10ba842f2d.yaml b/releasenotes/notes/bump-dependency-versions-d5dc3b10ba842f2d.yaml
+new file mode 100644
+index 0000000..010b414
+--- /dev/null
++++ b/releasenotes/notes/bump-dependency-versions-d5dc3b10ba842f2d.yaml
+@@ -0,0 +1,6 @@
++---
++upgrade:
++  - |
++    CKT now requires updated versions of some dependencies: ``qiskit``
++    1.0 or later, ``qiskit-aer`` 0.13.3 or later, and
++    ``qiskit-ibm-runtime`` 0.21.0 or later.
+diff --git a/releasenotes/notes/cutting-samplerv2-603b0c631a3330df.yaml b/releasenotes/notes/cutting-samplerv2-603b0c631a3330df.yaml
+new file mode 100644
+index 0000000..0f973c1
+--- /dev/null
++++ b/releasenotes/notes/cutting-samplerv2-603b0c631a3330df.yaml
+@@ -0,0 +1,9 @@
++---
++features:
++  - |
++    Circuit cutting reconstruction can now interpret the
++    :class:`~qiskit.primitives.PrimitiveResult` object, which is
++    returned by version 2 of the sampler primitive
++    (:class:`~qiskit.primitives.BaseSamplerV2`).  See the `migration guide
++    <https://docs.quantum.ibm.com/api/migration-guides/qiskit-1.0-features#qiskitprimitives>`__
++    for details on upgrading to version 2 of the Qiskit primitives.

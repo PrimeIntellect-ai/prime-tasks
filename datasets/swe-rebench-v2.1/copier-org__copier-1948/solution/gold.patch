@@ -1,0 +1,236 @@
+diff --git a/copier/main.py b/copier/main.py
+index 360f2b8..55aef37 100644
+--- a/copier/main.py
++++ b/copier/main.py
+@@ -65,6 +65,7 @@ from .types import (
+     AnyByStrMutableMapping,
+     JSONSerializable,
+     LazyDict,
++    Phase,
+     RelativePath,
+     StrOrPath,
+ )
+@@ -277,10 +278,18 @@ class Worker:
+         Files will only be parsed lazily on 1st access. This helps avoiding
+         circular dependencies when the file name also comes from a variable.
+         """
++
++        def _render(path: str) -> str:
++            with Phase.use(Phase.UNDEFINED):
++                return self._render_string(path)
++
++        # Given those values are lazily rendered on 1st access then cached
++        # the phase value is irrelevant and could be misleading.
++        # As a consequence it is explicitely set to "undefined".
+         return LazyDict(
+             **{
+                 name: lambda path=path: load_answersfile_data(
+-                    self.dst_path, self._render_string(path)
++                    self.dst_path, _render(path)
+                 )
+                 for name, path in self.template.external_data.items()
+             }
+@@ -375,6 +384,7 @@ class Worker:
+             _copier_conf=conf,
+             _folder_name=self.subproject.local_abspath.name,
+             _copier_python=sys.executable,
++            _copier_phase=Phase.current(),
+         )
+ 
+     def _path_matcher(self, patterns: Iterable[str]) -> Callable[[Path], bool]:
+@@ -560,7 +570,9 @@ class Worker:
+         """
+         path = self.answers_file or self.template.answers_relpath
+         template = self.jinja_env.from_string(str(path))
+-        return Path(template.render(**self.answers.combined))
++        return Path(
++            template.render(_copier_phase=Phase.current(), **self.answers.combined)
++        )
+ 
+     @cached_property
+     def all_exclusions(self) -> Sequence[str]:
+@@ -928,7 +940,8 @@ class Worker:
+         """
+         self._check_unsafe("copy")
+         self._print_message(self.template.message_before_copy)
+-        self._ask()
++        with Phase.use(Phase.PROMPT):
++            self._ask()
+         was_existing = self.subproject.local_abspath.exists()
+         try:
+             if not self.quiet:
+@@ -937,12 +950,14 @@ class Worker:
+                     f"\nCopying from template version {self.template.version}",
+                     file=sys.stderr,
+                 )
+-            self._render_template()
++            with Phase.use(Phase.RENDER):
++                self._render_template()
+             if not self.quiet:
+                 # TODO Unify printing tools
+                 print("")  # padding space
+             if not self.skip_tasks:
+-                self._execute_tasks(self.template.tasks)
++                with Phase.use(Phase.TASKS):
++                    self._execute_tasks(self.template.tasks)
+         except Exception:
+             if not was_existing and self.cleanup_on_error:
+                 rmtree(self.subproject.local_abspath)
+@@ -1044,9 +1059,10 @@ class Worker:
+             ) as old_worker:
+                 old_worker.run_copy()
+             # Run pre-migration tasks
+-            self._execute_tasks(
+-                self.template.migration_tasks("before", self.subproject.template)  # type: ignore[arg-type]
+-            )
++            with Phase.use(Phase.MIGRATE):
++                self._execute_tasks(
++                    self.template.migration_tasks("before", self.subproject.template)  # type: ignore[arg-type]
++                )
+             # Create a Git tree object from the current (possibly dirty) index
+             # and keep the object reference.
+             with local.cwd(subproject_top):
+@@ -1120,7 +1136,7 @@ class Worker:
+                 self._git_initialize_repo()
+                 new_copy_head = git("rev-parse", "HEAD").strip()
+             # Extract diff between temporary destination and real destination
+-            # with some special handling of newly added files in both the poject
++            # with some special handling of newly added files in both the project
+             # and the template.
+             with local.cwd(old_copy):
+                 # Configure borrowing Git objects from the real destination and
+@@ -1265,9 +1281,10 @@ class Worker:
+             _remove_old_files(subproject_top, compared)
+ 
+         # Run post-migration tasks
+-        self._execute_tasks(
+-            self.template.migration_tasks("after", self.subproject.template)  # type: ignore[arg-type]
+-        )
++        with Phase.use(Phase.MIGRATE):
++            self._execute_tasks(
++                self.template.migration_tasks("after", self.subproject.template)  # type: ignore[arg-type]
++            )
+ 
+     def _git_initialize_repo(self) -> None:
+         """Initialize a git repository in the current directory."""
+diff --git a/copier/types.py b/copier/types.py
+index f7ca137..a8fd982 100644
+--- a/copier/types.py
++++ b/copier/types.py
+@@ -1,11 +1,17 @@
+ """Complex types, annotations, validators."""
+ 
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from enum import Enum
+ from pathlib import Path
+ from typing import (
+     Annotated,
+     Any,
+     Callable,
+     Dict,
++    Iterator,
+     Literal,
+     Mapping,
+     MutableMapping,
+@@ -75,3 +81,34 @@ class LazyDict:
+         if key not in self.done:
+             self.done[key] = self.pending[key]()
+         return self.done[key]
++
++
++class Phase(str, Enum):
++    """The known execution phases."""
++
++    PROMPT = "prompt"
++    TASKS = "tasks"
++    MIGRATE = "migrate"
++    RENDER = "render"
++    UNDEFINED = "undefined"
++
++    def __str__(self) -> str:
++        return str(self.value)
++
++    @classmethod
++    @contextmanager
++    def use(cls, phase: Phase) -> Iterator[None]:
++        """Set the current phase for the duration of a context."""
++        token = _phase.set(phase)
++        try:
++            yield
++        finally:
++            _phase.reset(token)
++
++    @classmethod
++    def current(cls) -> Phase:
++        """Get the current phase."""
++        return _phase.get()
++
++
++_phase: ContextVar[Phase] = ContextVar("phase", default=Phase.UNDEFINED)
+diff --git a/copier/user_data.py b/copier/user_data.py
+index eec2cfc..ea293fe 100644
+--- a/copier/user_data.py
++++ b/copier/user_data.py
+@@ -5,13 +5,14 @@ from __future__ import annotations
+ import json
+ import warnings
+ from collections import ChainMap
++from collections.abc import Mapping, Sequence
+ from dataclasses import field
+ from datetime import datetime
+ from functools import cached_property
+ from hashlib import sha512
+ from os import urandom
+ from pathlib import Path
+-from typing import Any, Callable, Literal, Mapping, Sequence
++from typing import Any, Callable, Literal
+ 
+ import yaml
+ from jinja2 import UndefinedError
+@@ -33,6 +34,7 @@ from .types import (
+     AnyByStrMutableMapping,
+     LazyDict,
+     MissingType,
++    Phase,
+     StrOrPath,
+ )
+ 
+@@ -464,7 +466,13 @@ class Question:
+                 else value
+             )
+         try:
+-            return template.render({**self.answers.combined, **(extra_answers or {})})
++            return template.render(
++                {
++                    **self.answers.combined,
++                    **(extra_answers or {}),
++                    "_copier_phase": Phase.current(),
++                }
++            )
+         except UndefinedError as error:
+             raise UserMessageError(str(error)) from error
+ 
+diff --git a/docs/creating.md b/docs/creating.md
+index 174ba0b..83e5398 100644
+--- a/docs/creating.md
++++ b/docs/creating.md
+@@ -136,6 +136,16 @@ variable:
+ 
+ The name of the project root directory.
+ 
++### `_copier_phase`
++
++The current phase, one of `"prompt"`,`"tasks"`, `"migrate"` or `"render"`.
++
++!!! note
++
++    There is also an additional `"undefined"` phase used when not in any phase.
++    You may encounter this phase when rendering outside of those phases,
++    when rendering lazily (and the phase notion can be irrelevant) or when testing.
++
+ ## Variables (context-specific)
+ 
+ Some rendering contexts provide variables unique to them:

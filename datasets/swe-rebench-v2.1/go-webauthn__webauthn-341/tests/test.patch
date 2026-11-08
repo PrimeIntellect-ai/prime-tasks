@@ -1,0 +1,560 @@
+diff --git a/metadata/metadata_test.go b/metadata/metadata_test.go
+index b720fdf..a393bb4 100644
+--- a/metadata/metadata_test.go
++++ b/metadata/metadata_test.go
+@@ -82,7 +82,7 @@ func TestConformanceMetadataTOCParsing(t *testing.T) {
+ 	var (
+ 		res  *http.Response
+ 		blob *PayloadJSON
+-		me   *MetadataError
++		me   interface{ Error() string }
+ 	)
+ 
+ 	for _, endpoint := range endpoints {
+@@ -91,7 +91,7 @@ func TestConformanceMetadataTOCParsing(t *testing.T) {
+ 
+ 		if blob, err = decoder.Decode(res.Body); err != nil {
+ 			if errors.As(err, &me) {
+-				t.Log(me.Details)
++				t.Log(me.Error())
+ 			}
+ 		}
+ 
+diff --git a/protocol/assertion_test.go b/protocol/assertion_test.go
+index 2731850..2e00d1a 100644
+--- a/protocol/assertion_test.go
++++ b/protocol/assertion_test.go
+@@ -1,17 +1,52 @@
+-package protocol
++package protocol_test
+ 
+ import (
+ 	"bytes"
+ 	"encoding/base64"
++	"encoding/json"
++	"errors"
+ 	"io"
++	"net/http/httptest"
+ 	"testing"
+ 
++	. "github.com/go-webauthn/webauthn/protocol"
++	"github.com/go-webauthn/webauthn/webauthn"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
+ )
+ 
++func TestFinishDiscoverableLoginWrapsHandlerError(t *testing.T) {
++	sentinel := errors.New("credential lookup failed")
++	body, err := json.Marshal(map[string]any{
++		"id":   "AQ",
++		"type": "public-key",
++		"response": map[string]string{
++			"clientDataJSON":    base64.RawURLEncoding.EncodeToString([]byte(`{}`)),
++			"authenticatorData": base64.RawURLEncoding.EncodeToString(make([]byte, 37)),
++			"userHandle":        base64.RawURLEncoding.EncodeToString([]byte("user")),
++		},
++	})
++	require.NoError(t, err)
++
++	w := &webauthn.WebAuthn{}
++	_, err = w.FinishDiscoverableLogin(func(_, _ []byte) (webauthn.User, error) {
++		return nil, sentinel
++	}, webauthn.SessionData{}, httptest.NewRequest("POST", "/", bytes.NewReader(body)))
++
++	require.Error(t, err)
++	assert.ErrorIs(t, err, sentinel)
++}
++
++func assertProtocolError(t *testing.T, err error, errType, errInfo string) {
++	t.Helper()
++	var protocolError *Error
++	require.ErrorAs(t, err, &protocolError)
++	assert.Equal(t, errType, protocolError.Type)
++	assert.Equal(t, errInfo, protocolError.DevInfo)
++}
++
+ func TestParseCredentialRequestResponse(t *testing.T) {
+ 	byteID, _ := base64.RawURLEncoding.DecodeString("AI7D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng")
+ 	byteAAGUID, _ := base64.RawURLEncoding.DecodeString("rc4AAjW8xgpkiwsl8fBVAw")
+@@ -27,13 +62,12 @@ func TestParseCredentialRequestResponse(t *testing.T) {
+ 	}
+ 
+ 	testCases := []struct {
+-		name       string
+-		args       args
+-		expected   *ParsedCredentialAssertionData
+-		errString  string
+-		errType    string
+-		errDetails string
+-		errInfo    string
++		name      string
++		args      args
++		expected  *ParsedCredentialAssertionData
++		errString string
++		errType   string
++		errInfo   string
+ 	}{
+ 		{
+ 			name: "ShouldParseCredentialAssertion",
+@@ -99,11 +133,10 @@ func TestParseCredentialRequestResponse(t *testing.T) {
+ 			args: args{
+ 				"trailingData",
+ 			},
+-			expected:   nil,
+-			errString:  "Parse error for Assertion",
+-			errType:    "invalid_request",
+-			errDetails: "Parse error for Assertion",
+-			errInfo:    "The body contains trailing data",
++			expected:  nil,
++			errString: "Parse error for Assertion",
++			errType:   "invalid_request",
++			errInfo:   "The body contains trailing data",
+ 		},
+ 	}
+ 
+@@ -118,7 +151,7 @@ func TestParseCredentialRequestResponse(t *testing.T) {
+ 			if tc.errString != "" {
+ 				assert.EqualError(t, err, tc.errString)
+ 
+-				AssertIsProtocolError(t, err, tc.errType, tc.errDetails, tc.errInfo)
++				assertProtocolError(t, err, tc.errType, tc.errInfo)
+ 
+ 				return
+ 			}
+@@ -148,6 +181,19 @@ func TestParseCredentialRequestResponse(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseCredentialRequestResponseBody_ErrorUnwrap(t *testing.T) {
++	_, err := ParseCredentialRequestResponseBody(bytes.NewReader([]byte("this is not valid json")))
++	require.Error(t, err)
++
++	var protoErr *Error
++
++	require.ErrorAs(t, err, &protoErr)
++
++	cause := errors.Unwrap(protoErr)
++	require.NotNil(t, cause, "protocol.Error must wrap the error that caused it so callers can unwrap it")
++	require.ErrorIs(t, err, cause)
++}
++
+ func TestParsedCredentialAssertionData_Verify(t *testing.T) {
+ 	type fields struct {
+ 		ParsedPublicKeyCredential ParsedPublicKeyCredential
+diff --git a/protocol/attestation_androidkey.go b/protocol/attestation_androidkey.go
+index 6e387b3..38452bb 100644
+--- a/protocol/attestation_androidkey.go
++++ b/protocol/attestation_androidkey.go
+@@ -109,7 +109,7 @@ func verifyAndroidKeyFormat(att AttestationObject, clientDataHash []byte, _ meta
+ 	}
+ 
+ 	// Verify that the attestationChallenge field in the attestation certificate extension data is identical to clientDataHash.
+-	if 0 != bytes.Compare(decoded.AttestationChallenge, clientDataHash) {
++	if bytes.Compare(decoded.AttestationChallenge, clientDataHash) != 0 {
+ 		return "", nil, ErrAttestationFormat.WithDetails("Attestation challenge not equal to clientDataHash")
+ 	}
+ 
+diff --git a/protocol/attestation_androidkey_test.go b/protocol/attestation_androidkey_test.go
+index bdec9bc..ba9d94d 100644
+--- a/protocol/attestation_androidkey_test.go
++++ b/protocol/attestation_androidkey_test.go
+@@ -54,14 +54,10 @@ func TestVerifyAndroidKeyFormat(t *testing.T) {
+ 				t.Errorf("verifyAndroidKeyFormat() error = %v, wantErr %v", err, tt.wantErr)
+ 				return
+ 			}
++
+ 			if got != tt.want {
+ 				t.Errorf("verifyAndroidKeyFormat() got = %v, want %v", got, tt.want)
+ 			}
+-			/*
+-			if !reflect.DeepEqual(got1, tt.want1) {
+-				t.Errorf("verifySafetyNetFormat() got1 = %v, want %v", got1, tt.want1)
+-			}
+-			*/
+ 		})
+ 	}
+ }
+diff --git a/protocol/attestation_apple.go b/protocol/attestation_apple.go
+index 9b80b28..a69232a 100644
+--- a/protocol/attestation_apple.go
++++ b/protocol/attestation_apple.go
+@@ -34,8 +34,7 @@ func init() {
+ func verifyAppleFormat(att AttestationObject, clientDataHash []byte, _ metadata.Provider) (string, []any, error) {
+ 	// Step 1. Verify that attStmt is valid CBOR conforming to the syntax defined
+ 	// above and perform CBOR decoding on it to extract the contained fields.
+-
+-	// If x5c is not present, return an error
++	// If x5c is not present, return an error.
+ 	x5c, x509present := att.AttStatement[stmtX5C].([]any)
+ 	if !x509present {
+ 		// Handle Basic Attestation steps for the x509 Certificate
+@@ -104,7 +103,8 @@ func verifyAppleFormat(att AttestationObject, clientDataHash []byte, _ metadata.
+ 	return string(metadata.AnonCA), x5c, nil
+ }
+ 
+-// Apple has not yet publish schema for the extension(as of JULY 2021.)
++// AppleAnonymousAttestation represents the attestation format for Apple, who have not yet published a schema for the
++// extension (as of JULY 2021.)
+ type AppleAnonymousAttestation struct {
+ 	Nonce []byte `asn1:"tag:1,explicit"`
+ }
+diff --git a/protocol/attestation_packed.go b/protocol/attestation_packed.go
+index a46a47f..ddd17ee 100644
+--- a/protocol/attestation_packed.go
++++ b/protocol/attestation_packed.go
+@@ -37,10 +37,8 @@ func init() {
+ func verifyPackedFormat(att AttestationObject, clientDataHash []byte, _ metadata.Provider) (string, []any, error) {
+ 	// Step 1. Verify that attStmt is valid CBOR conforming to the syntax defined
+ 	// above and perform CBOR decoding on it to extract the contained fields.
+-
+ 	// Get the alg value - A COSEAlgorithmIdentifier containing the identifier of the algorithm
+ 	// used to generate the attestation signature.
+-
+ 	alg, present := att.AttStatement[stmtAlgorithm].(int64)
+ 	if !present {
+ 		return string(AttestationFormatPacked), nil, ErrAttestationFormat.WithDetails("Error retrieving alg value")
+@@ -202,10 +200,6 @@ func handleECDAAAttestation(signature, clientDataHash, ecdaaKeyID []byte) (strin
+ }
+ 
+ func handleSelfAttestation(alg int64, pubKey, authData, clientDataHash, signature []byte) (string, []any, error) {
+-	// §4.1 Validate that alg matches the algorithm of the credentialPublicKey in authenticatorData.
+-
+-	// §4.2 Verify that sig is a valid signature over the concatenation of authenticatorData and
+-	// clientDataHash using the credential public key with alg.
+ 	verificationData := append(authData, clientDataHash...)
+ 
+ 	key, err := webauthncose.ParsePublicKey(pubKey)
+@@ -213,6 +207,7 @@ func handleSelfAttestation(alg int64, pubKey, authData, clientDataHash, signatur
+ 		return "", nil, ErrAttestationFormat.WithDetails(fmt.Sprintf("Error parsing the public key: %+v\n", err))
+ 	}
+ 
++	// §4.1 Validate that alg matches the algorithm of the credentialPublicKey in authenticatorData.
+ 	switch k := key.(type) {
+ 	case webauthncose.OKPPublicKeyData:
+ 		err = verifyKeyAlgorithm(k.Algorithm, alg)
+@@ -228,6 +223,8 @@ func handleSelfAttestation(alg int64, pubKey, authData, clientDataHash, signatur
+ 		return "", nil, err
+ 	}
+ 
++	// §4.2 Verify that sig is a valid signature over the concatenation of authenticatorData and
++	// clientDataHash using the credential public key with alg.
+ 	valid, err := webauthncose.VerifySignature(key, verificationData, signature)
+ 	if !valid && err == nil {
+ 		return "", nil, ErrInvalidAttestation.WithDetails("Unable to verify signature")
+diff --git a/protocol/attestation_packed_test.go b/protocol/attestation_packed_test.go
+index 7f22266..11ad9b2 100644
+--- a/protocol/attestation_packed_test.go
++++ b/protocol/attestation_packed_test.go
+@@ -67,10 +67,10 @@ func Test_verifyPackedFormat(t *testing.T) {
+ 				return
+ 			}
+ 
++			// TODO: Consider doing something with the second return value from verifyPackedFormat, x5c.
+ 			if got != tt.want {
+ 				t.Errorf("verifyPackedFormat() got = %v, want %v", got, tt.want)
+ 			}
+-			// TODO: Consider doing something with the second return value from verifyPackedFormat, x5c.
+ 		})
+ 	}
+ }
+diff --git a/protocol/attestation_safetynet.go b/protocol/attestation_safetynet.go
+index 849cda1..7fa49ca 100644
+--- a/protocol/attestation_safetynet.go
++++ b/protocol/attestation_safetynet.go
+@@ -85,6 +85,7 @@ func verifySafetyNetFormat(att AttestationObject, clientDataHash []byte, mds met
+ 		}
+ 
+ 		cert, err := x509.ParseCertificate(o[:n])
++
+ 		return cert.PublicKey, err
+ 	})
+ 
+diff --git a/protocol/attestation_tpm.go b/protocol/attestation_tpm.go
+index 873e864..881b8aa 100644
+--- a/protocol/attestation_tpm.go
++++ b/protocol/attestation_tpm.go
+@@ -115,6 +115,7 @@ func verifyTPMFormat(att AttestationObject, clientDataHash []byte, _ metadata.Pr
+ 	// 3/4 Verify that extraData is set to the hash of attToBeSigned using the hash algorithm employed in "alg".
+ 	h := webauthncose.HasherFromCOSEAlg(coseAlg)
+ 	h.Write(attToBeSigned)
++
+ 	if !bytes.Equal(certInfo.ExtraData, h.Sum(nil)) {
+ 		return "", nil, ErrAttestationFormat.WithDetails("ExtraData is not set to hash of attToBeSigned")
+ 	}
+@@ -219,23 +220,24 @@ func verifyTPMFormat(att AttestationObject, clientDataHash []byte, _ metadata.Pr
+ 	return string(metadata.AttCA), x5c, err
+ }
+ 
++// forEachSAN loops through the TPM SAN extension.
++//
++// RFC 5280, 4.2.1.6
++// SubjectAltName ::= GeneralNames
++//
++// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
++//
++//	GeneralName ::= CHOICE {
++//	     otherName                       [0]     OtherName,
++//	     rfc822Name                      [1]     IA5String,
++//	     dNSName                         [2]     IA5String,
++//	     x400Address                     [3]     ORAddress,
++//	     directoryName                   [4]     Name,
++//	     ediPartyName                    [5]     EDIPartyName,
++//	     uniformResourceIdentifier       [6]     IA5String,
++//	     iPAddress                       [7]     OCTET STRING,
++//	     registeredID                    [8]     OBJECT IDENTIFIER }
+ func forEachSAN(extension []byte, callback func(tag int, data []byte) error) error {
+-	// RFC 5280, 4.2.1.6
+-
+-	// SubjectAltName ::= GeneralNames
+-	//
+-	// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+-	//
+-	// GeneralName ::= CHOICE {
+-	//      otherName                       [0]     OtherName,
+-	//      rfc822Name                      [1]     IA5String,
+-	//      dNSName                         [2]     IA5String,
+-	//      x400Address                     [3]     ORAddress,
+-	//      directoryName                   [4]     Name,
+-	//      ediPartyName                    [5]     EDIPartyName,
+-	//      uniformResourceIdentifier       [6]     IA5String,
+-	//      iPAddress                       [7]     OCTET STRING,
+-	//      registeredID                    [8]     OBJECT IDENTIFIER }
+ 	var seq asn1.RawValue
+ 
+ 	rest, err := asn1.Unmarshal(extension, &seq)
+@@ -284,13 +286,16 @@ func parseSANExtension(value []byte) (manufacturer string, model string, version
+ 		case nameTypeDN:
+ 			tpmDeviceAttributes := pkix.RDNSequence{}
+ 			_, err := asn1.Unmarshal(data, &tpmDeviceAttributes)
++
+ 			if err != nil {
+ 				return err
+ 			}
++
+ 			for _, rdn := range tpmDeviceAttributes {
+ 				if len(rdn) == 0 {
+ 					continue
+ 				}
++
+ 				for _, atv := range rdn {
+ 					value, ok := atv.Value.(string)
+ 					if !ok {
+@@ -300,15 +305,18 @@ func parseSANExtension(value []byte) (manufacturer string, model string, version
+ 					if atv.Type.Equal(tcgAtTpmManufacturer) {
+ 						manufacturer = strings.TrimPrefix(value, "id:")
+ 					}
++
+ 					if atv.Type.Equal(tcgAtTpmModel) {
+ 						model = value
+ 					}
++
+ 					if atv.Type.Equal(tcgAtTpmVersion) {
+ 						version = strings.TrimPrefix(value, "id:")
+ 					}
+ 				}
+ 			}
+ 		}
++
+ 		return nil
+ 	})
+ 
+@@ -359,21 +367,40 @@ func isValidTPMManufacturer(id string) bool {
+ 	return false
+ }
+ 
+-func tpmParseSANExtension(attestation *x509.Certificate) (err error) {
++func tpmParseAIKAttCA(x5c *x509.Certificate, x5cis []*x509.Certificate) (err *Error) {
++	if err = tpmParseSANExtension(x5c); err != nil {
++		return err
++	}
++
++	if err = tpmRemoveEKU(x5c); err != nil {
++		return err
++	}
++
++	for _, parent := range x5cis {
++		if err = tpmRemoveEKU(parent); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func tpmParseSANExtension(attestation *x509.Certificate) (protoErr *Error) {
+ 	var (
+ 		manufacturer, model, version string
++		err                          error
+ 	)
+ 
+ 	for _, ext := range attestation.Extensions {
+ 		if ext.Id.Equal(oidExtensionSubjectAltName) {
+ 			if manufacturer, model, version, err = parseSANExtension(ext.Value); err != nil {
+-				return ErrInvalidAttestation.WithDetails("Authenticator with invalid AIK SAN data encountered during attestation validation.").WithInfo(fmt.Sprintf("Error occurred parsing SAN extension: %s", err.Error()))
++				return ErrInvalidAttestation.WithDetails("Authenticator with invalid Authenticator Identity Key SAN data encountered during attestation validation.").WithInfo(fmt.Sprintf("Error occurred parsing SAN extension: %s", err.Error()))
+ 			}
+ 		}
+ 	}
+ 
+ 	if manufacturer == "" || model == "" || version == "" {
+-		return ErrAttestationFormat.WithDetails("Invalid SAN data in AIK certificate")
++		return ErrAttestationFormat.WithDetails("Invalid SAN data in AIK certificate.")
+ 	}
+ 
+ 	var unhandled []asn1.ObjectIdentifier
+@@ -404,7 +431,7 @@ type tpmBasicConstraints struct {
+ }
+ 
+ // Remove extension key usage to avoid ExtKeyUsage check failure.
+-func tpmRemoveEKU(x5c *x509.Certificate) error {
++func tpmRemoveEKU(x5c *x509.Certificate) *Error {
+ 	var (
+ 		unknown []asn1.ObjectIdentifier
+ 		hasAiK  bool
+@@ -425,7 +452,7 @@ func tpmRemoveEKU(x5c *x509.Certificate) error {
+ 	}
+ 
+ 	if !hasAiK {
+-		return ErrAttestationFormat.WithDetails("AIK certificate missing EKU")
++		return ErrAttestationFormat.WithDetails("Attestation Identity Key certificate missing required Extended Key Usage.")
+ 	}
+ 
+ 	x5c.UnknownExtKeyUsage = unknown
+diff --git a/protocol/attestation_tpm_test.go b/protocol/attestation_tpm_test.go
+index b784882..4390c54 100644
+--- a/protocol/attestation_tpm_test.go
++++ b/protocol/attestation_tpm_test.go
+@@ -30,6 +30,7 @@ func TestTPMAttestationVerificationSuccess(t *testing.T) {
+ 
+ 			attestationType, _, err := verifyTPMFormat(pcc.Response.AttestationObject, clientDataHash[:], nil)
+ 			require.NoError(t, err)
++
+ 			if err != nil {
+ 				t.Fatalf("Not valid: %+v", err)
+ 			}
+@@ -96,12 +97,12 @@ func TestTPMAttestationVerificationFailAttStatement(t *testing.T) {
+ 		{
+ 			"TPM Negative Test AttStatement x5c not present",
+ 			AttestationObject{AttStatement: map[string]any{stmtVersion: "2.0", stmtAlgorithm: int64(0)}},
+-			ErrNotImplemented.Details,
++			"This field is not yet supported by this library",
+ 		},
+ 		{
+ 			"TPM Negative Test AttStatement ecdaaKeyId present",
+ 			AttestationObject{AttStatement: map[string]any{stmtVersion: "2.0", stmtAlgorithm: int64(0), stmtX5C: []any{}, stmtECDAAKID: []byte{}}},
+-			ErrNotImplemented.Details,
++			"This field is not yet supported by this library",
+ 		},
+ 		{
+ 			"TPM Negative Test AttStatement sig not present",
+diff --git a/protocol/credential_test.go b/protocol/credential_test.go
+index b4e7ba8..a7af935 100644
+--- a/protocol/credential_test.go
++++ b/protocol/credential_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
+ )
+@@ -24,13 +25,12 @@ func TestParseCredentialCreationResponse(t *testing.T) {
+ 	byteClientDataJSON, _ := base64.RawURLEncoding.DecodeString("eyJjaGFsbGVuZ2UiOiJXOEd6RlU4cEdqaG9SYldyTERsYW1BZnFfeTRTMUNaRzFWdW9lUkxBUnJFIiwib3JpZ2luIjoiaHR0cHM6Ly93ZWJhdXRobi5pbyIsInR5cGUiOiJ3ZWJhdXRobi5jcmVhdGUifQ")
+ 
+ 	testCases := []struct {
+-		name       string
+-		args       args
+-		expected   *ParsedCredentialCreationData
+-		errString  string
+-		errType    string
+-		errDetails string
+-		errInfo    string
++		name      string
++		args      args
++		expected  *ParsedCredentialCreationData
++		errString string
++		errType   string
++		errInfo   string
+ 	}{
+ 		{
+ 			name: "ShouldParseCredentialRequest",
+@@ -41,7 +41,7 @@ func TestParseCredentialCreationResponse(t *testing.T) {
+ 				ParsedPublicKeyCredential: ParsedPublicKeyCredential{
+ 					ParsedCredential: ParsedCredential{
+ 						ID:   "6xrtBhJQW6QU4tOaB4rrHaS2Ks0yDDL_q8jDC16DEjZ-VLVf4kCRkvl2xp2D71sTPYns-exsHQHTy3G-zJRK8g",
+-						Type: "public-key",
++						Type: string(PublicKeyCredentialType),
+ 					},
+ 					RawID: byteID,
+ 					ClientExtensionResults: AuthenticationExtensionsClientOutputs{
+@@ -74,7 +74,7 @@ func TestParseCredentialCreationResponse(t *testing.T) {
+ 				Raw: CredentialCreationResponse{
+ 					PublicKeyCredential: PublicKeyCredential{
+ 						Credential: Credential{
+-							Type: "public-key",
++							Type: string(PublicKeyCredentialType),
+ 							ID:   "6xrtBhJQW6QU4tOaB4rrHaS2Ks0yDDL_q8jDC16DEjZ-VLVf4kCRkvl2xp2D71sTPYns-exsHQHTy3G-zJRK8g",
+ 						},
+ 						RawID: byteID,
+@@ -99,11 +99,10 @@ func TestParseCredentialCreationResponse(t *testing.T) {
+ 			args: args{
+ 				responseName: "trailingData",
+ 			},
+-			expected:   nil,
+-			errString:  "Parse error for Registration",
+-			errType:    "invalid_request",
+-			errDetails: "Parse error for Registration",
+-			errInfo:    "The body contains trailing data",
++			expected:  nil,
++			errString: "Parse error for Registration",
++			errType:   "invalid_request",
++			errInfo:   "The body contains trailing data",
+ 		},
+ 	}
+ 
+@@ -116,7 +115,10 @@ func TestParseCredentialCreationResponse(t *testing.T) {
+ 			if tc.errString != "" {
+ 				assert.EqualError(t, err, tc.errString)
+ 
+-				AssertIsProtocolError(t, err, tc.errType, tc.errDetails, tc.errInfo)
++				var protocolError *Error
++				require.ErrorAs(t, err, &protocolError)
++				assert.Equal(t, tc.errType, protocolError.Type)
++				assert.Equal(t, tc.errInfo, protocolError.DevInfo)
+ 
+ 				return
+ 			}
+@@ -182,7 +184,7 @@ func TestParsedCredentialCreationData_Verify(t *testing.T) {
+ 				ParsedPublicKeyCredential: ParsedPublicKeyCredential{
+ 					ParsedCredential: ParsedCredential{
+ 						ID:   "6xrtBhJQW6QU4tOaB4rrHaS2Ks0yDDL_q8jDC16DEjZ-VLVf4kCRkvl2xp2D71sTPYns-exsHQHTy3G-zJRK8g",
+-						Type: "public-key",
++						Type: string(PublicKeyCredentialType),
+ 					},
+ 					RawID: byteID,
+ 				},
+@@ -210,7 +212,7 @@ func TestParsedCredentialCreationData_Verify(t *testing.T) {
+ 				Raw: CredentialCreationResponse{
+ 					PublicKeyCredential: PublicKeyCredential{
+ 						Credential: Credential{
+-							Type: "public-key",
++							Type: string(PublicKeyCredentialType),
+ 							ID:   "6xrtBhJQW6QU4tOaB4rrHaS2Ks0yDDL_q8jDC16DEjZ-VLVf4kCRkvl2xp2D71sTPYns-exsHQHTy3G-zJRK8g",
+ 						},
+ 						RawID: byteID,
+diff --git a/protocol/options_test.go b/protocol/options_test.go
+index e3fe3e7..456a59f 100644
+--- a/protocol/options_test.go
++++ b/protocol/options_test.go
+@@ -27,7 +27,7 @@ func TestPublicKeyCredentialRequestOptions_GetAllowedCredentialIDs(t *testing.T)
+ 				Timeout:   60,
+ 				AllowedCredentials: []CredentialDescriptor{
+ 					{
+-						Type: "public-key", CredentialID: []byte("1234"), Transport: []AuthenticatorTransport{"usb"},
++						Type: PublicKeyCredentialType, CredentialID: []byte("1234"), Transport: []AuthenticatorTransport{"usb"},
+ 					},
+ 				},
+ 				RelyingPartyID:   "test.org",

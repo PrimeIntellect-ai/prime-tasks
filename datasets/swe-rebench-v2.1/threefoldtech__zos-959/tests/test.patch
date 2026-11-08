@@ -1,0 +1,73 @@
+diff --git a/pkg/flist/flist_test.go b/pkg/flist/flist_test.go
+index db0abcc..d7ef7cb 100644
+--- a/pkg/flist/flist_test.go
++++ b/pkg/flist/flist_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"text/template"
+@@ -256,3 +257,60 @@ func TestWaitPIDFileTimeout(t *testing.T) {
+ 	err := <-out
+ 	require.Equal(context.DeadlineExceeded, err)
+ }
++
++type lingeringDaemonCommander struct {
++	*testCommander
++}
++
++func (t *lingeringDaemonCommander) Command(_ string, args ...string) *exec.Cmd {
++	m, _ := t.args(args...)
++	return exec.Command("sh", "-c", `sleep 50 >/dev/null 2>&1 & printf '%s' "$!" > "$1"; echo "mount ready" > "$2"`, "sh", m["pid"], m["log"])
++}
++
++func TestUnmountStopsUnresponsiveDaemon(t *testing.T) {
++	cmder := &lingeringDaemonCommander{testCommander: &testCommander{T: t}}
++	strg := &StorageMock{}
++	root, err := ioutil.TempDir("", "flist_root")
++	require.NoError(t, err)
++	defer os.RemoveAll(root)
++
++	flister := newFlister(root, strg, cmder)
++	strg.On("Path", mock.Anything).Return("/my/backend", nil)
++	strg.On("CreateFilesystem", mock.Anything, uint64(256*mib), pkg.SSDDevice).Return("/my/backend", nil)
++
++	mountpoint, err := flister.Mount("https://hub.grid.tf/thabet/redis.flist", "", pkg.DefaultMountOptions)
++	require.NoError(t, err)
++
++	pidFile := filepath.Join(root, "pid", filepath.Base(mountpoint)+".pid")
++	pidBytes, err := ioutil.ReadFile(pidFile)
++	require.NoError(t, err)
++	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
++	require.NoError(t, err)
++	defer func() {
++		if process, err := os.FindProcess(pid); err == nil {
++			_ = process.Kill()
++		}
++	}()
++
++	// The simulated daemon keeps running after the mount command has returned.
++	// Umount cannot observe its normal exit, so it must still terminate it.
++	_ = flister.Umount(mountpoint)
++
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		stat, err := ioutil.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
++		if os.IsNotExist(err) {
++			return
++		}
++		if err == nil {
++			if end := strings.LastIndex(string(stat), ") "); end >= 0 {
++				fields := strings.Fields(string(stat)[end+2:])
++				if len(fields) > 0 && fields[0] == "Z" {
++					return
++				}
++			}
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	t.Fatalf("daemon process %d remained running after unmount", pid)
++}

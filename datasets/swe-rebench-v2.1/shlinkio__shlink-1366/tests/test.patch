@@ -1,0 +1,267 @@
+diff --git a/module/Core/test/ShortUrl/Helper/ShortUrlTitleResolutionHelperTest.php b/module/Core/test/ShortUrl/Helper/ShortUrlTitleResolutionHelperTest.php
+index 6783303c..3b6c1cb9 100644
+--- a/module/Core/test/ShortUrl/Helper/ShortUrlTitleResolutionHelperTest.php
++++ b/module/Core/test/ShortUrl/Helper/ShortUrlTitleResolutionHelperTest.php
+@@ -4,11 +4,21 @@ declare(strict_types=1);
+ 
+ namespace ShlinkioTest\Shlink\Core\ShortUrl\Helper;
+ 
++use Doctrine\ORM\EntityManagerInterface;
++use GuzzleHttp\ClientInterface;
++use Laminas\Diactoros\Response;
++use Laminas\Diactoros\Stream;
+ use PHPUnit\Framework\TestCase;
++use Prophecy\Argument;
+ use Prophecy\PhpUnit\ProphecyTrait;
+ use Prophecy\Prophecy\ObjectProphecy;
+ use Shlinkio\Shlink\Core\Model\ShortUrlMeta;
++use Shlinkio\Shlink\Core\Options\UrlShortenerOptions;
++use Shlinkio\Shlink\Core\Service\ShortUrl\ShortCodeUniquenessHelperInterface;
++use Shlinkio\Shlink\Core\Service\UrlShortener;
+ use Shlinkio\Shlink\Core\ShortUrl\Helper\ShortUrlTitleResolutionHelper;
++use Shlinkio\Shlink\Core\ShortUrl\Resolver\SimpleShortUrlRelationResolver;
++use Shlinkio\Shlink\Core\Util\UrlValidator;
+ use Shlinkio\Shlink\Core\Util\UrlValidatorInterface;
+ 
+ class ShortUrlTitleResolutionHelperTest extends TestCase
+@@ -24,26 +34,67 @@ class ShortUrlTitleResolutionHelperTest extends TestCase
+         $this->helper = new ShortUrlTitleResolutionHelper($this->urlValidator->reveal());
+     }
+ 
++    /** @test */
++    public function providedTitleIsPreserved(): void
++    {
++        $data = ShortUrlMeta::fromRawData([
++            'longUrl' => 'http://foobar.com/12345/hello?foo=bar',
++            'title' => 'link title',
++        ]);
++
++        $result = $this->helper->processTitleAndValidateUrl($data);
++
++        self::assertSame('link title', $result->getTitle());
++    }
++
++    /** @test */
++    public function resolvedTitleIsAddedToTheReturnedData(): void
++    {
++        $this->urlValidator->validateUrlWithTitle(Argument::cetera())->willReturn('Resolved title');
++        $data = ShortUrlMeta::fromRawData(['longUrl' => 'http://foobar.com/12345/hello?foo=bar']);
++
++        $result = $this->helper->processTitleAndValidateUrl($data);
++
++        self::assertSame('Resolved title', $result->getTitle());
++    }
++
+     /**
+      * @test
+-     * @dataProvider provideTitles
++     * @dataProvider provideValidateUrlFlags
+      */
+-    public function urlIsProperlyShortened(?string $title, int $validateWithTitleCallsNum, int $validateCallsNum): void
++    public function titleIsNotResolvedWhenAutoResolutionIsDisabled(bool $validateUrl): void
+     {
+-        $longUrl = 'http://foobar.com/12345/hello?foo=bar';
+-        $this->helper->processTitleAndValidateUrl(
+-            ShortUrlMeta::fromRawData(['longUrl' => $longUrl, 'title' => $title]),
+-        );
++        $httpClient = $this->prophesize(ClientInterface::class);
++        $body = new Stream('php://temp', 'wr');
++        $body->write('<title>Page title</title>');
++        $httpClient->request(Argument::cetera())->willReturn(new Response($body));
+ 
+-        $this->urlValidator->validateUrlWithTitle($longUrl, null)->shouldHaveBeenCalledTimes(
+-            $validateWithTitleCallsNum,
++        $entityManager = $this->prophesize(EntityManagerInterface::class);
++        $entityManager->persist(Argument::any())->willReturn(null);
++        $entityManager->transactional(Argument::type('callable'))->will(static fn (array $args) => $args[0]());
++        $shortCodeHelper = $this->prophesize(ShortCodeUniquenessHelperInterface::class);
++        $shortCodeHelper->ensureShortCodeUniqueness(Argument::cetera())->willReturn(true);
++        $urlShortener = new UrlShortener(
++            new ShortUrlTitleResolutionHelper(new UrlValidator(
++                $httpClient->reveal(),
++                new UrlShortenerOptions(['auto_resolve_titles' => false]),
++            )),
++            $entityManager->reveal(),
++            new SimpleShortUrlRelationResolver(),
++            $shortCodeHelper->reveal(),
+         );
+-        $this->urlValidator->validateUrl($longUrl, null)->shouldHaveBeenCalledTimes($validateCallsNum);
++
++        $shortUrl = $urlShortener->shorten(ShortUrlMeta::fromRawData([
++            'longUrl' => 'http://foobar.com/12345/hello?foo=bar',
++            'validateUrl' => $validateUrl,
++        ]));
++
++        self::assertNull($shortUrl->title());
+     }
+ 
+-    public function provideTitles(): iterable
++    public function provideValidateUrlFlags(): iterable
+     {
+-        yield 'no title' => [null, 1, 0];
+-        yield 'title' => ['link title', 0, 1];
++        yield 'validation requested' => [true];
++        yield 'validation not requested' => [false];
+     }
+ }
+diff --git a/module/Core/test/Util/UrlValidatorTest.php b/module/Core/test/Util/UrlValidatorTest.php
+index 57a5d3ce..ec8a1a45 100644
+--- a/module/Core/test/Util/UrlValidatorTest.php
++++ b/module/Core/test/Util/UrlValidatorTest.php
+@@ -7,10 +7,8 @@ namespace ShlinkioTest\Shlink\Core\Util;
+ use Fig\Http\Message\RequestMethodInterface;
+ use GuzzleHttp\ClientInterface;
+ use GuzzleHttp\Exception\ClientException;
+-use GuzzleHttp\RequestOptions;
+ use Laminas\Diactoros\Response;
+ use Laminas\Diactoros\Stream;
+-use PHPUnit\Framework\Assert;
+ use PHPUnit\Framework\TestCase;
+ use Prophecy\Argument;
+ use Prophecy\PhpUnit\ProphecyTrait;
+@@ -37,88 +35,47 @@ class UrlValidatorTest extends TestCase
+     /** @test */
+     public function exceptionIsThrownWhenUrlIsInvalid(): void
+     {
+-        $request = $this->httpClient->request(Argument::cetera())->willThrow(ClientException::class);
++        $this->httpClient->request(Argument::cetera())->willThrow(ClientException::class);
+ 
+-        $request->shouldBeCalledOnce();
+         $this->expectException(InvalidUrlException::class);
+ 
+-        $this->urlValidator->validateUrl('http://foobar.com/12345/hello?foo=bar', null);
++        $this->urlValidator->validateUrl('http://foobar.com/12345/hello?foo=bar', true);
+     }
+ 
+     /** @test */
+     public function expectedUrlIsCalledWhenTryingToVerify(): void
+     {
+-        $expectedUrl = 'http://foobar.com';
+-
++        $expectedUrl = 'http://foobar.com/12345/hello?foo=bar';
+         $request = $this->httpClient->request(
+             RequestMethodInterface::METHOD_GET,
+             $expectedUrl,
+-            Argument::that(function (array $options) {
+-                Assert::assertArrayHasKey(RequestOptions::ALLOW_REDIRECTS, $options);
+-                Assert::assertEquals(['max' => 15], $options[RequestOptions::ALLOW_REDIRECTS]);
+-                Assert::assertArrayHasKey(RequestOptions::IDN_CONVERSION, $options);
+-                Assert::assertTrue($options[RequestOptions::IDN_CONVERSION]);
+-                Assert::assertArrayHasKey(RequestOptions::HEADERS, $options);
+-                Assert::assertArrayHasKey('User-Agent', $options[RequestOptions::HEADERS]);
+-
+-                return true;
+-            }),
++            Argument::type('array'),
+         )->willReturn(new Response());
+ 
+-        $this->urlValidator->validateUrl($expectedUrl, null);
++        $this->urlValidator->validateUrl($expectedUrl, true);
+ 
+-        $request->shouldHaveBeenCalledOnce();
++        $request->shouldHaveBeenCalled();
+     }
+ 
+-    /**
+-     * @test
+-     * @dataProvider provideDisabledCombinations
+-     */
+-    public function noCheckIsPerformedWhenUrlValidationIsDisabled(?bool $doValidate, bool $validateUrl): void
++    /** @test */
++    public function noCheckIsPerformedWhenUrlValidationIsDisabled(): void
+     {
+         $request = $this->httpClient->request(Argument::cetera())->willReturn(new Response());
+-        $this->options->validateUrl = $validateUrl;
+ 
+-        $this->urlValidator->validateUrl('', $doValidate);
++        $this->urlValidator->validateUrl('', false);
+ 
+         $request->shouldNotHaveBeenCalled();
+     }
+ 
+-    /**
+-     * @test
+-     * @dataProvider provideDisabledCombinations
+-     */
+-    public function validateUrlWithTitleReturnsNullWhenRequestFailsAndValidationIsDisabled(
+-        ?bool $doValidate,
+-        bool $validateUrl,
+-    ): void {
+-        $request = $this->httpClient->request(Argument::cetera())->willThrow(ClientException::class);
+-        $this->options->validateUrl = $validateUrl;
+-        $this->options->autoResolveTitles = true;
+-
+-        $result = $this->urlValidator->validateUrlWithTitle('http://foobar.com/12345/hello?foo=bar', $doValidate);
+-
+-        self::assertNull($result);
+-        $request->shouldHaveBeenCalledOnce();
+-    }
+-
+-    public function provideDisabledCombinations(): iterable
+-    {
+-        yield 'config is disabled and no runtime option is provided' => [null, false];
+-        yield 'config is enabled but runtime option is disabled' => [false, true];
+-        yield 'both config and runtime option are disabled' => [false, false];
+-    }
+-
+     /** @test */
+-    public function validateUrlWithTitleReturnsNullWhenAutoResolutionIsDisabled(): void
++    public function validateUrlWithTitleReturnsNullWhenRequestFailsAndValidationIsDisabled(): void
+     {
+-        $request = $this->httpClient->request(Argument::cetera())->willReturn($this->respWithTitle());
+-        $this->options->autoResolveTitles = false;
++        $this->httpClient->request(Argument::cetera())->willThrow(ClientException::class);
++        $this->options->autoResolveTitles = true;
+ 
+         $result = $this->urlValidator->validateUrlWithTitle('http://foobar.com/12345/hello?foo=bar', false);
+ 
+         self::assertNull($result);
+-        $request->shouldNotHaveBeenCalled();
+     }
+ 
+     /** @test */
+@@ -130,7 +87,18 @@ class UrlValidatorTest extends TestCase
+         $result = $this->urlValidator->validateUrlWithTitle('http://foobar.com/12345/hello?foo=bar', true);
+ 
+         self::assertEquals('Resolved title', $result);
+-        $request->shouldHaveBeenCalledOnce();
++        $request->shouldHaveBeenCalled();
++    }
++
++    /** @test */
++    public function validateUrlWithTitleReturnsNullWhenAutoResolutionIsDisabledAndValidationIsNotRequested(): void
++    {
++        $this->httpClient->request(Argument::cetera())->willReturn($this->respWithTitle());
++        $this->options->autoResolveTitles = false;
++
++        $result = $this->urlValidator->validateUrlWithTitle('http://foobar.com/12345/hello?foo=bar', false);
++
++        self::assertNull($result);
+     }
+ 
+     private function respWithTitle(): Response
+diff --git a/module/Rest/test-api/Action/CreateShortUrlTest.php b/module/Rest/test-api/Action/CreateShortUrlTest.php
+index 0abd2021..2fe529a3 100644
+--- a/module/Rest/test-api/Action/CreateShortUrlTest.php
++++ b/module/Rest/test-api/Action/CreateShortUrlTest.php
+@@ -230,7 +230,7 @@ class CreateShortUrlTest extends ApiTestCase
+     {
+         $expectedDetail = sprintf('Provided URL %s is invalid. Try with a different one.', $url);
+ 
+-        [$statusCode, $payload] = $this->createShortUrl(['longUrl' => $url]);
++        [$statusCode, $payload] = $this->createShortUrl(['longUrl' => $url, 'validateUrl' => true]);
+ 
+         self::assertEquals(self::STATUS_BAD_REQUEST, $statusCode);
+         self::assertEquals(self::STATUS_BAD_REQUEST, $payload['status']);
+diff --git a/module/Rest/test-api/Action/EditShortUrlTest.php b/module/Rest/test-api/Action/EditShortUrlTest.php
+index a25ccddd..92f9bbe0 100644
+--- a/module/Rest/test-api/Action/EditShortUrlTest.php
++++ b/module/Rest/test-api/Action/EditShortUrlTest.php
+@@ -82,6 +82,7 @@ class EditShortUrlTest extends ApiTestCase
+ 
+         $resp = $this->callApiWithKey(self::METHOD_PATCH, $url, [RequestOptions::JSON => [
+             'longUrl' => $longUrl,
++            'validateUrl' => true,
+         ]]);
+ 
+         self::assertEquals($expectedStatus, $resp->getStatusCode());

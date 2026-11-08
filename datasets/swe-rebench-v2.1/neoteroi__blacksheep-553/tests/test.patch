@@ -1,0 +1,146 @@
+diff --git a/tests/test_application.py b/tests/test_application.py
+index 33441a1..9eb9c61 100644
+--- a/tests/test_application.py
++++ b/tests/test_application.py
+@@ -1,16 +1,19 @@
+ import json
+ import os
++import re
+ import sys
+ from base64 import urlsafe_b64decode, urlsafe_b64encode
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ from functools import wraps
+-from typing import Annotated, Any, Dict, List, Optional, TypeVar
++from typing import Annotated, Any, Dict, Generic, List, Optional, TypeVar
+ from uuid import UUID, uuid4
+ 
+ import pytest
++import yaml
+ from guardpost import AuthenticationHandler, Identity, User
+ from openapidocs.v3 import Info
++from pydantic import VERSION as PYDANTIC_LIB_VERSION
+ from pydantic import BaseModel, Field, ValidationError
+ from rodi import Container, inject
+ 
+@@ -4051,8 +4054,6 @@ async def test_application_sub_router_normalization():
+ 
+ 
+ async def test_pydantic_validate_call_scenario():
+-    from pydantic import VERSION as PYDANTIC_LIB_VERSION
+-
+     app = FakeApplication(show_error_details=True, router=Router())
+     get = app.router.get
+ 
+@@ -4090,3 +4091,87 @@ async def test_pydantic_validate_call_scenario():
+ 
+             if int(PYDANTIC_LIB_VERSION[0]) > 1:
+                 assert response_text in (await response.text())
++
++
++@pytest.mark.skipif(
++    int(PYDANTIC_LIB_VERSION[0]) < 2, reason="Run this test only with Pydantic v2"
++)
++async def test_refs_characters_handling():
++    app = FakeApplication(show_error_details=True, router=Router())
++    get = app.router.get
++
++    # TODO: when support for Python < 3.12 is dropped,
++    # the following can be rewritten without TypeVar, like:
++    #
++    # class Response[DataT](BaseModel):
++    #
++
++    DataT = TypeVar("DataT")
++
++    class Response(BaseModel, Generic[DataT]):
++        data: DataT
++
++    class Cat(BaseModel):
++        id: int
++        name: str
++        creation_time: datetime
++
++    docs = OpenAPIHandler(info=Info(title="Example API", version="0.0.1"))
++    docs.bind_app(app)
++
++    @get("/cat")
++    def generic_example() -> Response[Cat]: ...
++
++    @get("/cats")
++    def generic_list_example() -> list[Response[Cat]]: ...
++
++    await app.start()
++
++    await app(get_example_scope("GET", "/openapi.json"), MockReceive(), MockSend())
++    json_response = app.response
++    assert json_response is not None
++    json_docs = await json_response.text()
++
++    await app(get_example_scope("GET", "/openapi.yaml"), MockReceive(), MockSend())
++    yaml_response = app.response
++    assert yaml_response is not None
++    yaml_docs = await yaml_response.text()
++
++    spec = json.loads(json_docs)
++
++    # Schema component names and the component identifier in each local $ref
++    # use only letters, digits, hyphen, underscore, and period.
++    allowed = re.compile(r"^[a-zA-Z0-9\-_.]+$")
++
++    def collect_refs(value):
++        refs = []
++        if isinstance(value, dict):
++            for k, v in value.items():
++                if k == "$ref" and isinstance(v, str):
++                    refs.append(v)
++                else:
++                    refs.extend(collect_refs(v))
++        elif isinstance(value, list):
++            for item in value:
++                refs.extend(collect_refs(item))
++        return refs
++
++    schemas = spec["components"]["schemas"]
++    for key in schemas:
++        assert allowed.match(key), f"schema name {key!r} contains disallowed characters"
++
++    refs = collect_refs(spec)
++    assert refs, "expected at least one $ref in the generated document"
++    for ref in refs:
++        assert ref.startswith("#/components/schemas/"), ref
++        name = ref[len("#/components/schemas/") :]
++        assert allowed.match(name), f"$ref {ref!r} contains disallowed characters"
++        assert name in schemas, f"$ref {ref!r} does not resolve to a schema"
++
++    # The same references must be valid in the YAML representation.
++    yaml_spec = yaml.safe_load(yaml_docs)
++    for ref in collect_refs(yaml_spec):
++        assert ref.startswith("#/components/schemas/"), ref
++        name = ref[len("#/components/schemas/") :]
++        assert allowed.match(name), f"$ref {ref!r} contains disallowed characters"
++        assert name in yaml_spec["components"]["schemas"]
+diff --git a/tests/test_openapi_v3.py b/tests/test_openapi_v3.py
+index a0a7c00..b69747c 100644
+--- a/tests/test_openapi_v3.py
++++ b/tests/test_openapi_v3.py
+@@ -3744,3 +3744,19 @@ components:
+ 
+     for fragment in expected_fragments:
+         assert fragment.strip() in yaml
++
++
++@pytest.mark.parametrize(
++    "name,result",
++    [
++        ("Example[Cat]", "ExampleOfCat"),
++        ("Union[A, B, C]", "UnionOfAAndBAndC"),
++        ("List[Union[A, B, C]]", "ListOfUnionOfAAndBAndC"),
++        ("Dict[str, int]", "DictOfstrAndint"),
++    ],
++)
++def test_default_serializer_sanitize_name(name, result):
++    from blacksheep.server.openapi.common import DefaultSerializer
++
++    serializer = DefaultSerializer()
++    assert serializer.get_type_name_for_generic(name) == result

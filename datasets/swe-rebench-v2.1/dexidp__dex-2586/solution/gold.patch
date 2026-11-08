@@ -1,0 +1,237 @@
+diff --git a/.github/workflows/artifacts.yaml b/.github/workflows/artifacts.yaml
+index 2e017322..fdf9bee2 100644
+--- a/.github/workflows/artifacts.yaml
++++ b/.github/workflows/artifacts.yaml
+@@ -83,7 +83,7 @@ jobs:
+           labels: ${{ steps.meta.outputs.labels }}
+ 
+       - name: Run Trivy vulnerability scanner
+-        uses: aquasecurity/trivy-action@0.5.1
++        uses: aquasecurity/trivy-action@0.6.0
+         with:
+           image-ref: "ghcr.io/dexidp/dex:${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}"
+           format: "sarif"
+diff --git a/.github/workflows/docker.yaml b/.github/workflows/docker.yaml
+index 8683a648..ab970267 100644
+--- a/.github/workflows/docker.yaml
++++ b/.github/workflows/docker.yaml
+@@ -96,7 +96,7 @@ jobs:
+             org.opencontainers.image.documentation=https://dexidp.io/docs/
+ 
+       - name: Run Trivy vulnerability scanner
+-        uses: aquasecurity/trivy-action@0.5.1
++        uses: aquasecurity/trivy-action@0.6.0
+         with:
+           image-ref: "ghcr.io/dexidp/dex:${{ steps.tags.outputs.version }}"
+           format: "template"
+diff --git a/Dockerfile b/Dockerfile
+index c87e09b5..b80b216e 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,6 +1,6 @@
+ ARG BASE_IMAGE=alpine
+ 
+-FROM golang:1.18.3-alpine3.15 AS builder
++FROM golang:1.18.4-alpine3.15 AS builder
+ 
+ WORKDIR /usr/local/src/dex
+ 
+@@ -22,13 +22,13 @@ COPY . .
+ 
+ RUN make release-binary
+ 
+-FROM alpine:3.16.0 AS stager
++FROM alpine:3.16.1 AS stager
+ 
+ RUN mkdir -p /var/dex
+ RUN mkdir -p /etc/dex
+ COPY config.docker.yaml /etc/dex/
+ 
+-FROM alpine:3.16.0 AS gomplate
++FROM alpine:3.16.1 AS gomplate
+ 
+ ARG TARGETOS
+ ARG TARGETARCH
+@@ -41,7 +41,7 @@ RUN wget -O /usr/local/bin/gomplate \
+     && chmod +x /usr/local/bin/gomplate
+ 
+ # For Dependabot to detect base image versions
+-FROM alpine:3.16.0 AS alpine
++FROM alpine:3.16.1 AS alpine
+ FROM gcr.io/distroless/static:latest AS distroless
+ 
+ FROM $BASE_IMAGE
+diff --git a/config.yaml.dist b/config.yaml.dist
+index 6afd063c..ba7bad68 100644
+--- a/config.yaml.dist
++++ b/config.yaml.dist
+@@ -85,6 +85,11 @@ web:
+ #   deviceRequests: "5m"
+ #   signingKeys: "6h"
+ #   idTokens: "24h"
++#   refreshTokens:
++#     disableRotation: false
++#     reuseInterval: "3s"
++#     validIfNotUsedFor: "2160h" # 90 days
++#     absoluteLifetime: "3960h" # 165 days
+ 
+ # OAuth2 configuration
+ # oauth2:
+diff --git a/connector/gitlab/gitlab.go b/connector/gitlab/gitlab.go
+index 7d8e8337..f35ac357 100644
+--- a/connector/gitlab/gitlab.go
++++ b/connector/gitlab/gitlab.go
+@@ -9,6 +9,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"strconv"
++	"time"
+ 
+ 	"golang.org/x/oauth2"
+ 
+@@ -61,8 +62,9 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
+ }
+ 
+ type connectorData struct {
+-	// GitLab's OAuth2 tokens never expire. We don't need a refresh token.
+-	AccessToken string `json:"accessToken"`
++	// Support GitLab's Access Tokens and Refresh tokens.
++	AccessToken  string `json:"accessToken"`
++	RefreshToken string `json:"refreshToken"`
+ }
+ 
+ var (
+@@ -135,6 +137,11 @@ func (c *gitlabConnector) HandleCallback(s connector.Scopes, r *http.Request) (i
+ 		return identity, fmt.Errorf("gitlab: failed to get token: %v", err)
+ 	}
+ 
++	return c.identity(ctx, s, token)
++}
++
++func (c *gitlabConnector) identity(ctx context.Context, s connector.Scopes, token *oauth2.Token) (identity connector.Identity, err error) {
++	oauth2Config := c.oauth2Config(s)
+ 	client := oauth2Config.Client(ctx, token)
+ 
+ 	user, err := c.user(ctx, client)
+@@ -146,6 +153,7 @@ func (c *gitlabConnector) HandleCallback(s connector.Scopes, r *http.Request) (i
+ 	if username == "" {
+ 		username = user.Email
+ 	}
++
+ 	identity = connector.Identity{
+ 		UserID:            strconv.Itoa(user.ID),
+ 		Username:          username,
+@@ -166,10 +174,10 @@ func (c *gitlabConnector) HandleCallback(s connector.Scopes, r *http.Request) (i
+ 	}
+ 
+ 	if s.OfflineAccess {
+-		data := connectorData{AccessToken: token.AccessToken}
++		data := connectorData{RefreshToken: token.RefreshToken, AccessToken: token.AccessToken}
+ 		connData, err := json.Marshal(data)
+ 		if err != nil {
+-			return identity, fmt.Errorf("marshal connector data: %v", err)
++			return identity, fmt.Errorf("gitlab: marshal connector data: %v", err)
+ 		}
+ 		identity.ConnectorData = connData
+ 	}
+@@ -178,37 +186,39 @@ func (c *gitlabConnector) HandleCallback(s connector.Scopes, r *http.Request) (i
+ }
+ 
+ func (c *gitlabConnector) Refresh(ctx context.Context, s connector.Scopes, ident connector.Identity) (connector.Identity, error) {
+-	if len(ident.ConnectorData) == 0 {
+-		return ident, errors.New("no upstream access token found")
+-	}
+-
+ 	var data connectorData
+ 	if err := json.Unmarshal(ident.ConnectorData, &data); err != nil {
+-		return ident, fmt.Errorf("gitlab: unmarshal access token: %v", err)
+-	}
+-
+-	client := c.oauth2Config(s).Client(ctx, &oauth2.Token{AccessToken: data.AccessToken})
+-	user, err := c.user(ctx, client)
+-	if err != nil {
+-		return ident, fmt.Errorf("gitlab: get user: %v", err)
++		return ident, fmt.Errorf("gitlab: unmarshal connector data: %v", err)
+ 	}
++	oauth2Config := c.oauth2Config(s)
+ 
+-	username := user.Name
+-	if username == "" {
+-		username = user.Email
++	if c.httpClient != nil {
++		ctx = context.WithValue(ctx, oauth2.HTTPClient, c.httpClient)
+ 	}
+-	ident.Username = username
+-	ident.PreferredUsername = user.Username
+-	ident.Email = user.Email
+ 
+-	if c.groupsRequired(s.Groups) {
+-		groups, err := c.getGroups(ctx, client, s.Groups, user.Username)
+-		if err != nil {
+-			return ident, fmt.Errorf("gitlab: get groups: %v", err)
++	switch {
++	case data.RefreshToken != "":
++		{
++			t := &oauth2.Token{
++				RefreshToken: data.RefreshToken,
++				Expiry:       time.Now().Add(-time.Hour),
++			}
++			token, err := oauth2Config.TokenSource(ctx, t).Token()
++			if err != nil {
++				return ident, fmt.Errorf("gitlab: failed to get refresh token: %v", err)
++			}
++			return c.identity(ctx, s, token)
++		}
++	case data.AccessToken != "":
++		{
++			token := &oauth2.Token{
++				AccessToken: data.AccessToken,
++			}
++			return c.identity(ctx, s, token)
+ 		}
+-		ident.Groups = groups
++	default:
++		return ident, errors.New("no refresh or access token found")
+ 	}
+-	return ident, nil
+ }
+ 
+ func (c *gitlabConnector) groupsRequired(groupScope bool) bool {
+diff --git a/connector/microsoft/microsoft.go b/connector/microsoft/microsoft.go
+index 328ea152..2a8bbcfb 100644
+--- a/connector/microsoft/microsoft.go
++++ b/connector/microsoft/microsoft.go
+@@ -57,6 +57,7 @@ type Config struct {
+ 	// PromptType is used for the prompt query parameter.
+ 	// For valid values, see https://docs.microsoft.com/en-us/azure/active-directory/develop/v2-oauth2-auth-code-flow#request-an-authorization-code.
+ 	PromptType string `json:"promptType"`
++	DomainHint string `json:"domainHint"`
+ }
+ 
+ // Open returns a strategy for logging in through Microsoft.
+@@ -75,6 +76,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
+ 		logger:               logger,
+ 		emailToLowercase:     c.EmailToLowercase,
+ 		promptType:           c.PromptType,
++		domainHint:           c.DomainHint,
+ 	}
+ 	// By default allow logins from both personal and business/school
+ 	// accounts.
+@@ -119,6 +121,7 @@ type microsoftConnector struct {
+ 	logger               log.Logger
+ 	emailToLowercase     bool
+ 	promptType           string
++	domainHint           string
+ }
+ 
+ func (c *microsoftConnector) isOrgTenant() bool {
+@@ -160,6 +163,9 @@ func (c *microsoftConnector) LoginURL(scopes connector.Scopes, callbackURL, stat
+ 	if c.promptType != "" {
+ 		options = append(options, oauth2.SetAuthURLParam("prompt", c.promptType))
+ 	}
++	if c.domainHint != "" {
++		options = append(options, oauth2.SetAuthURLParam("domain_hint", c.domainHint))
++	}
+ 
+ 	return c.oauth2Config(scopes).AuthCodeURL(state, options...), nil
+ }

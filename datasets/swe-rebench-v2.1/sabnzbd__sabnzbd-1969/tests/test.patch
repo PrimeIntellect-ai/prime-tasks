@@ -1,0 +1,273 @@
+diff --git a/tests/test_decoder.py b/tests/test_decoder.py
+new file mode 100644
+index 00000000..c95c2c2b
+--- /dev/null
++++ b/tests/test_decoder.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/python3 -OO
++# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 2
++# of the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++
++"""
++tests.test_decoder- Testing functions in decoder.py
++"""
++import binascii
++import hashlib
++import os
++import pytest
++
++from random import randint
++from unittest import mock
++
++import sabnzbd.decoder as decoder
++from sabnzbd.nzbstuff import Article
++
++
++LINES_DATA = [os.urandom(45) for _ in range(32)]
++VALID_UU_LINES = [binascii.b2a_uu(data).rstrip(b"\n") for data in LINES_DATA]
++
++END_DATA = os.urandom(randint(1, 45))
++VALID_UU_END = [
++    binascii.b2a_uu(END_DATA).rstrip(b"\n"),
++    b"`",
++    b"end",
++]
++
++
++class TestUuDecoder:
++    def _generate_msg_part(
++        self,
++        part: str,
++        insert_empty_line: bool = True,
++        insert_excess_empty_lines: bool = False,
++        insert_headers: bool = False,
++        insert_end: bool = True,
++        begin_line: bytes = b"begin 644 My Favorite Open Source Movie.mkv",
++    ):
++        """Generate message parts. Part may be one of 'begin', 'middle', or 'end' for multipart
++        messages, or 'single' for a singlepart message. All uu payload is taken from VALID_UU_*.
++
++        Returns Article with a random id and lowest_partnum correctly set, socket-style raw
++        data, and the expected result of uu decoding for the generated message.
++        """
++        article_id = "test@host" + os.urandom(8).hex() + ".sab"
++        article = Article(article_id, randint(4321, 54321), None)
++        article.lowest_partnum = True if part in ("begin", "single") else False
++        # Mock an nzf so results from hashing and filename handling can be stored
++        article.nzf = mock.Mock()
++        article.nzf.filename_checked = False
++        article.nzf.nzo = mock.Mock()
++
++        # Store the message data and the expected decoding result
++        data = []
++        result = []
++
++        # Always start with the response code line
++        data.append(b"222 0 <" + bytes(article_id, encoding="ascii") + b">")
++
++        if insert_empty_line:
++            # Only insert other headers if there's an empty line
++            if insert_headers:
++                data.extend([b"x-hoop: is uitgestelde teleurstelling", b"Another-Header: Sure"])
++
++            # Insert the empty line between response code and body
++            data.append(b"")
++
++        if insert_excess_empty_lines:
++            data.extend([b"", b""])
++
++        # Insert uu data into the body
++        if part in ("begin", "single"):
++            data.append(begin_line)
++
++        if part in ("begin", "middle", "single"):
++            size = randint(4, len(VALID_UU_LINES) - 1)
++            data.extend(VALID_UU_LINES[:size])
++            result.extend(LINES_DATA[:size])
++
++        if part in ("end", "single"):
++            if insert_end:
++                data.extend(VALID_UU_END)
++                result.append(END_DATA)
++
++        # Signal the end of the message with a dot on a line of its own
++        data.append(b".")
++
++        # Join the data with \r\n line endings, just like we get from socket reads
++        data = b"\r\n".join(data)
++        # Concatenate expected result
++        result = b"".join(result)
++
++        return article, data, result
++
++    def test_no_data(self):
++        with pytest.raises(decoder.BadUu):
++            assert decoder.decode_uu(None, None)
++
++    @pytest.mark.parametrize(
++        "raw_data",
++        [
++            [b""],
++            [b"\r\n\r\n"],
++            [b"f", b"o", b"o", b"b", b"a", b"r", b"\r\n"],  # Plenty of list items, but (too) few actual lines
++            [b"222 0 <artid@woteva>\r\nX-Too-Short: yup\r\n"],
++        ],
++    )
++    def test_short_data(self, raw_data):
++        with pytest.raises(decoder.BadUu):
++            assert decoder.decode_uu(None, raw_data)
++
++    @pytest.mark.parametrize(
++        "raw_data",
++        [
++            [b"222 0 <foo@bar>\r\n\r\n"],  # Missing altogether
++            [b"222 0 <foo@bar>\r\n\r\nbeing\r\n"],  # Typo in 'begin'
++            [b"222 0 <foo@bar>\r\n\r\nx-header: begin 644 foobar\r\n"],  # Not at start of the line
++            [b"666 0 <foo@bar>\r\nbegin\r\n"],  # No empty line + wrong response code
++            [b"OMG 0 <foo@bar>\r\nbegin\r\n"],  # No empty line + invalid response code
++            [b"222 0 <foo@bar>\r\nbegin\r\n"],  # No perms
++            [b"222 0 <foo@bar>\r\nbegin ABC DEF\r\n"],  # Permissions not octal
++            [b"222 0 <foo@bar>\r\nbegin 755\r\n"],  # No filename
++            [b"222 0 <foo@bar>\r\nbegin 644 \t \t\r\n"],  # Filename empty after stripping
++        ],
++    )
++    def test_missing_uu_begin(self, raw_data):
++        article = Article("foo@bar", 1234, None)
++        article.lowest_partnum = True
++        # Add some filler lines so the article is long enough to reach the
++        # 'begin'-line validation instead of being rejected as too short.
++        raw_data = raw_data + [b"filler\r\n" * 4]
++        with pytest.raises(decoder.BadUu):
++            assert decoder.decode_uu(article, raw_data)
++
++    def test_bad_uu_is_no_argument_exception(self):
++        """BadUu is a sentinel that can be constructed without arguments"""
++        assert isinstance(decoder.BadUu(), Exception)
++
++    @pytest.mark.parametrize("insert_empty_line", [True, False])
++    @pytest.mark.parametrize("insert_excess_empty_lines", [True, False])
++    @pytest.mark.parametrize("insert_headers", [True, False])
++    @pytest.mark.parametrize("insert_end", [True, False])
++    @pytest.mark.parametrize(
++        "begin_line",
++        [
++            b"begin 644 nospace.bin",
++            b"begin 444 filename with spaces.txt",
++            b"begin 0755 shell.sh",
++        ],
++    )
++    def test_singlepart(self, insert_empty_line, insert_excess_empty_lines, insert_headers, insert_end, begin_line):
++        """Test variations of a sane single part nzf with proper uu-encoded data"""
++        # Generate a singlepart message
++        article, raw_data, expected_result = self._generate_msg_part(
++            "single", insert_empty_line, insert_excess_empty_lines, insert_headers, insert_end, begin_line
++        )
++        assert decoder.decode_uu(article, [raw_data]) == expected_result
++        # The first part must record the file metadata
++        assert article.nzf.type == "uu"
++        expected_md5 = hashlib.md5(expected_result[:16384])
++        assert article.nzf.md5of16k in (
++            expected_md5.digest(),
++            expected_md5.hexdigest(),
++            expected_md5.hexdigest().upper(),
++        )
++        # The filename from the 'begin' line must be verified
++        expected_filename = begin_line.split(b" ", 2)[2].decode("ascii")
++        assert article.nzf.nzo.verify_nzf_filename.called
++        called_args, called_kwargs = article.nzf.nzo.verify_nzf_filename.call_args
++        assert expected_filename in (tuple(called_args) + tuple(called_kwargs.values()))
++
++    @pytest.mark.parametrize("insert_empty_line", [True, False])
++    def test_multipart(self, insert_empty_line):
++        """Test a simple multipart nzf"""
++
++        # Generate and process a multipart msg
++        decoded_data = expected_data = b""
++        first_article = None
++        for part in ("begin", "middle", "middle", "end"):
++            article, data, result = self._generate_msg_part(part, insert_empty_line, False, False, True)
++            if first_article is None:
++                first_article = article
++            decoded_data += decoder.decode_uu(article, [data])
++            expected_data += result
++
++        # Verify results
++        assert decoded_data == expected_data
++        assert first_article.nzf.type == "uu"
++
++    def test_multiple_list_items(self):
++        """The article may be split across several socket-read chunks"""
++        article, raw_data, expected_result = self._generate_msg_part("single")
++        chunks = [raw_data[i : i + 7] for i in range(0, len(raw_data), 7)]
++        assert len(chunks) > 1
++        assert decoder.decode_uu(article, chunks) == expected_result
++
++    @pytest.mark.parametrize(
++        "bad_data",
++        [
++            b"MI^+0E\"C^364:CQ':]DW++^$F0J)6FDG/!`]0\\(4;EG$UY5RI,3JMBNX\\8+06\r\n$(WAIVBC^",  # Trailing junk
++            VALID_UU_LINES[-1][:10] + bytes("ваше здоровье", encoding="utf8") + VALID_UU_LINES[-1][-10:],  # Non-ascii
++        ],
++    )
++    def test_broken_uu(self, bad_data):
++        article = Article("foo@bar", 4321, None)
++        article.lowest_partnum = False
++        filler = b"\r\n".join(VALID_UU_LINES[:4]) + b"\r\n"
++        with pytest.raises(decoder.BadData):
++            assert decoder.decode_uu(article, [b"222 0 <foo@bar>\r\n" + filler + bad_data + b"\r\n"])
++
++    def test_broken_uu_data_attribute(self):
++        """BadData must carry the bytes that were decoded before the failure"""
++        article = Article("foo@bar", 4321, None)
++        article.lowest_partnum = False
++        good = b"\r\n".join(VALID_UU_LINES[:4]) + b"\r\n"
++        bad = VALID_UU_LINES[-1][:10] + bytes("ваше здоровье", encoding="utf8") + VALID_UU_LINES[-1][-10:]
++        with pytest.raises(decoder.BadData) as excinfo:
++            decoder.decode_uu(article, [b"222 0 <foo@bar>\r\n" + good + bad + b"\r\n"])
++        assert excinfo.value.data == b"".join(LINES_DATA[:4])
++
++    def test_worker_decodes_uu_article(self, monkeypatch):
++        article, raw_data, expected = self._generate_msg_part("single")
++        article.nzf.type = None
++        article.nzf.nzo.precheck = False
++        article.nzf.nzo.final_name = "test-download"
++        article.fetcher = mock.Mock(id="server", priority=1)
++
++        def reject_yenc(*args):
++            raise decoder.BadYenc()
++
++        monkeypatch.setattr(decoder.sabyenc3, "decode_usenet_chunks", reject_yenc)
++        monkeypatch.setattr(decoder.sabnzbd, "BPSMeter", mock.Mock(), raising=False)
++        monkeypatch.setattr(decoder.sabnzbd, "Downloader", mock.Mock(servers=[]), raising=False)
++
++        saved = []
++        registered = []
++        article_cache = mock.Mock()
++        article_cache.save_article.side_effect = lambda saved_article, data: saved.append((saved_article, data))
++        nzb_queue = mock.Mock()
++        nzb_queue.register_article.side_effect = lambda registered_article, success: registered.append(
++            (registered_article, success)
++        )
++        monkeypatch.setattr(decoder.sabnzbd, "ArticleCache", article_cache, raising=False)
++        monkeypatch.setattr(decoder.sabnzbd, "NzbQueue", nzb_queue, raising=False)
++
++        work = decoder.queue.Queue()
++        work.put((article, [raw_data]))
++        work.put((None, None))
++        decoder.DecoderWorker(work).run()
++
++        assert saved == [(article, expected)]
++        assert registered == [(article, True)]

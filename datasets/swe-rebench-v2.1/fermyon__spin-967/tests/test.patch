@@ -1,0 +1,254 @@
+diff --git a/crates/loader/src/local/tests.rs b/crates/loader/src/local/tests.rs
+index ceaff58..7837e1f 100644
+--- a/crates/loader/src/local/tests.rs
++++ b/crates/loader/src/local/tests.rs
+@@ -11,7 +11,7 @@ async fn test_from_local_source() -> Result<()> {
+ 
+     let temp_dir = tempfile::tempdir()?;
+     let dir = temp_dir.path();
+-    let app = from_file(MANIFEST, dir, &None).await?;
++    let app = from_file(MANIFEST, Some(dir), &None).await?;
+ 
+     assert_eq!(app.info.name, "spin-local-source-test");
+     assert_eq!(app.info.version, "1.0.0");
+@@ -26,6 +26,10 @@ async fn test_from_local_source() -> Result<()> {
+ 
+     let component = &app.components[0];
+     assert_eq!(component.wasm.mounts.len(), 1);
++    assert!(
++        component.wasm.mounts[0].host.starts_with(dir),
++        "expected assets to be copied into a temporary directory under the provided base directory"
++    );
+ 
+     let http: HttpConfig = app
+         .component_triggers
+@@ -42,6 +46,193 @@ async fn test_from_local_source() -> Result<()> {
+ 
+     Ok(())
+ }
++fn spin_up_direct_mount_option() -> Result<String> {
++    let spin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/spin");
++    let output = std::process::Command::new(&spin)
++        .args(["up", "--help"])
++        .output()?;
++
++    assert!(
++        output.status.success(),
++        "could not retrieve spin up help: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let help = String::from_utf8_lossy(&output.stdout);
++    // Options that `spin up` already had before direct mounting was added.
++    const PRE_EXISTING: &[&str] = &[
++        "bindle",
++        "bindle-password",
++        "bindle-server",
++        "bindle-username",
++        "env",
++        "file",
++        "help",
++        "insecure",
++        "listen",
++        "temp",
++    ];
++    // Any other long option in the help text is the new one; its spelling is not prescribed.
++    let flags: Vec<String> = help
++        .split_whitespace()
++        .filter_map(|tok| tok.strip_prefix("--"))
++        .map(|rest| {
++            rest.chars()
++                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
++                .collect::<String>()
++        })
++        .filter(|name| !name.is_empty() && !PRE_EXISTING.contains(&name.as_str()))
++        .collect();
++    match flags.first() {
++        Some(name) => Ok(format!("--{name}")),
++        None => anyhow::bail!("spin up help does not offer a direct-mount option"),
++    }
++}
++
++#[test]
++fn spin_up_exposes_direct_mount_option() -> Result<()> {
++    spin_up_direct_mount_option()?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn spin_up_direct_mount_option_serves_host_changes_without_restart() -> Result<()> {
++    use std::process::Stdio;
++    use tokio::time::{sleep, Duration};
++
++    let temp_dir = tempfile::tempdir()?;
++    let root = temp_dir.path();
++    let static_dir = root.join("static/thisshouldbemounted");
++    std::fs::create_dir_all(&static_dir)?;
++    std::fs::write(static_dir.join("1"), "initial")?;
++    std::fs::copy(
++        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("../../tests/http/assets-test/spin_static_fs.wasm"),
++        root.join("spin_static_fs.wasm"),
++    )?;
++    std::fs::write(
++        root.join("spin.toml"),
++        r#"
++spin_version = "1"
++name = "direct-mount-cli-test"
++trigger = {type = "http", base = "/"}
++version = "1.0.0"
++
++[[component]]
++id = "fs"
++source = "spin_static_fs.wasm"
++files = [{source = "static/thisshouldbemounted", destination = "/thisshouldbemounted"}]
++
++[component.trigger]
++executor = {type = "spin"}
++route = "/static/..."
++"#,
++    )?;
++
++    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
++    let address = listener.local_addr()?;
++    drop(listener);
++    let spin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/spin");
++    let flag = spin_up_direct_mount_option()?;
++    let mut child = std::process::Command::new(spin)
++        .current_dir(root)
++        .args(["up", &flag, "--file", "spin.toml", "--listen"])
++        .arg(address.to_string())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .spawn()?;
++
++    let result: Result<()> = async {
++        let url = format!("http://{address}/static/thisshouldbemounted/1");
++        let mut response = None;
++        for _ in 0..100 {
++            if child.try_wait()?.is_some() {
++                anyhow::bail!("spin up stopped before the HTTP endpoint became available");
++            }
++            if let Ok(Ok(found)) = tokio::time::timeout(
++                Duration::from_millis(200),
++                reqwest::get(&url),
++            )
++            .await
++            {
++                if found.status().is_success() {
++                    response = Some(found);
++                    break;
++                }
++            }
++            sleep(Duration::from_millis(50)).await;
++        }
++        let response = response.ok_or_else(|| anyhow::anyhow!("HTTP endpoint did not become ready"))?;
++        assert_eq!(response.text().await?, "initial");
++
++        std::fs::write(static_dir.join("2"), "updated")?;
++        let response = reqwest::get(format!("http://{address}/static/thisshouldbemounted/2"))
++            .await?;
++        assert!(response.status().is_success(), "new host-side asset was not served");
++        assert_eq!(response.text().await?, "updated");
++        Ok(())
++    }
++    .await;
++
++    let _ = child.kill();
++    let _ = child.wait();
++    result
++}
++
++#[tokio::test]
++async fn test_direct_mount_uses_source_directory() -> Result<()> {
++    let temp_dir = tempfile::tempdir()?;
++    let root = temp_dir.path();
++
++    std::fs::create_dir(root.join("static"))?;
++    std::fs::write(root.join("static/hello.txt"), "hello")?;
++    std::fs::write(root.join("spin-fs.wasm"), "not actual wasm")?;
++    std::fs::write(
++        root.join("spin.toml"),
++        r#"
++spin_version = "1"
++name = "direct-mount-test"
++trigger = {type = "http", base = "/"}
++version = "1.0.0"
++
++[[component]]
++id = "fs"
++source = "spin-fs.wasm"
++files = [{ source = "static", destination = "/static" }]
++
++[component.trigger]
++executor = {type = "spin"}
++route = "/..."
++"#,
++    )?;
++
++    let manifest = root.join("spin.toml");
++    let app = from_file(&manifest, None::<&Path>, &None).await?;
++
++    let component = &app.components[0];
++    assert_eq!(component.wasm.mounts.len(), 1);
++    let mount = &component.wasm.mounts[0];
++    assert_eq!(mount.guest, "/static");
++
++    // The host directory must be the source directory itself, not a copy.
++    let host = if mount.host.is_absolute() {
++        mount.host.clone()
++    } else {
++        root.join(&mount.host)
++    };
++    assert_eq!(
++        std::fs::canonicalize(&host)?,
++        std::fs::canonicalize(root.join("static"))?
++    );
++
++    // Changes on the host filesystem are immediately visible.
++    std::fs::write(root.join("static/world.txt"), "world")?;
++    assert!(
++        host.join("world.txt").exists(),
++        "expected host-side change to be visible in the mounted directory"
++    );
++
++    Ok(())
++}
+ 
+ #[test]
+ fn test_manifest() -> Result<()> {
+@@ -157,7 +348,7 @@ async fn test_invalid_manifest() -> Result<()> {
+ 
+     let temp_dir = tempfile::tempdir()?;
+     let dir = temp_dir.path();
+-    let app = from_file(MANIFEST, dir, &None).await;
++    let app = from_file(MANIFEST, Some(dir), &None).await;
+ 
+     let e = app.unwrap_err().to_string();
+     assert!(
+@@ -214,7 +405,7 @@ async fn test_duplicate_component_id_is_rejected() -> Result<()> {
+ 
+     let temp_dir = tempfile::tempdir()?;
+     let dir = temp_dir.path();
+-    let app = from_file(MANIFEST, dir, &None).await;
++    let app = from_file(MANIFEST, Some(dir), &None).await;
+ 
+     assert!(
+         app.is_err(),
+@@ -236,7 +427,7 @@ async fn test_insecure_allow_all_with_invalid_url() -> Result<()> {
+ 
+     let temp_dir = tempfile::tempdir()?;
+     let dir = temp_dir.path();
+-    let app = from_file(MANIFEST, dir, &None).await;
++    let app = from_file(MANIFEST, Some(dir), &None).await;
+ 
+     assert!(
+         app.is_ok(),
+@@ -252,7 +443,7 @@ async fn test_invalid_url_in_allowed_http_hosts_is_rejected() -> Result<()> {
+ 
+     let temp_dir = tempfile::tempdir()?;
+     let dir = temp_dir.path();
+-    let app = from_file(MANIFEST, dir, &None).await;
++    let app = from_file(MANIFEST, Some(dir), &None).await;
+ 
+     assert!(app.is_err(), "Expected allowed_http_hosts parsing error");
+ 

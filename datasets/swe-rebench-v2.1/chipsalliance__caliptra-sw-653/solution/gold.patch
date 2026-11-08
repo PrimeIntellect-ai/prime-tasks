@@ -1,0 +1,278 @@
+diff --git a/common/src/mailbox_api.rs b/common/src/mailbox_api.rs
+index 99eed5a4..337e1aa8 100644
+--- a/common/src/mailbox_api.rs
++++ b/common/src/mailbox_api.rs
+@@ -193,6 +193,7 @@ pub struct StashMeasurementReq {
+     pub hdr: MailboxReqHeader,
+     pub metadata: [u8; 4],
+     pub measurement: [u8; 48],
++    pub svn: u32,
+ }
+ 
+ #[repr(C)]
+@@ -238,7 +239,7 @@ pub struct InvokeDpeResp {
+ }
+ 
+ impl InvokeDpeResp {
+-    pub const DATA_MAX_SIZE: usize = 2500;
++    pub const DATA_MAX_SIZE: usize = 2200;
+ 
+     fn as_bytes_partial(&self) -> &[u8] {
+         let unused_byte_count = Self::DATA_MAX_SIZE.saturating_sub(self.data_size as usize);
+diff --git a/runtime/README.md b/runtime/README.md
+index ed9deab6..b10b3d50 100644
+--- a/runtime/README.md
++++ b/runtime/README.md
+@@ -202,6 +202,7 @@ Table: `STASH_MEASUREMENT` input arguments
+ | chksum       | u32      | Checksum over other input arguments, computed by the caller. Little endian.
+ | metadata     | u8[4]    | 4-byte measurement identifier.
+ | measurement  | u8[48]   | Data to measure into DPE.
++| svn          | u32      | SVN passed to to DPE to be used in derive child.
+ 
+ 
+ Table: `STASH_MEASUREMENT` output arguments
+diff --git a/runtime/src/dpe_crypto.rs b/runtime/src/dpe_crypto.rs
+index 3a604c12..add63daa 100644
+--- a/runtime/src/dpe_crypto.rs
++++ b/runtime/src/dpe_crypto.rs
+@@ -1,15 +1,18 @@
+ // Licensed under the Apache-2.0 license
+ 
+-use caliptra_drivers::{Array4x12, KeyId, Sha384, Sha384DigestOp};
++use core::cmp::min;
++
++use caliptra_drivers::{Array4x12, KeyId, Sha384, Sha384DigestOp, Trng};
+ use crypto::{AlgLen, Crypto, CryptoError, Digest, EcdsaPub, EcdsaSig, Hasher, HmacSig};
+ 
+ pub struct DpeCrypto<'a> {
+     sha384: &'a mut Sha384,
++    trng: &'a mut Trng,
+ }
+ 
+ impl<'a> DpeCrypto<'a> {
+-    pub fn new(sha384: &'a mut Sha384) -> Self {
+-        Self { sha384 }
++    pub fn new(sha384: &'a mut Sha384, trng: &'a mut Trng) -> Self {
++        Self { sha384, trng }
+     }
+ }
+ 
+@@ -45,8 +48,19 @@ impl<'a> Crypto for DpeCrypto<'a> {
+     type Hasher<'b> = DpeHasher<'b> where Self: 'b;
+     type PrivKey = KeyId;
+ 
+-    fn rand_bytes(&mut self, _dst: &mut [u8]) -> Result<(), CryptoError> {
+-        Err(CryptoError::NotImplemented)
++    fn rand_bytes(&mut self, dst: &mut [u8]) -> Result<(), CryptoError> {
++        let mut curr_idx = 0;
++        while curr_idx < dst.len() {
++            let trng_bytes = <[u8; 48]>::from(
++                self.trng
++                    .generate()
++                    .map_err(|_| CryptoError::CryptoLibError)?,
++            );
++            let bytes_to_write = min(dst.len() - curr_idx, trng_bytes.len());
++            dst[curr_idx..curr_idx + bytes_to_write].copy_from_slice(&trng_bytes[..bytes_to_write]);
++            curr_idx += bytes_to_write;
++        }
++        Ok(())
+     }
+ 
+     fn hash_initialize(&mut self, algs: AlgLen) -> Result<Self::Hasher<'_>, CryptoError> {
+diff --git a/runtime/src/dpe_platform.rs b/runtime/src/dpe_platform.rs
+index 2bbc07a7..c989bfca 100644
+--- a/runtime/src/dpe_platform.rs
++++ b/runtime/src/dpe_platform.rs
+@@ -2,11 +2,18 @@
+ 
+ use platform::{Platform, PlatformError, MAX_CHUNK_SIZE};
+ 
+-pub struct DpePlatform;
++pub struct DpePlatform {
++    auto_init_locality: u32,
++}
+ 
+ pub const VENDOR_ID: u32 = u32::from_be_bytes(*b"CTRA");
+ pub const VENDOR_SKU: u32 = u32::from_be_bytes(*b"CTRA");
+-pub const AUTO_INIT_LOCALITY: u32 = 0;
++
++impl DpePlatform {
++    pub fn new(auto_init_locality: u32) -> Self {
++        Self { auto_init_locality }
++    }
++}
+ 
+ impl Platform for DpePlatform {
+     fn get_certificate_chain(
+@@ -27,7 +34,7 @@ impl Platform for DpePlatform {
+     }
+ 
+     fn get_auto_init_locality(&mut self) -> Result<u32, PlatformError> {
+-        Ok(AUTO_INIT_LOCALITY)
++        Ok(self.auto_init_locality)
+     }
+ 
+     fn get_issuer_name(&mut self, out: &mut [u8; MAX_CHUNK_SIZE]) -> Result<usize, PlatformError> {
+diff --git a/runtime/src/invoke_dpe.rs b/runtime/src/invoke_dpe.rs
+index 9bea52e4..18cc5398 100644
+--- a/runtime/src/invoke_dpe.rs
++++ b/runtime/src/invoke_dpe.rs
+@@ -11,8 +11,8 @@ impl InvokeDpeCmd {
+         if let Some(cmd) = InvokeDpeReq::read_from(cmd_args) {
+             let mut response_buf = [0u8; InvokeDpeResp::DATA_MAX_SIZE];
+             let mut env = DpeEnv::<CptraDpeTypes> {
+-                crypto: DpeCrypto::new(&mut drivers.sha384),
+-                platform: DpePlatform,
++                crypto: DpeCrypto::new(&mut drivers.sha384, &mut drivers.trng),
++                platform: DpePlatform::new(drivers.manifest.header.pl0_pauser),
+             };
+             match drivers
+                 .dpe
+diff --git a/runtime/src/lib.rs b/runtime/src/lib.rs
+index 703a9413..cbca2895 100644
+--- a/runtime/src/lib.rs
++++ b/runtime/src/lib.rs
+@@ -9,6 +9,7 @@ mod dpe_platform;
+ pub mod fips;
+ pub mod info;
+ mod invoke_dpe;
++mod stash_measurement;
+ mod update;
+ mod verify;
+ 
+@@ -24,6 +25,7 @@ pub use dpe_platform::{DpePlatform, VENDOR_ID, VENDOR_SKU};
+ pub use fips::{FipsSelfTestCmd, FipsShutdownCmd, FipsVersionCmd};
+ pub use info::FwInfoCmd;
+ pub use invoke_dpe::InvokeDpeCmd;
++pub use stash_measurement::StashMeasurementCmd;
+ pub use verify::EcdsaVerifyCmd;
+ pub mod packet;
+ use packet::Packet;
+@@ -87,8 +89,6 @@ pub const DPE_SUPPORT: Support = Support {
+     is_ca: true,
+ };
+ 
+-pub const DPE_LOCALITY: u32 = 0x0;
+-
+ pub struct Drivers<'a> {
+     pub mbox: Mailbox,
+     pub sha_acc: Sha512AccCsr,
+@@ -143,7 +143,7 @@ impl<'a> Drivers<'a> {
+         };
+         let manifest = ImageManifest::read_from(manifest_slice.as_bytes())
+             .ok_or(CaliptraError::RUNTIME_NO_MANIFEST)?;
+-        let trng = Trng::new(
++        let mut trng = Trng::new(
+             CsrngReg::new(),
+             EntropySrcReg::new(),
+             SocIfcTrngReg::new(),
+@@ -152,12 +152,13 @@ impl<'a> Drivers<'a> {
+ 
+         let mut sha384 = Sha384::new(Sha512Reg::new());
+ 
++        let locality = manifest.header.pl0_pauser;
+         let env = DpeEnv::<CptraDpeTypes> {
+-            crypto: DpeCrypto::new(&mut sha384),
+-            platform: DpePlatform,
++            crypto: DpeCrypto::new(&mut sha384, &mut trng),
++            platform: DpePlatform::new(locality),
+         };
+         let mut pcr_bank = PcrBank::new(PvReg::new());
+-        let dpe = Self::initialize_dpe(env, &mut pcr_bank)?;
++        let dpe = Self::initialize_dpe(env, &mut pcr_bank, locality)?;
+ 
+         Ok(Self {
+             mbox: Mailbox::new(MboxCsr::new()),
+@@ -182,12 +183,10 @@ impl<'a> Drivers<'a> {
+     fn initialize_dpe(
+         mut env: DpeEnv<CptraDpeTypes>,
+         pcr_bank: &mut PcrBank,
++        locality: u32,
+     ) -> CaliptraResult<DpeInstance> {
+         let mut dpe = DpeInstance::new(&mut env, DPE_SUPPORT)
+             .map_err(|_| CaliptraError::RUNTIME_INITIALIZE_DPE_FAILED)?;
+-
+-        // TODO: Set target_locality to SoC's initial locality
+-        const TARGET_LOCALITY: u32 = 0;
+         let data = <[u8; DPE_PROFILE.get_hash_size()]>::from(&pcr_bank.read_pcr(PcrId::PcrId1));
+         DeriveChildCmd {
+             handle: ContextHandle::default(),
+@@ -197,11 +196,10 @@ impl<'a> Drivers<'a> {
+                 | DeriveChildCmd::INPUT_ALLOW_CA
+                 | DeriveChildCmd::INPUT_ALLOW_X509,
+             tci_type: u32::from_be_bytes(*b"RTJM"),
+-            target_locality: TARGET_LOCALITY,
++            target_locality: locality,
+         }
+-        .execute(&mut dpe, &mut env, DPE_LOCALITY)
++        .execute(&mut dpe, &mut env, locality)
+         .map_err(|_| CaliptraError::RUNTIME_INITIALIZE_DPE_FAILED)?;
+-
+         Ok(dpe)
+     }
+ }
+@@ -244,7 +242,7 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
+         CommandId::GET_LDEV_CERT => Err(CaliptraError::RUNTIME_UNIMPLEMENTED_COMMAND),
+         CommandId::INVOKE_DPE => InvokeDpeCmd::execute(drivers, cmd_bytes),
+         CommandId::ECDSA384_VERIFY => EcdsaVerifyCmd::execute(drivers, cmd_bytes),
+-        CommandId::STASH_MEASUREMENT => Err(CaliptraError::RUNTIME_UNIMPLEMENTED_COMMAND),
++        CommandId::STASH_MEASUREMENT => StashMeasurementCmd::execute(drivers, cmd_bytes),
+         CommandId::DISABLE_ATTESTATION => DisableAttestationCmd::execute(drivers),
+         CommandId::FW_INFO => FwInfoCmd::execute(drivers),
+         #[cfg(feature = "test_only_commands")]
+diff --git a/runtime/src/stash_measurement.rs b/runtime/src/stash_measurement.rs
+new file mode 100644
+index 00000000..d7332907
+--- /dev/null
++++ b/runtime/src/stash_measurement.rs
+@@ -0,0 +1,50 @@
++// Licensed under the Apache-2.0 license
++
++use crate::{dpe_crypto::DpeCrypto, CptraDpeTypes, DpePlatform, Drivers};
++use caliptra_common::mailbox_api::{
++    MailboxResp, MailboxRespHeader, StashMeasurementReq, StashMeasurementResp,
++};
++use caliptra_drivers::{CaliptraError, CaliptraResult};
++use dpe::{
++    commands::{CommandExecution, DeriveChildCmd},
++    context::ContextHandle,
++    dpe_instance::DpeEnv,
++    response::DpeErrorCode,
++};
++use zerocopy::FromBytes;
++
++pub struct StashMeasurementCmd;
++impl StashMeasurementCmd {
++    pub(crate) fn execute(drivers: &mut Drivers, cmd_args: &[u8]) -> CaliptraResult<MailboxResp> {
++        if let Some(cmd) = StashMeasurementReq::read_from(cmd_args) {
++            let mut env = DpeEnv::<CptraDpeTypes> {
++                crypto: DpeCrypto::new(&mut drivers.sha384, &mut drivers.trng),
++                platform: DpePlatform::new(drivers.manifest.header.pl0_pauser),
++            };
++            let locality = drivers.mbox.user();
++            let derive_child_resp = DeriveChildCmd {
++                handle: ContextHandle::default(),
++                data: cmd.measurement,
++                flags: DeriveChildCmd::MAKE_DEFAULT
++                    | DeriveChildCmd::CHANGE_LOCALITY
++                    | DeriveChildCmd::INPUT_ALLOW_CA
++                    | DeriveChildCmd::INPUT_ALLOW_X509,
++                tci_type: u32::from_be_bytes(cmd.metadata),
++                target_locality: locality,
++            }
++            .execute(&mut drivers.dpe, &mut env, locality);
++
++            let dpe_result = match derive_child_resp {
++                Ok(_) => DpeErrorCode::NoError,
++                Err(e) => e,
++            } as u32;
++
++            Ok(MailboxResp::StashMeasurement(StashMeasurementResp {
++                hdr: MailboxRespHeader::default(),
++                dpe_result,
++            }))
++        } else {
++            Err(CaliptraError::RUNTIME_INSUFFICIENT_MEMORY)
++        }
++    }
++}

@@ -1,0 +1,150 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 388d66d89..8fcfb700e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,7 @@ package to install PyBaMM with only the required dependencies. ([conda-forge/pyb
+ 
+ ## Bug fixes
+ 
++- Fixed bug when using stoichiometry-dependent diffusivity with the DFN model with a particle size distribution. ([#4726](https://github.com/pybamm-team/PyBaMM/pull/4726))
+ - Remove internal use of deprecated `set_parameters` function in the `Simulation` class which caused warnings. ([#4638](https://github.com/pybamm-team/PyBaMM/pull/4638))
+ - Provide default value for `Symbol.mesh` attribute to avoid errors when adding variables after discretisation. ([#4644](https://github.com/pybamm-team/PyBaMM/pull/4644))
+ 
+diff --git a/src/pybamm/models/submodels/particle/base_particle.py b/src/pybamm/models/submodels/particle/base_particle.py
+index e47039b97..80c09d7ac 100644
+--- a/src/pybamm/models/submodels/particle/base_particle.py
++++ b/src/pybamm/models/submodels/particle/base_particle.py
+@@ -166,7 +166,7 @@ class BaseParticle(pybamm.BaseSubModel):
+ 
+         variables = {f"{Domain} {phase_name}particle flux [mol.m-2.s-1]": N_s}
+ 
+-        if isinstance(N_s, pybamm.Broadcast):
++        if isinstance(N_s, pybamm.SecondaryBroadcast):
+             N_s_xav = pybamm.x_average(N_s)
+             variables.update(
+                 {
+@@ -403,29 +403,29 @@ class BaseParticle(pybamm.BaseSubModel):
+ 
+         if [f"{domain} electrode"] in N_s.domains.values():
+             # N_s depends on x
+-
+             N_s_distribution = N_s
+-            # x-av the *tertiary* domain
+-            # NOTE: not yet implemented. Fill with zeros instead
+-            N_s_xav_distribution = pybamm.FullBroadcast(
+-                0,
+-                [f"{domain} {phase_name}particle"],
+-                {
+-                    "secondary": f"{domain} {phase_name}particle size",
+-                    "tertiary": "current collector",
+-                },
+-            )
++            if isinstance(N_s, pybamm.TertiaryBroadcast):
++                N_s_xav_distribution = N_s.orphans[0]
++            else:
++                # can't average variables that evaluate on edges
++                N_s_xav_distribution = None
+         else:
+             N_s_xav_distribution = N_s
+             N_s_distribution = pybamm.TertiaryBroadcast(N_s, [f"{domain} electrode"])
+ 
+         variables = {
+-            f"X-averaged {domain} {phase_name}particle flux "
+-            "distribution [mol.m-2.s-1]": N_s_xav_distribution,
+             f"{Domain} {phase_name}particle flux "
+             "distribution [mol.m-2.s-1]": N_s_distribution,
+         }
+ 
++        if N_s_xav_distribution is not None:
++            variables.update(
++                {
++                    f"X-averaged {domain} {phase_name}particle flux "
++                    "distribution [mol.m-2.s-1]": N_s_xav_distribution,
++                }
++            )
++
+         return variables
+ 
+     def _get_standard_diffusivity_variables(self, D_eff):
+diff --git a/src/pybamm/models/submodels/particle/fickian_diffusion.py b/src/pybamm/models/submodels/particle/fickian_diffusion.py
+index 5ae5d3a4d..cd67d6da9 100644
+--- a/src/pybamm/models/submodels/particle/fickian_diffusion.py
++++ b/src/pybamm/models/submodels/particle/fickian_diffusion.py
+@@ -130,7 +130,6 @@ class FickianDiffusion(BaseParticle):
+     def get_coupled_variables(self, variables):
+         domain, Domain = self.domain_Domain
+         phase_name = self.phase_name
+-        Phase_prefactor = self.phase_param.phase_prefactor
+ 
+         if self.size_distribution is False:
+             if self.x_average is False:
+@@ -213,6 +212,14 @@ class FickianDiffusion(BaseParticle):
+             }
+         )
+ 
++        if self.x_average is True:
++            if self.size_distribution is True:
++                D_eff = pybamm.TertiaryBroadcast(D_eff, [f"{domain} electrode"])
++                N_s = pybamm.TertiaryBroadcast(N_s, [f"{domain} electrode"])
++            else:
++                D_eff = pybamm.SecondaryBroadcast(D_eff, [f"{domain} electrode"])
++                N_s = pybamm.SecondaryBroadcast(N_s, [f"{domain} electrode"])
++
+         if self.size_distribution is True:
+             # Size-dependent flux variables
+             variables.update(
+@@ -220,15 +227,10 @@ class FickianDiffusion(BaseParticle):
+             )
+             variables.update(self._get_standard_flux_distribution_variables(N_s))
+             # Size-averaged flux variables
+-            R = variables[f"{Phase_prefactor}{Domain} {phase_name}particle sizes [m]"]
++            D_eff = pybamm.size_average(D_eff)
++            R = pybamm.SpatialVariable("R", domains=D_eff.domains)
+             f_a_dist = self.phase_param.f_a_dist(R)
+-            D_eff = pybamm.Integral(f_a_dist * D_eff, R)
+             N_s = pybamm.Integral(f_a_dist * N_s, R)
+-
+-        if self.x_average is True:
+-            D_eff = pybamm.SecondaryBroadcast(D_eff, [f"{domain} electrode"])
+-            N_s = pybamm.SecondaryBroadcast(N_s, [f"{domain} electrode"])
+-
+         variables.update(self._get_standard_diffusivity_variables(D_eff))
+         variables.update(self._get_standard_flux_variables(N_s))
+ 
+diff --git a/src/pybamm/models/submodels/particle/msmr_diffusion.py b/src/pybamm/models/submodels/particle/msmr_diffusion.py
+index 8967116ce..4c73b29a4 100644
+--- a/src/pybamm/models/submodels/particle/msmr_diffusion.py
++++ b/src/pybamm/models/submodels/particle/msmr_diffusion.py
+@@ -240,6 +240,14 @@ class MSMRDiffusion(BaseParticle):
+             }
+         )
+ 
++        if self.x_average is True:
++            if self.size_distribution is True:
++                D_eff = pybamm.TertiaryBroadcast(D_eff, [f"{domain} electrode"])
++                N_s = pybamm.TertiaryBroadcast(N_s, [f"{domain} electrode"])
++            else:
++                D_eff = pybamm.SecondaryBroadcast(D_eff, [f"{domain} electrode"])
++                N_s = pybamm.SecondaryBroadcast(N_s, [f"{domain} electrode"])
++
+         if self.size_distribution is True:
+             # Size-dependent flux variables
+             variables.update(
+@@ -247,15 +255,10 @@ class MSMRDiffusion(BaseParticle):
+             )
+             variables.update(self._get_standard_flux_distribution_variables(N_s))
+             # Size-averaged flux variables
+-            R = variables[f"{Domain} {phase_name}particle sizes [m]"]
++            D_eff = pybamm.size_average(D_eff)
++            R = pybamm.SpatialVariable("R", domains=D_eff.domains)
+             f_a_dist = self.phase_param.f_a_dist(R)
+-            D_eff = pybamm.Integral(f_a_dist * D_eff, R)
+             N_s = pybamm.Integral(f_a_dist * N_s, R)
+-
+-        if self.x_average is True:
+-            D_eff = pybamm.SecondaryBroadcast(D_eff, [f"{domain} electrode"])
+-            N_s = pybamm.SecondaryBroadcast(N_s, [f"{domain} electrode"])
+-
+         variables.update(self._get_standard_diffusivity_variables(D_eff))
+         variables.update(self._get_standard_flux_variables(N_s))
+ 

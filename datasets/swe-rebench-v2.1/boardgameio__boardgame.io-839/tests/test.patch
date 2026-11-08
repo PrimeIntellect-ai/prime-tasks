@@ -1,0 +1,213 @@
+diff --git a/src/client/transport/socketio.test.js b/src/client/transport/socketio.test.js
+index a8e4116..5b365a8 100644
+--- a/src/client/transport/socketio.test.js
++++ b/src/client/transport/socketio.test.js
+@@ -135,6 +135,16 @@ describe('multiplayer', () => {
+     expect(store.getState()).toMatchObject(restored);
+   });
+ 
++  test('receive matchData', () => {
++    let receivedMatchData;
++    m.subscribeMatchData(data => (receivedMatchData = data));
++    const matchData = [{ id: '0', name: 'Alice' }];
++    mockSocket.receive('matchData', 'unknown matchID', matchData);
++    expect(receivedMatchData).toBe(undefined);
++    mockSocket.receive('matchData', 'default', matchData);
++    expect(receivedMatchData).toMatchObject(matchData);
++  });
++
+   test('send update', () => {
+     const action = makeMove();
+     const state = { _stateID: 0 };
+diff --git a/src/master/master.test.ts b/src/master/master.test.ts
+index 5db608d..bdc1334 100644
+--- a/src/master/master.test.ts
++++ b/src/master/master.test.ts
+@@ -349,6 +349,118 @@ describe('update', () => {
+   });
+ });
+ 
++describe('connectionChange', () => {
++  let sendAllReturn;
++
++  const send = jest.fn();
++  const sendAll = jest.fn(arg => {
++    sendAllReturn = arg;
++  });
++
++  const db = new InMemory();
++  const master = new Master(game, db, TransportAPI(send, sendAll));
++
++  const metadata = {
++    gameName: 'tic-tac-toe',
++    setupData: {},
++    players: {
++      '0': {
++        id: 0,
++        credentials: 'qS2m4Ujb_',
++        name: 'Alice',
++      },
++      '1': {
++        id: 1,
++        credentials: 'nIQtXFybDD',
++        name: 'Bob',
++        isConnected: true,
++      },
++    },
++    createdAt: 0,
++    updatedAt: 0,
++  };
++  db.createMatch('matchID', { metadata, initialState: {} as State });
++
++  beforeEach(() => {
++    sendAllReturn = undefined;
++    jest.clearAllMocks();
++  });
++
++  test('returns a Promise for successful and error results', async () => {
++    const successfulResult = master.onConnectionChange('matchID', '0', true);
++    expect(successfulResult).toBeInstanceOf(Promise);
++    await successfulResult;
++
++    const missingMatchResult = master.onConnectionChange(
++      'invalidMatchID',
++      '0',
++      true
++    );
++    expect(missingMatchResult).toBeInstanceOf(Promise);
++    await expect(missingMatchResult).resolves.toEqual({
++      error: 'metadata not found',
++    });
++
++    const missingPlayerResult = master.onConnectionChange('matchID', '3', true);
++    expect(missingPlayerResult).toBeInstanceOf(Promise);
++    await expect(missingPlayerResult).resolves.toEqual({
++      error: 'player not in the match',
++    });
++  });
++
++  test('changes players metadata', async () => {
++    await master.onConnectionChange('matchID', '0', true);
++
++    const expectedPlayerData = { id: 0, name: 'Alice', isConnected: true };
++    const {
++      metadata: { players },
++    } = db.fetch('matchID', { metadata: true });
++    expect(players['0']).toMatchObject(expectedPlayerData);
++  });
++
++  test('sends metadata to all', async () => {
++    await master.onConnectionChange('matchID', '1', false);
++    const sentMessage = sendAllReturn('0');
++    expect(sentMessage.type).toEqual('matchData');
++    expect(sentMessage.args[0]).toEqual('matchID');
++    expect(sentMessage.args[1]).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ id: 1, name: 'Bob', isConnected: false }),
++      ])
++    );
++  });
++
++  test('invalid matchID', async () => {
++    const result = await master.onConnectionChange('invalidMatchID', '0', true);
++    expect(error).toHaveBeenCalledWith(
++      'metadata not found for matchID=[invalidMatchID]'
++    );
++    expect(result.error).toEqual('metadata not found');
++  });
++
++  test('invalid playerID', async () => {
++    const result = await master.onConnectionChange('matchID', '3', true);
++    expect(error).toHaveBeenCalledWith(
++      'Player not in the match, matchID=[matchID] playerID=[3]'
++    );
++    expect(result.error).toEqual('player not in the match');
++  });
++
++  test('processes connection change with an async db', async () => {
++    const asyncDb = new InMemoryAsync();
++    const masterWithAsyncDb = new Master(
++      game,
++      asyncDb,
++      TransportAPI(send, sendAll)
++    );
++    asyncDb.createMatch('matchID', { metadata, initialState: {} as State });
++
++    await masterWithAsyncDb.onConnectionChange('matchID', '0', true);
++
++    expect(sendAll).toHaveBeenCalled();
++  });
++});
++
+ describe('playerView', () => {
+   let sendAllReturn;
+   let sendReturn;
+diff --git a/src/server/transport/socketio.test.ts b/src/server/transport/socketio.test.ts
+index 56b9dd3..8fa82e0 100644
+--- a/src/server/transport/socketio.test.ts
++++ b/src/server/transport/socketio.test.ts
+@@ -26,14 +26,19 @@ class SocketIOTestAdapter extends SocketIO {
+   }
+ }
+ 
++const mockInstances = [];
++
+ jest.mock('../../master/master', () => {
+   class Master {
+     onUpdate: jest.Mock<any, any>;
+     onSync: jest.Mock<any, any>;
++    onConnectionChange: jest.Mock<any, any>;
+ 
+     constructor() {
+       this.onUpdate = jest.fn();
+       this.onSync = jest.fn();
++      this.onConnectionChange = jest.fn();
++      mockInstances.push(this);
+     }
+   }
+ 
+@@ -263,3 +268,44 @@ describe('connect / disconnect', () => {
+     expect(toObj(roomInfo.get('matchID'))).toEqual({});
+   });
+ });
++
++describe('connection status', () => {
++  const app: any = { context: {} };
++  const games = [ProcessGameConfig({ seed: 0 })];
++  let clientInfo;
++  let roomInfo;
++  let io;
++
++  const onConnectionChangeCalls = () => {
++    const calls = [];
++    mockInstances.forEach(m => {
++      m.onConnectionChange.mock.calls.forEach(c => calls.push(c));
++    });
++    return calls;
++  };
++
++  beforeEach(() => {
++    mockInstances.length = 0;
++    clientInfo = new Map();
++    roomInfo = new Map();
++    const transport = new SocketIOTestAdapter({ clientInfo, roomInfo });
++    transport.init(app, games);
++    io = app.context.io;
++  });
++
++  test('notifies the master when a player connects', async () => {
++    io.socket.id = '0';
++    await io.socket.receive('sync', 'matchID', '0', 2);
++
++    expect(onConnectionChangeCalls()).toContainEqual(['matchID', '0', true]);
++  });
++
++  test('notifies the master when a player disconnects', async () => {
++    io.socket.id = '0';
++    await io.socket.receive('sync', 'matchID', '0', 2);
++
++    await io.socket.receive('disconnect');
++
++    expect(onConnectionChangeCalls()).toContainEqual(['matchID', '0', false]);
++  });
++});

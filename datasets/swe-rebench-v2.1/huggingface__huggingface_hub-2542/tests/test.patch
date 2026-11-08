@@ -1,0 +1,203 @@
+diff --git a/tests/test_lfs.py b/tests/test_lfs.py
+index b0f9c18..057fc57 100644
+--- a/tests/test_lfs.py
++++ b/tests/test_lfs.py
+@@ -1,10 +1,18 @@
++import json
+ import os
++import socket
++import threading
+ import unittest
++from contextlib import contextmanager
+ from hashlib import sha256
++from http.server import BaseHTTPRequestHandler, HTTPServer
+ from io import BytesIO
+ 
+-from huggingface_hub.lfs import SliceFileObj, UploadInfo
+-from huggingface_hub.utils import SoftTemporaryDirectory
++import requests
++
++from huggingface_hub import CommitOperationAdd
++from huggingface_hub.lfs import SliceFileObj, UploadInfo, lfs_upload
++from huggingface_hub.utils import SoftTemporaryDirectory, http_backoff
+ 
+ 
+ class TestUploadInfo(unittest.TestCase):
+@@ -176,3 +184,177 @@ class TestSliceFileObj(unittest.TestCase):
+                     fileobj_slice.seek(-200, os.SEEK_END)
+                     self.assertEqual(fileobj_slice.tell(), 0)
+                     self.assertEqual(fileobj_slice.fileobj.tell(), 100)
++
++
++@contextmanager
++def _local_server(handler_class, **state):
++    """Run an HTTP server on localhost in a background thread, with extra attributes set on the server."""
++    server = HTTPServer(("127.0.0.1", 0), handler_class)
++    for key, value in state.items():
++        setattr(server, key, value)
++    thread = threading.Thread(target=server.serve_forever)
++    thread.start()
++    try:
++        yield server
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++
++
++class _RetryableUploadHandler(BaseHTTPRequestHandler):
++    """Test HTTP handler that records PUT bodies and fails the first request."""
++
++    def do_PUT(self):
++        content_length = int(self.headers.get("Content-Length", 0))
++        body = self.rfile.read(content_length) if content_length else b""
++        self.server.received_bodies.append(body)
++        self.send_response(500 if len(self.server.received_bodies) == 1 else 200)
++        self.end_headers()
++
++    def log_message(self, *args):
++        pass
++
++
++class TestHttpBackoffSliceFileObj(unittest.TestCase):
++    """`http_backoff` must re-send the full content when retrying seekable file-like request data."""
++
++    def test_http_backoff_retries_slice_fileobj(self):
++        content = bytes(range(256)) * 8
++        with _local_server(_RetryableUploadHandler, received_bodies=[]) as server:
++            url = f"http://127.0.0.1:{server.server_port}/upload"
++            with SliceFileObj(BytesIO(content), seek_from=100, read_limit=200) as fileobj_slice:
++                response = http_backoff(
++                    "PUT",
++                    url,
++                    data=fileobj_slice,
++                    retry_on_status_codes=(500,),
++                    base_wait_time=0.0,
++                )
++
++        self.assertEqual(response.status_code, 200)
++        # The request must have been retried after the transient 500.
++        self.assertEqual(len(server.received_bodies), 2)
++        # Both attempts must carry the full slice content, not an exhausted stream.
++        self.assertEqual(server.received_bodies[0], content[100:300])
++        self.assertEqual(server.received_bodies[1], content[100:300])
++
++    def test_http_backoff_retries_bytesio_body(self):
++        content = bytes(range(256)) * 8
++        with _local_server(_RetryableUploadHandler, received_bodies=[]) as server:
++            url = f"http://127.0.0.1:{server.server_port}/upload"
++            response = http_backoff(
++                "PUT",
++                url,
++                data=BytesIO(content),
++                retry_on_status_codes=(500,),
++                base_wait_time=0.0,
++            )
++
++        self.assertEqual(response.status_code, 200)
++        # The request must have been retried after the transient 500.
++        self.assertEqual(len(server.received_bodies), 2)
++        # Both attempts must carry the full content of the file-like body.
++        self.assertEqual(server.received_bodies[0], content)
++        self.assertEqual(server.received_bodies[1], content)
++
++
++class _DisconnectOnceHandler(BaseHTTPRequestHandler):
++    """Drop the first connection to simulate a transient request failure."""
++
++    def do_GET(self):
++        self.server.request_count += 1
++        if self.server.request_count == 1:
++            self.connection.shutdown(socket.SHUT_RDWR)
++            self.connection.close()
++            return
++        self.send_response(200)
++        self.end_headers()
++
++    def log_message(self, *args):
++        pass
++
++
++class TestHttpBackoffExceptions(unittest.TestCase):
++    def test_http_backoff_retries_configured_connection_exception(self):
++        with _local_server(_DisconnectOnceHandler, request_count=0) as server:
++            response = http_backoff(
++                "GET",
++                f"http://127.0.0.1:{server.server_port}/resource",
++                max_retries=1,
++                base_wait_time=0.0,
++                retry_on_exceptions=(requests.ConnectionError,),
++            )
++
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(server.request_count, 2)
++
++
++class _LfsMultipartHandler(BaseHTTPRequestHandler):
++    """Fails the first part upload with a transient 500, then accepts part uploads and the completion request."""
++
++    def do_PUT(self):
++        content_length = int(self.headers.get("Content-Length", 0))
++        body = self.rfile.read(content_length) if content_length else b""
++        if not self.server.failed_once:
++            self.server.failed_once = True
++            self._respond(500)
++            return
++        self.server.accepted_parts[self.path] = body
++        part_number = self.path.rsplit("/", 1)[-1]
++        self._respond(200, etag=f"etag-{part_number}")
++
++    def do_POST(self):
++        content_length = int(self.headers.get("Content-Length", 0))
++        body = self.rfile.read(content_length) if content_length else b""
++        self.server.completion_payloads.append(json.loads(body))
++        self._respond(200)
++
++    def _respond(self, status, etag=None):
++        self.send_response(status)
++        if etag is not None:
++            self.send_header("ETag", etag)
++        self.send_header("Content-Length", "0")
++        self.end_headers()
++
++    def log_message(self, *args):
++        pass
++
++
++class TestLfsUploadRetry(unittest.TestCase):
++    def test_lfs_multipart_upload_retries_transient_part_failure(self):
++        chunk_size = 2048
++        content = bytes(range(256)) * 16  # 4096 bytes, uploaded as two parts
++        with _local_server(
++            _LfsMultipartHandler, failed_once=False, accepted_parts={}, completion_payloads=[]
++        ) as server:
++            base_url = f"http://127.0.0.1:{server.server_port}"
++            lfs_batch_action = {
++                "oid": sha256(content).hexdigest(),
++                "size": len(content),
++                "actions": {
++                    "upload": {
++                        "href": f"{base_url}/complete",
++                        "header": {
++                            "chunk_size": chunk_size,
++                            "1": f"{base_url}/parts/1",
++                            "2": f"{base_url}/parts/2",
++                        },
++                    }
++                }
++            }
++            operation = CommitOperationAdd(path_in_repo="file.bin", path_or_fileobj=content)
++            # Must not raise even though the first part upload fails transiently.
++            lfs_upload(operation=operation, lfs_batch_action=lfs_batch_action)
++
++        # The transient failure really happened, and the upload still completed.
++        self.assertTrue(server.failed_once)
++        self.assertEqual(server.accepted_parts["/parts/1"], content[:chunk_size])
++        self.assertEqual(server.accepted_parts["/parts/2"], content[chunk_size:])
++        self.assertEqual(len(server.completion_payloads), 1)
++        payload = server.completion_payloads[0]
++        self.assertEqual(payload["oid"], sha256(content).hexdigest())
++        self.assertEqual(
++            [(part["partNumber"], part["etag"]) for part in payload["parts"]],
++            [(1, "etag-1"), (2, "etag-2")],
++        )

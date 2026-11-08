@@ -1,0 +1,177 @@
+diff --git a/internal/locate/region_request3_test.go b/internal/locate/region_request3_test.go
+index 36e1f71..73008a5 100644
+--- a/internal/locate/region_request3_test.go
++++ b/internal/locate/region_request3_test.go
+@@ -1273,98 +1273,6 @@ func (s *testRegionRequestToThreeStoresSuite) TestSendReqFirstTimeout() {
+ 	s.True(backoffTimes["tikvRPC"] > 0) // write request timeout won't do fast retry, so backoff times should be more than 0.
+ }
+ 
+-func (s *testRegionRequestToThreeStoresSuite) TestStaleReadFallback2Follower() {
+-	leaderStore, _ := s.loadAndGetLeaderStore()
+-	leaderLabel := []*metapb.StoreLabel{
+-		{
+-			Key:   "id",
+-			Value: strconv.FormatUint(leaderStore.StoreID(), 10),
+-		},
+-	}
+-	var followerID *uint64
+-	for _, storeID := range s.storeIDs {
+-		if storeID != leaderStore.storeID {
+-			id := storeID
+-			followerID = &id
+-			break
+-		}
+-	}
+-	s.NotNil(followerID)
+-	followerLabel := []*metapb.StoreLabel{
+-		{
+-			Key:   "id",
+-			Value: strconv.FormatUint(*followerID, 10),
+-		},
+-	}
+-
+-	regionLoc, err := s.cache.LocateRegionByID(s.bo, s.regionID)
+-	s.Nil(err)
+-	s.NotNil(regionLoc)
+-
+-	dataIsNotReady := false
+-	s.regionRequestSender.client = &fnClient{fn: func(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (response *tikvrpc.Response, err error) {
+-		select {
+-		case <-ctx.Done():
+-			return nil, errors.New("timeout")
+-		default:
+-		}
+-		if dataIsNotReady && req.StaleRead {
+-			dataIsNotReady = false
+-			return &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{RegionError: &errorpb.Error{
+-				DataIsNotReady: &errorpb.DataIsNotReady{},
+-			}}}, nil
+-		}
+-		if addr == leaderStore.addr {
+-			return &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{RegionError: &errorpb.Error{
+-				ServerIsBusy: &errorpb.ServerIsBusy{},
+-			}}}, nil
+-		}
+-		if !req.ReplicaRead {
+-			return &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{RegionError: &errorpb.Error{
+-				NotLeader: &errorpb.NotLeader{},
+-			}}}, nil
+-		}
+-		return &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{Value: []byte(addr)}}, nil
+-	}}
+-
+-	for _, localLeader := range []bool{true, false} {
+-		dataIsNotReady = true
+-		// data is not ready, then server is busy in the first round,
+-		// directly server is busy in the second round.
+-		for i := 0; i < 2; i++ {
+-			req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{Key: []byte("key")}, kv.ReplicaReadLeader, nil)
+-			req.ReadReplicaScope = oracle.GlobalTxnScope
+-			req.TxnScope = oracle.GlobalTxnScope
+-			req.EnableStaleWithMixedReplicaRead()
+-			req.ReplicaReadType = kv.ReplicaReadMixed
+-			var ops []StoreSelectorOption
+-			if localLeader {
+-				ops = append(ops, WithMatchLabels(leaderLabel))
+-			} else {
+-				ops = append(ops, WithMatchLabels(followerLabel))
+-			}
+-
+-			ctx, cancel := context.WithTimeout(context.Background(), 10000*time.Second)
+-			bo := retry.NewBackoffer(ctx, -1)
+-			s.Nil(err)
+-			resp, _, _, err := s.regionRequestSender.SendReqCtx(bo, req, regionLoc.Region, time.Second, tikvrpc.TiKV, ops...)
+-			s.Nil(err)
+-
+-			regionErr, err := resp.GetRegionError()
+-			s.Nil(err)
+-			s.Nil(regionErr)
+-			getResp, ok := resp.Resp.(*kvrpcpb.GetResponse)
+-			s.True(ok)
+-			if localLeader {
+-				s.NotEqual(getResp.Value, []byte("store"+leaderLabel[0].Value))
+-			} else {
+-				s.Equal(getResp.Value, []byte("store"+followerLabel[0].Value))
+-			}
+-			cancel()
+-		}
+-	}
+-}
+-
+ func (s *testRegionRequestToThreeStoresSuite) TestReplicaReadFallbackToLeaderRegionError() {
+ 	regionLoc, err := s.cache.LocateRegionByID(s.bo, s.regionID)
+ 	s.Nil(err)
+diff --git a/internal/locate/replica_selector_test.go b/internal/locate/replica_selector_test.go
+index 5259903..741fe67 100644
+--- a/internal/locate/replica_selector_test.go
++++ b/internal/locate/replica_selector_test.go
+@@ -282,7 +282,69 @@ func TestReplicaReadStaleReadAccessPathByCase(t *testing.T) {
+ 		},
+ 	}
+ 	s.True(s.runCaseAndCompare(ca))
++
++	ca = replicaSelectorAccessPathCase{
++		reqType:   tikvrpc.CmdGet,
++		readType:  kv.ReplicaReadMixed,
++		staleRead: true,
++		timeout:   0,
++		label:     &metapb.StoreLabel{Key: "id", Value: "3"},
++		accessErr: []RegionErrorType{ServerIsBusyErr, ServerIsBusyErr},
++	}
++	ca.run(s)
++	s.False(ca.accessErrInValid)
++	s.Equal([]string{
++		"{addr: store3, replica-read: false, stale-read: true}",
++		"{addr: store1, replica-read: false, stale-read: false}",
++		"{addr: store2, replica-read: true, stale-read: false}",
++	}, ca.accessPath)
++
++	assertDataNotReadyRetry := func(ca replicaSelectorAccessPathCase, retriedStore string, otherStores ...string) {
++		ca.run(s)
++		s.False(ca.accessErrInValid)
++		path := strings.Join(ca.accessPath, "\n")
++		s.LessOrEqual(strings.Count(path, fmt.Sprintf("{addr: %s, replica-read: true, stale-read: false}", retriedStore)), 1,
++			"a DataIsNotReady replica may receive at most one replica-read retry")
++		s.LessOrEqual(strings.Count(path, "{addr: "+retriedStore+","), 2,
++			"a DataIsNotReady replica may be attempted at most twice in the round")
++		for _, store := range otherStores {
++			s.LessOrEqual(strings.Count(path, "{addr: "+store+","), 1, "a replica with a non-DataIsNotReady error must not be retried")
++		}
++	}
++
++	ca = replicaSelectorAccessPathCase{
++		reqType:   tikvrpc.CmdGet,
++		readType:  kv.ReplicaReadMixed,
++		staleRead: true,
++		label:     &metapb.StoreLabel{Key: "id", Value: "2"},
++		accessErr: []RegionErrorType{DataIsNotReadyErr, ServerIsBusyErr, ServerIsBusyErr, ServerIsBusyErr},
++	}
++	assertDataNotReadyRetry(ca, "store2", "store1", "store3")
++
++	s.changeRegionLeader(2)
++	ca = replicaSelectorAccessPathCase{
++		reqType:   tikvrpc.CmdGet,
++		readType:  kv.ReplicaReadMixed,
++		staleRead: true,
++		accessErr: []RegionErrorType{DataIsNotReadyErr, ServerIsBusyErr, ServerIsBusyErr, ServerIsBusyErr},
++	}
++	assertDataNotReadyRetry(ca, "store1", "store2", "store3")
++	s.changeRegionLeader(1)
++}
++
++func (s *testReplicaSelectorSuite) changeRegionLeader(storeId uint64) {
++	loc, err := s.cache.LocateKey(s.bo, []byte("key"))
++	s.Nil(err)
++	rc := s.cache.GetCachedRegionWithRLock(loc.Region)
++	for _, peer := range rc.meta.Peers {
++		if peer.StoreId == storeId {
++			s.cluster.ChangeLeader(rc.meta.Id, peer.Id)
++		}
++	}
++	// Invalidate region cache to reload.
++	s.cache.InvalidateCachedRegion(loc.Region)
+ }
++
+ func (s *testReplicaSelectorSuite) runCaseAndCompare(ca2 replicaSelectorAccessPathCase) bool {
+ 	ca2.run(s)
+ 	if ca2.accessErrInValid {

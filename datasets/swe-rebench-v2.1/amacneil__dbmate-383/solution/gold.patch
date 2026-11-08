@@ -1,0 +1,836 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index fe51262..4d831fa 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -154,7 +154,7 @@ jobs:
+             type=semver,pattern={{major}}
+ 
+       - name: Publish Docker image
+-        uses: docker/build-push-action@v3
++        uses: docker/build-push-action@v4
+         if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+         with:
+           context: .
+diff --git a/main.go b/main.go
+index 04a777f..b32c594 100644
+--- a/main.go
++++ b/main.go
+@@ -33,6 +33,7 @@ func NewApp() *cli.App {
+ 	app.Usage = "A lightweight, framework-independent database migration tool."
+ 	app.Version = dbmate.Version
+ 
++	defaultDB := dbmate.New(nil)
+ 	app.Flags = []cli.Flag{
+ 		&cli.StringFlag{
+ 			Name:    "url",
+@@ -49,20 +50,20 @@ func NewApp() *cli.App {
+ 			Name:    "migrations-dir",
+ 			Aliases: []string{"d"},
+ 			EnvVars: []string{"DBMATE_MIGRATIONS_DIR"},
+-			Value:   dbmate.DefaultMigrationsDir,
++			Value:   defaultDB.MigrationsDir,
+ 			Usage:   "specify the directory containing migration files",
+ 		},
+ 		&cli.StringFlag{
+ 			Name:    "migrations-table",
+ 			EnvVars: []string{"DBMATE_MIGRATIONS_TABLE"},
+-			Value:   dbmate.DefaultMigrationsTableName,
++			Value:   defaultDB.MigrationsTableName,
+ 			Usage:   "specify the database table to record migrations in",
+ 		},
+ 		&cli.StringFlag{
+ 			Name:    "schema-file",
+ 			Aliases: []string{"s"},
+ 			EnvVars: []string{"DBMATE_SCHEMA_FILE"},
+-			Value:   dbmate.DefaultSchemaFile,
++			Value:   defaultDB.SchemaFile,
+ 			Usage:   "specify the schema file location",
+ 		},
+ 		&cli.BoolFlag{
+@@ -79,7 +80,7 @@ func NewApp() *cli.App {
+ 			Name:    "wait-timeout",
+ 			EnvVars: []string{"DBMATE_WAIT_TIMEOUT"},
+ 			Usage:   "timeout for --wait flag",
+-			Value:   dbmate.DefaultWaitTimeout,
++			Value:   defaultDB.WaitTimeout,
+ 		},
+ 	}
+ 
+@@ -231,9 +232,9 @@ func action(f func(*dbmate.DB, *cli.Context) error) cli.ActionFunc {
+ 		db.MigrationsTableName = c.String("migrations-table")
+ 		db.SchemaFile = c.String("schema-file")
+ 		db.WaitBefore = c.Bool("wait")
+-		overrideTimeout := c.Duration("wait-timeout")
+-		if overrideTimeout != 0 {
+-			db.WaitTimeout = overrideTimeout
++		waitTimeout := c.Duration("wait-timeout")
++		if waitTimeout != 0 {
++			db.WaitTimeout = waitTimeout
+ 		}
+ 
+ 		return f(db, c)
+diff --git a/pkg/dbmate/db.go b/pkg/dbmate/db.go
+index 5c1c3a2..92ee4a8 100644
+--- a/pkg/dbmate/db.go
++++ b/pkg/dbmate/db.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
+@@ -15,21 +16,6 @@ import (
+ 	"github.com/amacneil/dbmate/pkg/dbutil"
+ )
+ 
+-// DefaultMigrationsDir specifies default directory to find migration files
+-const DefaultMigrationsDir = "./db/migrations"
+-
+-// DefaultMigrationsTableName specifies default database tables to record migraitons in
+-const DefaultMigrationsTableName = "schema_migrations"
+-
+-// DefaultSchemaFile specifies default location for schema.sql
+-const DefaultSchemaFile = "./db/schema.sql"
+-
+-// DefaultWaitInterval specifies length of time between connection attempts
+-const DefaultWaitInterval = time.Second
+-
+-// DefaultWaitTimeout specifies maximum time for connection attempts
+-const DefaultWaitTimeout = 60 * time.Second
+-
+ // Error codes
+ var (
+ 	ErrNoMigrationFiles      = errors.New("no migration files found")
+@@ -44,23 +30,35 @@ var (
+ 	ErrCreateDirectory       = errors.New("unable to create directory")
+ )
+ 
++// migrationFileRegexp pattern for valid migration files
++var migrationFileRegexp = regexp.MustCompile(`^(\d+).*\.sql$`)
++
+ // DB allows dbmate actions to be performed on a specified database
+ type DB struct {
+-	AutoDumpSchema      bool
+-	DatabaseURL         *url.URL
+-	MigrationsDir       string
++	// AutoDumpSchema generates schema.sql after each action
++	AutoDumpSchema bool
++	// DatabaseURL is the database connection string
++	DatabaseURL *url.URL
++	// FS allows overriding the filesystem
++	FS fs.FS
++	// Log is the interface to write stdout
++	Log io.Writer
++	// MigrationsDir specifies the directory to find migration files
++	MigrationsDir string
++	// MigrationsTableName specifies the database table to record migrations in
+ 	MigrationsTableName string
+-	SchemaFile          string
+-	Verbose             bool
+-	WaitBefore          bool
+-	WaitInterval        time.Duration
+-	WaitTimeout         time.Duration
+-	Log                 io.Writer
++	// SchemaFile specifies the location for schema.sql file
++	SchemaFile string
++	// Verbose prints the result of each statement execution
++	Verbose bool
++	// WaitBefore will wait for database to become available before running any actions
++	WaitBefore bool
++	// WaitInterval specifies length of time between connection attempts
++	WaitInterval time.Duration
++	// WaitTimeout specifies maximum time for connection attempts
++	WaitTimeout time.Duration
+ }
+ 
+-// migrationFileRegexp pattern for valid migration files
+-var migrationFileRegexp = regexp.MustCompile(`^\d.*\.sql$`)
+-
+ // StatusResult represents an available migration status
+ type StatusResult struct {
+ 	Filename string
+@@ -72,18 +70,20 @@ func New(databaseURL *url.URL) *DB {
+ 	return &DB{
+ 		AutoDumpSchema:      true,
+ 		DatabaseURL:         databaseURL,
+-		MigrationsDir:       DefaultMigrationsDir,
+-		MigrationsTableName: DefaultMigrationsTableName,
+-		SchemaFile:          DefaultSchemaFile,
+-		WaitBefore:          false,
+-		WaitInterval:        DefaultWaitInterval,
+-		WaitTimeout:         DefaultWaitTimeout,
++		FS:                  os.DirFS("."),
+ 		Log:                 os.Stdout,
++		MigrationsDir:       "./db/migrations",
++		MigrationsTableName: "schema_migrations",
++		SchemaFile:          "./db/schema.sql",
++		Verbose:             false,
++		WaitBefore:          false,
++		WaitInterval:        time.Second,
++		WaitTimeout:         60 * time.Second,
+ 	}
+ }
+ 
+-// GetDriver initializes the appropriate database driver
+-func (db *DB) GetDriver() (Driver, error) {
++// Driver initializes the appropriate database driver
++func (db *DB) Driver() (Driver, error) {
+ 	if db.DatabaseURL == nil || db.DatabaseURL.Scheme == "" {
+ 		return nil, ErrInvalidURL
+ 	}
+@@ -95,22 +95,18 @@ func (db *DB) GetDriver() (Driver, error) {
+ 
+ 	config := DriverConfig{
+ 		DatabaseURL:         db.DatabaseURL,
+-		MigrationsTableName: db.MigrationsTableName,
+ 		Log:                 db.Log,
++		MigrationsTableName: db.MigrationsTableName,
+ 	}
++	drv := driverFunc(config)
+ 
+-	return driverFunc(config), nil
+-}
+-
+-// Wait blocks until the database server is available. It does not verify that
+-// the specified database exists, only that the host is ready to accept connections.
+-func (db *DB) Wait() error {
+-	drv, err := db.GetDriver()
+-	if err != nil {
+-		return err
++	if db.WaitBefore {
++		if err := db.wait(drv); err != nil {
++			return nil, err
++		}
+ 	}
+ 
+-	return db.wait(drv)
++	return drv, nil
+ }
+ 
+ func (db *DB) wait(drv Driver) error {
+@@ -140,18 +136,23 @@ func (db *DB) wait(drv Driver) error {
+ 	return fmt.Errorf("%w: %s", ErrCantConnect, err)
+ }
+ 
+-// CreateAndMigrate creates the database (if necessary) and runs migrations
+-func (db *DB) CreateAndMigrate() error {
+-	drv, err := db.GetDriver()
++// Wait blocks until the database server is available. It does not verify that
++// the specified database exists, only that the host is ready to accept connections.
++func (db *DB) Wait() error {
++	drv, err := db.Driver()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if db.WaitBefore {
+-		err := db.wait(drv)
+-		if err != nil {
+-			return err
+-		}
++	// if db.WaitBefore is true, wait() will get called twice, no harm
++	return db.wait(drv)
++}
++
++// CreateAndMigrate creates the database (if necessary) and runs migrations
++func (db *DB) CreateAndMigrate() error {
++	drv, err := db.Driver()
++	if err != nil {
++		return err
+ 	}
+ 
+ 	// create database if it does not already exist
+@@ -165,61 +166,36 @@ func (db *DB) CreateAndMigrate() error {
+ 	}
+ 
+ 	// migrate
+-	return db.migrate(drv)
++	return db.Migrate()
+ }
+ 
+ // Create creates the current database
+ func (db *DB) Create() error {
+-	drv, err := db.GetDriver()
++	drv, err := db.Driver()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if db.WaitBefore {
+-		err := db.wait(drv)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	return drv.CreateDatabase()
+ }
+ 
+ // Drop drops the current database (if it exists)
+ func (db *DB) Drop() error {
+-	drv, err := db.GetDriver()
++	drv, err := db.Driver()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if db.WaitBefore {
+-		err := db.wait(drv)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	return drv.DropDatabase()
+ }
+ 
+ // DumpSchema writes the current database schema to a file
+ func (db *DB) DumpSchema() error {
+-	drv, err := db.GetDriver()
++	drv, err := db.Driver()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	return db.dumpSchema(drv)
+-}
+-
+-func (db *DB) dumpSchema(drv Driver) error {
+-	if db.WaitBefore {
+-		err := db.wait(drv)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	sqlDB, err := db.openDatabaseForMigration(drv)
+ 	if err != nil {
+ 		return err
+@@ -319,59 +295,41 @@ func (db *DB) openDatabaseForMigration(drv Driver) (*sql.DB, error) {
+ 
+ // Migrate migrates database to the latest version
+ func (db *DB) Migrate() error {
+-	drv, err := db.GetDriver()
++	drv, err := db.Driver()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	return db.migrate(drv)
+-}
+-
+-func (db *DB) migrate(drv Driver) error {
+-	files, err := findMigrationFiles(db.MigrationsDir, migrationFileRegexp)
++	migrations, err := db.FindMigrations()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if len(files) == 0 {
++	if len(migrations) == 0 {
+ 		return ErrNoMigrationFiles
+ 	}
+ 
+-	if db.WaitBefore {
+-		err := db.wait(drv)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	sqlDB, err := db.openDatabaseForMigration(drv)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer dbutil.MustClose(sqlDB)
+ 
+-	applied, err := drv.SelectMigrations(sqlDB, -1)
+-	if err != nil {
+-		return err
+-	}
+-
+-	for _, filename := range files {
+-		ver := migrationVersion(filename)
+-		if ok := applied[ver]; ok {
+-			// migration already applied
++	for _, migration := range migrations {
++		if migration.Applied {
+ 			continue
+ 		}
+ 
+-		fmt.Fprintf(db.Log, "Applying: %s\n", filename)
++		fmt.Fprintf(db.Log, "Applying: %s\n", migration.FileName)
+ 
+-		up, _, err := parseMigration(filepath.Join(db.MigrationsDir, filename))
++		parsed, err := migration.Parse()
+ 		if err != nil {
+ 			return err
+ 		}
+ 
+ 		execMigration := func(tx dbutil.Transaction) error {
+ 			// run actual migration
+-			result, err := tx.Exec(up.Contents)
++			result, err := tx.Exec(parsed.Up)
+ 			if err != nil {
+ 				return err
+ 			} else if db.Verbose {
+@@ -379,10 +337,10 @@ func (db *DB) migrate(drv Driver) error {
+ 			}
+ 
+ 			// record migration
+-			return drv.InsertMigration(tx, ver)
++			return drv.InsertMigration(tx, migration.Version)
+ 		}
+ 
+-		if up.Options.Transaction() {
++		if parsed.UpOptions.Transaction() {
+ 			// begin transaction
+ 			err = doTransaction(sqlDB, execMigration)
+ 		} else {
+@@ -397,7 +355,7 @@ func (db *DB) migrate(drv Driver) error {
+ 
+ 	// automatically update schema file, silence errors
+ 	if db.AutoDumpSchema {
+-		_ = db.dumpSchema(drv)
++		_ = db.DumpSchema()
+ 	}
+ 
+ 	return nil
+@@ -414,104 +372,111 @@ func (db *DB) printVerbose(result sql.Result) {
+ 	}
+ }
+ 
+-func findMigrationFiles(dir string, re *regexp.Regexp) ([]string, error) {
+-	files, err := os.ReadDir(dir)
++// FindMigrations lists all available migrations
++func (db *DB) FindMigrations() ([]Migration, error) {
++	drv, err := db.Driver()
++	if err != nil {
++		return nil, err
++	}
++
++	sqlDB, err := drv.Open()
++	if err != nil {
++		return nil, err
++	}
++	defer dbutil.MustClose(sqlDB)
++
++	// find applied migrations
++	appliedMigrations := map[string]bool{}
++	migrationsTableExists, err := drv.MigrationsTableExists(sqlDB)
++	if err != nil {
++		return nil, err
++	}
++
++	if migrationsTableExists {
++		appliedMigrations, err = drv.SelectMigrations(sqlDB, -1)
++		if err != nil {
++			return nil, err
++		}
++	}
++
++	// find filesystem migrations
++	files, err := fs.ReadDir(db.FS, filepath.Clean(db.MigrationsDir))
+ 	if err != nil {
+-		return nil, fmt.Errorf("%w `%s`", ErrMigrationDirNotFound, dir)
++		return nil, fmt.Errorf("%w `%s`", ErrMigrationDirNotFound, db.MigrationsDir)
+ 	}
+ 
+-	matches := []string{}
++	migrations := []Migration{}
+ 	for _, file := range files {
+ 		if file.IsDir() {
+ 			continue
+ 		}
+ 
+-		name := file.Name()
+-		if !re.MatchString(name) {
++		matches := migrationFileRegexp.FindStringSubmatch(file.Name())
++		if len(matches) < 2 {
+ 			continue
+ 		}
+ 
+-		matches = append(matches, name)
+-	}
+-
+-	sort.Strings(matches)
+-
+-	return matches, nil
+-}
+-
+-func findMigrationFile(dir string, ver string) (string, error) {
+-	if ver == "" {
+-		panic("migration version is required")
+-	}
+-
+-	ver = regexp.QuoteMeta(ver)
+-	re := regexp.MustCompile(fmt.Sprintf(`^%s.*\.sql$`, ver))
+-
+-	files, err := findMigrationFiles(dir, re)
+-	if err != nil {
+-		return "", err
+-	}
++		migration := Migration{
++			Applied:  false,
++			FileName: matches[0],
++			FilePath: filepath.Join(db.MigrationsDir, matches[0]),
++			FS:       db.FS,
++			Version:  matches[1],
++		}
++		if ok := appliedMigrations[migration.Version]; ok {
++			migration.Applied = true
++		}
+ 
+-	if len(files) == 0 {
+-		return "", fmt.Errorf("%w: %s*.sql", ErrMigrationNotFound, ver)
++		migrations = append(migrations, migration)
+ 	}
+ 
+-	return files[0], nil
+-}
++	sort.Slice(migrations, func(i, j int) bool {
++		return migrations[i].FileName < migrations[j].FileName
++	})
+ 
+-func migrationVersion(filename string) string {
+-	return regexp.MustCompile(`^\d+`).FindString(filename)
++	return migrations, nil
+ }
+ 
+ // Rollback rolls back the most recent migration
+ func (db *DB) Rollback() error {
+-	drv, err := db.GetDriver()
++	drv, err := db.Driver()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if db.WaitBefore {
+-		err := db.wait(drv)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	sqlDB, err := db.openDatabaseForMigration(drv)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer dbutil.MustClose(sqlDB)
+ 
+-	applied, err := drv.SelectMigrations(sqlDB, 1)
++	// find last applied migration
++	var latest *Migration
++	migrations, err := db.FindMigrations()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	// grab most recent applied migration (applied has len=1)
+-	latest := ""
+-	for ver := range applied {
+-		latest = ver
+-	}
+-	if latest == "" {
+-		return ErrNoRollback
++	for _, migration := range migrations {
++		if migration.Applied {
++			latest = &migration
++		}
+ 	}
+ 
+-	filename, err := findMigrationFile(db.MigrationsDir, latest)
+-	if err != nil {
+-		return err
++	if latest == nil {
++		return ErrNoRollback
+ 	}
+ 
+-	fmt.Fprintf(db.Log, "Rolling back: %s\n", filename)
++	fmt.Fprintf(db.Log, "Rolling back: %s\n", latest.FileName)
+ 
+-	_, down, err := parseMigration(filepath.Join(db.MigrationsDir, filename))
++	parsed, err := latest.Parse()
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+ 	execMigration := func(tx dbutil.Transaction) error {
+ 		// rollback migration
+-		result, err := tx.Exec(down.Contents)
++		result, err := tx.Exec(parsed.Down)
+ 		if err != nil {
+ 			return err
+ 		} else if db.Verbose {
+@@ -519,10 +484,10 @@ func (db *DB) Rollback() error {
+ 		}
+ 
+ 		// remove migration record
+-		return drv.DeleteMigration(tx, latest)
++		return drv.DeleteMigration(tx, latest.Version)
+ 	}
+ 
+-	if down.Options.Transaction() {
++	if parsed.DownOptions.Transaction() {
+ 		// begin transaction
+ 		err = doTransaction(sqlDB, execMigration)
+ 	} else {
+@@ -536,7 +501,7 @@ func (db *DB) Rollback() error {
+ 
+ 	// automatically update schema file, silence errors
+ 	if db.AutoDumpSchema {
+-		_ = db.dumpSchema(drv)
++		_ = db.DumpSchema()
+ 	}
+ 
+ 	return nil
+@@ -544,12 +509,7 @@ func (db *DB) Rollback() error {
+ 
+ // Status shows the status of all migrations
+ func (db *DB) Status(quiet bool) (int, error) {
+-	drv, err := db.GetDriver()
+-	if err != nil {
+-		return -1, err
+-	}
+-
+-	results, err := db.CheckMigrationsStatus(drv)
++	results, err := db.FindMigrations()
+ 	if err != nil {
+ 		return -1, err
+ 	}
+@@ -559,10 +519,10 @@ func (db *DB) Status(quiet bool) (int, error) {
+ 
+ 	for _, res := range results {
+ 		if res.Applied {
+-			line = fmt.Sprintf("[X] %s", res.Filename)
++			line = fmt.Sprintf("[X] %s", res.FileName)
+ 			totalApplied++
+ 		} else {
+-			line = fmt.Sprintf("[ ] %s", res.Filename)
++			line = fmt.Sprintf("[ ] %s", res.FileName)
+ 		}
+ 		if !quiet {
+ 			fmt.Fprintln(db.Log, line)
+@@ -578,51 +538,3 @@ func (db *DB) Status(quiet bool) (int, error) {
+ 
+ 	return totalPending, nil
+ }
+-
+-// CheckMigrationsStatus returns the status of all available mgirations
+-func (db *DB) CheckMigrationsStatus(drv Driver) ([]StatusResult, error) {
+-	files, err := findMigrationFiles(db.MigrationsDir, migrationFileRegexp)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if len(files) == 0 {
+-		return nil, ErrNoMigrationFiles
+-	}
+-
+-	sqlDB, err := drv.Open()
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer dbutil.MustClose(sqlDB)
+-
+-	applied := map[string]bool{}
+-
+-	migrationsTableExists, err := drv.MigrationsTableExists(sqlDB)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if migrationsTableExists {
+-		applied, err = drv.SelectMigrations(sqlDB, -1)
+-		if err != nil {
+-			return nil, err
+-		}
+-	}
+-
+-	var results []StatusResult
+-
+-	for _, filename := range files {
+-		ver := migrationVersion(filename)
+-		res := StatusResult{Filename: filename}
+-		if ok := applied[ver]; ok {
+-			res.Applied = true
+-		} else {
+-			res.Applied = false
+-		}
+-
+-		results = append(results, res)
+-	}
+-
+-	return results, nil
+-}
+diff --git a/pkg/dbmate/driver.go b/pkg/dbmate/driver.go
+index 730a29b..4ad2b74 100644
+--- a/pkg/dbmate/driver.go
++++ b/pkg/dbmate/driver.go
+@@ -26,8 +26,8 @@ type Driver interface {
+ // DriverConfig holds configuration passed to driver constructors
+ type DriverConfig struct {
+ 	DatabaseURL         *url.URL
+-	MigrationsTableName string
+ 	Log                 io.Writer
++	MigrationsTableName string
+ }
+ 
+ // DriverFunc represents a driver constructor
+diff --git a/pkg/dbmate/migration.go b/pkg/dbmate/migration.go
+index 4bb18ef..c2df7ea 100644
+--- a/pkg/dbmate/migration.go
++++ b/pkg/dbmate/migration.go
+@@ -2,43 +2,49 @@ package dbmate
+ 
+ import (
+ 	"errors"
+-	"os"
++	"io/fs"
+ 	"regexp"
+ 	"strings"
+ )
+ 
+-// MigrationOptions is an interface for accessing migration options
+-type MigrationOptions interface {
+-	Transaction() bool
++// Migration represents an available migration and status
++type Migration struct {
++	Applied  bool
++	FileName string
++	FilePath string
++	FS       fs.FS
++	Version  string
+ }
+ 
+-type migrationOptions map[string]string
++// Parse a migration
++func (m *Migration) Parse() (*ParsedMigration, error) {
++	bytes, err := fs.ReadFile(m.FS, m.FilePath)
++	if err != nil {
++		return nil, err
++	}
+ 
+-// Transaction returns whether or not this migration should run in a transaction
+-// Defaults to true.
+-func (m migrationOptions) Transaction() bool {
+-	return m["transaction"] != "false"
++	return parseMigrationContents(string(bytes))
+ }
+ 
+-// Migration contains the migration contents and options
+-type Migration struct {
+-	Contents string
+-	Options  MigrationOptions
++// ParsedMigration contains the migration contents and options
++type ParsedMigration struct {
++	Up          string
++	UpOptions   ParsedMigrationOptions
++	Down        string
++	DownOptions ParsedMigrationOptions
+ }
+ 
+-// NewMigration constructs a Migration object
+-func NewMigration() Migration {
+-	return Migration{Contents: "", Options: make(migrationOptions)}
++// ParsedMigrationOptions is an interface for accessing migration options
++type ParsedMigrationOptions interface {
++	Transaction() bool
+ }
+ 
+-// parseMigration reads a migration file and returns (up Migration, down Migration, error)
+-func parseMigration(path string) (Migration, Migration, error) {
+-	data, err := os.ReadFile(path)
+-	if err != nil {
+-		return NewMigration(), NewMigration(), err
+-	}
+-	up, down, err := parseMigrationContents(string(data))
+-	return up, down, err
++type migrationOptions map[string]string
++
++// Transaction returns whether or not this migration should run in a transaction
++// Defaults to true.
++func (m migrationOptions) Transaction() bool {
++	return m["transaction"] != "false"
+ }
+ 
+ var (
+@@ -62,17 +68,14 @@ var (
+ // block and the second representing the "down" block. This function
+ // requires that at least an up block was defined and will otherwise
+ // return an error.
+-func parseMigrationContents(contents string) (Migration, Migration, error) {
+-	up := NewMigration()
+-	down := NewMigration()
+-
++func parseMigrationContents(contents string) (*ParsedMigration, error) {
+ 	upDirectiveStart, upDirectiveEnd, hasDefinedUpBlock := getMatchPositions(contents, upRegExp)
+ 	downDirectiveStart, downDirectiveEnd, hasDefinedDownBlock := getMatchPositions(contents, downRegExp)
+ 
+ 	if !hasDefinedUpBlock {
+-		return up, down, ErrParseMissingUp
++		return nil, ErrParseMissingUp
+ 	} else if statementsPrecedeMigrateBlocks(contents, upDirectiveStart, downDirectiveStart) {
+-		return up, down, ErrParseUnexpectedStmt
++		return nil, ErrParseUnexpectedStmt
+ 	}
+ 
+ 	upEnd := len(contents)
+@@ -89,13 +92,13 @@ func parseMigrationContents(contents string) (Migration, Migration, error) {
+ 	upDirective := substring(contents, upDirectiveStart, upDirectiveEnd)
+ 	downDirective := substring(contents, downDirectiveStart, downDirectiveEnd)
+ 
+-	up.Options = parseMigrationOptions(upDirective)
+-	up.Contents = substring(contents, upDirectiveStart, upEnd)
+-
+-	down.Options = parseMigrationOptions(downDirective)
+-	down.Contents = substring(contents, downDirectiveStart, downEnd)
+-
+-	return up, down, nil
++	parsed := ParsedMigration{
++		Up:          substring(contents, upDirectiveStart, upEnd),
++		UpOptions:   parseMigrationOptions(upDirective),
++		Down:        substring(contents, downDirectiveStart, downEnd),
++		DownOptions: parseMigrationOptions(downDirective),
++	}
++	return &parsed, nil
+ }
+ 
+ // parseMigrationOptions parses the migration options out of a block
+@@ -105,7 +108,7 @@ func parseMigrationContents(contents string) (Migration, Migration, error) {
+ //
+ //	fmt.Printf("%#v", parseMigrationOptions("-- migrate:up transaction:false"))
+ //	// migrationOptions{"transaction": "false"}
+-func parseMigrationOptions(contents string) MigrationOptions {
++func parseMigrationOptions(contents string) ParsedMigrationOptions {
+ 	options := make(migrationOptions)
+ 
+ 	// strip away the -- migrate:[up|down] part
+diff --git a/pkg/driver/clickhouse/clickhouse.go b/pkg/driver/clickhouse/clickhouse.go
+index 2059cbe..c785002 100644
+--- a/pkg/driver/clickhouse/clickhouse.go
++++ b/pkg/driver/clickhouse/clickhouse.go
+@@ -233,7 +233,7 @@ func (drv *Driver) DatabaseExists() (bool, error) {
+ // MigrationsTableExists checks if the schema_migrations table exists
+ func (drv *Driver) MigrationsTableExists(db *sql.DB) (bool, error) {
+ 	exists := false
+-	err := db.QueryRow("EXISTS TABLE $1", drv.quotedMigrationsTableName()).
++	err := db.QueryRow(fmt.Sprintf("EXISTS TABLE %s", drv.quotedMigrationsTableName())).
+ 		Scan(&exists)
+ 	if err == sql.ErrNoRows {
+ 		return false, nil
+diff --git a/pkg/driver/sqlite/sqlite.go b/pkg/driver/sqlite/sqlite.go
+index 0009710..d4150d3 100644
+--- a/pkg/driver/sqlite/sqlite.go
++++ b/pkg/driver/sqlite/sqlite.go
+@@ -131,7 +131,7 @@ func (drv *Driver) schemaMigrationsDump(db *sql.DB) ([]byte, error) {
+ // DumpSchema returns the current database schema
+ func (drv *Driver) DumpSchema(db *sql.DB) ([]byte, error) {
+ 	path := ConnectionString(drv.databaseURL)
+-	schema, err := dbutil.RunCommand("sqlite3", path, ".schema")
++	schema, err := dbutil.RunCommand("sqlite3", path, ".schema --nosys")
+ 	if err != nil {
+ 		return nil, err
+ 	}

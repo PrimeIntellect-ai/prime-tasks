@@ -1,0 +1,173 @@
+diff --git a/crates/loader/src/local/assets.rs b/crates/loader/src/local/assets.rs
+index a38f0f0d..174c95be 100644
+--- a/crates/loader/src/local/assets.rs
++++ b/crates/loader/src/local/assets.rs
+@@ -18,6 +18,26 @@ use super::config::{RawDirectoryPlacement, RawFileMount};
+ /// Prepare all local assets given a component ID and its file patterns.
+ /// This file will copy all assets into a temporary directory as read-only.
+ pub(crate) async fn prepare_component(
++    raw_mounts: &[RawFileMount],
++    src: impl AsRef<Path>,
++    base_dst: Option<impl AsRef<Path>>,
++    id: &str,
++    exclude_files: &[String],
++) -> Result<Vec<DirectoryMount>> {
++    if let Some(base_dst) = base_dst {
++        prepare_component_with_temp_dir(raw_mounts, src, base_dst, id, exclude_files).await
++    } else {
++        tracing::info!("directly mounting local asset directories into guest");
++
++        if !exclude_files.is_empty() {
++            bail!("this component cannot be run with `--direct-mount` because some files are excluded from mounting")
++        }
++
++        prepare_component_with_direct_mounts(raw_mounts)
++    }
++}
++
++async fn prepare_component_with_temp_dir(
+     raw_mounts: &[RawFileMount],
+     src: impl AsRef<Path>,
+     base_dst: impl AsRef<Path>,
+@@ -38,6 +58,29 @@ pub(crate) async fn prepare_component(
+     Ok(vec![DirectoryMount { guest, host }])
+ }
+ 
++fn prepare_component_with_direct_mounts(
++    raw_mounts: &[RawFileMount],
++) -> Result<Vec<DirectoryMount>> {
++    tracing::info!("directly mounting local asset directories into guest");
++
++    raw_mounts
++        .iter()
++        .map(|mount| match mount {
++            RawFileMount::Placement(placement) => Ok(DirectoryMount {
++                guest: placement
++                    .destination
++                    .to_str()
++                    .context("unable to parse mount destination as UTF-8")?
++                    .to_owned(),
++                host: placement.source.clone(),
++            }),
++            RawFileMount::Pattern(_) => Err(anyhow!(
++                "this component cannot be run with `--direct-mount` because it uses file patterns"
++            )),
++        })
++        .collect()
++}
++
+ /// A file that a component requires to be present at runtime.
+ #[derive(Debug, Clone)]
+ pub struct FileMount {
+diff --git a/crates/loader/src/local/mod.rs b/crates/loader/src/local/mod.rs
+index 07324642..433f660f 100644
+--- a/crates/loader/src/local/mod.rs
++++ b/crates/loader/src/local/mod.rs
+@@ -38,7 +38,7 @@ use self::config::FileComponentUrlSource;
+ /// otherwise create a new temporary directory.
+ pub async fn from_file(
+     app: impl AsRef<Path>,
+-    base_dst: impl AsRef<Path>,
++    base_dst: Option<impl AsRef<Path>>,
+     bindle_connection: &Option<BindleConnectionInfo>,
+ ) -> Result<Application> {
+     let app = absolutize(app)?;
+@@ -91,7 +91,7 @@ pub fn absolutize(path: impl AsRef<Path>) -> Result<PathBuf> {
+ async fn prepare_any_version(
+     raw: RawAppManifestAnyVersion,
+     src: impl AsRef<Path>,
+-    base_dst: impl AsRef<Path>,
++    base_dst: Option<impl AsRef<Path>>,
+     bindle_connection: &Option<BindleConnectionInfo>,
+ ) -> Result<Application> {
+     match raw {
+@@ -129,7 +129,7 @@ pub fn validate_raw_app_manifest(raw: &RawAppManifestAnyVersion) -> Result<()> {
+ async fn prepare(
+     raw: RawAppManifest,
+     src: impl AsRef<Path>,
+-    base_dst: impl AsRef<Path>,
++    base_dst: Option<impl AsRef<Path>>,
+     bindle_connection: &Option<BindleConnectionInfo>,
+ ) -> Result<Application> {
+     let info = info(raw.info, &src);
+@@ -145,7 +145,7 @@ async fn prepare(
+     let components = future::join_all(
+         raw.components
+             .into_iter()
+-            .map(|c| async { core(c, &src, &base_dst, bindle_connection).await })
++            .map(|c| async { core(c, &src, base_dst.as_ref(), bindle_connection).await })
+             .collect::<Vec<_>>(),
+     )
+     .await
+@@ -171,7 +171,7 @@ async fn prepare(
+ async fn core(
+     raw: RawComponentManifest,
+     src: impl AsRef<Path>,
+-    base_dst: impl AsRef<Path>,
++    base_dst: Option<impl AsRef<Path>>,
+     bindle_connection: &Option<BindleConnectionInfo>,
+ ) -> Result<CoreComponent> {
+     let id = raw.id;
+@@ -227,7 +227,7 @@ async fn core(
+     let mounts = match raw.wasm.files {
+         Some(f) => {
+             let exclude_files = raw.wasm.exclude_files.unwrap_or_default();
+-            assets::prepare_component(&f, src, &base_dst, &id, &exclude_files).await?
++            assets::prepare_component(&f, src, base_dst, &id, &exclude_files).await?
+         }
+         None => vec![],
+     };
+diff --git a/crates/trigger/src/locked.rs b/crates/trigger/src/locked.rs
+index 67de11e3..e485531c 100644
+--- a/crates/trigger/src/locked.rs
++++ b/crates/trigger/src/locked.rs
+@@ -235,7 +235,7 @@ mod tests {
+         std::fs::write("spin.toml", TEST_MANIFEST).expect("write manifest");
+         std::fs::write("test-source.wasm", "not actual wasm").expect("write source");
+         std::fs::write("static.txt", "content").expect("write static");
+-        let app = spin_loader::local::from_file("spin.toml", &tempdir, &None)
++        let app = spin_loader::local::from_file("spin.toml", Some(&tempdir), &None)
+             .await
+             .expect("load app");
+         (app, tempdir)
+diff --git a/src/commands/up.rs b/src/commands/up.rs
+index 0a83078c..a9c4f855 100644
+--- a/src/commands/up.rs
++++ b/src/commands/up.rs
+@@ -87,6 +87,14 @@ pub struct UpCommand {
+     #[clap(long = "temp")]
+     pub tmp: Option<PathBuf>,
+ 
++    /// For local apps with directory mounts and no excluded files, mount them directly instead of using a temporary
++    /// directory.
++    ///
++    /// This allows you to update the assets on the host filesystem such that the updates are visible to the guest
++    /// without a restart.  This cannot be used with bindle apps or apps which use file patterns and/or exclusions.
++    #[clap(long, takes_value = false, conflicts_with = BINDLE_ID_OPT)]
++    pub direct_mounts: bool,
++
+     /// All other args, to be passed through to the trigger
+     #[clap(hide = true)]
+     pub trigger_args: Vec<OsString>,
+@@ -127,10 +135,19 @@ impl UpCommand {
+                     .as_deref()
+                     .unwrap_or_else(|| DEFAULT_MANIFEST_FILE.as_ref());
+                 let bindle_connection = self.bindle_connection();
+-                spin_loader::from_file(manifest_file, &working_dir, &bindle_connection).await?
++                let asset_dst = if self.direct_mounts {
++                    None
++                } else {
++                    Some(&working_dir)
++                };
++                spin_loader::from_file(manifest_file, asset_dst, &bindle_connection).await?
+             }
+             (None, Some(bindle)) => match &self.server {
+-                Some(server) => spin_loader::from_bindle(bindle, server, &working_dir).await?,
++                Some(server) => {
++                    assert!(!self.direct_mounts);
++
++                    spin_loader::from_bindle(bindle, server, &working_dir).await?
++                }
+                 _ => bail!("Loading from a bindle requires a Bindle server URL"),
+             },
+             (Some(_), Some(_)) => bail!("Specify only one of app file or bindle ID"),

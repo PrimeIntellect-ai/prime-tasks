@@ -1,0 +1,161 @@
+diff --git a/Makefile b/Makefile
+index 189a0d71a..814daec92 100644
+--- a/Makefile
++++ b/Makefile
+@@ -27,7 +27,7 @@ TEST_MANIFEST ?= linux
+ # build hyperkube image when specified
+ K8S_BRANCH ?=
+ # Only run conformance tests by default (non-serial and non-slow)
+-# Note autoscaling tests would be skiped as well.
++# Note autoscaling tests would be skipped as well.
+ CCM_E2E_ARGS ?= -ginkgo.skip=\\[Serial\\]\\[Slow\\]
+ #The test args for Kubernetes e2e tests
+ TEST_E2E_ARGS ?= '--ginkgo.focus=Port\sforwarding'
+diff --git a/pkg/provider/azure.go b/pkg/provider/azure.go
+index 0cd32d41c..98f122697 100644
+--- a/pkg/provider/azure.go
++++ b/pkg/provider/azure.go
+@@ -253,6 +253,8 @@ type Cloud struct {
+ 	ipv6DualStackEnabled bool
+ 	// Lock for access to node caches, includes nodeZones, nodeResourceGroups, and unmanagedNodes.
+ 	nodeCachesLock sync.RWMutex
++	// nodeNames holds current nodes for tracking added nodes in VM caches.
++	nodeNames sets.String
+ 	// nodeZones is a mapping from Zone to a sets.String of Node's names in the Zone
+ 	// it is updated by the nodeInformer
+ 	nodeZones map[string]sets.String
+@@ -321,6 +323,7 @@ func NewCloudWithoutFeatureGates(configReader io.Reader) (*Cloud, error) {
+ 	}
+ 
+ 	az := &Cloud{
++		nodeNames:          sets.NewString(),
+ 		nodeZones:          map[string]sets.String{},
+ 		nodeResourceGroups: map[string]string{},
+ 		unmanagedNodes:     sets.NewString(),
+@@ -787,6 +790,9 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
+ 	defer az.nodeCachesLock.Unlock()
+ 
+ 	if prevNode != nil {
++		// Remove from nodeNames cache.
++		az.nodeNames.Delete(prevNode.ObjectMeta.Name)
++
+ 		// Remove from nodeZones cache.
+ 		prevZone, ok := prevNode.ObjectMeta.Labels[consts.LabelFailureDomainBetaZone]
+ 		if ok && az.isAvailabilityZone(prevZone) {
+@@ -810,6 +816,9 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
+ 	}
+ 
+ 	if newNode != nil {
++		// Add to nodeNames cache.
++		az.nodeNames.Insert(newNode.ObjectMeta.Name)
++
+ 		// Add to nodeZones cache.
+ 		newZone, ok := newNode.ObjectMeta.Labels[consts.LabelFailureDomainBetaZone]
+ 		if ok && az.isAvailabilityZone(newZone) {
+@@ -881,6 +890,22 @@ func (az *Cloud) GetNodeResourceGroup(nodeName string) (string, error) {
+ 	return az.ResourceGroup, nil
+ }
+ 
++// GetNodeNames returns a set of all node names in the k8s cluster.
++func (az *Cloud) GetNodeNames() (sets.String, error) {
++	// Kubelet won't set az.nodeInformerSynced, return nil.
++	if az.nodeInformerSynced == nil {
++		return nil, nil
++	}
++
++	az.nodeCachesLock.RLock()
++	defer az.nodeCachesLock.RUnlock()
++	if !az.nodeInformerSynced() {
++		return nil, fmt.Errorf("node informer is not synced when trying to GetNodeNames")
++	}
++
++	return sets.NewString(az.nodeNames.List()...), nil
++}
++
+ // GetResourceGroups returns a set of resource groups that all nodes are running on.
+ func (az *Cloud) GetResourceGroups() (sets.String, error) {
+ 	// Kubelet won't set az.nodeInformerSynced, always return configured resourceGroup.
+diff --git a/pkg/provider/azure_vmss.go b/pkg/provider/azure_vmss.go
+index 8e90903e9..a94352b03 100644
+--- a/pkg/provider/azure_vmss.go
++++ b/pkg/provider/azure_vmss.go
+@@ -79,8 +79,9 @@ type nodeIdentity struct {
+ type ScaleSet struct {
+ 	*Cloud
+ 
+-	// availabilitySet is also required for ScaleSet because some instances
+-	// (e.g. master nodes) may not belong to any scale sets.
++	// availabilitySet is also required for scaleSet because some instances
++	// (e.g. control plane nodes) may not belong to any scale sets.
++	// this also allows for clusters with both VM and VMSS nodes.
+ 	availabilitySet VMSet
+ 
+ 	vmssCache                 *azcache.TimedCache
+diff --git a/pkg/provider/azure_vmss_cache.go b/pkg/provider/azure_vmss_cache.go
+index 8a98443f0..3d957ef4f 100644
+--- a/pkg/provider/azure_vmss_cache.go
++++ b/pkg/provider/azure_vmss_cache.go
+@@ -57,6 +57,11 @@ type vmssEntry struct {
+ 	lastUpdate    time.Time
+ }
+ 
++type availabilitySetEntry struct {
++	vmNames   sets.String
++	nodeNames sets.String
++}
++
+ func (ss *ScaleSet) newVMSSCache() (*azcache.TimedCache, error) {
+ 	getter := func(key string) (interface{}, error) {
+ 		localCache := &sync.Map{} // [vmssName]*vmssEntry
+@@ -272,7 +277,7 @@ func (ss *ScaleSet) deleteCacheForNode(nodeName string) error {
+ 
+ func (ss *ScaleSet) newAvailabilitySetNodesCache() (*azcache.TimedCache, error) {
+ 	getter := func(key string) (interface{}, error) {
+-		localCache := sets.NewString()
++		vmNames := sets.NewString()
+ 		resourceGroups, err := ss.GetResourceGroups()
+ 		if err != nil {
+ 			return nil, err
+@@ -286,11 +291,22 @@ func (ss *ScaleSet) newAvailabilitySetNodesCache() (*azcache.TimedCache, error)
+ 
+ 			for _, vm := range vmList {
+ 				if vm.Name != nil {
+-					localCache.Insert(*vm.Name)
++					vmNames.Insert(*vm.Name)
+ 				}
+ 			}
+ 		}
+ 
++		// store all the node names in the cluster when the cache data was created.
++		nodeNames, err := ss.GetNodeNames()
++		if err != nil {
++			return nil, err
++		}
++
++		localCache := availabilitySetEntry{
++			vmNames:   vmNames,
++			nodeNames: nodeNames,
++		}
++
+ 		return localCache, nil
+ 	}
+ 
+@@ -312,6 +328,16 @@ func (ss *ScaleSet) isNodeManagedByAvailabilitySet(nodeName string, crt azcache.
+ 		return false, err
+ 	}
+ 
+-	availabilitySetNodes := cached.(sets.String)
+-	return availabilitySetNodes.Has(nodeName), nil
++	cachedNodes := cached.(availabilitySetEntry).nodeNames
++	// if the node is not in the cache, assume the node has joined after the last cache refresh and attempt to refresh the cache.
++	if !cachedNodes.Has(nodeName) {
++		klog.V(2).Infof("Node %s has joined the cluster since the last VM cache refresh, refreshing the cache", nodeName)
++		cached, err = ss.availabilitySetNodesCache.Get(availabilitySetNodesKey, azcache.CacheReadTypeForceRefresh)
++		if err != nil {
++			return false, err
++		}
++	}
++
++	cachedVMs := cached.(availabilitySetEntry).vmNames
++	return cachedVMs.Has(nodeName), nil
+ }

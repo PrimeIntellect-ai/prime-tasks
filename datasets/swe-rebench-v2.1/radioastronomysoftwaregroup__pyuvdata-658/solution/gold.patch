@@ -1,0 +1,443 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 00215d68..53a71fa8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
+ ## [Unreleased]
+ 
+ ### Added
++- `utils.uvcalibrate(.., undo=True)` kwarg for undo-ing a calibration.
++- `utils.uvcalibrate` updates `UVData.vis_units` if `UVCal.gain_scale` is set.
++- `UVCal.gain_scale` non-required attribute
+ - UVData.get_redundancies method to replace old get_baseline_redundancies and get_antenna_redundancies.
+ - option for `UVBeam.interp` to return a new beam object.
+ - `UVFlag` information on Read The Docs
+@@ -14,6 +17,7 @@ All notable changes to this project will be documented in this file.
+ - `UVFlag` inherits from `UVBase` object.
+ 
+ ### Fixed
++- A bug in get_antenna_redundancies for nearly N-S baselines.
+ - A bug where `conj_pol` could not handle cardinal direction polarizations.
+ - A bug that gave the wrong error message when calling `UVData.phase_to_time` without an Astropy Time object.
+ 
+diff --git a/docs/tutorial.rst b/docs/tutorial.rst
+index 7fb060f0..2c77b8ec 100644
+--- a/docs/tutorial.rst
++++ b/docs/tutorial.rst
+@@ -959,22 +959,29 @@ considered redundant if they are within a specified tolerance distance (default
+ The :func:`utils.get_baseline_redundancies` function accepts an array of baseline indices
+ and an array of baseline vectors (ie, uvw coordinates) as input, and finds
+ redundancies among the vectors as given. If the ``with_conjugates`` option is
+-selected, it will flip baselines such that ``u > 0``, or ``v > 0 if u = 0``, or
+-``w > 0 if u = v = 0``. In this case, a list of ``conjugates`` is returned as well,
++selected, it will include baselines that are redundant when reversed in the same group.
++In this case, a list of ``conjugates`` is returned as well,
+ which contains indices for the baselines that were flipped for the redundant groups.
+ In either mode of operation, this will only return baseline indices that are in the list passed in.
+ 
+ The :func:`utils.get_antenna_redundancies` function accepts an array of
+ antenna indices and an array of antenna positions as input, defines baseline vectors
+-and indices under the positive-u condition described above, and runs
+-:func:`utils.get_baseline_redundancies` to find redundant baselines.
+-This is similar to running get_baseline_redundancies with the `with_conjugates`
+-option, except that the baseline indices are returned such that none need to be
+-flipped to be redundant. This is more like what's defined in the `hera_cal` package.
++and indices in the convention that ``ant1<ant2``, and runs
++:func:`utils.get_baseline_redundancies` to find redundant baselines. It will then apply the conjugates
++list to the groups it finds.
++
++There is a subtle difference between the purposes of the two functions. `utils.get_antenna_redundancies`
++gives you all redundant baselines from the antenna positions, and does not necessarily reflect the baselines
++in a file. This is similar to what is written in the `hera_cal` package.
++Alternatively, `utils.get_baseline_redundancies` may be given the actual
++baseline vectors in a file and it will search for redundancies among those.
+ 
+ The method :meth:`~pyuvdata.UVData.get_redundancies` is provided as a convenience. If
+ run with the `use_antpos` option, it will mimic the behavior of `utils.get_antenna_redundancies`.
+-Otherwise it will return redundancies in the existing data using `utils.get_baesline_redundancies`.
++Otherwise it will return redundancies in the existing data using `utils.get_baseline_redundancies`.
++If run with `use_antpos` and the `conjugate_bls` option, it will also adjust the data_array and baseline_array
++so that the baselines in the returned groups correspond with the baselines listed on the object (i.e., except for
++antenna pairs with no associated data).
+ 
+ ::
+ 
+@@ -1039,7 +1046,8 @@ baselines from the antenna positions and fills in the full data array based on r
+ 
+     # Note -- Compressing and inflating changes the baseline order, reorder before comparing.
+     >>> uv0.inflate_by_redundancy(tol=tol)
+-    >>> uv_backup.reorder_blts()
++    >>> uv_backup.reorder_blts(conj_convention="u>0", uvw_tol=tol)
++    >>> uv0.reorder_blts()
+     >>> np.all(uv0.baseline_array == uv_backup.baseline_array)
+     True
+ 
+@@ -1151,6 +1159,9 @@ a) Calibration of UVData by UVCal
+   >>> UVC.read_calfits('pyuvdata/data/zen.2458116.30448.HH.flagged_abs.calfits')
+   >>> UV_calibrated = utils.uvcalibrate(UV, UVC, inplace=False)
+ 
++  # We can also un-calibrate using the same UVCal
++  >>> UV_uncalibrated = utils.uvcalibrate(UV_calibrated, UVC, inplace=False, undo=True)
++
+ UVCal: Selecting data
+ -----------------------
+ The select method lets you select specific antennas (by number or name),
+diff --git a/pyuvdata/calfits.py b/pyuvdata/calfits.py
+index 00d7b5d5..8b92d74f 100644
+--- a/pyuvdata/calfits.py
++++ b/pyuvdata/calfits.py
+@@ -134,6 +134,8 @@ class CALFITS(UVCal):
+             prihdr['BL_RANGE'] = '[' + ', '.join([str(b) for b in self.baseline_range]) + ']'
+         if self.diffuse_model is not None:
+             prihdr['DIFFUSE'] = self.diffuse_model
++        if self.gain_scale is not None:
++            prihdr['GNSCALE'] = self.gain_scale
+         prihdr['INTTIME'] = self.integration_time
+         prihdr['CHWIDTH'] = self.channel_width
+         prihdr['XORIENT'] = self.x_orientation
+@@ -403,6 +405,7 @@ class CALFITS(UVCal):
+                 hdr.remove('HISTORY')
+             self.time_range = list(map(float, hdr.pop('TMERANGE').split(',')))
+             self.gain_convention = hdr.pop('GNCONVEN')
++            self.gain_scale = hdr.pop("GNSCALE", None)
+             self.x_orientation = hdr.pop('XORIENT')
+             self.cal_type = hdr.pop('CALTYPE')
+             if self.cal_type == 'delay':
+diff --git a/pyuvdata/utils.py b/pyuvdata/utils.py
+index d9231cb6..15a5e985 100644
+--- a/pyuvdata/utils.py
++++ b/pyuvdata/utils.py
+@@ -394,7 +394,7 @@ def unphase_uvw(ra, dec, uvw):
+ 
+ 
+ def uvcalibrate(uvdata, uvcal, inplace=True, prop_flags=True, flag_missing=True,
+-                Dterm_cal=False, delay_convention='minus'):
++                Dterm_cal=False, delay_convention='minus', undo=False):
+     """
+     Calibrate a UVData object with a UVCal object.
+ 
+@@ -417,6 +417,9 @@ def uvcalibrate(uvdata, uvcal, inplace=True, prop_flags=True, flag_missing=True,
+     delay_convention : str, optional
+         Exponent sign to use in conversion of 'delay' to 'gain' cal_type
+         if the input uvcal is not inherently 'gain' cal_type. Default to 'minus'.
++    undo : bool, optional
++        If True, undo the provided calibration. i.e. apply the calibration with
++        flipped gain_convention. Flag propagation rules apply the same.
+ 
+     Returns
+     -------
+@@ -466,13 +469,21 @@ def uvcalibrate(uvdata, uvcal, inplace=True, prop_flags=True, flag_missing=True,
+                 uvdata.flag_array[blt_inds, 0, :, pol_ind] += mask
+ 
+             # apply to data
+-            if uvcal.gain_convention == 'multiply':
++            mult_gains = uvcal.gain_convention == 'multiply'
++            if undo:
++                mult_gains = not mult_gains
++            if mult_gains:
+                 uvdata.data_array[blt_inds, 0, :, pol_ind] *= gain
+-            elif uvcal.gain_convention == 'divide':
++            else:
+                 uvdata.data_array[blt_inds, 0, :, pol_ind] /= gain
+ 
+-    # update history
++    # update attributes
+     uvdata.history += "\nCalibrated with pyuvdata.utils.uvcalibrate."
++    if undo:
++        uvdata.vis_units = 'UNCALIB'
++    else:
++        if uvcal.gain_scale is not None:
++            uvdata.vis_units = uvcal.gain_scale
+ 
+     if not inplace:
+         return uvdata
+@@ -1062,6 +1073,14 @@ def antnums_to_baseline(ant1, ant2, Nants_telescope, attempt256=False):
+         return np.int64(baseline)
+ 
+ 
++def baseline_index_flip(baseline, Nants_telescope):
++    """
++    Change baseline number to reverse antenna order.
++    """
++    ant1, ant2 = baseline_to_antnums(baseline, Nants_telescope)
++    return antnums_to_baseline(ant2, ant1, Nants_telescope)
++
++
+ def get_baseline_redundancies(baselines, baseline_vecs, tol=1.0, with_conjugates=False):
+     """
+     Find redundant baseline groups
+@@ -1098,14 +1117,14 @@ def get_baseline_redundancies(baselines, baseline_vecs, tol=1.0, with_conjugates
+ 
+     if with_conjugates:
+         conjugates = []
+-        for bl in baseline_vecs:
+-            if bl[0] == 0:
+-                if bl[1] == 0:
+-                    conjugates.append(bl[2] < 0)
+-                else:
+-                    conjugates.append(bl[1] < 0)
+-            else:
+-                conjugates.append(bl[0] < 0)
++        for bv in baseline_vecs:
++            uneg = bv[0] < -tol
++            uzer = np.isclose(bv[0], 0.0, atol=tol)
++            vneg = bv[1] < -tol
++            vzer = np.isclose(bv[1], 0.0, atol=tol)
++            wneg = bv[2] < -tol
++            conjugates.append(uneg or (uzer and vneg) or (uzer and vzer and wneg))
++
+         conjugates = np.array(conjugates, dtype=bool)
+         baseline_vecs[conjugates] *= (-1)
+         baseline_ind_conj = baselines[conjugates]
+@@ -1164,8 +1183,6 @@ def get_antenna_redundancies(antenna_numbers, antenna_positions, tol=1.0, includ
+     """
+     Find redundant baseline groups based on antenna positions.
+ 
+-    Include all possible redundant baselines based on antenna positions.
+-
+     Parameters
+     ----------
+     antenna_numbers : array_like of int
+@@ -1185,8 +1202,24 @@ def get_antenna_redundancies(antenna_numbers, antenna_positions, tol=1.0, includ
+         List of vectors describing redundant group centers
+     lengths : list of float
+         List of redundant group baseline lengths in meters
++
++    Notes
++    -----
++
++    The baseline numbers refer to antenna pairs (a1, a2) such that
++    the baseline vector formed from ENU antenna positions,
++        blvec = enu[a1] - enu[a2]
++    is close to the other baselines in the group.
++
++    This is achieved by putting baselines in a form of the u>0
++    convention, but with a tolerance in defining the signs of
++    vector components.
++
++    To guarantee that the same baseline numbers are present in a UVData
++    object, ``UVData.conjugate_bls('u>0', uvw_tol=tol)``, where `tol` is
++    the tolerance used here.
+     """
+-    Nants = antenna_numbers.shape[0]
++    Nants = antenna_numbers.size
+ 
+     bls = []
+     bl_vecs = []
+@@ -1197,18 +1230,20 @@ def get_antenna_redundancies(antenna_numbers, antenna_positions, tol=1.0, includ
+             mini = aj
+         for ai in range(mini, Nants):
+             anti, antj = antenna_numbers[ai], antenna_numbers[aj]
+-            bidx = antnums_to_baseline(anti, antj, Nants)
+-            bv = antenna_positions[aj] - antenna_positions[ai]
+-            # Enforce u-positive orientation
+-            if (bv[0] < 0 or ((bv[0] == 0) and bv[1] < 0)
+-                    or ((bv[0] == 0) and (bv[1] == 0) and bv[2] < 0)):
+-                bv *= (-1)
+-                bidx = antnums_to_baseline(antj, anti, Nants)
++            bidx = antnums_to_baseline(antj, anti, Nants)
++            bv = antenna_positions[ai] - antenna_positions[aj]
+             bl_vecs.append(bv)
+             bls.append(bidx)
+     bls = np.array(bls)
+     bl_vecs = np.array(bl_vecs)
+-    return get_baseline_redundancies(bls, bl_vecs, tol=tol, with_conjugates=False)
++    gps, vecs, lens, conjs = get_baseline_redundancies(bls, bl_vecs, tol=tol, with_conjugates=True)
++    # Flip the baselines in the groups.
++    for gi, gp in enumerate(gps):
++        for bi, bl in enumerate(gp):
++            if bl in conjs:
++                gps[gi][bi] = baseline_index_flip(bl, Nants)
++
++    return gps, vecs, lens
+ 
+ 
+ def _reraise_context(fmt, *args):
+diff --git a/pyuvdata/uvcal.py b/pyuvdata/uvcal.py
+index 6f86fa83..0f0a0a6f 100644
+--- a/pyuvdata/uvcal.py
++++ b/pyuvdata/uvcal.py
+@@ -232,6 +232,12 @@ class UVCal(UVBase):
+                                               expected_type=str, description=desc)
+ 
+         # --- truly optional parameters ---
++        desc = ('The gain scale of the calibration, which indicates the units of the '
++                'calibrated visibilities. For example, Jy or K str.')
++        self._gain_scale = uvp.UVParameter('gain_scale', form='str',
++                                           expected_type=str,
++                                           description=desc, required=False)
++
+         desc = ('Array of input flags, True is flagged. shape: (Nants_data, Nspws, '
+                 'Nfreqs, Ntimes, Njones), type = bool.')
+         self._input_flag_array = uvp.UVParameter('input_flag_array',
+diff --git a/pyuvdata/uvdata.py b/pyuvdata/uvdata.py
+index 11fc38d5..85b26381 100644
+--- a/pyuvdata/uvdata.py
++++ b/pyuvdata/uvdata.py
+@@ -1033,7 +1033,7 @@ class UVData(UVBase):
+             self.phase(phase_center_ra, phase_center_dec, phase_center_epoch,
+                        phase_frame=output_phase_frame)
+ 
+-    def conjugate_bls(self, convention='ant1<ant2', use_enu=True):
++    def conjugate_bls(self, convention='ant1<ant2', use_enu=True, uvw_tol=0.0):
+         """
+         Conjugate baselines according to one of the supported conventions.
+ 
+@@ -1050,6 +1050,9 @@ class UVData(UVBase):
+             Use true antenna positions to determine uv location (as opposed to
+             uvw array). Only applies if `convention` is 'u<0', 'u>0', 'v<0', 'v>0'.
+             Set to False to use uvw array values.
++        uvw_tol : float
++            Defines a tolerance on uvw coordinates for setting the
++            u>0, u<0, v>0, or v<0 conventions. Defaults to 0m.
+ 
+         Raises
+         ------
+@@ -1087,29 +1090,29 @@ class UVData(UVBase):
+             elif convention == 'ant2<ant1':
+                 index_array = np.asarray(self.ant_2_array > self.ant_1_array).nonzero()
+             elif convention == 'u<0':
+-                index_array = np.asarray((uvw_array_use[:, 0] > 0)
+-                                         | (uvw_array_use[:, 1] < 0) & (uvw_array_use[:, 0] == 0)
+-                                         | ((uvw_array_use[:, 2] < 0)
+-                                            & (uvw_array_use[:, 0] == 0)
+-                                            & (uvw_array_use[:, 1] == 0))).nonzero()
++                index_array = np.asarray((uvw_array_use[:, 0] > uvw_tol)
++                                         | (uvw_array_use[:, 1] > uvw_tol) & np.isclose(uvw_array_use[:, 0], 0, atol=uvw_tol)
++                                         | (uvw_array_use[:, 2] > uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 0], 0, atol=uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 1], 0, atol=uvw_tol)).nonzero()
+             elif convention == 'u>0':
+-                index_array = np.asarray((uvw_array_use[:, 0] < 0)
+-                                         | (uvw_array_use[:, 1] < 0) & (uvw_array_use[:, 0] == 0)
+-                                         | ((uvw_array_use[:, 2] < 0)
+-                                            & (uvw_array_use[:, 0] == 0)
+-                                            & (uvw_array_use[:, 1] == 0))).nonzero()
++                index_array = np.asarray((uvw_array_use[:, 0] < -uvw_tol)
++                                         | ((uvw_array_use[:, 1] < -uvw_tol) & np.isclose(uvw_array_use[:, 0], 0, atol=uvw_tol))
++                                         | ((uvw_array_use[:, 2] < -uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 0], 0, atol=uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 1], 0, atol=uvw_tol))).nonzero()
+             elif convention == 'v<0':
+-                index_array = np.asarray((uvw_array_use[:, 1] > 0)
+-                                         | (uvw_array_use[:, 0] < 0) & (uvw_array_use[:, 1] == 0)
+-                                         | ((uvw_array_use[:, 2] < 0)
+-                                            & (uvw_array_use[:, 0] == 0)
+-                                            & (uvw_array_use[:, 1] == 0))).nonzero()
++                index_array = np.asarray((uvw_array_use[:, 1] > uvw_tol)
++                                         | (uvw_array_use[:, 0] > uvw_tol) & np.isclose(uvw_array_use[:, 1], 0, atol=uvw_tol)
++                                         | (uvw_array_use[:, 2] > uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 0], 0, atol=uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 1], 0, atol=uvw_tol)).nonzero()
+             elif convention == 'v>0':
+-                index_array = np.asarray((uvw_array_use[:, 1] < 0)
+-                                         | (uvw_array_use[:, 0] < 0) & (uvw_array_use[:, 1] == 0)
+-                                         | ((uvw_array_use[:, 2] < 0)
+-                                            & (uvw_array_use[:, 0] == 0)
+-                                            & (uvw_array_use[:, 1] == 0))).nonzero()
++                index_array = np.asarray((uvw_array_use[:, 1] < -uvw_tol)
++                                         | (uvw_array_use[:, 0] < -uvw_tol) & np.isclose(uvw_array_use[:, 1], 0, atol=uvw_tol)
++                                         | (uvw_array_use[:, 2] < -uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 0], 0, atol=uvw_tol)
++                                         & np.isclose(uvw_array_use[:, 1], 0, atol=uvw_tol)).nonzero()
+         else:
+             index_array = convention
+ 
+@@ -1212,7 +1215,7 @@ class UVData(UVBase):
+                       'reorder_pols in version 1.5', DeprecationWarning)
+         self.reorder_pols(order=order)
+ 
+-    def reorder_blts(self, order='time', minor_order=None, conj_convention=None,
++    def reorder_blts(self, order='time', minor_order=None, conj_convention=None, uvw_tol=0.0,
+                      conj_convention_use_enu=True, run_check=True, check_extra=True,
+                      run_check_acceptability=True):
+         """
+@@ -1233,6 +1236,10 @@ class UVData(UVBase):
+         conj_convention : str or array_like of int
+             Optionally conjugate baselines to make the baselines have the
+             desired orientation. See conjugate_bls for allowed values and details.
++        uvw_tol : float
++            If conjugating baselines, sets a tolerance for determining the signs
++            of u,v, and w, and whether or not they are zero.
++            See conjugate_bls for details.
+         conj_convention_use_enu: bool
+             If `conj_convention` is set, this is passed to conjugate_bls, see that
+             method for details.
+@@ -1289,7 +1296,7 @@ class UVData(UVBase):
+ 
+         if conj_convention is not None:
+             self.conjugate_bls(convention=conj_convention,
+-                               use_enu=conj_convention_use_enu)
++                               use_enu=conj_convention_use_enu, uvw_tol=uvw_tol)
+ 
+         if isinstance(order, str):
+             if minor_order is None:
+@@ -4424,7 +4431,8 @@ class UVData(UVBase):
+         return np.diff(np.sort(list(set(self.time_array))))[0] * 86400
+ 
+     def get_redundancies(self, tol=1.0, use_antpos=False,
+-                         include_conjugates=True, include_autos=True):
++                         include_conjugates=False, include_autos=True,
++                         conjugate_bls=False):
+         """
+         Get redundant baselines to a given tolerance. This can be used to identify
+         redundant baselines present in the data, or find all possible redundant
+@@ -4444,6 +4452,9 @@ class UVData(UVBase):
+         include_autos : bool
+             Option to include autocorrelations in the full redundancy list.
+             Only used if use_antpos is True.
++        conjugate_bls : bool
++            If using antenna positions, this will conjugate baselines on this
++            object to correspond with those in the returned groups.
+ 
+         Returns
+         -------
+@@ -4453,7 +4464,7 @@ class UVData(UVBase):
+             List of vectors describing redundant group uvw centers
+         lengths : list of float
+             List of redundant group baseline lengths in meters
+-        conjugate_bls : list of int, or None, optional
++        conjugates : list of int, or None, optional
+             List of indices for baselines that must be conjugated to fit into their
+             redundant groups.
+             Will return None if use_antpos is True and include_conjugates is True
+@@ -4469,6 +4480,9 @@ class UVData(UVBase):
+             antpos, numbers = self.get_ENU_antpos(center=False)
+             result = uvutils.get_antenna_redundancies(numbers, antpos, tol=tol,
+                                                       include_autos=include_autos)
++            if conjugate_bls:
++                self.conjugate_bls(convention='u>0', uvw_tol=tol)
++
+             if include_conjugates:
+                 result = result + (None,)
+             return result
+@@ -4489,10 +4503,8 @@ class UVData(UVBase):
+         warnings.warn("UVData.get_antenna_redundancies has been replaced with get_redundancies,"
+                       "and will be removed in version 1.6.",
+                       DeprecationWarning)
+-        if kwargs.pop('conjugate_bls', False):
+-            self.conjugate_bls('u>0')
+         kwargs['use_antpos'] = True
+-        red_gps, blvecs, lens, conjs = self.get_redundancies(*args, **kwargs)
++        red_gps, blvecs, lens = self.get_redundancies(*args, **kwargs)
+         return red_gps, blvecs, lens
+ 
+     def get_baseline_redundancies(self, *args, **kwargs):
+@@ -4535,7 +4547,7 @@ class UVData(UVBase):
+             if inplace is False, return the compressed UVData object
+         """
+ 
+-        red_gps, centers, lengths, conjugates = self.get_redundancies(tol)
++        red_gps, centers, lengths, conjugates = self.get_redundancies(tol, include_conjugates=True)
+ 
+         bl_ants = [self.baseline_to_antnums(gp[0]) for gp in red_gps]
+         return self.select(bls=bl_ants, inplace=inplace, metadata_only=metadata_only,
+@@ -4559,7 +4571,7 @@ class UVData(UVBase):
+         """
+ 
+         self.conjugate_bls(convention='u>0')
+-        red_gps, centers, lengths, _, = self.get_redundancies(tol=tol, use_antpos=True)
++        red_gps, centers, lengths = self.get_redundancies(tol=tol, use_antpos=True, conjugate_bls=True)
+ 
+         # Stack redundant groups into one array.
+         group_index, bl_array_full = zip(*[(i, bl) for i, gp in enumerate(red_gps) for bl in gp])

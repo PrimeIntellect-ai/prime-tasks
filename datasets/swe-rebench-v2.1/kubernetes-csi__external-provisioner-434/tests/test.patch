@@ -1,0 +1,201 @@
+diff --git a/pkg/controller/clone_controller_test.go b/pkg/controller/clone_controller_test.go
+index 07477e73e..fc1c18ec5 100644
+--- a/pkg/controller/clone_controller_test.go
++++ b/pkg/controller/clone_controller_test.go
+@@ -3,9 +3,21 @@ package controller
+ import (
+ 	"context"
+ 	"fmt"
++	"io/ioutil"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"github.com/golang/mock/gomock"
++	"github.com/kubernetes-csi/csi-lib-utils/rpc"
++	"github.com/kubernetes-csi/csi-test/driver"
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -174,8 +186,66 @@ func TestEnqueueClaimUpadate(t *testing.T) {
+ 	}
+ }
+ 
++// TestNewCloningProtectionController verifies that the cloning-protection controller is only
++// created when the driver advertises the CLONE_VOLUME controller capability.
++func TestNewCloningProtectionController(t *testing.T) {
++	testcases := map[string]struct {
++		capabilities rpc.ControllerCapabilitySet
++		expectNil    bool
++	}{
++		"clone volume capability enabled": {
++			capabilities: rpc.ControllerCapabilitySet{
++				csi.ControllerServiceCapability_RPC_CLONE_VOLUME: true,
++			},
++			expectNil: false,
++		},
++		"clone volume capability disabled": {
++			capabilities: rpc.ControllerCapabilitySet{},
++			expectNil:    true,
++		},
++		"only other capabilities enabled": {
++			capabilities: rpc.ControllerCapabilitySet{
++				csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME: true,
++			},
++			expectNil: true,
++		},
++	}
++
++	for k, tc := range testcases {
++		tc := tc
++		t.Run(k, func(t *testing.T) {
++			t.Parallel()
++
++			clientSet := fakeclientset.NewSimpleClientset()
++			informerFactory := informers.NewSharedInformerFactory(clientSet, 1*time.Second)
++			claimInformer := informerFactory.Core().V1().PersistentVolumeClaims().Informer()
++			claimLister := informerFactory.Core().V1().PersistentVolumeClaims().Lister()
++			rateLimiter := workqueue.NewItemExponentialFailureRateLimiter(time.Second, 2*time.Second)
++			claimQueue := workqueue.NewNamedRateLimitingQueue(rateLimiter, "claims")
++
++			cloningProtector := NewCloningProtectionController(
++				clientSet,
++				claimLister,
++				claimInformer,
++				claimQueue,
++				tc.capabilities,
++			)
++
++			if tc.expectNil && cloningProtector != nil {
++				t.Errorf("expected a nil controller when CLONE_VOLUME capability is absent, got: %v", cloningProtector)
++			}
++			if !tc.expectNil && cloningProtector == nil {
++				t.Errorf("expected a non-nil controller when CLONE_VOLUME capability is present, got nil")
++			}
++		})
++	}
++}
++
+ func fakeCloningProtector(client *fakeclientset.Clientset, objects ...runtime.Object) *CloningProtectionController {
+ 	utilruntime.ReallyCrash = false
++	controllerCapabilities := rpc.ControllerCapabilitySet{
++		csi.ControllerServiceCapability_RPC_CLONE_VOLUME: true,
++	}
+ 
+ 	informerFactory := informers.NewSharedInformerFactory(client, 1*time.Second)
+ 	claimInformer := informerFactory.Core().V1().PersistentVolumeClaims().Informer()
+@@ -195,5 +265,107 @@ func fakeCloningProtector(client *fakeclientset.Clientset, objects ...runtime.Ob
+ 		claimLister,
+ 		claimInformer,
+ 		claimQueue,
++		controllerCapabilities,
+ 	)
+ }
++
++// fakeIdentityServer is a minimal CSI Identity service used to start the
++// provisioner against a driver that does not advertise CLONE_VOLUME.
++type fakeIdentityServer struct{}
++
++func (f *fakeIdentityServer) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
++	return &csi.GetPluginInfoResponse{Name: "fake.csi.driver.io", VendorVersion: "1.0"}, nil
++}
++
++func (f *fakeIdentityServer) GetPluginCapabilities(context.Context, *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
++	return &csi.GetPluginCapabilitiesResponse{}, nil
++}
++
++func (f *fakeIdentityServer) Probe(context.Context, *csi.ProbeRequest) (*csi.ProbeResponse, error) {
++	return &csi.ProbeResponse{}, nil
++}
++
++// TestCloningProtectionControllerNotRunWhenDisabled starts the provisioner
++// against a CSI driver that does not advertise the CLONE_VOLUME controller
++// capability and verifies that startup does not attempt to run the
++// cloning-protection controller.
++func TestCloningProtectionControllerNotRunWhenDisabled(t *testing.T) {
++	tmpdir, err := ioutil.TempDir("", "cloning-protection-disabled-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(tmpdir)
++
++	// Build the provisioner binary.
++	binPath := filepath.Join(tmpdir, "csi-provisioner")
++	build := exec.Command("go", "build", "-o", binPath, "github.com/kubernetes-csi/external-provisioner/cmd/csi-provisioner")
++	if out, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("failed to build csi-provisioner: %v\n%s", err, out)
++	}
++
++	// Fake Kubernetes API server that serves an empty cluster.
++	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case r.URL.Path == "/version":
++			fmt.Fprint(w, `{"major":"1","minor":"20","gitVersion":"v1.20.0","gitCommit":"x","gitTreeState":"clean","buildDate":"2020-01-01T00:00:00Z","goVersion":"go1.15","compiler":"gc","platform":"linux/amd64"}`)
++		case r.URL.Query().Get("watch") == "true":
++			w.WriteHeader(http.StatusOK)
++		default:
++			fmt.Fprint(w, `{"kind":"List","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[]}`)
++		}
++	}))
++	defer apiServer.Close()
++
++	kubeconfig := fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: %s
++  name: fake
++contexts:
++- context:
++    cluster: fake
++    user: fake
++  name: fake
++current-context: fake
++users:
++- name: fake
++  user: {}
++`, apiServer.URL)
++	kubeconfigPath := filepath.Join(tmpdir, "kubeconfig")
++	if err := ioutil.WriteFile(kubeconfigPath, []byte(kubeconfig), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	// Fake CSI driver that does not advertise CLONE_VOLUME.
++	mockController := gomock.NewController(t)
++	defer mockController.Finish()
++	controllerServer := driver.NewMockControllerServer(mockController)
++	controllerServer.EXPECT().ControllerGetCapabilities(gomock.Any(), gomock.Any()).Return(&csi.ControllerGetCapabilitiesResponse{}, nil).AnyTimes()
++
++	drv := driver.NewCSIDriver(&driver.CSIDriverServers{
++		Identity:   &fakeIdentityServer{},
++		Controller: controllerServer,
++	})
++	sock := filepath.Join(tmpdir, "csi.sock")
++	listener, err := net.Listen("unix", sock)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := drv.Start(listener); err != nil {
++		t.Fatal(err)
++	}
++	defer drv.Stop()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, binPath, "--csi-address", sock, "--kubeconfig", kubeconfigPath)
++	out, err := cmd.CombinedOutput()
++	if strings.Contains(string(out), "panic:") {
++		t.Fatalf("starting the provisioner with a driver lacking CLONE_VOLUME panicked:\n%s", out)
++	}
++	if ctx.Err() == nil {
++		t.Fatalf("provisioner exited unexpectedly (err=%v):\n%s", err, out)
++	}
++}

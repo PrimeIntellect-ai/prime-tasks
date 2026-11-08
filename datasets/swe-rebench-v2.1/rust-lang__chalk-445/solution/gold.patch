@@ -1,0 +1,238 @@
+diff --git a/chalk-integration/src/db.rs b/chalk-integration/src/db.rs
+index 4efab72d..9f33f640 100644
+--- a/chalk-integration/src/db.rs
++++ b/chalk-integration/src/db.rs
+@@ -156,4 +156,8 @@ impl RustIrDatabase<ChalkIr> for ChalkDatabase {
+     fn interner(&self) -> &ChalkIr {
+         &ChalkIr
+     }
++
++    fn is_object_safe(&self, trait_id: TraitId<ChalkIr>) -> bool {
++        self.program_ir().unwrap().is_object_safe(trait_id)
++    }
+ }
+diff --git a/chalk-integration/src/lowering.rs b/chalk-integration/src/lowering.rs
+index 5272d449..22275406 100644
+--- a/chalk-integration/src/lowering.rs
++++ b/chalk-integration/src/lowering.rs
+@@ -10,7 +10,7 @@ use chalk_rust_ir as rust_ir;
+ use chalk_rust_ir::{
+     Anonymize, AssociatedTyValueId, IntoWhereClauses, OpaqueTyDatum, OpaqueTyDatumBound,
+ };
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, HashSet};
+ use std::sync::Arc;
+ use string_cache::DefaultAtom as Atom;
+ 
+@@ -243,6 +243,7 @@ impl LowerProgram for Program {
+         let mut struct_kinds = BTreeMap::new();
+         let mut trait_kinds = BTreeMap::new();
+         let mut opaque_ty_kinds = BTreeMap::new();
++        let mut object_safe_traits = HashSet::new();
+         for (item, &raw_id) in self.items.iter().zip(&raw_ids) {
+             match item {
+                 Item::StructDefn(defn) => {
+@@ -256,6 +257,10 @@ impl LowerProgram for Program {
+                     let id = TraitId(raw_id);
+                     trait_ids.insert(type_kind.name.clone(), id);
+                     trait_kinds.insert(id, type_kind);
++
++                    if defn.flags.object_safe {
++                        object_safe_traits.insert(id);
++                    }
+                 }
+                 Item::OpaqueTyDefn(defn) => {
+                     let type_kind = defn.lower_type_kind()?;
+@@ -457,6 +462,7 @@ impl LowerProgram for Program {
+             opaque_ty_kinds,
+             opaque_ty_data,
+             custom_clauses,
++            object_safe_traits,
+         };
+ 
+         Ok(program)
+@@ -758,6 +764,9 @@ impl LowerDomainGoal for DomainGoal {
+                 vec![chalk_ir::DomainGoal::DownstreamType(ty.lower(env)?)]
+             }
+             DomainGoal::Reveal => vec![chalk_ir::DomainGoal::Reveal(())],
++            DomainGoal::ObjectSafe { id } => {
++                vec![chalk_ir::DomainGoal::ObjectSafe(env.lookup_trait(id)?)]
++            }
+         };
+         Ok(goals)
+     }
+diff --git a/chalk-integration/src/program.rs b/chalk-integration/src/program.rs
+index 019cab5e..c0380e37 100644
+--- a/chalk-integration/src/program.rs
++++ b/chalk-integration/src/program.rs
+@@ -13,7 +13,7 @@ use chalk_rust_ir::{
+ };
+ use chalk_solve::split::Split;
+ use chalk_solve::RustIrDatabase;
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, HashSet};
+ use std::fmt;
+ use std::sync::Arc;
+ 
+@@ -61,6 +61,9 @@ pub struct Program {
+ 
+     /// For each user-specified clause
+     pub custom_clauses: Vec<ProgramClause<ChalkIr>>,
++
++    /// Store the traits marked with `#[object_safe]`
++    pub object_safe_traits: HashSet<TraitId<ChalkIr>>,
+ }
+ 
+ impl Program {
+@@ -392,4 +395,8 @@ impl RustIrDatabase<ChalkIr> for Program {
+     fn interner(&self) -> &ChalkIr {
+         &ChalkIr
+     }
++
++    fn is_object_safe(&self, trait_id: TraitId<ChalkIr>) -> bool {
++        self.object_safe_traits.contains(&trait_id)
++    }
+ }
+diff --git a/chalk-ir/src/debug.rs b/chalk-ir/src/debug.rs
+index ed9b29c9..397f5605 100644
+--- a/chalk-ir/src/debug.rs
++++ b/chalk-ir/src/debug.rs
+@@ -628,6 +628,7 @@ impl<I: Interner> Debug for DomainGoal<I> {
+             DomainGoal::Compatible(_) => write!(fmt, "Compatible"),
+             DomainGoal::DownstreamType(n) => write!(fmt, "DownstreamType({:?})", n),
+             DomainGoal::Reveal(_) => write!(fmt, "Reveal"),
++            DomainGoal::ObjectSafe(n) => write!(fmt, "ObjectSafe({:?})", n),
+         }
+     }
+ }
+diff --git a/chalk-ir/src/lib.rs b/chalk-ir/src/lib.rs
+index 5b8dbc25..89422d4e 100644
+--- a/chalk-ir/src/lib.rs
++++ b/chalk-ir/src/lib.rs
+@@ -1088,6 +1088,9 @@ pub enum DomainGoal<I: Interner> {
+     /// Used to activate the "reveal mode", in which opaque (`impl Trait`) types can be equated
+     /// to their actual type.
+     Reveal(()),
++
++    /// Used to indicate that a trait is object safe.
++    ObjectSafe(TraitId<I>),
+ }
+ 
+ pub type QuantifiedWhereClause<I> = Binders<WhereClause<I>>;
+diff --git a/chalk-parse/src/ast.rs b/chalk-parse/src/ast.rs
+index 8dad5635..2dd7f950 100644
+--- a/chalk-parse/src/ast.rs
++++ b/chalk-parse/src/ast.rs
+@@ -68,6 +68,7 @@ pub struct TraitFlags {
+     pub fundamental: bool,
+     pub non_enumerable: bool,
+     pub coinductive: bool,
++    pub object_safe: bool,
+ }
+ 
+ #[derive(Clone, PartialEq, Eq, Debug)]
+@@ -315,6 +316,7 @@ pub enum DomainGoal {
+     Compatible,
+     DownstreamType { ty: Ty },
+     Reveal,
++    ObjectSafe { id: Identifier },
+ }
+ 
+ #[derive(Clone, PartialEq, Eq, Debug)]
+diff --git a/chalk-parse/src/parser.lalrpop b/chalk-parse/src/parser.lalrpop
+index 25ede469..ee6d3800 100644
+--- a/chalk-parse/src/parser.lalrpop
++++ b/chalk-parse/src/parser.lalrpop
+@@ -43,6 +43,7 @@ MarkerKeyword: () = "#" "[" "marker" "]";
+ FundamentalKeyword: () = "#" "[" "fundamental" "]";
+ NonEnumerableKeyword: () = "#" "[" "non_enumerable" "]";
+ CoinductiveKeyword: () = "#" "[" "coinductive" "]";
++ObjectSafeKeyword: () = "#" "[" "object_safe" "]";
+ 
+ WellKnownTrait: WellKnownTrait = {
+      "#" "[" "lang" "(" "sized" ")" "]" => WellKnownTrait::SizedTrait,
+@@ -67,7 +68,7 @@ StructDefn: StructDefn = {
+ };
+ 
+ TraitDefn: TraitDefn = {
+-    <auto:AutoKeyword?> <marker:MarkerKeyword?> <upstream:UpstreamKeyword?> <fundamental:FundamentalKeyword?> <non_enumerable:NonEnumerableKeyword?> <coinductive:CoinductiveKeyword?> <well_known:WellKnownTrait?> "trait" <n:Id><p:Angle<ParameterKind>>
++    <auto:AutoKeyword?> <marker:MarkerKeyword?> <upstream:UpstreamKeyword?> <fundamental:FundamentalKeyword?> <non_enumerable:NonEnumerableKeyword?> <coinductive:CoinductiveKeyword?> <object_safe:ObjectSafeKeyword?> <well_known:WellKnownTrait?> "trait" <n:Id><p:Angle<ParameterKind>>
+         <w:QuantifiedWhereClauses> "{" <a:AssocTyDefn*> "}" => TraitDefn
+     {
+         name: n,
+@@ -82,6 +83,7 @@ TraitDefn: TraitDefn = {
+             fundamental: fundamental.is_some(),
+             non_enumerable: non_enumerable.is_some(),
+             coinductive: coinductive.is_some(),
++            object_safe: object_safe.is_some(),
+         },
+     }
+ };
+@@ -365,6 +367,8 @@ DomainGoal: DomainGoal = {
+     "DownstreamType" "(" <ty:Ty> ")" => DomainGoal::DownstreamType { ty },
+ 
+     "Reveal" => DomainGoal::Reveal,
++
++    "ObjectSafe" "(" <id:Id> ")" => DomainGoal::ObjectSafe { id }
+ };
+ 
+ LeafGoal: LeafGoal = {
+diff --git a/chalk-solve/src/clauses.rs b/chalk-solve/src/clauses.rs
+index 44fb2d00..6101a2c6 100644
+--- a/chalk-solve/src/clauses.rs
++++ b/chalk-solve/src/clauses.rs
+@@ -244,16 +244,21 @@ fn program_clauses_that_could_match<I: Interner>(
+                 .opaque_ty_data(opaque_ty.opaque_ty_id)
+                 .to_program_clauses(builder),
+         },
+-        DomainGoal::WellFormed(WellFormed::Trait(trait_predicate)) => {
+-            db.trait_datum(trait_predicate.trait_id)
++        DomainGoal::WellFormed(WellFormed::Trait(trait_ref))
++        | DomainGoal::LocalImplAllowed(trait_ref) => {
++            db.trait_datum(trait_ref.trait_id)
+                 .to_program_clauses(builder);
+         }
++        DomainGoal::ObjectSafe(trait_id) => {
++            if builder.db.is_object_safe(*trait_id) {
++                builder.push_fact(DomainGoal::ObjectSafe(*trait_id));
++            }
++        }
+         DomainGoal::WellFormed(WellFormed::Ty(ty))
+         | DomainGoal::IsUpstream(ty)
+-        | DomainGoal::DownstreamType(ty) => match_ty(builder, environment, ty)?,
+-        DomainGoal::IsFullyVisible(ty) | DomainGoal::IsLocal(ty) => {
+-            match_ty(builder, environment, ty)?
+-        }
++        | DomainGoal::DownstreamType(ty)
++        | DomainGoal::IsFullyVisible(ty)
++        | DomainGoal::IsLocal(ty) => match_ty(builder, environment, ty)?,
+         DomainGoal::FromEnv(_) => (), // Computed in the environment
+         DomainGoal::Normalize(Normalize { alias, ty: _ }) => match alias {
+             AliasTy::Projection(proj) => {
+@@ -291,11 +296,7 @@ fn program_clauses_that_could_match<I: Interner>(
+             }
+             AliasTy::Opaque(_) => (),
+         },
+-        DomainGoal::LocalImplAllowed(trait_ref) => db
+-            .trait_datum(trait_ref.trait_id)
+-            .to_program_clauses(builder),
+-        DomainGoal::Compatible(()) => (),
+-        DomainGoal::Reveal(()) => (),
++        DomainGoal::Compatible(()) | DomainGoal::Reveal(()) => (),
+     };
+ 
+     Ok(())
+diff --git a/chalk-solve/src/lib.rs b/chalk-solve/src/lib.rs
+index de97c49c..6eac6dc7 100644
+--- a/chalk-solve/src/lib.rs
++++ b/chalk-solve/src/lib.rs
+@@ -93,6 +93,9 @@ pub trait RustIrDatabase<I: Interner>: Debug {
+     fn program_clauses_for_env(&self, environment: &Environment<I>) -> ProgramClauses<I>;
+ 
+     fn interner(&self) -> &I;
++
++    /// Check if a trait is object safe
++    fn is_object_safe(&self, trait_id: TraitId<I>) -> bool;
+ }
+ 
+ pub use clauses::program_clauses_for_env;

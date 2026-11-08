@@ -1,0 +1,334 @@
+diff --git a/README.md b/README.md
+index 7093f28..a3a5b9c 100644
+--- a/README.md
++++ b/README.md
+@@ -109,6 +109,7 @@ Check out the [CONTRIBUTING.md](CONTRIBUTING.md) to join the group of amazing pe
+ * [winds2016](https://github.com/winds2016) - *Windows platform testing*
+ * [songjiayang](https://github.com/songjiayang) - *SongJiaYang*
+ * [Yutaka Takeda](https://github.com/enobufs) - *vnet*
++* [namreg](https://github.com/namreg) - *Igor German*
+ 
+ ### License
+ MIT License - see [LICENSE.md](LICENSE.md) for full text
+diff --git a/client.go b/client.go
+index 97c52bf..e30db2d 100644
+--- a/client.go
++++ b/client.go
+@@ -17,14 +17,18 @@ type ClientConfig struct {
+ 	ListeningAddress string
+ 	LoggerFactory    logging.LoggerFactory
+ 	Net              *vnet.Net
++	Software         *stun.Software
++	Sender           Sender
+ }
+ 
+ // Client is a STUN server client
+ type Client struct {
+-	conn net.PacketConn
+-	mux  sync.Mutex
+-	net  *vnet.Net
+-	log  logging.LeveledLogger
++	conn     net.PacketConn
++	mux      sync.Mutex
++	net      *vnet.Net
++	log      logging.LeveledLogger
++	software *stun.Software
++	sender   Sender
+ }
+ 
+ // NewClient returns a new Client instance. listeningAddress is the address and port to listen on, default "0.0.0.0:0"
+@@ -38,9 +42,15 @@ func NewClient(config *ClientConfig) (*Client, error) {
+ 		log.Warn("vnet is enabled")
+ 	}
+ 
++	if config.Sender == nil {
++		config.Sender = defaultBuildAndSend
++	}
++
+ 	c := &Client{
+-		net: config.Net,
+-		log: log,
++		net:      config.Net,
++		log:      log,
++		software: config.Software,
++		sender:   config.Sender,
+ 	}
+ 
+ 	var err error
+@@ -58,7 +68,12 @@ func (c *Client) SendSTUNRequest(serverIP net.IP, serverPort int) (net.Addr, err
+ 	defer c.mux.Unlock()
+ 
+ 	c.log.Debug("sending STUN request")
+-	if err := sendStunRequest(c.conn, serverIP, serverPort); err != nil {
++
++	attrs := []stun.Setter{stun.TransactionID, stun.BindingRequest}
++	if c.software != nil {
++		attrs = append(attrs, *c.software)
++	}
++	if err := c.sender(c.conn, &net.UDPAddr{IP: serverIP, Port: serverPort}, attrs...); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -86,12 +101,3 @@ func (c *Client) SendSTUNRequest(serverIP net.IP, serverPort int) (net.Addr, err
+ 		Port: reflAddr.Port,
+ 	}, nil
+ }
+-
+-func sendStunRequest(conn net.PacketConn, serverIP net.IP, serverPort int) error {
+-	msg, err := stun.Build(stun.TransactionID, stun.BindingRequest)
+-	if err != nil {
+-		return err
+-	}
+-	_, err = conn.WriteTo(msg.Raw, &net.UDPAddr{IP: serverIP, Port: serverPort})
+-	return err
+-}
+diff --git a/cmd/client/main.go b/cmd/client/main.go
+index be1ea00..15d75ad 100644
+--- a/cmd/client/main.go
++++ b/cmd/client/main.go
+@@ -7,12 +7,14 @@ import (
+ 	"net"
+ 
+ 	"github.com/pion/logging"
++	"github.com/pion/stun"
+ 	"github.com/pion/turn"
+ )
+ 
+ func main() {
+ 	host := flag.String("host", "74.125.143.127", "IP of TURN Server. Default is the IP of stun1.l.google.com.")
+ 	port := flag.Int("port", 19302, "Port of TURN server.")
++	software := flag.String("software", "", "The STUN SOFTWARE attribute. Useful for debugging purpose.")
+ 	flag.Parse()
+ 
+ 	ip := net.ParseIP(*host)
+@@ -20,10 +22,17 @@ func main() {
+ 		panic(errors.New("failed to parse host IP"))
+ 	}
+ 
+-	c, err := turn.NewClient(&turn.ClientConfig{
++	cfg := &turn.ClientConfig{
+ 		ListeningAddress: "0.0.0.0:0",
+ 		LoggerFactory:    logging.NewDefaultLoggerFactory(),
+-	})
++	}
++
++	if *software != "" {
++		attr := stun.NewSoftware(*software)
++		cfg.Software = &attr
++	}
++
++	c, err := turn.NewClient(cfg)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+diff --git a/cmd/simple-turn/main.go b/cmd/simple-turn/main.go
+index 4d3d6c5..43c0cd4 100644
+--- a/cmd/simple-turn/main.go
++++ b/cmd/simple-turn/main.go
+@@ -11,6 +11,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/pion/logging"
++	"github.com/pion/stun"
+ 	"github.com/pion/turn"
+ )
+ 
+@@ -60,12 +61,19 @@ func main() {
+ 		}
+ 	}
+ 
++	var software *stun.Software
++	if sw := os.Getenv("SOFTWARE"); sw != "" {
++		attr := stun.NewSoftware(sw)
++		software = &attr
++	}
++
+ 	s := turn.NewServer(&turn.ServerConfig{
+ 		Realm:              realm,
+ 		AuthHandler:        createAuthHandler(usersMap),
+ 		ChannelBindTimeout: channelBindTimeout,
+ 		ListeningPort:      udpPort,
+ 		LoggerFactory:      logging.NewDefaultLoggerFactory(),
++		Software:           software,
+ 	})
+ 
+ 	err = s.Start()
+diff --git a/sender.go b/sender.go
+new file mode 100644
+index 0000000..bb0bc1c
+--- /dev/null
++++ b/sender.go
+@@ -0,0 +1,20 @@
++package turn
++
++import (
++	"net"
++
++	"github.com/pion/stun"
++)
++
++// Sender is responsible for building a message and sending it to the given addr.
++type Sender func(conn net.PacketConn, addr net.Addr, attrs ...stun.Setter) error
++
++// defaultBuildAndSend is a sender default implementation.
++func defaultBuildAndSend(conn net.PacketConn, dst net.Addr, attrs ...stun.Setter) error {
++	msg, err := stun.Build(attrs...)
++	if err != nil {
++		return err
++	}
++	_, err = conn.WriteTo(msg.Raw, dst)
++	return err
++}
+diff --git a/server.go b/server.go
+index 2d7d130..c98f788 100644
+--- a/server.go
++++ b/server.go
+@@ -40,6 +40,10 @@ type ServerConfig struct {
+ 	LoggerFactory logging.LoggerFactory
+ 	// Net is used by pion developers. Do not use in your application.
+ 	Net *vnet.Net
++	// Software is the STUN SOFTWARE attribute. Useful for debugging purpose.
++	Software *stun.Software
++	// Sender is a custom implementation of the request Sender.
++	Sender Sender
+ }
+ 
+ type listener struct {
+@@ -61,6 +65,8 @@ type Server struct {
+ 	channelBindTimeout time.Duration
+ 	log                logging.LeveledLogger
+ 	net                *vnet.Net
++	software           *stun.Software
++	sender             Sender
+ }
+ 
+ // NewServer creates the Pion TURN server
+@@ -73,6 +79,10 @@ func NewServer(config *ServerConfig) *Server {
+ 		log.Warn("vnet is enabled")
+ 	}
+ 
++	if config.Sender == nil {
++		config.Sender = defaultBuildAndSend
++	}
++
+ 	manager := allocation.NewManager(&allocation.ManagerConfig{
+ 		LeveledLogger: log,
+ 		Net:           config.Net,
+@@ -97,6 +107,8 @@ func NewServer(config *ServerConfig) *Server {
+ 		channelBindTimeout: channelBindTimeout,
+ 		log:                log,
+ 		net:                config.Net,
++		software:           config.Software,
++		sender:             config.Sender,
+ 	}
+ }
+ 
+@@ -402,13 +414,3 @@ func assertMessageIntegrity(m *stun.Message, ourKey []byte) error {
+ 	messageIntegrityAttr := stun.MessageIntegrity(ourKey)
+ 	return messageIntegrityAttr.Check(m)
+ }
+-
+-func buildAndSend(conn net.PacketConn, dst net.Addr, attrs ...stun.Setter) error {
+-	msg, err := stun.Build(attrs...)
+-	if err != nil {
+-		return err
+-	}
+-
+-	_, err = conn.WriteTo(msg.Raw, dst)
+-	return err
+-}
+diff --git a/stun.go b/stun.go
+index 44297aa..ae0131f 100644
+--- a/stun.go
++++ b/stun.go
+@@ -14,11 +14,10 @@ func (s *Server) handleBindingRequest(conn net.PacketConn, srcAddr net.Addr, m *
+ 		return err
+ 	}
+ 
+-	return buildAndSend(conn, srcAddr, &stun.Message{TransactionID: m.TransactionID}, stun.BindingSuccess,
+-		&stun.XORMappedAddress{
+-			IP:   ip,
+-			Port: port,
+-		},
+-		stun.Fingerprint,
+-	)
++	attrs := s.makeAttrs(m.TransactionID, stun.BindingSuccess, &stun.XORMappedAddress{
++		IP:   ip,
++		Port: port,
++	}, stun.Fingerprint)
++
++	return s.sender(conn, srcAddr, attrs...)
+ }
+diff --git a/turn.go b/turn.go
+index 6f9b6e1..e90bd81 100644
+--- a/turn.go
++++ b/turn.go
+@@ -96,7 +96,7 @@ func assertDontFragment(curriedSend curriedSend, m *stun.Message, attr stun.Sett
+ func (s *Server) handleAllocateRequest(conn net.PacketConn, srcAddr net.Addr, m *stun.Message) error {
+ 	dstAddr := conn.LocalAddr()
+ 	curriedSend := func(class stun.MessageClass, method stun.Method, transactionID [stun.TransactionIDSize]byte, attrs ...stun.Setter) error {
+-		return buildAndSend(conn, srcAddr, append([]stun.Setter{&stun.Message{TransactionID: transactionID}, stun.NewType(method, class)}, attrs...)...)
++		return s.sender(conn, srcAddr, s.makeAttrs(transactionID, stun.NewType(method, class), attrs...)...)
+ 	}
+ 	respondWithError := func(err error, messageIntegrity stun.MessageIntegrity, errorCode stun.ErrorCode) error {
+ 		if sendErr := curriedSend(stun.ClassErrorResponse, stun.MethodAllocate, m.TransactionID,
+@@ -273,7 +273,7 @@ func (s *Server) handleAllocateRequest(conn net.PacketConn, srcAddr net.Addr, m
+ func (s *Server) handleRefreshRequest(conn net.PacketConn, srcAddr net.Addr, m *stun.Message) error {
+ 	dstAddr := conn.LocalAddr()
+ 	curriedSend := func(class stun.MessageClass, method stun.Method, transactionID [stun.TransactionIDSize]byte, attrs ...stun.Setter) error {
+-		return buildAndSend(conn, srcAddr, append([]stun.Setter{&stun.Message{TransactionID: transactionID}, stun.NewType(method, class)}, attrs...)...)
++		return s.sender(conn, srcAddr, s.makeAttrs(transactionID, stun.NewType(method, class), attrs...)...)
+ 	}
+ 	messageIntegrity, _, err := authenticateRequest(curriedSend, m, stun.MethodCreatePermission, s.realm, s.authHandler, srcAddr)
+ 	if err != nil {
+@@ -304,7 +304,7 @@ func (s *Server) handleRefreshRequest(conn net.PacketConn, srcAddr net.Addr, m *
+ func (s *Server) handleCreatePermissionRequest(conn net.PacketConn, srcAddr net.Addr, m *stun.Message) error {
+ 	dstAddr := conn.LocalAddr()
+ 	curriedSend := func(class stun.MessageClass, method stun.Method, transactionID [stun.TransactionIDSize]byte, attrs ...stun.Setter) error {
+-		return buildAndSend(conn, srcAddr, append([]stun.Setter{&stun.Message{TransactionID: transactionID}, stun.NewType(method, class)}, attrs...)...)
++		return s.sender(conn, srcAddr, s.makeAttrs(transactionID, stun.NewType(method, class), attrs...)...)
+ 	}
+ 
+ 	a := s.manager.GetAllocation(&allocation.FiveTuple{
+@@ -388,7 +388,7 @@ func (s *Server) handleSendIndication(conn net.PacketConn, srcAddr net.Addr, m *
+ func (s *Server) handleChannelBindRequest(conn net.PacketConn, srcAddr net.Addr, m *stun.Message) error {
+ 	dstAddr := conn.LocalAddr()
+ 	errorSend := func(err error, attrs ...stun.Setter) error {
+-		sendErr := buildAndSend(conn, srcAddr, append([]stun.Setter{&stun.Message{TransactionID: m.TransactionID}, stun.NewType(stun.MethodChannelBind, stun.ClassErrorResponse)}, attrs...)...)
++		sendErr := s.sender(conn, srcAddr, s.makeAttrs(m.TransactionID, stun.NewType(stun.MethodChannelBind, stun.ClassErrorResponse), attrs...)...)
+ 		if sendErr != nil {
+ 			err = errors.Errorf(strings.Join([]string{sendErr.Error(), err.Error()}, "\n"))
+ 		}
+@@ -405,7 +405,7 @@ func (s *Server) handleChannelBindRequest(conn net.PacketConn, srcAddr net.Addr,
+ 	}
+ 
+ 	messageIntegrity, _, err := authenticateRequest(func(class stun.MessageClass, method stun.Method, transactionID [stun.TransactionIDSize]byte, attrs ...stun.Setter) error {
+-		return buildAndSend(conn, srcAddr, append([]stun.Setter{&stun.Message{TransactionID: m.TransactionID}, stun.NewType(method, class)}, attrs...)...)
++		return s.sender(conn, srcAddr, s.makeAttrs(m.TransactionID, stun.NewType(method, class))...)
+ 	}, m, stun.MethodChannelBind, s.realm, s.authHandler, srcAddr)
+ 	if err != nil {
+ 		return errorSend(err, stun.CodeBadRequest)
+@@ -430,7 +430,7 @@ func (s *Server) handleChannelBindRequest(conn net.PacketConn, srcAddr net.Addr,
+ 		return errorSend(err, stun.CodeBadRequest)
+ 	}
+ 
+-	return buildAndSend(conn, srcAddr, &stun.Message{TransactionID: m.TransactionID}, stun.NewType(stun.MethodChannelBind, stun.ClassSuccessResponse), messageIntegrity)
++	return s.sender(conn, srcAddr, s.makeAttrs(m.TransactionID, stun.NewType(stun.MethodChannelBind, stun.ClassSuccessResponse), messageIntegrity)...)
+ }
+ 
+ func (s *Server) handleChannelData(conn net.PacketConn, srcAddr net.Addr, c *turn.ChannelData) error {
+@@ -462,6 +462,14 @@ func (s *Server) handleChannelData(conn net.PacketConn, srcAddr net.Addr, c *tur
+ 	return nil
+ }
+ 
++func (s *Server) makeAttrs(transactionID [stun.TransactionIDSize]byte, msgType stun.MessageType, additional ...stun.Setter) []stun.Setter {
++	attrs := append([]stun.Setter{&stun.Message{TransactionID: transactionID}, msgType}, additional...)
++	if s.software != nil {
++		attrs = append(attrs, *s.software)
++	}
++	return attrs
++}
++
+ func allocationLifeTime(m *stun.Message) time.Duration {
+ 	lifetimeDuration := turn.DefaultLifetime
+ 

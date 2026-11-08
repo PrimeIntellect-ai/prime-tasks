@@ -1,0 +1,191 @@
+diff --git a/internal/scm/gitlab/gitlab_test.go b/internal/scm/gitlab/gitlab_test.go
+new file mode 100644
+index 0000000..b3f65d9
+--- /dev/null
++++ b/internal/scm/gitlab/gitlab_test.go
+@@ -0,0 +1,185 @@
++package gitlab
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestProjectReferenceParsing(t *testing.T) {
++	tests := []struct {
++		name    string
++		val     string
++		want    ProjectReference
++		wantErr bool
++	}{
++		{
++			name: "single",
++			val:  "my-group/my-project",
++			want: ProjectReference{
++				OwnerName: "my-group",
++				Name:      "my-project",
++			},
++		},
++		{
++			name: "subgroup",
++			val:  "my-group/sub-group/my-project",
++			want: ProjectReference{
++				OwnerName: "my-group/sub-group",
++				Name:      "my-project",
++			},
++		},
++		{
++			name: "two subgroups",
++			val:  "my-group/sub-group1/sub-group2/my-project",
++			want: ProjectReference{
++				OwnerName: "my-group/sub-group1/sub-group2",
++				Name:      "my-project",
++			},
++		},
++		{
++			name:    "no-group",
++			val:     "my-project",
++			wantErr: true,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := ParseProjectReference(tt.val)
++			if (err != nil) != tt.wantErr {
++				t.Errorf("ParseProjectReference() error = %v, wantErr %v", err, tt.wantErr)
++				return
++			}
++			if tt.wantErr {
++				return
++			}
++			// The split between OwnerName and Name is not prescribed; the complete
++			// path must be preserved and the project name must be the final component.
++			if joined := got.OwnerName + "/" + got.Name; joined != tt.val {
++				t.Errorf("ParseProjectReference() full path = %q, want %q", joined, tt.val)
++			}
++			lastSegment := tt.val[strings.LastIndex(tt.val, "/")+1:]
++			if got.Name == "" || !strings.HasSuffix(got.Name, lastSegment) {
++				t.Errorf("ParseProjectReference() Name = %q, want project name %q as final component", got.Name, lastSegment)
++			}
++		})
++	}
++}
++
++// TestGetRepositoriesNestedGroup verifies that a project living in a nested
++// GitLab group can actually be fetched, not just parsed.
++func TestGetRepositoriesNestedGroup(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprint(w, `{
++"id": 1,
++"path": "project",
++"path_with_namespace": "group-org/subgroup/project",
++"namespace": {"path": "group-org/subgroup"},
++"http_url_to_repo": "https://gitlab.com/group-org/subgroup/project.git",
++"default_branch": "main"
++}`)
++	}))
++	defer server.Close()
++
++	ref, err := ParseProjectReference("group-org/subgroup/project")
++	if err != nil {
++		t.Fatalf("ParseProjectReference() error = %v", err)
++	}
++
++	g, err := New("token", server.URL, RepositoryListing{
++		Projects: []ProjectReference{ref},
++	}, Config{})
++	if err != nil {
++		t.Fatalf("New() error = %v", err)
++	}
++
++	repos, err := g.GetRepositories(context.Background())
++	if err != nil {
++		t.Fatalf("GetRepositories() error = %v", err)
++	}
++	if len(repos) != 1 {
++		t.Fatalf("GetRepositories() returned %d repositories, want 1", len(repos))
++	}
++	if got, want := repos[0].FullName(), "group-org/subgroup/project"; got != want {
++		t.Errorf("repository FullName() = %q, want %q", got, want)
++	}
++}
++
++func TestNestedProjectFromCLIAndYAML(t *testing.T) {
++	const project = "group-org/subgroup/project"
++	cases := []struct {
++		name string
++		args func(string, string) ([]string, error)
++	}{
++		{
++			name: "command line",
++			args: func(baseURL, _ string) ([]string, error) {
++				return []string{"--platform", "gitlab", "--base-url", baseURL, "--token", "token", "--project", project}, nil
++			},
++		},
++		{
++			name: "YAML configuration",
++			args: func(baseURL, configFile string) ([]string, error) {
++				config := "platform: gitlab\nbase-url: " + baseURL + "\ntoken: token\nproject:\n  - " + project + "\n"
++				if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
++					return nil, err
++				}
++				return []string{"--config", configFile}, nil
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			var receivedMu sync.Mutex
++			var receivedProject bool
++			var server *httptest.Server
++			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				receivedMu.Lock()
++				receivedProject = true
++				receivedMu.Unlock()
++				w.Header().Set("Content-Type", "application/json")
++				projectJSON := fmt.Sprintf(`{"id":1,"path":"project","path_with_namespace":"group-org/subgroup/project","namespace":{"path":"group-org/subgroup"},"http_url_to_repo":%q,"default_branch":"main"}`, server.URL+"/repo.git")
++				if strings.HasSuffix(r.URL.Path, "/projects") {
++					fmt.Fprintf(w, "[%s]", projectJSON)
++					return
++				}
++				fmt.Fprint(w, projectJSON)
++			}))
++			defer server.Close()
++
++			configFile := t.TempDir() + "/config.yaml"
++			platformArgs, err := tc.args(server.URL, configFile)
++			if err != nil {
++				t.Fatalf("prepare project input: %v", err)
++			}
++			commandArgs := []string{"run", "--skip-pr", "--dry-run", "--commit-message", "update", "--author-name", "Test", "--author-email", "test@example.com"}
++			commandArgs = append(commandArgs, platformArgs...)
++			commandArgs = append(commandArgs, "/bin/true")
++			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++			defer cancel()
++			command := exec.CommandContext(ctx, "go", append([]string{"run", "../../../main.go"}, commandArgs...)...)
++			output, commandErr := command.CombinedOutput()
++			if ctx.Err() != nil {
++				t.Fatalf("multi-gitter command timed out: %v", ctx.Err())
++			}
++			if commandErr != nil {
++				t.Fatalf("multi-gitter could not use the nested project reference: %v\n%s", commandErr, output)
++			}
++			receivedMu.Lock()
++			gotProject := receivedProject
++			receivedMu.Unlock()
++			if !gotProject {
++				t.Fatal("the GitLab API was not contacted to fetch the configured project")
++			}
++		})
++	}
++}

@@ -1,0 +1,173 @@
+diff --git a/pkg/reporter/sync_test.go b/pkg/reporter/sync_test.go
+index 70b9b13..e676632 100644
+--- a/pkg/reporter/sync_test.go
++++ b/pkg/reporter/sync_test.go
+@@ -3,8 +3,13 @@ package reporter
+ import (
+ 	"context"
+ 	"errors"
++	"net"
++	"os"
++	"os/exec"
++	"strings"
+ 	"testing"
+ 
++	controltowerv1grpc "buf.build/gen/go/safedep/api/grpc/go/safedep/services/controltower/v1/controltowerv1grpc"
+ 	controltowerv1pb "buf.build/gen/go/safedep/api/protocolbuffers/go/safedep/messages/controltower/v1"
+ 	malysisv1 "buf.build/gen/go/safedep/api/protocolbuffers/go/safedep/messages/malysis/v1"
+ 	packagev1 "buf.build/gen/go/safedep/api/protocolbuffers/go/safedep/messages/package/v1"
+@@ -111,6 +116,111 @@ func mockDependencyGraph(pkg *models.Package) {
+ 	pkg.Manifest.DependencyGraph = dg
+ }
+ 
++type scanSyncCapture struct {
++	controltowerv1grpc.UnimplementedToolServiceServer
++	requests chan *controltowerv1.CreateToolSessionRequest
++}
++
++func (s *scanSyncCapture) CreateToolSession(_ context.Context, req *controltowerv1.CreateToolSessionRequest) (*controltowerv1.CreateToolSessionResponse, error) {
++	s.requests <- req
++	return &controltowerv1.CreateToolSessionResponse{
++		ToolSession: &controltowerv1.ToolSession{ToolSessionId: "scan-test-session"},
++	}, nil
++}
++
++func (s *scanSyncCapture) CompleteToolSession(context.Context, *controltowerv1.CompleteToolSessionRequest) (*controltowerv1.CompleteToolSessionResponse, error) {
++	return &controltowerv1.CompleteToolSessionResponse{}, nil
++}
++
++func TestScanSyncUsesDetectedEnvironment(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := grpc.NewServer()
++	capture := &scanSyncCapture{requests: make(chan *controltowerv1.CreateToolSessionRequest, 2)}
++	controltowerv1grpc.RegisterToolServiceServer(server, capture)
++	go func() { _ = server.Serve(listener) }()
++	t.Cleanup(server.Stop)
++
++	cases := []struct {
++		name                string
++		githubActions       bool
++		wantSource          controltowerv1pb.Project_Source
++		wantURL             string
++		wantTrigger         controltowerv1.ToolTrigger
++		wantGitRef, wantSHA string
++	}{
++		{
++			name:          "GitHub Actions metadata",
++			githubActions: true,
++			wantSource:    controltowerv1pb.Project_SOURCE_GITHUB,
++			wantURL:       "https://github.com/sample-org/sample-repo",
++			wantTrigger:   controltowerv1.ToolTrigger_TOOL_TRIGGER_PUSH,
++			wantGitRef:    "refs/heads/main",
++			wantSHA:       "deadbeef",
++		},
++		{
++			name:        "default metadata outside GitHub Actions",
++			wantSource:  controltowerv1pb.Project_SOURCE_UNSPECIFIED,
++			wantTrigger: controltowerv1.ToolTrigger_TOOL_TRIGGER_MANUAL,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			directory := t.TempDir()
++			command := exec.Command("go", "run", "-ldflags=-X=main.version=test-version", ".", "scan",
++				"--silent", "--report-sync", "--report-sync-project", "sample-project",
++				"--report-sync-project-version", "sample-version", "--directory", directory,
++				"--enrich=false")
++			command.Dir = "../.."
++			env := make([]string, 0, len(os.Environ())+8)
++			for _, entry := range os.Environ() {
++				if !strings.HasPrefix(entry, "GITHUB_ACTIONS=") &&
++					!strings.HasPrefix(entry, "GITHUB_SERVER_URL=") &&
++					!strings.HasPrefix(entry, "GITHUB_REPOSITORY=") &&
++					!strings.HasPrefix(entry, "GITHUB_EVENT_NAME=") &&
++					!strings.HasPrefix(entry, "GITHUB_REF=") &&
++					!strings.HasPrefix(entry, "GITHUB_SHA=") &&
++					!strings.HasPrefix(entry, "VET_SYNC_API_URL=") &&
++					!strings.HasPrefix(entry, "INSECURE_GRPC_CLIENT_USE_INSECURE_TRANSPORT=") {
++					env = append(env, entry)
++				}
++			}
++			command.Env = append(env,
++				"VET_SYNC_API_URL=http://"+listener.Addr().String(),
++				"INSECURE_GRPC_CLIENT_USE_INSECURE_TRANSPORT=true",
++			)
++			if tc.githubActions {
++				command.Env = append(command.Env,
++					"GITHUB_ACTIONS=true",
++					"GITHUB_SERVER_URL=https://github.com",
++					"GITHUB_REPOSITORY=sample-org/sample-repo",
++					"GITHUB_EVENT_NAME=push",
++					"GITHUB_REF=refs/heads/main",
++					"GITHUB_SHA=deadbeef",
++				)
++			}
++			output, err := command.CombinedOutput()
++			if err != nil {
++				t.Fatalf("scan command failed: %v\n%s", err, output)
++			}
++
++			select {
++			case req := <-capture.requests:
++				assert.Equal(t, tc.wantSource, req.GetOriginProjectSource())
++				assert.Equal(t, tc.wantURL, req.GetOriginProjectUrl())
++				assert.Equal(t, tc.wantTrigger, req.GetTrigger())
++				assert.Equal(t, tc.wantGitRef, req.GetGitRef())
++				assert.Equal(t, tc.wantSHA, req.GetGitSha())
++			default:
++				t.Fatal("scan did not create a sync session")
++			}
++		})
++	}
++}
++
+ func TestSyncPackage(t *testing.T) {
+ 	tests := []struct {
+ 		name          string
+@@ -676,3 +786,42 @@ func TestCreateToolSessionRequestForProjectVersion(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestSyncReporterEnvironmentResolverFactory(t *testing.T) {
++	t.Run("GitHub Actions environment", func(t *testing.T) {
++		t.Setenv("GITHUB_ACTIONS", "true")
++		t.Setenv("GITHUB_SERVER_URL", "https://github.example")
++		t.Setenv("GITHUB_REPOSITORY", "team/project")
++		t.Setenv("GITHUB_EVENT_NAME", "pull_request")
++		t.Setenv("GITHUB_REF", "refs/heads/feature")
++		t.Setenv("GITHUB_SHA", "0123456789abcdef")
++
++		resolver := NewSyncReporterEnvironmentResolver()
++		assert.Equal(t, controltowerv1pb.Project_SOURCE_GITHUB, resolver.GetProjectSource())
++		assert.Equal(t, "https://github.example/team/project", resolver.GetProjectURL())
++		assert.Equal(t, controltowerv1.ToolTrigger_TOOL_TRIGGER_PULL_REQUEST, resolver.Trigger())
++		assert.Equal(t, "refs/heads/feature", resolver.GitRef())
++		assert.Equal(t, "0123456789abcdef", resolver.GitSha())
++	})
++
++	t.Run("outside GitHub Actions", func(t *testing.T) {
++		previous, wasSet := os.LookupEnv("GITHUB_ACTIONS")
++		if err := os.Unsetenv("GITHUB_ACTIONS"); err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() {
++			if wasSet {
++				_ = os.Setenv("GITHUB_ACTIONS", previous)
++			} else {
++				_ = os.Unsetenv("GITHUB_ACTIONS")
++			}
++		})
++
++		resolver := NewSyncReporterEnvironmentResolver()
++		assert.Equal(t, controltowerv1pb.Project_SOURCE_UNSPECIFIED, resolver.GetProjectSource())
++		assert.Empty(t, resolver.GetProjectURL())
++		assert.Equal(t, controltowerv1.ToolTrigger_TOOL_TRIGGER_MANUAL, resolver.Trigger())
++		assert.Empty(t, resolver.GitRef())
++		assert.Empty(t, resolver.GitSha())
++	})
++}

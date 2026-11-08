@@ -1,0 +1,409 @@
+diff --git a/.gitignore b/.gitignore
+index 2a61bde..609124d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,3 +17,5 @@ doc/api/backreferences
+ .ipynb_checkpoints
+ *.egg-info
+ MANIFEST
++dask-worker-space
++.coverage.*
+diff --git a/.pylintrc b/.pylintrc
+index 2064e80..7bfc216 100644
+--- a/.pylintrc
++++ b/.pylintrc
+@@ -240,7 +240,7 @@ function-name-hint=(([a-z][a-z0-9_]{2,50})|(_[a-z0-9_]*))$
+ function-rgx=(([a-z][a-z0-9_]{2,50})|(_[a-z0-9_]*))$
+ 
+ # Good variable names which should always be accepted, separated by a comma
+-good-names=i,j,k,w,e,s,n,x,y,z
++good-names=i,j,k,w,e,s,n,x,y,z,cv
+ 
+ # Include a hint for the correct naming format with invalid-name
+ include-naming-hint=no
+diff --git a/Makefile b/Makefile
+index 97fc983..0419305 100644
+--- a/Makefile
++++ b/Makefile
+@@ -41,5 +41,6 @@ check: pep8 lint
+ 
+ clean:
+ 	find . -name "*.pyc" -exec rm -v {} \;
++	find . -name ".coverage.*" -exec rm -v {} \;
+ 	rm -rvf build dist MANIFEST *.egg-info __pycache__ .coverage .cache .pytest_cache
+-	rm -rvf $(TESTDIR)
++	rm -rvf $(TESTDIR) dask-worker-space
+diff --git a/examples/spline.py b/examples/spline.py
+index 3af0bfa..f88682a 100644
+--- a/examples/spline.py
++++ b/examples/spline.py
+@@ -40,9 +40,18 @@ chain = vd.Chain([
+     ('spline', vd.Spline(damping=1e-10))])
+ print(chain)
+ 
+-# Weights need to 1/uncertainty**2 for the error propagation in BlockMean to
+-# work
+-chain.fit(projection(*coordinates), data.velocity_up, weights=1/data.std_up**2)
++# Split the data into a training and testing set. We'll use the training set to
++# grid the data and the testing set to validate our spline model. Weights need
++# to 1/uncertainty**2 for the error propagation in BlockMean to work.
++train, test = vd.train_test_split(projection(*coordinates), data.velocity_up,
++                                  weights=1/data.std_up**2, random_state=0)
++# Fit the model on the training set
++chain.fit(*train)
++# And calculate an R^2 score coefficient on the testing set. The best possible
++# score (perfect prediction) is 1. This can tell us how good our spline is at
++# predicting data that was not in the input dataset.
++score = chain.score(*test)
++print("\nScore: {:.3f}".format(score))
+ 
+ # Create a grid of the vertical velocity and mask it to only show points close
+ # to the actual data.
+diff --git a/verde/__init__.py b/verde/__init__.py
+index e3fe520..9b1fa65 100644
+--- a/verde/__init__.py
++++ b/verde/__init__.py
+@@ -15,6 +15,7 @@ from .scipygridder import ScipyGridder
+ from .trend import Trend, trend_jacobian, VectorTrend
+ from .chain import Chain
+ from .spline import Spline, spline_jacobian
++from .model_selection import cross_val_score, train_test_split
+ 
+ 
+ # Get the version number through versioneer
+diff --git a/verde/base.py b/verde/base.py
+index 01af1cc..4907b68 100644
+--- a/verde/base.py
++++ b/verde/base.py
+@@ -562,11 +562,11 @@ def check_fit_input(coordinates, data, weights, ravel=True):
+ 
+     """
+     data = check_data(data)
++    weights = check_data(weights)
+     if any(i.shape != j.shape for i in coordinates for j in data):
+         raise ValueError(
+             "Coordinate and data arrays must have the same shape.")
+-    if weights is not None:
+-        weights = check_data(weights)
++    if any(w is not None for w in weights):
+         if len(weights) != len(data):
+             raise ValueError(
+                 "Number of data '{}' and weights '{}' must be equal."
+diff --git a/verde/chain.py b/verde/chain.py
+index 27f3971..73c66ce 100644
+--- a/verde/chain.py
++++ b/verde/chain.py
+@@ -69,11 +69,14 @@ class Chain(BaseGridder):
+         coordinates : tuple of arrays
+             Arrays with the coordinates of each data point. Should be in the
+             following order: (easting, northing, vertical, ...).
+-        data : array
+-            The data values of each data point.
+-        weights : None or array
+-            If not None, then the weights assigned to each data point.
+-            Typically, this should be 1 over the data uncertainty squared.
++        data : array or tuple of arrays
++            the data values of each data point. if the data has more than one
++            component, *data* must be a tuple of arrays (one for each
++            component).
++        weights : none or array or tuple of arrays
++            if not none, then the weights assigned to each data point. if more
++            than one data component is provided, you must provide a weights
++            array for each data component (if not none).
+ 
+         Returns
+         -------
+diff --git a/verde/model_selection.py b/verde/model_selection.py
+new file mode 100644
+index 0000000..fd8eda4
+--- /dev/null
++++ b/verde/model_selection.py
+@@ -0,0 +1,234 @@
++"""
++Functions for automating model selection through cross-validation.
++
++Supports using a dask.distributed.Client object for parallelism. The
++DummyClient is used as a serial version of the parallel client.
++"""
++import numpy as np
++from sklearn.model_selection import KFold, ShuffleSplit
++
++from .base import check_fit_input
++
++
++class DummyClient():  # pylint: disable=no-self-use,too-few-public-methods
++    """
++    Dummy client to mimic a dask.distributed.Client for immediate local
++    execution.
++
++    >>> client = DummyClient()
++    >>> client.submit(sum, (1, 2, 3))
++    6
++
++    """
++
++    def submit(self, function, *args, **kwargs):
++        "Execute function with the given arguments and return its output"
++        return function(*args, **kwargs)
++
++
++def train_test_split(coordinates, data, weights=None, **kwargs):
++    r"""
++    Split a dataset into a training and a testing set for cross-validation.
++
++    Similar to :func:`sklearn.model_selection.train_test_split` but is tuned to
++    work on multi-component spatial data with optional weights.
++
++    Extra keyword arguments will be passed to
++    :class:`sklearn.model_selection.ShuffleSplit`, except for ``n_splits``
++    which is always 1.
++
++    Parameters
++    ----------
++    coordinates : tuple of arrays
++        Arrays with the coordinates of each data point. Should be in the
++        following order: (easting, northing, vertical, ...).
++    data : array or tuple of arrays
++        the data values of each data point. If the data has more than one
++        component, *data* must be a tuple of arrays (one for each component).
++    weights : none or array or tuple of arrays
++        if not none, then the weights assigned to each data point. If more than
++        one data component is provided, you must provide a weights array for
++        each data component (if not none).
++
++    Returns
++    -------
++    train, test : tuples
++        Each is a tuple = (coordinates, data, weights) generated by separating
++        the input values randomly.
++
++    Examples
++    --------
++
++    >>> import numpy as np
++    >>> # Split 2-component data with weights
++    >>> data = (np.array([1, 3, 5, 7]), np.array([0, 2, 4, 6]))
++    >>> coordinates = (np.arange(4), np.arange(-4, 0))
++    >>> weights = (np.array([1, 1, 2, 1]), np.array([1, 2, 1, 1]))
++    >>> train, test = train_test_split(coordinates, data, weights,
++    ...                                random_state=0)
++    >>> print("Coordinates:", train[0], test[0], sep='\n  ')
++    Coordinates:
++      (array([3, 1, 0]), array([-1, -3, -4]))
++      (array([2]), array([-2]))
++    >>> print("Data:", train[1], test[1], sep='\n  ')
++    Data:
++      (array([7, 3, 1]), array([6, 2, 0]))
++      (array([5]), array([4]))
++    >>> print("Weights:", train[2], test[2], sep='\n  ')
++    Weights:
++      (array([1, 1, 1]), array([1, 2, 1]))
++      (array([2]), array([1]))
++    >>> # Split single component data without weights
++    >>> train, test = train_test_split(coordinates, data[0], None,
++    ...                                random_state=0)
++    >>> print("Coordinates:", train[0], test[0], sep='\n  ')
++    Coordinates:
++      (array([3, 1, 0]), array([-1, -3, -4]))
++      (array([2]), array([-2]))
++    >>> print("Data:", train[1], test[1], sep='\n  ')
++    Data:
++      (array([7, 3, 1]),)
++      (array([5]),)
++    >>> print("Weights:", train[2], test[2], sep='\n  ')
++    Weights:
++      (None,)
++      (None,)
++
++    """
++    args = check_fit_input(coordinates, data, weights, ravel=False)
++    ndata = args[1][0].size
++    indices = np.arange(ndata)
++    split = next(ShuffleSplit(n_splits=1, **kwargs).split(indices))
++    train, test = (tuple(select(i, index) for i in args) for index in split)
++    return train, test
++
++
++def cross_val_score(estimator, coordinates, data, weights=None, cv=None,
++                    client=None):
++    """
++    Score an estimator/gridder using cross-validation.
++
++    Similar to :func:`sklearn.model_selection.cross_val_score` but modified to
++    accept spatial multi-component data with weights.
++
++    By default, will use :class:`sklearn.model_selection.KFold` to split the
++    dataset. Another cross-validation class can be passed in through the *cv*
++    argument.
++
++    Can optionally run in parallel using `dask <https://dask.pydata.org/>`__.
++    To do this, pass in a :class:`dask.distributed.Client` as the *client*
++    argument. Tasks in this function will be submitted to the dask cluster,
++    which can be local. In this case, the resulting scores won't be the actual
++    values but :class:`dask.distributed.Future` objects. Call their
++    ``.result()`` methods to get back the values or pass them along to other
++    dask computations.
++
++    Parameters
++    ----------
++    estimator : verde gridder
++        Any verde gridder class that has the ``fit`` and ``score`` methods.
++    coordinates : tuple of arrays
++        Arrays with the coordinates of each data point. Should be in the
++        following order: (easting, northing, vertical, ...).
++    data : array or tuple of arrays
++        the data values of each data point. If the data has more than one
++        component, *data* must be a tuple of arrays (one for each component).
++    weights : none or array or tuple of arrays
++        if not none, then the weights assigned to each data point. If more than
++        one data component is provided, you must provide a weights array for
++        each data component (if not none).
++    cv : None or cross-validation generator
++        Any scikit-learn cross-validation generator. Defaults to
++        :class:`sklearn.model_selection.KFold`.
++    client : None or dask.distributed.Client
++        If None, then computations are run serially. Otherwise, should be a
++        dask ``Client`` object. It will be used to dispatch computations to the
++        dask cluster.
++
++    Returns
++    -------
++    scores : list
++        List of scores for each split of the cross-validation generator. If
++        *client* is not None, then the scores will be futures.
++
++    Examples
++    --------
++
++    >>> from verde import grid_coordinates, Trend
++    >>> coords = grid_coordinates((0, 10, -10, -5), spacing=0.1)
++    >>> data = 10 - coords[0] + 0.5*coords[1]
++    >>> # A linear trend should perfectly predict this data
++    >>> scores = cross_val_score(Trend(degree=1), coords, data)
++    >>> print(', '.join(['{:.2f}'.format(score) for score in scores]))
++    1.00, 1.00, 1.00
++
++    >>> # To run parallel, we need to create a dask.distributed Client. It will
++    >>> # create a local cluster if no arguments are given so we can run the
++    >>> # scoring on a single machine.
++    >>> from dask.distributed import Client
++    >>> client = Client()
++    >>> # The scoring will now only submit tasks to our local cluster
++    >>> scores = cross_val_score(Trend(degree=1), coords, data, client=client)
++    >>> # The scores are not the actual values but Futures
++    >>> type(scores[0])
++    <class 'distributed.client.Future'>
++    >>> # We need to call .result() to get back the actual value
++    >>> print('{:.2f}'.format(scores[0].result()))
++    1.00
++
++    """
++    coordinates, data, weights = check_fit_input(coordinates, data, weights,
++                                                 ravel=False)
++    if client is None:
++        client = DummyClient()
++    if cv is None:
++        cv = KFold(shuffle=True, random_state=0)
++    ndata = data[0].size
++    args = (coordinates, data, weights)
++    scores = []
++    for train, test in cv.split(np.arange(ndata)):
++        train_data, test_data = (tuple(select(i, index) for i in args)
++                                 for index in (train, test))
++        score = client.submit(fit_score, estimator, train_data, test_data)
++        scores.append(score)
++    return scores
++
++
++def fit_score(estimator, train_data, test_data):
++    """
++    Fit an estimator on the training data and then score it on the testing data
++    """
++    estimator.fit(*train_data)
++    return estimator.score(*test_data)
++
++
++def select(arrays, index):
++    """
++    Index each array in a tuple of arrays.
++
++    If the arrays tuple contains a ``None``, the entire tuple will be returned
++    as is.
++
++    Parameters
++    ----------
++    arrays : tuple of arrays
++    index : array
++        An array of indices to select from arrays.
++
++    Returns
++    -------
++    indexed_arrays : tuple of arrays
++
++    Examples
++    --------
++
++    >>> import numpy as np
++    >>> select((np.arange(5), np.arange(-3, 2, 1)), [1, 3])
++    (array([1, 3]), array([-2,  0]))
++    >>> select((None, None, None, None), [1, 2])
++    (None, None, None, None)
++
++    """
++    if arrays is None or any(i is None for i in arrays):
++        return arrays
++    return tuple(i.ravel()[index] for i in arrays)
+diff --git a/verde/spline.py b/verde/spline.py
+index 4c723fa..6706065 100644
+--- a/verde/spline.py
++++ b/verde/spline.py
+@@ -41,7 +41,8 @@ class Spline(BaseGridder):
+ 
+     Approximate (and more stable) solutions can be obtained by applying damping
+     regularization to smooth the estimated forces (and interpolated values) or
+-    by distributing the forces on a regular grid instead of at the data points.
++    by distributing the forces on a regular grid instead (using arguments
++    *spacing*, *shape*, and/or *region*).
+ 
+     Data weights can be used during fitting but only have an any effect when
+     using the approximate solutions.
+@@ -66,6 +67,10 @@ class Spline(BaseGridder):
+     spacing : None or float or tuple
+         If not None, then should be the spacing of the regular grid of forces.
+         See :func:`verde.grid_coordinates` for details.
++    region : None or tuple
++        If not None, then the boundaries (``[W, E, S, N]``) used to generate a
++        regular grid of forces. If None is given, then will use the boundaries
++        of data given to the first call to :meth:`~verde.Spline.fit`.
+ 
+     Attributes
+     ----------
+@@ -84,11 +89,13 @@ class Spline(BaseGridder):
+ 
+     """
+ 
+-    def __init__(self, fudge=1e-5, damping=None, shape=None, spacing=None):
++    def __init__(self, fudge=1e-5, damping=None, shape=None, spacing=None,
++                 region=None):
+         self.damping = damping
+         self.shape = shape
+         self.spacing = spacing
+         self.fudge = fudge
++        self.region = region
+ 
+     def fit(self, coordinates, data, weights=None):
+         """
+@@ -132,7 +139,12 @@ class Spline(BaseGridder):
+         if self.shape is None and self.spacing is None:
+             self.force_coords_ = tuple(i.copy() for i in coordinates[:2])
+         else:
+-            self.force_coords_ = grid_coordinates(self.region_,
++            # Set the force grid region to the data region if none is given.
++            # This will only happen once so the model won't change during later
++            # fits.
++            if self.region is None:
++                self.region = self.region_
++            self.force_coords_ = grid_coordinates(self.region,
+                                                   shape=self.shape,
+                                                   spacing=self.spacing)
+         jac = spline_jacobian(coordinates[:2], self.force_coords_, self.fudge)

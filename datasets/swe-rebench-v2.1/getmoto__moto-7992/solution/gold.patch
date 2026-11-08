@@ -1,0 +1,343 @@
+diff --git a/moto/events/models.py b/moto/events/models.py
+index 9b43ba57..dc54f52e 100644
+--- a/moto/events/models.py
++++ b/moto/events/models.py
+@@ -38,7 +38,12 @@ from moto.utilities.utils import (
+     get_partition,
+ )
+ 
+-from .utils import _BASE_EVENT_MESSAGE, PAGINATION_MODEL, EventMessageType
++from .utils import (
++    _BASE_EVENT_MESSAGE,
++    PAGINATION_MODEL,
++    EventMessageType,
++    EventTemplateParser,
++)
+ 
+ if TYPE_CHECKING:
+     from moto.secretsmanager.models import SecretsManagerBackend
+@@ -110,7 +115,8 @@ class Rule(CloudFormationModel):
+         self.state = "DISABLED"
+ 
+     def delete(self, account_id: str, region_name: str) -> None:
+-        event_backend = events_backends[account_id][region_name]
++        event_backend: EventsBackend = events_backends[account_id][region_name]
++        self.remove_targets([t["Id"] for t in self.targets])
+         event_backend.delete_rule(name=self.name, event_bus_arn=self.event_bus_name)
+ 
+     def put_targets(self, targets: List[Dict[str, Any]]) -> None:
+@@ -128,8 +134,10 @@ class Rule(CloudFormationModel):
+             if index is not None:
+                 self.targets.pop(index)
+ 
+-    def send_to_targets(self, event: EventMessageType) -> None:
+-        if not self.event_pattern.matches_event(event):
++    def send_to_targets(
++        self, original_event: EventMessageType, transform_input: bool = True
++    ) -> None:
++        if not self.event_pattern.matches_event(original_event):
+             return
+ 
+         # supported targets
+@@ -140,13 +148,22 @@ class Rule(CloudFormationModel):
+         for target in self.targets:
+             arn = parse_arn(target["Arn"])
+ 
++            if transform_input:
++                input_transformer = target.get("InputTransformer", {})
++                event = EventTemplateParser.parse(
++                    input_template=input_transformer.get("InputTemplate"),
++                    input_paths_map=input_transformer.get("InputPathsMap", {}),
++                    event=original_event,
++                )
++            else:
++                event = original_event.copy()  # type: ignore[assignment]
++
+             if arn.service == "logs" and arn.resource_type == "log-group":
+                 self._send_to_cw_log_group(arn.resource_id, event)
+             elif arn.service == "events" and not arn.resource_type:
+-                input_template = json.loads(target["InputTransformer"]["InputTemplate"])
+-                archive_arn = parse_arn(input_template["archive-arn"])
++                archive_arn = parse_arn(event["archive-arn"])
+ 
+-                self._send_to_events_archive(archive_arn.resource_id, event)
++                self._send_to_events_archive(archive_arn.resource_id, original_event)
+             elif arn.service == "sqs":
+                 group_id = target.get("SqsParameters", {}).get("MessageGroupId")
+                 self._send_to_sqs_queue(arn.resource_id, event, group_id)
+@@ -181,18 +198,15 @@ class Rule(CloudFormationModel):
+             else:
+                 raise NotImplementedError(f"Expr not defined for {type(self)}")
+ 
+-    def _send_to_cw_log_group(self, name: str, event: EventMessageType) -> None:
++    def _send_to_cw_log_group(self, name: str, event: Dict[str, Any]) -> None:
+         from moto.logs import logs_backends
+ 
+-        event_copy = copy.deepcopy(event)
+-        event_copy["time"] = iso_8601_datetime_without_milliseconds(
+-            utcfromtimestamp(event_copy["time"])  # type: ignore[arg-type]
++        event["time"] = iso_8601_datetime_without_milliseconds(
++            utcfromtimestamp(event["time"])  # type: ignore[arg-type]
+         )
+ 
+         log_stream_name = str(random.uuid4())
+-        log_events = [
+-            {"timestamp": unix_time_millis(), "message": json.dumps(event_copy)}
+-        ]
++        log_events = [{"timestamp": unix_time_millis(), "message": json.dumps(event)}]
+ 
+         log_backend = logs_backends[self.account_id][self.region_name]
+         log_backend.create_log_stream(name, log_stream_name)
+@@ -214,13 +228,12 @@ class Rule(CloudFormationModel):
+         return backend.destinations[destination_name]
+ 
+     def _send_to_sqs_queue(
+-        self, resource_id: str, event: EventMessageType, group_id: Optional[str] = None
++        self, resource_id: str, event: Dict[str, Any], group_id: Optional[str] = None
+     ) -> None:
+         from moto.sqs import sqs_backends
+ 
+-        event_copy = copy.deepcopy(event)
+-        event_copy["time"] = iso_8601_datetime_without_milliseconds(
+-            utcfromtimestamp(event_copy["time"])  # type: ignore[arg-type]
++        event["time"] = iso_8601_datetime_without_milliseconds(
++            utcfromtimestamp(float(event["time"]))  # type: ignore[arg-type]
+         )
+ 
+         if group_id:
+@@ -238,7 +251,7 @@ class Rule(CloudFormationModel):
+ 
+         sqs_backends[self.account_id][self.region_name].send_message(
+             queue_name=resource_id,
+-            message_body=json.dumps(event_copy),
++            message_body=json.dumps(event),
+             group_id=group_id,
+         )
+ 
+@@ -288,8 +301,8 @@ class Rule(CloudFormationModel):
+         event_bus_arn = properties.get("EventBusName")
+         tags = properties.get("Tags")
+ 
+-        backend = events_backends[account_id][region_name]
+-        return backend.put_rule(
++        backend: "EventsBackend" = events_backends[account_id][region_name]
++        rule = backend.put_rule(
+             event_name,
+             scheduled_expression=scheduled_expression,
+             event_pattern=event_pattern,
+@@ -300,6 +313,16 @@ class Rule(CloudFormationModel):
+             tags=tags,
+         )
+ 
++        targets = properties.get("Targets", [])
++        if targets:
++            backend.put_targets(
++                name=rule.name,
++                event_bus_arn=event_bus_arn,
++                targets=targets,
++            )
++
++        return rule
++
+     @classmethod
+     def update_from_cloudformation_json(  # type: ignore[misc]
+         cls,
+@@ -322,9 +345,10 @@ class Rule(CloudFormationModel):
+         account_id: str,
+         region_name: str,
+     ) -> None:
+-        event_backend = events_backends[account_id][region_name]
++        event_backend: EventsBackend = events_backends[account_id][region_name]
+         properties = cloudformation_json["Properties"]
+         event_bus_arn = properties.get("EventBusName")
++
+         event_backend.delete_rule(resource_name, event_bus_arn)
+ 
+     def describe(self) -> Dict[str, Any]:
+@@ -378,6 +402,8 @@ class EventBus(CloudFormationModel):
+ 
+     def delete(self, account_id: str, region_name: str) -> None:
+         event_backend = events_backends[account_id][region_name]
++        for rule in self.rules.values():
++            rule.delete(account_id, region_name)
+         event_backend.delete_event_bus(name=self.name)
+ 
+     @classmethod
+@@ -576,6 +602,7 @@ class Archive(CloudFormationModel):
+ 
+         self.events: List[EventMessageType] = []
+         self.event_bus_name = source_arn.split("/")[-1]
++        self.rule: Optional[Rule] = None
+ 
+     def describe_short(self) -> Dict[str, Any]:
+         return {
+@@ -612,7 +639,11 @@ class Archive(CloudFormationModel):
+             self.retention = retention
+ 
+     def delete(self, account_id: str, region_name: str) -> None:
+-        event_backend = events_backends[account_id][region_name]
++        event_backend: EventsBackend = events_backends[account_id][region_name]
++
++        if self.rule:
++            self.rule.delete(account_id, region_name)
++
+         event_backend.archives.pop(self.name)
+ 
+     @classmethod
+@@ -756,6 +787,7 @@ class Replay(BaseModel):
+                         event,
+                         **{"id": str(random.uuid4()), "replay-name": self.name},  # type: ignore
+                     ),
++                    transform_input=False,
+                 )
+ 
+         self.state = ReplayState.COMPLETED
+@@ -1148,7 +1180,11 @@ class EventsBackend(BaseBackend):
+ 
+     def delete_rule(self, name: str, event_bus_arn: Optional[str]) -> None:
+         event_bus_name = self._normalize_event_bus_arn(event_bus_arn)
+-        event_bus = self._get_event_bus(event_bus_name)
++        try:
++            event_bus = self._get_event_bus(event_bus_name)
++        except ResourceNotFoundException:
++            # If the EventBus is deleted, the Rule is also gone
++            return
+         rule = event_bus.rules.get(name)
+         if not rule:
+             return
+@@ -1350,6 +1386,7 @@ class EventsBackend(BaseBackend):
+                     event_msg["region"] = self.region_name
+                     event_msg["resources"] = event.get("Resources", [])
+                     event_msg["detail"] = json.loads(event["Detail"])
++                    event_msg["ingestion-time"] = unix_time()
+                     rule.send_to_targets(event_msg)
+ 
+         return entries
+@@ -1610,6 +1647,7 @@ class EventsBackend(BaseBackend):
+             event_bus_arn=event_bus.name,
+             managed_by="prod.vhs.events.aws.internal",
+         )
++        archive.rule = rule
+         self.put_targets(
+             rule.name,
+             rule.event_bus_name,
+@@ -1619,13 +1657,8 @@ class EventsBackend(BaseBackend):
+                     "Arn": f"arn:{get_partition(self.region_name)}:events:{self.region_name}:::",
+                     "InputTransformer": {
+                         "InputPathsMap": {},
+-                        "InputTemplate": json.dumps(
+-                            {
+-                                "archive-arn": f"{archive.arn}:{archive.uuid}",
+-                                "event": "<aws.events.event.json>",
+-                                "ingestion-time": "<aws.events.event.ingestion-time>",
+-                            }
+-                        ),
++                        # Template is not valid JSON, so we can't json.dump it
++                        "InputTemplate": f'{{"archive-arn": "{archive.arn}:{archive.uuid}", "event": <aws.events.event.json>, "ingestion-time": <aws.events.event.ingestion-time>}}',
+                     },
+                 }
+             ],
+diff --git a/moto/events/utils.py b/moto/events/utils.py
+index e84c6854..6c4640f2 100644
+--- a/moto/events/utils.py
++++ b/moto/events/utils.py
+@@ -1,4 +1,5 @@
+-from typing import TYPE_CHECKING, List, TypedDict
++import json
++from typing import TYPE_CHECKING, Any, Dict, List, TypedDict
+ 
+ if TYPE_CHECKING:
+     from typing_extensions import Any, Dict, Required, Union
+@@ -19,6 +20,7 @@ EventMessageType = TypedDict(
+         "region": str,
+         "resources": List[str],
+         "detail": "Required[Dict[str, Any]]",
++        "ingestion-time": float,
+     },
+     total=False,
+ )
+@@ -58,3 +60,58 @@ _BASE_EVENT_MESSAGE: EventMessageType = {
+     "resources": [],
+     "detail": {},
+ }
++
++
++class EventTemplateParser:
++    DEFAULT_EVENT_INPUT_TEMPLATE = '{"id": "<id>", "time": <time>, "version": "0", "detail-type": "<detail-type>", "source": "<source>", "region": "<region>", "resources": <resources>, "detail": <detail>}'
++    DEFAULT_EVENT_INPUT_PATHS_MAP = {
++        "account": "$.account",
++        "detail": "$.detail",
++        "detail-type": "$.detail-type",
++        "source": "$.source",
++        "id": "$.id",
++        "region": "$.region",
++        "resources": "$.resources",
++        "time": "$.time",
++    }
++
++    @staticmethod
++    def _stringify(result: Any) -> str:  # type: ignore[misc]
++        if isinstance(result, dict):
++            result = json.dumps(result)
++        elif isinstance(result, list):
++            result = json.dumps([EventTemplateParser._stringify(x) for x in result])
++        elif isinstance(result, (int, float)):
++            result = str(result)
++        return result
++
++    @staticmethod
++    def parse(  # type: ignore[misc]
++        input_template: str, input_paths_map: Dict[str, Any], event: EventMessageType
++    ) -> Dict[str, Any]:
++        from jsonpath_ng.ext import parse
++
++        template_to_use = (
++            input_template or EventTemplateParser.DEFAULT_EVENT_INPUT_TEMPLATE
++        )
++        input_paths_map = (
++            input_paths_map or EventTemplateParser.DEFAULT_EVENT_INPUT_PATHS_MAP
++        )
++        for input_path in input_paths_map:
++            input_expr = parse(input_paths_map[input_path])
++            matches = input_expr.find(event)
++            result = (
++                EventTemplateParser._stringify(matches[0].value) if matches else None
++            )
++            if result:
++                template_to_use = template_to_use.replace(f"<{input_path}>", result)
++
++        default_inputs_map = {
++            "aws.events.event.json": event,
++            "aws.events.event.ingestion-time": event["ingestion-time"],
++        }
++        for input_path in default_inputs_map:
++            result = EventTemplateParser._stringify(default_inputs_map[input_path])
++            template_to_use = template_to_use.replace(f"<{input_path}>", result)
++
++        return json.loads(template_to_use)
+diff --git a/moto/s3/notifications.py b/moto/s3/notifications.py
+index 9f935a8f..6dcae000 100644
+--- a/moto/s3/notifications.py
++++ b/moto/s3/notifications.py
+@@ -203,7 +203,7 @@ def _send_event_bridge_message(
+         events_backend = events_backends[account_id][bucket.region_name]
+         for event_bus in events_backend.event_buses.values():
+             for rule in event_bus.rules.values():
+-                rule.send_to_targets(event)
++                rule.send_to_targets(event, transform_input=False)
+ 
+     except:  # noqa
+         # This is an async action in AWS.
+diff --git a/setup.cfg b/setup.cfg
+index 03d5fdb5..31a38c27 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -162,7 +162,7 @@ emr =
+ emrcontainers =
+ emrserverless =
+ es =
+-events =
++events = jsonpath_ng
+ firehose =
+ forecast =
+ glacier =

@@ -1,0 +1,2 @@
+File column/line should consistently point to the first primary label instead of the first label
+Currently when you have a diagnostic, and that diagnostic contains 2 labels, say, one secondary at `1:1` and one primary at `6:3`, the column/line at the top of the diagnostic on rich rendering shows `1:1`, this should instead point to the first primary label, which seems to be the case for short rendering. When you use short rendering it points to `6:3`, this should be made consistent across rendering types.

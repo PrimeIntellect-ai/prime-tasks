@@ -1,0 +1,153 @@
+diff --git a/wild/tests/integration_tests.rs b/wild/tests/integration_tests.rs
+index fb88617..dd6dce9 100644
+--- a/wild/tests/integration_tests.rs
++++ b/wild/tests/integration_tests.rs
+@@ -2235,6 +2235,7 @@ fn integration_test(
+         "rust-tls.rs",
+         "input_does_not_exist.c",
+         "ifunc2.c",
++        "visibility-merging.c",
+         "tls-local-exec.c",
+         "undefined_symbols.c",
+         "whole_archive.c",
+@@ -2278,6 +2279,92 @@ fn integration_test(
+     Ok(())
+ }
+ 
++/// Compiles `source` to a position-independent object file at `output`.
++fn compile_pic_object(source: &Path, output: &Path) -> Result {
++    let status = Command::new("gcc")
++        .args(["-c", "-fPIC"])
++        .arg(source)
++        .arg("-o")
++        .arg(output)
++        .status()
++        .context("Failed to run gcc")?;
++    if !status.success() {
++        bail!("gcc failed to compile `{}`", source.display());
++    }
++    Ok(())
++}
++
++/// Links the visibility-merging fixtures, together with an object that refers to one of the merged
++/// symbols, into a shared object with wild. Checks that the protected symbol is still exported and
++/// that references to the merged symbols are bound directly rather than through dynamic
++/// relocations.
++#[test]
++fn visibility_merging_dynamic_output() -> Result {
++    let out_dir = build_dir().join("visibility-merging-dynamic-output");
++    std::fs::create_dir_all(&out_dir)?;
++    let sources = base_dir().join("tests/sources");
++    let main_obj = out_dir.join("visibility-merging.o");
++    let other_obj = out_dir.join("visibility-merging-1.o");
++    let refs_src = out_dir.join("visibility-merging-refs.c");
++    let refs_obj = out_dir.join("visibility-merging-refs.o");
++    let out_so = out_dir.join("visibility-merging.so");
++
++    std::fs::write(
++        &refs_src,
++        "extern int data3;\nint get_data3(void) {\n    return data3;\n}\n",
++    )?;
++
++    compile_pic_object(&sources.join("visibility-merging.c"), &main_obj)?;
++    compile_pic_object(&sources.join("visibility-merging-1.c"), &other_obj)?;
++    compile_pic_object(&refs_src, &refs_obj)?;
++
++    let status = Command::new(wild_path())
++        .args(["-shared", "-z", "now", "-o"])
++        .arg(&out_so)
++        .arg(&main_obj)
++        .arg(&other_obj)
++        .arg(&refs_obj)
++        .status()
++        .context("Failed to run wild")?;
++    if !status.success() {
++        bail!("wild failed to link `{}`", out_so.display());
++    }
++
++    let bytes = std::fs::read(&out_so)?;
++    let obj = ElfFile64::parse(bytes.as_slice())?;
++
++    let mut exported = HashSet::new();
++    let mut names = HashMap::new();
++    for sym in obj.dynamic_symbols() {
++        let name = sym.name()?.to_owned();
++        names.insert(sym.index(), name.clone());
++        exported.insert(name);
++    }
++
++    // `data3` is protected in one of its definitions. It must remain exported.
++    if !exported.contains("data3") {
++        bail!("Expected `data3` to be exported as a dynamic symbol");
++    }
++
++    // `get_data1` and `get_data3` refer to merged symbols that must not be preemptible, so the
++    // references must bind directly rather than through a dynamic relocation.
++    let mut relocated = HashSet::new();
++    for (_, reloc) in obj.dynamic_relocations().into_iter().flatten() {
++        if let object::RelocationTarget::Symbol(index) = reloc.target() {
++            if let Some(name) = names.get(&index) {
++                relocated.insert(name.clone());
++            }
++        }
++    }
++    for name in ["data1", "data3"] {
++        if relocated.contains(name) {
++            bail!("A reference to `{name}` is bound through a dynamic relocation");
++        }
++    }
++
++    Ok(())
++}
++
+ fn read_test_config() -> Result<TestConfig> {
+     let config_default_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+         .parent()
+diff --git a/wild/tests/sources/visibility-merging-1.c b/wild/tests/sources/visibility-merging-1.c
+new file mode 100644
+index 0000000..9e43137
+--- /dev/null
++++ b/wild/tests/sources/visibility-merging-1.c
+@@ -0,0 +1,8 @@
++// Even though the definition of `data1` from the main file is selected, this definition is hidden,
++// so the merged symbol must not be preemptible.
++int data1  __attribute__ ((weak, visibility(("hidden")))) = 0x100;
++
++// Similarly, this definition is protected, so the merged `data3` must remain exported.
++int data3  __attribute__ ((weak, visibility(("protected")))) = 0x55;
++
++int data4 __attribute__ ((weak, visibility(("hidden")))) = 0x99;
+diff --git a/wild/tests/sources/visibility-merging.c b/wild/tests/sources/visibility-merging.c
+new file mode 100644
+index 0000000..3ef8d29
+--- /dev/null
++++ b/wild/tests/sources/visibility-merging.c
+@@ -0,0 +1,28 @@
++//#Static:false
++//#LinkArgs:-shared -z now
++//#Object:visibility-merging-1.c
++//#RunEnabled:false
++//#DiffIgnore:section.got
++
++// This definition is selected, but the definition in our other file is hidden, so references to
++// this symbol must not be preemptible.
++int data1 __attribute__ ((weak)) = 0x42;
++
++// This symbol is only defined here, so it stays a default-visibility export.
++int data2 __attribute__ ((weak)) = 0x88888888;
++
++// The definition in the second file is protected, so this symbol must remain exported.
++int data3 __attribute__ ((weak)) = 0x55;
++
++// Protected here and hidden in our second object.
++int data4 __attribute__ ((weak, visibility(("protected")))) = 0x99;
++
++// References to `data1` bind directly, since one of its definitions is hidden.
++int get_data1(void) {
++    return data1;
++}
++
++// Note, we don't check direct references to `data2` and `data3` in this file. Direct references to
++// `data2` wouldn't be permitted, since the symbol is interposable. Direct references to protected
++// symbols are also left out, because GNU ld < 2.40 rejects them, so this file stays compatible
++// with those versions.

@@ -1,0 +1,801 @@
+diff --git a/internal/compile/manager_test.go b/internal/compile/manager_test.go
+index 21977bb1..cd52c30f 100644
+--- a/internal/compile/manager_test.go
++++ b/internal/compile/manager_test.go
+@@ -255,6 +255,21 @@ func (ms *MockStore) Unsubscribe(s storage.Subscriber) {
+ 	ms.subscriber = nil
+ }
+ 
++func (ms *MockStore) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*policy.CompilationUnit, error) {
++	args := ms.MethodCalled("GetFirstMatch", ctx, candidates)
++	res := args.Get(0)
++	switch t := res.(type) {
++	case nil:
++		return nil, args.Error(1)
++	case *policy.CompilationUnit:
++		return t, args.Error(1)
++	case func() (*policy.CompilationUnit, error):
++		return t()
++	default:
++		panic(fmt.Errorf("unknown return value type: %T", res))
++	}
++}
++
+ func (ms *MockStore) GetCompilationUnits(ctx context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error) {
+ 	args := ms.MethodCalled("GetCompilationUnits", ctx, ids)
+ 	res := args.Get(0)
+diff --git a/internal/engine/engine_test.go b/internal/engine/engine_test.go
+index f584e656..4aa9c257 100644
+--- a/internal/engine/engine_test.go
++++ b/internal/engine/engine_test.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/cerbos/cerbos/internal/audit"
+ 	"github.com/cerbos/cerbos/internal/audit/local"
+ 	"github.com/cerbos/cerbos/internal/compile"
++	"github.com/cerbos/cerbos/internal/config"
+ 	"github.com/cerbos/cerbos/internal/engine/tracer"
+ 	"github.com/cerbos/cerbos/internal/printer"
+ 	"github.com/cerbos/cerbos/internal/schema"
+@@ -64,6 +65,69 @@ func TestCheck(t *testing.T) {
+ 	}
+ }
+ 
++func TestLenientScopeSearchConfigKey(t *testing.T) {
++	defer func() {
++		require.NoError(t, config.Load("", nil))
++	}()
++
++	require.NoError(t, config.LoadMap(map[string]any{
++		"engine": map[string]any{
++			"lenientScopeSearch": true,
++		},
++	}))
++
++	engineConf, err := GetConf()
++	require.NoError(t, err)
++	require.True(t, engineConf.LenientScopeSearch)
++}
++
++func TestCheckWithLenientScopeSearch(t *testing.T) {
++	eng, cancelFunc := mkEngine(t, param{schemaEnforcement: schema.EnforcementNone, lenientScopeSearch: true})
++	defer cancelFunc()
++
++	testCases := test.LoadTestCases(t, "engine")
++	testCases = append(testCases, test.LoadTestCases(t, "engine_lenient_scope_search")...)
++
++	for _, tcase := range testCases {
++		tcase := tcase
++		t.Run(tcase.Name, func(t *testing.T) {
++			tc := readTestCase(t, tcase.Input)
++
++			traceCollector := tracer.NewCollector()
++			haveOutputs, err := eng.Check(context.Background(), tc.Inputs, WithTraceSink(traceCollector))
++
++			if tc.WantError {
++				require.Error(t, err)
++			} else {
++				require.NoError(t, err)
++			}
++
++			for i, have := range haveOutputs {
++				require.Empty(t, cmp.Diff(tc.WantOutputs[i],
++					have,
++					protocmp.Transform(),
++					protocmp.SortRepeatedFields(&enginev1.CheckOutput{}, "effective_derived_roles"),
++				))
++			}
++		})
++	}
++	strictEngine, strictCancel := mkEngine(t, param{schemaEnforcement: schema.EnforcementNone})
++	defer strictCancel()
++	for _, tcase := range test.LoadTestCases(t, "engine_lenient_scope_search") {
++		t.Run("disabled/"+tcase.Name, func(t *testing.T) {
++			tc := readTestCase(t, tcase.Input)
++			haveOutputs, err := strictEngine.Check(context.Background(), tc.Inputs[:1])
++			require.NoError(t, err)
++			require.Len(t, haveOutputs, 1)
++			for actionName, action := range haveOutputs[0].GetActions() {
++				wantAncestorPolicy := tc.WantOutputs[0].GetActions()[actionName].GetPolicy()
++				require.NotEqual(t, wantAncestorPolicy, action.GetPolicy(), "disabled lenient search must not use an ancestor-scope policy")
++			}
++		})
++	}
++
++}
++
+ func TestSchemaValidation(t *testing.T) {
+ 	for _, enforcement := range []string{"warn", "reject"} {
+ 		enforcement := enforcement
+@@ -159,9 +223,10 @@ func runBenchmarks(b *testing.B, eng *Engine, testCases []test.Case) {
+ }
+ 
+ type param struct {
+-	enableAuditLog    bool
+-	schemaEnforcement schema.Enforcement
+-	subDir            string
++	enableAuditLog     bool
++	schemaEnforcement  schema.Enforcement
++	subDir             string
++	lenientScopeSearch bool
+ }
+ 
+ func mkEngine(tb testing.TB, p param) (*Engine, context.CancelFunc) {
+@@ -199,6 +264,7 @@ func mkEngine(tb testing.TB, p param) (*Engine, context.CancelFunc) {
+ 	engineConf := &Conf{}
+ 	engineConf.SetDefaults()
+ 	engineConf.Globals = map[string]any{"environment": "test"}
++	engineConf.LenientScopeSearch = p.lenientScopeSearch
+ 
+ 	eng := NewFromConf(ctx, engineConf, Components{
+ 		PolicyLoader:      compiler,
+diff --git a/internal/namer/namer_test.go b/internal/namer/namer_test.go
+index 14ff9314..100892d6 100644
+--- a/internal/namer/namer_test.go
++++ b/internal/namer/namer_test.go
+@@ -186,3 +186,83 @@ func TestPolicyCoords(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestScopedModuleIDs(t *testing.T) {
++	testCases := []struct {
++		scope            string
++		wantCountForTree int
++	}{
++		{
++			scope:            "",
++			wantCountForTree: 1,
++		},
++		{
++			scope:            "a.b.c.d.e",
++			wantCountForTree: 6,
++		},
++	}
++
++	fns := []struct {
++		kind    string
++		fn      func(string, string, string, bool) []namer.ModuleID
++		modIDFn func(string, string, string) namer.ModuleID
++	}{
++		{
++			kind: "resource_policy",
++			fn:   namer.ScopedResourcePolicyModuleIDs,
++			modIDFn: func(resource, version, scope string) namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN(resource, version, scope))
++			},
++		},
++		{
++			kind: "principal_policy",
++			fn:   namer.ScopedPrincipalPolicyModuleIDs,
++			modIDFn: func(principal, version, scope string) namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN(principal, version, scope))
++			},
++		},
++	}
++
++	t.Parallel()
++
++	const (
++		inputName    = "foo"
++		inputVersion = "bar"
++	)
++
++	for _, fn := range fns {
++		fn := fn
++		t.Run(fn.kind, func(t *testing.T) {
++			t.Parallel()
++
++			for _, tc := range testCases {
++				tc := tc
++				t.Run(fmt.Sprintf("scope=%s/genTree=false", tc.scope), func(t *testing.T) {
++					t.Parallel()
++
++					have := fn.fn(inputName, inputVersion, tc.scope, false)
++					require.Len(t, have, 1)
++					require.Equal(t, fn.modIDFn(inputName, inputVersion, tc.scope), have[0])
++				})
++
++				t.Run(fmt.Sprintf("scope=%s/genTree=true", tc.scope), func(t *testing.T) {
++					t.Parallel()
++
++					have := fn.fn(inputName, inputVersion, tc.scope, true)
++					require.Len(t, have, tc.wantCountForTree)
++					require.Equal(t, fn.modIDFn(inputName, inputVersion, tc.scope), have[0])
++					require.Equal(t, fn.modIDFn(inputName, inputVersion, ""), have[len(have)-1])
++
++					idx := 1
++					for i := len(tc.scope) - 1; i >= 0; i-- {
++						if tc.scope[i] == '.' {
++							wantModID := fn.modIDFn(inputName, inputVersion, tc.scope[:i])
++							require.Equal(t, wantModID, have[idx], "Unexpected modID for scope %s", tc.scope[:i])
++							idx++
++						}
++					}
++				})
++			}
++		})
++	}
++}
+diff --git a/internal/storage/bundle/local_source_test.go b/internal/storage/bundle/local_source_test.go
+index 1a98452c..aab29930 100644
+--- a/internal/storage/bundle/local_source_test.go
++++ b/internal/storage/bundle/local_source_test.go
+@@ -4,23 +4,59 @@
+ package bundle_test
+ 
+ import (
++	"archive/zip"
+ 	"bytes"
+ 	"context"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+ 
++	runtimev1 "github.com/cerbos/cerbos/api/genpb/cerbos/runtime/v1"
+ 	"github.com/cerbos/cerbos/internal/namer"
+ 	"github.com/cerbos/cerbos/internal/storage"
+ 	"github.com/cerbos/cerbos/internal/storage/bundle"
+ 	"github.com/cerbos/cerbos/internal/test"
+ 	bundlev1 "github.com/cerbos/cloud-api/genpb/cerbos/cloud/bundle/v1"
++	"github.com/spf13/afero"
+ 	"github.com/stretchr/testify/require"
+ 	"google.golang.org/protobuf/encoding/protojson"
+ )
+ 
+ const bundleName = "bundle.crbp"
+ 
++func TestBundleGetFirstMatch(t *testing.T) {
++	manifest, err := loadManifest(t).MarshalVT()
++	require.NoError(t, err)
++	bundlePath := filepath.Join(t.TempDir(), "ordered-match.zip")
++	archiveFile, err := os.Create(bundlePath)
++	require.NoError(t, err)
++	archive := zip.NewWriter(archiveFile)
++	manifestFile, err := archive.Create("MANIFEST")
++	require.NoError(t, err)
++	_, err = manifestFile.Write(manifest)
++	require.NoError(t, err)
++
++	presentID := namer.GenModuleIDFromFQN("cerbos.resource.example.vdefault")
++	policyBytes, err := (&runtimev1.RunnablePolicySet{Fqn: "cerbos.resource.example.vdefault"}).MarshalVT()
++	require.NoError(t, err)
++	policyFile, err := archive.Create("policies/" + presentID.HexStr())
++	require.NoError(t, err)
++	_, err = policyFile.Write(policyBytes)
++	require.NoError(t, err)
++	require.NoError(t, archive.Close())
++	require.NoError(t, archiveFile.Close())
++
++	opened, err := bundle.Open(bundle.OpenOpts{BundlePath: bundlePath, ScratchFS: afero.NewOsFs()})
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, opened.Release()) })
++
++	missingID := namer.GenModuleIDFromFQN("cerbos.resource.missing.vdefault")
++	have, err := opened.GetFirstMatch(context.Background(), []namer.ModuleID{missingID, presentID})
++	require.NoError(t, err)
++	require.NotNil(t, have)
++	require.Equal(t, "cerbos.resource.example.vdefault", have.GetFqn())
++}
++
+ func TestLocalSource(t *testing.T) {
+ 	bundlePath, tempDir := prepareTestInputs(t)
+ 	manifest := loadManifest(t)
+@@ -64,11 +100,13 @@ func runTests(have *bundle.LocalSource, manifest *bundlev1.Manifest) func(*testi
+ 			}
+ 		})
+ 
+-		t.Run("getPolicySet", func(t *testing.T) {
++		t.Run("getFirstMatch", func(t *testing.T) {
++			blahMod := namer.GenModuleIDFromFQN("blah")
++
+ 			t.Run("existing", func(t *testing.T) {
+ 				for fqn := range manifest.PolicyIndex {
+ 					modID := namer.GenModuleIDFromFQN(fqn)
+-					havePolicy, err := have.GetPolicySet(context.Background(), modID)
++					havePolicy, err := have.GetFirstMatch(context.Background(), []namer.ModuleID{blahMod, modID})
+ 					require.NoError(t, err, "Failed to get policy set for %q", fqn)
+ 					require.NotNil(t, havePolicy, "Policy set %q is nil", fqn)
+ 					require.Equal(t, havePolicy.Fqn, fqn, "FQN mismatch for policy set %q", fqn)
+@@ -76,8 +114,7 @@ func runTests(have *bundle.LocalSource, manifest *bundlev1.Manifest) func(*testi
+ 			})
+ 
+ 			t.Run("nonExisting", func(t *testing.T) {
+-				modID := namer.GenModuleIDFromFQN("blah")
+-				havePolicy, err := have.GetPolicySet(context.Background(), modID)
++				havePolicy, err := have.GetFirstMatch(context.Background(), []namer.ModuleID{blahMod})
+ 				require.NoError(t, err)
+ 				require.Nil(t, havePolicy)
+ 			})
+diff --git a/internal/storage/db/internal/tests.go b/internal/storage/db/internal/tests.go
+index 7ac970eb..4e0731a9 100644
+--- a/internal/storage/db/internal/tests.go
++++ b/internal/storage/db/internal/tests.go
+@@ -187,6 +187,43 @@ func TestSuite(store DBStorage) func(*testing.T) {
+ 			require.Empty(t, have)
+ 		})
+ 
++		t.Run("get_first_match_resource_policy", func(t *testing.T) {
++			modIDs := namer.ScopedResourcePolicyModuleIDs(rpAcmeHR.Name, rpAcmeHR.Version, "acme.hr.france.marseille", true)
++			have, err := store.GetFirstMatch(ctx, modIDs)
++			require.NoError(t, err)
++			require.NotNil(t, have)
++			require.Equal(t, rpAcmeHR.ID, have.ModID)
++			require.Contains(t, have.Definitions, rpAcmeHR.ID)
++			require.Empty(t, cmp.Diff(rpAcmeHR, have.Definitions[rpAcmeHR.ID], protocmp.Transform()))
++			require.Contains(t, have.Definitions, rpAcme.ID)
++			require.Empty(t, cmp.Diff(rpAcme, have.Definitions[rpAcme.ID], protocmp.Transform()))
++			require.Contains(t, have.Definitions, rp.ID)
++			require.Empty(t, cmp.Diff(rp, have.Definitions[rp.ID], protocmp.Transform()))
++			require.Contains(t, have.Definitions, dr.ID)
++			require.Empty(t, cmp.Diff(dr, have.Definitions[dr.ID], protocmp.Transform()))
++		})
++
++		t.Run("get_first_match_principal_policy", func(t *testing.T) {
++			modIDs := namer.ScopedPrincipalPolicyModuleIDs(ppAcmeHR.Name, ppAcmeHR.Version, "acme.hr.france.marseille", true)
++			have, err := store.GetFirstMatch(ctx, modIDs)
++			require.NoError(t, err)
++			require.NotNil(t, have)
++			require.Equal(t, ppAcmeHR.ID, have.ModID)
++			require.Contains(t, have.Definitions, ppAcmeHR.ID)
++			require.Empty(t, cmp.Diff(ppAcmeHR, have.Definitions[ppAcmeHR.ID], protocmp.Transform()))
++			require.Contains(t, have.Definitions, ppAcme.ID)
++			require.Empty(t, cmp.Diff(ppAcme, have.Definitions[ppAcme.ID], protocmp.Transform()))
++			require.Contains(t, have.Definitions, pp.ID)
++			require.Empty(t, cmp.Diff(pp, have.Definitions[pp.ID], protocmp.Transform()))
++		})
++
++		t.Run("get_first_match_non_existent", func(t *testing.T) {
++			modIDs := namer.ScopedResourcePolicyModuleIDs("foo", "bar", "acme.hr.france.marseille", true)
++			have, err := store.GetFirstMatch(ctx, modIDs)
++			require.NoError(t, err)
++			require.Nil(t, have)
++		})
++
+ 		t.Run("get_dependents", func(t *testing.T) {
+ 			have, err := store.GetDependents(ctx, dr.ID)
+ 			require.NoError(t, err)
+diff --git a/internal/storage/index/index_test.go b/internal/storage/index/index_test.go
+index 1f5c0dda..98c18242 100644
+--- a/internal/storage/index/index_test.go
++++ b/internal/storage/index/index_test.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/stretchr/testify/require"
+ 	"google.golang.org/protobuf/types/known/wrapperspb"
+ 
++	"github.com/cerbos/cerbos/internal/namer"
+ 	"github.com/cerbos/cerbos/internal/policy"
+ 	"github.com/cerbos/cerbos/internal/storage/index"
+ 	"github.com/cerbos/cerbos/internal/test"
+@@ -115,3 +116,110 @@ func TestIndexListSchemaIDs(t *testing.T) {
+ 		"resources/salary_record.json",
+ 	}, ids)
+ }
++
++func TestIndexFirstCandidateLookupWithScopeFallback(t *testing.T) {
++	t.Parallel()
++
++	ctx := context.Background()
++	fsys := os.DirFS(test.PathToDir(t, "."))
++
++	idx, err := index.Build(ctx, fsys, index.WithRootDir("store"))
++	require.NoError(t, err)
++
++	testCases := []struct {
++		name            string
++		modIDs          []namer.ModuleID
++		want            func() namer.ModuleID
++		wantDefinitions []namer.ModuleID
++	}{
++		{
++			name:   "resource_policy/strict/non_existent",
++			modIDs: namer.ScopedResourcePolicyModuleIDs("leave_request", "default", "acme.hr.france.marseille", false),
++		},
++		{
++			name:   "resource_policy/strict/existent",
++			modIDs: namer.ScopedResourcePolicyModuleIDs("leave_request", "default", "acme.hr", false),
++			want: func() namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN("leave_request", "default", "acme.hr"))
++			},
++		},
++		{
++			name:   "resource_policy/lenient/some_leaf_scopes_missing",
++			modIDs: namer.ScopedResourcePolicyModuleIDs("leave_request", "default", "acme.hr.france.marseille", true),
++			want: func() namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN("leave_request", "default", "acme.hr"))
++			},
++			wantDefinitions: []namer.ModuleID{
++				namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN("leave_request", "default", "acme.hr")),
++				namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN("leave_request", "default", "acme")),
++				namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN("leave_request", "default", "")),
++				namer.GenModuleIDFromFQN(namer.DerivedRolesFQN("alpha")),
++				namer.GenModuleIDFromFQN(namer.DerivedRolesFQN("beta")),
++			},
++		},
++		{
++			name:   "resource_policy/lenient/all_scopes_missing",
++			modIDs: namer.ScopedResourcePolicyModuleIDs("leave_request", "default", "foo.bar.baz", true),
++			want: func() namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.ResourcePolicyFQN("leave_request", "default", ""))
++			},
++		},
++		{
++			name:   "resource_policy/lenient/non_existent",
++			modIDs: namer.ScopedResourcePolicyModuleIDs("leave_request", "blah", "blah", true),
++		},
++		{
++			name:   "principal_policy/strict/non_existent",
++			modIDs: namer.ScopedPrincipalPolicyModuleIDs("donald_duck", "default", "acme.hr.france.marseille", false),
++		},
++		{
++			name:   "principal_policy/strict/existent",
++			modIDs: namer.ScopedPrincipalPolicyModuleIDs("donald_duck", "default", "acme.hr", false),
++			want: func() namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN("donald_duck", "default", "acme.hr"))
++			},
++		},
++		{
++			name:   "principal_policy/lenient/some_leaf_scopes_missing",
++			modIDs: namer.ScopedPrincipalPolicyModuleIDs("donald_duck", "default", "acme.hr.france.marseille", true),
++			want: func() namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN("donald_duck", "default", "acme.hr"))
++			},
++			wantDefinitions: []namer.ModuleID{
++				namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN("donald_duck", "default", "acme.hr")),
++				namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN("donald_duck", "default", "acme")),
++				namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN("donald_duck", "default", "")),
++			},
++		},
++		{
++			name:   "principal_policy/lenient/all_scopes_missing",
++			modIDs: namer.ScopedPrincipalPolicyModuleIDs("donald_duck", "default", "foo.bar.baz", true),
++			want: func() namer.ModuleID {
++				return namer.GenModuleIDFromFQN(namer.PrincipalPolicyFQN("donald_duck", "default", ""))
++			},
++		},
++		{
++			name:   "principal_policy/lenient/non_existent",
++			modIDs: namer.ScopedPrincipalPolicyModuleIDs("donald_duck", "blah", "blah", true),
++		},
++	}
++
++	for _, tc := range testCases {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			have, err := idx.GetFirstMatch(tc.modIDs)
++			require.NoError(t, err)
++			if tc.want == nil {
++				require.Nil(t, have)
++			} else {
++				want := tc.want()
++				require.Equal(t, want, have.ModID)
++				for _, defID := range tc.wantDefinitions {
++					require.Contains(t, have.Definitions, defID)
++				}
++			}
++		})
++	}
++}
+diff --git a/internal/storage/overlay/store_test.go b/internal/storage/overlay/store_test.go
+index d1795381..4a4b9fa1 100644
+--- a/internal/storage/overlay/store_test.go
++++ b/internal/storage/overlay/store_test.go
+@@ -110,8 +110,8 @@ func TestFailover(t *testing.T) {
+ 		nFailures := fallbackErrorThreshold - 1
+ 		nRequests := nFailures + 1
+ 		basePolicyLoader := new(MockPolicyLoader)
+-		basePolicyLoader.On("GetPolicySet", ctx, mock.AnythingOfType("namer.ModuleID")).Return((*runtimev1.RunnablePolicySet)(nil), errors.New("base store error")).Times(nFailures)
+-		basePolicyLoader.On("GetPolicySet", ctx, mock.AnythingOfType("namer.ModuleID")).Return(&runtimev1.RunnablePolicySet{}, nil).Once()
++		basePolicyLoader.On("GetFirstMatch", ctx, mock.AnythingOfType("[]namer.ModuleID")).Return((*runtimev1.RunnablePolicySet)(nil), errors.New("base store error")).Times(nFailures)
++		basePolicyLoader.On("GetFirstMatch", ctx, mock.AnythingOfType("[]namer.ModuleID")).Return(&runtimev1.RunnablePolicySet{}, nil).Once()
+ 
+ 		fallbackPolicyLoader := new(MockPolicyLoader)
+ 
+@@ -123,7 +123,7 @@ func TestFailover(t *testing.T) {
+ 		}
+ 
+ 		for i := 0; i < nRequests; i++ {
+-			_, err := wrappedSourceStore.GetPolicySet(ctx, namer.GenModuleIDFromFQN("example"))
++			_, err := wrappedSourceStore.GetFirstMatch(ctx, []namer.ModuleID{namer.GenModuleIDFromFQN("example")})
+ 			if i < nFailures {
+ 				require.Error(t, err, "expected base store to return an error")
+ 			} else {
+@@ -141,10 +141,10 @@ func TestFailover(t *testing.T) {
+ 		nFailures := fallbackErrorThreshold
+ 		nRequests := nFailures + 1
+ 		basePolicyLoader := new(MockPolicyLoader)
+-		basePolicyLoader.On("GetPolicySet", ctx, mock.AnythingOfType("namer.ModuleID")).Return((*runtimev1.RunnablePolicySet)(nil), errors.New("base store error")).Times(nFailures)
++		basePolicyLoader.On("GetFirstMatch", ctx, mock.AnythingOfType("[]namer.ModuleID")).Return((*runtimev1.RunnablePolicySet)(nil), errors.New("base store error")).Times(nFailures)
+ 
+ 		fallbackPolicyLoader := new(MockPolicyLoader)
+-		fallbackPolicyLoader.On("GetPolicySet", ctx, mock.AnythingOfType("namer.ModuleID")).Return(&runtimev1.RunnablePolicySet{}, nil).Once()
++		fallbackPolicyLoader.On("GetFirstMatch", ctx, mock.AnythingOfType("[]namer.ModuleID")).Return(&runtimev1.RunnablePolicySet{}, nil).Once()
+ 
+ 		wrappedSourceStore := &Store{
+ 			log:                  zap.S(),
+@@ -154,7 +154,7 @@ func TestFailover(t *testing.T) {
+ 		}
+ 
+ 		for i := 0; i < nRequests; i++ {
+-			_, err := wrappedSourceStore.GetPolicySet(ctx, namer.GenModuleIDFromFQN("example"))
++			_, err := wrappedSourceStore.GetFirstMatch(ctx, []namer.ModuleID{namer.GenModuleIDFromFQN("example")})
+ 			if i < nFailures {
+ 				require.Error(t, err, "expected base store to return an error")
+ 			} else {
+@@ -239,8 +239,8 @@ type MockPolicyLoader struct {
+ 	mock.Mock
+ }
+ 
+-func (m *MockPolicyLoader) GetPolicySet(ctx context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+-	args := m.Called(ctx, id)
++func (m *MockPolicyLoader) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++	args := m.Called(ctx, candidates)
+ 	return args.Get(0).(*runtimev1.RunnablePolicySet), args.Error(1)
+ }
+ 
+@@ -282,8 +282,8 @@ type MockBinaryStore struct {
+ 	MockStore
+ }
+ 
+-func (m *MockBinaryStore) GetPolicySet(ctx context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+-	args := m.Called(ctx, id)
++func (m *MockBinaryStore) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++	args := m.Called(ctx, candidates)
+ 	return args.Get(0).(*runtimev1.RunnablePolicySet), args.Error(1)
+ }
+ 
+diff --git a/internal/test/mocks/Index.go b/internal/test/mocks/Index.go
+index 6c063016..64094de2 100644
+--- a/internal/test/mocks/Index.go
++++ b/internal/test/mocks/Index.go
+@@ -399,6 +399,60 @@ func (_c *Index_GetFiles_Call) RunAndReturn(run func() []string) *Index_GetFiles
+ 	return _c
+ }
+ 
++// GetFirstMatch provides a mock function with given fields: _a0
++func (_m *Index) GetFirstMatch(_a0 []namer.ModuleID) (*policy.CompilationUnit, error) {
++	ret := _m.Called(_a0)
++
++	var r0 *policy.CompilationUnit
++	var r1 error
++	if rf, ok := ret.Get(0).(func([]namer.ModuleID) (*policy.CompilationUnit, error)); ok {
++		return rf(_a0)
++	}
++	if rf, ok := ret.Get(0).(func([]namer.ModuleID) *policy.CompilationUnit); ok {
++		r0 = rf(_a0)
++	} else {
++		if ret.Get(0) != nil {
++			r0 = ret.Get(0).(*policy.CompilationUnit)
++		}
++	}
++
++	if rf, ok := ret.Get(1).(func([]namer.ModuleID) error); ok {
++		r1 = rf(_a0)
++	} else {
++		r1 = ret.Error(1)
++	}
++
++	return r0, r1
++}
++
++// Index_GetFirstMatch_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetFirstMatch'
++type Index_GetFirstMatch_Call struct {
++	*mock.Call
++}
++
++// GetFirstMatch is a helper method to define mock.On call
++//   - _a0 []namer.ModuleID
++func (_e *Index_Expecter) GetFirstMatch(_a0 interface{}) *Index_GetFirstMatch_Call {
++	return &Index_GetFirstMatch_Call{Call: _e.mock.On("GetFirstMatch", _a0)}
++}
++
++func (_c *Index_GetFirstMatch_Call) Run(run func(_a0 []namer.ModuleID)) *Index_GetFirstMatch_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		run(args[0].([]namer.ModuleID))
++	})
++	return _c
++}
++
++func (_c *Index_GetFirstMatch_Call) Return(_a0 *policy.CompilationUnit, _a1 error) *Index_GetFirstMatch_Call {
++	_c.Call.Return(_a0, _a1)
++	return _c
++}
++
++func (_c *Index_GetFirstMatch_Call) RunAndReturn(run func([]namer.ModuleID) (*policy.CompilationUnit, error)) *Index_GetFirstMatch_Call {
++	_c.Call.Return(run)
++	return _c
++}
++
+ // ListPolicyIDs provides a mock function with given fields: _a0
+ func (_m *Index) ListPolicyIDs(_a0 context.Context) ([]string, error) {
+ 	ret := _m.Called(_a0)
+diff --git a/internal/test/testdata/engine/case_12.yaml b/internal/test/testdata/engine/case_12.yaml
+index 44bfe3d7..dd28c72e 100644
+--- a/internal/test/testdata/engine/case_12.yaml
++++ b/internal/test/testdata/engine/case_12.yaml
+@@ -21,7 +21,7 @@ inputs: [
+       }
+     },
+     "resource": {
+-      "kind": "leave_request",
++      "kind": "leave_request_x",
+       "scope": "acme.hr.fr",
+       "id": "XX125",
+       "attr": {
+diff --git a/internal/test/testdata/engine_lenient_scope_search/case_lenient_00.yaml b/internal/test/testdata/engine_lenient_scope_search/case_lenient_00.yaml
+new file mode 100644
+index 00000000..cabf81e6
+--- /dev/null
++++ b/internal/test/testdata/engine_lenient_scope_search/case_lenient_00.yaml
+@@ -0,0 +1,63 @@
++---
++description: "Scoped policy: lenient search"
++inputs: [
++  {
++    "requestId": "test",
++    "actions": [
++      "create",
++      "delete",
++      "view:public"
++    ],
++    "principal": {
++      "id": "john",
++      "roles": [
++        "employee"
++      ],
++      "attr": {
++        "department": "marketing",
++        "geography": "GB",
++        "team": "design",
++        "ip_address": "10.20.0.13"
++      }
++    },
++    "resource": {
++      "kind": "leave_request",
++      "scope": "acme.hr.uk.wales.cardiff",
++      "id": "XX125",
++      "attr": {
++        "department": "marketing",
++        "geography": "GB",
++        "id": "XX125",
++        "owner": "john",
++        "team": "design"
++      }
++    }
++  }
++]
++wantOutputs: [
++  {
++    "requestId": "test",
++    "resourceId": "XX125",
++    "actions": {
++      "view:public": {
++        "effect": "EFFECT_ALLOW",
++        "policy": "resource.leave_request.vdefault/acme.hr.uk",
++        "scope": "acme.hr"
++      },
++      "delete": {
++        "effect": "EFFECT_ALLOW",
++        "policy": "resource.leave_request.vdefault/acme.hr.uk",
++        "scope": "acme.hr.uk"
++      },
++      "create": {
++        "effect": "EFFECT_ALLOW",
++        "policy": "resource.leave_request.vdefault/acme.hr.uk",
++        "scope": "acme"
++      }
++    },
++    "effectiveDerivedRoles": [
++      "any_employee",
++      "employee_that_owns_the_record"
++    ]
++  }
++]
+diff --git a/internal/test/testdata/engine_lenient_scope_search/case_lenient_01.yaml b/internal/test/testdata/engine_lenient_scope_search/case_lenient_01.yaml
+new file mode 100644
+index 00000000..e1768033
+--- /dev/null
++++ b/internal/test/testdata/engine_lenient_scope_search/case_lenient_01.yaml
+@@ -0,0 +1,101 @@
++---
++description: "Scoped principal policy: lenient scope search"
++inputs: [
++  {
++    "requestId": "test",
++    "actions": [
++      "view:public",
++      "delete"
++    ],
++    "principal": {
++      "id": "donald_duck",
++      "scope": "acme.hr.france.marseille",
++      "roles": [
++        "employee"
++      ],
++      "attr": {
++        "department": "marketing",
++        "geography": "GB",
++        "team": "design",
++        "managed_geographies": "GB"
++      }
++    },
++    "resource": {
++      "kind": "salary_record",
++      "id": "XX125",
++      "attr": {
++        "department": "marketing",
++        "geography": "GB",
++        "id": "XX125",
++        "owner": "john",
++        "team": "design"
++      }
++    }
++  },
++  {
++    "requestId": "test",
++    "actions": [
++      "approve",
++      "view:public"
++    ],
++    "principal": {
++      "id": "donald_duck",
++      "scope": "acme.hr",
++      "roles": [
++        "employee"
++      ],
++      "attr": {
++        "department": "marketing",
++        "geography": "GB",
++        "team": "design",
++        "managed_geographies": "GB"
++      }
++    },
++    "resource": {
++      "kind": "leave_request",
++      "id": "XX126",
++      "attr": {
++        "department": "marketing",
++        "geography": "GB",
++        "id": "XX125",
++        "owner": "mickey_mouse",
++        "team": "design",
++        "dev_record": true
++      }
++    }
++  }
++]
++wantOutputs: [
++  {
++    "requestId": "test",
++    "resourceId": "XX125",
++    "actions": {
++      "view:public": {
++        "effect": "EFFECT_ALLOW",
++        "policy": "principal.donald_duck.vdefault/acme.hr",
++        "scope": "acme.hr"
++      },
++      "delete": {
++        "effect": "EFFECT_DENY",
++        "policy": "principal.donald_duck.vdefault/acme.hr",
++        "scope": "acme"
++      }
++    }
++  },
++  {
++    "requestId": "test",
++    "resourceId": "XX126",
++    "actions": {
++      "approve": {
++        "effect": "EFFECT_DENY",
++        "policy": "principal.donald_duck.vdefault/acme.hr",
++        "scope": "acme"
++      },
++      "view:public": {
++        "effect": "EFFECT_DENY",
++        "policy": "principal.donald_duck.vdefault/acme.hr",
++        "scope": "acme"
++      }
++    }
++  }
++]

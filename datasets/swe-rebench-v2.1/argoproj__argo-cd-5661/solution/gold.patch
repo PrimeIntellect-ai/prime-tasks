@@ -1,0 +1,263 @@
+diff --git a/common/common.go b/common/common.go
+index 563cda98..d411c013 100644
+--- a/common/common.go
++++ b/common/common.go
+@@ -188,6 +188,8 @@ const (
+ 	EnvEnableGRPCTimeHistogramEnv = "ARGOCD_ENABLE_GRPC_TIME_HISTOGRAM"
+ 	// EnvGithubAppCredsExpirationDuration controls the caching of Github app credentials. This value is in minutes (default: 60)
+ 	EnvGithubAppCredsExpirationDuration = "ARGOCD_GITHUB_APP_CREDS_EXPIRATION_DURATION"
++	// EnvHelmIndexCacheDuration controls how the helm repository index file is cached for (default: 0)
++	EnvHelmIndexCacheDuration = "ARGOCD_HELM_INDEX_CACHE_DURATION"
+ )
+ 
+ const (
+diff --git a/reposerver/repository/repository.go b/reposerver/repository/repository.go
+index ad331245..512d30a9 100644
+--- a/reposerver/repository/repository.go
++++ b/reposerver/repository/repository.go
+@@ -202,7 +202,7 @@ func (s *Service) runRepoOperation(
+ 	var err error
+ 	revision = textutils.FirstNonEmpty(revision, source.TargetRevision)
+ 	if source.IsHelm() {
+-		helmClient, revision, err = s.newHelmClientResolveRevision(repo, revision, source.Chart)
++		helmClient, revision, err = s.newHelmClientResolveRevision(repo, revision, source.Chart, settings.noCache)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -1299,7 +1299,7 @@ func (s *Service) newClientResolveRevision(repo *v1alpha1.Repository, revision s
+ 	return gitClient, commitSHA, nil
+ }
+ 
+-func (s *Service) newHelmClientResolveRevision(repo *v1alpha1.Repository, revision string, chart string) (helm.Client, string, error) {
++func (s *Service) newHelmClientResolveRevision(repo *v1alpha1.Repository, revision string, chart string, noCache bool) (helm.Client, string, error) {
+ 	helmClient := s.newHelmClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI || helm.IsHelmOciChart(chart))
+ 	if helm.IsVersion(revision) {
+ 		return helmClient, revision, nil
+@@ -1311,7 +1311,7 @@ func (s *Service) newHelmClientResolveRevision(repo *v1alpha1.Repository, revisi
+ 	if err != nil {
+ 		return nil, "", fmt.Errorf("invalid revision '%s': %v", revision, err)
+ 	}
+-	index, err := helmClient.GetIndex()
++	index, err := helmClient.GetIndex(noCache)
+ 	if err != nil {
+ 		return nil, "", err
+ 	}
+@@ -1360,7 +1360,7 @@ func checkoutRevision(gitClient git.Client, revision string) error {
+ }
+ 
+ func (s *Service) GetHelmCharts(ctx context.Context, q *apiclient.HelmChartsRequest) (*apiclient.HelmChartsResponse, error) {
+-	index, err := s.newHelmClient(q.Repo.Repo, q.Repo.GetHelmCreds(), q.Repo.EnableOCI).GetIndex()
++	index, err := s.newHelmClient(q.Repo.Repo, q.Repo.GetHelmCreds(), q.Repo.EnableOCI).GetIndex(true)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/application/application.go b/server/application/application.go
+index 83b5b33e..68e1d606 100644
+--- a/server/application/application.go
++++ b/server/application/application.go
+@@ -1404,7 +1404,7 @@ func (s *Server) resolveRevision(ctx context.Context, app *appv1.Application, sy
+ 			return ambiguousRevision, ambiguousRevision, nil
+ 		}
+ 		client := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI || app.Spec.Source.IsHelmOci())
+-		index, err := client.GetIndex()
++		index, err := client.GetIndex(false)
+ 		if err != nil {
+ 			return "", "", err
+ 		}
+diff --git a/util/argo/argo.go b/util/argo/argo.go
+index f2aac32a..bcce4104 100644
+--- a/util/argo/argo.go
++++ b/util/argo/argo.go
+@@ -161,7 +161,7 @@ func TestRepo(repo *argoappv1.Repository) error {
+ 				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI).TestHelmOCI()
+ 				return err
+ 			} else {
+-				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI).GetIndex()
++				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI).GetIndex(false)
+ 				return err
+ 			}
+ 		},
+diff --git a/util/env/env.go b/util/env/env.go
+index f26ecb08..a43002f7 100644
+--- a/util/env/env.go
++++ b/util/env/env.go
+@@ -3,6 +3,9 @@ package env
+ import (
+ 	"os"
+ 	"strconv"
++	"time"
++
++	timeutil "github.com/argoproj/pkg/time"
+ 
+ 	log "github.com/sirupsen/logrus"
+ )
+@@ -32,3 +35,29 @@ func ParseNumFromEnv(env string, defaultValue, min, max int) int {
+ 	}
+ 	return num
+ }
++
++// Helper function to parse a time duration from an environment variable. Returns a
++// default if env is not set, is not parseable to a duration, exceeds max (if
++// max is greater than 0) or is less than min.
++func ParseDurationFromEnv(env string, defaultValue, min, max time.Duration) time.Duration {
++	str := os.Getenv(env)
++	if str == "" {
++		return defaultValue
++	}
++	durPtr, err := timeutil.ParseDuration(str)
++	if err != nil {
++		log.Warnf("Could not parse '%s' as a number from environment %s", str, env)
++		return defaultValue
++	}
++
++	dur := *durPtr
++	if dur < min {
++		log.Warnf("Value in %s is %s, which is less than minimum %s allowed", env, dur, min)
++		return defaultValue
++	}
++	if dur > max {
++		log.Warnf("Value in %s is %s, which is greater than maximum %s allowed", env, dur, max)
++		return defaultValue
++	}
++	return dur
++}
+diff --git a/util/helm/client.go b/util/helm/client.go
+index 3c7ed2cf..c12163c0 100644
+--- a/util/helm/client.go
++++ b/util/helm/client.go
+@@ -16,17 +16,25 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/argoproj/argo-cd/common"
++
++	"github.com/argoproj/argo-cd/util/env"
++
+ 	"github.com/Masterminds/semver"
+ 	"github.com/argoproj/pkg/sync"
+ 	log "github.com/sirupsen/logrus"
+ 	"gopkg.in/yaml.v2"
+ 
++	"github.com/argoproj/argo-cd/util/cache"
+ 	executil "github.com/argoproj/argo-cd/util/exec"
+ 	"github.com/argoproj/argo-cd/util/io"
+ )
+ 
+ var (
+-	globalLock = sync.NewKeyLock()
++	globalLock    = sync.NewKeyLock()
++	indexDuration = env.ParseDurationFromEnv(common.EnvHelmIndexCacheDuration, 0, 0, time.Hour*24)
++	indexCache    = cache.NewInMemoryCache(indexDuration)
++	indexLock     = sync.NewKeyLock()
+ )
+ 
+ type Creds struct {
+@@ -41,7 +49,7 @@ type Creds struct {
+ type Client interface {
+ 	CleanChartCache(chart string, version *semver.Version) error
+ 	ExtractChart(chart string, version *semver.Version) (string, io.Closer, error)
+-	GetIndex() (*Index, error)
++	GetIndex(noCache bool) (*Index, error)
+ 	TestHelmOCI() (bool, error)
+ }
+ 
+@@ -202,22 +210,38 @@ func (c *nativeHelmChart) ExtractChart(chart string, version *semver.Version) (s
+ 	}), nil
+ }
+ 
+-func (c *nativeHelmChart) GetIndex() (*Index, error) {
+-	start := time.Now()
++func (c *nativeHelmChart) GetIndex(noCache bool) (*Index, error) {
++	indexLock.Lock(c.repoURL)
++	defer indexLock.Unlock(c.repoURL)
+ 
+-	data, err := c.loadRepoIndex()
+-	if err != nil {
+-		return nil, err
++	var data []byte
++	useCache := !noCache && indexDuration > 0
++	if useCache {
++		if err := indexCache.Get(c.repoURL, &data); err != nil && err != cache.ErrCacheMiss {
++			log.Warnf("Failed to load index cache for repo: %s: %v", c.repoURL, err)
++		}
++	}
++
++	if len(data) == 0 {
++		start := time.Now()
++		var err error
++		data, err = c.loadRepoIndex()
++		if err != nil {
++			return nil, err
++		}
++		log.WithFields(log.Fields{"seconds": time.Since(start).Seconds()}).Info("took to get index")
++
++		if err := indexCache.Set(&cache.Item{Key: c.repoURL, Object: data}); err != nil {
++			log.Warnf("Failed to store index cache for repo: %s: %v", c.repoURL, err)
++		}
+ 	}
+ 
+ 	index := &Index{}
+-	err = yaml.NewDecoder(bytes.NewBuffer(data)).Decode(index)
++	err := yaml.NewDecoder(bytes.NewBuffer(data)).Decode(index)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	log.WithFields(log.Fields{"seconds": time.Since(start).Seconds()}).Info("took to get index")
+-
+ 	return index, nil
+ }
+ 
+diff --git a/util/helm/mocks/Client.go b/util/helm/mocks/Client.go
+index 2683c400..db7a6a5b 100644
+--- a/util/helm/mocks/Client.go
++++ b/util/helm/mocks/Client.go
+@@ -4,7 +4,6 @@ package mocks
+ 
+ import (
+ 	helm "github.com/argoproj/argo-cd/util/helm"
+-
+ 	io "github.com/argoproj/argo-cd/util/io"
+ 
+ 	mock "github.com/stretchr/testify/mock"
+@@ -61,13 +60,13 @@ func (_m *Client) ExtractChart(chart string, version *semver.Version) (string, i
+ 	return r0, r1, r2
+ }
+ 
+-// GetIndex provides a mock function with given fields:
+-func (_m *Client) GetIndex() (*helm.Index, error) {
+-	ret := _m.Called()
++// GetIndex provides a mock function with given fields: noCache
++func (_m *Client) GetIndex(noCache bool) (*helm.Index, error) {
++	ret := _m.Called(noCache)
+ 
+ 	var r0 *helm.Index
+-	if rf, ok := ret.Get(0).(func() *helm.Index); ok {
+-		r0 = rf()
++	if rf, ok := ret.Get(0).(func(bool) *helm.Index); ok {
++		r0 = rf(noCache)
+ 	} else {
+ 		if ret.Get(0) != nil {
+ 			r0 = ret.Get(0).(*helm.Index)
+@@ -75,8 +74,8 @@ func (_m *Client) GetIndex() (*helm.Index, error) {
+ 	}
+ 
+ 	var r1 error
+-	if rf, ok := ret.Get(1).(func() error); ok {
+-		r1 = rf()
++	if rf, ok := ret.Get(1).(func(bool) error); ok {
++		r1 = rf(noCache)
+ 	} else {
+ 		r1 = ret.Error(1)
+ 	}
+@@ -92,9 +91,7 @@ func (_m *Client) TestHelmOCI() (bool, error) {
+ 	if rf, ok := ret.Get(0).(func() bool); ok {
+ 		r0 = rf()
+ 	} else {
+-		if ret.Get(0) != nil {
+-			r0 = ret.Get(0).(bool)
+-		}
++		r0 = ret.Get(0).(bool)
+ 	}
+ 
+ 	var r1 error

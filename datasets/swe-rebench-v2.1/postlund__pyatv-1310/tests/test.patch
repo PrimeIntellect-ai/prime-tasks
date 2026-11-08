@@ -1,0 +1,210 @@
+diff --git a/tests/common_functional_tests.py b/tests/common_functional_tests.py
+index 8e01545..1cc143d 100644
+--- a/tests/common_functional_tests.py
++++ b/tests/common_functional_tests.py
+@@ -518,9 +518,10 @@ class CommonFunctionalTests(AioHTTPTestCase):
+ 
+     @unittest_run_loop
+     async def test_features_play_url(self):
+-        # TODO: The test always sets up AirPlay, so PlayUrl will always be available.
+-        # In the future (after migrating to pytest fixtures), I will add a test where
+-        # AirPlay is not available.
++        # TODO: As availability is based on zeroconf properties, this test just
++        # verifies that PlayUrl is available. It's hard to change zeroconf properties
++        # between test runs here, so better tests will be written when dedicated
++        # functional tests for AirPlay are written.
+         self.assertFeatures(FeatureState.Available, FeatureName.PlayUrl)
+ 
+     @unittest_run_loop
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ac7921e..e78414e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -82,7 +82,7 @@ def stub_heartbeat_loop(request):
+ async def session_manager():
+     session_manager = await create_session()
+     yield session_manager
+-    session_manager.close()
++    await session_manager.close()
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/core/test_facade.py b/tests/core/test_facade.py
+index 6bfe99f..c47cc89 100644
+--- a/tests/core/test_facade.py
++++ b/tests/core/test_facade.py
+@@ -21,8 +21,11 @@ from pyatv.interface import (
+     FeatureState,
+     Power,
+     PushUpdater,
++    Stream,
+ )
+ 
++TEST_URL = "http://test"
++
+ pytestmark = pytest.mark.asyncio
+ 
+ 
+@@ -129,6 +132,14 @@ class DummyDeviceListener(DeviceListener):
+         self.closed_calls += 1
+ 
+ 
++class DummyStream(Stream):
++    def __init__(self) -> None:
++        self.url = None
++
++    async def play_url(self, url: str, **kwargs) -> None:
++        self.url = url
++
++
+ @pytest.fixture(name="register_interface")
+ def register_interface_fixture(facade_dummy):
+     def _register_func(feature: FeatureName, instance, protocol: Protocol):
+@@ -415,3 +426,30 @@ async def tests_device_info_from_multiple_protocols(facade_dummy, register_inter
+     assert dev_info.operating_system == OperatingSystem.TvOS
+     assert dev_info.version == "1.0"
+     assert dev_info.build_number == "ABC"
++
++
++def test_stream_play_url_not_available(facade_dummy, register_interface):
++    stream, _ = register_interface(FeatureName.Volume, DummyStream(), Protocol.RAOP)
++
++    async def check_unavailable():
++        await facade_dummy.connect()
++        with pytest.raises(Exception):
++            await facade_dummy.stream.play_url(TEST_URL)
++
++    asyncio.run(check_unavailable())
++    assert stream.url is None
++
++
++def test_stream_play_url_available(facade_dummy, register_interface):
++    stream, _ = register_interface(FeatureName.PlayUrl, DummyStream(), Protocol.RAOP)
++
++    register_interface(
++        FeatureName.PlayUrl, DummyFeatures(FeatureName.PlayUrl), Protocol.DMAP
++    )
++
++    async def play_available_url():
++        await facade_dummy.connect()
++        await facade_dummy.stream.play_url(TEST_URL)
++
++    asyncio.run(play_available_url())
++    assert stream.url == TEST_URL
+diff --git a/tests/fake_udns.py b/tests/fake_udns.py
+index bf5e1c4..7074b2c 100644
+--- a/tests/fake_udns.py
++++ b/tests/fake_udns.py
+@@ -58,7 +58,7 @@ def airplay_service(
+         name=atv_name,
+         addresses=addresses,
+         port=port,
+-        properties={"deviceid": deviceid.encode("utf-8")},
++        properties={"deviceid": deviceid.encode("utf-8"), "features": b"0x1"},
+         model=model,
+     )
+     return ("_airplay._tcp.local", service)
+diff --git a/tests/protocols/airplay/test_airplay_interface.py b/tests/protocols/airplay/test_airplay_interface.py
+new file mode 100644
+index 0000000..814ff89
+--- /dev/null
++++ b/tests/protocols/airplay/test_airplay_interface.py
+@@ -0,0 +1,23 @@
++"""Unit tests for interface implementations in pyatv.protocols.airplay."""
++
++import pytest
++
++from pyatv.conf import AirPlayService
++from pyatv.const import FeatureName, FeatureState
++from pyatv.protocols.airplay import AirPlayFeatures
++
++# AirPlayFeatures
++
++
++@pytest.mark.parametrize(
++    "flags,expected_state",
++    [
++        ("0x0,0x0", FeatureState.Unavailable),
++        ("0x1,0x0", FeatureState.Available),  # VideoV1
++        ("0x00000000,0x20000", FeatureState.Available),  # VideoV2
++    ],
++)
++def test_feature_play_url(flags, expected_state):
++    service = AirPlayService("id", properties={"features": flags})
++    features = AirPlayFeatures(service)
++    assert features.get_feature(FeatureName.PlayUrl).state == expected_state
+diff --git a/tests/protocols/airplay/test_features.py b/tests/protocols/airplay/test_features.py
+index 2f8f554..9edcab3 100644
+--- a/tests/protocols/airplay/test_features.py
++++ b/tests/protocols/airplay/test_features.py
+@@ -1,31 +1,27 @@
+ """Unit tests for pyatv.protocols.airplay.features."""
+ import pytest
+ 
+-from pyatv.protocols.airplay.features import AirPlayFeatures, parse
++from pyatv.protocols.airplay.features import parse
+ 
+ 
+ @pytest.mark.parametrize(
+     "flags,output",
+     [
+         # Single feature flag
+-        ("0x00000001", AirPlayFeatures.SupportsAirPlayVideoV1),
++        ("0x00000001", 0x00000001),
+         (
+             "0x40000003",
+-            AirPlayFeatures.HasUnifiedAdvertiserInfo
+-            | AirPlayFeatures.SupportsAirPlayPhoto
+-            | AirPlayFeatures.SupportsAirPlayVideoV1,
++            0x40000000 | 0x00000002 | 0x00000001,
+         ),
+         # Dual feature flag
+         (
+             "0x00000003,0x00000001",
+-            AirPlayFeatures.IsCarPlay
+-            | AirPlayFeatures.SupportsAirPlayPhoto
+-            | AirPlayFeatures.SupportsAirPlayVideoV1,
++            0x00000002 | 0x00000001 | (0x00000001 << 32),
+         ),
+     ],
+ )
+ def test_parse_features(flags, output):
+-    assert parse(flags) == output
++    assert int(parse(flags)) == output
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/protocols/dmap/test_dmap_functional.py b/tests/protocols/dmap/test_dmap_functional.py
+index a1f7d87..8afc348 100644
+--- a/tests/protocols/dmap/test_dmap_functional.py
++++ b/tests/protocols/dmap/test_dmap_functional.py
+@@ -77,7 +77,10 @@ class DMAPFunctionalTest(common_functional_tests.CommonFunctionalTests):
+     async def get_connected_device(self, hsgid):
+         self.dmap_service = DmapService("dmapid", hsgid, port=self.server.port)
+         self.airplay_service = AirPlayService(
+-            "airplay_id", self.server.port, DEVICE_CREDENTIALS
++            "airplay_id",
++            self.server.port,
++            DEVICE_CREDENTIALS,
++            properties={"features": "0x1"},  # AirPlayVideoV1 supported
+         )
+         self.conf = AppleTV(ipaddress.IPv4Address("127.0.0.1"), "Apple TV")
+         self.conf.add_service(self.dmap_service)
+diff --git a/tests/protocols/mrp/test_mrp_functional.py b/tests/protocols/mrp/test_mrp_functional.py
+index 13f620c..c639912 100644
+--- a/tests/protocols/mrp/test_mrp_functional.py
++++ b/tests/protocols/mrp/test_mrp_functional.py
+@@ -54,7 +54,12 @@ class MRPFunctionalTest(common_functional_tests.CommonFunctionalTests):
+             MrpService("mrp_id", self.fake_atv.get_port(Protocol.MRP))
+         )
+         self.conf.add_service(
+-            AirPlayService("airplay_id", self.server.port, DEVICE_CREDENTIALS)
++            AirPlayService(
++                "airplay_id",
++                self.server.port,
++                DEVICE_CREDENTIALS,
++                properties={"features": "0x1"},  # AirPlayVideoV1 supported
++            )
+         )
+         self.atv = await self.get_connected_device()
+ 

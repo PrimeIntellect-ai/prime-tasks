@@ -1,0 +1,336 @@
+diff --git a/google-cloud-storage/src/test/java/com/google/cloud/storage/it/ITTransferManagerTest.java b/google-cloud-storage/src/test/java/com/google/cloud/storage/it/ITTransferManagerTest.java
+index 5c1feed6..d258c3af 100644
+--- a/google-cloud-storage/src/test/java/com/google/cloud/storage/it/ITTransferManagerTest.java
++++ b/google-cloud-storage/src/test/java/com/google/cloud/storage/it/ITTransferManagerTest.java
+@@ -18,11 +18,14 @@ package com.google.cloud.storage.it;
+ 
+ import static com.google.common.truth.Truth.assertThat;
+ 
++import com.google.api.gax.paging.Page;
+ import com.google.cloud.WriteChannel;
++import com.google.cloud.storage.Blob;
+ import com.google.cloud.storage.BlobId;
+ import com.google.cloud.storage.BlobInfo;
+ import com.google.cloud.storage.BucketInfo;
+ import com.google.cloud.storage.DataGenerator;
++import com.google.cloud.storage.ParallelCompositeUploadBlobWriteSessionConfig.PartNamingStrategy;
+ import com.google.cloud.storage.Storage;
+ import com.google.cloud.storage.Storage.BlobSourceOption;
+ import com.google.cloud.storage.Storage.BlobWriteOption;
+@@ -56,6 +59,8 @@ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
+ import java.util.stream.Collectors;
+ import org.junit.Before;
+ import org.junit.Rule;
+@@ -141,6 +146,52 @@ public class ITTransferManagerTest {
+     }
+   }
+ 
++  private static void setParallelCompositeUploadPartNamingStrategy(
++      TransferManagerConfig.Builder builder, PartNamingStrategy strategy) throws Exception {
++    builder
++        .getClass()
++        .getMethod("setParallelCompositeUploadPartNamingStrategy", PartNamingStrategy.class)
++        .invoke(builder, strategy);
++  }
++
++  @Test
++  public void uploadFilesPartNaming() throws Exception {
++    TransferManagerConfig.Builder configBuilder =
++        TransferManagerConfigTestingInstances.defaults(storage.getOptions())
++            .toBuilder()
++            .setAllowParallelCompositeUpload(true)
++            .setPerWorkerBufferSize(128 * 1024);
++    setParallelCompositeUploadPartNamingStrategy(
++        configBuilder, PartNamingStrategy.prefix("not-root"));
++    TransferManagerConfig config = configBuilder.build();
++    String prefix = "not-root";
++    long size = 16 * 1024 * 1024L;
++    try (TransferManager transferManager = config.getService();
++        TmpFile tmpFile = DataGenerator.base64Characters().tempFile(baseDir, size)) {
++      ParallelUploadConfig parallelUploadConfig =
++          ParallelUploadConfig.newBuilder().setBucketName(bucket.getName()).build();
++      UploadJob job =
++          transferManager.uploadFiles(
++              Collections.singletonList(tmpFile.getPath()), parallelUploadConfig);
++      CompletableFuture<List<UploadResult>> uploadResultsFuture =
++          CompletableFuture.supplyAsync(job::getUploadResults);
++      boolean sawIntermediateObjectWithPrefix = false;
++      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
++      while (!uploadResultsFuture.isDone() && System.nanoTime() < deadline) {
++        Page<Blob> intermediateObjects =
++            storage.list(bucket.getName(), Storage.BlobListOption.prefix(prefix));
++        if (intermediateObjects.iterateAll().iterator().hasNext()) {
++          sawIntermediateObjectWithPrefix = true;
++          break;
++        }
++        Thread.sleep(100);
++      }
++      List<UploadResult> uploadResults = uploadResultsFuture.join();
++      assertThat(uploadResults.get(0).getStatus()).isEqualTo(TransferStatus.SUCCESS);
++      assertThat(sawIntermediateObjectWithPrefix).isTrue();
++    }
++  }
++
+   @Test
+   public void uploadFilesWithOpts() throws Exception {
+     TransferManagerConfig config =
+@@ -517,4 +568,254 @@ public class ITTransferManagerTest {
+       throw new RuntimeException(e);
+     }
+   }
++
++  /** Offline coverage for the caller's parallel composite upload part naming strategy. */
++  public static class TransferManagerPartNamingTest {
++
++    @org.junit.Rule public final TemporaryFolder tmpDir = new TemporaryFolder();
++
++    @Test
++    public void builderAcceptsPartNamingStrategy() throws Exception {
++      TransferManagerConfig.Builder configBuilder = TransferManagerConfig.newBuilder();
++      setParallelCompositeUploadPartNamingStrategy(
++          configBuilder, PartNamingStrategy.prefix("temporary"));
++      assertThat(configBuilder.build()).isNotNull();
++    }
++
++    @Test
++    public void prefixStrategyAppliesToAllIntermediateObjects() throws Exception {
++      FakeJsonStorage fake = new FakeJsonStorage();
++      fake.start();
++      try {
++        com.google.cloud.storage.StorageOptions options =
++            com.google.cloud.storage.StorageOptions.newBuilder()
++                .setHost(fake.endpoint())
++                .setProjectId("test-project")
++                .setCredentials(com.google.cloud.NoCredentials.getInstance())
++                .build();
++        TransferManagerConfig.Builder configBuilder =
++            TransferManagerConfig.newBuilder()
++                .setStorageOptions(options)
++                .setAllowParallelCompositeUpload(true)
++                .setPerWorkerBufferSize(128 * 1024);
++        setParallelCompositeUploadPartNamingStrategy(
++            configBuilder, PartNamingStrategy.prefix("not-root"));
++        java.nio.file.Path baseDir = tmpDir.getRoot().toPath();
++        try (TransferManager transferManager = configBuilder.build().getService();
++            TmpFile tmpFile = DataGenerator.base64Characters().tempFile(baseDir, 1024 * 1024L)) {
++          ParallelUploadConfig parallelUploadConfig =
++              ParallelUploadConfig.newBuilder().setBucketName("bucket").build();
++          UploadJob job =
++              transferManager.uploadFiles(
++                  Collections.singletonList(tmpFile.getPath()), parallelUploadConfig);
++          List<UploadResult> uploadResults = job.getUploadResults();
++          assertThat(uploadResults).hasSize(1);
++          assertThat(uploadResults.get(0).getStatus()).isEqualTo(TransferStatus.SUCCESS);
++          String finalName = uploadResults.get(0).getUploadedBlob().getName();
++          List<String> intermediateNames =
++              fake.touchedNames().stream()
++                  .filter(name -> !name.equals(finalName))
++                  .collect(Collectors.toList());
++          assertThat(intermediateNames).isNotEmpty();
++          for (String intermediateName : intermediateNames) {
++            assertThat(intermediateName).startsWith("not-root/");
++          }
++        }
++      } finally {
++        fake.stop();
++      }
++    }
++
++    /**
++     * Minimal JSON API stand-in. Accepts multipart and resumable uploads, compose requests and
++     * deletes, records every object name the client touches, and keeps object contents so that
++     * composed objects report the checksum the client expects.
++     */
++    private static final class FakeJsonStorage {
++
++      private final com.sun.net.httpserver.HttpServer server;
++      private final java.util.Set<String> touchedNames =
++          java.util.concurrent.ConcurrentHashMap.newKeySet();
++      private final java.util.Map<String, String> sessionToCreateJson =
++          new java.util.concurrent.ConcurrentHashMap<>();
++      private final java.util.Map<String, String> sessionToName =
++          new java.util.concurrent.ConcurrentHashMap<>();
++      private final java.util.Map<String, byte[]> contents =
++          new java.util.concurrent.ConcurrentHashMap<>();
++      private final java.util.concurrent.atomic.AtomicInteger sessionIds =
++          new java.util.concurrent.atomic.AtomicInteger();
++
++      FakeJsonStorage() throws java.io.IOException {
++        server =
++            com.sun.net.httpserver.HttpServer.create(
++                new java.net.InetSocketAddress("localhost", 0), 0);
++        server.createContext(
++            "/",
++            exchange -> {
++              try {
++                handle(exchange);
++              } catch (Exception e) {
++                exchange.sendResponseHeaders(500, -1);
++              } finally {
++                exchange.close();
++              }
++            });
++      }
++
++      void start() {
++        server.start();
++      }
++
++      void stop() {
++        server.stop(0);
++      }
++
++      String endpoint() {
++        return "http://localhost:" + server.getAddress().getPort();
++      }
++
++      java.util.Set<String> touchedNames() {
++        return touchedNames;
++      }
++
++      private void handle(com.sun.net.httpserver.HttpExchange exchange) throws Exception {
++        String method = exchange.getRequestMethod();
++        String rawPath = exchange.getRequestURI().getRawPath();
++        String query = exchange.getRequestURI().getRawQuery();
++        java.io.InputStream requestBody = exchange.getRequestBody();
++        if ("gzip".equals(exchange.getRequestHeaders().getFirst("Content-Encoding"))) {
++          requestBody = new java.util.zip.GZIPInputStream(requestBody);
++        }
++        byte[] body = readAll(requestBody);
++        String bodyText = new String(body, java.nio.charset.StandardCharsets.UTF_8);
++        if (rawPath.startsWith("/upload/storage/v1/b/") && "POST".equals(method)) {
++          String name = jsonStringField(bodyText, "name");
++          touchedNames.add(name);
++          if (query != null && query.contains("uploadType=multipart")) {
++            contents.put(name, multipartContent(bodyText));
++            respondJson(exchange, resource(name, body.length, bodyText));
++          } else {
++            String sessionId = String.valueOf(sessionIds.incrementAndGet());
++            sessionToCreateJson.put(sessionId, bodyText);
++            sessionToName.put(sessionId, name);
++            exchange
++                .getResponseHeaders()
++                .set("Location", endpoint() + "/upload/session/" + sessionId);
++            exchange.sendResponseHeaders(200, -1);
++          }
++        } else if (rawPath.startsWith("/upload/session/") && "PUT".equals(method)) {
++          String sessionId = rawPath.substring("/upload/session/".length());
++          String name = sessionToName.get(sessionId);
++          contents.put(name, body);
++          respondJson(exchange, resource(name, body.length, sessionToCreateJson.get(sessionId)));
++        } else if (rawPath.startsWith("/storage/v1/b/") && "POST".equals(method)) {
++          // /storage/v1/b/{bucket}/o/{object}/compose
++          String name = java.net.URLDecoder.decode(rawPath.split("/")[6], "UTF-8");
++          touchedNames.add(name);
++          java.io.ByteArrayOutputStream composed = new java.io.ByteArrayOutputStream();
++          for (String source : sourceNames(bodyText)) {
++            composed.write(contents.get(source));
++          }
++          byte[] composedBytes = composed.toByteArray();
++          contents.put(name, composedBytes);
++          respondJson(exchange, resource(name, composedBytes.length, crcJson(composedBytes)));
++        } else if (rawPath.startsWith("/storage/v1/b/") && "DELETE".equals(method)) {
++          touchedNames.add(java.net.URLDecoder.decode(rawPath.split("/")[6], "UTF-8"));
++          exchange.sendResponseHeaders(204, -1);
++        } else {
++          exchange.sendResponseHeaders(404, -1);
++        }
++      }
++
++      /** Extracts the octet-stream payload of a multipart/related upload body. */
++      private static byte[] multipartContent(String bodyText) {
++        int header = bodyText.indexOf("application/octet-stream");
++        int start = bodyText.indexOf("\r\n\r\n", header) + 4;
++        int end = bodyText.lastIndexOf("\r\n--");
++        return bodyText.substring(start, end).getBytes(java.nio.charset.StandardCharsets.UTF_8);
++      }
++
++      /** Object names listed in the sourceObjects array of a compose request, in order. */
++      private static List<String> sourceNames(String composeJson) {
++        String sources = composeJson.substring(composeJson.indexOf("\"sourceObjects\""));
++        java.util.regex.Matcher m =
++            java.util.regex.Pattern.compile("\"name\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
++                .matcher(sources);
++        List<String> names = new ArrayList<>();
++        while (m.find()) {
++          names.add(m.group(1));
++        }
++        return names;
++      }
++
++      private static String crcJson(byte[] content) {
++        int value = com.google.common.hash.Hashing.crc32c().hashBytes(content).asInt();
++        byte[] bytes =
++            new byte[] {
++              (byte) (value >>> 24), (byte) (value >>> 16), (byte) (value >>> 8), (byte) value
++            };
++        return "{\"crc32c\":\"" + java.util.Base64.getEncoder().encodeToString(bytes) + "\"}";
++      }
++
++      /** Object resource echoing the name, metadata and checksums of the request. */
++      private static String resource(String name, long size, String requestJson) {
++        String metadata = "{}";
++        java.util.regex.Matcher m =
++            java.util.regex.Pattern.compile("\"metadata\"\\s*:\\s*(\\{[^}]*\\})")
++                .matcher(requestJson == null ? "" : requestJson);
++        if (m.find()) {
++          metadata = m.group(1);
++        }
++        StringBuilder json =
++            new StringBuilder("{\"kind\":\"storage#object\",\"bucket\":\"bucket\",\"name\":\"")
++                .append(name)
++                .append("\",\"generation\":\"1\",\"metageneration\":\"1\",\"size\":\"")
++                .append(size)
++                .append("\",\"metadata\":")
++                .append(metadata);
++        for (String checksum : new String[] {"crc32c", "md5Hash"}) {
++          String value = jsonOptionalStringField(requestJson == null ? "" : requestJson, checksum);
++          if (value != null) {
++            json.append(",\"").append(checksum).append("\":\"").append(value).append("\"");
++          }
++        }
++        return json.append("}").toString();
++      }
++
++      private static void respondJson(com.sun.net.httpserver.HttpExchange exchange, String json)
++          throws java.io.IOException {
++        byte[] bytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
++        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
++        exchange.sendResponseHeaders(200, bytes.length);
++        exchange.getResponseBody().write(bytes);
++      }
++
++      private static String jsonStringField(String json, String field) {
++        String value = jsonOptionalStringField(json, field);
++        if (value == null) {
++          throw new IllegalStateException("missing field " + field + " in " + json);
++        }
++        return value;
++      }
++
++      private static String jsonOptionalStringField(String json, String field) {
++        java.util.regex.Matcher m =
++            java.util.regex.Pattern.compile(
++                    "\"" + field + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
++                .matcher(json);
++        return m.find() ? m.group(1) : null;
++      }
++
++      private static byte[] readAll(java.io.InputStream in) throws java.io.IOException {
++        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
++        byte[] buf = new byte[8192];
++        int n;
++        while ((n = in.read(buf)) != -1) {
++          out.write(buf, 0, n);
++        }
++        return out.toByteArray();
++      }
++    }
++  }
++
+ }

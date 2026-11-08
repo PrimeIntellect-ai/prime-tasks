@@ -1,0 +1,1 @@
+Rename `isproper` -> `isnondegenerate`

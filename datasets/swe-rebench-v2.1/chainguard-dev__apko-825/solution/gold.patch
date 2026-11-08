@@ -1,0 +1,369 @@
+diff --git a/internal/cli/build.go b/internal/cli/build.go
+index 7883a2e..93187a7 100644
+--- a/internal/cli/build.go
++++ b/internal/cli/build.go
+@@ -23,6 +23,7 @@ import (
+ 	"path/filepath"
+ 	"sync"
+ 
++	"github.com/chainguard-dev/go-apk/pkg/apk"
+ 	coci "github.com/sigstore/cosign/v2/pkg/oci"
+ 	"github.com/sirupsen/logrus"
+ 	"github.com/spf13/cobra"
+@@ -152,7 +153,7 @@ func BuildCmd(ctx context.Context, imageRef, outputTarGZ string, archs []types.A
+ 	defer os.RemoveAll(wd)
+ 
+ 	// build all of the components in the working directory
+-	idx, sboms, err := buildImageComponents(ctx, wd, archs, opts...)
++	idx, sboms, _, err := buildImageComponents(ctx, wd, archs, opts...)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -177,13 +178,13 @@ func BuildCmd(ctx context.Context, imageRef, outputTarGZ string, archs []types.A
+ 
+ // buildImage build all of the components of an image in a single working directory.
+ // Each layer is a separate file, as are config, manifests, index and sbom.
+-func buildImageComponents(ctx context.Context, wd string, archs []types.Architecture, opts ...build.Option) (idx coci.SignedImageIndex, sboms []types.SBOM, err error) {
++func buildImageComponents(ctx context.Context, wd string, archs []types.Architecture, opts ...build.Option) (idx coci.SignedImageIndex, sboms []types.SBOM, pkgs map[types.Architecture][]*apk.InstalledPackage, err error) {
+ 	ctx, span := otel.Tracer("apko").Start(ctx, "buildImageComponents")
+ 	defer span.End()
+ 
+ 	o, ic, err := build.NewOptions(wd, opts...)
+ 	if err != nil {
+-		return nil, nil, err
++		return nil, nil, nil, err
+ 	}
+ 
+ 	// cases:
+@@ -217,7 +218,7 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 	workDir := wd
+ 	imageDir := filepath.Join(workDir, "image")
+ 	if err := os.MkdirAll(imageDir, 0755); err != nil {
+-		return nil, nil, fmt.Errorf("unable to create working image directory %s: %w", imageDir, err)
++		return nil, nil, nil, fmt.Errorf("unable to create working image directory %s: %w", imageDir, err)
+ 	}
+ 
+ 	imgs := map[types.Architecture]coci.SignedImage{}
+@@ -232,6 +233,9 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 	// computation.
+ 	multiArchBDE := o.SourceDateEpoch
+ 
++	// pkgs will hold a reference to installed packages by architecture
++	pkgs = make(map[types.Architecture][]*apk.InstalledPackage)
++
+ 	for _, arch := range archs {
+ 		arch := arch
+ 		// working directory for this architecture
+@@ -243,7 +247,7 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 		)
+ 		bc, err := build.New(ctx, wd, bopts...)
+ 		if err != nil {
+-			return nil, nil, err
++			return nil, nil, nil, err
+ 		}
+ 
+ 		// save the build context for later
+@@ -255,6 +259,11 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 				return fmt.Errorf("failed to build layer image for %q: %w", arch, err)
+ 			}
+ 
++			installed, err := bc.InstalledPackages()
++			if err != nil {
++				return fmt.Errorf("failed to get installed packages for %q: %w", arch, err)
++			}
++			pkgs[arch] = installed
+ 			// Compute the "build date epoch" from the packages that were
+ 			// installed.  The "build date epoch" is the MAX of the builddate
+ 			// embedded in the installed APKs.  If SOURCE_DATE_EPOCH is
+@@ -286,13 +295,13 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 		})
+ 	}
+ 	if err := errg.Wait(); err != nil {
+-		return nil, nil, err
++		return nil, nil, nil, err
+ 	}
+ 
+ 	// generate the index
+ 	finalDigest, idx, err := oci.GenerateIndex(ctx, *ic, imgs)
+ 	if err != nil {
+-		return nil, nil, fmt.Errorf("failed to generate OCI index: %w", err)
++		return nil, nil, nil, fmt.Errorf("failed to generate OCI index: %w", err)
+ 	}
+ 
+ 	opts = append(opts,
+@@ -303,11 +312,11 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 
+ 	bc, err := build.New(ctx, wd, opts...)
+ 	if err != nil {
+-		return nil, nil, err
++		return nil, nil, nil, err
+ 	}
+ 
+ 	if _, _, err := bc.WriteIndex(idx); err != nil {
+-		return nil, nil, fmt.Errorf("failed to write OCI index: %w", err)
++		return nil, nil, nil, fmt.Errorf("failed to write OCI index: %w", err)
+ 	}
+ 
+ 	// the sboms are saved to the same working directory as the image components
+@@ -335,17 +344,17 @@ func buildImageComponents(ctx context.Context, wd string, archs []types.Architec
+ 		}
+ 
+ 		if err := g.Wait(); err != nil {
+-			return nil, nil, err
++			return nil, nil, nil, err
+ 		}
+ 
+ 		files, err := bc.GenerateIndexSBOM(ctx, finalDigest, imgs)
+ 		if err != nil {
+-			return nil, nil, fmt.Errorf("generating index SBOM: %w", err)
++			return nil, nil, nil, fmt.Errorf("generating index SBOM: %w", err)
+ 		}
+ 		sboms = append(sboms, files...)
+ 	}
+ 
+-	return idx, sboms, nil
++	return idx, sboms, pkgs, nil
+ }
+ 
+ // rename just like os.Rename, but does a copy and delete if the rename fails
+diff --git a/internal/cli/publish.go b/internal/cli/publish.go
+index f59c3c9..ab65650 100644
+--- a/internal/cli/publish.go
++++ b/internal/cli/publish.go
+@@ -34,6 +34,7 @@ import (
+ 	"go.opentelemetry.io/otel"
+ 	"golang.org/x/sync/errgroup"
+ 
++	"chainguard.dev/apko/pkg/apk"
+ 	"chainguard.dev/apko/pkg/build"
+ 	"chainguard.dev/apko/pkg/build/oci"
+ 	"chainguard.dev/apko/pkg/build/types"
+@@ -206,7 +207,7 @@ func PublishCmd(ctx context.Context, outputRefs string, archs []types.Architectu
+ 	defer os.RemoveAll(wd)
+ 
+ 	// build all of the components in the working directory
+-	idx, sboms, err := buildImageComponents(ctx, wd, archs, buildOpts...)
++	idx, sboms, pkgs, err := buildImageComponents(ctx, wd, archs, buildOpts...)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to build image components: %w", err)
+ 	}
+@@ -237,6 +238,40 @@ func PublishCmd(ctx context.Context, outputRefs string, archs []types.Architectu
+ 		return nil
+ 	}
+ 
++	// generate additional tags from the package information per architecture
++	tagsByArch := make(map[types.Architecture][]string)
++	for arch, pkgList := range pkgs {
++		addTags, err := apk.AdditionalTags(pkgList, opts.logger, tags, opts.packageVersionTag, opts.packageVersionTagPrefix, opts.tagSuffix, opts.packageVersionTagStem)
++		if err != nil {
++			return fmt.Errorf("failed to generate additional tags for arch %s: %w", arch, err)
++		}
++		tagsByArch[arch] = append(tags, addTags...)
++	}
++
++	// if the tags are not identical across arches, that is an error
++	allTagsMap := make(map[string]bool)
++	for arch, archTags := range tagsByArch {
++		if len(allTagsMap) == 0 {
++			for _, tag := range archTags {
++				allTagsMap[tag] = true
++			}
++			continue
++		}
++		if len(archTags) != len(allTagsMap) {
++			return fmt.Errorf("tags for arch %s are not identical to other arches", arch)
++		}
++		for _, tag := range archTags {
++			if !allTagsMap[tag] {
++				return fmt.Errorf("tags for arch %s are not identical to other arches", arch)
++			}
++		}
++	}
++	// and now generate a slice
++	allTags := make([]string, 0, len(allTagsMap))
++	for tag := range allTagsMap {
++		allTags = append(allTags, tag)
++	}
++
+ 	// publish each arch-specific image
+ 	// TODO: This should just happen as part of PublishIndex.
+ 	ref, err := name.ParseReference(tags[0])
+@@ -252,7 +287,7 @@ func PublishCmd(ctx context.Context, outputRefs string, archs []types.Architectu
+ 	}
+ 
+ 	// publish the index
+-	finalDigest, err := oci.PublishIndex(ctx, idx, logger, shouldPushTags, tags, ropt...)
++	finalDigest, err := oci.PublishIndex(ctx, idx, logger, shouldPushTags, allTags, ropt...)
+ 	if err != nil {
+ 		return fmt.Errorf("publishing image index: %w", err)
+ 	}
+diff --git a/pkg/apk/apk.go b/pkg/apk/apk.go
+index 677bd75..37a9030 100644
+--- a/pkg/apk/apk.go
++++ b/pkg/apk/apk.go
+@@ -16,66 +16,65 @@ package apk
+ 
+ import (
+ 	"fmt"
+-	"io/fs"
+ 	"regexp"
+ 	"sort"
+ 	"strings"
+ 
++	apkimpl "github.com/chainguard-dev/go-apk/pkg/apk"
+ 	"github.com/google/go-containerregistry/pkg/name"
+ 
+-	"chainguard.dev/apko/pkg/options"
+-	"chainguard.dev/apko/pkg/sbom"
++	"chainguard.dev/apko/pkg/log"
+ )
+ 
+ // AdditionalTags is a helper function used in conjunction with the --package-version-tag flag
+ // If --package-version-tag is set to a package name (e.g. go), then this function
+ // returns a list of all images that should be published with the associated version of that package tagged (e.g. 1.18)
+-func AdditionalTags(fsys fs.FS, opts options.Options) ([]string, error) {
+-	if opts.PackageVersionTag == "" {
++func AdditionalTags(pkgs []*apkimpl.InstalledPackage, logger log.Logger, tags []string, packageVersionTag, packageVersionTagPrefix, tagSuffix string, packageVersionTagStem bool) ([]string, error) {
++	if packageVersionTag == "" {
+ 		return nil, nil
+ 	}
+-	pkgs, err := sbom.ReadPackageIndex(fsys)
+-	if err != nil {
+-		return nil, err
+-	}
+ 	for _, pkg := range pkgs {
+-		if pkg.Name != opts.PackageVersionTag {
++		if pkg.Name != packageVersionTag {
+ 			continue
+ 		}
+ 		version := pkg.Version
+ 		if version == "" {
+-			opts.Log.Warnf("Version for package %s is empty", pkg.Name)
++			logger.Warnf("Version for package %s is empty", pkg.Name)
+ 			continue
+ 		}
+-		if opts.TagSuffix != "" {
+-			version += opts.TagSuffix
+-		}
+-		opts.Log.Debugf("Found version, images will be tagged with %s", version)
++		logger.Debugf("Found version, images will be tagged with %s", version)
+ 
+-		additionalTags, err := appendTag(opts, fmt.Sprintf("%s%s", opts.PackageVersionTagPrefix, version))
++		additionalTags, err := appendTag(tags, fmt.Sprintf("%s%s", packageVersionTagPrefix, version))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 
+-		if opts.PackageVersionTagStem && len(additionalTags) > 0 {
+-			opts.Log.Debugf("Adding stemmed version tags")
+-			stemmedTags, err := getStemmedVersionTags(opts, additionalTags[0], version)
++		if packageVersionTagStem && len(additionalTags) > 0 {
++			logger.Debugf("Adding stemmed version tags")
++			stemmedTags, err := getStemmedVersionTags(packageVersionTagPrefix, additionalTags[0], version)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+ 			additionalTags = append(additionalTags, stemmedTags...)
+ 		}
++		finalTags := additionalTags
++		if tagSuffix != "" {
++			finalTags = []string{}
++			for _, tag := range additionalTags {
++				finalTags = append(finalTags, fmt.Sprintf("%s%s", tag, tagSuffix))
++			}
++		}
+ 
+-		opts.Log.Infof("Returning additional tags %v", additionalTags)
+-		return additionalTags, nil
++		logger.Infof("Returning additional tags %v", finalTags)
++		return finalTags, nil
+ 	}
+-	opts.Log.Warnf("No version info found for package %s, skipping additional tagging", opts.PackageVersionTag)
++	logger.Warnf("No version info found for package %s, skipping additional tagging", packageVersionTag)
+ 	return nil, nil
+ }
+ 
+-func appendTag(opts options.Options, newTag string) ([]string, error) {
+-	newTags := make([]string, len(opts.Tags))
+-	for i, t := range opts.Tags {
++func appendTag(tags []string, newTag string) ([]string, error) {
++	newTags := make([]string, len(tags))
++	for i, t := range tags {
+ 		nt, err := replaceTag(t, newTag)
+ 		if err != nil {
+ 			return nil, err
+@@ -94,7 +93,7 @@ func replaceTag(img, newTag string) (string, error) {
+ }
+ 
+ // TODO: use version parser from https://gitlab.alpinelinux.org/alpine/go/-/tree/master/version
+-func getStemmedVersionTags(opts options.Options, origRef string, version string) ([]string, error) {
++func getStemmedVersionTags(packageVersionTagPrefix string, origRef string, version string) ([]string, error) {
+ 	tags := []string{}
+ 	re := regexp.MustCompile("[.]+")
+ 	tmp := []string{}
+@@ -106,7 +105,7 @@ func getStemmedVersionTags(opts options.Options, origRef string, version string)
+ 			additionalTag = strings.Join(tmp[:len(tmp)-1], "-")
+ 		}
+ 		additionalTag, err := replaceTag(origRef,
+-			fmt.Sprintf("%s%s", opts.PackageVersionTagPrefix, additionalTag))
++			fmt.Sprintf("%s%s", packageVersionTagPrefix, additionalTag))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/pkg/build/build_implementation.go b/pkg/build/build_implementation.go
+index cfe69b0..b61f71d 100644
+--- a/pkg/build/build_implementation.go
++++ b/pkg/build/build_implementation.go
+@@ -28,13 +28,10 @@ import (
+ 	gzip "github.com/klauspost/pgzip"
+ 	"go.opentelemetry.io/otel"
+ 
+-	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
++	"github.com/chainguard-dev/go-apk/pkg/apk"
+ 	"github.com/chainguard-dev/go-apk/pkg/tarball"
+ 	"github.com/sigstore/cosign/v2/pkg/oci"
+ 	"gitlab.alpinelinux.org/alpine/go/repository"
+-
+-	chainguardAPK "chainguard.dev/apko/pkg/apk"
+-	"chainguard.dev/apko/pkg/options"
+ )
+ 
+ // BuildTarball takes the fully populated working directory and saves it to
+@@ -92,18 +89,6 @@ func (bc *Context) BuildTarball(ctx context.Context) (string, hash.Hash, hash.Ha
+ 	return outfile.Name(), diffid, digest, stat.Size(), nil
+ }
+ 
+-func additionalTags(fsys apkfs.FullFS, o *options.Options) error {
+-	at, err := chainguardAPK.AdditionalTags(fsys, *o)
+-	if err != nil {
+-		return err
+-	}
+-	if at == nil {
+-		return nil
+-	}
+-	o.Tags = append(o.Tags, at...)
+-	return nil
+-}
+-
+ func (bc *Context) buildImage(ctx context.Context) error {
+ 	ctx, span := otel.Tracer("apko").Start(ctx, "buildImage")
+ 	defer span.End()
+@@ -112,10 +97,6 @@ func (bc *Context) buildImage(ctx context.Context) error {
+ 		return fmt.Errorf("installing apk packages: %w", err)
+ 	}
+ 
+-	if err := additionalTags(bc.fs, &bc.o); err != nil {
+-		return fmt.Errorf("adding additional tags: %w", err)
+-	}
+-
+ 	if err := mutateAccounts(bc.fs, &bc.o, &bc.ic); err != nil {
+ 		return fmt.Errorf("failed to mutate accounts: %w", err)
+ 	}
+@@ -190,3 +171,7 @@ func (bc *Context) BuildPackageList(ctx context.Context) (toInstall []*repositor
+ 
+ 	return toInstall, conflicts, err
+ }
++
++func (bc *Context) InstalledPackages() ([]*apk.InstalledPackage, error) {
++	return bc.apk.GetInstalled()
++}

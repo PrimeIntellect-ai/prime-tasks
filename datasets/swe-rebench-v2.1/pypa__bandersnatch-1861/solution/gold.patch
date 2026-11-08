@@ -1,0 +1,240 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 8b2f60b..5b62e14 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -4,6 +4,10 @@
+ 
+ - Declare support for python 3.13 `PR #1848`
+ 
++## Big Fixes
++
++- Support reading HTTP proxy URLs from environment variables, and SOCKS proxy URLs from the 'mirror.proxy' config option `PR #1861`
++
+ # 6.6.0
+ 
+ ## New Features
+diff --git a/docs/mirror_configuration.md b/docs/mirror_configuration.md
+index 2157729..6e1fdac 100644
+--- a/docs/mirror_configuration.md
++++ b/docs/mirror_configuration.md
+@@ -282,22 +282,20 @@ Bandersnatch can download package release files from an alternative source by co
+ 
+ ### `proxy`
+ 
+-Use an HTTP proxy server.
++Use an HTTP or SOCKS proxy server.
+ 
+ :Type: URL
+ :Required: no
+ :Default: none
+ 
+-The proxy server is used when sending requests to a repository server set by the [](#master) or [](#download-mirror) option.
++The proxy server is used when sending requests to a repository server set by the [](#master) or [](#download-mirror) option. The URL scheme must be one of `http`, `https`, `socks4`, or `socks5`.
+ 
+-```{seealso}
+-HTTP proxies are supported through the `aiohttp` library. See the aiohttp manual for details on what connection types are supported: <https://docs.aiohttp.org/en/stable/client_advanced.html#proxy-support>
+-```
++If this configuration option is not set, Bandersnatch will also use the first URL found in the following environment variables in order: `SOCKS5_PROXY`, `SOCKS4_PROXY`, `SOCKS_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`.
+ 
+-```{note}
+-Alternatively, you can specify a proxy URL by setting one of the environment variables `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY`. _This method supports both HTTP and SOCKS proxies._ Support for `socks4`/`socks5` uses the [aiohttp-socks](https://github.com/romis2012/aiohttp-socks) library.
++```{seealso}
++HTTP proxies are supported through the `aiohttp` library. The aiohttp manual has more details on what connection types are supported: <https://docs.aiohttp.org/en/stable/client_advanced.html#proxy-support>
+ 
+-SOCKS proxies are not currently supported via the `mirror.proxy` config option.
++SOCKS proxies are supported through the `aiohttp_socks` library: [aiohttp-socks](https://github.com/romis2012/aiohttp-socks).
+ ```
+ 
+ ### `timeout`
+diff --git a/src/bandersnatch/config/proxy.py b/src/bandersnatch/config/proxy.py
+new file mode 100644
+index 0000000..a21dcb6
+--- /dev/null
++++ b/src/bandersnatch/config/proxy.py
+@@ -0,0 +1,84 @@
++"""
++Implements 2 aspects of network proxy support:
++
++1. Detecting proxy configuration in the runtime environment
++2. Configuring aiohttp for different proxy protocol families
++"""
++
++import logging
++import urllib.request
++from collections.abc import Mapping
++from typing import Any
++
++from aiohttp_socks import ProxyConnector
++
++logger = logging.getLogger(__name__)
++
++# The protocols we accept from 'getproxies()' in the an arbitrary but reasonable seeming precedence order.
++# These roughly correspond to environment variables `(f"{p.upper()}_PROXY" for p in _supported_protocols)`.
++_supported_protocols = (
++    "socks5",
++    "socks4",
++    "socks",
++    "https",
++    "http",
++    "all",
++)
++
++
++def proxy_address_from_env() -> str | None:
++    """
++    Find an HTTP or SOCKS proxy server URL in the environment using urllib's
++    'getproxies' function. This checks both environment variables and OS-specific sources
++    like the Windows registry and returns a mapping of protocol name to address. If there
++    are URLs for multiple protocols we use an arbitrary precedence order based roughly on
++    protocol sophistication and specificity:
++
++    'socks5' > 'socks4' > 'https' > 'http' > 'all'
++
++    Note that nothing actually constrains the value of an environment variable to have a
++    URI scheme/protocol that matches the protocol indicated by the variable name - e.g.
++    not only is `ALL_PROXY=socks4://...` possible but so is `HTTP_PROXY=socks4://...`. We
++    use the protocol from the variable name for address selection but should generate
++    connection configuration based on the scheme.
++    """
++    proxies_in_env = urllib.request.getproxies()
++    for proto in _supported_protocols:
++        if proto in proxies_in_env:
++            address = proxies_in_env[proto]
++            logger.debug("Found %s proxy address in environment: %s", proto, address)
++            return address
++    return None
++
++
++def get_aiohttp_proxy_kwargs(proxy_url: str) -> Mapping[str, Any]:
++    """
++    Return initializer keyword arguments for `aiohttp.ClientSession` for either an HTTP
++    or SOCKS proxy based on the scheme of the given URL.
++
++    Proxy support uses aiohttp's built-in support for HTTP(S), and uses aiohttp_socks for
++    SOCKS{4,5}. Initializing an aiohttp session is different for each. An HTTP proxy
++    address can be passed to ClientSession's 'proxy' option:
++
++        ClientSession(..., proxy=<PROXY_ADDRESS>, trust_env=True)
++
++    'trust_env' enables aiohttp to read additional configuration from environment variables
++    and net.rc. `aiohttp_socks` works by replacing the default transport (TcpConnector)
++    with a custom one:
++
++        socks_transport = aiohttp_socks.ProxyConnector.from_url(<PROXY_ADDRESS>)
++        ClientSession(..., connector=socks_transport)
++
++    This uses the protocol family of the URL to select one or the other and return the
++    corresponding keyword arguments in a dictionary.
++    """
++    lowered = proxy_url.lower()
++    if lowered.startswith("socks"):
++        logger.debug("Using SOCKS ProxyConnector for %s", proxy_url)
++        return {"connector": ProxyConnector.from_url(proxy_url)}
++
++    if lowered.startswith("http"):
++        logger.debug("Using HTTP proxy address %s", proxy_url)
++        return {"proxy": proxy_url, "trust_env": True}
++
++    return {}
+diff --git a/src/bandersnatch/master.py b/src/bandersnatch/master.py
+index 34c4ed8..e1d781d 100644
+--- a/src/bandersnatch/master.py
++++ b/src/bandersnatch/master.py
+@@ -1,19 +1,17 @@
+ import asyncio
+ import logging
+-import re
+ import sys
+ from collections.abc import AsyncGenerator
+ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+ from functools import partial
+-from os import environ
+ from pathlib import Path
+ from typing import Any
+ 
+ import aiohttp
+-from aiohttp_socks import ProxyConnector
+ from aiohttp_xmlrpc.client import ServerProxy
+ 
+ import bandersnatch
++from bandersnatch.config.proxy import get_aiohttp_proxy_kwargs, proxy_address_from_env
+ 
+ from .errors import PackageNotFound
+ from .utils import USER_AGENT
+@@ -43,40 +41,24 @@ class Master:
+         proxy: str | None = None,
+         allow_non_https: bool = False,
+     ) -> None:
+-        self.proxy = proxy
+-        self.loop = asyncio.get_event_loop()
++        self.url = url
+         self.timeout = timeout
+         self.global_timeout = global_timeout or FIVE_HOURS_FLOAT
+-        self.url = url
++
++        proxy_url = proxy if proxy else proxy_address_from_env()
++        self.proxy_kwargs = get_aiohttp_proxy_kwargs(proxy_url) if proxy_url else {}
++        # testing self.proxy_kwargs b/c even if there is a proxy_url, get_aiohttp_proxy_kwargs may
++        # still return {} if the url is invalid somehow
++        if self.proxy_kwargs:
++            logging.info("Using proxy URL %s", proxy_url)
++
+         self.allow_non_https = allow_non_https
+         if self.url.startswith("http://") and not self.allow_non_https:
+             err = f"Master URL {url} is not https scheme"
+             logger.error(err)
+             raise ValueError(err)
+ 
+-    def _check_for_socks_proxy(self) -> ProxyConnector | None:
+-        """Check env for a SOCKS proxy URL and return a connector if found"""
+-        proxy_vars = (
+-            "https_proxy",
+-            "http_proxy",
+-            "all_proxy",
+-        )
+-        socks_proxy_re = re.compile(r"^socks[45]h?:\/\/.+")
+-
+-        proxy_url = None
+-        for proxy_var in proxy_vars:
+-            for pv in (proxy_var, proxy_var.upper()):
+-                proxy_url = environ.get(pv)
+-                if proxy_url:
+-                    break
+-            if proxy_url:
+-                break
+-
+-        if not proxy_url or not socks_proxy_re.match(proxy_url):
+-            return None
+-
+-        logger.debug(f"Creating a SOCKS ProxyConnector to use {proxy_url}")
+-        return ProxyConnector.from_url(proxy_url)
++        self.loop = asyncio.get_event_loop()
+ 
+     async def __aenter__(self) -> "Master":
+         logger.debug("Initializing Master's aiohttp ClientSession")
+@@ -87,14 +69,12 @@ class Master:
+             sock_connect=self.timeout,
+             sock_read=self.timeout,
+         )
+-        socks_connector = self._check_for_socks_proxy()
+         self.session = aiohttp.ClientSession(
+-            connector=socks_connector,
+             headers=custom_headers,
+             skip_auto_headers=skip_headers,
+             timeout=aiohttp_timeout,
+-            trust_env=True if not socks_connector else False,
+             raise_for_status=True,
++            **self.proxy_kwargs,
+         )
+         return self
+ 
+@@ -129,9 +109,6 @@ class Master:
+         logger.debug(f"Getting {path} (serial {required_serial})")
+         if not path.startswith(("https://", "http://")):
+             path = self.url + path
+-        if not kw.get("proxy") and self.proxy:
+-            kw["proxy"] = self.proxy
+-            logger.debug(f"Using proxy set in configuration: {self.proxy}")
+         async with self.session.get(path, **kw) as r:
+             got_serial = (
+                 int(r.headers[PYPI_SERIAL_HEADER])

@@ -1,0 +1,326 @@
+diff --git a/flexx/app/clientcore.py b/flexx/app/clientcore.py
+index 1d05225..025d835 100644
+--- a/flexx/app/clientcore.py
++++ b/flexx/app/clientcore.py
+@@ -185,11 +185,13 @@ class FlexxJS:
+     def command(self, msg):
+         """ Execute a command received from the server.
+         """
+-        if msg.startswith('PRINT '):
++        if msg.startswith('PING '):
++            self.ws.send('PONG ' + msg[5:])
++        elif msg.startswith('PRINT '):
+             window.console.ori_log(msg[6:])
+         elif msg.startswith('EVAL '):
+             window._ = eval(msg[5:])
+-            window.flexx.ws.send('RET ' + window._)  # send back result
++            self.ws.send('RET ' + window._)  # send back result
+         elif msg.startswith('EXEC '):
+             eval(msg[5:])  # like eval, but do not return result
+         elif msg.startswith('DEFINE-JS '):
+diff --git a/flexx/app/model.py b/flexx/app/model.py
+index fa41f6f..92806c9 100644
+--- a/flexx/app/model.py
++++ b/flexx/app/model.py
+@@ -401,6 +401,7 @@ class Model(with_metaclass(ModelMeta, event.HasEvents)):
+         # so that they can connect to newly created sub Models.
+         self._init_handlers()
+         self._session._exec('flexx.instances.%s._init_handlers();' % self._id)
++        self._session.keep_alive(self)
+     
+     def __repr__(self):
+         clsname = self.__class__.__name__
+@@ -433,7 +434,6 @@ class Model(with_metaclass(ModelMeta, event.HasEvents)):
+         """
+         pass
+     
+-    
+     def __check_not_active(self):
+         active_models = _get_active_models()
+         if self in active_models:
+diff --git a/flexx/app/session.py b/flexx/app/session.py
+index 0b7482f..98651c9 100644
+--- a/flexx/app/session.py
++++ b/flexx/app/session.py
+@@ -248,6 +248,9 @@ class Session(SessionAssets):
+         # commands, which are send to the client as soon as it connects
+         self._pending_commands = []
+         
++        # Objects that are guarded from deletion: id: (ping_count, instance)
++        self._instances_guarded = {}
++        
+         self._creation_time = time.time()
+     
+     def __repr__(self):
+@@ -379,6 +382,28 @@ class Session(SessionAssets):
+         else:
+             logger.warn('Unknown command received from JS:\n%s' % command)
+     
++    def keep_alive(self, ob, iters=4):
++        """ Keep an object alive for a certain amount of time, expressed
++        in Python-JS ping roundtrips. This is intended for making Model
++        objects survive jitter due to synchronisation, though any type
++        of object can be given.
++        """
++        obid = id(ob)
++        counter = 0 if self._ws is None else self._ws.ping_counter
++        lifetime = counter + int(iters)
++        if lifetime > self._instances_guarded.get(obid, (0, ))[0]:
++            self._instances_guarded[obid] = lifetime, ob
++    
++    def _receive_pong(self, count):
++        """ Called by ws when it gets a pong. Thus gets called about
++        every sec. Clear the guarded Model instances for which the
++        "timeout counter" has expired.
++        """
++        objects_to_clear = [ob for c, ob in
++                           self._instances_guarded.values() if c <= count]
++        for ob in objects_to_clear:
++            self._instances_guarded.pop(id(ob))
++    
+     def _exec(self, code):
+         """ Like eval, but without returning the result value.
+         """
+diff --git a/flexx/app/tornadoserver.py b/flexx/app/tornadoserver.py
+index 82888db..0b54f6d 100644
+--- a/flexx/app/tornadoserver.py
++++ b/flexx/app/tornadoserver.py
+@@ -446,7 +446,8 @@ class WSHandler(tornado.websocket.WebSocketHandler):
+         
+         logger.debug('New websocket connection %s' % path)
+         if manager.has_app_name(self.app_name):
+-            IOLoop.current().spawn_callback(self.pinger)
++            IOLoop.current().spawn_callback(self.pinger1)
++            IOLoop.current().spawn_callback(self.pinger2)
+         else:
+             self.close(1003, "Could not associate socket with an app.")
+     
+@@ -472,6 +473,8 @@ class WSHandler(tornado.websocket.WebSocketHandler):
+                     self.close(1003, "Could not launch app: %r" % err)
+                     raise
+                 self.write_message("PRINT Flexx server says hi", binary=BINARY)
++        elif message.startswith('PONG '):
++            self.on_pong2(message[5:])
+         else:
+             try:
+                 self._session._receive_command(message)
+@@ -491,24 +494,79 @@ class WSHandler(tornado.websocket.WebSocketHandler):
+             self._session = None  # Allow cleaning up
+     
+     @gen.coroutine
+-    def pinger(self):
++    def pinger1(self):
+         """ Check for timeouts. This helps remove lingering false connections.
++        
++        This uses the websocket's native ping-ping mechanism. On the
++        browser side, pongs work even if JS is busy. On the Python side
++        we perform a check whether we were really waiting or whether Python 
++        was too busy to detect the pong.
+         """
+         self._pongtime = time.time()
++        self._pingtime = pingtime = 0
++        
+         while self.close_code is None:
+-            self.ping(b'x')
+-            yield gen.sleep(2)
+-            if time.time() - self._pongtime > config.ws_timeout:
++            dt = config.ws_timeout
++            
++            # Ping, but don't spam
++            if pingtime <= self._pongtime:
++                self.ping(b'x')
++                pingtime = self._pingtime = time.time()
++                iters_since_ping = 0
++            
++            yield gen.sleep(dt / 5)
++            
++            # Check pong status
++            iters_since_ping += 1
++            if iters_since_ping < 5:
++                pass  # we might have missed the pong
++            elif time.time() - self._pongtime > dt:
++                # Delay is so big that connection probably dropped.
++                # Note that a browser sends a pong even if JS is busy
+                 logger.warn('Closing connection due to lack of pong')
+                 self.close(1000, 'Conection timed out (no pong).')
+                 return
+     
+     def on_pong(self, data):
+-        """ Called when our ping is returned.
++        """ Implement the ws's on_pong() method. Called when our ping
++        is returned by the browser.
+         """
+-        #logger.debug('pong')
+         self._pongtime = time.time()
+     
++    @property
++    def ping_counter(self):
++        """ Counter indicating the number of pings so far. This measure is
++        used by ``Session.keep_alive()``.
++        """
++        return self._ping_counter
++    
++    @gen.coroutine
++    def pinger2(self):
++        """ Ticker so we have a signal of sorts to indicate round-trips.
++        
++        This is used to implement session.call_on_next_pong(), which
++        is sort of like call_later(), but waits for both Py and JS to "flush"
++        their current events.
++        
++        This uses a ping-pong mechanism implemented *atop* the websocket.
++        When JS is working, it is not able to send a pong (which is what we
++        want in this case).
++        """
++        self._ping_counter = 0
++        self._pong_counter = 0
++        while self.close_code is None:
++            if self._pong_counter >= self._ping_counter:
++                self._ping_counter += 1
++                self.command('PING %i' % self._ping_counter)
++            yield gen.sleep(1.0)
++    
++    def on_pong2(self, data):
++        """ Called when our ping is returned by Flexx.
++        """
++        self._pong_counter = int(data)
++        if self._session:
++            self._session._receive_pong(self._pong_counter)
++    
+     # --- methods
+     
+     def command(self, cmd):
+diff --git a/flexx/ui/_widget.py b/flexx/ui/_widget.py
+index 36754c7..63c1a52 100644
+--- a/flexx/ui/_widget.py
++++ b/flexx/ui/_widget.py
+@@ -10,29 +10,19 @@
+ """
+ 
+ from .. import event
+-from ..app import Model, call_later, get_active_model
++from ..app import Model, get_active_model
+ from ..pyscript import undefined, window
++from . import logger
+ 
+-
++# todo: remove this (left for now for backward compat)
+ class LiveKeeper:
+-    """ This little utility keeps objects alive for a set period of
+-    time. This is used to prevent Widget objects from being cleaned up
+-    by the garbadge collector when they are only referenced by the
+-    "children" property of their parent. Due to synchronization, the
+-    children property can "jitter", causing references of objects to
+-    be lost.
+-    """
+-
+-    def __init__(self):
+-        self._objects = {}
+-
+-    def keep(self, ob, timeout=5.0):
+-        i = id(ob)
+-        self._objects[i] = ob
+-        call_later(timeout, self.clear, i)
+-
+-    def clear(self, i):
+-        self._objects.pop(i, None)
++    _warned = False
++    
++    def keep(self, ob):
++        if not self._warned:
++            self._warned = True
++            logger.warn('liveKeeper is deprecated, use Session.keep_alive() instead.')
++        ob.session.keep_alive(ob)
+ 
+ liveKeeper = LiveKeeper()
+ 
+@@ -169,7 +159,7 @@ class Widget(Model):
+     def __keep_alive(self, *events):
+         # When the parent changes, we prevent the widget from being deleted
+         # for a few seconds, to it will survive parent-children "jitter".
+-        liveKeeper.keep(self)
++        self._session.keep_alive(self)
+     
+     parent = event.prop(parent)
+     
+diff --git a/flexx/ui/examples/stayin_alive.py b/flexx/ui/examples/stayin_alive.py
+new file mode 100644
+index 0000000..d3475c2
+--- /dev/null
++++ b/flexx/ui/examples/stayin_alive.py
+@@ -0,0 +1,75 @@
++"""
++Example that demonstrates/tests how objects survive synchronisation
++jitter even if Python and JS are busy. We tried hard to make this
++as painless as possible in Flexx, which is why this example may look
++a bit dull. But the fact that this works is not trivial :)
++
++What happens is that the ``the_thing`` property is set in the
++``init()``. This will sync to JS, and then back again to Py (syncing
++always ends at the Python side, for eventual synchronicity). However,
++in the mean time, Python has set the property again, so by the time
++that the prop gets synced back to Python, the first Thing is not there
++anymore, and would be deleted (if we had not taken measures to prevent
++that), which would cause problems.
++"""
++
++import time
++from flexx import app, event, ui
++
++
++class Thing(app.Model):
++    
++    @event.prop
++    def value(self, v):
++        return v
++
++
++class Example(ui.Widget):
++    
++    def init(self):
++        self.the_thing = Thing(value=2)
++    
++    @event.prop
++    def foo(self, v=0):
++        print('in foo setter')
++        return v
++
++    @event.connect('the_thing')
++    def on_the_thing(self, *events):
++        for ev in events:
++            print('the thing became %s with value %s' % 
++                  (ev.new_value.id, ev.new_value.value))
++
++    @event.connect('foo')
++    def on_foo(self, *events):
++        print('sleep in Py')
++        time.sleep(10)
++        print('Done sleeping in Py')
++            
++    class Both:
++        
++        @event.prop
++        def the_thing(self, v):
++            assert isinstance(v, Thing)
++            return v
++   
++    class JS:
++        
++        def init(self):
++            print('sleep in JS')
++            self.sleep(10)
++            print('Done sleeping in JS')
++        
++        def sleep(self, t):
++            import time
++            etime = time.time() + t
++            while time.time() < etime:
++                pass
++
++
++m = app.launch(Example)
++with m:
++    m.the_thing = Thing(value=3)
++
++print('starting event loop')
++app.run()

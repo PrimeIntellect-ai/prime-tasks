@@ -1,0 +1,166 @@
+diff --git a/auditors/apparmor/apparmor_test.go b/auditors/apparmor/apparmor_test.go
+index dd51cfc..3d132e9 100644
+--- a/auditors/apparmor/apparmor_test.go
++++ b/auditors/apparmor/apparmor_test.go
+@@ -1,16 +1,69 @@
+ package apparmor
+ 
+ import (
++	"os"
++	"path/filepath"
+ 	"strings"
+ 	"testing"
+ 
++	"github.com/Shopify/kubeaudit"
++	"github.com/Shopify/kubeaudit/auditors/capabilities"
++	"github.com/Shopify/kubeaudit/auditors/nonroot"
++	"github.com/Shopify/kubeaudit/auditors/privileged"
+ 	"github.com/Shopify/kubeaudit/internal/test"
+ 	"github.com/Shopify/kubeaudit/pkg/k8s"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ const fixtureDir = "fixtures"
+ 
++// initContainerEnabledManifest has an AppArmor annotation for both a regular
++// container and an initContainer, both of which exist.
++const initContainerEnabledManifest = `apiVersion: v1
++kind: Pod
++metadata:
++  name: pod
++  namespace: apparmor-annotation-init-container-enabled
++  annotations:
++    container.apparmor.security.beta.kubernetes.io/container: localhost/someval
++    container.apparmor.security.beta.kubernetes.io/init-container: localhost/someval
++spec:
++  initContainers:
++  - name: init-container
++    image: scratch
++  containers:
++    - name: container
++      image: scratch
++`
++
++// initContainerMissingManifest has an initContainer without an AppArmor annotation.
++const initContainerMissingManifest = `apiVersion: v1
++kind: Pod
++metadata:
++  name: pod
++  namespace: apparmor-annotation-init-container-missing
++  annotations:
++    container.apparmor.security.beta.kubernetes.io/container: localhost/someval
++spec:
++  initContainers:
++  - name: init-container
++    image: scratch
++  containers:
++    - name: container
++      image: scratch
++`
++
++// writeManifest writes the given manifest to a temporary directory and returns
++// the directory and file name so it can be used with the shared test helpers.
++func writeManifest(t *testing.T, content string) (dir, file string) {
++	t.Helper()
++	dir = t.TempDir()
++	file = "manifest.yml"
++	require.NoError(t, os.WriteFile(filepath.Join(dir, file), []byte(content), 0644))
++	return dir, file
++}
++
+ func TestAuditAppArmor(t *testing.T) {
+ 	cases := []struct {
+ 		file           string
+@@ -37,6 +90,21 @@ func TestAuditAppArmor(t *testing.T) {
+ 	}
+ }
+ 
++// TestAuditAppArmorInitContainer verifies that the AppArmor auditor treats an
++// annotation that refers to an existing initContainer as valid, and that it
++// still reports a missing annotation for an initContainer.
++func TestAuditAppArmorInitContainer(t *testing.T) {
++	t.Run("annotation refers to existing initContainer", func(t *testing.T) {
++		dir, file := writeManifest(t, initContainerEnabledManifest)
++		test.AuditManifest(t, dir, file, New(), nil)
++	})
++
++	t.Run("initContainer annotation missing", func(t *testing.T) {
++		dir, file := writeManifest(t, initContainerMissingManifest)
++		test.AuditManifest(t, dir, file, New(), []string{AppArmorAnnotationMissing})
++	})
++}
++
+ func TestFixAppArmor(t *testing.T) {
+ 	cases := []struct {
+ 		file                    string
+@@ -63,3 +131,69 @@ func TestFixAppArmor(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestFixAppArmorInitContainer verifies that autofix does not remove a valid
++// AppArmor annotation that refers to an initContainer. It applies the pending
++// fixes produced by the audit directly to the resource so it does not depend on
++// manifest encoding.
++func TestFixAppArmorInitContainer(t *testing.T) {
++	pod := k8s.NewPod()
++	pod.Name = "pod"
++	pod.Spec.Containers = []k8s.ContainerV1{{Name: "container", Image: "scratch"}}
++	pod.Spec.InitContainers = []k8s.ContainerV1{{Name: "init-container", Image: "scratch"}}
++	pod.Annotations = map[string]string{
++		ContainerAnnotationKeyPrefix + "container":      "localhost/someval",
++		ContainerAnnotationKeyPrefix + "init-container": "localhost/someval",
++	}
++
++	results, err := New().Audit(pod, nil)
++	require.NoError(t, err)
++
++	for _, result := range results {
++		if result == nil {
++			continue
++		}
++		result.Fix(pod)
++	}
++
++	annotations := k8s.GetAnnotations(pod)
++	assert.Contains(t, annotations, ContainerAnnotationKeyPrefix+"init-container",
++		"autofix must not remove a valid AppArmor annotation that refers to an initContainer")
++}
++
++// TestAuditAppArmorInitContainers verifies the general requirement that kubeaudit
++// applies security controls to initContainers the same way it does to regular
++// containers, not just for the AppArmor auditor. It builds a Pod in memory so it
++// does not depend on any fixture files.
++func TestAuditAppArmorInitContainers(t *testing.T) {
++	pod := k8s.NewPod()
++	pod.Name = "pod"
++	pod.Spec.Containers = []k8s.ContainerV1{{Name: "container", Image: "scratch"}}
++	pod.Spec.InitContainers = []k8s.ContainerV1{{Name: "init-container", Image: "scratch"}}
++
++	auditors := map[string]kubeaudit.Auditable{
++		"apparmor":     New(),
++		"capabilities": capabilities.New(capabilities.Config{}),
++		"nonroot":      nonroot.New(),
++		"privileged":   privileged.New(),
++	}
++
++	for name, auditable := range auditors {
++		name, auditable := name, auditable
++		t.Run(name, func(t *testing.T) {
++			results, err := auditable.Audit(pod, nil)
++			require.NoError(t, err)
++
++			auditedContainers := map[string]bool{}
++			for _, result := range results {
++				if result == nil {
++					continue
++				}
++				auditedContainers[result.Metadata["Container"]] = true
++			}
++
++			assert.True(t, auditedContainers["container"], "expected the regular container to be audited by %s", name)
++			assert.True(t, auditedContainers["init-container"], "expected the initContainer to be audited by %s", name)
++		})
++	}
++}

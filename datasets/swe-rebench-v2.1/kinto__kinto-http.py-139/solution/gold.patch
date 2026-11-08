@@ -1,0 +1,175 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index c1b6b42..f0fb15c 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -12,14 +12,11 @@ This document describes changes between each past release.
+ - Keep tracks of Backoff headers and raise an ``BackoffException`` if
+   we are not waiting enough between two calls. (#53)
+ - Add ``--retry`` and ``--retry-after`` to CLI utils helpers (fixes #126)
+-- Fetch only one page when ``_limit`` is specified and allow to override this
+-  with a ``pages`` argument (fixes #136)
+ 
+ **Bug fixes**
+ 
+ - Fix retry behaviour when responses are successful (fixes #129)
+ - Fix Retry-After value to be read as integer rather than string. (#131)
+-- Fix No JSON could be decoded ValueError (fixes #116)
+ 
+ **Internal changes**
+ 
+diff --git a/README.rst b/README.rst
+index 36062ef..19458b8 100644
+--- a/README.rst
++++ b/README.rst
+@@ -367,26 +367,6 @@ It is possible (but not recommended) to force this value in the clients:
+                   retry=10,
+                   retry_after=5)
+ 
+-Pagination
+-----------
+-
+-When the server responses are paginated, the client will download every pages and
+-merge them transparently.
+-
+-However, it is possible to specify a limit for the number of items to be retrieved
+-in one page:
+-
+-.. code-block:: python
+-
+-    records = client.get_records(_limit=10)
+-
+-In order to retrieve every available pages with a limited number of items in each
+-of them, you can specify the number of pages:
+-
+-.. code-block:: python
+-
+-    records = client.get_records(_limit=10, pages=float('inf'))  # Infinity
+-
+ 
+ Generating endpoint paths
+ -------------------------
+diff --git a/kinto_http/__init__.py b/kinto_http/__init__.py
+index 6ed6447..17f9073 100644
+--- a/kinto_http/__init__.py
++++ b/kinto_http/__init__.py
+@@ -121,16 +121,13 @@ class Client(object):
+         }
+         return self.endpoints.get(name, **kwargs)
+ 
+-    def _paginated(self, endpoint, records=None, if_none_match=None, pages=None, **kwargs):
++    def _paginated(self, endpoint, records=None, if_none_match=None, **kwargs):
+         if records is None:
+             records = collections.OrderedDict()
+         headers = {}
+         if if_none_match is not None:
+             headers['If-None-Match'] = utils.quote(if_none_match)
+ 
+-        if pages is None:
+-            pages = 1 if '_limit' in kwargs else float('inf')
+-
+         record_resp, headers = self.session.request(
+             'get', endpoint, headers=headers, params=kwargs)
+ 
+@@ -142,13 +139,12 @@ class Client(object):
+             records_tuples = [(r['id'], r) for r in record_resp['data']]
+             records.update(collections.OrderedDict(records_tuples))
+ 
+-            if pages > 1 and 'next-page' in map(str.lower, headers.keys()):
++            if 'next-page' in map(str.lower, headers.keys()):
+                 # Paginated wants a relative URL, but the returned one is
+                 # absolute.
+                 next_page = headers['Next-Page']
+                 return self._paginated(next_page, records,
+-                                       if_none_match=if_none_match,
+-                                       pages=pages - 1)
++                                       if_none_match=if_none_match)
+         return list(records.values())
+ 
+     def _get_cache_headers(self, safe, data=None, if_match=None):
+@@ -243,9 +239,9 @@ class Client(object):
+         kwargs['method'] = 'patch'
+         return self.update_bucket(*args, **kwargs)
+ 
+-    def get_buckets(self, **kwargs):
++    def get_buckets(self):
+         endpoint = self.get_endpoint('buckets')
+-        return self._paginated(endpoint, **kwargs)
++        return self._paginated(endpoint)
+ 
+     def get_bucket(self, bucket=None):
+         endpoint = self.get_endpoint('bucket', bucket=bucket)
+@@ -255,6 +251,13 @@ class Client(object):
+         try:
+             resp, _ = self.session.request('get', endpoint)
+         except KintoException as e:
++            error_resp_code = e.response.status_code
++            if error_resp_code == 401:
++                msg = ("Unauthorized. Please authenticate or make sure the bucket "
++                       "can be read anonymously.")
++                e = KintoException(msg, e)
++                raise e
++
+             raise BucketNotFound(bucket or self._bucket_name, e)
+         return resp
+ 
+@@ -283,9 +286,9 @@ class Client(object):
+ 
+     # Groups
+ 
+-    def get_groups(self, bucket=None, **kwargs):
++    def get_groups(self, bucket=None):
+         endpoint = self.get_endpoint('groups', bucket=bucket)
+-        return self._paginated(endpoint, **kwargs)
++        return self._paginated(endpoint)
+ 
+     def create_group(self, group, bucket=None,
+                      data=None, permissions=None,
+@@ -377,9 +380,9 @@ class Client(object):
+ 
+     # Collections
+ 
+-    def get_collections(self, bucket=None, **kwargs):
++    def get_collections(self, bucket=None):
+         endpoint = self.get_endpoint('collections', bucket=bucket)
+-        return self._paginated(endpoint, **kwargs)
++        return self._paginated(endpoint)
+ 
+     def create_collection(self, collection=None, bucket=None,
+                           data=None, permissions=None, safe=True,
+@@ -602,14 +605,10 @@ class Client(object):
+         return resp['data']
+ 
+     def __repr__(self):
+-        if self._collection_name:
+-            endpoint = self.get_endpoint('collection',
+-                                         bucket=self._bucket_name,
+-                                         collection=self._collection_name)
+-        elif self._bucket_name:
+-            endpoint = self.get_endpoint('bucket', bucket=self._bucket_name)
+-        else:
+-            endpoint = self.get_endpoint('root')
+-
++        endpoint = self.get_endpoint(
++            'collection',
++            bucket=self._bucket_name,
++            collection=self._collection_name
++        )
+         absolute_endpoint = utils.urljoin(self.session.server_url, endpoint)
+         return "<KintoClient %s>" % absolute_endpoint
+diff --git a/kinto_http/session.py b/kinto_http/session.py
+index d33f6a5..b0fb2a5 100644
+--- a/kinto_http/session.py
++++ b/kinto_http/session.py
+@@ -96,11 +96,7 @@ class Session(object):
+                     continue
+ 
+                 # Retries exhausted, raise expection.
+-                try:
+-                    message = '{0} - {1}'.format(resp.status_code, resp.json())
+-                except ValueError:
+-                    # In case the response is not JSON, fallback to text.
+-                    message = '{0} - {1}'.format(resp.status_code, resp.text)
++                message = '{0} - {1}'.format(resp.status_code, resp.json())
+                 exception = KintoException(message)
+                 exception.request = resp.request
+                 exception.response = resp

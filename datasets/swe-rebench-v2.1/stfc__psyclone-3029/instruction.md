@@ -1,0 +1,2 @@
+Bug in RegionTrans.get_node_list() when passed `[Schedule]`
+RegionTrans.get_node_list is supposed to ensure that we always have a valid list of Nodes to transform. However, @imaranresearch has discovered that it is possible to defeat it by passing it a list containing just a Schedule. In this case, we need to do the same as we do when passed a single Schedule node - i.e. return a new list containing its children.

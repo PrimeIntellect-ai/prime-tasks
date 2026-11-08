@@ -1,0 +1,300 @@
+diff --git a/README.md b/README.md
+index 8a65a5a..acf419b 100644
+--- a/README.md
++++ b/README.md
+@@ -82,6 +82,7 @@ Every argument is optional.
+ | [ignore-updates](#ignore-updates)                                   | Any update (update/comment) can reset the stale idle time on the issues/PRs | `false`               |
+ | [ignore-issue-updates](#ignore-issue-updates)                       | Override [ignore-updates](#ignore-updates) for issues only                  |                       |
+ | [ignore-pr-updates](#ignore-pr-updates)                             | Override [ignore-updates](#ignore-updates) for PRs only                     |                       |
++| [include-only-assigned](#include-only-assigned)                             |    Process only assigned issues                |        `false`               |
+ 
+ ### List of output options
+ 
+@@ -517,6 +518,12 @@ Useful to override [ignore-updates](#ignore-updates) but only to ignore the upda
+ 
+ Default value: unset
+ 
++#### include-only-assigned
++
++If set to `true`, only the issues or the pull requests with an assignee will be marked as stale automatically.
++
++Default value: `false`
++
+ ### Usage
+ 
+ See also [action.yml](./action.yml) for a comprehensive list of all the options.
+diff --git a/dist/index.js b/dist/index.js
+index 18754b2..b874b38 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -476,6 +476,11 @@ class IssuesProcessor {
+                 IssuesProcessor._endIssueProcessing(issue);
+                 return; // Don't process locked issues
+             }
++            if (this._isIncludeOnlyAssigned(issue)) {
++                issueLogger.info(`Skipping this $$type because its assignees list is empty`);
++                IssuesProcessor._endIssueProcessing(issue);
++                return; // If the issue has an 'include-only-assigned' option set, process only issues with nonempty assignees list
++            }
+             const onlyLabels = words_to_list_1.wordsToList(this._getOnlyLabels(issue));
+             if (onlyLabels.length > 0) {
+                 issueLogger.info(`The option ${issueLogger.createOptionLink(option_1.Option.OnlyLabels)} was specified to only process issues and pull requests with all those labels (${logger_service_1.LoggerService.cyan(onlyLabels.length)})`);
+@@ -737,7 +742,9 @@ class IssuesProcessor {
+             if (issue.markedStaleThisRun) {
+                 issueLogger.info(`marked stale this run, so don't check for updates`);
+             }
+-            const issueHasUpdateSinceStale = new Date(issue.updated_at) > new Date(markedStaleOn);
++            // The issue.updated_at and markedStaleOn are not always exactly in sync (they can be off by a second or 2)
++            // isDateMoreRecentThan makes sure they are not the same date within a certain tolerance (15 seconds in this case)
++            const issueHasUpdateSinceStale = is_date_more_recent_than_1.isDateMoreRecentThan(new Date(issue.updated_at), new Date(markedStaleOn), 15);
+             issueLogger.info(`$$type has been updated since it was marked stale: ${logger_service_1.LoggerService.cyan(issueHasUpdateSinceStale)}`);
+             // Should we un-stale this issue?
+             if (shouldRemoveStaleWhenUpdated &&
+@@ -988,6 +995,9 @@ class IssuesProcessor {
+         }
+         return this.options.onlyLabels;
+     }
++    _isIncludeOnlyAssigned(issue) {
++        return this.options.includeOnlyAssigned && !issue.hasAssignees;
++    }
+     _getAnyOfLabels(issue) {
+         if (issue.isPullRequest) {
+             if (this.options.anyOfPrLabels !== '') {
+@@ -1957,12 +1967,25 @@ exports.getHumanizedDate = getHumanizedDate;
+ 
+ "use strict";
+ 
++/// returns false if the dates are equal within the `equalityToleranceInSeconds` number of seconds
++/// otherwise returns true if `comparedDate` is after `date`
+ Object.defineProperty(exports, "__esModule", ({ value: true }));
+-exports.isDateMoreRecentThan = void 0;
+-function isDateMoreRecentThan(date, comparedDate) {
++exports.isDateEqualTo = exports.isDateMoreRecentThan = void 0;
++function isDateMoreRecentThan(date, comparedDate, equalityToleranceInSeconds = 0) {
++    if (equalityToleranceInSeconds > 0) {
++        const areDatesEqual = isDateEqualTo(date, comparedDate, equalityToleranceInSeconds);
++        return !areDatesEqual && date > comparedDate;
++    }
+     return date > comparedDate;
+ }
+ exports.isDateMoreRecentThan = isDateMoreRecentThan;
++function isDateEqualTo(date, otherDate, toleranceInSeconds) {
++    const timestamp = date.getTime();
++    const otherTimestamp = otherDate.getTime();
++    const deltaInSeconds = Math.abs(timestamp - otherTimestamp) / 1000;
++    return deltaInSeconds <= toleranceInSeconds;
++}
++exports.isDateEqualTo = isDateEqualTo;
+ 
+ 
+ /***/ }),
+@@ -2207,7 +2230,8 @@ function _getAndValidateArgs() {
+         ignoreIssueUpdates: _toOptionalBoolean('ignore-issue-updates'),
+         ignorePrUpdates: _toOptionalBoolean('ignore-pr-updates'),
+         exemptDraftPr: core.getInput('exempt-draft-pr') === 'true',
+-        closeIssueReason: core.getInput('close-issue-reason')
++        closeIssueReason: core.getInput('close-issue-reason'),
++        includeOnlyAssigned: core.getInput('include-only-assigned') === 'true'
+     };
+     for (const numberInput of [
+         'days-before-stale',
+diff --git a/src/classes/issue.spec.ts b/src/classes/issue.spec.ts
+index 0a60d1a..977b767 100644
+--- a/src/classes/issue.spec.ts
++++ b/src/classes/issue.spec.ts
+@@ -62,7 +62,8 @@ describe('Issue', (): void => {
+       ignoreIssueUpdates: undefined,
+       ignorePrUpdates: undefined,
+       exemptDraftPr: false,
+-      closeIssueReason: ''
++      closeIssueReason: '',
++      includeOnlyAssigned: false
+     };
+     issueInterface = {
+       title: 'dummy-title',
+diff --git a/src/classes/issues-processor.ts b/src/classes/issues-processor.ts
+index d0397eb..70e3bf2 100644
+--- a/src/classes/issues-processor.ts
++++ b/src/classes/issues-processor.ts
+@@ -221,6 +221,14 @@ export class IssuesProcessor {
+       return; // Don't process locked issues
+     }
+ 
++    if (this._isIncludeOnlyAssigned(issue)) {
++      issueLogger.info(
++        `Skipping this $$type because its assignees list is empty`
++      );
++      IssuesProcessor._endIssueProcessing(issue);
++      return; // If the issue has an 'include-only-assigned' option set, process only issues with nonempty assignees list
++    }
++
+     const onlyLabels: string[] = wordsToList(this._getOnlyLabels(issue));
+ 
+     if (onlyLabels.length > 0) {
+@@ -665,8 +673,13 @@ export class IssuesProcessor {
+       issueLogger.info(`marked stale this run, so don't check for updates`);
+     }
+ 
+-    const issueHasUpdateSinceStale =
+-      new Date(issue.updated_at) > new Date(markedStaleOn);
++    // The issue.updated_at and markedStaleOn are not always exactly in sync (they can be off by a second or 2)
++    // isDateMoreRecentThan makes sure they are not the same date within a certain tolerance (15 seconds in this case)
++    const issueHasUpdateSinceStale = isDateMoreRecentThan(
++      new Date(issue.updated_at),
++      new Date(markedStaleOn),
++      15
++    );
+ 
+     issueLogger.info(
+       `$$type has been updated since it was marked stale: ${LoggerService.cyan(
+@@ -1012,6 +1025,10 @@ export class IssuesProcessor {
+     return this.options.onlyLabels;
+   }
+ 
++  private _isIncludeOnlyAssigned(issue: Issue): boolean {
++    return this.options.includeOnlyAssigned && !issue.hasAssignees;
++  }
++
+   private _getAnyOfLabels(issue: Issue): string {
+     if (issue.isPullRequest) {
+       if (this.options.anyOfPrLabels !== '') {
+diff --git a/src/functions/dates/is-date-more-recent-than.spec.ts b/src/functions/dates/is-date-more-recent-than.spec.ts
+index f564cf6..6ed1f3a 100644
+--- a/src/functions/dates/is-date-more-recent-than.spec.ts
++++ b/src/functions/dates/is-date-more-recent-than.spec.ts
+@@ -1,4 +1,4 @@
+-import {isDateMoreRecentThan} from './is-date-more-recent-than';
++import {isDateEqualTo, isDateMoreRecentThan} from './is-date-more-recent-than';
+ 
+ describe('isDateMoreRecentThan()', (): void => {
+   let date: Date;
+@@ -48,4 +48,68 @@ describe('isDateMoreRecentThan()', (): void => {
+       expect(result).toStrictEqual(true);
+     });
+   });
++
++  describe('date equality', (): void => {
++    it('should correctly compare a before date outside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T14:00:00');
++      expect(isDateEqualTo(aDate, otherDate, 60)).toBe(false);
++    });
++
++    it('should correctly compare a before date inside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T13:00:42');
++      expect(isDateEqualTo(aDate, otherDate, 60)).toBe(true);
++    });
++
++    it('should correctly compare an after date outside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T12:00:00');
++      expect(isDateEqualTo(aDate, otherDate, 60)).toBe(false);
++    });
++
++    it('should correctly compare an after date inside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T12:59:42');
++      expect(isDateEqualTo(aDate, otherDate, 60)).toBe(true);
++    });
++
++    it('should correctly compare an exactly equal date', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T13:00:00');
++      expect(isDateEqualTo(aDate, otherDate, 60)).toBe(true);
++    });
++  });
++
++  describe('date comparison with tolerances', (): void => {
++    it('should correctly compare a before date outside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T14:00:00');
++      expect(isDateMoreRecentThan(aDate, otherDate)).toBe(false);
++    });
++
++    it('should correctly compare a before date inside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T13:00:42');
++      expect(isDateMoreRecentThan(aDate, otherDate, 60)).toBe(false); // considered equal here
++    });
++
++    it('should correctly compare an after date outside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T12:00:00');
++      expect(isDateMoreRecentThan(aDate, otherDate, 60)).toBe(true);
++    });
++
++    it('should correctly compare an after date inside tolerance', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T12:59:42');
++      expect(isDateMoreRecentThan(aDate, otherDate, 60)).toBe(false); // considered equal here
++    });
++
++    it('should correctly compare an exactly equal date', (): void => {
++      const aDate = new Date('2022-09-09T13:00:00');
++      const otherDate = new Date('2022-09-09T13:00:00');
++      expect(isDateMoreRecentThan(aDate, otherDate, 60)).toBe(false);
++    });
++  });
+ });
+diff --git a/src/functions/dates/is-date-more-recent-than.ts b/src/functions/dates/is-date-more-recent-than.ts
+index 482c9db..ee7dbda 100644
+--- a/src/functions/dates/is-date-more-recent-than.ts
++++ b/src/functions/dates/is-date-more-recent-than.ts
+@@ -1,6 +1,31 @@
++/// returns false if the dates are equal within the `equalityToleranceInSeconds` number of seconds
++/// otherwise returns true if `comparedDate` is after `date`
++
+ export function isDateMoreRecentThan(
+   date: Readonly<Date>,
+-  comparedDate: Readonly<Date>
++  comparedDate: Readonly<Date>,
++  equalityToleranceInSeconds = 0
+ ): boolean {
++  if (equalityToleranceInSeconds > 0) {
++    const areDatesEqual = isDateEqualTo(
++      date,
++      comparedDate,
++      equalityToleranceInSeconds
++    );
++
++    return !areDatesEqual && date > comparedDate;
++  }
++
+   return date > comparedDate;
+ }
++
++export function isDateEqualTo(
++  date: Date,
++  otherDate: Date,
++  toleranceInSeconds: number
++): boolean {
++  const timestamp = date.getTime();
++  const otherTimestamp = otherDate.getTime();
++  const deltaInSeconds = Math.abs(timestamp - otherTimestamp) / 1000;
++  return deltaInSeconds <= toleranceInSeconds;
++}
+diff --git a/src/interfaces/issues-processor-options.ts b/src/interfaces/issues-processor-options.ts
+index 496584e..b056a28 100644
+--- a/src/interfaces/issues-processor-options.ts
++++ b/src/interfaces/issues-processor-options.ts
+@@ -52,4 +52,5 @@ export interface IIssuesProcessorOptions {
+   ignorePrUpdates: boolean | undefined;
+   exemptDraftPr: boolean;
+   closeIssueReason: string;
++  includeOnlyAssigned: boolean;
+ }
+diff --git a/src/main.ts b/src/main.ts
+index 770aa11..4b7adea 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -88,7 +88,8 @@ function _getAndValidateArgs(): IIssuesProcessorOptions {
+     ignoreIssueUpdates: _toOptionalBoolean('ignore-issue-updates'),
+     ignorePrUpdates: _toOptionalBoolean('ignore-pr-updates'),
+     exemptDraftPr: core.getInput('exempt-draft-pr') === 'true',
+-    closeIssueReason: core.getInput('close-issue-reason')
++    closeIssueReason: core.getInput('close-issue-reason'),
++    includeOnlyAssigned: core.getInput('include-only-assigned') === 'true'
+   };
+ 
+   for (const numberInput of [

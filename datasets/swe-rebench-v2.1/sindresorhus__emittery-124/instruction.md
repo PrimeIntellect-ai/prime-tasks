@@ -1,0 +1,2 @@
+once: support filter predicate
+Sometimes `once()` is very convenient but it can't be used when wanting to wait for the first event that meets some predicate (e.g. an event from a websocket with not only a certain name but where the message payload also provides some specific property). I'd like a way to pass in a filter predicate to `once()` so that I can still use it and rather than using `on()` and manually unsubscribing once the desired event is received.

@@ -1,0 +1,397 @@
+diff --git a/pkg/provider/azure_loadbalancer_test.go b/pkg/provider/azure_loadbalancer_test.go
+index 9445514f..e14a288d 100644
+--- a/pkg/provider/azure_loadbalancer_test.go
++++ b/pkg/provider/azure_loadbalancer_test.go
+@@ -31,18 +31,23 @@ import (
+ 
+ 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
+ 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
++	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-02-01/storage"
+ 	"github.com/Azure/go-autorest/autorest/to"
+ 	"github.com/golang/mock/gomock"
+ 	"github.com/stretchr/testify/assert"
+ 
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	cloudprovider "k8s.io/cloud-provider"
+ 
++	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/diskclient/mockdiskclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/interfaceclient/mockinterfaceclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/loadbalancerclient/mockloadbalancerclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/publicipclient/mockpublicipclient"
++	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/routetableclient/mockroutetableclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/securitygroupclient/mocksecuritygroupclient"
++	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient/mockstorageaccountclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmclient/mockvmclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmssclient/mockvmssclient"
+@@ -693,7 +698,7 @@ func TestShouldReleaseExistingOwnedPublicIP(t *testing.T) {
+ 	existingPipWithNoPublicIPAddressFormatProperties := network.PublicIPAddress{
+ 		ID:                              to.StringPtr("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testPIP"),
+ 		Name:                            to.StringPtr("testPIP"),
+-		Tags:                            map[string]*string{"service": to.StringPtr("default/test2")},
++		Tags:                            map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test2")},
+ 		PublicIPAddressPropertiesFormat: nil,
+ 	}
+ 
+@@ -2910,6 +2915,35 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			expectedCreateOrUpdateCount: 0,
+ 			expectedDeleteCount:         0,
+ 		},
++		{
++			desc:   "reconcilePublicIP shall not claim a PIP assigned to another legacy cluster",
++			wantLb: false,
++			existingPIPs: []network.PublicIPAddress{
++				{
++					Name: to.StringPtr("pip1"),
++					Tags: map[string]*string{
++						"service":                 to.StringPtr("default/test1"),
++						"kubernetes-cluster-name": to.StringPtr("another-cluster"),
++					},
++					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{IPAddress: to.StringPtr("1.2.3.4")},
++				},
++			},
++			expectedCreateOrUpdateCount: 0,
++			expectedDeleteCount:         0,
++		},
++		{
++			desc:   "reconcilePublicIP shall release an unused PIP with legacy ownership tags",
++			wantLb: false,
++			existingPIPs: []network.PublicIPAddress{{
++				Name: to.StringPtr("pip1"),
++				Tags: map[string]*string{
++					"service":                 to.StringPtr("default/test1"),
++					"kubernetes-cluster-name": to.StringPtr("testCluster"),
++				},
++				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{IPAddress: to.StringPtr("1.2.3.4")},
++			}},
++			expectedDeleteCount: 1,
++		},
+ 		{
+ 			desc:   "reconcilePublicIP shall delete unwanted pips and create a new one",
+ 			wantLb: true,
+@@ -2927,6 +2961,47 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			expectedCreateOrUpdateCount: 1,
+ 			expectedDeleteCount:         1,
+ 		},
++		{
++			desc:        "reconcilePublicIP shall create a tagged public IP while removing an unwanted one",
++			wantLb:      true,
++			annotations: map[string]string{consts.ServiceAnnotationDNSLabelName: "test-dns"},
++			existingPIPs: []network.PublicIPAddress{
++				{
++					Name: to.StringPtr("pip1"),
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("kube-system/test1")},
++					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
++						IPAddress: to.StringPtr("1.2.3.4"),
++					},
++				},
++			},
++			expectedID: "/subscriptions/subscription/resourceGroups/rg/providers/" +
++				"Microsoft.Network/publicIPAddresses/testCluster-atest1",
++			expectedCreateOrUpdateCount: 1,
++			expectedDeleteCount:         1,
++		},
++		{
++			desc:   "reconcilePublicIP shall honor another service's legacy DNS-label claim",
++			wantLb: true,
++			annotations: map[string]string{
++				consts.ServiceAnnotationPIPName:      "pip1",
++				consts.ServiceAnnotationDNSLabelName: "test-dns",
++			},
++			existingPIPs: []network.PublicIPAddress{{
++				Name: to.StringPtr("pip1"),
++				Tags: map[string]*string{
++					consts.ServiceTagKey:           to.StringPtr("default/test1"),
++					consts.ClusterNameKey:          to.StringPtr("testCluster"),
++					"kubernetes-dns-label-service": to.StringPtr("default/other"),
++				},
++				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
++					IPAddress:   to.StringPtr("1.2.3.4"),
++					DNSSettings: &network.PublicIPAddressDNSSettings{DomainNameLabel: to.StringPtr("test-dns")},
++				},
++			}},
++			expectedError:               true,
++			expectedCreateOrUpdateCount: 0,
++			expectedDeleteCount:         0,
++		},
+ 		{
+ 			desc:        "reconcilePublicIP shall report error if the given PIP name doesn't exist in the resource group",
+ 			wantLb:      true,
+@@ -2934,11 +3009,11 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			existingPIPs: []network.PublicIPAddress{
+ 				{
+ 					Name: to.StringPtr("pip1"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 				},
+ 				{
+ 					Name: to.StringPtr("pip2"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 				},
+ 			},
+ 			expectedError:               true,
+@@ -2952,21 +3027,21 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			existingPIPs: []network.PublicIPAddress{
+ 				{
+ 					Name: to.StringPtr("pip1"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+ 				},
+ 				{
+ 					Name: to.StringPtr("pip2"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+ 				},
+ 				{
+ 					Name: to.StringPtr("testPIP"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+@@ -2975,7 +3050,7 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			expectedPIP: &network.PublicIPAddress{
+ 				ID:   to.StringPtr("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testPIP"),
+ 				Name: to.StringPtr("testPIP"),
+-				Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++				Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 					PublicIPAddressVersion: network.IPVersionIPv4,
+ 					IPAddress:              to.StringPtr("1.2.3.4"),
+@@ -2991,21 +3066,21 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			existingPIPs: []network.PublicIPAddress{
+ 				{
+ 					Name: to.StringPtr("pip1"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+ 				},
+ 				{
+ 					Name: to.StringPtr("pip2"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1,default/test2")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1,default/test2")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+ 				},
+ 				{
+ 					Name: to.StringPtr("testPIP"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+@@ -3014,7 +3089,7 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			expectedPIP: &network.PublicIPAddress{
+ 				ID:   to.StringPtr("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testPIP"),
+ 				Name: to.StringPtr("testPIP"),
+-				Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++				Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 					PublicIPAddressVersion: network.IPVersionIPv4,
+ 					IPAddress:              to.StringPtr("1.2.3.4"),
+@@ -3033,21 +3108,21 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			existingPIPs: []network.PublicIPAddress{
+ 				{
+ 					Name: to.StringPtr("pip1"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+ 				},
+ 				{
+ 					Name: to.StringPtr("pip2"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+ 				},
+ 				{
+ 					Name: to.StringPtr("testPIP"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+@@ -3056,7 +3131,7 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			expectedPIP: &network.PublicIPAddress{
+ 				ID:   to.StringPtr("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testPIP"),
+ 				Name: to.StringPtr("testPIP"),
+-				Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++				Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 					PublicIPAddressVersion:   network.IPVersionIPv4,
+ 					PublicIPAllocationMethod: network.IPAllocationMethodStatic,
+@@ -3081,7 +3156,7 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			existingPIPs: []network.PublicIPAddress{
+ 				{
+ 					Name: to.StringPtr("testPIP"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						PublicIPAddressVersion:   network.IPVersionIPv4,
+ 						PublicIPAllocationMethod: network.IPAllocationMethodStatic,
+@@ -3098,7 +3173,7 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			expectedPIP: &network.PublicIPAddress{
+ 				ID:   to.StringPtr("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testPIP"),
+ 				Name: to.StringPtr("testPIP"),
+-				Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++				Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 					PublicIPAddressVersion:   network.IPVersionIPv4,
+ 					PublicIPAllocationMethod: network.IPAllocationMethodStatic,
+@@ -3127,7 +3202,7 @@ func TestReconcilePublicIP(t *testing.T) {
+ 				},
+ 				{
+ 					Name: to.StringPtr("pip2"),
+-					Tags: map[string]*string{"service": to.StringPtr("default/test1")},
++					Tags: map[string]*string{consts.ServiceTagKey: to.StringPtr("default/test1")},
+ 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
+ 						IPAddress: to.StringPtr("1.2.3.4"),
+ 					},
+@@ -3185,11 +3260,14 @@ func TestReconcilePublicIP(t *testing.T) {
+ 			})
+ 
+ 			mockPIPsClient.EXPECT().List(gomock.Any(), "rg").Return(test.existingPIPs, nil).AnyTimes()
+-			if i == 2 {
++			if test.desc == "reconcilePublicIP shall create a tagged public IP while removing an unwanted one" || test.desc == "reconcilePublicIP shall delete unwanted pips and create a new one" {
+ 				mockPIPsClient.EXPECT().Get(gomock.Any(), "rg", "testCluster-atest1", gomock.Any()).Return(network.PublicIPAddress{}, &retry.Error{HTTPStatusCode: http.StatusNotFound}).Times(1)
+ 				mockPIPsClient.EXPECT().Get(gomock.Any(), "rg", "testCluster-atest1", gomock.Any()).Return(network.PublicIPAddress{ID: to.StringPtr("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testCluster-atest1")}, nil).Times(1)
+ 			}
+ 			service := getTestService("test1", v1.ProtocolTCP, nil, false, 80)
++			if test.desc == "reconcilePublicIP shall create a tagged public IP while removing an unwanted one" {
++				service.Namespace = "kube-system"
++			}
+ 			service.Annotations = test.annotations
+ 			for _, pip := range test.existingPIPs {
+ 				savedPips[*pip.Name] = pip
+@@ -3224,6 +3302,15 @@ func TestReconcilePublicIP(t *testing.T) {
+ 				createOrUpdateCount = 0
+ 			}
+ 			pip, err := az.reconcilePublicIP("testCluster", &service, "", test.wantLb)
++			if test.desc == "reconcilePublicIP shall create a tagged public IP while removing an unwanted one" {
++				created := savedPips["testCluster-atest1"]
++				assert.Equal(t, to.StringPtr("kube-system/test1"), created.Tags[consts.ServiceTagKey])
++				assert.Equal(t, to.StringPtr("testCluster"), created.Tags[consts.ClusterNameKey])
++				assert.Equal(t, to.StringPtr("kube-system/test1"), created.Tags[consts.ServiceUsingDNSKey])
++				assert.NotContains(t, created.Tags, "service")
++				assert.NotContains(t, created.Tags, "kubernetes-cluster-name")
++				assert.NotContains(t, created.Tags, "kubernetes-dns-label-service")
++			}
+ 			if !test.expectedError {
+ 				assert.Equal(t, nil, err, "TestCase[%d]: %s", i, test.desc)
+ 			}
+@@ -3559,8 +3646,8 @@ func TestEnsurePublicIPExistsWithExtendedLocation(t *testing.T) {
+ 			ProvisioningState:        "",
+ 		},
+ 		Tags: map[string]*string{
+-			"service":                 to.StringPtr("default/test1"),
+-			"kubernetes-cluster-name": to.StringPtr(""),
++			consts.ServiceTagKey:  to.StringPtr("default/test1"),
++			consts.ClusterNameKey: to.StringPtr(""),
+ 		},
+ 	}
+ 	mockPIPsClient := az.PublicIPAddressesClient.(*mockpublicipclient.MockInterface)
+@@ -4642,3 +4729,74 @@ func TestReconcileSharedLoadBalancer(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestAzureCreatedByTagsOnDiskAndStorageAccountCreation(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	cloud := GetTestCloud(ctrl)
++	diskClient := cloud.DisksClient.(*mockdiskclient.MockInterface)
++	var createdDisk compute.Disk
++	diskClient.EXPECT().CreateOrUpdate(gomock.Any(), cloud.ResourceGroup, "tagged-disk", gomock.Any()).
++		DoAndReturn(func(ctx context.Context, resourceGroup, name string, parameters compute.Disk) *retry.Error {
++			createdDisk = parameters
++			return nil
++		})
++	diskClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, "tagged-disk").
++		Return(compute.Disk{ID: to.StringPtr("disk-id"), Name: to.StringPtr("tagged-disk"), DiskProperties: &compute.DiskProperties{ProvisioningState: to.StringPtr("Succeeded")}}, nil).AnyTimes()
++	_, err := cloud.ManagedDiskController.CreateManagedDisk(&ManagedDiskOptions{
++		DiskName: "tagged-disk", StorageAccountType: compute.StandardLRS, ResourceGroup: cloud.ResourceGroup, SizeGB: 1,
++	})
++	assert.NoError(t, err)
++	assert.Equal(t, to.StringPtr("kubernetes-azure-dd"), createdDisk.Tags["k8s-azure-created-by"])
++
++	storageClient := mockstorageaccountclient.NewMockInterface(ctrl)
++	cloud.StorageAccountClient = storageClient
++	var createdAccount storage.AccountCreateParameters
++	storageClient.EXPECT().Create(gomock.Any(), "rg", gomock.Any(), gomock.Any()).
++		DoAndReturn(func(ctx context.Context, resourceGroup, name string, parameters storage.AccountCreateParameters) *retry.Error {
++			createdAccount = parameters
++			return nil
++		})
++	storageClient.EXPECT().ListKeys(gomock.Any(), "rg", gomock.Any()).Return(storage.AccountListKeysResult{
++		Keys: &[]storage.AccountKey{{Value: to.StringPtr("account-key")}},
++	}, nil)
++	_, _, err = cloud.EnsureStorageAccount(context.Background(), &AccountOptions{
++		ResourceGroup: "rg", CreateAccount: true, Tags: map[string]string{},
++	}, "tagged")
++	assert.NoError(t, err)
++	assert.Equal(t, to.StringPtr("azure"), createdAccount.Tags["k8s-azure-created-by"])
++}
++
++func TestListRoutesAppliesConfiguredResourceTags(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++	routeTables := mockroutetableclient.NewMockInterface(ctrl)
++	cloud := &Cloud{
++		RouteTablesClient:  routeTables,
++		Config:             Config{RouteTableResourceGroup: "rg", RouteTableName: "routes", RouteUpdateWaitingInSeconds: 0, Tags: "owner=team"},
++		unmanagedNodes:     sets.NewString(),
++		nodeInformerSynced: func() bool { return true },
++	}
++	cache, err := cloud.newRouteTableCache()
++	assert.NoError(t, err)
++	cloud.rtCache = cache
++	routeTable := network.RouteTable{Name: to.StringPtr("routes"), Location: to.StringPtr("location")}
++	routeTables.EXPECT().Get(gomock.Any(), "rg", "routes", "").Return(routeTable, nil).AnyTimes()
++	updated := make(chan struct{}, 1)
++	routeTables.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "routes", gomock.Any(), gomock.Any()).
++		DoAndReturn(func(ctx context.Context, resourceGroup, name string, parameters network.RouteTable, etag string) *retry.Error {
++			assert.Equal(t, to.StringPtr("team"), parameters.Tags["owner"])
++			updated <- struct{}{}
++			return nil
++		})
++	cloud.routeUpdater = newDelayedRouteUpdater(cloud, time.Millisecond)
++	go cloud.routeUpdater.run()
++	_, err = cloud.ListRoutes(context.Background(), "cluster")
++	assert.NoError(t, err)
++	select {
++	case <-updated:
++	case <-time.After(time.Second):
++		t.Fatal("route-table tag reconciliation did not update Azure")
++	}
++}
+diff --git a/tests/e2e/network/service_annotations.go b/tests/e2e/network/service_annotations.go
+index 9e0c630b..c900b1e2 100644
+--- a/tests/e2e/network/service_annotations.go
++++ b/tests/e2e/network/service_annotations.go
+@@ -502,8 +502,8 @@ func waitComparePIPTags(tc *utils.AzureTestClient, expectedTags map[string]*stri
+ 			return false, err
+ 		}
+ 		tags := pip.Tags
+-		delete(tags, "kubernetes-cluster-name")
+-		delete(tags, "service")
++		delete(tags, consts.ClusterNameKey)
++		delete(tags, consts.ServiceTagKey)
+ 		utils.Logf("\ntags: %v\nexpectedTags: %v", tags, expectedTags)
+ 		return reflect.DeepEqual(tags, expectedTags), nil
+ 	})

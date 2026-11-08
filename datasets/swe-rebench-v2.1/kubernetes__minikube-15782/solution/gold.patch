@@ -1,0 +1,555 @@
+diff --git a/cmd/minikube/cmd/delete.go b/cmd/minikube/cmd/delete.go
+index acdf12bc6..74ecf22bf 100644
+--- a/cmd/minikube/cmd/delete.go
++++ b/cmd/minikube/cmd/delete.go
+@@ -584,9 +584,10 @@ func deleteMachineDirectories(cc *config.ClusterConfig) {
+ 	}
+ }
+ 
+-// killMountProcess kills the mount process, if it is running
++// killMountProcess looks for the legacy path and for profile path for a pidfile,
++// it then tries to kill all the pids listed in the pidfile (one or more)
+ func killMountProcess() error {
+-	profile := viper.GetString("profile")
++	profile := ClusterFlagValue()
+ 	paths := []string{
+ 		localpath.MiniPath(), // legacy mount-process path for backwards compatibility
+ 		localpath.Profile(profile),
+@@ -601,49 +602,120 @@ func killMountProcess() error {
+ 	return nil
+ }
+ 
++// killProcess takes a path to look for a pidfile (space-separated),
++// it reads the file and converts it to a bunch of pid ints,
++// then it tries to kill each one of them.
++// If no errors were encountered, it cleans the pidfile
+ func killProcess(path string) error {
+ 	pidPath := filepath.Join(path, constants.MountProcessFileName)
+ 	if _, err := os.Stat(pidPath); os.IsNotExist(err) {
+ 		return nil
+ 	}
+-
+ 	klog.Infof("Found %s ...", pidPath)
+-	out, err := os.ReadFile(pidPath)
++
++	ppp, err := getPids(pidPath)
+ 	if err != nil {
+-		return errors.Wrap(err, "ReadFile")
++		return err
+ 	}
+-	klog.Infof("pidfile contents: %s", out)
+-	pid, err := strconv.Atoi(string(out))
+-	if err != nil {
+-		return errors.Wrap(err, "error parsing pid")
++
++	// we're trying to kill each process, without stopping at first error encountered
++	// error handling is done below
++	var errs []error
++	for _, pp := range ppp {
++		err := trySigKillProcess(pp)
++		if err != nil {
++			errs = append(errs, err)
++		}
++
+ 	}
+-	// os.FindProcess does not check if pid is running :(
+-	entry, err := ps.FindProcess(pid)
++
++	if len(errs) == 1 {
++		// if we've encountered only one error, we're returning it:
++		return errs[0]
++	} else if len(errs) != 0 {
++		// if multiple errors were encountered, combine them into a single error
++		out.Styled(style.Failure, "Multiple errors encountered:")
++		for _, e := range errs {
++			out.Err("%v\n", e)
++		}
++		return errors.New("multiple errors encountered while closing mount processes")
++	}
++
++	// if no errors were encoutered, it's safe to delete pidFile
++	if err := os.Remove(pidPath); err != nil {
++		return errors.Wrap(err, "while closing mount-pids file")
++	}
++
++	return nil
++}
++
++// trySigKillProcess takes a PID as argument and tries to SIGKILL it.
++// It performs an ownership check of the pid,
++// before trying to send a sigkill signal to it
++func trySigKillProcess(pid int) error {
++	itDoes, err := isMinikubeProcess(pid)
+ 	if err != nil {
+-		return errors.Wrap(err, "ps.FindProcess")
++		return err
+ 	}
+-	if entry == nil {
+-		klog.Infof("Stale pid: %d", pid)
+-		if err := os.Remove(pidPath); err != nil {
+-			return errors.Wrap(err, "Removing stale pid")
+-		}
+-		return nil
++
++	if !itDoes {
++		return fmt.Errorf("stale pid: %d", pid)
+ 	}
+ 
+-	// We found a process, but it still may not be ours.
+-	klog.Infof("Found process %d: %s", pid, entry.Executable())
+ 	proc, err := os.FindProcess(pid)
+ 	if err != nil {
+-		return errors.Wrap(err, "os.FindProcess")
++		return errors.Wrapf(err, "os.FindProcess: %d", pid)
+ 	}
+ 
+ 	klog.Infof("Killing pid %d ...", pid)
+ 	if err := proc.Kill(); err != nil {
+ 		klog.Infof("Kill failed with %v - removing probably stale pid...", err)
+-		if err := os.Remove(pidPath); err != nil {
+-			return errors.Wrap(err, "Removing likely stale unkillable pid")
+-		}
+-		return errors.Wrap(err, fmt.Sprintf("Kill(%d/%s)", pid, entry.Executable()))
++		return errors.Wrapf(err, "removing likely stale unkillable pid: %d", pid)
+ 	}
++
+ 	return nil
+ }
++
++// doesPIDBelongToMinikube tries to find the process with that PID
++// and checks if the executable name contains the string "minikube"
++var isMinikubeProcess = func(pid int) (bool, error) {
++	entry, err := ps.FindProcess(pid)
++	if err != nil {
++		return false, errors.Wrapf(err, "ps.FindProcess for %d", pid)
++	}
++	if entry == nil {
++		klog.Infof("Process not found. pid %d", pid)
++		return false, nil
++	}
++
++	klog.Infof("Found process %d", pid)
++	if !strings.Contains(entry.Executable(), "minikube") {
++		klog.Infof("process %d was not started by minikube", pid)
++		return false, nil
++	}
++
++	return true, nil
++}
++
++// getPids opens the file at PATH and tries to read
++// one or more space separated pids
++func getPids(path string) ([]int, error) {
++	out, err := os.ReadFile(path)
++	if err != nil {
++		return nil, errors.Wrap(err, "ReadFile")
++	}
++	klog.Infof("pidfile contents: %s", out)
++
++	pids := []int{}
++	strPids := strings.Fields(string(out))
++	for _, p := range strPids {
++		intPid, err := strconv.Atoi(p)
++		if err != nil {
++			return nil, err
++		}
++
++		pids = append(pids, intPid)
++	}
++
++	return pids, nil
++}
+diff --git a/cmd/minikube/cmd/mount.go b/cmd/minikube/cmd/mount.go
+index fc9fdc120..dde841f25 100644
+--- a/cmd/minikube/cmd/mount.go
++++ b/cmd/minikube/cmd/mount.go
+@@ -21,6 +21,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"os/signal"
++	"path/filepath"
+ 	"runtime"
+ 	"strconv"
+ 	"strings"
+@@ -35,11 +36,13 @@ import (
+ 	"k8s.io/minikube/pkg/minikube/detect"
+ 	"k8s.io/minikube/pkg/minikube/driver"
+ 	"k8s.io/minikube/pkg/minikube/exit"
++	"k8s.io/minikube/pkg/minikube/localpath"
+ 	"k8s.io/minikube/pkg/minikube/mustload"
+ 	"k8s.io/minikube/pkg/minikube/out"
+ 	"k8s.io/minikube/pkg/minikube/reason"
+ 	"k8s.io/minikube/pkg/minikube/style"
+ 	pkgnetwork "k8s.io/minikube/pkg/network"
++	"k8s.io/minikube/pkg/util/lock"
+ 	"k8s.io/minikube/third_party/go9p/ufs"
+ )
+ 
+@@ -202,15 +205,18 @@ var mountCmd = &cobra.Command{
+ 		out.Infof("Bind Address: {{.Address}}", out.V{"Address": net.JoinHostPort(bindIP, fmt.Sprint(port))})
+ 
+ 		var wg sync.WaitGroup
++		pidchan := make(chan int)
+ 		if cfg.Type == nineP {
+ 			wg.Add(1)
+-			go func() {
++			go func(pid chan int) {
++				pid <- os.Getpid()
+ 				out.Styled(style.Fileserver, "Userspace file server: ")
+ 				ufs.StartServer(net.JoinHostPort(bindIP, strconv.Itoa(port)), debugVal, hostPath)
+ 				out.Step(style.Stopped, "Userspace file server is shutdown")
+ 				wg.Done()
+-			}()
++			}(pidchan)
+ 		}
++		pid := <-pidchan
+ 
+ 		// Unmount if Ctrl-C or kill request is received.
+ 		c := make(chan os.Signal, 1)
+@@ -222,11 +228,17 @@ var mountCmd = &cobra.Command{
+ 				if err != nil {
+ 					out.FailureT("Failed unmount: {{.error}}", out.V{"error": err})
+ 				}
++
++				err = removePidFromFile(pid)
++				if err != nil {
++					out.FailureT("Failed removing pid from pidfile: {{.error}}", out.V{"error": err})
++				}
++
+ 				exit.Message(reason.Interrupted, "Received {{.name}} signal", out.V{"name": sig})
+ 			}
+ 		}()
+ 
+-		err = cluster.Mount(co.CP.Runner, ip.String(), vmPath, cfg)
++		err = cluster.Mount(co.CP.Runner, ip.String(), vmPath, cfg, pid)
+ 		if err != nil {
+ 			if rtErr, ok := err.(*cluster.MountError); ok && rtErr.ErrorType == cluster.MountErrorConnect {
+ 				exit.Error(reason.GuestMountCouldNotConnect, "mount could not connect", rtErr)
+@@ -266,3 +278,56 @@ func getPort() (int, error) {
+ 	defer l.Close()
+ 	return l.Addr().(*net.TCPAddr).Port, nil
+ }
++
++// removePidFromFile looks at the default locations for the mount-pids file,
++// for the profile in use. If a file is found and its content shows PID, PID gets removed.
++func removePidFromFile(pid int) error {
++	profile := ClusterFlagValue()
++	paths := []string{
++		localpath.MiniPath(), // legacy mount-process path for backwards compatibility
++		localpath.Profile(profile),
++	}
++
++	for _, path := range paths {
++		err := removePid(path, strconv.Itoa(pid))
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++// removePid reads the file at PATH and tries to remove PID from it if found
++func removePid(path string, pid string) error {
++	// is it the file we're looking for?
++	pidPath := filepath.Join(path, constants.MountProcessFileName)
++	if _, err := os.Stat(pidPath); os.IsNotExist(err) {
++		return nil
++	}
++
++	// we found the correct file
++	// we're reading the pids...
++	out, err := os.ReadFile(pidPath)
++	if err != nil {
++		return errors.Wrap(err, "readFile")
++	}
++
++	pids := []string{}
++	// we're splitting the mount-pids file content into a slice of strings
++	// so that we can compare each to the PID we're looking for
++	strPids := strings.Fields(string(out))
++	for _, p := range strPids {
++		// If we find the PID, we don't add it to the slice
++		if p == pid {
++			continue
++		}
++
++		// if p doesn't correspond to PID, we add to a list
++		pids = append(pids, p)
++	}
++
++	// we write the slice that we obtained back to the mount-pids file
++	newPids := strings.Join(pids, " ")
++	return lock.WriteFile(pidPath, []byte(newPids), 0o644)
++}
+diff --git a/pkg/minikube/cluster/mount.go b/pkg/minikube/cluster/mount.go
+index 9e8163c58..147729905 100644
+--- a/pkg/minikube/cluster/mount.go
++++ b/pkg/minikube/cluster/mount.go
+@@ -19,13 +19,20 @@ package cluster
+ import (
+ 	"fmt"
+ 	"os/exec"
++	"path/filepath"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+ 
+ 	"github.com/pkg/errors"
++	"github.com/spf13/viper"
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/minikube/pkg/minikube/command"
++	"k8s.io/minikube/pkg/minikube/constants"
++	"k8s.io/minikube/pkg/minikube/exit"
++	"k8s.io/minikube/pkg/minikube/localpath"
++	"k8s.io/minikube/pkg/minikube/reason"
++	"k8s.io/minikube/pkg/util/lock"
+ )
+ 
+ // MountConfig defines the options available to the Mount command
+@@ -73,7 +80,7 @@ func (m *MountError) Error() string {
+ }
+ 
+ // Mount runs the mount command from the 9p client on the VM to the 9p server on the host
+-func Mount(r mountRunner, source string, target string, c *MountConfig) error {
++func Mount(r mountRunner, source string, target string, c *MountConfig, pid int) error {
+ 	if err := Unmount(r, target); err != nil {
+ 		return &MountError{ErrorType: MountErrorUnknown, UnderlyingError: errors.Wrap(err, "umount")}
+ 	}
+@@ -90,6 +97,11 @@ func Mount(r mountRunner, source string, target string, c *MountConfig) error {
+ 		return &MountError{ErrorType: MountErrorUnknown, UnderlyingError: errors.Wrapf(err, "mount with cmd %s ", rr.Command())}
+ 	}
+ 
++	profile := viper.GetString("profile")
++	if err := lock.AppendToFile(filepath.Join(localpath.Profile(profile), constants.MountProcessFileName), []byte(fmt.Sprintf(" %s", strconv.Itoa(pid))), 0o644); err != nil {
++		exit.Error(reason.HostMountPid, "Error writing mount pid", err)
++	}
++
+ 	klog.Infof("mount successful: %q", rr.Output())
+ 	return nil
+ }
+diff --git a/pkg/minikube/node/config.go b/pkg/minikube/node/config.go
+index b2f51740f..f58839aa5 100644
+--- a/pkg/minikube/node/config.go
++++ b/pkg/minikube/node/config.go
+@@ -89,7 +89,7 @@ func configureMounts(wg *sync.WaitGroup, cc config.ClusterConfig) {
+ 	if err := mountCmd.Start(); err != nil {
+ 		exit.Error(reason.GuestMount, "Error starting mount", err)
+ 	}
+-	if err := lock.WriteFile(filepath.Join(localpath.Profile(profile), constants.MountProcessFileName), []byte(strconv.Itoa(mountCmd.Process.Pid)), 0o644); err != nil {
++	if err := lock.AppendToFile(filepath.Join(localpath.Profile(profile), constants.MountProcessFileName), []byte(fmt.Sprintf(" %s", strconv.Itoa(mountCmd.Process.Pid))), 0o644); err != nil {
+ 		exit.Error(reason.HostMountPid, "Error writing mount pid", err)
+ 	}
+ }
+diff --git a/pkg/util/lock/lock.go b/pkg/util/lock/lock.go
+index efb8dc01b..54154ff83 100644
+--- a/pkg/util/lock/lock.go
++++ b/pkg/util/lock/lock.go
+@@ -43,6 +43,27 @@ func WriteFile(filename string, data []byte, perm os.FileMode) error {
+ 	return os.WriteFile(filename, data, perm)
+ }
+ 
++// AppendToFile appends DATA bytes to the specified FILENAME in a mutually exclusive way.
++// The file is created if it does not exist, using the specified PERM (before umask)
++func AppendToFile(filename string, data []byte, perm os.FileMode) error {
++	spec := PathMutexSpec(filename)
++	klog.Infof("WriteFile acquiring %s: %+v", filename, spec)
++	releaser, err := mutex.Acquire(spec)
++	if err != nil {
++		return errors.Wrapf(err, "failed to acquire lock for %s: %+v", filename, spec)
++	}
++
++	defer releaser.Release()
++
++	fd, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, perm)
++	if err != nil {
++		return errors.Wrapf(err, "failed to open %s: %+v", filename, spec)
++	}
++
++	_, err = fd.Write(data)
++	return err
++}
++
+ // PathMutexSpec returns a mutex spec for a path
+ func PathMutexSpec(path string) mutex.Spec {
+ 	s := mutex.Spec{
+diff --git a/translations/de.json b/translations/de.json
+index 12ea4e025..9ed7e20a7 100644
+--- a/translations/de.json
++++ b/translations/de.json
+@@ -249,6 +249,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "Port, der für das über den Proxy erreichbare Dashboard freigegeben wird. Wenn man 0 angibt, wird ein zufälliger Port ausgewählt.",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "Externer Adapter, auf dem der externe Switch erzeugt wird, wenn kein externer Switch gefunden wurde. (nur hyperv Treiber)",
+ 	"Fail check if container paused": "Schlägt fehl, wenn der Container pausiert ist",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "Runtime fehlgeschlagen",
+ 	"Failed to build image": "Bau des Images fehlgeschlagen",
+ 	"Failed to cache and load images": "Cachen und laden der Images fehlgeschlagen",
+@@ -431,6 +432,7 @@
+ 	"Mounts the specified directory into minikube": "Mounted das angegebene Verzeichnis in Minikube",
+ 	"Mounts the specified directory into minikube.": "Mounted das angegebene Verzeichnis in Minikube.",
+ 	"Multiple errors deleting profiles": "Es sind mehrere Fehler beim Löschen der Profile aufgetreten",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "Es wurden mehrere Minikube Profile gefunden - ",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "NIC Type der fürs Host only Netzwerk verwendet wird. Einer aus Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, oder virtio (nur virtualbox Treiber)",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "NIC Type der fürs NAT Network verwendet wird. Einer aus Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (Nur virtualbox Treiber)",
+diff --git a/translations/es.json b/translations/es.json
+index 97c950087..3673d2bbd 100644
+--- a/translations/es.json
++++ b/translations/es.json
+@@ -258,6 +258,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "",
+ 	"Fail check if container paused": "",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "",
+ 	"Failed to build image": "No se pudo construir la imagen",
+ 	"Failed to cache and load images": "",
+@@ -439,6 +440,7 @@
+ 	"Mounts the specified directory into minikube": "",
+ 	"Mounts the specified directory into minikube.": "",
+ 	"Multiple errors deleting profiles": "",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+diff --git a/translations/fr.json b/translations/fr.json
+index af3d6a585..b3f7635a5 100644
+--- a/translations/fr.json
++++ b/translations/fr.json
+@@ -245,6 +245,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "Port exposé du tableau de bord proxyfié. Réglez sur 0 pour choisir un port aléatoire.",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "L'adaptateur externe sur lequel un commutateur externe sera créé si aucun commutateur externe n'est trouvé. (pilote hyperv uniquement)",
+ 	"Fail check if container paused": "Échec de la vérification si le conteneur est en pause",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "Échec de l'exécution",
+ 	"Failed to build image": "Échec de la création de l'image",
+ 	"Failed to cache and load images": "Échec de la mise en cache et du chargement des images",
+@@ -422,6 +423,7 @@
+ 	"Mounts the specified directory into minikube": "Monte le répertoire spécifié dans minikube",
+ 	"Mounts the specified directory into minikube.": "Monte le répertoire spécifié dans minikube.",
+ 	"Multiple errors deleting profiles": "Plusieurs erreurs lors de la suppression des profils",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "Plusieurs profils minikube ont été trouvés -",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "Type de carte réseau utilisé pour le réseau hôte uniquement. Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM ou virtio (pilote virtualbox uniquement)",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "Type de carte réseau utilisé pour le réseau nat. Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM ou virtio (pilote virtualbox uniquement)",
+diff --git a/translations/ja.json b/translations/ja.json
+index 52f00c68e..4fa2db612 100644
+--- a/translations/ja.json
++++ b/translations/ja.json
+@@ -235,6 +235,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "プロキシー化されたダッシュボードの公開ポート。0 に設定すると、ランダムなポートが選ばれます。",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "外部スイッチが見つからない場合に、外部スイッチが作成される外部アダプター (hyperv ドライバーのみ)。",
+ 	"Fail check if container paused": "コンテナーが一時停止しているかどうかのチェックに失敗しました",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "ランタイムが失敗しました",
+ 	"Failed to build image": "イメージのビルドに失敗しました",
+ 	"Failed to cache and load images": "イメージのキャッシュとロードに失敗しました",
+@@ -408,6 +409,7 @@
+ 	"Mounts the specified directory into minikube": "minikube に指定されたディレクトリーをマウントします",
+ 	"Mounts the specified directory into minikube.": "minikube に指定されたディレクトリーをマウントします。",
+ 	"Multiple errors deleting profiles": "プロファイル削除中に複数のエラーが発生しました",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "複数の minikube プロファイルが見つかりました - ",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "ホストオンリーネットワークに使用する NIC タイプ。Am79C970A、Am79C973、82540EM、82543GC、82545EM、virtio のいずれか (virtualbox ドライバーのみ)",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "NAT ネットワークに使用する NIC タイプ。Am79C970A、Am79C973、82540EM、82543GC、82545EM、virtio のいずれか (virtualbox ドライバーのみ)",
+diff --git a/translations/ko.json b/translations/ko.json
+index ec8cca1a2..9064e493d 100644
+--- a/translations/ko.json
++++ b/translations/ko.json
+@@ -267,6 +267,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "",
+ 	"Fail check if container paused": "",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "런타임이 실패하였습니다",
+ 	"Failed to build image": "",
+ 	"Failed to cache ISO": "ISO 캐싱에 실패하였습니다",
+@@ -454,6 +455,7 @@
+ 	"Mounts the specified directory into minikube": "특정 디렉토리를 minikube 에 마운트합니다",
+ 	"Mounts the specified directory into minikube.": "",
+ 	"Multiple errors deleting profiles": "",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+diff --git a/translations/pl.json b/translations/pl.json
+index c300a992b..494464de6 100644
+--- a/translations/pl.json
++++ b/translations/pl.json
+@@ -258,6 +258,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "",
+ 	"Fail check if container paused": "",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "",
+ 	"Failed to build image": "",
+ 	"Failed to cache and load images": "",
+@@ -443,6 +444,7 @@
+ 	"Mounts the specified directory into minikube": "Montuje podany katalog wewnątrz minikube",
+ 	"Mounts the specified directory into minikube.": "Montuje podany katalog wewnątrz minikube",
+ 	"Multiple errors deleting profiles": "Wystąpiło wiele błędów podczas usuwania profili",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "Znaleziono wiele profili minikube - ",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+diff --git a/translations/ru.json b/translations/ru.json
+index 095293e49..d8540a316 100644
+--- a/translations/ru.json
++++ b/translations/ru.json
+@@ -232,6 +232,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "",
+ 	"Fail check if container paused": "",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "",
+ 	"Failed to build image": "",
+ 	"Failed to cache and load images": "",
+@@ -404,6 +405,7 @@
+ 	"Mounts the specified directory into minikube": "",
+ 	"Mounts the specified directory into minikube.": "",
+ 	"Multiple errors deleting profiles": "",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+diff --git a/translations/strings.txt b/translations/strings.txt
+index 953366b39..fa3bed8d7 100644
+--- a/translations/strings.txt
++++ b/translations/strings.txt
+@@ -232,6 +232,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "",
+ 	"Fail check if container paused": "",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "",
+ 	"Failed to build image": "",
+ 	"Failed to cache and load images": "",
+@@ -404,6 +405,7 @@
+ 	"Mounts the specified directory into minikube": "",
+ 	"Mounts the specified directory into minikube.": "",
+ 	"Multiple errors deleting profiles": "",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found - ": "",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+ 	"NIC Type used for nat network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "",
+diff --git a/translations/zh-CN.json b/translations/zh-CN.json
+index ed7882591..5eada44e9 100644
+--- a/translations/zh-CN.json
++++ b/translations/zh-CN.json
+@@ -316,6 +316,7 @@
+ 	"Exposed port of the proxyfied dashboard. Set to 0 to pick a random port.": "",
+ 	"External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)": "",
+ 	"Fail check if container paused": "如果容器已挂起，则检查失败",
++	"Failed removing pid from pidfile: {{.error}}": "",
+ 	"Failed runtime": "运行时失败",
+ 	"Failed to build image": "构建镜像失败",
+ 	"Failed to cache ISO": "缓存ISO 时失败",
+@@ -518,6 +519,7 @@
+ 	"Mounts the specified directory into minikube": "将指定的目录挂载到 minikube",
+ 	"Mounts the specified directory into minikube.": "将指定的目录挂载到 minikube。",
+ 	"Multiple errors deleting profiles": "删除配置文件时出现多个错误",
++	"Multiple errors encountered:": "",
+ 	"Multiple minikube profiles were found -": "发现了多个 minikube 配置文件 -",
+ 	"Multiple minikube profiles were found - ": "",
+ 	"NIC Type used for host only network. One of Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM, or virtio (virtualbox driver only)": "网卡类型仅用于主机网络。Am79C970A, Am79C973, 82540EM, 82543GC, 82545EM 之一，或 virtio(仅限 VirtualBox 驱动程序)",

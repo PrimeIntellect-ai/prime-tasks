@@ -1,0 +1,218 @@
+diff --git a/soroban-env-common/src/meta.rs b/soroban-env-common/src/meta.rs
+index 80413f2f..f5add576 100644
+--- a/soroban-env-common/src/meta.rs
++++ b/soroban-env-common/src/meta.rs
+@@ -45,12 +45,12 @@ soroban_env_macros::generate_env_meta_consts!(
+     pre_release_version: 57,
+ );
+ 
+-pub fn get_ledger_protocol_version(interface_version: u64) -> u32 {
++pub const fn get_ledger_protocol_version(interface_version: u64) -> u32 {
+     // The ledger protocol version is the high 32 bits of INTERFACE_VERSION
+     (interface_version >> 32) as u32
+ }
+ 
+-pub fn get_pre_release_version(interface_version: u64) -> u32 {
++pub const fn get_pre_release_version(interface_version: u64) -> u32 {
+     // The pre-release version is the low 32 bits of INTERFACE_VERSION
+     interface_version as u32
+ }
+diff --git a/soroban-env-host/src/host.rs b/soroban-env-host/src/host.rs
+index 4bde5f1a..f6a9dafa 100644
+--- a/soroban-env-host/src/host.rs
++++ b/soroban-env-host/src/host.rs
+@@ -358,6 +358,10 @@ impl Host {
+         }
+     }
+ 
++    pub fn get_ledger_protocol_version(&self) -> Result<u32, HostError> {
++        self.with_ledger_info(|li| Ok(li.protocol_version))
++    }
++
+     /// Helper for mutating the [`Budget`] held in this [`Host`], either to
+     /// allocate it on contract creation or to deplete it on callbacks from
+     /// the VM or host functions.
+@@ -756,6 +760,37 @@ impl Host {
+                     &[],
+                 )
+             })?;
++
++        // Check size before instantiation.
++        let wasm_bytes_m: crate::xdr::BytesM = wasm.try_into().map_err(|_| {
++            self.err(
++                ScErrorType::Value,
++                ScErrorCode::ExceededLimit,
++                "Wasm code is too large",
++                &[],
++            )
++        })?;
++
++        // Instantiate a temporary / throwaway VM using this wasm. This will do
++        // both quick checks like "does this wasm have the right protocol number
++        // to run on this network" and also a full parse-and-link pass to check
++        // that the wasm is basically not garbage. It might still fail to run
++        // but it will at least instantiate. This might seem a bit heavyweight
++        // but really "instantiating a VM" is mostly just "parsing the module
++        // and doing those checks" anyway. Revisit in the future if you want to
++        // try to split these costs up some.
++        if cfg!(any(test, feature = "testutils")) && wasm_bytes_m.as_slice().is_empty() {
++            // Allow a zero-byte contract when testing, as this is used to make
++            // native test contracts behave like wasm. They will never be
++            // instantiated, this is just to exercise their storage logic.
++        } else {
++            let _check_vm = Vm::new(
++                self,
++                Hash(hash_bytes.metered_clone(self)?),
++                wasm_bytes_m.as_slice(),
++            )?;
++        }
++
+         let hash_obj = self.add_host_object(self.scbytes_from_slice(hash_bytes.as_slice())?)?;
+         let code_key = Rc::metered_new(
+             LedgerKey::ContractCode(LedgerKeyContractCode {
+@@ -772,14 +807,7 @@ impl Host {
+                 let data = LedgerEntryData::ContractCode(ContractCodeEntry {
+                     hash: Hash(hash_bytes),
+                     ext: ExtensionPoint::V0,
+-                    code: wasm.try_into().map_err(|_| {
+-                        self.err(
+-                            ScErrorType::Value,
+-                            ScErrorCode::ExceededLimit,
+-                            "Wasm code is too large",
+-                            &[],
+-                        )
+-                    })?,
++                    code: wasm_bytes_m,
+                 });
+                 storage.put(
+                     &code_key,
+@@ -1344,7 +1372,7 @@ impl VmCallerEnv for Host {
+     }
+ 
+     fn get_ledger_version(&self, _vmcaller: &mut VmCaller<Host>) -> Result<U32Val, Self::Error> {
+-        self.with_ledger_info(|li| Ok(li.protocol_version.into()))
++        Ok(self.get_ledger_protocol_version()?.into())
+     }
+ 
+     fn get_ledger_sequence(&self, _vmcaller: &mut VmCaller<Host>) -> Result<U32Val, Self::Error> {
+diff --git a/soroban-env-host/src/vm.rs b/soroban-env-host/src/vm.rs
+index 9679dd46..cbb95baf 100644
+--- a/soroban-env-host/src/vm.rs
++++ b/soroban-env-host/src/vm.rs
+@@ -75,6 +75,71 @@ pub struct VmFunction {
+ }
+ 
+ impl Vm {
++    fn check_contract_interface_version(
++        host: &Host,
++        interface_version: u64,
++    ) -> Result<(), HostError> {
++        let want_proto = {
++            let ledger_proto = host.get_ledger_protocol_version()?;
++            let env_proto = get_ledger_protocol_version(meta::INTERFACE_VERSION);
++            if ledger_proto <= env_proto {
++                // ledger proto should be before or equal to env proto
++                ledger_proto
++            } else {
++                return Err(err!(
++                    host,
++                    (ScErrorType::Context, ScErrorCode::InternalError),
++                    "ledger protocol number is ahead of supported env protocol number",
++                    ledger_proto,
++                    env_proto
++                ));
++            }
++        };
++
++        let got_pre = get_pre_release_version(interface_version);
++        let got_proto = get_ledger_protocol_version(interface_version);
++
++        if got_proto < want_proto {
++            // Old protocols are finalized, we only support contracts
++            // with similarly finalized (zero) prerelease numbers.
++            if got_pre != 0 {
++                return Err(err!(
++                    host,
++                    (ScErrorType::WasmVm, ScErrorCode::InvalidInput),
++                    "contract pre-release number for old protocol is nonzero",
++                    got_pre
++                ));
++            }
++        } else if got_proto == want_proto {
++            // Current protocol might have a nonzero prerelease number; we will
++            // allow it only if it matches the current prerelease exactly.
++            let want_pre = get_pre_release_version(meta::INTERFACE_VERSION);
++            if want_pre != got_pre {
++                return Err(err!(
++                    host,
++                    (ScErrorType::WasmVm, ScErrorCode::InvalidInput),
++                    "contract pre-release number for current protocol does not match host",
++                    got_pre,
++                    want_pre
++                ));
++            }
++        } else {
++            // Future protocols we don't allow. It might be nice (in the sense
++            // of "allowing uploads of a future-protocol contract that will go
++            // live as soon as the network upgrades to it") but there's a risk
++            // that the "future" protocol semantics baked in to a contract
++            // differ from the final semantics chosen by the network, so to be
++            // conservative we avoid even allowing this.
++            return Err(err!(
++                host,
++                (ScErrorType::WasmVm, ScErrorCode::InvalidInput),
++                "contract protocol number is newer than host",
++                got_proto
++            ));
++        }
++        Ok(())
++    }
++
+     fn check_meta_section(host: &Host, m: &Module) -> Result<(), HostError> {
+         // We check that the interface version number has the same pre-release number as
+         // us as well as a protocol that's less than or equal to our protocol.
+@@ -85,36 +150,15 @@ impl Vm {
+             if let Some(env_meta_entry) = ScEnvMetaEntry::read_xdr_iter(&mut cursor).next() {
+                 let ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(v) =
+                     host.map_err(env_meta_entry)?;
+-                let got_pre = get_pre_release_version(v);
+-                let want_pre = get_pre_release_version(meta::INTERFACE_VERSION);
+-                let got_proto = get_ledger_protocol_version(v);
+-                let want_proto = get_ledger_protocol_version(meta::INTERFACE_VERSION);
+-                if got_pre != want_pre {
+-                    return Err(err!(
+-                        host,
+-                        (ScErrorType::WasmVm, ScErrorCode::InvalidInput),
+-                        "contract pre-release number does not match host",
+-                        got_pre,
+-                        want_pre
+-                    ));
+-                } else if got_proto > want_proto {
+-                    return Err(err!(
+-                        host,
+-                        (ScErrorType::WasmVm, ScErrorCode::InvalidInput),
+-                        "contract ledger protocol number exceeds host",
+-                        got_proto,
+-                        want_proto
+-                    ));
+-                } else {
+-                    return Ok(());
+-                }
++                Vm::check_contract_interface_version(host, v)
++            } else {
++                Err(host.err(
++                    ScErrorType::WasmVm,
++                    ScErrorCode::InvalidInput,
++                    "contract missing environment interface version",
++                    &[],
++                ))
+             }
+-            Err(host.err(
+-                ScErrorType::WasmVm,
+-                ScErrorCode::InvalidInput,
+-                "contract missing environment interface version",
+-                &[],
+-            ))
+         } else {
+             Err(host.err(
+                 ScErrorType::WasmVm,

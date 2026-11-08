@@ -1,0 +1,203 @@
+diff --git a/csml_interpreter/CSML/examples/hello_world.csml b/csml_interpreter/CSML/examples/hello_world.csml
+index 0ccfa782..569caa4a 100644
+--- a/csml_interpreter/CSML/examples/hello_world.csml
++++ b/csml_interpreter/CSML/examples/hello_world.csml
+@@ -1,5 +1,16 @@
+ start:
+ 
+     say "Hello World 😆"
++    do obj = {
++        "params": {
++            "name": "toto"
++        }
++    }
+ 
+-    goto end
+\ No newline at end of file
++    goto $obj.params.name
++
++    goto end
++
++
++toto:
++    say "TOTO"
+\ No newline at end of file
+diff --git a/csml_interpreter/src/data/ast.rs b/csml_interpreter/src/data/ast.rs
+index 2f1ba52e..cd11aa36 100644
+--- a/csml_interpreter/src/data/ast.rs
++++ b/csml_interpreter/src/data/ast.rs
+@@ -123,21 +123,13 @@ pub struct Instruction {
+     pub actions: Expr,
+ }
+ 
+-#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
++#[derive(Debug, Clone, Serialize, Deserialize)]
+ pub enum GotoValueType {
+-    Variable(Identifier),
+     Name(Identifier),
++    Variable(Box<Expr>),
+ }
+ 
+-impl GotoValueType {
+-    pub fn to_string(&self) -> String {
+-        match self {
+-            GotoValueType::Variable(value) | GotoValueType::Name(value) => value.ident.to_string(),
+-        }
+-    }
+-}
+-
+-#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
++#[derive(Debug, Clone, Serialize, Deserialize)]
+ pub enum GotoType {
+     Step(GotoValueType),
+     Flow(GotoValueType),
+diff --git a/csml_interpreter/src/error_format.rs b/csml_interpreter/src/error_format.rs
+index 1900f24b..537fb59f 100644
+--- a/csml_interpreter/src/error_format.rs
++++ b/csml_interpreter/src/error_format.rs
+@@ -67,6 +67,9 @@ pub const ERROR_PAYLOAD_EXCEED_MAX_SIZE: &str = "payload exceeds max payload siz
+ // Event
+ pub const ERROR_EVENT_CONTENT_TYPE: &str = "event can only be of ContentType::Event";
+ 
++// Goto
++pub const ERROR_GOTO_VAR: &str = "variables in goto need to resolve as strings";
++
+ // Component
+ pub const ERROR_COMPONENT_NAMESPACE: &str = "component must have a function applied";
+ pub const ERROR_COMPONENT_UNKNOWN: &str = "function does not exist for component";
+diff --git a/csml_interpreter/src/interpreter/ast_interpreter/actions.rs b/csml_interpreter/src/interpreter/ast_interpreter/actions.rs
+index 980bb160..9e3fc435 100644
+--- a/csml_interpreter/src/interpreter/ast_interpreter/actions.rs
++++ b/csml_interpreter/src/interpreter/ast_interpreter/actions.rs
+@@ -147,7 +147,7 @@ pub fn match_actions(
+             Ok(msg_data)
+         }
+         ObjectType::Goto(GotoType::Step(step), ..) => {
+-            let step = search_goto_var_memory(step, &mut msg_data, data)?;
++            let step = search_goto_var_memory(step, &mut msg_data, data, sender)?;
+ 
+             MSG::send(
+                 &sender,
+@@ -167,7 +167,7 @@ pub fn match_actions(
+             Ok(msg_data)
+         }
+         ObjectType::Goto(GotoType::Flow(flow), ..) => {
+-            let flow = search_goto_var_memory(&flow, &mut msg_data, data)?;
++            let flow = search_goto_var_memory(&flow, &mut msg_data, data, sender)?;
+ 
+             MSG::send(
+                 &sender,
+@@ -185,11 +185,11 @@ pub fn match_actions(
+         }
+         ObjectType::Goto(GotoType::StepFlow { step, flow }, ..) => {
+             let step = match step {
+-                Some(step) => search_goto_var_memory(&step, &mut msg_data, data)?,
++                Some(step) => search_goto_var_memory(&step, &mut msg_data, data, sender)?,
+                 None => "start".to_owned() // default value start step
+             };
+             let flow = match flow {
+-                Some(flow) => search_goto_var_memory(&flow, &mut msg_data, data)?,
++                Some(flow) => search_goto_var_memory(&flow, &mut msg_data, data, sender)?,
+                 None => data.context.flow.to_owned() // default value current flow
+             };
+ 
+diff --git a/csml_interpreter/src/interpreter/variable_handler.rs b/csml_interpreter/src/interpreter/variable_handler.rs
+index cf439c59..27f8e997 100644
+--- a/csml_interpreter/src/interpreter/variable_handler.rs
++++ b/csml_interpreter/src/interpreter/variable_handler.rs
+@@ -611,20 +611,27 @@ pub fn search_goto_var_memory<'a>(
+     var: &GotoValueType,
+     msg_data: &mut MessageData,
+     data: &'a mut Data,
++    sender: &Option<mpsc::Sender<MSG>>,
+ ) -> Result<String, ErrorInfo> {
+     let flow_name = data.context.flow.clone();
+ 
+     match var {
+         GotoValueType::Name(ident) => Ok(ident.ident.clone()),
+-        GotoValueType::Variable(ident) => {
+-            let (literal, ..) =
+-                get_var_from_mem(ident.clone(), false, None, data, msg_data, &None)?;
++        GotoValueType::Variable(expr) => {
++            let literal = expr_to_literal(
++                expr,
++                false,
++                None,
++                data,
++                msg_data,
++                sender,
++            )?;
+ 
+             Ok(Literal::get_value::<String>(
+                 &literal.primitive,
+                 &flow_name,
+                 literal.interval,
+-                format!("< {} > {}", ident.ident, ERROR_FIND_MEMORY),
++                format!("{}", ERROR_GOTO_VAR),
+             )?
+             .to_owned())
+         }
+diff --git a/csml_interpreter/src/parser/parse_goto.rs b/csml_interpreter/src/parser/parse_goto.rs
+index b282e42b..accc9e55 100644
+--- a/csml_interpreter/src/parser/parse_goto.rs
++++ b/csml_interpreter/src/parser/parse_goto.rs
+@@ -1,6 +1,7 @@
+ use crate::data::{ast::*, tokens::*};
+ use crate::error_format::{gen_nom_failure, ERROR_GOTO_STEP};
+ use crate::parser::{
++    parse_path::parse_path, parse_var_types::parse_idents_expr_usage,
+     get_interval, parse_comments::comment, parse_idents::parse_string_assignation,
+     tools::get_string, tools::get_tag, GotoType, GotoValueType,
+ };
+@@ -15,10 +16,12 @@ fn get_variable<'a, E>(s: Span<'a>) -> IResult<Span<'a>, GotoValueType, E>
+ where
+     E: ParseError<Span<'a>>,
+ {
+-    let (s, position) = get_interval(s)?;
+     let (s, ..) = tag(DOLLAR)(s)?;
+-    let (s, name) = parse_string_assignation(s)?;
+-    Ok((s, GotoValueType::Variable(Expr::new_idents(name, position))))
++
++    let (s, expr) = parse_idents_expr_usage(s)?;
++    let (s, expr) = parse_path(s, expr)?;
++
++    Ok((s, GotoValueType::Variable(Box::new(expr))))
+ }
+ 
+ fn get_name<'a, E>(s: Span<'a>) -> IResult<Span<'a>, GotoValueType, E>
+diff --git a/csml_interpreter/src/parser/parse_var_types.rs b/csml_interpreter/src/parser/parse_var_types.rs
+index d16cda70..75c573ee 100644
+--- a/csml_interpreter/src/parser/parse_var_types.rs
++++ b/csml_interpreter/src/parser/parse_var_types.rs
+@@ -52,15 +52,6 @@ where
+     )(s)
+ }
+ 
+-fn parse_idents_expr_usage<'a, E>(s: Span<'a>) -> IResult<Span<'a>, Expr, E>
+-where
+-    E: ParseError<Span<'a>>,
+-{
+-    let (s, idents) = parse_idents_usage(s)?;
+-
+-    Ok((s, Expr::IdentExpr(idents)))
+-}
+-
+ fn parse_assignation_without_path<'a, E>(s: Span<'a>) -> IResult<Span<'a>, Expr, E>
+ where
+     E: ParseError<Span<'a>>,
+@@ -82,6 +73,15 @@ where
+ // PUBLIC FUNCTIONS
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++pub fn parse_idents_expr_usage<'a, E>(s: Span<'a>) -> IResult<Span<'a>, Expr, E>
++where
++    E: ParseError<Span<'a>>,
++{
++    let (s, idents) = parse_idents_usage(s)?;
++
++    Ok((s, Expr::IdentExpr(idents)))
++}
++
+ pub fn parse_fn_args<'a, E>(s: Span<'a>) -> IResult<Span<'a>, Vec<String>, E>
+ where
+     E: ParseError<Span<'a>>,

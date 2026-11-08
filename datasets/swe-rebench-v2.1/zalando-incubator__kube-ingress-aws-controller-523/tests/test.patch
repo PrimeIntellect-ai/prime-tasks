@@ -1,0 +1,190 @@
+diff --git a/aws/adapter_test.go b/aws/adapter_test.go
+index e095b4c..0ee69b4 100644
+--- a/aws/adapter_test.go
++++ b/aws/adapter_test.go
+@@ -1,14 +1,22 @@
+ package aws
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
++	"os/exec"
+ 	"reflect"
+ 	"sort"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/aws/aws-sdk-go/aws"
++	awscloudformation "github.com/aws/aws-sdk-go/service/cloudformation"
++	"github.com/aws/aws-sdk-go/service/cloudformation/cloudformationiface"
+ 	"github.com/aws/aws-sdk-go/service/ec2"
+ 	"github.com/aws/aws-sdk-go/service/elbv2"
++	cf "github.com/mweagle/go-cloudformation"
++
++	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+@@ -1010,15 +1018,122 @@ func TestAdapter_SetTargetsOnCNITargetGroups(t *testing.T) {
+ 	})
+ }
+ 
++// templateCapturingCloudFormationClient records the template body passed to CreateStack.
++type templateCapturingCloudFormationClient struct {
++	cloudformationiface.CloudFormationAPI
++	templateBody string
++}
++
++func (m *templateCapturingCloudFormationClient) CreateStack(params *awscloudformation.CreateStackInput) (*awscloudformation.CreateStackOutput, error) {
++	m.templateBody = aws.StringValue(params.TemplateBody)
++	return &awscloudformation.CreateStackOutput{StackId: aws.String("stack-id")}, nil
++}
++
++func (m *templateCapturingCloudFormationClient) UpdateStack(params *awscloudformation.UpdateStackInput) (*awscloudformation.UpdateStackOutput, error) {
++	m.templateBody = aws.StringValue(params.TemplateBody)
++	return &awscloudformation.UpdateStackOutput{StackId: aws.String("stack-id")}, nil
++}
++
++// targetGroupForAccessMode builds an Adapter configured with the given target access
++// mode and returns the target group resource from the CloudFormation template it
++// generates. It only observes the publicly produced template, not internal fields.
++func targetGroupForAccessMode(t *testing.T, mode string) *cf.ElasticLoadBalancingV2TargetGroup {
++	t.Helper()
++
++	cfClient := &templateCapturingCloudFormationClient{}
++	a := &Adapter{
++		cloudformation: cfClient,
++		TargetCNI:      &TargetCNIconfig{},
++		manifest: &manifest{
++			clusterID: "cluster-id",
++			vpcID:     "vpc-id",
++		},
++	}
++	a = a.WithTargetAccessMode(mode)
++
++	_, err := a.CreateStack(nil, "internet-facing", "sg-1", "", "ELBSecurityPolicy-2016-08", "ipv4", "", nil, LoadBalancerTypeApplication, true)
++	require.NoError(t, err)
++
++	var template *cf.Template
++	require.NoError(t, json.Unmarshal([]byte(cfClient.templateBody), &template))
++
++	tg, ok := template.Resources["TG"].Properties.(*cf.ElasticLoadBalancingV2TargetGroup)
++	require.True(t, ok, "couldn't convert resource to ElasticLoadBalancingV2TargetGroup")
++	return tg
++}
++
+ func TestWithTargetAccessMode(t *testing.T) {
+-	t.Run("WithTargetAccessMode enables AWS CNI mode", func(t *testing.T) {
++	t.Run("AWSCNI sets ip target type and enables CNI", func(t *testing.T) {
+ 		a := &Adapter{TargetCNI: &TargetCNIconfig{Enabled: false}}
+ 		a = a.WithTargetAccessMode("AWSCNI")
+-		require.True(t, a.TargetCNI.Enabled)
++		assert.True(t, a.TargetCNI.Enabled)
++
++		tg := targetGroupForAccessMode(t, "AWSCNI")
++		assert.Equal(t, cf.String("ip"), tg.TargetType)
+ 	})
+-	t.Run("WithTargetAccessMode disables AWS CNI mode", func(t *testing.T) {
++	t.Run("HostPort sets instance target type and disables CNI", func(t *testing.T) {
+ 		a := &Adapter{TargetCNI: &TargetCNIconfig{Enabled: true}}
+ 		a = a.WithTargetAccessMode("HostPort")
+-		require.False(t, a.TargetCNI.Enabled)
++		assert.False(t, a.TargetCNI.Enabled)
++
++		tg := targetGroupForAccessMode(t, "HostPort")
++		assert.Equal(t, cf.String("instance"), tg.TargetType)
++	})
++	t.Run("Legacy does not set target type and disables CNI", func(t *testing.T) {
++		a := &Adapter{TargetCNI: &TargetCNIconfig{Enabled: true}}
++		a = a.WithTargetAccessMode("Legacy")
++		assert.False(t, a.TargetCNI.Enabled)
++
++		tg := targetGroupForAccessMode(t, "Legacy")
++		assert.Nil(t, tg.TargetType)
++	})
++}
++
++func TestUpdateStackTargetAccessMode(t *testing.T) {
++	for _, test := range []struct {
++		mode       string
++		targetType *cf.StringExpr
++	}{
++		{mode: "HostPort", targetType: cf.String("instance")},
++		{mode: "AWSCNI", targetType: cf.String("ip")},
++		{mode: "Legacy", targetType: nil},
++	} {
++		t.Run(test.mode, func(t *testing.T) {
++			cfClient := &templateCapturingCloudFormationClient{}
++			a := &Adapter{
++				cloudformation: cfClient,
++				TargetCNI:      &TargetCNIconfig{},
++				manifest: &manifest{
++					clusterID: "cluster-id",
++					vpcID:     "vpc-id",
++				},
++			}
++			a.WithTargetAccessMode(test.mode)
++			_, err := a.UpdateStack("stack-name", map[string]time.Time{}, "internet-facing", "sg-1", "", "ELBSecurityPolicy-2016-08", "ipv4", "", nil, LoadBalancerTypeApplication, true)
++			require.NoError(t, err)
++
++			var template *cf.Template
++			require.NoError(t, json.Unmarshal([]byte(cfClient.templateBody), &template))
++			tg, ok := template.Resources["TG"].Properties.(*cf.ElasticLoadBalancingV2TargetGroup)
++			require.True(t, ok, "couldn't convert resource to ElasticLoadBalancingV2TargetGroup")
++			assert.Equal(t, test.targetType, tg.TargetType)
++		})
++	}
++}
++
++func TestTargetAccessModeFlagValues(t *testing.T) {
++	for _, mode := range []string{"HostPort", "AWSCNI", "Legacy"} {
++		t.Run(mode, func(t *testing.T) {
++			cmd := exec.Command("go", "run", "..", "--target-access-mode="+mode,
++				"--target-cni-namespace=ingress", "--target-cni-pod-labelselector=app=controller", "--version")
++			output, err := cmd.CombinedOutput()
++			assert.NoError(t, err, "CLI rejected %q: %s", mode, output)
++		})
++	}
++
++	t.Run("rejects other values", func(t *testing.T) {
++		cmd := exec.Command("go", "run", "..", "--target-access-mode=Other", "--version")
++		output, err := cmd.CombinedOutput()
++		assert.Error(t, err, "CLI unexpectedly accepted an unsupported mode: %s", output)
+ 	})
+ }
+diff --git a/aws/cf_template_test.go b/aws/cf_template_test.go
+index 6d67cee..addf883 100644
+--- a/aws/cf_template_test.go
++++ b/aws/cf_template_test.go
+@@ -614,31 +614,6 @@ func TestGenerateTemplate(t *testing.T) {
+ 				require.NotEqual(t, cloudformation.Integer(3), tg.UnhealthyThresholdCount)
+ 			},
+ 		},
+-		{
+-			name: "Default TG type is Instance",
+-			spec: &stackSpec{
+-				loadbalancerType: LoadBalancerTypeApplication,
+-			},
+-			validate: func(t *testing.T, template *cloudformation.Template) {
+-				require.NotNil(t, template.Resources, "TG")
+-				tg, ok := template.Resources["TG"].Properties.(*cloudformation.ElasticLoadBalancingV2TargetGroup)
+-				require.True(t, ok, "couldn't convert resource to ElasticLoadBalancingV2TargetGroup")
+-				require.Equal(t, cloudformation.String("instance"), tg.TargetType)
+-			},
+-		},
+-		{
+-			name: "TG type is IP in in mode AWS CNI",
+-			spec: &stackSpec{
+-				loadbalancerType:    LoadBalancerTypeApplication,
+-				targetAccessModeCNI: true,
+-			},
+-			validate: func(t *testing.T, template *cloudformation.Template) {
+-				require.NotNil(t, template.Resources, "TG")
+-				tg, ok := template.Resources["TG"].Properties.(*cloudformation.ElasticLoadBalancingV2TargetGroup)
+-				require.True(t, ok, "couldn't convert resource to ElasticLoadBalancingV2TargetGroup")
+-				require.Equal(t, cloudformation.String("ip"), tg.TargetType)
+-			},
+-		},
+ 	} {
+ 		t.Run(test.name, func(t *testing.T) {
+ 			generated, err := generateTemplate(test.spec)

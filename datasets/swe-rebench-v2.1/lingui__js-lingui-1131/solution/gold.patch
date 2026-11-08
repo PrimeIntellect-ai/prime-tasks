@@ -1,0 +1,469 @@
+diff --git a/packages/cli/package.json b/packages/cli/package.json
+index 6a4f4892..ebd610cc 100644
+--- a/packages/cli/package.json
++++ b/packages/cli/package.json
+@@ -29,6 +29,7 @@
+     "LICENSE",
+     "README.md",
+     "api",
++    "services",
+     "lingui.js",
+     "lingui-*.js"
+   ],
+diff --git a/packages/cli/src/api/formats/fixtures/messages_plural-4-letter.po b/packages/cli/src/api/formats/fixtures/messages_plural-4-letter.po
+new file mode 100644
+index 00000000..c318bb84
+--- /dev/null
++++ b/packages/cli/src/api/formats/fixtures/messages_plural-4-letter.po
+@@ -0,0 +1,33 @@
++msgid ""
++msgstr ""
++"POT-Creation-Date: 2018-08-27 10:00+0000\n"
++"MIME-Version: 1.0\n"
++"Content-Type: text/plain; charset=utf-8\n"
++"Content-Transfer-Encoding: 8bit\n"
++"X-Generator: @lingui/cli\n"
++"Language: en_CA\n"
++
++#. js-lingui:pluralize_on=someCount
++msgid "message_with_id"
++msgid_plural "message_with_id_plural"
++msgstr[0] "Singular case"
++msgstr[1] "Case number {someCount}"
++
++#. js-lingui:icu=%7BanotherCount%2C+plural%2C+one+%7BSingular+case%7D+other+%7BCase+number+%7BanotherCount%7D%7D%7D&pluralize_on=anotherCount
++msgid "Singular case"
++msgid_plural "Case number {anotherCount}"
++msgstr[0] "Singular case"
++msgstr[1] "Case number {anotherCount}"
++
++#. Comment made by the developers.
++#. js-lingui:pluralize_on=count
++msgid "message_with_id_but_without_translation"
++msgid_plural "message_with_id_but_without_translation_plural"
++msgstr[0] ""
++msgstr[1] ""
++
++#. js-lingui:icu=%7Bcount%2C+plural%2C+one+%7BSingular%7D+other+%7BPlural%7D%7D&pluralize_on=count
++msgid "Singular"
++msgid_plural "Plural"
++msgstr[0] ""
++msgstr[1] ""
+\ No newline at end of file
+diff --git a/packages/cli/src/api/formats/po-gettext.ts b/packages/cli/src/api/formats/po-gettext.ts
+index 7b86aa37..d041b777 100644
+--- a/packages/cli/src/api/formats/po-gettext.ts
++++ b/packages/cli/src/api/formats/po-gettext.ts
+@@ -204,10 +204,12 @@ const deserialize: (Object) => Object = R.map(
+  * https://github.com/LLK/po2icu/blob/9eb97f81f72b2fee02b77f1424702e019647e9b9/lib/po2icu.js#L148.
+  */
+ const getPluralCases = (lang: string): string[] | undefined => {
+-  const gettextPluralsInfo = gettextPlurals[lang]
++  // If users uses locale with underscore or slash, es-ES, es_ES, gettextplural is "es" not es-ES.
++  const [correctLang] = lang.split(/[-_]/g)
++  const gettextPluralsInfo = gettextPlurals[correctLang]
+ 
+   return gettextPluralsInfo?.examples.map((pluralCase) =>
+-    pluralsCldr(lang, pluralCase.sample)
++    pluralsCldr(correctLang, pluralCase.sample)
+   )
+ }
+ 
+diff --git a/packages/cli/src/lingui-extract.ts b/packages/cli/src/lingui-extract.ts
+index 7eb4ca9b..3acc97f2 100644
+--- a/packages/cli/src/lingui-extract.ts
++++ b/packages/cli/src/lingui-extract.ts
+@@ -68,6 +68,13 @@ export default function command(
+     )
+   }
+ 
++  // If service key is present in configuration, synchronize with cloud translation platform
++  if (typeof config.service === 'object' && config.service.name && config.service.name.length) {
++    import(`./services/${config.service.name}`)
++      .then(module => module.default(config, options))
++      .catch(err => console.error(`Can't load service module ${config.service.name}`, err))
++  }
++
+   return true
+ }
+ 
+diff --git a/packages/cli/src/services/translationIO.ts b/packages/cli/src/services/translationIO.ts
+new file mode 100644
+index 00000000..07c391c3
+--- /dev/null
++++ b/packages/cli/src/services/translationIO.ts
+@@ -0,0 +1,293 @@
++import fs from "fs"
++import { dirname } from "path"
++import PO from "pofile"
++import https from "https"
++import glob from "glob"
++import { format as formatDate } from "date-fns"
++
++const getCreateHeaders = (language) => ({
++  "POT-Creation-Date": formatDate(new Date(), "yyyy-MM-dd HH:mmxxxx"),
++  "MIME-Version": "1.0",
++  "Content-Type": "text/plain; charset=utf-8",
++  "Content-Transfer-Encoding": "8bit",
++  "X-Generator": "@lingui/cli",
++  Language: language,
++})
++
++// Main sync method, call "Init" or "Sync" depending on the project context
++export default function syncProcess(config, options) {
++  if (config.format != 'po') {
++    console.error(`\n----------\nTranslation.io service is only compatible with the "po" format. Please update your Lingui configuration accordingly.\n----------`)
++    process.exit(1)
++  }
++
++  const successCallback = (project) => {
++    console.log(`\n----------\nProject successfully synchronized. Please use this URL to translate: ${project.url}\n----------`)
++  }
++
++  const failCallback = (errors) => {
++    console.error(`\n----------\nSynchronization with Translation.io failed: ${errors.join(', ')}\n----------`)
++  }
++
++  init(config, options, successCallback, (errors) => {
++    if (errors.length && errors[0] === 'This project has already been initialized.') {
++      sync(config, options, successCallback, failCallback)
++    }
++    else {
++      failCallback(errors)
++    }
++  })
++}
++
++// Initialize project with source and existing translations (only first time!)
++// Cf. https://translation.io/docs/create-library#initialization
++function init(config, options, successCallback, failCallback) {
++  const sourceLocale  = config.sourceLocale || 'en'
++  const targetLocales = config.locales.filter((value) => value != sourceLocale)
++  const paths         = poPathsPerLocale(config)
++
++  let segments = {}
++
++  targetLocales.forEach((targetLocale) => {
++    segments[targetLocale] = []
++  })
++
++  // Create segments from source locale PO items
++  paths[sourceLocale].forEach((path) => {
++    let raw = fs.readFileSync(path).toString()
++    let po = PO.parse(raw)
++
++    po.items.filter((item) => !item['obsolete']).forEach((item) => {
++      targetLocales.forEach((targetLocale) => {
++        let newSegment = createSegmentFromPoItem(item)
++
++        segments[targetLocale].push(newSegment)
++      })
++    })
++  })
++
++  // Add translations to segments from target locale PO items
++  targetLocales.forEach((targetLocale) => {
++    paths[targetLocale].forEach((path) => {
++      let raw = fs.readFileSync(path).toString()
++      let po = PO.parse(raw)
++
++      po.items.filter((item) => !item['obsolete']).forEach((item, index) => {
++        segments[targetLocale][index].target = item.msgstr[0]
++      })
++    })
++  })
++
++  let request = {
++    "client": "lingui",
++    "version": require('@lingui/core/package.json').version,
++    "source_language": sourceLocale,
++    "target_languages": targetLocales,
++    "segments": segments
++  }
++
++  postTio("init", request, config.service.apiKey, (response) => {
++    if (response.errors) {
++      failCallback(response.errors)
++    }
++    else {
++      saveSegmentsToTargetPos(config, paths, response.segments)
++      successCallback(response.project)
++    }
++  }, (error) => {
++    console.error(`\n----------\nSynchronization with Translation.io failed: ${error}\n----------`)
++  })
++}
++
++// Send all source text from PO to Translation.io and create new PO based on received translations
++// Cf. https://translation.io/docs/create-library#synchronization
++function sync(config, options, successCallback, failCallback) {
++  const sourceLocale  = config.sourceLocale || 'en'
++  const targetLocales = config.locales.filter((value) => value != sourceLocale)
++  const paths         = poPathsPerLocale(config)
++
++  let segments = []
++
++  // Create segments with correct source
++  paths[sourceLocale].forEach((path) => {
++    let raw = fs.readFileSync(path).toString()
++    let po = PO.parse(raw)
++
++    po.items.filter((item) => !item['obsolete']).forEach((item) => {
++      let newSegment = createSegmentFromPoItem(item)
++
++      segments.push(newSegment)
++    })
++  })
++
++  let request = {
++    "client": "lingui",
++    "version": require('@lingui/core/package.json').version,
++    "source_language": sourceLocale,
++    "target_languages": targetLocales,
++    "segments": segments
++  }
++
++  // Sync and then remove unused segments (not present in the local application) from Translation.io
++  if (options.clean) {
++    request['purge'] = true
++  }
++
++  postTio("sync", request, config.service.apiKey, (response) => {
++    if (response.errors) {
++      failCallback(response.errors)
++    }
++    else {
++      saveSegmentsToTargetPos(config, paths, response.segments)
++      successCallback(response.project)
++    }
++  }, (error) => {
++    console.error(`\n----------\nSynchronization with Translation.io failed: ${error}\n----------`)
++  })
++}
++
++function createSegmentFromPoItem(item) {
++  let itemHasId = item.msgid != item.msgstr[0] && item.msgstr[0].length
++
++  let segment = {
++    type: 'source',                                 // No way to edit text for source language (inside code), so not using "key" here
++    source: itemHasId ? item.msgstr[0] : item.msgid, // msgstr may be empty if --overwrite is used and no ID is used
++    context: '',
++    references: [],
++    comment: ''
++  }
++
++  if (itemHasId) {
++    segment.context = item.msgid
++  }
++
++  if (item.references.length) {
++    segment.references = item.references
++  }
++
++  if (item.extractedComments.length) {
++    segment.comment = item.extractedComments.join(' | ')
++  }
++
++  return segment
++}
++
++function createPoItemFromSegment(segment) {
++  let item = new PO.Item()
++
++  item.msgid             = segment.context ? segment.context : segment.source
++  item.msgstr            = [segment.target]
++  item.references        = (segment.references && segment.references.length) ? segment.references : []
++  item.extractedComments = segment.comment ? segment.comment.split(' | ') : []
++
++  return item
++}
++
++function saveSegmentsToTargetPos(config, paths, segmentsPerLocale) {
++  const NAME = "{name}"
++  const LOCALE = "{locale}"
++
++  Object.keys(segmentsPerLocale).forEach((targetLocale) => {
++    // Remove existing target POs and JS for this target locale
++    paths[targetLocale].forEach((path) => {
++      const jsPath  = path.replace(/\.po?$/, "") + ".js"
++      const dirPath = dirname(path)
++
++      // Remove PO, JS and empty dir
++      if (fs.existsSync(path)) { fs.unlinkSync(path) }
++      if (fs.existsSync(jsPath)) { fs.unlinkSync(jsPath) }
++      if (fs.existsSync(dirPath) && fs.readdirSync(dirPath).length === 0) { fs.rmdirSync(dirPath) }
++    })
++
++    // Find target path (ignoring {name})
++    const localePath = "".concat(config.catalogs[0].path.replace(LOCALE, targetLocale).replace(NAME, ''), ".po")
++    const segments = segmentsPerLocale[targetLocale]
++
++    let po = new PO()
++    po.headers = getCreateHeaders(targetLocale)
++
++    let items = []
++
++    segments.forEach((segment) => {
++      let item = createPoItemFromSegment(segment)
++      items.push(item)
++    })
++
++    // Sort items by messageId
++    po.items = items.sort((a, b) => {
++      if (a.msgid < b.msgid) { return -1 }
++      if (a.msgid > b.msgid) { return 1 }
++      return 0
++    })
++
++    // Check that localePath directory exists and save PO file
++    fs.promises.mkdir(dirname(localePath), {recursive: true}).then(() => {
++      po.save(localePath, (err) => {
++        if (err) {
++          console.error('Error while saving target PO files:')
++          console.error(err)
++          process.exit(1)
++        }
++      })
++    })
++  })
++}
++
++function poPathsPerLocale(config) {
++  const NAME = "{name}"
++  const LOCALE = "{locale}"
++  const paths = []
++
++  config.locales.forEach((locale) => {
++    paths[locale] = []
++
++    config.catalogs.forEach((catalog) => {
++      const path = "".concat(catalog.path.replace(LOCALE, locale).replace(NAME, "*"), ".po")
++
++      // If {name} is present (replaced by *), list all the existing POs
++      if (path.includes('*')) {
++        paths[locale] = paths[locale].concat(glob.sync(path))
++      }
++      else {
++        paths[locale].push(path)
++      }
++    })
++  })
++
++  return paths
++}
++
++function postTio(action, request, apiKey, successCallback, failCallback) {
++  let jsonRequest = JSON.stringify(request)
++
++  let options = {
++    hostname: 'translation.io',
++    path: '/api/v1/segments/' + action + '.json?api_key=' + apiKey,
++    method: 'POST',
++    headers: {
++      'Content-Type': 'application/json',
++    }
++  }
++
++  let req = https.request(options, (res) => {
++    res.setEncoding('utf8')
++
++    let body = ""
++
++    res.on('data', (chunk) => {
++      body = body.concat(chunk)
++    })
++
++    res.on('end', () => {
++      let response = JSON.parse(body)
++      successCallback(response)
++    })
++  })
++
++  req.on('error', (e) => {
++    failCallback(e)
++  })
++
++  req.write(jsonRequest)
++  req.end()
++}
+diff --git a/packages/conf/index.d.ts b/packages/conf/index.d.ts
+index fe47871e..227fb8db 100644
+--- a/packages/conf/index.d.ts
++++ b/packages/conf/index.d.ts
+@@ -1,6 +1,6 @@
+ import type { GeneratorOptions } from "@babel/core";
+ 
+-export declare type CatalogFormat = "lingui" | "minimal" | "po" | "csv" | "po-gettext";
++export declare type CatalogFormat = "lingui" | "minimal" | "po" | "csv" | "po-gettext";
+ export type CatalogFormatOptions = {
+     origins?: boolean;
+     lineNumbers?: boolean;
+@@ -23,6 +23,11 @@ export type DefaultLocaleObject = {
+ 
+ export declare type FallbackLocales = LocaleObject | DefaultLocaleObject
+ 
++declare type CatalogService = {
++    name: string;
++    apiKey: string;
++}
++
+ declare type ExtractorType = {
+     match(filename: string): boolean;
+     extract(filename: string, targetDir: string, options?: any): void;
+@@ -46,6 +51,7 @@ export declare type LinguiConfig = {
+     rootDir: string;
+     runtimeConfigModule: [string, string?];
+     sourceLocale: string;
++    service: CatalogService;
+ };
+ export declare const defaultConfig: LinguiConfig;
+ export declare function getConfig({ cwd, configPath, skipValidation, }?: {
+@@ -63,7 +69,7 @@ export declare const configValidation: {
+         };
+         compilerBabelOptions: GeneratorOptions;
+         catalogs: CatalogConfig[];
+-        compileNamespace: "es" | "ts" | "cjs" | string;
++        compileNamespace: "es" | "ts" | "cjs" | string;
+         fallbackLocales: FallbackLocales;
+         format: CatalogFormat;
+         formatOptions: CatalogFormatOptions;
+@@ -73,6 +79,7 @@ export declare const configValidation: {
+         rootDir: string;
+         runtimeConfigModule: [string, string?];
+         sourceLocale: string;
++        service: CatalogService;
+     };
+     deprecatedConfig: {
+         fallbackLocale: (config: LinguiConfig & DeprecatedFallbackLanguage) => string;
+diff --git a/packages/conf/src/index.ts b/packages/conf/src/index.ts
+index 4d827798..a8c89586 100644
+--- a/packages/conf/src/index.ts
++++ b/packages/conf/src/index.ts
+@@ -32,6 +32,11 @@ export type FallbackLocales = LocaleObject | DefaultLocaleObject | false
+ 
+ type ModuleSource = [string, string?]
+ 
++type CatalogService = {
++  name: string
++  apiKey: string
++}
++
+ type ExtractorType = {
+   match(filename: string): boolean
+   extract(filename: string, targetDir: string, options?: any): void
+@@ -53,6 +58,7 @@ export type LinguiConfig = {
+   rootDir: string
+   runtimeConfigModule: ModuleSource | { [symbolName: string]: ModuleSource }
+   sourceLocale: string
++  service: CatalogService
+ }
+ 
+ // Enforce posix path delimiters internally
+@@ -98,6 +104,7 @@ export const defaultConfig: LinguiConfig = {
+   rootDir: ".",
+   runtimeConfigModule: ["@lingui/core", "i18n"],
+   sourceLocale: "",
++  service: { name: "", apiKey: "" }
+ }
+ 
+ function configExists(path) {

@@ -1,0 +1,177 @@
+diff --git a/internal/integrations/externaldns_test.go b/internal/integrations/externaldns_test.go
+index 1e3847d..8954d68 100644
+--- a/internal/integrations/externaldns_test.go
++++ b/internal/integrations/externaldns_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ 	"sigs.k8s.io/external-dns/endpoint"
+ )
+ 
+@@ -65,35 +66,67 @@ func TestExternalDNSUpdateResource(t *testing.T) {
+ }
+ 
+ func TestExternalDNSEndpoints(t *testing.T) {
+-	integration := externalDNS{ttl: 250}
++	ctx := context.Background()
+ 	hosts := []string{"example.com", "www.example.com"}
+-
+-	endpoints := integration.endpoints(hosts, "127.0.0.1")
+-	assert.Len(t, endpoints, 2)
+-	for _, ep := range endpoints {
+-		assert.ElementsMatch(t, ep.Targets, []string{"127.0.0.1"})
+-		assert.Equal(t, ep.RecordTTL, endpoint.TTL(250))
+-		assert.Equal(t, ep.RecordType, "A")
+-		assert.Contains(t, hosts, ep.DNSName)
++	tests := []struct {
++		name    string
++		ips     []string
++		records map[string][]string
++	}{
++		{
++			name:    "ipv4 only",
++			ips:     []string{"10.0.0.1"},
++			records: map[string][]string{"A": {"10.0.0.1"}},
++		},
++		{
++			name:    "ipv6 only",
++			ips:     []string{"2001:db8::1"},
++			records: map[string][]string{"AAAA": {"2001:db8::1"}},
++		},
++		{
++			name:    "dual stack",
++			ips:     []string{"10.0.0.1", "2001:db8::1"},
++			records: map[string][]string{"A": {"10.0.0.1"}, "AAAA": {"2001:db8::1"}},
++		},
+ 	}
+ 
+-	endpoints = integration.endpoints(hosts, "::FFFF:C0A8:1")
+-	assert.Len(t, endpoints, 2)
+-	for _, ep := range endpoints {
+-		assert.ElementsMatch(t, ep.Targets, []string{"::FFFF:C0A8:1"})
+-		assert.Equal(t, ep.RecordTTL, endpoint.TTL(250))
+-		assert.Equal(t, ep.RecordType, "AAAA")
+-		assert.Contains(t, hosts, ep.DNSName)
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			scheme := k8tests.NewScheme()
++			service := k8tests.DummyService("my-service", "my-namespace", 80)
++			service.Spec.ClusterIP = tt.ips[0]
++			service.Spec.ClusterIPs = tt.ips
++			ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&service).Build()
++
++			integration := NewExternalDNS(
++				ctrlClient, switchboard.NewTarget(service.Name, service.Namespace),
++			)
++			err := integration.UpdateResource(ctx, &service, IngressInfo{Hosts: hosts})
++			require.Nil(t, err)
++
++			var dnsEndpoint endpoint.DNSEndpoint
++			err = ctrlClient.Get(ctx, client.ObjectKeyFromObject(&service), &dnsEndpoint)
++			require.Nil(t, err)
++
++			assert.Len(t, dnsEndpoint.Spec.Endpoints, len(hosts)*len(tt.records))
++			for _, ep := range dnsEndpoint.Spec.Endpoints {
++				assert.Equal(t, endpoint.TTL(300), ep.RecordTTL)
++			}
++			for _, host := range hosts {
++				for recordType, targets := range tt.records {
++					found := make([]string, 0)
++					for _, ep := range dnsEndpoint.Spec.Endpoints {
++						if ep.DNSName == host && ep.RecordType == recordType {
++							found = append(found, ep.Targets...)
++						}
++					}
++					assert.ElementsMatch(t, targets, found, "host %s, record type %s", host, recordType)
++				}
++			}
++		})
+ 	}
+ }
+ 
+-func TestExternalDNSRecordType(t *testing.T) {
+-	integration := externalDNS{ttl: 250}
+-	assert.Equal(t, "A", integration.recordType("127.0.0.1"))
+-	assert.Equal(t, "AAAA", integration.recordType("::FFFF:C0A8:1"))
+-	assert.Equal(t, "AAAA", integration.recordType("0000:0000:0000:0000:0000:FFFF:C0A8:1"))
+-}
+-
+ //-------------------------------------------------------------------------------------------------
+ // UTILS
+ //-------------------------------------------------------------------------------------------------
+diff --git a/internal/switchboard/targets_test.go b/internal/switchboard/targets_test.go
+index ecdda3d..b963db7 100644
+--- a/internal/switchboard/targets_test.go
++++ b/internal/switchboard/targets_test.go
+@@ -3,46 +3,47 @@ package switchboard
+ import (
+ 	"context"
+ 	"testing"
+-	"time"
+ 
+ 	"github.com/borchero/switchboard/internal/k8tests"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+-	"sigs.k8s.io/controller-runtime/pkg/client"
++	v1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+ 
+ func TestIP(t *testing.T) {
+-	// Setup
+ 	ctx := context.Background()
+ 	scheme := k8tests.NewScheme()
+-	ctrlClient := k8tests.NewClient(t, scheme)
+-	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
+-	defer shutdown()
+ 
+-	// Create a new service
+-	service := k8tests.DummyService("my-service", namespace, 80)
+-	err := ctrlClient.Create(ctx, &service)
+-	require.Nil(t, err)
++	service := k8tests.DummyService("my-service", "my-namespace", 80)
++	service.Spec.ClusterIP = "10.0.0.1"
++	service.Spec.ClusterIPs = []string{"10.0.0.1", "2001:db8::1"}
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&service).Build()
+ 
+-	// Check whether we find the cluster IP
+ 	target := NewTarget(service.Name, service.Namespace)
+-	ip, err := target.IP(ctx, ctrlClient)
++	ips, err := target.IPs(ctx, ctrlClient)
+ 	require.Nil(t, err)
+-	assert.Equal(t, service.Spec.ClusterIP, ip)
++	assert.ElementsMatch(t, []string{"10.0.0.1", "2001:db8::1"}, ips)
+ 
+-	// Update the service to provide a load balancer
+-	service.Spec.Type = "LoadBalancer"
++	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{
++		{IP: "1.2.3.4"},
++		{IP: "2001:db8::2"},
++	}
+ 	err = ctrlClient.Update(ctx, &service)
+ 	require.Nil(t, err)
+ 
+-	// Check whether we find the load balancer IP
+-	time.Sleep(time.Second)
+-	name := client.ObjectKeyFromObject(&service)
+-	err = ctrlClient.Get(ctx, name, &service)
+-	require.Nil(t, err)
+-	ip, err = target.IP(ctx, ctrlClient)
++	ips, err = target.IPs(ctx, ctrlClient)
+ 	require.Nil(t, err)
+-	assert.Equal(t, service.Status.LoadBalancer.Ingress[0].IP, ip)
++	assert.ElementsMatch(t, []string{"1.2.3.4", "2001:db8::2"}, ips)
++}
++
++func TestIPReturnsErrorWhenServiceCannotBeRetrieved(t *testing.T) {
++	target := NewTarget("missing-service", "my-namespace")
++	ctrlClient := fake.NewClientBuilder().WithScheme(k8tests.NewScheme()).Build()
++
++	_, err := target.IPs(context.Background(), ctrlClient)
++
++	require.Error(t, err)
+ }
+ 
+ func TestNamespacedName(t *testing.T) {

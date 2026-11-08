@@ -1,0 +1,531 @@
+diff --git a/api-extractor/report/hls.js.api.md b/api-extractor/report/hls.js.api.md
+index 6d061b901..cae2518d8 100644
+--- a/api-extractor/report/hls.js.api.md
++++ b/api-extractor/report/hls.js.api.md
+@@ -278,7 +278,7 @@ export class BaseSegment {
+ //
+ // @public (undocumented)
+ export class BaseStreamController extends TaskLoop implements NetworkComponentAPI {
+-    constructor(hls: Hls, fragmentTracker: FragmentTracker, keyLoader: KeyLoader, logPrefix: string);
++    constructor(hls: Hls, fragmentTracker: FragmentTracker, keyLoader: KeyLoader, logPrefix: string, playlistType: PlaylistLevelType);
+     // (undocumented)
+     protected afterBufferFlushed(media: Bufferable, bufferType: SourceBufferName, playlistType: PlaylistLevelType): void;
+     // (undocumented)
+@@ -412,12 +412,16 @@ export class BaseStreamController extends TaskLoop implements NetworkComponentAP
+     // (undocumented)
+     protected onvseeking: EventListener | null;
+     // (undocumented)
++    protected playlistType: PlaylistLevelType;
++    // (undocumented)
+     protected recoverWorkerError(data: ErrorData): void;
+     // (undocumented)
+     protected reduceLengthAndFlushBuffer(data: ErrorData): boolean;
+     // (undocumented)
+     protected reduceMaxBufferLength(threshold: number): boolean;
+     // (undocumented)
++    protected removeUnbufferedFrags(start?: number): void;
++    // (undocumented)
+     protected resetFragmentErrors(filterType: PlaylistLevelType): void;
+     // (undocumented)
+     protected resetFragmentLoading(frag: Fragment): void;
+@@ -428,6 +432,8 @@ export class BaseStreamController extends TaskLoop implements NetworkComponentAP
+     // (undocumented)
+     protected resetTransmuxer(): void;
+     // (undocumented)
++    protected resetWhenMissingContext(chunkMeta: ChunkMetadata): void;
++    // (undocumented)
+     protected retryDate: number;
+     // (undocumented)
+     protected seekToStartPos(): void;
+diff --git a/src/controller/abr-controller.ts b/src/controller/abr-controller.ts
+index 085bee604..8b95ea018 100644
+--- a/src/controller/abr-controller.ts
++++ b/src/controller/abr-controller.ts
+@@ -357,8 +357,14 @@ class AbrController implements AbrComponentAPI {
+     // compute next level using ABR logic
+     let nextABRAutoLevel = this.getNextABRAutoLevel();
+     // use forced auto level when ABR selected level has errored
+-    if (forcedAutoLevel !== -1 && this.hls.levels[nextABRAutoLevel].loadError) {
+-      return forcedAutoLevel;
++    if (forcedAutoLevel !== -1) {
++      const levels = this.hls.levels;
++      if (
++        levels.length > Math.max(forcedAutoLevel, nextABRAutoLevel) &&
++        levels[forcedAutoLevel].loadError <= levels[nextABRAutoLevel].loadError
++      ) {
++        return forcedAutoLevel;
++      }
+     }
+     // if forced auto level has been defined, use it to cap ABR computed quality level
+     if (forcedAutoLevel !== -1) {
+diff --git a/src/controller/audio-stream-controller.ts b/src/controller/audio-stream-controller.ts
+index 55b28f316..bf98e02bd 100644
+--- a/src/controller/audio-stream-controller.ts
++++ b/src/controller/audio-stream-controller.ts
+@@ -64,7 +64,13 @@ class AudioStreamController
+     fragmentTracker: FragmentTracker,
+     keyLoader: KeyLoader
+   ) {
+-    super(hls, fragmentTracker, keyLoader, '[audio-stream-controller]');
++    super(
++      hls,
++      fragmentTracker,
++      keyLoader,
++      '[audio-stream-controller]',
++      PlaylistLevelType.AUDIO
++    );
+     this._registerListeners();
+   }
+ 
+@@ -309,9 +315,9 @@ class AudioStreamController
+     if (bufferInfo === null) {
+       return;
+     }
+-    const audioSwitch = !!this.switchingTrack;
++    const { bufferedTrack, switchingTrack } = this;
+ 
+-    if (!audioSwitch && this._streamEnded(bufferInfo, trackDetails)) {
++    if (!switchingTrack && this._streamEnded(bufferInfo, trackDetails)) {
+       hls.trigger(Events.BUFFER_EOS, { type: 'audio' });
+       this.state = State.ENDED;
+       return;
+@@ -325,16 +331,18 @@ class AudioStreamController
+     const maxBufLen = this.getMaxBufferLength(mainBufferInfo?.len);
+ 
+     // if buffer length is less than maxBufLen try to load a new fragment
+-    if (bufferLen >= maxBufLen && !audioSwitch) {
++    if (bufferLen >= maxBufLen && !switchingTrack) {
+       return;
+     }
+     const fragments = trackDetails.fragments;
+     const start = fragments[0].start;
+     let targetBufferTime = bufferInfo.end;
+ 
+-    if (audioSwitch && media) {
++    if (switchingTrack && media) {
+       const pos = this.getLoadPosition();
+-      targetBufferTime = pos;
++      if (bufferedTrack && switchingTrack.attrs !== bufferedTrack.attrs) {
++        targetBufferTime = pos;
++      }
+       // if currentTime (pos) is less than alt audio playlist start time, it means that alt audio is ahead of currentTime
+       if (trackDetails.PTSKnown && pos < start) {
+         // if everything is buffered from pos to start or if audio buffer upfront, let's seek to start
+@@ -431,7 +439,7 @@ class AudioStreamController
+ 
+     if (fragCurrent) {
+       fragCurrent.abortRequests();
+-      this.fragmentTracker.removeFragment(fragCurrent);
++      this.removeUnbufferedFrags(fragCurrent.start);
+     }
+     this.resetLoadingState();
+     // destroy useless transmuxer when switching audio to main
+@@ -541,12 +549,13 @@ class AudioStreamController
+ 
+     const track = levels[trackId] as Level;
+     if (!track) {
+-      this.warn('Audio track is defined on fragment load progress');
++      this.warn('Audio track is undefined on fragment load progress');
+       return;
+     }
+     const details = track.details as LevelDetails;
+     if (!details) {
+       this.warn('Audio track details undefined on fragment load progress');
++      this.removeUnbufferedFrags(frag.start);
+       return;
+     }
+     const audioCodec =
+@@ -731,10 +740,7 @@ class AudioStreamController
+ 
+     const context = this.getCurrentContext(chunkMeta);
+     if (!context) {
+-      this.warn(
+-        `The loading context changed while buffering fragment ${chunkMeta.sn} of level ${chunkMeta.level}. This chunk will not be buffered.`
+-      );
+-      this.resetStartWhenNotLoaded(chunkMeta.level);
++      this.resetWhenMissingContext(chunkMeta);
+       return;
+     }
+     const { frag, part, level } = context;
+diff --git a/src/controller/base-stream-controller.ts b/src/controller/base-stream-controller.ts
+index bbb601354..a4ce9cf29 100644
+--- a/src/controller/base-stream-controller.ts
++++ b/src/controller/base-stream-controller.ts
+@@ -79,6 +79,7 @@ export default class BaseStreamController
+   protected fragmentTracker: FragmentTracker;
+   protected transmuxer: TransmuxerInterface | null = null;
+   protected _state: string = State.STOPPED;
++  protected playlistType: PlaylistLevelType;
+   protected media: HTMLMediaElement | null = null;
+   protected mediaBuffer: Bufferable | null = null;
+   protected config: HlsConfig;
+@@ -107,9 +108,11 @@ export default class BaseStreamController
+     hls: Hls,
+     fragmentTracker: FragmentTracker,
+     keyLoader: KeyLoader,
+-    logPrefix: string
++    logPrefix: string,
++    playlistType: PlaylistLevelType
+   ) {
+     super();
++    this.playlistType = playlistType;
+     this.logPrefix = logPrefix;
+     this.log = logger.log.bind(logger, `${logPrefix}:`);
+     this.warn = logger.warn.bind(logger, `${logPrefix}:`);
+@@ -270,6 +273,14 @@ export default class BaseStreamController
+     }
+ 
+     if (media) {
++      // Remove gap fragments
++      this.fragmentTracker.removeFragmentsInRange(
++        currentTime,
++        Infinity,
++        this.playlistType,
++        true
++      );
++
+       this.lastCurrentTime = currentTime;
+     }
+ 
+@@ -1587,6 +1598,25 @@ export default class BaseStreamController
+     }
+   }
+ 
++  protected resetWhenMissingContext(chunkMeta: ChunkMetadata) {
++    this.warn(
++      `The loading context changed while buffering fragment ${chunkMeta.sn} of level ${chunkMeta.level}. This chunk will not be buffered.`
++    );
++    this.removeUnbufferedFrags();
++    this.resetStartWhenNotLoaded(chunkMeta.level);
++    this.resetLoadingState();
++  }
++
++  protected removeUnbufferedFrags(start: number = 0) {
++    this.fragmentTracker.removeFragmentsInRange(
++      start,
++      Infinity,
++      this.playlistType,
++      false,
++      true
++    );
++  }
++
+   private updateLevelTiming(
+     frag: Fragment,
+     part: Part | null,
+diff --git a/src/controller/error-controller.ts b/src/controller/error-controller.ts
+index f7008fb78..e0742e8ed 100644
+--- a/src/controller/error-controller.ts
++++ b/src/controller/error-controller.ts
+@@ -88,6 +88,7 @@ export default class ErrorController implements NetworkComponentAPI {
+     this.unregisterListeners();
+     // @ts-ignore
+     this.hls = null;
++    this.penalizedRenditions = {};
+   }
+ 
+   startLoad(startPosition: number): void {
+@@ -328,10 +329,7 @@ export default class ErrorController implements NetworkComponentAPI {
+     }
+     const level = this.hls.levels[levelIndex];
+     if (level) {
+-      // No penalty for GAP tags so that player can switch back when GAPs are found in other levels
+-      if (data.details !== ErrorDetails.FRAG_GAP) {
+-        level.loadError++;
+-      }
++      level.loadError++;
+       if (hls.autoLevelEnabled) {
+         // Search for next level to retry
+         let nextLevel = -1;
+@@ -476,14 +474,17 @@ export default class ErrorController implements NetworkComponentAPI {
+         : hls.loadLevel;
+     const level = hls.levels[levelIndex];
+     const redundantLevels = level.url.length;
+-    this.penalizeRendition(level, data);
++    const errorUrlId = data.frag ? data.frag.urlId : level.urlId;
++    if (level.urlId === errorUrlId && (!data.frag || level.details)) {
++      this.penalizeRendition(level, data);
++    }
+     for (let i = 1; i < redundantLevels; i++) {
+-      const newUrlId = (level.urlId + i) % redundantLevels;
++      const newUrlId = (errorUrlId + i) % redundantLevels;
+       const penalizedRendition = penalizedRenditions[newUrlId];
+       // Check if rendition is penalized and skip if it is a bad fit for failover
+       if (
+         !penalizedRendition ||
+-        checkExpired(penalizedRendition, data, penalizedRenditions[level.urlId])
++        checkExpired(penalizedRendition, data, penalizedRenditions[errorUrlId])
+       ) {
+         // delete penalizedRenditions[newUrlId];
+         // Update the url id of all levels so that we stay on the same set of variants when level switching
+diff --git a/src/controller/fragment-tracker.ts b/src/controller/fragment-tracker.ts
+index b3d807572..8b4539d67 100644
+--- a/src/controller/fragment-tracker.ts
++++ b/src/controller/fragment-tracker.ts
+@@ -37,6 +37,7 @@ export class FragmentTracker implements ComponentAPI {
+ 
+   private bufferPadding: number = 0.2;
+   private hls: Hls;
++  private hasGaps: boolean = false;
+ 
+   constructor(hls: Hls) {
+     this.hls = hls;
+@@ -220,7 +221,7 @@ export class FragmentTracker implements ComponentAPI {
+     }
+   }
+ 
+-  public fragBuffered(frag: Fragment, force?: boolean) {
++  public fragBuffered(frag: Fragment, force?: true) {
+     const fragKey = getFragmentKey(frag);
+     let fragmentEntity = this.fragments[fragKey];
+     if (!fragmentEntity && force) {
+@@ -231,6 +232,9 @@ export class FragmentTracker implements ComponentAPI {
+         buffered: false,
+         range: Object.create(null),
+       };
++      if (frag.gap) {
++        this.hasGaps = true;
++      }
+     }
+     if (fragmentEntity) {
+       fragmentEntity.loaded = null;
+@@ -447,22 +451,28 @@ export class FragmentTracker implements ComponentAPI {
+   public removeFragmentsInRange(
+     start: number,
+     end: number,
+-    playlistType: PlaylistLevelType
++    playlistType: PlaylistLevelType,
++    withGapOnly?: boolean,
++    unbufferedOnly?: boolean
+   ) {
++    if (withGapOnly && !this.hasGaps) {
++      return;
++    }
+     Object.keys(this.fragments).forEach((key) => {
+       const fragmentEntity = this.fragments[key];
+       if (!fragmentEntity) {
+         return;
+       }
+-      if (fragmentEntity.buffered) {
+-        const frag = fragmentEntity.body;
+-        if (
+-          frag.type === playlistType &&
+-          frag.start < end &&
+-          frag.end > start
+-        ) {
+-          this.removeFragment(frag);
+-        }
++      const frag = fragmentEntity.body;
++      if (frag.type !== playlistType || (withGapOnly && !frag.gap)) {
++        return;
++      }
++      if (
++        frag.start < end &&
++        frag.end > start &&
++        (fragmentEntity.buffered || unbufferedOnly)
++      ) {
++        this.removeFragment(frag);
+       }
+     });
+   }
+@@ -485,6 +495,7 @@ export class FragmentTracker implements ComponentAPI {
+     this.endListFragments = Object.create(null);
+     this.mainFragEntity = null;
+     this.activeParts = null;
++    this.hasGaps = false;
+   }
+ }
+ 
+diff --git a/src/controller/gap-controller.ts b/src/controller/gap-controller.ts
+index 8d7e160a4..9a6a77283 100644
+--- a/src/controller/gap-controller.ts
++++ b/src/controller/gap-controller.ts
+@@ -1,6 +1,7 @@
+ import type { BufferInfo } from '../utils/buffer-helper';
+ import { BufferHelper } from '../utils/buffer-helper';
+ import { ErrorTypes, ErrorDetails } from '../errors';
++import { PlaylistLevelType } from '../types/loader';
+ import { Events } from '../events';
+ import { logger } from '../utils/logger';
+ import type Hls from '../hls';
+@@ -256,7 +257,46 @@ export default class GapController {
+       const bufferStarved = bufferInfo.len <= config.maxBufferHole;
+       const waiting =
+         bufferInfo.len > 0 && bufferInfo.len < 1 && media.readyState < 3;
+-      if (currentTime < startTime && (bufferStarved || waiting)) {
++      const gapLength = startTime - currentTime;
++      if (gapLength > 0 && (bufferStarved || waiting)) {
++        // Only allow large gaps to be skipped if it is a start gap, or all fragments in skip range are partial
++        if (gapLength > config.maxBufferHole) {
++          const { fragmentTracker } = this;
++          let startGap = false;
++          if (currentTime === 0) {
++            const startFrag = fragmentTracker.getAppendedFrag(
++              0,
++              PlaylistLevelType.MAIN
++            );
++            if (startFrag && startTime < startFrag.end) {
++              startGap = true;
++            }
++          }
++          if (!startGap) {
++            const startProvisioned =
++              partial ||
++              fragmentTracker.getAppendedFrag(
++                currentTime,
++                PlaylistLevelType.MAIN
++              );
++            if (startProvisioned) {
++              let moreToLoad = false;
++              let pos = startProvisioned.end;
++              while (pos < startTime) {
++                const provisioned = fragmentTracker.getPartialFragment(pos);
++                if (provisioned) {
++                  pos += provisioned.duration;
++                } else {
++                  moreToLoad = true;
++                  break;
++                }
++              }
++              if (moreToLoad) {
++                return 0;
++              }
++            }
++          }
++        }
+         const targetTime = Math.max(
+           startTime + SKIP_BUFFER_RANGE_START,
+           currentTime + SKIP_BUFFER_HOLE_STEP_SECONDS
+diff --git a/src/controller/level-helper.ts b/src/controller/level-helper.ts
+index cf6a2d4e2..e967900f8 100644
+--- a/src/controller/level-helper.ts
++++ b/src/controller/level-helper.ts
+@@ -88,10 +88,13 @@ export function updateFragPTSDTS(
+     endPTS = Math.max(endPTS, fragEndPts);
+     endDTS = Math.max(endDTS, frag.endDTS);
+   }
+-  frag.duration = endPTS - startPTS;
+ 
+   const drift = startPTS - frag.start;
+-  frag.start = frag.startPTS = startPTS;
++  if (frag.start !== 0) {
++    frag.start = startPTS;
++  }
++  frag.duration = endPTS - frag.start;
++  frag.startPTS = startPTS;
+   frag.maxStartPTS = maxStartPTS;
+   frag.startDTS = startDTS;
+   frag.endPTS = endPTS;
+diff --git a/src/controller/stream-controller.ts b/src/controller/stream-controller.ts
+index 9c6113519..37297178d 100644
+--- a/src/controller/stream-controller.ts
++++ b/src/controller/stream-controller.ts
+@@ -62,7 +62,13 @@ export default class StreamController
+     fragmentTracker: FragmentTracker,
+     keyLoader: KeyLoader
+   ) {
+-    super(hls, fragmentTracker, keyLoader, '[stream-controller]');
++    super(
++      hls,
++      fragmentTracker,
++      keyLoader,
++      '[stream-controller]',
++      PlaylistLevelType.MAIN
++    );
+     this._registerListeners();
+   }
+ 
+@@ -248,6 +254,9 @@ export default class StreamController
+     }
+ 
+     // set next load level : this will trigger a playlist load if needed
++    if (hls.loadLevel !== level && hls.manualLevel === -1) {
++      this.log(`Adapting to level ${level} from level ${this.level}`);
++    }
+     this.level = hls.nextLoadLevel = level;
+ 
+     const levelDetails = levelInfo.details;
+@@ -469,6 +478,7 @@ export default class StreamController
+     this.backtrackFragment = null;
+     if (fragCurrent) {
+       fragCurrent.abortRequests();
++      this.fragmentTracker.removeFragment(fragCurrent);
+     }
+     switch (this.state) {
+       case State.KEY_LOADING:
+@@ -622,18 +632,22 @@ export default class StreamController
+       `Level ${newLevelId} loaded [${newDetails.startSN},${newDetails.endSN}], cc [${newDetails.startCC}, ${newDetails.endCC}] duration:${duration}`
+     );
+ 
++    const curLevel = levels[newLevelId];
+     const fragCurrent = this.fragCurrent;
+     if (
+       fragCurrent &&
+       (this.state === State.FRAG_LOADING ||
+         this.state === State.FRAG_LOADING_WAITING_RETRY)
+     ) {
+-      if (fragCurrent.level !== data.level && fragCurrent.loader) {
++      if (
++        (fragCurrent.level !== data.level ||
++          fragCurrent.urlId !== curLevel.urlId) &&
++        fragCurrent.loader
++      ) {
+         this.abortCurrentFrag();
+       }
+     }
+ 
+-    const curLevel = levels[newLevelId];
+     let sliding = 0;
+     if (newDetails.live || curLevel.details?.live) {
+       if (!newDetails.fragments[0]) {
+@@ -687,6 +701,7 @@ export default class StreamController
+       this.warn(
+         `Dropping fragment ${frag.sn} of level ${frag.level} after level details were reset`
+       );
++      this.fragmentTracker.removeFragment(frag);
+       return;
+     }
+     const videoCodec = currentLevel.videoCodec;
+@@ -1039,10 +1054,7 @@ export default class StreamController
+ 
+     const context = this.getCurrentContext(chunkMeta);
+     if (!context) {
+-      this.warn(
+-        `The loading context changed while buffering fragment ${chunkMeta.sn} of level ${chunkMeta.level}. This chunk will not be buffered.`
+-      );
+-      this.resetStartWhenNotLoaded(chunkMeta.level);
++      this.resetWhenMissingContext(chunkMeta);
+       return;
+     }
+     const { frag, part, level } = context;
+diff --git a/src/controller/subtitle-stream-controller.ts b/src/controller/subtitle-stream-controller.ts
+index 11a125345..f1cbdb1fc 100644
+--- a/src/controller/subtitle-stream-controller.ts
++++ b/src/controller/subtitle-stream-controller.ts
+@@ -49,7 +49,13 @@ export class SubtitleStreamController
+     fragmentTracker: FragmentTracker,
+     keyLoader: KeyLoader
+   ) {
+-    super(hls, fragmentTracker, keyLoader, '[subtitle-stream-controller]');
++    super(
++      hls,
++      fragmentTracker,
++      keyLoader,
++      '[subtitle-stream-controller]',
++      PlaylistLevelType.SUBTITLE
++    );
+     this._registerListeners();
+   }
+ 
+diff --git a/src/types/level.ts b/src/types/level.ts
+index 49b21a63f..7abe3c2f4 100644
+--- a/src/types/level.ts
++++ b/src/types/level.ts
+@@ -150,6 +150,7 @@ export class Level {
+     const newValue = value % this.url.length;
+     if (this._urlId !== newValue) {
+       this.fragmentError = 0;
++      this.loadError = 0;
+       this.details = undefined;
+       this._urlId = newValue;
+     }

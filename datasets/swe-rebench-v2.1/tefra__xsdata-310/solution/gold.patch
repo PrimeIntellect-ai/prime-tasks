@@ -1,0 +1,531 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 725224f8..71807971 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -7,7 +7,7 @@ repos:
+       - id: pyupgrade
+         args: [--py37-plus]
+   - repo: https://github.com/asottile/reorder_python_imports
+-    rev: v2.3.5
++    rev: v2.3.6
+     hooks:
+       - id: reorder-python-imports
+   - repo: https://github.com/ambv/black
+diff --git a/xsdata/formats/dataclass/context.py b/xsdata/formats/dataclass/context.py
+index b730d1be..28a046e4 100644
+--- a/xsdata/formats/dataclass/context.py
++++ b/xsdata/formats/dataclass/context.py
+@@ -21,6 +21,7 @@ from xsdata.formats.converter import converter
+ from xsdata.formats.dataclass.models.constants import XmlType
+ from xsdata.formats.dataclass.models.elements import XmlMeta
+ from xsdata.formats.dataclass.models.elements import XmlVar
++from xsdata.models.enums import DataType
+ from xsdata.models.enums import NamespaceType
+ from xsdata.utils.constants import EMPTY_SEQUENCE
+ from xsdata.utils.namespaces import build_qname
+@@ -34,12 +35,15 @@ class XmlContext:
+ 
+     :param element_name: Default callable to convert field names to element tags
+     :param attribute_name: Default callable to convert field names to attribute tags
+-    :param cache: Local storage to store and reuse models' bind metadata.
++    :param cache: Cache models metadata
++    :param xsi_cache: Index models by xsi:type
+     """
+ 
+     element_name: Callable = field(default=lambda x: x)
+     attribute_name: Callable = field(default=lambda x: x)
+     cache: Dict[Type, XmlMeta] = field(default_factory=dict)
++    xsi_cache: Dict[str, List[Type]] = field(default_factory=lambda: defaultdict(list))
++    sys_modules: int = field(default=0, init=False)
+ 
+     def fetch(
+         self,
+@@ -58,45 +62,60 @@ class XmlContext:
+             name instead.
+         """
+         meta = self.build(clazz, parent_ns)
+-
+-        subclass = self.find_subclass(clazz, xsi_type) if xsi_type else None
+-        if subclass:
+-            meta = self.build(subclass, parent_ns)
+-
+-        return meta
+-
+-    def find_subclass(self, clazz: Type, xsi_type: str) -> Optional[Type]:
++        subclass = None
++        if xsi_type and meta.source_qname != xsi_type:
++            subclass = self.find_subclass(clazz, xsi_type)
++
++        return self.build(subclass, parent_ns) if subclass else meta
++
++    def build_xsi_cache(self):
++        """Index all imported dataclasses by their xsi:type qualified name."""
++        self.xsi_cache.clear()
++
++        for clazz in self.get_subclasses(object):
++            if is_dataclass(clazz):
++                meta = clazz.Meta if "Meta" in clazz.__dict__ else None
++                name = getattr(meta, "name", None) or self.local_name(clazz.__name__)
++                module = sys.modules[clazz.__module__]
++                source_namespace = getattr(module, "__NAMESPACE__", None)
++                source_qname = build_qname(source_namespace, name)
++                self.xsi_cache[source_qname].append(clazz)
++
++    def find_types(self, qname: str) -> Optional[List[Type]]:
+         """
+-        Find a derived class of the given clazz that matches the given
+-        qualified xsi type.
++        Find all classes that match the given xsi:type qname.
+ 
+-        The derived class is either a subclass or shares the same parent
+-        class as the given class.
++        - Ignores native schema types, xs:string, xs:float, xs:int, ...
++        - Rebuild cache if new modules were imported since last run
+         """
+-        for subclass in clazz.__subclasses__():
+-            if self.match_class_source_qname(subclass, xsi_type):
+-                return subclass
++        if DataType.from_qname(qname):
++            return None
+ 
+-        for base in clazz.__bases__:
+-            if not is_dataclass(base):
+-                continue
++        if len(sys.modules) != self.sys_modules:
++            self.build_xsi_cache()
++            self.sys_modules = len(sys.modules)
+ 
+-            if self.match_class_source_qname(base, xsi_type):
+-                return base
++        return self.xsi_cache[qname] if qname in self.xsi_cache else None
+ 
+-            sibling = self.find_subclass(base, xsi_type)
+-            if sibling:
+-                return sibling
++    def find_type(self, qname: str) -> Optional[Type]:
++        """Return the most recently imported class that matches the given
++        xsi:type qname."""
++        types = self.find_types(qname)
++        return types[-1] if types else None
+ 
+-        return None
++    def find_subclass(self, clazz: Type, qname: str) -> Optional[Type]:
++        """Compare all classes that match the given xsi:type qname and return
++        the first one that is either a subclass or shares the same parent class
++        as the original class."""
+ 
+-    def match_class_source_qname(self, clazz: Type, xsi_type: str) -> bool:
+-        """Match a given source qualified name with the given xsi type."""
+-        if is_dataclass(clazz):
+-            meta = self.build(clazz)
+-            return meta.source_qname == xsi_type
++        types = self.find_types(qname)
++        if types:
++            for tp in types:
++                for tp_mro in tp.__mro__:
++                    if tp_mro is not object and tp_mro in clazz.__mro__:
++                        return tp
+ 
+-        return False
++        return None
+ 
+     def build(self, clazz: Type, parent_ns: Optional[str] = None) -> XmlMeta:
+         """Fetch from cache or build the metadata object for the given class
+@@ -199,6 +218,9 @@ class XmlContext:
+             qname = build_qname(default_namespace, choice.get("name", "any"))
+             nillable = choice.get("nillable", False)
+ 
++            if xml_type == XmlType.ELEMENT and len(types) == 1 and types[0] == object:
++                derived = True
++
+             yield xml_clazz(
+                 name=parent_name,
+                 qname=qname,
+@@ -329,6 +351,13 @@ class XmlContext:
+ 
+         return XmlType.ELEMENT
+ 
++    @classmethod
++    def get_subclasses(cls, clazz: Type):
++        if clazz is not type:
++            for subclass in clazz.__subclasses__():
++                yield from cls.get_subclasses(subclass)
++                yield subclass
++
+     def local_name(self, name: str, xml_type: Optional[str] = None) -> str:
+         if xml_type == "Attribute":
+             return self.attribute_name(name)
+diff --git a/xsdata/formats/dataclass/models/elements.py b/xsdata/formats/dataclass/models/elements.py
+index 01000f12..4197ee0b 100644
+--- a/xsdata/formats/dataclass/models/elements.py
++++ b/xsdata/formats/dataclass/models/elements.py
+@@ -201,10 +201,6 @@ class XmlWildcard(XmlVar):
+     def is_wildcard(self) -> bool:
+         return True
+ 
+-    @property
+-    def is_any_type(self) -> bool:
+-        return True
+-
+     def matches(self, qname: str) -> bool:
+         """Match the given qname to the wildcard allowed namespaces."""
+ 
+@@ -304,6 +300,9 @@ class XmlMeta:
+     def namespace(self) -> Optional[str]:
+         return split_qname(self.qname)[0]
+ 
++    def has_var(self, qname: str = "*", mode: FindMode = FindMode.ALL) -> bool:
++        return self.find_var(qname, mode) is not None
++
+     def find_var(
+         self, qname: str = "*", mode: FindMode = FindMode.ALL
+     ) -> Optional[XmlVar]:
+diff --git a/xsdata/formats/dataclass/parsers/nodes.py b/xsdata/formats/dataclass/parsers/nodes.py
+index 4216b6a5..b1691be3 100644
+--- a/xsdata/formats/dataclass/parsers/nodes.py
++++ b/xsdata/formats/dataclass/parsers/nodes.py
+@@ -132,26 +132,23 @@ class ElementNode(XmlNode):
+             )
+ 
+         if var.clazz:
+-            xsi_type = ParserUtils.xsi_type(attrs, ns_map)
+-            is_nillable = ParserUtils.is_nillable(attrs)
+-            meta = self.context.fetch(var.clazz, self.meta.namespace, xsi_type)
+-            mixed = self.meta.find_var(mode=FindMode.MIXED_CONTENT)
+-
+-            if not is_nillable and meta.nillable:
+-                return None
+-
+-            return ElementNode(
+-                meta=meta,
+-                config=self.config,
+-                attrs=attrs,
+-                ns_map=ns_map,
+-                context=self.context,
+-                position=position,
+-                derived=var.derived,
+-                mixed=mixed is not None,
++            return self.build_element_node(
++                var.clazz, attrs, ns_map, position, var.derived
+             )
+ 
+         if var.is_any_type:
++            node = self.build_element_node(None, attrs, ns_map, position, var.derived)
++            if not node:
++                node = AnyTypeNode(
++                    var=var,
++                    attrs=attrs,
++                    ns_map=ns_map,
++                    position=position,
++                    mixed=self.meta.has_var(mode=FindMode.MIXED_CONTENT),
++                )
++            return node
++
++        if var.is_wildcard:
+             return WildcardNode(var=var, attrs=attrs, ns_map=ns_map, position=position)
+ 
+         return PrimitiveNode(var=var, ns_map=ns_map)
+@@ -170,6 +167,88 @@ class ElementNode(XmlNode):
+             else:
+                 yield var
+ 
++    def build_element_node(
++        self,
++        clazz: Optional[Type],
++        attrs: Dict,
++        ns_map: Dict,
++        position: int,
++        derived: bool,
++    ) -> Optional[XmlNode]:
++        xsi_type = ParserUtils.xsi_type(attrs, ns_map)
++
++        if clazz is None:
++            if not xsi_type:
++                return None
++
++            clazz = self.context.find_type(xsi_type)
++            xsi_type = None
++
++        if clazz is None:
++            return None
++
++        is_nillable = ParserUtils.is_nillable(attrs)
++        meta = self.context.fetch(clazz, self.meta.namespace, xsi_type)
++
++        if not is_nillable and meta.nillable:
++            return None
++
++        return ElementNode(
++            meta=meta,
++            config=self.config,
++            attrs=attrs,
++            ns_map=ns_map,
++            context=self.context,
++            position=position,
++            derived=derived,
++            mixed=self.meta.has_var(mode=FindMode.MIXED_CONTENT),
++        )
++
++
++@dataclass
++class AnyTypeNode(XmlNode):
++
++    var: XmlVar
++    attrs: Dict
++    ns_map: Dict
++    position: int
++    mixed: bool = False
++    has_children: bool = field(init=False, default=False)
++
++    def child(self, qname: str, attrs: Dict, ns_map: Dict, position: int) -> "XmlNode":
++        self.has_children = True
++        return WildcardNode(position=position, var=self.var, attrs=attrs, ns_map=ns_map)
++
++    def bind(self, qname: str, text: NoneStr, tail: NoneStr, objects: List) -> bool:
++        obj: Any = None
++        if self.has_children:
++            obj = AnyElement(
++                qname=qname,
++                text=ParserUtils.normalize_content(text),
++                tail=ParserUtils.normalize_content(tail),
++                ns_map=self.ns_map,
++                attributes=ParserUtils.parse_any_attributes(self.attrs, self.ns_map),
++                children=ParserUtils.fetch_any_children(self.position, objects),
++            )
++            objects.append((self.var.qname, obj))
++        else:
++            var = self.var
++            ns_map = self.ns_map
++            datatype = ParserUtils.data_type(self.attrs, self.ns_map)
++            obj = ParserUtils.parse_value(text, [datatype.local], var.default, ns_map)
++
++            if var.derived:
++                obj = DerivedElement(qname=qname, value=obj)
++
++            objects.append((qname, obj))
++
++            if self.mixed:
++                tail = ParserUtils.normalize_content(tail)
++                if tail:
++                    objects.append((None, tail))
++
++        return True
++
+ 
+ @dataclass
+ class WildcardNode(XmlNode):
+diff --git a/xsdata/formats/dataclass/parsers/utils.py b/xsdata/formats/dataclass/parsers/utils.py
+index 2192aa45..6bf8b42b 100644
+--- a/xsdata/formats/dataclass/parsers/utils.py
++++ b/xsdata/formats/dataclass/parsers/utils.py
+@@ -4,15 +4,16 @@ from typing import Dict
+ from typing import List
+ from typing import Optional
+ from typing import Type
+-from xml.etree.ElementTree import QName
+ 
+ from xsdata.formats.converter import converter
++from xsdata.formats.converter import QNameConverter
+ from xsdata.formats.dataclass.models.elements import FindMode
+ from xsdata.formats.dataclass.models.elements import XmlMeta
+ from xsdata.formats.dataclass.models.elements import XmlVar
+ from xsdata.formats.dataclass.models.generics import AnyElement
+ from xsdata.formats.dataclass.models.generics import DerivedElement
+ from xsdata.logger import logger
++from xsdata.models.enums import DataType
+ from xsdata.models.enums import QNames
+ from xsdata.utils import text
+ from xsdata.utils.namespaces import build_qname
+@@ -21,12 +22,24 @@ from xsdata.utils.namespaces import build_qname
+ class ParserUtils:
+     @classmethod
+     def xsi_type(cls, attrs: Dict, ns_map: Dict) -> Optional[str]:
+-        """Parse the elements xsi:type attribute if present."""
++        """Parse the xsi:type attribute if present."""
+         xsi_type = attrs.get(QNames.XSI_TYPE)
++        if not xsi_type:
++            return None
++
++        namespace, name = QNameConverter.resolve(xsi_type, ns_map)
++        return build_qname(namespace, name)
++
++    @classmethod
++    def data_type(cls, attrs: Dict, ns_map: Dict) -> DataType:
++        """Convert the xsi:type attribute to a DataType, defaults to
++        DataType.STRING."""
++        xsi_type = cls.xsi_type(attrs, ns_map)
++        datatype = DataType.STRING
+         if xsi_type:
+-            return cls.parse_value(xsi_type, [QName], None, ns_map).text
++            datatype = DataType.from_qname(xsi_type) or datatype
+ 
+-        return None
++        return datatype
+ 
+     @classmethod
+     def is_nillable(cls, attrs: Dict) -> bool:
+@@ -86,7 +99,10 @@ class ParserUtils:
+             if value is None:
+                 value = ""
+ 
+-            params[var.name].append(cls.prepare_generic_value(qname, value))
++            if qname:
++                value = cls.prepare_generic_value(qname, value)
++
++            params[var.name].append(value)
+ 
+     @classmethod
+     def bind_var(cls, params: Dict, var: XmlVar, value: Any) -> bool:
+diff --git a/xsdata/formats/dataclass/serializers/xml.py b/xsdata/formats/dataclass/serializers/xml.py
+index 79f7b4b0..1c14e6cf 100644
+--- a/xsdata/formats/dataclass/serializers/xml.py
++++ b/xsdata/formats/dataclass/serializers/xml.py
+@@ -21,12 +21,12 @@ from xsdata.formats.dataclass.models.generics import DerivedElement
+ from xsdata.formats.dataclass.serializers.mixins import XmlWriter
+ from xsdata.formats.dataclass.serializers.mixins import XmlWriterEvent
+ from xsdata.formats.dataclass.serializers.writers import LxmlEventWriter
++from xsdata.models.enums import DataType
+ from xsdata.models.enums import QNames
+ from xsdata.utils import namespaces
+ from xsdata.utils.constants import EMPTY_MAP
+ from xsdata.utils.namespaces import split_qname
+ 
+-
+ NoneStr = Optional[str]
+ 
+ 
+@@ -114,12 +114,16 @@ class XmlSerializer(AbstractSerializer):
+         yield XmlWriterEvent.END, qname
+ 
+     def write_xsi_type(self, value: Any, var: XmlVar, namespace: NoneStr) -> Generator:
+-        """Produce an events stream from a dataclass with xsi abstract type
+-        check."""
+-        xsi_type = self.xsi_type(var, value, namespace)
+-        yield from self.write_dataclass(
+-            value, namespace, var.qname, var.nillable, xsi_type
+-        )
++        """Produce an events stream from a dataclass for the given var with
++        with xsi abstract type check for non wildcards."""
++
++        if var.is_wildcard:
++            yield from self.write_dataclass(value, namespace)
++        else:
++            xsi_type = self.xsi_type(var, value, namespace)
++            yield from self.write_dataclass(
++                value, namespace, var.qname, var.nillable, xsi_type
++            )
+ 
+     def write_value(self, value: Any, var: XmlVar, namespace: NoneStr) -> Generator:
+         """
+@@ -139,7 +143,7 @@ class XmlSerializer(AbstractSerializer):
+             yield from self.write_elements(value, var, namespace)
+         elif var.is_list and isinstance(value, list):
+             yield from self.write_list(value, var, namespace)
+-        elif var.is_any_type:
++        elif var.is_any_type or var.is_wildcard:
+             yield from self.write_any_type(value, var, namespace)
+         elif var.dataclass:
+             yield from self.write_xsi_type(value, var, namespace)
+@@ -178,17 +182,16 @@ class XmlSerializer(AbstractSerializer):
+         The object can be a dataclass or a generic object or any other
+         simple type.
+         """
+-        if not is_dataclass(value):
+-            if var.is_element:
+-                yield from self.write_element(value, var, namespace)
+-            else:
+-                yield from self.write_data(value, var, namespace)
+-        elif isinstance(value, AnyElement):
++        if isinstance(value, AnyElement):
+             yield from self.write_wildcard(value, var, namespace)
+         elif isinstance(value, DerivedElement):
+             yield from self.write_dataclass(value.value, namespace, qname=value.qname)
++        elif is_dataclass(value):
++            yield from self.write_xsi_type(value, var, namespace)
++        elif var.is_element:
++            yield from self.write_element(value, var, namespace)
+         else:
+-            yield from self.write_dataclass(value, namespace)
++            yield from self.write_data(value, var, namespace)
+ 
+     def write_wildcard(
+         self, value: AnyElement, var: XmlVar, namespace: NoneStr
+@@ -209,17 +212,16 @@ class XmlSerializer(AbstractSerializer):
+         if value.qname:
+             yield XmlWriterEvent.END, value.qname
+ 
+-        yield XmlWriterEvent.DATA, value.tail
++        if value.tail:
++            yield XmlWriterEvent.DATA, value.tail
+ 
+     def xsi_type(self, var: XmlVar, value: Any, namespace: NoneStr) -> Optional[QName]:
+         """Get xsi:type if the given value is a derived instance."""
+-        if not value or value.__class__ in var.types or not var.dataclass:
++        if not value or value.__class__ in var.types:
+             return None
+ 
+         clazz = var.clazz
+-        assert clazz is not None  # not possible :)
+-
+-        if self.context.is_derived(value, clazz):
++        if clazz is None or self.context.is_derived(value, clazz):
+             meta = self.context.fetch(value.__class__, namespace)
+             return QName(meta.source_qname)
+ 
+@@ -269,6 +271,11 @@ class XmlSerializer(AbstractSerializer):
+         if var.nillable:
+             yield XmlWriterEvent.ATTR, QNames.XSI_NIL, "true"
+ 
++        if value is not None and var.is_any_type:
++            datatype = DataType.from_value(value)
++            if datatype != DataType.STRING:
++                yield XmlWriterEvent.ATTR, QNames.XSI_TYPE, datatype.qname
++
+         yield XmlWriterEvent.DATA, value
+         yield XmlWriterEvent.END, var.qname
+ 
+diff --git a/xsdata/models/enums.py b/xsdata/models/enums.py
+index f4d45ee9..78e33cf4 100644
+--- a/xsdata/models/enums.py
++++ b/xsdata/models/enums.py
+@@ -1,6 +1,7 @@
+ from decimal import Decimal
+ from enum import Enum
+ from pathlib import Path
++from typing import Any
+ from typing import Iterator
+ from typing import Optional
+ from xml.etree.ElementTree import QName
+@@ -148,10 +149,30 @@ class DataType(Enum):
+ 
+     @classmethod
+     def get_enum(cls, code: str) -> Optional["DataType"]:
+-        return __XSDType__.get(code) if code else None
++        return __DataTypeCodeIndex__.get(code) if code else None
++
++    @classmethod
++    def from_value(cls, value: Any) -> "DataType":
++        if isinstance(value, bool):
++            return DataType.BOOLEAN
++        if isinstance(value, int):
++            return DataType.INT
++        if isinstance(value, float):
++            return DataType.FLOAT
++        if isinstance(value, Decimal):
++            return DataType.DECIMAL
++        if isinstance(value, QName):
++            return DataType.QNAME
++
++        return DataType.STRING
++
++    @classmethod
++    def from_qname(cls, qname: str) -> Optional["DataType"]:
++        return __DataTypeQNameIndex__.get(qname)
+ 
+ 
+-__XSDType__ = {xsd.code: xsd for xsd in DataType}
++__DataTypeCodeIndex__ = {xsd.code: xsd for xsd in DataType}
++__DataTypeQNameIndex__ = {xsd.qname: xsd for xsd in DataType}
+ 
+ 
+ class EventType:

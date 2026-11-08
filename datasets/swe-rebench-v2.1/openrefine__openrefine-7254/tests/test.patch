@@ -1,0 +1,303 @@
+diff --git a/main/tests/server/src/com/google/refine/operations/row/RowAdditionOperationTests.java b/main/tests/server/src/com/google/refine/operations/row/RowAdditionOperationTests.java
+index d029e0121..21c5e2a94 100644
+--- a/main/tests/server/src/com/google/refine/operations/row/RowAdditionOperationTests.java
++++ b/main/tests/server/src/com/google/refine/operations/row/RowAdditionOperationTests.java
+@@ -28,13 +28,17 @@
+ package com.google.refine.operations.row;
+ 
+ import static org.testng.Assert.assertEquals;
++import static org.testng.Assert.assertNotNull;
+ 
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
+-import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.fasterxml.jackson.databind.node.TextNode;
+ import org.slf4j.LoggerFactory;
+ import org.testng.annotations.BeforeMethod;
+@@ -43,15 +47,22 @@ import org.testng.annotations.BeforeTest;
+ import org.testng.annotations.Test;
+ 
+ import com.google.refine.RefineTest;
++import com.google.refine.expr.MetaParser;
++import com.google.refine.grel.Parser;
++import com.google.refine.model.Cell;
++import com.google.refine.model.Project;
+ import com.google.refine.model.Row;
+ import com.google.refine.operations.OperationDescription;
+ import com.google.refine.operations.OperationRegistry;
++import com.google.refine.operations.cell.MassEditOperation;
++import com.google.refine.operations.cell.MassEditOperation.Edit;
+ import com.google.refine.util.ParsingUtilities;
+-import com.google.refine.util.TestUtils;
++import com.google.refine.util.Pool;
+ 
+ public class RowAdditionOperationTests extends RefineTest {
+ 
+-    String json;
++    String legacyJson;
++    String newJson;
+ 
+     @BeforeSuite
+     public void registerOperation() {
+@@ -60,9 +71,17 @@ public class RowAdditionOperationTests extends RefineTest {
+ 
+     @BeforeMethod
+     public void setUp() {
+-        json = "{"
++        // JSON serialization before 3.9.3, which might contain some corrupted cells because of mutability issues,
++        // manifesting themselves in https://github.com/OpenRefine/OpenRefine/issues/7245
++        legacyJson = "{"
+                 + "\"op\":\"core/row-addition\","
+-                + "\"rows\":[{\"starred\":false,\"flagged\":false,\"cells\":[]},{\"starred\":false,\"flagged\":false,\"cells\":[]}],"
++                + "\"rows\":[{\"starred\":false,\"flagged\":false,\"cells\":[{\"foo\":3}]},{\"starred\":false,\"flagged\":false,\"cells\":[]}],"
++                + "\"index\":0,"
++                + "\"description\":" + new TextNode(OperationDescription.row_addition_brief()).toString() + "}";
++        // JSON serialization from 3.9.3 on
++        newJson = "{"
++                + "\"op\":\"core/row-addition\","
++                + "\"addedRows\":[{\"starred\":false,\"flagged\":false,\"cells\":[]},{\"starred\":false,\"flagged\":false,\"cells\":[]}],"
+                 + "\"index\":0,"
+                 + "\"description\":" + new TextNode(OperationDescription.row_addition_brief()).toString() + "}";
+     }
+@@ -73,10 +92,21 @@ public class RowAdditionOperationTests extends RefineTest {
+         logger = LoggerFactory.getLogger(this.getClass());
+     }
+ 
++    private void assertSerializedAsNewFormat(RowAdditionOperation op) throws IOException {
++        String serialized = ParsingUtilities.mapper.writeValueAsString(op);
++        assertEquals(ParsingUtilities.mapper.readTree(serialized), ParsingUtilities.mapper.readTree(newJson));
++    }
++
+     @Test
+-    public void testDeserialization() throws IOException {
+-        RowAdditionOperation op = ParsingUtilities.mapper.readValue(json, RowAdditionOperation.class);
+-        TestUtils.isSerializedTo(op, json);
++    public void testLegacyDeserialization() throws IOException {
++        RowAdditionOperation op = ParsingUtilities.mapper.readValue(legacyJson, RowAdditionOperation.class);
++        assertSerializedAsNewFormat(op);
++    }
++
++    @Test
++    public void testNewDeserialization() throws IOException {
++        RowAdditionOperation op = ParsingUtilities.mapper.readValue(newJson, RowAdditionOperation.class);
++        assertSerializedAsNewFormat(op);
+     }
+ 
+     @Test
+@@ -87,9 +117,70 @@ public class RowAdditionOperationTests extends RefineTest {
+         int index = 0; // Prepend rows
+ 
+         RowAdditionOperation op = new RowAdditionOperation(rows, index);
+-        ObjectMapper objectMapper = new ObjectMapper();
+-        String serializedObject = objectMapper.writeValueAsString(op);
+-        assertEquals(serializedObject, json);
++        assertSerializedAsNewFormat(op);
+     }
+ 
++
++    // regression test for https://github.com/OpenRefine/OpenRefine/issues/7245
++    @Test
++    public void mutabilityBugRegressionTest() throws Exception {
++        Project project = createProject(new String[] { "foo", "bar" },
++                new Serializable[][] {
++                        { "a", "b " },
++                        { null, "c" },
++                });
++
++        RowAdditionOperation op = ParsingUtilities.mapper.readValue(newJson, RowAdditionOperation.class);
++
++        // add the two rows at the beginning
++        runOperation(op, project);
++        // and then edit a cell in the first row
++        project.rows.get(0).setCell(0, new Cell("hello", null));
++
++        Project expected = createProject(new String[] { "foo", "bar" },
++                new Serializable[][] {
++                        { "hello", null },
++                        { null, null },
++                        { "a", "b " },
++                        { null, "c" },
++                });
++        assertProjectEquals(project, expected);
++
++        // the operation metadata is still unchanged
++        assertSerializedAsNewFormat(op);
++    }
++
++    @Test
++    public void massEditBlankCellsAfterAddingRowsAndReloadProject() throws Exception {
++        Project project = createProject(new String[] { "value" },
++                new Serializable[][] { { "kept" } });
++        RowAdditionOperation addRows = new RowAdditionOperation(
++                Arrays.asList(new Row(0), new Row(0)), project.rows.size());
++        runOperation(addRows, project);
++
++        MetaParser.registerLanguageParser("grel", "GREL", Parser.grelParser, "value");
++        try {
++            MassEditOperation editBlanks = new MassEditOperation(
++                    defaultEngineConfig, "value", "grel:value",
++                    List.of(new Edit(List.of(), true, false, "entered")));
++            runOperation(editBlanks, project);
++        } finally {
++            MetaParser.unregisterLanguageParser("grel");
++        }
++
++        assertEquals(project.rows.size(), 3);
++        assertEquals(project.rows.get(0).getCell(0).value, "kept");
++        assertEquals(project.rows.get(1).getCell(0).value, "entered");
++        assertEquals(project.rows.get(2).getCell(0).value, "entered");
++
++        ByteArrayOutputStream output = new ByteArrayOutputStream();
++        project.saveToOutputStream(output, new Pool());
++        Project loaded = Project.loadFromInputStream(
++                new ByteArrayInputStream(output.toByteArray()), project.id, new Pool());
++        assertNotNull(loaded);
++        assertEquals(loaded.rows.size(), 3);
++        assertEquals(loaded.rows.get(0).getCell(0).value, "kept");
++        assertEquals(loaded.rows.get(1).getCell(0).value, "entered");
++        assertEquals(loaded.rows.get(2).getCell(0).value, "entered");
++    }
+ }
+diff --git a/modules/core/src/test/java/com/google/refine/model/CellTests.java b/modules/core/src/test/java/com/google/refine/model/CellTests.java
+index 1fecf9e1e..ed8b1c2ab 100644
+--- a/modules/core/src/test/java/com/google/refine/model/CellTests.java
++++ b/modules/core/src/test/java/com/google/refine/model/CellTests.java
+@@ -31,6 +31,7 @@ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.when;
+ import static org.testng.Assert.assertEquals;
+ import static org.testng.Assert.assertNotEquals;
++import static org.testng.Assert.assertNotSame;
+ import static org.testng.Assert.assertNull;
+ 
+ import java.time.LocalDateTime;
+@@ -184,4 +185,29 @@ public class CellTests {
+         assertNotEquals(c1, "foo");
+         assertEquals(c1.hashCode(), new Cell("foo", recon).hashCode());
+     }
++
++    @Test
++    public void testDeepCopy() {
++        Recon recon = mock(Recon.class);
++        Recon reconDup = mock(Recon.class);
++        when(recon.dup()).thenReturn(reconDup);
++
++        Cell c1 = new Cell("foo", recon);
++        Cell c2 = c1.deepCopy();
++
++        assertNotSame(c1, c2);
++        assertNotSame(c1.recon, c2.recon);
++        assertEquals(c2.value, "foo");
++        assertEquals(c2.recon, reconDup);
++    }
++
++    @Test
++    public void testDeepCopyNullRecon() {
++        Cell c1 = new Cell("foo", null);
++        Cell c2 = c1.deepCopy();
++
++        assertNotSame(c1, c2);
++        assertEquals(c2.value, "foo");
++        assertNull(c2.recon);
++    }
+ }
+diff --git a/modules/core/src/test/java/com/google/refine/model/RowTests.java b/modules/core/src/test/java/com/google/refine/model/RowTests.java
+index 8337acd1b..6294b62d7 100644
+--- a/modules/core/src/test/java/com/google/refine/model/RowTests.java
++++ b/modules/core/src/test/java/com/google/refine/model/RowTests.java
+@@ -35,6 +35,9 @@ package com.google.refine.model;
+ 
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.when;
++import static org.testng.Assert.assertEquals;
++import static org.testng.Assert.assertNotSame;
++import static org.testng.Assert.assertTrue;
+ 
+ import java.io.StringWriter;
+ import java.util.Properties;
+@@ -187,4 +190,22 @@ public class RowTests extends RefineTest {
+         Assert.assertTrue((Boolean) row.getField("starred", options));
+     }
+ 
++    @Test
++    public void deepCopy() {
++        Row row = new Row(1);
++        row.flagged = true;
++        row.starred = true;
++        Cell originalCell = new Cell("original value", null);
++        row.setCell(0, originalCell);
++
++        Row copied = row.deepCopy();
++        row.flagged = false;
++        row.starred = false;
++        row.setCell(0, new Cell("new value", null));
++
++        assertTrue(copied.flagged);
++        assertTrue(copied.starred);
++        assertNotSame(originalCell, copied.cells.get(0));
++        assertEquals(copied.cells.get(0).value, "original value");
++    }
+ }
+diff --git a/modules/core/src/test/java/com/google/refine/model/changes/RowAdditionChangeTests.java b/modules/core/src/test/java/com/google/refine/model/changes/RowAdditionChangeTests.java
+index b742aa489..66eeda3f8 100644
+--- a/modules/core/src/test/java/com/google/refine/model/changes/RowAdditionChangeTests.java
++++ b/modules/core/src/test/java/com/google/refine/model/changes/RowAdditionChangeTests.java
+@@ -29,7 +29,7 @@ package com.google.refine.model.changes;
+ 
+ import static org.testng.Assert.assertEquals;
+ import static org.testng.Assert.assertNotNull;
+-import static org.testng.Assert.assertSame;
++import static org.testng.Assert.assertNotSame;
+ import static org.testng.Assert.assertTrue;
+ 
+ import java.io.IOException;
+@@ -107,13 +107,18 @@ public class RowAdditionChangeTests extends RefineTest {
+     }
+ 
+     @Test
+-    // After prepend apply, project's new prepended rows are identical those passed to constructor
++    // After prepend apply, project's new prepended rows are equal those passed to constructor
++    // but not identical, because otherwise modifying the row will change the operation's metadata.
++    // See https://github.com/OpenRefine/OpenRefine/issues/7245
+     public void testPrependApplyRowIdentity() {
+         change.apply(project);
+         for (int i = insertionIndex; i < newRows.size(); i++) {
+             Row actual = project.rows.get(i);
+             Row expected = newRows.get(i);
+-            assertSame(actual, expected);
++            assertNotSame(actual, expected);
++            assertEquals(actual.flagged, expected.flagged);
++            assertEquals(actual.starred, expected.starred);
++            assertEquals(actual.cells, expected.cells);
+         }
+     }
+ 
+@@ -204,7 +209,9 @@ public class RowAdditionChangeTests extends RefineTest {
+     }
+ 
+     @Test
+-    // After append apply, project's new append rows are identical those passed to constructor
++    // After append apply, project's new append rows are equal those passed to constructor
++    // but not identical, because otherwise modifying the row will change the operation's metadata.
++    // See https://github.com/OpenRefine/OpenRefine/issues/7245
+     public void testAppendApplyRowIdentity() {
+         insertionIndex = project.rows.size();
+         change = new RowAdditionChange(newRows, insertionIndex);
+@@ -213,7 +220,10 @@ public class RowAdditionChangeTests extends RefineTest {
+         for (int i = insertionIndex; i < newRows.size(); i++) {
+             Row actual = project.rows.get(insertionIndex + i);
+             Row expected = newRows.get(i);
+-            assertSame(actual, expected);
++            assertNotSame(actual, expected);
++            assertEquals(actual.flagged, expected.flagged);
++            assertEquals(actual.starred, expected.starred);
++            assertEquals(actual.cells, expected.cells);
+         }
+     }
+ 

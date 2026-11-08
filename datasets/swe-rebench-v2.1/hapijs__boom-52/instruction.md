@@ -1,0 +1,2 @@
+Make sure Boom initialize method auto cast string statusCode to Integer if possible
+At line https://github.com/hapijs/boom/blob/f4e765af32e1e8d38e20af6551472ab893e58752/lib/index.js#L30 the validation is failing if input `statusCode` is not of `Integer` type, but which can be converted to integer. Can someone please fix this issue, otherwise in consumer module previous initialization code started breaking and client is receiving 500 internal server error.

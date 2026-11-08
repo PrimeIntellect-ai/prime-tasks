@@ -1,0 +1,176 @@
+diff --git a/docs/configuration.md b/docs/configuration.md
+index d27b98c..e4565c0 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -31,14 +31,16 @@ Here is a complete list of configuration directives we support:
+   the current directory, i.e. like `pyenvs = ["."]`.
+ - `ignore_undeclared`: A list of specific dependencies to ignore when reporting
+   undeclared dependencies, for example: `["some_module", "some_other_module"]`.
+-  The default is the empty list: `ignore_undeclared = []`.
++  Simple `*`-wildcards are supported. The default is the empty list:
++  `ignore_undeclared = []`.
+ - `ignore_unused`: A list of specific dependencies to ignore when reporting
+   unused dependencies, for example: `["black", "mypy", "some_other_module"]`.
+-  The default is a list including common development tools. However, you have the
+-  flexibility to overwrite this list according to your project's specific requirements.
+-  For the complete default list, please see the `DEFAULT_IGNORE_UNUSED`
+-  variable in the [`fawltydeps/settings.py`](https://github.com/tweag/FawltyDeps/blob/main/fawltydeps/settings.py) file
+-  in the repository.
++  Simple `*`-wildcards are supported, so e.g. `"pytest-*"` can be used to ignore
++  many pytest plugins. If `ignore_unused` is left unconfigured, it defaults to a
++  list of common development tools (see the `DEFAULT_IGNORE_UNUSED` variable in
++  [`fawltydeps/settings.py`](https://github.com/tweag/FawltyDeps/blob/main/fawltydeps/settings.py)
++  for the complete list). Once you specify it, however, your list will _replace_
++  the default list.
+ - `deps_parser_choice`: Manually select which format to use for parsing
+   declared dependencies. Must be one of `"requirements.txt"`, `"setup.py"`,
+   `"setup.cfg"`, `"pyproject.toml"`, `"pixi.toml"`, `"environment.yml"`, or
+diff --git a/docs/how_to_guides.md b/docs/how_to_guides.md
+index 51c40f8..589a5ba 100644
+--- a/docs/how_to_guides.md
++++ b/docs/how_to_guides.md
+@@ -36,7 +36,7 @@ in one of these ways:
+ How not to display tools like `black` and `pylint` in _unused dependencies_?
+ 
+ By default, all packages declared as dependencies by your project are included
+-in the FawltyDeps analysis, even if they only contain tools that were not meant
++in the FawltyDeps analysis. This includes tools that are typically not meant
+ to be `import`ed, but rather meant to be run by, say, in a pre-commit hook or a
+ CI script. In such cases you may use either:
+ 
+diff --git a/docs/usage.md b/docs/usage.md
+index 54078b3..94866fb 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -175,6 +175,12 @@ to customize the ignore list. By providing your own list of dependencies with
+ this option, you can effectively overwrite the default list. For example:
+ `--ignore-unused black mypy some_other_module`
+ 
++Both `--ignore-undeclared` and `--ignore-unused` support use of simple
++`*`-wildcards to ignore multiple dependencies, for example
++`--ignore-unused types-*` to ignore type stubs dependencies, or
++`--ignore-unused *pre-commit*` to ignore the pre-commit tool and associated
++addons.
++
+ ## Output formats
+ 
+ The default output from FawltyDeps is a summary outlining the relevant
+diff --git a/fawltydeps/check.py b/fawltydeps/check.py
+index d171581..154b366 100644
+--- a/fawltydeps/check.py
++++ b/fawltydeps/check.py
+@@ -1,6 +1,7 @@
+ """Compare imports and dependencies to determine undeclared and unused deps."""
+ 
+ import logging
++import re
+ from collections.abc import Iterable
+ from itertools import groupby
+ 
+@@ -16,6 +17,18 @@ from fawltydeps.types import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++def is_ignored(name: str, ignore_set: set[str]) -> bool:
++    """Return True iff 'name' is in 'ignore_set'."""
++    if name in ignore_set:  # common case
++        return True
++    patterns = [
++        ".*".join(re.escape(fragment) for fragment in word.split("*"))
++        for word in ignore_set
++        if "*" in word
++    ]
++    return any(re.fullmatch(pattern, name) for pattern in patterns)
++
++
+ def calculate_undeclared(
+     imports: list[ParsedImport],
+     resolved_deps: dict[str, Package],
+@@ -32,7 +45,8 @@ def calculate_undeclared(
+     undeclared = [
+         i
+         for i in imports
+-        if i.name not in declared_names.union(settings.ignore_undeclared)
++        if not is_ignored(i.name, settings.ignore_undeclared)
++        and i.name not in declared_names
+     ]
+     undeclared.sort(key=lambda i: i.name)  # groupby requires pre-sorting
+     return [
+@@ -61,7 +75,7 @@ def calculate_unused(
+     unused = [
+         dep
+         for dep in declared_deps
+-        if (dep.name not in settings.ignore_unused)
++        if not is_ignored(dep.name, settings.ignore_unused)
+         and not resolved_deps[dep.name].is_used(imported_names)
+     ]
+     unused.sort(key=lambda dep: dep.name)  # groupby requires pre-sorting
+diff --git a/fawltydeps/packages.py b/fawltydeps/packages.py
+index 4fc7d51..a839af9 100644
+--- a/fawltydeps/packages.py
++++ b/fawltydeps/packages.py
+@@ -70,27 +70,45 @@ class Package:
+         (e.g. typing-extensions), but once installed, it is presented in the
+         context of the local environment with a slightly different spelling
+         (e.g. typing_extension).
++
++        Exception: Stubs-only packages have a "-stubs" suffix on their import
++        name that is _not_ normalized to "_stubs".
+         """
+-        return package_name.lower().replace("-", "_")
++        suffix = ""
++        if package_name.endswith("-stubs"):
++            package_name = package_name[:-6]
++            suffix = "-stubs"
++        return package_name.lower().replace("-", "_") + suffix
+ 
+     @cached_property
+     def normalized_name(self) -> str:
+         """Package name in normalized form."""
+         return self.normalize_name(self.package_name)
+ 
+-    def has_type_stubs(self) -> set[str]:
+-        """Return a set of import names without type stubs suffix."""
+-        provides_stubs_for = [
++    def stubbed_imports(self) -> set[str]:
++        """Return a set of import names without the type stubs suffix.
++
++        For example, a package that has .import_names == {"foo", "bar-stubs"},
++        will return {"bar"} from this method, indicating that it provides type
++        stubs for the "bar" import.
++
++        This allows stub-only packages to be matched against the import names
++        for which they provide type stubs. Stub-only packages are described in
++        https://typing.readthedocs.io/en/latest/spec/distributing.html, and the
++        "-stubs" suffix is mandated here. This makes it relatively safe for us
++        to assume that "FOO-stubs" is indeed directly associated with the "FOO"
++        module.
++        """
++        return {
+             import_name[: -len("-stubs")]
+             for import_name in self.import_names
+             if import_name.endswith("-stubs")
+-        ]
+-        return set(provides_stubs_for)
++        }
+ 
+     def is_used(self, imported_names: Iterable[str]) -> bool:
+         """Return True iff this package is among the given import names."""
+         return bool(self.import_names.intersection(imported_names)) or bool(
+-            self.has_type_stubs().intersection(imported_names)
++            self.stubbed_imports().intersection(imported_names)
+         )
+ 
+ 
+diff --git a/fawltydeps/settings.py b/fawltydeps/settings.py
+index 9e91f63..d813378 100644
+--- a/fawltydeps/settings.py
++++ b/fawltydeps/settings.py
+@@ -130,6 +130,7 @@ DEFAULT_IGNORE_UNUSED = {
+     "nox",
+     "pre-commit",
+     "pytest",
++    "pytest-*",
+     "tox",
+     # Building and Packaging Tools
+     "twine",

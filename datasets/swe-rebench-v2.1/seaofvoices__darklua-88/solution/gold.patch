@@ -1,0 +1,461 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 74bee22..47364f5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++* improve `convert_index_to_field` to refactor table entries ([#88](https://github.com/seaofvoices/darklua/pull/88))
+ * fix `remove_nil_declaration` ([#84](https://github.com/seaofvoices/darklua/pull/84))
+ * upgrade CLI library (mostly changes the help messages format) ([#83](https://github.com/seaofvoices/darklua/pull/83))
+ * add rule to remove compount assignments ([#78](https://github.com/seaofvoices/darklua/pull/78))
+diff --git a/site/content/rules/convert_index_to_field.md b/site/content/rules/convert_index_to_field.md
+index b5a1415..1cab892 100644
+--- a/site/content/rules/convert_index_to_field.md
++++ b/site/content/rules/convert_index_to_field.md
+@@ -4,6 +4,7 @@ added_in: "0.7.0"
+ parameters: []
+ examples:
+   - content: "return var['field']"
++  - content: "return { ['field'] = true }"
+ ---
+ 
+-When an index expression is using a static string (or an expression that can be statically evaluated into a string), this rule replaces it with a field expression.
++When an index expression is using a static string (or an expression that can be statically evaluated into a string), this rule replaces it with a field expression. This rule also applies for table declarations: an entry that uses the bracket syntax (e.g. `{ ["key"] = value }`) will get converted into a field-like entry when possible.
+diff --git a/src/nodes/expressions/table.rs b/src/nodes/expressions/table.rs
+index 9845754..8150835 100644
+--- a/src/nodes/expressions/table.rs
++++ b/src/nodes/expressions/table.rs
+@@ -251,6 +251,11 @@ impl TableExpression {
+         self.entries.iter()
+     }
+ 
++    #[inline]
++    pub fn iter_mut_entries(&mut self) -> impl Iterator<Item = &mut TableEntry> {
++        self.entries.iter_mut()
++    }
++
+     #[inline]
+     pub fn len(&self) -> usize {
+         self.entries.len()
+diff --git a/src/process/visitors.rs b/src/process/visitors.rs
+index bea7bbf..932e294 100644
+--- a/src/process/visitors.rs
++++ b/src/process/visitors.rs
+@@ -232,17 +232,14 @@ pub trait NodeVisitor<T: NodeProcessor> {
+     fn visit_table(table: &mut TableExpression, processor: &mut T) {
+         processor.process_table_expression(table);
+ 
+-        table
+-            .mutate_entries()
+-            .iter_mut()
+-            .for_each(|entry| match entry {
+-                TableEntry::Field(entry) => Self::visit_expression(entry.mutate_value(), processor),
+-                TableEntry::Index(entry) => {
+-                    Self::visit_expression(entry.mutate_key(), processor);
+-                    Self::visit_expression(entry.mutate_value(), processor);
+-                }
+-                TableEntry::Value(value) => Self::visit_expression(value, processor),
+-            });
++        table.iter_mut_entries().for_each(|entry| match entry {
++            TableEntry::Field(entry) => Self::visit_expression(entry.mutate_value(), processor),
++            TableEntry::Index(entry) => {
++                Self::visit_expression(entry.mutate_key(), processor);
++                Self::visit_expression(entry.mutate_value(), processor);
++            }
++            TableEntry::Value(value) => Self::visit_expression(value, processor),
++        });
+     }
+ 
+     fn visit_prefix_expression(prefix: &mut Prefix, processor: &mut T) {
+diff --git a/src/rules/call_parens.rs b/src/rules/call_parens.rs
+index f20308a..eccee01 100644
+--- a/src/rules/call_parens.rs
++++ b/src/rules/call_parens.rs
+@@ -86,4 +86,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_function_call_parens", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_function_call_parens',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/convert_index_to_field.rs b/src/rules/convert_index_to_field.rs
+index af72051..0b4b1f2 100644
+--- a/src/rules/convert_index_to_field.rs
++++ b/src/rules/convert_index_to_field.rs
+@@ -1,5 +1,6 @@
+ use crate::nodes::{
+-    Block, Expression, FieldExpression, Identifier, IndexExpression, Prefix, Variable,
++    Block, Expression, FieldExpression, Identifier, IndexExpression, Prefix, TableEntry,
++    TableExpression, TableFieldEntry, Variable,
+ };
+ use crate::process::utils::is_valid_identifier;
+ use crate::process::{DefaultVisitor, Evaluator, LuaValue, NodeProcessor, NodeVisitor};
+@@ -17,13 +18,16 @@ struct Converter {
+ }
+ 
+ impl Converter {
+-    fn convert_to_field(&self, index: &IndexExpression) -> Option<FieldExpression> {
+-        if let LuaValue::String(string) = self.evaluator.evaluate(index.get_index()) {
++    #[inline]
++    fn convert_index_to_field(&self, index: &IndexExpression) -> Option<FieldExpression> {
++        self.convert_to_field(index.get_index())
++            .map(|key| FieldExpression::new(index.get_prefix().clone(), Identifier::new(key)))
++    }
++
++    fn convert_to_field(&self, key_expression: &Expression) -> Option<String> {
++        if let LuaValue::String(string) = self.evaluator.evaluate(key_expression) {
+             if is_valid_identifier(&string) {
+-                return Some(FieldExpression::new(
+-                    index.get_prefix().clone(),
+-                    Identifier::new(string),
+-                ));
++                return Some(string);
+             }
+         }
+         None
+@@ -33,7 +37,7 @@ impl Converter {
+ impl NodeProcessor for Converter {
+     fn process_expression(&mut self, expression: &mut Expression) {
+         let field: Option<Expression> = if let Expression::Index(index) = expression {
+-            self.convert_to_field(index).map(Into::into)
++            self.convert_index_to_field(index).map(Into::into)
+         } else {
+             None
+         };
+@@ -44,7 +48,7 @@ impl NodeProcessor for Converter {
+ 
+     fn process_prefix_expression(&mut self, prefix: &mut Prefix) {
+         let field: Option<Prefix> = if let Prefix::Index(index) = prefix {
+-            self.convert_to_field(index).map(Into::into)
++            self.convert_index_to_field(index).map(Into::into)
+         } else {
+             None
+         };
+@@ -55,7 +59,7 @@ impl NodeProcessor for Converter {
+ 
+     fn process_variable(&mut self, variable: &mut Variable) {
+         let field: Option<Variable> = if let Variable::Index(index) = variable {
+-            self.convert_to_field(index).map(Into::into)
++            self.convert_index_to_field(index).map(Into::into)
+         } else {
+             None
+         };
+@@ -63,6 +67,22 @@ impl NodeProcessor for Converter {
+             mem::swap(variable, &mut field);
+         }
+     }
++
++    fn process_table_expression(&mut self, table: &mut TableExpression) {
++        for entry in table.iter_mut_entries() {
++            let replace_with = match entry {
++                TableEntry::Index(entry) => self
++                    .convert_to_field(entry.get_key())
++                    .map(|key| TableFieldEntry::new(key, entry.get_value().clone()))
++                    .map(TableEntry::from),
++
++                TableEntry::Field(_) | TableEntry::Value(_) => None,
++            };
++            if let Some(new_entry) = replace_with {
++                *entry = new_entry;
++            }
++        }
++    }
+ }
+ 
+ pub const CONVERT_INDEX_TO_FIELD_RULE_NAME: &str = "convert_index_to_field";
+@@ -111,4 +131,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_convert_index_to_field", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'convert_index_to_field',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/empty_do.rs b/src/rules/empty_do.rs
+index 142761e..ed65cf5 100644
+--- a/src/rules/empty_do.rs
++++ b/src/rules/empty_do.rs
+@@ -106,4 +106,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_empty_do", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_empty_do',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/filter_early_return.rs b/src/rules/filter_early_return.rs
+index 6b8987c..e027fce 100644
+--- a/src/rules/filter_early_return.rs
++++ b/src/rules/filter_early_return.rs
+@@ -97,4 +97,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_filter_after_early_return", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'filter_after_early_return',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/method_def.rs b/src/rules/method_def.rs
+index a70c127..baa6ba9 100644
+--- a/src/rules/method_def.rs
++++ b/src/rules/method_def.rs
+@@ -63,4 +63,20 @@ mod test {
+     fn serialize_default_rule() {
+         assert_json_snapshot!("default_remove_method_definition", wrap(new_rule()));
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_method_definition',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/no_local_function.rs b/src/rules/no_local_function.rs
+index 3064128..dd14fa5 100644
+--- a/src/rules/no_local_function.rs
++++ b/src/rules/no_local_function.rs
+@@ -94,6 +94,8 @@ impl Serialize for ConvertLocalFunctionToAssign {
+ mod test {
+     use super::*;
+ 
++    use crate::rules::Rule;
++
+     use insta::assert_json_snapshot;
+ 
+     fn new_rule() -> ConvertLocalFunctionToAssign {
+@@ -104,4 +106,20 @@ mod test {
+     fn serialize_default_rule() {
+         assert_json_snapshot!("default_convert_local_function_to_assign", new_rule());
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'convert_local_function_to_assign',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/remove_comments.rs b/src/rules/remove_comments.rs
+index de05eed..ca2adc0 100644
+--- a/src/rules/remove_comments.rs
++++ b/src/rules/remove_comments.rs
+@@ -191,4 +191,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_comments", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_comments',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/remove_compound_assign.rs b/src/rules/remove_compound_assign.rs
+index 225e61e..2f5ceed 100644
+--- a/src/rules/remove_compound_assign.rs
++++ b/src/rules/remove_compound_assign.rs
+@@ -333,4 +333,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_compound_assignment", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_compound_assignment',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/remove_nil_declarations.rs b/src/rules/remove_nil_declarations.rs
+index 2ccc433..e508ff6 100644
+--- a/src/rules/remove_nil_declarations.rs
++++ b/src/rules/remove_nil_declarations.rs
+@@ -126,4 +126,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_nil_declaration", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_nil_declaration',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/remove_spaces.rs b/src/rules/remove_spaces.rs
+index 335f959..41ad7de 100644
+--- a/src/rules/remove_spaces.rs
++++ b/src/rules/remove_spaces.rs
+@@ -191,4 +191,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_spaces", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_spaces',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/unused_if_branch.rs b/src/rules/unused_if_branch.rs
+index fa1a5a8..fb93b55 100644
+--- a/src/rules/unused_if_branch.rs
++++ b/src/rules/unused_if_branch.rs
+@@ -246,4 +246,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_unused_if_branch", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_unused_if_branch',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }
+diff --git a/src/rules/unused_while.rs b/src/rules/unused_while.rs
+index 44d1af4..bc87347 100644
+--- a/src/rules/unused_while.rs
++++ b/src/rules/unused_while.rs
+@@ -75,4 +75,20 @@ mod test {
+ 
+         assert_json_snapshot!("default_remove_unused_while", rule);
+     }
++
++    #[test]
++    fn configure_with_extra_field_error() {
++        let result = json5::from_str::<Box<dyn Rule>>(
++            r#"{
++            rule: 'remove_unused_while',
++            prop: "something",
++        }"#,
++        );
++        let err_message = match result {
++            Ok(_) => panic!("expected error when deserializing rule"),
++            Err(e) => e,
++        }
++        .to_string();
++        pretty_assertions::assert_eq!(err_message, "unexpected field 'prop'");
++    }
+ }

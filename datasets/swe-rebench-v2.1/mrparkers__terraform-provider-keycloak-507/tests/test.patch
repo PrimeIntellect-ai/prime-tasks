@@ -1,0 +1,311 @@
+diff --git a/keycloak/keycloak_client_test.go b/keycloak/keycloak_client_test.go
+index 174749d..d3930a7 100644
+--- a/keycloak/keycloak_client_test.go
++++ b/keycloak/keycloak_client_test.go
+@@ -1,12 +1,18 @@
+ package keycloak
+ 
+ import (
+-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
+ 	"io/ioutil"
+ 	"log"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
++	"reflect"
+ 	"strconv"
++	"strings"
++	"sync"
+ 	"testing"
++
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
+ )
+ 
+ var requiredEnvironmentVariables = []string{
+@@ -53,7 +59,9 @@ func TestAccKeycloakApiClientRefresh(t *testing.T) {
+ 		t.Fatal("KEYCLOAK_CLIENT_TIMEOUT must be an integer")
+ 	}
+ 
+-	keycloakClient, err := NewKeycloakClient(os.Getenv("KEYCLOAK_URL"), "/auth", os.Getenv("KEYCLOAK_CLIENT_ID"), os.Getenv("KEYCLOAK_CLIENT_SECRET"), os.Getenv("KEYCLOAK_REALM"), os.Getenv("KEYCLOAK_USER"), os.Getenv("KEYCLOAK_PASSWORD"), true, clientTimeout, "", false, "")
++	keycloakClient, err := newKeycloakClientWithHeaders(os.Getenv("KEYCLOAK_URL"), "/auth", os.Getenv("KEYCLOAK_CLIENT_ID"), os.Getenv("KEYCLOAK_CLIENT_SECRET"), os.Getenv("KEYCLOAK_REALM"), os.Getenv("KEYCLOAK_USER"), os.Getenv("KEYCLOAK_PASSWORD"), true, clientTimeout, "", false, "", map[string]string{
++		"foo": "bar",
++	})
+ 	if err != nil {
+ 		t.Fatalf("%s", err)
+ 	}
+@@ -112,3 +120,114 @@ func TestAccKeycloakApiClientRefresh(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestKeycloakClientAdditionalHeaders verifies that headers supplied to the
++// client constructor are attached to every outgoing Keycloak REST request,
++// including the authentication request and regular admin API requests.
++func TestKeycloakClientAdditionalHeaders(t *testing.T) {
++	additionalHeaders := map[string]string{
++		"foo": "bar",
++	}
++
++	var mu sync.Mutex
++	type recordedRequest struct {
++		path   string
++		header http.Header
++	}
++	var recorded []recordedRequest
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		recorded = append(recorded, recordedRequest{path: r.URL.Path, header: r.Header.Clone()})
++		mu.Unlock()
++
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case strings.HasSuffix(r.URL.Path, "/protocol/openid-connect/token"):
++			_, _ = w.Write([]byte(`{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer"}`))
++		case strings.HasSuffix(r.URL.Path, "/serverinfo"):
++			_, _ = w.Write([]byte(`{"systemInfo":{"version":"12.0.4"}}`))
++		default:
++			_, _ = w.Write([]byte(`{}`))
++		}
++	}))
++	defer server.Close()
++
++	keycloakClient, err := newKeycloakClientWithHeaders(server.URL, "/auth", "client-id", "client-secret", "realm", "", "", true, 5, "", false, "", additionalHeaders)
++	if err != nil {
++		t.Fatalf("unexpected error creating client: %s", err)
++	}
++
++	// Trigger a regular admin API request as well.
++	if _, err := keycloakClient.GetRealm("some-realm"); err != nil {
++		t.Fatalf("unexpected error getting realm: %s", err)
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++
++	if len(recorded) == 0 {
++		t.Fatal("expected the client to send at least one request")
++	}
++
++	tokenRequestSeen := false
++	adminRequestSeen := false
++	for _, request := range recorded {
++		if strings.HasSuffix(request.path, "/protocol/openid-connect/token") {
++			tokenRequestSeen = true
++		}
++		if strings.Contains(request.path, "/admin/") {
++			adminRequestSeen = true
++		}
++		if got := request.header.Get("foo"); got != "bar" {
++			t.Errorf("expected request to %s to include additional header foo=bar, got %q", request.path, got)
++		}
++	}
++	if !tokenRequestSeen || !adminRequestSeen {
++		t.Fatalf("expected token and admin API requests, got token=%t admin=%t", tokenRequestSeen, adminRequestSeen)
++	}
++}
++
++func TestNewKeycloakClientSignature(t *testing.T) {
++	constructorType := reflect.TypeOf(NewKeycloakClient)
++	wantInputs := []reflect.Type{
++		reflect.TypeOf(""), reflect.TypeOf(""), reflect.TypeOf(""), reflect.TypeOf(""),
++		reflect.TypeOf(""), reflect.TypeOf(""), reflect.TypeOf(""), reflect.TypeOf(false),
++		reflect.TypeOf(int(0)), reflect.TypeOf(""), reflect.TypeOf(false), reflect.TypeOf(""),
++		reflect.TypeOf(map[string]string{}),
++	}
++	if constructorType.NumIn() != len(wantInputs) {
++		t.Fatalf("NewKeycloakClient accepts %d arguments, want %d", constructorType.NumIn(), len(wantInputs))
++	}
++	for index, want := range wantInputs {
++		if got := constructorType.In(index); got != want {
++			t.Errorf("argument %d has type %s, want %s", index+1, got, want)
++		}
++	}
++	if constructorType.NumOut() != 2 || constructorType.Out(0) != reflect.TypeOf((*KeycloakClient)(nil)) || constructorType.Out(1) != reflect.TypeOf((*error)(nil)).Elem() {
++		t.Fatalf("NewKeycloakClient must return (*KeycloakClient, error)")
++	}
++}
++
++// Use reflection so that a base implementation with the previous constructor
++// arity still builds and reaches behavioral assertions about missing headers.
++func newKeycloakClientWithHeaders(url, basePath, clientId, clientSecret, realm, username, password string, initialLogin bool, clientTimeout int, caCert string, tlsInsecureSkipVerify bool, userAgent string, additionalHeaders map[string]string) (*KeycloakClient, error) {
++	constructor := reflect.ValueOf(NewKeycloakClient)
++	arguments := []interface{}{url, basePath, clientId, clientSecret, realm, username, password, initialLogin, clientTimeout, caCert, tlsInsecureSkipVerify, userAgent}
++	if constructor.Type().NumIn() == 13 {
++		arguments = append(arguments, additionalHeaders)
++	}
++	values := make([]reflect.Value, len(arguments))
++	for index, argument := range arguments {
++		values[index] = reflect.ValueOf(argument)
++	}
++	results := constructor.Call(values)
++	var client *KeycloakClient
++	if !results[0].IsNil() {
++		client = results[0].Interface().(*KeycloakClient)
++	}
++	if results[1].IsNil() {
++		return client, nil
++	}
++	return client, results[1].Interface().(error)
++}
+diff --git a/provider/provider_test.go b/provider/provider_test.go
+index b477235..71f1dde 100644
+--- a/provider/provider_test.go
++++ b/provider/provider_test.go
+@@ -1,13 +1,19 @@
+ package provider
+ 
+ import (
++	"context"
+ 	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"reflect"
++	"strings"
++	"testing"
++
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/meta"
+ 	"github.com/mrparkers/terraform-provider-keycloak/keycloak"
+-	"os"
+-	"testing"
+ )
+ 
+ var testAccProviderFactories map[string]func() (*schema.Provider, error)
+@@ -26,7 +32,9 @@ var requiredEnvironmentVariables = []string{
+ 
+ func init() {
+ 	userAgent := fmt.Sprintf("HashiCorp Terraform/%s (+https://www.terraform.io) Terraform Plugin SDK/%s", schema.Provider{}.TerraformVersion, meta.SDKVersionString())
+-	keycloakClient, _ = keycloak.NewKeycloakClient(os.Getenv("KEYCLOAK_URL"), "/auth", os.Getenv("KEYCLOAK_CLIENT_ID"), os.Getenv("KEYCLOAK_CLIENT_SECRET"), os.Getenv("KEYCLOAK_REALM"), "", "", true, 5, "", false, userAgent)
++	keycloakClient, _ = newProviderTestClient(os.Getenv("KEYCLOAK_URL"), "/auth", os.Getenv("KEYCLOAK_CLIENT_ID"), os.Getenv("KEYCLOAK_CLIENT_SECRET"), os.Getenv("KEYCLOAK_REALM"), "", "", true, 5, "", false, userAgent, map[string]string{
++		"foo": "bar",
++	})
+ 	testAccProvider = KeycloakProvider(keycloakClient)
+ 	testAccProviderFactories = map[string]func() (*schema.Provider, error){
+ 		"keycloak": func() (*schema.Provider, error) {
+@@ -36,6 +44,10 @@ func init() {
+ }
+ 
+ func TestMain(m *testing.M) {
++	if os.Getenv("KEYCLOAK_URL") == "" {
++		m.Run()
++		return
++	}
+ 	testAccRealm = createTestRealm()
+ 	testAccRealmTwo = createTestRealm()
+ 	testAccRealmUserFederation = createTestRealm()
+@@ -89,3 +101,112 @@ func testAccPreCheck(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestProviderAdditionalHeaders(t *testing.T) {
++	additionalHeaders := map[string]string{
++		"X-Proxy-Key":   "proxy-secret",
++		"X-Proxy-Scope": "terraform",
++	}
++	requests := make(chan *http.Request, 4)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests <- r.Clone(r.Context())
++		w.Header().Set("Content-Type", "application/json")
++		if strings.HasSuffix(r.URL.Path, "/protocol/openid-connect/token") {
++			_, _ = w.Write([]byte(`{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer"}`))
++			return
++		}
++		if strings.HasSuffix(r.URL.Path, "/serverinfo") {
++			_, _ = w.Write([]byte(`{"systemInfo":{"version":"12.0.4"}}`))
++			return
++		}
++		_, _ = w.Write([]byte(`{}`))
++	}))
++	defer server.Close()
++
++	configuredProvider := KeycloakProvider(nil)
++	resourceData := schema.TestResourceDataRaw(t, configuredProvider.Schema, map[string]interface{}{
++		"url":            server.URL,
++		"base_path":      "/auth",
++		"client_id":      "client-id",
++		"client_secret":  "client-secret",
++		"realm":          "master",
++		"initial_login":  true,
++		"client_timeout": 5,
++		"additional_headers": map[string]interface{}{
++			"X-Proxy-Key":   "proxy-secret",
++			"X-Proxy-Scope": "terraform",
++		},
++	})
++	configuredClient, diagnostics := configuredProvider.ConfigureContextFunc(context.Background(), resourceData)
++	if diagnostics.HasError() {
++		t.Fatalf("unexpected provider configuration error: %v", diagnostics)
++	}
++	client, ok := configuredClient.(*keycloak.KeycloakClient)
++	if !ok || client == nil {
++		t.Fatalf("provider configuration returned %T, want a Keycloak client", configuredClient)
++	}
++	if _, err := client.GetRealm("example"); err != nil {
++		t.Fatalf("unexpected admin API request error: %s", err)
++	}
++
++	close(requests)
++	if len(requests) < 2 {
++		t.Fatalf("expected token and admin API requests, got %d", len(requests))
++	}
++	tokenRequestSeen := false
++	adminRequestSeen := false
++	for request := range requests {
++		if strings.HasSuffix(request.URL.Path, "/protocol/openid-connect/token") {
++			tokenRequestSeen = true
++		}
++		if strings.Contains(request.URL.Path, "/admin/") {
++			adminRequestSeen = true
++		}
++		for name, want := range additionalHeaders {
++			if got := request.Header.Get(name); got != want {
++				t.Errorf("request to %s has %s=%q, want %q", request.URL.Path, name, got, want)
++			}
++		}
++	}
++	if !tokenRequestSeen || !adminRequestSeen {
++		t.Fatalf("expected token and admin API requests, got token=%t admin=%t", tokenRequestSeen, adminRequestSeen)
++	}
++
++	resourceDataWithoutHeaders := schema.TestResourceDataRaw(t, configuredProvider.Schema, map[string]interface{}{
++		"url":            server.URL,
++		"base_path":      "/auth",
++		"client_id":      "client-id",
++		"client_secret":  "client-secret",
++		"realm":          "master",
++		"initial_login":  false,
++		"client_timeout": 5,
++	})
++	clientWithoutHeaders, diagnostics := configuredProvider.ConfigureContextFunc(context.Background(), resourceDataWithoutHeaders)
++	if diagnostics.HasError() {
++		t.Fatalf("provider configuration without additional_headers failed: %v", diagnostics)
++	}
++	if _, ok := clientWithoutHeaders.(*keycloak.KeycloakClient); !ok {
++		t.Fatalf("provider configuration without additional_headers returned %T, want a Keycloak client", clientWithoutHeaders)
++	}
++}
++
++func newProviderTestClient(url, basePath, clientId, clientSecret, realm, username, password string, initialLogin bool, clientTimeout int, caCert string, tlsInsecureSkipVerify bool, userAgent string, additionalHeaders map[string]string) (*keycloak.KeycloakClient, error) {
++	constructor := reflect.ValueOf(keycloak.NewKeycloakClient)
++	arguments := []interface{}{url, basePath, clientId, clientSecret, realm, username, password, initialLogin, clientTimeout, caCert, tlsInsecureSkipVerify, userAgent}
++	if constructor.Type().NumIn() == 13 {
++		arguments = append(arguments, additionalHeaders)
++	}
++	values := make([]reflect.Value, len(arguments))
++	for index, argument := range arguments {
++		values[index] = reflect.ValueOf(argument)
++	}
++	results := constructor.Call(values)
++	var client *keycloak.KeycloakClient
++	if !results[0].IsNil() {
++		client = results[0].Interface().(*keycloak.KeycloakClient)
++	}
++	if results[1].IsNil() {
++		return client, nil
++	}
++	return client, results[1].Interface().(error)
++}

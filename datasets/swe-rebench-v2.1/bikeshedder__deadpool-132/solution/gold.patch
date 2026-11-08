@@ -1,0 +1,215 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 349e8ac..23801e6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ * Remove `Runtime::None` in favor of `Option<Runtime>`
+ * Remove `Pool::new` method
+ * Add `Pool::builder` method and `PoolBuilder` struct
++* Add `Object::metrics` method and `Metrics` struct
+ 
+ ## v0.8.2
+ 
+diff --git a/src/managed/hooks.rs b/src/managed/hooks.rs
+index dd06742..9f00829 100644
+--- a/src/managed/hooks.rs
++++ b/src/managed/hooks.rs
+@@ -4,7 +4,7 @@ use std::fmt;
+ 
+ use async_trait::async_trait;
+ 
+-use super::Manager;
++use super::{metrics::Metrics, Manager};
+ 
+ /// Possible errors returned by [`Hooks`] which will abort the creation and/or
+ /// recycling of objects.
+@@ -56,7 +56,11 @@ pub trait PostRecycle<M: Manager>: Sync + Send {
+     /// The hook method which is called after recycling an existing [`Object`].
+     ///
+     /// [`Object`]: super::Object
+-    async fn post_recycle(&self, obj: &mut M::Type) -> Result<(), HookError<M::Error>>;
++    async fn post_recycle(
++        &self,
++        obj: &mut M::Type,
++        metrics: &Metrics,
++    ) -> Result<(), HookError<M::Error>>;
+ }
+ 
+ impl<M: Manager> fmt::Debug for dyn PostRecycle<M> {
+diff --git a/src/managed/metrics.rs b/src/managed/metrics.rs
+new file mode 100644
+index 0000000..72dff7a
+--- /dev/null
++++ b/src/managed/metrics.rs
+@@ -0,0 +1,43 @@
++use std::time::{Duration, Instant};
++
++/// Statistics regarding an object returned by the pool
++#[derive(Clone, Copy, Debug)]
++#[must_use]
++pub struct Metrics {
++    /// The instant when this object was created
++    pub created: Instant,
++    /// The instant when this object was last used
++    pub recycled: Option<Instant>,
++    /// The number of times the objects was recycled
++    pub recycle_count: usize,
++}
++
++impl Metrics {
++    /// Access the age of this object
++    pub fn age(&self) -> Duration {
++        self.created.elapsed()
++    }
++    /// Get the time elapsed when this object was last used
++    pub fn last_used(&self) -> Duration {
++        self.recycled.unwrap_or(self.created).elapsed()
++    }
++}
++
++impl Default for Metrics {
++    fn default() -> Self {
++        Self {
++            created: Instant::now(),
++            recycled: None,
++            recycle_count: 0,
++        }
++    }
++}
++
++/// The combination of an object and its metrics
++#[derive(Debug)]
++pub(crate) struct WithMetrics<T> {
++    /// The object
++    pub(crate) obj: T,
++    /// The metrics of the object
++    pub(crate) metrics: Metrics,
++}
+diff --git a/src/managed/mod.rs b/src/managed/mod.rs
+index 2b889e6..f9a3574 100644
+--- a/src/managed/mod.rs
++++ b/src/managed/mod.rs
+@@ -54,6 +54,7 @@ mod builder;
+ mod config;
+ mod errors;
+ pub mod hooks;
++mod metrics;
+ pub mod sync;
+ 
+ use std::{
+@@ -66,7 +67,7 @@ use std::{
+         atomic::{AtomicIsize, AtomicUsize, Ordering},
+         Arc, Mutex, Weak,
+     },
+-    time::Duration,
++    time::{Duration, Instant},
+ };
+ 
+ use async_trait::async_trait;
+@@ -74,6 +75,9 @@ use tokio::sync::{Semaphore, TryAcquireError};
+ 
+ use crate::runtime::Runtime;
+ 
++pub use metrics::Metrics;
++use metrics::WithMetrics;
++
+ pub use crate::Status;
+ 
+ pub use self::{
+@@ -133,7 +137,7 @@ enum ObjectState {
+ #[must_use]
+ pub struct Object<M: Manager> {
+     /// Actual pooled object.
+-    obj: Option<M::Type>,
++    obj: Option<WithMetrics<M::Type>>,
+ 
+     /// Current state of the object.
+     state: ObjectState,
+@@ -151,7 +155,12 @@ impl<M: Manager> Object<M> {
+         if let Some(pool) = this.pool.upgrade() {
+             pool.manager.detach(&mut this);
+         }
+-        this.obj.take().unwrap()
++        this.obj.take().unwrap().obj
++    }
++
++    /// Get object statistics
++    pub fn statistics(this: &Self) -> Metrics {
++        this.obj.as_ref().unwrap().metrics
+     }
+ 
+     /// Returns the [`Pool`] this [`Object`] belongs to.
+@@ -207,13 +216,13 @@ impl<M: Manager> Drop for Object<M> {
+ impl<M: Manager> Deref for Object<M> {
+     type Target = M::Type;
+     fn deref(&self) -> &M::Type {
+-        self.obj.as_ref().unwrap()
++        &self.obj.as_ref().unwrap().obj
+     }
+ }
+ 
+ impl<M: Manager> DerefMut for Object<M> {
+     fn deref_mut(&mut self) -> &mut M::Type {
+-        self.obj.as_mut().unwrap()
++        &mut self.obj.as_mut().unwrap().obj
+     }
+ }
+ 
+@@ -373,11 +382,14 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
+                     {
+                         Ok(_) => {
+                             // Apply post_recycle hooks
++                            let with_metrics = obj.obj.as_mut().unwrap();
+                             for hook in &self.inner.hooks.post_recycle {
+-                                hook.post_recycle(&mut obj.obj.as_mut().unwrap())
++                                hook.post_recycle(&mut with_metrics.obj, &with_metrics.metrics)
+                                     .await
+                                     .map_err(PoolError::PostRecycleHook)?;
+                             }
++                            with_metrics.metrics.recycle_count += 1;
++                            with_metrics.metrics.recycled = Some(Instant::now());
+                             break;
+                         }
+                         Err(_) => {
+@@ -392,18 +404,20 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
+                     obj.state = ObjectState::Creating;
+                     let _ = self.inner.available.fetch_add(1, Ordering::Relaxed);
+                     let _ = self.inner.size.fetch_add(1, Ordering::Relaxed);
+-                    obj.obj = Some(
+-                        apply_timeout(
++                    obj.obj = Some(WithMetrics {
++                        obj: apply_timeout(
+                             self.inner.runtime,
+                             TimeoutType::Create,
+                             self.inner.config.timeouts.create,
+                             self.inner.manager.create(),
+                         )
+                         .await?,
+-                    );
++                        metrics: Metrics::default(),
++                    });
+                     // Apply post_create hooks
+                     for hook in &self.inner.hooks.post_create {
+-                        hook.post_create(&mut obj.obj.as_mut().unwrap())
++                        let with_metrics = obj.obj.as_mut().unwrap();
++                        hook.post_create(&mut with_metrics.obj)
+                             .await
+                             .map_err(PoolError::PostCreateHook)?;
+                     }
+@@ -413,6 +427,7 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
+         }
+ 
+         obj.state = ObjectState::Ready;
++
+         Ok(obj.into())
+     }
+ 
+@@ -452,7 +467,7 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
+ 
+ struct PoolInner<M: Manager> {
+     manager: Box<M>,
+-    queue: Mutex<VecDeque<M::Type>>,
++    queue: Mutex<VecDeque<WithMetrics<M::Type>>>,
+     size: AtomicUsize,
+     /// Number of available [`Object`]s in the [`Pool`]. If there are no
+     /// [`Object`]s in the [`Pool`] this number can become negative and store

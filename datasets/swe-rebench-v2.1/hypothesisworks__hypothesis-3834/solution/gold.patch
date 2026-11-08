@@ -1,0 +1,448 @@
+diff --git a/build.sh b/build.sh
+index 7d4ca6cde..e8600a3bc 100755
+--- a/build.sh
++++ b/build.sh
+@@ -4,6 +4,8 @@
+ # version of Python, then hand over to the actual Hypothesis build runner (which
+ # is written in Python instead of bash).
+ 
++if [ -n "${CI:-}" ] ; then echo "::group::Build setup" ; fi
++
+ set -o xtrace
+ set -o errexit
+ set -o nounset
+@@ -44,4 +46,6 @@ if ! "$TOOL_PYTHON" -m hypothesistooling check-installed ; then
+   "$TOOL_PYTHON" -m pip install --no-warn-script-location -r requirements/tools.txt
+ fi
+ 
++if [ -n "${CI:-}" ] ; then echo "::endgroup::" ; fi
++
+ "$TOOL_PYTHON" -m hypothesistooling "$@"
+diff --git a/hypothesis-python/RELEASE.rst b/hypothesis-python/RELEASE.rst
+new file mode 100644
+index 000000000..738301e97
+--- /dev/null
++++ b/hypothesis-python/RELEASE.rst
+@@ -0,0 +1,15 @@
++RELEASE_TYPE: patch
++
++This patch improves :doc:`observability <observability>` reports by moving
++timing information from ``metadata`` to a new ``timing`` key, and supporting
++conversion of additional argument types to json rather than string reprs
++via a ``.to_json()`` method (including e.g. Pandas dataframes).
++
++Additionally, the :obj:`~hypothesis.HealthCheck.too_slow` health check will
++now report *which* strategies were slow, e.g. for strategies a, b, c, ...::
++
++        count | fraction |    slowest draws (seconds)
++    a |    3  |     65%  |      --      --      --   0.357,  2.000
++    b |    8  |     16%  |   0.100,  0.100,  0.100,  0.111,  0.123
++    c |    3  |      8%  |      --      --   0.030,  0.050,  0.200
++    (skipped 2 rows of fast draws)
+diff --git a/hypothesis-python/docs/schema_observations.json b/hypothesis-python/docs/schema_observations.json
+index 48b44a797..4047c2ccd 100644
+--- a/hypothesis-python/docs/schema_observations.json
++++ b/hypothesis-python/docs/schema_observations.json
+@@ -25,7 +25,7 @@
+                 },
+                 "arguments": {
+                     "type": "object",
+-                    "description": "A structured json-encoded representation of the input.  Hypothesis always provides a dictionary of argument names to json-ified values, including interactive draws from the :func:`~hypothesis.strategies.data` strategy.  In other libraries this can be any object."
++                    "description": "A structured json-encoded representation of the input.  Hypothesis provides a dictionary of argument names to json-ified values, including interactive draws from the :func:`~hypothesis.strategies.data` strategy.  If 'status' is 'gave_up', this may be absent or incomplete.  In other libraries this can be any object."
+                 },
+                 "how_generated": {
+                     "type": ["string", "null"],
+@@ -33,7 +33,7 @@
+                 },
+                 "features": {
+                     "type": "object",
+-                    "description": "Runtime observations which might help explain what this test case did.  Hypothesis includes target() scores, tags from event(), time spent generating data and running user code, and so on."
++                    "description": "Runtime observations which might help explain what this test case did.  Hypothesis includes target() scores, tags from event(), and so on."
+                 },
+                 "coverage": {
+                     "type": ["object", "null"],
+@@ -44,6 +44,14 @@
+                         "uniqueItems": true
+                     }
+                 },
++                "timing": {
++                    "type": "object",
++                    "description": "The time in seconds taken by non-overlapping parts of this test case.  Hypothesis reports execute_test, and generate:{argname} for each argument.",
++                    "additionalProperties": {
++                        "type": "number",
++                        "minimum": 0
++                    }
++                },
+                 "metadata": {
+                     "type": "object",
+                     "description": "Arbitrary metadata which might be of interest, but does not semantically fit in 'features'.  For example, Hypothesis includes the traceback for failing tests here."
+@@ -57,7 +65,7 @@
+                     "description": "unix timestamp at which we started running this test function, so that later analysis can group test cases by run."
+                 }
+             },
+-            "required": ["type", "status", "status_reason", "representation", "arguments", "how_generated", "features", "coverage", "metadata", "property", "run_start"],
++            "required": ["type", "status", "status_reason", "representation", "arguments", "how_generated", "features", "coverage", "timing", "metadata", "property", "run_start"],
+             "additionalProperties": false
+         },
+         {
+diff --git a/hypothesis-python/src/hypothesis/control.py b/hypothesis-python/src/hypothesis/control.py
+index 3a973f666..5b662197a 100644
+--- a/hypothesis-python/src/hypothesis/control.py
++++ b/hypothesis-python/src/hypothesis/control.py
+@@ -105,16 +105,13 @@ class BuildContext:
+             )
+         )
+ 
+-    def prep_args_kwargs_from_strategies(self, arg_strategies, kwarg_strategies):
++    def prep_args_kwargs_from_strategies(self, kwarg_strategies):
+         arg_labels = {}
+-        all_s = [(None, s) for s in arg_strategies] + list(kwarg_strategies.items())
+-        args = []
+         kwargs = {}
+-        for i, (k, s) in enumerate(all_s):
++        for k, s in kwarg_strategies.items():
+             start_idx = self.data.index
+-            obj = self.data.draw(s)
++            obj = self.data.draw(s, observe_as=f"generate:{k}")
+             end_idx = self.data.index
+-            assert k is not None
+             kwargs[k] = obj
+ 
+             # This high up the stack, we can't see or really do much with the conjecture
+@@ -124,10 +121,10 @@ class BuildContext:
+             # pass a dict of such out so that the pretty-printer knows where to place
+             # the which-parts-matter comments later.
+             if start_idx != end_idx:
+-                arg_labels[k or i] = (start_idx, end_idx)
++                arg_labels[k] = (start_idx, end_idx)
+                 self.data.arg_slices.add((start_idx, end_idx))
+ 
+-        return args, kwargs, arg_labels
++        return kwargs, arg_labels
+ 
+     def __enter__(self):
+         self.assign_variable = _current_build_context.with_value(self)
+diff --git a/hypothesis-python/src/hypothesis/core.py b/hypothesis-python/src/hypothesis/core.py
+index 86b20ea6f..75f1cc70e 100644
+--- a/hypothesis-python/src/hypothesis/core.py
++++ b/hypothesis-python/src/hypothesis/core.py
+@@ -15,6 +15,7 @@ import contextlib
+ import datetime
+ import inspect
+ import io
++import math
+ import sys
+ import time
+ import types
+@@ -605,6 +606,7 @@ def execute_explicit_examples(state, wrapped_test, arguments, kwargs, original_s
+                     data=empty_data,
+                     how_generated="explicit example",
+                     string_repr=state._string_repr,
++                    timing=state._timing_features,
+                 )
+                 deliver_json_blob(tc)
+ 
+@@ -816,34 +818,30 @@ class StateForActualGivenExecution:
+ 
+         self._string_repr = ""
+         text_repr = None
+-        if self.settings.deadline is None:
++        if self.settings.deadline is None and not TESTCASE_CALLBACKS:
+             test = self.test
+         else:
+ 
+             @proxies(self.test)
+             def test(*args, **kwargs):
+-                arg_drawtime = sum(data.draw_times)
+-                initial_draws = len(data.draw_times)
++                arg_drawtime = math.fsum(data.draw_times.values())
+                 start = time.perf_counter()
+                 try:
+                     result = self.test(*args, **kwargs)
+                 finally:
+                     finish = time.perf_counter()
+-                    internal_draw_time = sum(data.draw_times[initial_draws:])
+-                    runtime = datetime.timedelta(
+-                        seconds=finish - start - internal_draw_time
+-                    )
++                    in_drawtime = math.fsum(data.draw_times.values()) - arg_drawtime
++                    runtime = datetime.timedelta(seconds=finish - start - in_drawtime)
+                     self._timing_features = {
+-                        "time_running_test": finish - start - internal_draw_time,
+-                        "time_drawing_args": arg_drawtime,
+-                        "time_interactive_draws": internal_draw_time,
++                        "execute_test": finish - start - in_drawtime,
++                        **data.draw_times,
+                     }
+ 
+-                current_deadline = self.settings.deadline
+-                if not is_final:
+-                    current_deadline = (current_deadline // 4) * 5
+-                if runtime >= current_deadline:
+-                    raise DeadlineExceeded(runtime, self.settings.deadline)
++                if (current_deadline := self.settings.deadline) is not None:
++                    if not is_final:
++                        current_deadline = (current_deadline // 4) * 5
++                    if runtime >= current_deadline:
++                        raise DeadlineExceeded(runtime, self.settings.deadline)
+                 return result
+ 
+         def run(data):
+@@ -854,10 +852,9 @@ class StateForActualGivenExecution:
+             args = self.stuff.args
+             kwargs = dict(self.stuff.kwargs)
+             if example_kwargs is None:
+-                a, kw, argslices = context.prep_args_kwargs_from_strategies(
+-                    (), self.stuff.given_kwargs
++                kw, argslices = context.prep_args_kwargs_from_strategies(
++                    self.stuff.given_kwargs
+                 )
+-                assert not a, "strategies all moved to kwargs by now"
+             else:
+                 kw = example_kwargs
+                 argslices = {}
+@@ -944,7 +941,7 @@ class StateForActualGivenExecution:
+         if expected_failure is not None:
+             exception, traceback = expected_failure
+             if isinstance(exception, DeadlineExceeded) and (
+-                runtime_secs := self._timing_features.get("time_running_test")
++                runtime_secs := self._timing_features.get("execute_test")
+             ):
+                 report(
+                     "Unreliable test timings! On an initial run, this "
+@@ -1066,11 +1063,12 @@ class StateForActualGivenExecution:
+                     how_generated=f"generated during {phase} phase",
+                     string_repr=self._string_repr,
+                     arguments={**self._jsonable_arguments, **data._observability_args},
+-                    metadata=self._timing_features,
++                    timing=self._timing_features,
++                    metadata={},
+                     coverage=tractable_coverage_report(trace) or None,
+                 )
+                 deliver_json_blob(tc)
+-            self._timing_features.clear()
++            self._timing_features = {}
+ 
+     def run_engine(self):
+         """Run the test function many times, on database input and generated
+@@ -1184,17 +1182,17 @@ class StateForActualGivenExecution:
+                     "status": "passed" if sys.exc_info()[0] else "failed",
+                     "status_reason": str(origin or "unexpected/flaky pass"),
+                     "representation": self._string_repr,
++                    "arguments": self._jsonable_arguments,
+                     "how_generated": "minimal failing example",
+                     "features": {
+                         **{
+-                            k: v
++                            f"target:{k}".strip(":"): v
+                             for k, v in ran_example.target_observations.items()
+-                            if isinstance(k, str)
+                         },
+                         **ran_example.events,
+-                        **self._timing_features,
+                     },
+-                    "coverage": None,  # TODO: expose this?
++                    "timing": self._timing_features,
++                    "coverage": None,  # Not recorded when we're replaying the MFE
+                     "metadata": {"traceback": tb},
+                 }
+                 deliver_json_blob(tc)
+diff --git a/hypothesis-python/src/hypothesis/internal/conjecture/data.py b/hypothesis-python/src/hypothesis/internal/conjecture/data.py
+index 0531ffb0a..03f489fa5 100644
+--- a/hypothesis-python/src/hypothesis/internal/conjecture/data.py
++++ b/hypothesis-python/src/hypothesis/internal/conjecture/data.py
+@@ -1429,7 +1429,7 @@ class ConjectureData:
+         self.events: Dict[str, Union[str, int, float]] = {}
+         self.forced_indices: "Set[int]" = set()
+         self.interesting_origin: Optional[InterestingOrigin] = None
+-        self.draw_times: "List[float]" = []
++        self.draw_times: "Dict[str, float]" = {}
+         self.max_depth = 0
+         self.has_discards = False
+         self.provider = PrimitiveProvider(self)
+@@ -1599,7 +1599,12 @@ class ConjectureData:
+             value = repr(value)
+         self.output += value
+ 
+-    def draw(self, strategy: "SearchStrategy[Ex]", label: Optional[int] = None) -> "Ex":
++    def draw(
++        self,
++        strategy: "SearchStrategy[Ex]",
++        label: Optional[int] = None,
++        observe_as: Optional[str] = None,
++    ) -> "Ex":
+         if self.is_find and not strategy.supports_find:
+             raise InvalidArgument(
+                 f"Cannot use strategy {strategy!r} within a call to find "
+@@ -1636,7 +1641,8 @@ class ConjectureData:
+                 try:
+                     return strategy.do_draw(self)
+                 finally:
+-                    self.draw_times.append(time.perf_counter() - start_time)
++                    key = observe_as or f"unlabeled_{len(self.draw_times)}"
++                    self.draw_times[key] = time.perf_counter() - start_time
+         finally:
+             self.stop_example()
+ 
+diff --git a/hypothesis-python/src/hypothesis/internal/conjecture/engine.py b/hypothesis-python/src/hypothesis/internal/conjecture/engine.py
+index c5d33480e..961774816 100644
+--- a/hypothesis-python/src/hypothesis/internal/conjecture/engine.py
++++ b/hypothesis-python/src/hypothesis/internal/conjecture/engine.py
+@@ -53,7 +53,39 @@ class HealthCheckState:
+     valid_examples: int = attr.ib(default=0)
+     invalid_examples: int = attr.ib(default=0)
+     overrun_examples: int = attr.ib(default=0)
+-    draw_times: list = attr.ib(factory=list)
++    draw_times: "defaultdict[str, list[float]]" = attr.ib(
++        factory=lambda: defaultdict(list)
++    )
++
++    @property
++    def total_draw_time(self):
++        return math.fsum(sum(self.draw_times.values(), start=[]))
++
++    def timing_report(self):
++        """Return a terminal report describing what was slow."""
++        if not self.draw_times:
++            return ""
++        width = max(len(k[len("generate:") :].strip(": ")) for k in self.draw_times)
++        out = [f"\n  {'':^{width}}   count | fraction |    slowest draws (seconds)"]
++        args_in_order = sorted(self.draw_times.items(), key=lambda kv: -sum(kv[1]))
++        for i, (argname, times) in enumerate(args_in_order):  # pragma: no branch
++            # If we have very many unique keys, which can happen due to interactive
++            # draws with computed labels, we'll skip uninformative rows.
++            if (
++                5 <= i < (len(self.draw_times) - 2)
++                and math.fsum(times) * 20 < self.total_draw_time
++            ):
++                out.append(f"  (skipped {len(self.draw_times) - i} rows of fast draws)")
++                break
++            # Compute the row to report, omitting times <1ms to focus on slow draws
++            reprs = [f"{t:>6.3f}," for t in sorted(times)[-5:] if t > 5e-4]
++            desc = " ".join((["    -- "] * 5 + reprs)[-5:]).rstrip(",")
++            arg = argname[len("generate:") :].strip(": ")  # removeprefix in py3.9
++            out.append(
++                f"  {arg:^{width}} | {len(times):>4}  | "
++                f"{math.fsum(times)/self.total_draw_time:>7.0%}  |  {desc}"
++            )
++        return "\n".join(out)
+ 
+ 
+ class ExitReason(Enum):
+@@ -205,7 +237,7 @@ class ConjectureRunner:
+                 call_stats = {
+                     "status": data.status.name.lower(),
+                     "runtime": data.finish_time - data.start_time,
+-                    "drawtime": math.fsum(data.draw_times),
++                    "drawtime": math.fsum(data.draw_times.values()),
+                     "events": sorted(
+                         k if v == "" else f"{k}: {v}" for k, v in data.events.items()
+                     ),
+@@ -328,7 +360,8 @@ class ConjectureRunner:
+         if state is None:
+             return
+ 
+-        state.draw_times.extend(data.draw_times)
++        for k, v in data.draw_times.items():
++            state.draw_times[k].append(v)
+ 
+         if data.status == Status.VALID:
+             state.valid_examples += 1
+@@ -371,7 +404,7 @@ class ConjectureRunner:
+                 HealthCheck.filter_too_much,
+             )
+ 
+-        draw_time = sum(state.draw_times)
++        draw_time = state.total_draw_time
+ 
+         # Allow at least the greater of one second or 5x the deadline.  If deadline
+         # is None, allow 30s - the user can disable the healthcheck too if desired.
+@@ -383,7 +416,8 @@ class ConjectureRunner:
+                 f"{state.valid_examples} valid examples in {draw_time:.2f} seconds "
+                 f"({state.invalid_examples} invalid ones and {state.overrun_examples} "
+                 "exceeded maximum size). Try decreasing size of the data you're "
+-                "generating (with e.g. max_size or max_leaves parameters).",
++                "generating (with e.g. max_size or max_leaves parameters)."
++                + state.timing_report(),
+                 HealthCheck.too_slow,
+             )
+ 
+diff --git a/hypothesis-python/src/hypothesis/internal/observability.py b/hypothesis-python/src/hypothesis/internal/observability.py
+index 0da4aca76..284a2072d 100644
+--- a/hypothesis-python/src/hypothesis/internal/observability.py
++++ b/hypothesis-python/src/hypothesis/internal/observability.py
+@@ -37,6 +37,7 @@ def make_testcase(
+     how_generated: str = "unknown",
+     string_repr: str = "<unknown>",
+     arguments: Optional[dict] = None,
++    timing: Dict[str, float],
+     metadata: Optional[dict] = None,
+     coverage: Optional[Dict[str, List[int]]] = None,
+ ) -> dict:
+@@ -65,6 +66,7 @@ def make_testcase(
+             },
+             **data.events,
+         },
++        "timing": timing,
+         "metadata": {
+             **(metadata or {}),
+             "traceback": getattr(data.extra_information, "_expected_traceback", None),
+diff --git a/hypothesis-python/src/hypothesis/strategies/_internal/core.py b/hypothesis-python/src/hypothesis/strategies/_internal/core.py
+index b3a558c30..804901268 100644
+--- a/hypothesis-python/src/hypothesis/strategies/_internal/core.py
++++ b/hypothesis-python/src/hypothesis/strategies/_internal/core.py
+@@ -2100,10 +2100,10 @@ class DataObject:
+ 
+     def draw(self, strategy: SearchStrategy[Ex], label: Any = None) -> Ex:
+         check_strategy(strategy, "strategy")
+-        result = self.conjecture_data.draw(strategy)
+         self.count += 1
+         printer = RepresentationPrinter(context=current_build_context())
+         desc = f"Draw {self.count}{'' if label is None else f' ({label})'}: "
++        result = self.conjecture_data.draw(strategy, observe_as=f"generate:{desc}")
+         if TESTCASE_CALLBACKS:
+             self.conjecture_data._observability_args[desc] = to_jsonable(result)
+ 
+diff --git a/hypothesis-python/src/hypothesis/strategies/_internal/utils.py b/hypothesis-python/src/hypothesis/strategies/_internal/utils.py
+index b2a7661cd..bd56d2287 100644
+--- a/hypothesis-python/src/hypothesis/strategies/_internal/utils.py
++++ b/hypothesis-python/src/hypothesis/strategies/_internal/utils.py
+@@ -184,5 +184,11 @@ def to_jsonable(obj: object) -> object:
+     if (pyd := sys.modules.get("pydantic")) and isinstance(obj, pyd.BaseModel):
+         return to_jsonable(obj.model_dump())
+ 
++    # Hey, might as well try calling a .to_json() method - it works for Pandas!
++    try:
++        return to_jsonable(obj.to_json())  # type: ignore
++    except Exception:
++        pass
++
+     # If all else fails, we'll just pretty-print as a string.
+     return pretty(obj)
+diff --git a/tooling/scripts/ensure-python.sh b/tooling/scripts/ensure-python.sh
+index 8f3a9e459..7060f1cb8 100755
+--- a/tooling/scripts/ensure-python.sh
++++ b/tooling/scripts/ensure-python.sh
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env bash
+ 
++if [ -n "${CI:-}" ] ; then echo "::group::Ensure Python" ; fi
++
+ set -o errexit
+ set -o nounset
+ set -x
+@@ -23,7 +25,7 @@ source "$HERE/common.sh"
+ VERSION="$1"
+ TARGET=$(pythonloc "$VERSION")
+ 
+-if [ ! -e "$TARGET/bin/python" ] ; then 
++if [ ! -e "$TARGET/bin/python" ] ; then
+     mkdir -p "$BASE"
+ 
+     LOCKFILE="$BASE/.install-lockfile"
+@@ -64,3 +66,5 @@ if [ ! -e "$TARGET/bin/python" ] ; then
+         sleep $(( ( RANDOM % 10 )  + 1 )).$(( RANDOM % 100 ))s
+     done
+ fi
++
++if [ -n "${CI:-}" ] ; then echo "::endgroup::" ; fi

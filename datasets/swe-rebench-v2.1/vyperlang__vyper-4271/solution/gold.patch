@@ -1,0 +1,475 @@
+diff --git a/docs/types.rst b/docs/types.rst
+index 752e06b1..807c8384 100644
+--- a/docs/types.rst
++++ b/docs/types.rst
+@@ -359,11 +359,12 @@ A byte array with a max size.
+ The syntax being ``Bytes[maxLen]``, where ``maxLen`` is an integer which denotes the maximum number of bytes.
+ On the ABI level the Fixed-size bytes array is annotated as ``bytes``.
+ 
+-Bytes literals may be given as bytes strings.
++Bytes literals may be given as bytes strings or as hex strings.
+ 
+ .. code-block:: vyper
+ 
+     bytes_string: Bytes[100] = b"\x01"
++    bytes_string: Bytes[100] = x"01"
+ 
+ .. index:: !string
+ 
+diff --git a/vyper/ast/grammar.lark b/vyper/ast/grammar.lark
+index 97f9f70e..bc2f9ba7 100644
+--- a/vyper/ast/grammar.lark
++++ b/vyper/ast/grammar.lark
+@@ -318,7 +318,7 @@ COMMENT: /#[^\n\r]*/
+ _NEWLINE: ( /\r?\n[\t ]*/ | COMMENT )+
+ 
+ 
+-STRING: /b?("(?!"").*?(?<!\\)(\\\\)*?"|'(?!'').*?(?<!\\)(\\\\)*?')/i
++STRING: /x?b?("(?!"").*?(?<!\\)(\\\\)*?"|'(?!'').*?(?<!\\)(\\\\)*?')/i
+ DOCSTRING: /(""".*?(?<!\\)(\\\\)*?"""|'''.*?(?<!\\)(\\\\)*?''')/is
+ 
+ DEC_NUMBER: /0|[1-9]\d*/i
+diff --git a/vyper/ast/nodes.py b/vyper/ast/nodes.py
+index d3c721db..a5e3d011 100644
+--- a/vyper/ast/nodes.py
++++ b/vyper/ast/nodes.py
+@@ -916,6 +916,25 @@ class Bytes(Constant):
+         return self.value
+ 
+ 
++class HexBytes(Constant):
++    __slots__ = ()
++    _translated_fields = {"s": "value"}
++
++    def __init__(self, parent: Optional["VyperNode"] = None, **kwargs: dict):
++        super().__init__(parent, **kwargs)
++        if isinstance(self.value, str):
++            self.value = bytes.fromhex(self.value)
++
++    def to_dict(self):
++        ast_dict = super().to_dict()
++        ast_dict["value"] = f"0x{self.value.hex()}"
++        return ast_dict
++
++    @property
++    def s(self):
++        return self.value
++
++
+ class List(ExprNode):
+     __slots__ = ("elements",)
+     _translated_fields = {"elts": "elements"}
+diff --git a/vyper/ast/nodes.pyi b/vyper/ast/nodes.pyi
+index 3e3a9a62..6d05a2e2 100644
+--- a/vyper/ast/nodes.pyi
++++ b/vyper/ast/nodes.pyi
+@@ -131,6 +131,10 @@ class Bytes(Constant):
+     @property
+     def s(self): ...
+ 
++class HexBytes(Constant):
++    @property
++    def s(self): ...
++
+ class NameConstant(Constant): ...
+ class Ellipsis(Constant): ...
+ 
+diff --git a/vyper/ast/parse.py b/vyper/ast/parse.py
+index d4569dd6..1e882411 100644
+--- a/vyper/ast/parse.py
++++ b/vyper/ast/parse.py
+@@ -6,10 +6,9 @@ from typing import Any, Dict, List, Optional, Union
+ import asttokens
+ 
+ from vyper.ast import nodes as vy_ast
+-from vyper.ast.pre_parser import pre_parse
++from vyper.ast.pre_parser import PreParseResult, pre_parse
+ from vyper.compiler.settings import Settings
+ from vyper.exceptions import CompilerPanic, ParserException, SyntaxException
+-from vyper.typing import ModificationOffsets
+ from vyper.utils import sha256sum, vyper_warn
+ 
+ 
+@@ -55,9 +54,9 @@ def parse_to_ast_with_settings(
+     """
+     if "\x00" in vyper_source:
+         raise ParserException("No null bytes (\\x00) allowed in the source code.")
+-    settings, class_types, for_loop_annotations, python_source = pre_parse(vyper_source)
++    pre_parse_result = pre_parse(vyper_source)
+     try:
+-        py_ast = python_ast.parse(python_source)
++        py_ast = python_ast.parse(pre_parse_result.reformatted_code)
+     except SyntaxError as e:
+         # TODO: Ensure 1-to-1 match of source_code:reformatted_code SyntaxErrors
+         raise SyntaxException(str(e), vyper_source, e.lineno, e.offset) from None
+@@ -73,21 +72,20 @@ def parse_to_ast_with_settings(
+     annotate_python_ast(
+         py_ast,
+         vyper_source,
+-        class_types,
+-        for_loop_annotations,
++        pre_parse_result,
+         source_id=source_id,
+         module_path=module_path,
+         resolved_path=resolved_path,
+     )
+ 
+     # postcondition: consumed all the for loop annotations
+-    assert len(for_loop_annotations) == 0
++    assert len(pre_parse_result.for_loop_annotations) == 0
+ 
+     # Convert to Vyper AST.
+     module = vy_ast.get_node(py_ast)
+     assert isinstance(module, vy_ast.Module)  # mypy hint
+ 
+-    return settings, module
++    return pre_parse_result.settings, module
+ 
+ 
+ def ast_to_dict(ast_struct: Union[vy_ast.VyperNode, List]) -> Union[Dict, List]:
+@@ -118,8 +116,7 @@ def dict_to_ast(ast_struct: Union[Dict, List]) -> Union[vy_ast.VyperNode, List]:
+ def annotate_python_ast(
+     parsed_ast: python_ast.AST,
+     vyper_source: str,
+-    modification_offsets: ModificationOffsets,
+-    for_loop_annotations: dict,
++    pre_parse_result: PreParseResult,
+     source_id: int = 0,
+     module_path: Optional[str] = None,
+     resolved_path: Optional[str] = None,
+@@ -133,11 +130,8 @@ def annotate_python_ast(
+         The AST to be annotated and optimized.
+     vyper_source: str
+         The original vyper source code
+-    loop_var_annotations: dict
+-        A mapping of line numbers of `For` nodes to the tokens of the type
+-        annotation of the iterator extracted during pre-parsing.
+-    modification_offsets : dict
+-        A mapping of class names to their original class types.
++    pre_parse_result: PreParseResult
++        Outputs from pre-parsing.
+ 
+     Returns
+     -------
+@@ -148,8 +142,7 @@ def annotate_python_ast(
+     tokens.mark_tokens(parsed_ast)
+     visitor = AnnotatingVisitor(
+         vyper_source,
+-        modification_offsets,
+-        for_loop_annotations,
++        pre_parse_result,
+         tokens,
+         source_id,
+         module_path=module_path,
+@@ -162,14 +155,12 @@ def annotate_python_ast(
+ 
+ class AnnotatingVisitor(python_ast.NodeTransformer):
+     _source_code: str
+-    _modification_offsets: ModificationOffsets
+-    _loop_var_annotations: dict[int, dict[str, Any]]
++    _pre_parse_result: PreParseResult
+ 
+     def __init__(
+         self,
+         source_code: str,
+-        modification_offsets: ModificationOffsets,
+-        for_loop_annotations: dict,
++        pre_parse_result: PreParseResult,
+         tokens: asttokens.ASTTokens,
+         source_id: int,
+         module_path: Optional[str] = None,
+@@ -180,8 +171,7 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
+         self._module_path = module_path
+         self._resolved_path = resolved_path
+         self._source_code = source_code
+-        self._modification_offsets = modification_offsets
+-        self._for_loop_annotations = for_loop_annotations
++        self._pre_parse_result = pre_parse_result
+ 
+         self.counter: int = 0
+ 
+@@ -275,7 +265,7 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
+         """
+         self.generic_visit(node)
+ 
+-        node.ast_type = self._modification_offsets[(node.lineno, node.col_offset)]
++        node.ast_type = self._pre_parse_result.modification_offsets[(node.lineno, node.col_offset)]
+         return node
+ 
+     def visit_For(self, node):
+@@ -283,7 +273,8 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
+         Visit a For node, splicing in the loop variable annotation provided by
+         the pre-parser
+         """
+-        annotation_tokens = self._for_loop_annotations.pop((node.lineno, node.col_offset))
++        key = (node.lineno, node.col_offset)
++        annotation_tokens = self._pre_parse_result.for_loop_annotations.pop(key)
+ 
+         if not annotation_tokens:
+             # a common case for people migrating to 0.4.0, provide a more
+@@ -350,14 +341,15 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
+         if isinstance(node.value, python_ast.Yield):
+             # CMC 2024-03-03 consider unremoving this from the enclosing Expr
+             node = node.value
+-            node.ast_type = self._modification_offsets[(node.lineno, node.col_offset)]
++            key = (node.lineno, node.col_offset)
++            node.ast_type = self._pre_parse_result.modification_offsets[key]
+ 
+         return node
+ 
+     def visit_Await(self, node):
+         start_pos = node.lineno, node.col_offset  # grab these before generic_visit modifies them
+         self.generic_visit(node)
+-        node.ast_type = self._modification_offsets[start_pos]
++        node.ast_type = self._pre_parse_result.modification_offsets[start_pos]
+         return node
+ 
+     def visit_Call(self, node):
+@@ -401,7 +393,18 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
+         if node.value is None or isinstance(node.value, bool):
+             node.ast_type = "NameConstant"
+         elif isinstance(node.value, str):
+-            node.ast_type = "Str"
++            key = (node.lineno, node.col_offset)
++            if key in self._pre_parse_result.native_hex_literal_locations:
++                if len(node.value) % 2 != 0:
++                    raise SyntaxException(
++                        "Native hex string must have an even number of characters",
++                        self._source_code,
++                        node.lineno,
++                        node.col_offset,
++                    )
++                node.ast_type = "HexBytes"
++            else:
++                node.ast_type = "Str"
+         elif isinstance(node.value, bytes):
+             node.ast_type = "Bytes"
+         elif isinstance(node.value, Ellipsis.__class__):
+diff --git a/vyper/ast/pre_parser.py b/vyper/ast/pre_parser.py
+index b12aecd0..07ba1d2d 100644
+--- a/vyper/ast/pre_parser.py
++++ b/vyper/ast/pre_parser.py
+@@ -2,7 +2,7 @@ import enum
+ import io
+ import re
+ from collections import defaultdict
+-from tokenize import COMMENT, NAME, OP, TokenError, TokenInfo, tokenize, untokenize
++from tokenize import COMMENT, NAME, OP, STRING, TokenError, TokenInfo, tokenize, untokenize
+ 
+ from packaging.specifiers import InvalidSpecifier, SpecifierSet
+ 
+@@ -12,7 +12,7 @@ from vyper.compiler.settings import OptimizationLevel, Settings
+ # evm-version pragma
+ from vyper.evm.opcodes import EVM_VERSIONS
+ from vyper.exceptions import StructureException, SyntaxException, VersionException
+-from vyper.typing import ModificationOffsets, ParserPosition
++from vyper.typing import ParserPosition
+ 
+ 
+ def validate_version_pragma(version_str: str, full_source_code: str, start: ParserPosition) -> None:
+@@ -48,7 +48,7 @@ def validate_version_pragma(version_str: str, full_source_code: str, start: Pars
+         )
+ 
+ 
+-class ForParserState(enum.Enum):
++class ParserState(enum.Enum):
+     NOT_RUNNING = enum.auto()
+     START_SOON = enum.auto()
+     RUNNING = enum.auto()
+@@ -63,7 +63,7 @@ class ForParser:
+         self.annotations = {}
+         self._current_annotation = None
+ 
+-        self._state = ForParserState.NOT_RUNNING
++        self._state = ParserState.NOT_RUNNING
+         self._current_for_loop = None
+ 
+     def consume(self, token):
+@@ -71,15 +71,15 @@ class ForParser:
+         if token.type == NAME and token.string == "for":
+             # note: self._state should be NOT_RUNNING here, but we don't sanity
+             # check here as that should be an error the parser will handle.
+-            self._state = ForParserState.START_SOON
++            self._state = ParserState.START_SOON
+             self._current_for_loop = token.start
+ 
+-        if self._state == ForParserState.NOT_RUNNING:
++        if self._state == ParserState.NOT_RUNNING:
+             return False
+ 
+         # state machine: start slurping tokens
+         if token.type == OP and token.string == ":":
+-            self._state = ForParserState.RUNNING
++            self._state = ParserState.RUNNING
+ 
+             # sanity check -- this should never really happen, but if it does,
+             # try to raise an exception which pinpoints the source.
+@@ -93,12 +93,12 @@ class ForParser:
+ 
+         # state machine: end slurping tokens
+         if token.type == NAME and token.string == "in":
+-            self._state = ForParserState.NOT_RUNNING
++            self._state = ParserState.NOT_RUNNING
+             self.annotations[self._current_for_loop] = self._current_annotation or []
+             self._current_annotation = None
+             return False
+ 
+-        if self._state != ForParserState.RUNNING:
++        if self._state != ParserState.RUNNING:
+             return False
+ 
+         # slurp the token
+@@ -106,6 +106,42 @@ class ForParser:
+         return True
+ 
+ 
++class HexStringParser:
++    def __init__(self):
++        self.locations = []
++        self._current_x = None
++        self._state = ParserState.NOT_RUNNING
++
++    def consume(self, token, result):
++        # prepare to check if the next token is a STRING
++        if token.type == NAME and token.string == "x":
++            self._state = ParserState.RUNNING
++            self._current_x = token
++            return True
++
++        if self._state == ParserState.NOT_RUNNING:
++            return False
++
++        if self._state == ParserState.RUNNING:
++            current_x = self._current_x
++            self._current_x = None
++            self._state = ParserState.NOT_RUNNING
++
++            toks = [current_x]
++
++            # drop the leading x token if the next token is a STRING to avoid a python
++            # parser error
++            if token.type == STRING:
++                self.locations.append(current_x.start)
++                toks = [TokenInfo(STRING, token.string, current_x.start, token.end, token.line)]
++                result.extend(toks)
++                return True
++
++            result.extend(toks)
++
++        return False
++
++
+ # compound statements that are replaced with `class`
+ # TODO remove enum in favor of flag
+ VYPER_CLASS_TYPES = {
+@@ -122,7 +158,34 @@ CUSTOM_STATEMENT_TYPES = {"log": "Log"}
+ CUSTOM_EXPRESSION_TYPES = {"extcall": "ExtCall", "staticcall": "StaticCall"}
+ 
+ 
+-def pre_parse(code: str) -> tuple[Settings, ModificationOffsets, dict, str]:
++class PreParseResult:
++    # Compilation settings based on the directives in the source code
++    settings: Settings
++    # A mapping of class names to their original class types.
++    modification_offsets: dict[tuple[int, int], str]
++    # A mapping of line/column offsets of `For` nodes to the annotation of the for loop target
++    for_loop_annotations: dict[tuple[int, int], list[TokenInfo]]
++    # A list of line/column offsets of native hex literals
++    native_hex_literal_locations: list[tuple[int, int]]
++    # Reformatted python source string.
++    reformatted_code: str
++
++    def __init__(
++        self,
++        settings,
++        modification_offsets,
++        for_loop_annotations,
++        native_hex_literal_locations,
++        reformatted_code,
++    ):
++        self.settings = settings
++        self.modification_offsets = modification_offsets
++        self.for_loop_annotations = for_loop_annotations
++        self.native_hex_literal_locations = native_hex_literal_locations
++        self.reformatted_code = reformatted_code
++
++
++def pre_parse(code: str) -> PreParseResult:
+     """
+     Re-formats a vyper source string into a python source string and performs
+     some validation.  More specifically,
+@@ -144,19 +207,14 @@ def pre_parse(code: str) -> tuple[Settings, ModificationOffsets, dict, str]:
+ 
+     Returns
+     -------
+-    Settings
+-        Compilation settings based on the directives in the source code
+-    ModificationOffsets
+-        A mapping of class names to their original class types.
+-    dict[tuple[int, int], list[TokenInfo]]
+-        A mapping of line/column offsets of `For` nodes to the annotation of the for loop target
+-    str
+-        Reformatted python source string.
++    PreParseResult
++        Outputs for transforming the python AST to vyper AST
+     """
+-    result = []
+-    modification_offsets: ModificationOffsets = {}
++    result: list[TokenInfo] = []
++    modification_offsets: dict[tuple[int, int], str] = {}
+     settings = Settings()
+     for_parser = ForParser(code)
++    native_hex_parser = HexStringParser()
+ 
+     _col_adjustments: dict[int, int] = defaultdict(lambda: 0)
+ 
+@@ -264,7 +322,7 @@ def pre_parse(code: str) -> tuple[Settings, ModificationOffsets, dict, str]:
+             if (typ, string) == (OP, ";"):
+                 raise SyntaxException("Semi-colon statements not allowed", code, start[0], start[1])
+ 
+-            if not for_parser.consume(token):
++            if not for_parser.consume(token) and not native_hex_parser.consume(token, result):
+                 result.extend(toks)
+ 
+     except TokenError as e:
+@@ -274,4 +332,10 @@ def pre_parse(code: str) -> tuple[Settings, ModificationOffsets, dict, str]:
+     for k, v in for_parser.annotations.items():
+         for_loop_annotations[k] = v.copy()
+ 
+-    return settings, modification_offsets, for_loop_annotations, untokenize(result).decode("utf-8")
++    return PreParseResult(
++        settings,
++        modification_offsets,
++        for_loop_annotations,
++        native_hex_parser.locations,
++        untokenize(result).decode("utf-8"),
++    )
+diff --git a/vyper/codegen/expr.py b/vyper/codegen/expr.py
+index 0b3b29b9..cd519667 100644
+--- a/vyper/codegen/expr.py
++++ b/vyper/codegen/expr.py
+@@ -140,6 +140,12 @@ class Expr:
+ 
+     # Byte literals
+     def parse_Bytes(self):
++        return self._parse_bytes()
++
++    def parse_HexBytes(self):
++        return self._parse_bytes()
++
++    def _parse_bytes(self):
+         bytez = self.expr.value
+         bytez_length = len(self.expr.value)
+         typ = BytesT(bytez_length)
+diff --git a/vyper/typing.py b/vyper/typing.py
+index ad3964df..108c0605 100644
+--- a/vyper/typing.py
++++ b/vyper/typing.py
+@@ -1,7 +1,6 @@
+ from typing import Dict, Optional, Sequence, Tuple, Union
+ 
+ # Parser
+-ModificationOffsets = Dict[Tuple[int, int], str]
+ ParserPosition = Tuple[int, int]
+ 
+ # Compiler

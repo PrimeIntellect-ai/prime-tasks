@@ -1,0 +1,2 @@
+log level and stats
+Is it possible to prevent `s5cmd cp` from listing all copied files while still keeping `--stat` output? It seems that `--log error` is the only way to prevent s5cmd from listing files. Yet this also prevents `--stat` from working, as it is attached to info logging level. I have to copy thousands of files, and listing everything is too busy, so getting some kind of stats at the end would be nice. I don't think it would be unreasonable for `--stat` to force output independent of log level, since this is what user is asking for.

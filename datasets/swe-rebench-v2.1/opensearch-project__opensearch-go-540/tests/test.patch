@@ -1,0 +1,144 @@
+diff --git a/opensearchtransport/opensearchtransport_internal_test.go b/opensearchtransport/opensearchtransport_internal_test.go
+index 6daaeba..2b4c8ab 100644
+--- a/opensearchtransport/opensearchtransport_internal_test.go
++++ b/opensearchtransport/opensearchtransport_internal_test.go
+@@ -31,6 +31,8 @@ package opensearchtransport
+ import (
+ 	"bytes"
+ 	"compress/gzip"
++	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"math/rand"
+@@ -848,6 +850,130 @@ func TestTransportPerformRetries(t *testing.T) {
+ 			t.Errorf("Unexpected duration, want=>%s, got=%s", expectedDuration, end)
+ 		}
+ 	})
++
++	t.Run("Delay the retry with retry on timeout and context deadline", func(t *testing.T) {
++		var i int
++		u, _ := url.Parse("http://foo.bar")
++		tp, _ := New(Config{
++			EnableRetryOnTimeout: true,
++			MaxRetries:           100,
++			RetryBackoff:         func(i int) time.Duration { return time.Hour },
++			URLs:                 []*url.URL{u},
++			Transport: &mockTransp{
++				RoundTripFunc: func(req *http.Request) (*http.Response, error) {
++					i++
++					<-req.Context().Done()
++					return nil, req.Context().Err()
++				},
++			},
++		})
++
++		req, _ := http.NewRequest(http.MethodGet, "/abc", nil)
++		ctx, cancel := context.WithTimeout(req.Context(), 50*time.Millisecond)
++		defer cancel()
++		req = req.WithContext(ctx)
++
++		//nolint:bodyclose // Mock response does not have a body to close
++		_, err := tp.Perform(req)
++		if !errors.Is(err, context.DeadlineExceeded) {
++			t.Fatalf("expected context.DeadlineExceeded, got %s", err)
++		}
++		if i != 1 {
++			t.Fatalf("unexpected number of requests: expected 1, got %d", i)
++		}
++	})
++
++	t.Run("Stops retrying after max retries", func(t *testing.T) {
++		var (
++			i          int
++			numReqs    = 5
++			numRetries = numReqs - 1
++		)
++
++		u, _ := url.Parse("http://foo.bar")
++		tp, _ := New(Config{
++			MaxRetries: numRetries,
++			URLs:       []*url.URL{u, u, u},
++			Transport: &mockTransp{
++				RoundTripFunc: func(req *http.Request) (*http.Response, error) {
++					i++
++					fmt.Printf("Request #%d", i)
++					fmt.Print(": ERR\n")
++					return nil, &mockNetError{error: fmt.Errorf("Mock network error (%d)", i)}
++				},
++			},
++
++			// A simple incremental backoff function
++			//
++			RetryBackoff: func(i int) time.Duration {
++				d := time.Millisecond
++				fmt.Printf("Attempt: %d | Sleeping for %s...\n", i, d)
++				return d
++			},
++		})
++
++		req, _ := http.NewRequest(http.MethodGet, "/abc", nil)
++
++		//nolint:bodyclose // Mock response does not have a body to close
++		_, err := tp.Perform(req)
++		if err == nil {
++			t.Fatalf("Expected error, got: %v", err)
++		}
++
++		if i != numReqs {
++			t.Errorf("Unexpected number of requests, want=%d, got=%d", numReqs, i)
++		}
++	})
++
++	t.Run("Cancellation during retry backoff returns the context error", func(t *testing.T) {
++		u, _ := url.Parse("http://foo.bar")
++		backoffStarted := make(chan struct{}, 1)
++		requestCalls := make(chan struct{}, 10)
++		tp, _ := New(Config{
++			MaxRetries: 3,
++			URLs:       []*url.URL{u},
++			Transport: &mockTransp{
++				RoundTripFunc: func(req *http.Request) (*http.Response, error) {
++					requestCalls <- struct{}{}
++					return nil, &mockNetError{error: errors.New("temporary network failure")}
++				},
++			},
++			RetryBackoff: func(int) time.Duration {
++				backoffStarted <- struct{}{}
++				return 2 * time.Second
++			},
++		})
++
++		ctx, cancel := context.WithCancel(context.Background())
++		defer cancel()
++		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/abc", nil)
++		result := make(chan error, 1)
++		go func() {
++			_, err := tp.Perform(req)
++			result <- err
++		}()
++
++		select {
++		case <-backoffStarted:
++		case <-time.After(time.Second):
++			t.Fatal("retry backoff did not start")
++		}
++		// Allow the backoff wait to begin before cancelling the request.
++		time.Sleep(100 * time.Millisecond)
++		cancel()
++
++		select {
++		case err := <-result:
++			if !errors.Is(err, context.Canceled) {
++				t.Fatalf("expected context.Canceled, got %v", err)
++			}
++		case <-time.After(time.Second):
++			t.Fatal("Perform did not return promptly after cancellation during backoff")
++		}
++		if got := len(requestCalls); got != 1 {
++			t.Errorf("expected no retry after cancellation, got %d requests", got)
++		}
++	})
+ }
+ 
+ func TestURLs(t *testing.T) {

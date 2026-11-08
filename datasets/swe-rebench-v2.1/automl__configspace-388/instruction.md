@@ -1,0 +1,2 @@
+Feature Request: Instantiate a ConfigSpace via a Sequence instead of a Mapping
+If I read the code correctly, then if you instantiate a ConfigSpace via a Mapping where each value is a Hyperparameter, each single key of the Mapping will be discarded. To name the hyperparameters the names inside the hyperparameters are used. This produces a lot of tough to read code when using ConfigSpace. Each hyperparameter name has to be named twice or you have to come up with dummy keys for the Mapping which still makes code tougher to read

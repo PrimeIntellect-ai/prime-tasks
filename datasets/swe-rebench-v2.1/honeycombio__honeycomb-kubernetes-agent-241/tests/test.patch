@@ -1,0 +1,272 @@
+diff --git a/handlers/handlers_test.go b/handlers/handlers_test.go
+index 954cedc..9208f12 100644
+--- a/handlers/handlers_test.go
++++ b/handlers/handlers_test.go
+@@ -10,7 +10,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	v1types "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 
+diff --git a/podtailer/podtailer_test.go b/podtailer/podtailer_test.go
+index d11fa91..ab88c7f 100644
+--- a/podtailer/podtailer_test.go
++++ b/podtailer/podtailer_test.go
+@@ -7,9 +7,14 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"testing"
++	"time"
+ 
++	"github.com/honeycombio/honeycomb-kubernetes-agent/config"
++	"github.com/honeycombio/honeycomb-kubernetes-agent/event"
+ 	"github.com/stretchr/testify/assert"
+-	"k8s.io/api/core/v1"
++	yaml "gopkg.in/yaml.v2"
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/types"
+ )
+ 
+ // test patterns after https://github.com/kubernetes/kubernetes/pull/74441
+@@ -130,7 +135,7 @@ func TestDetermineFilterFuncLegacyLogs(t *testing.T) {
+ 		return ok
+ 	}
+ 
+-	f := determineFilterFunc(pod, "/var/log", "wibble", true)
++	f := determineFilterFunc(pod, "/var/log", "wibble", true, nil)
+ 	// functions should have same output
+ 	assert.Equal(
+ 		t,
+@@ -160,7 +165,7 @@ func TestDetermineFilterFunc(t *testing.T) {
+ 		return ok
+ 	}
+ 
+-	f := determineFilterFunc(pod, "/var/log", "wibble", false)
++	f := determineFilterFunc(pod, "/var/log", "wibble", false, nil)
+ 	assert.Equal(
+ 		t,
+ 		expected("/var/log/pods/123456/wibble_0.log"),
+@@ -192,7 +197,7 @@ func TestDetermineFilterFuncK8S1Dot10(t *testing.T) {
+ 		return ok
+ 	}
+ 
+-	f := determineFilterFunc(pod, "/var/log", "wibble", false)
++	f := determineFilterFunc(pod, "/var/log", "wibble", false, nil)
+ 	assert.Equal(
+ 		t,
+ 		expected("/var/log/pods/123456/wibble/0.log"),
+@@ -236,7 +241,7 @@ func TestDetermineFilterFuncK8S74441(t *testing.T) {
+ 	_, err = os.Create(file2)
+ 	assert.Nil(t, err)
+ 
+-	f := determineFilterFunc(pod, basePath, "container1", false)
++	f := determineFilterFunc(pod, basePath, "container1", false, nil)
+ 
+ 	assert.Equal(
+ 		t,
+@@ -250,3 +255,135 @@ func TestDetermineFilterFuncK8S74441(t *testing.T) {
+ 		false,
+ 	)
+ }
++
++func TestDetermineFilterFuncExclude(t *testing.T) {
++	t.Parallel()
++	pod := &v1.Pod{}
++	pod.Namespace = "asdf"
++	pod.Name = "foo"
++	pod.UID = "123456"
++	podDirName := fmt.Sprintf("%s_%s_%s", pod.Namespace, pod.Name, pod.UID)
++
++	basePath, err := ioutil.TempDir("", "")
++	assert.Nil(t, err)
++	defer os.RemoveAll(basePath)
++
++	err = os.Mkdir(filepath.Join(basePath, "pods"), 0777)
++	assert.Nil(t, err)
++	err = os.Mkdir(filepath.Join(basePath, "pods", podDirName), 0777)
++	assert.Nil(t, err)
++	err = os.Mkdir(filepath.Join(basePath, "pods", podDirName, "container1"), 0777)
++	assert.Nil(t, err)
++	err = os.Mkdir(filepath.Join(basePath, "pods", podDirName, "container2"), 0777)
++	assert.Nil(t, err)
++
++	tests := []struct {
++		path string
++		name string
++		want bool
++	}{
++		{"container1", "0.log", true},
++		{"container1", "1.log.exclude1only", false},
++		{"container1", "1.log.excludeAlways", false},
++		{"container2", "0.log", true},
++		{"container2", "0.log.excludeAlways", false},
++		{"container2", "1.log", true},
++		{"container2", "1.log.exclude1only", true},
++		{"container2", "1.log.excludeAlways", false},
++	}
++
++	f := determineFilterFunc(pod, basePath, "", false, []string{"**/*.excludeAlways", "**/container1/*.exclude1only"})
++
++	for _, tc := range tests {
++		t.Run(filepath.Join(tc.path, tc.name), func(t *testing.T) {
++			file1 := filepath.Join(basePath, "pods", podDirName, tc.path, tc.name)
++			_, err = os.Create(file1)
++			assert.Nil(t, err)
++
++			assert.Equal(
++				t,
++				tc.want,
++				f(file1),
++			)
++		})
++	}
++}
++
++func TestExcludeConfigOption(t *testing.T) {
++	// Users can configure ignored file paths in the watcher config.
++	cfg := &config.WatcherConfig{}
++	err := yaml.Unmarshal([]byte("exclude:\n  - /**/*.tmp\n  - /**/*.old\n"), cfg)
++	assert.NoError(t, err)
++	assert.Equal(t, []string{"/**/*.tmp", "/**/*.old"}, cfg.ExcludePaths)
++}
++
++type recordingTransmitter struct {
++	events chan *event.Event
++}
++
++func (r *recordingTransmitter) Send(ev *event.Event) {
++	r.events <- ev
++}
++
++type emptyPodWatcher struct{}
++
++func (emptyPodWatcher) Get(types.UID) (*v1.Pod, bool) { return nil, false }
++func (emptyPodWatcher) Pods() chan *v1.Pod            { return nil }
++func (emptyPodWatcher) DeletedPods() chan types.UID   { return nil }
++
++func TestWatcherAppliesConfiguredExclusions(t *testing.T) {
++	pod := &v1.Pod{}
++	pod.Namespace = "rebench"
++	pod.Name = fmt.Sprintf("exclude-%d", time.Now().UnixNano())
++	pod.UID = types.UID(fmt.Sprintf("%d", time.Now().UnixNano()))
++	podDir := filepath.Join("/var/log/pods", fmt.Sprintf("%s_%s_%s", pod.Namespace, pod.Name, pod.UID), "app")
++	if err := os.MkdirAll(podDir, 0755); err != nil {
++		t.Skipf("cannot create temporary pod log directory: %v", err)
++	}
++	defer os.RemoveAll(filepath.Dir(podDir))
++
++	includedPath := filepath.Join(podDir, "0.log")
++	excludedPath := filepath.Join(podDir, "1.log.tmp")
++	includedLine := `{"log":"{\"message\":\"included\"}\n","stream":"stdout","time":"2020-01-01T00:00:00Z"}` + "\n"
++	excludedLine := `{"log":"{\"message\":\"excluded\"}\n","stream":"stdout","time":"2020-01-01T00:00:00Z"}` + "\n"
++	if err := os.WriteFile(includedPath, []byte(includedLine), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(excludedPath, []byte(excludedLine), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	transmitter := &recordingTransmitter{events: make(chan *event.Event, 4)}
++	pt := &PodSetTailer{
++		config: &config.WatcherConfig{
++			Dataset:      "watcher-exclusion-test",
++			Parser:       &config.ParserConfig{Name: "json"},
++			ExcludePaths: []string{"**/*.tmp"},
++		},
++		transmitter: transmitter,
++	}
++	watcher, err := pt.watcherForPod(pod, "", emptyPodWatcher{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	watcher.Start()
++	defer watcher.Stop()
++
++	select {
++	case ev := <-transmitter.events:
++		if ev.Path != includedPath || ev.Data["message"] != "included" {
++			t.Fatalf("received unexpected event from %q: %#v", ev.Path, ev.Data)
++		}
++	case <-time.After(2500 * time.Millisecond):
++		t.Fatal("watcher did not process the non-excluded log")
++	}
++	select {
++	case ev := <-transmitter.events:
++		t.Fatalf("excluded file produced an event from %q", ev.Path)
++	case <-time.After(150 * time.Millisecond):
++	}
++}
++
++func TestDetermineFilterFuncReturnsNilWithoutFilters(t *testing.T) {
++	assert.Nil(t, determineFilterFunc(&v1.Pod{}, "/var/log", "", false, nil))
++}
+diff --git a/tailer/tailer_test.go b/tailer/tailer_test.go
+index e1136dd..491eee6 100644
+--- a/tailer/tailer_test.go
++++ b/tailer/tailer_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"io/ioutil"
+ 	"os"
+ 	"path"
++	"path/filepath"
+ 	"testing"
+ 	"time"
+ 
+@@ -150,7 +151,7 @@ func TestPathWatching(t *testing.T) {
+ 	time.Sleep(time.Second)
+ 	watcher.Stop()
+ 
+-	assert.Equal(t, len(handlerFactory.handlers), 2)
++	assert.Equal(t, 2, len(handlerFactory.handlers))
+ 	for _, h := range handlerFactory.handlers {
+ 		assert.Equal(t, 2, len(h.lines))
+ 	}
+@@ -165,9 +166,45 @@ func TestTailingWithoutStateRecorder(t *testing.T) {
+ 	handler := &mockLineHandler{}
+ 
+ 	logFile, err := ioutil.TempFile("/tmp", "honeycomb-log-test")
++	assert.NoError(t, err)
+ 	logFile.Write([]byte("line1\n"))
+ 	logFile.Sync()
+ 	tailer := NewTailer(logFile.Name(), handler, stateRecorder)
+ 	tailer.Run()
+ 	tailer.Stop()
+ }
++
++func TestGlobbing(t *testing.T) {
++	paths := []string{
++		"/var/log/*",
++		"*",
++		".",
++	}
++
++	for _, p := range paths {
++		t.Run(p, func(t *testing.T) {
++			oldfiles, err := filepath.Glob(p)
++			assert.NoError(t, err)
++
++			newfiles, err := doublestarGlob(p)
++			assert.NoError(t, err)
++
++			assert.Equal(t, oldfiles, newfiles)
++		})
++	}
++}
++
++func TestGlobbingRecursivePattern(t *testing.T) {
++	base, err := ioutil.TempDir("", "doublestar-glob-")
++	assert.NoError(t, err)
++	defer os.RemoveAll(base)
++
++	matchedPath := filepath.Join(base, "one", "two", "application.log")
++	assert.NoError(t, os.MkdirAll(filepath.Dir(matchedPath), 0755))
++	assert.NoError(t, ioutil.WriteFile(matchedPath, []byte("log\n"), 0644))
++	assert.NoError(t, ioutil.WriteFile(filepath.Join(base, "one", "two", "ignored.tmp"), []byte("tmp"), 0644))
++
++	matches, err := doublestarGlob(filepath.Join(base, "**", "*.log"))
++	assert.NoError(t, err)
++	assert.Equal(t, []string{matchedPath}, matches)
++}

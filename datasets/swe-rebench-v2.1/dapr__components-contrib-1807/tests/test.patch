@@ -1,0 +1,235 @@
+diff --git a/pubsub/aws/snssqs/snssqs_test.go b/pubsub/aws/snssqs/snssqs_test.go
+index 95104b74..31abf14e 100644
+--- a/pubsub/aws/snssqs/snssqs_test.go
++++ b/pubsub/aws/snssqs/snssqs_test.go
+@@ -14,8 +14,23 @@ limitations under the License.
+ package snssqs
+ 
+ import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"html"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"sync"
+ 	"testing"
++	"time"
+ 
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/credentials"
++	"github.com/aws/aws-sdk-go/aws/session"
++	"github.com/aws/aws-sdk-go/service/sns"
++	"github.com/aws/aws-sdk-go/service/sqs"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/dapr/components-contrib/metadata"
+@@ -402,6 +417,206 @@ func Test_replaceNameToAWSSanitizedExistingFifoName_Trimmed(t *testing.T) {
+ 	r.Equal("012345678901234567890123456789012345678901234567890123456789012345678901234.fifo", v)
+ }
+ 
++// fakePolicyServer emulates the AWS operations needed by Subscribe and persists
++// queue policies between subscriptions.
++type fakePolicyServer struct {
++	mu        sync.Mutex
++	policy    string
++	submitted []string
++}
++
++func newFakePolicyServer(t *testing.T) (*httptest.Server, *fakePolicyServer) {
++	t.Helper()
++	state := &fakePolicyServer{}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		body, _ := io.ReadAll(req.Body)
++		values, _ := url.ParseQuery(string(body))
++		action := values.Get("Action")
++		w.Header().Set("Content-Type", "text/xml")
++
++		switch action {
++		case "CreateTopic":
++			arn := "arn:aws:sns:us-east-1:123456789012:" + values.Get("Name")
++			fmt.Fprintf(w, `<CreateTopicResponse><CreateTopicResult><TopicArn>%s</TopicArn></CreateTopicResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></CreateTopicResponse>`, arn)
++		case "Subscribe":
++			fmt.Fprint(w, `<SubscribeResponse><SubscribeResult><SubscriptionArn>subscription-arn</SubscriptionArn></SubscribeResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SubscribeResponse>`)
++		case "Unsubscribe":
++			fmt.Fprint(w, `<UnsubscribeResponse><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></UnsubscribeResponse>`)
++		case "CreateQueue":
++			fmt.Fprint(w, `<CreateQueueResponse><CreateQueueResult><QueueUrl>http://example.com/queue</QueueUrl></CreateQueueResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></CreateQueueResponse>`)
++		case "GetQueueAttributes":
++			state.mu.Lock()
++			policy := state.policy
++			state.mu.Unlock()
++			if values.Get("AttributeName.1") == "QueueArn" {
++				fmt.Fprint(w, `<GetQueueAttributesResponse><GetQueueAttributesResult><Attribute><Name>QueueArn</Name><Value>arn:aws:sqs:us-east-1:123456789012:queue</Value></Attribute></GetQueueAttributesResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></GetQueueAttributesResponse>`)
++			} else if policy == "" {
++				fmt.Fprint(w, `<GetQueueAttributesResponse><GetQueueAttributesResult></GetQueueAttributesResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></GetQueueAttributesResponse>`)
++			} else {
++				fmt.Fprintf(w, `<GetQueueAttributesResponse><GetQueueAttributesResult><Attribute><Name>Policy</Name><Value>%s</Value></Attribute></GetQueueAttributesResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></GetQueueAttributesResponse>`, html.EscapeString(policy))
++			}
++		case "SetQueueAttributes":
++			policy := values.Get("Attribute.1.Value")
++			state.mu.Lock()
++			state.policy = policy
++			state.submitted = append(state.submitted, policy)
++			state.mu.Unlock()
++			fmt.Fprint(w, `<SetQueueAttributesResponse><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SetQueueAttributesResponse>`)
++		case "ReceiveMessage":
++			fmt.Fprint(w, `<ReceiveMessageResponse><ReceiveMessageResult></ReceiveMessageResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></ReceiveMessageResponse>`)
++		default:
++			http.Error(w, "unexpected AWS action: "+action, http.StatusBadRequest)
++		}
++	}))
++	return server, state
++}
++
++func newSnsSqsWithEndpoint(t *testing.T, endpoint string) (*snsSqs, context.CancelFunc) {
++	t.Helper()
++	sess := session.Must(session.NewSession(&aws.Config{
++		Region:      aws.String("us-east-1"),
++		Endpoint:    aws.String(endpoint),
++		Credentials: credentials.NewStaticCredentials("a", "s", ""),
++		DisableSSL:  aws.Bool(true),
++	}))
++	ctx, cancel := context.WithCancel(context.Background())
++	return &snsSqs{
++		snsClient:     sns.New(sess),
++		sqsClient:     sqs.New(sess),
++		metadata:      &snsSqsMetadata{Region: "us-east-1", Partition: "aws", accountID: "123456789012", sqsQueueName: "queue", messageMaxNumber: 10},
++		topicArns:     make(map[string]string),
++		topicHandlers: make(map[string]topicHandler),
++		logger:        logger.NewLogger("SnsSqs unit test"),
++		opsTimeout:    5 * time.Second,
++		ctx:           ctx,
++		pollerRunning: make(chan struct{}, 1),
++	}, cancel
++}
++
++func sourceArnsForQueue(t *testing.T, policyJSON, queueArn string) []string {
++	t.Helper()
++	var parsed struct {
++		Statement []struct {
++			Resource  string                                `json:"Resource"`
++			Condition map[string]map[string]json.RawMessage `json:"Condition"`
++		} `json:"Statement"`
++	}
++	require.NoError(t, json.Unmarshal([]byte(policyJSON), &parsed))
++	var arns []string
++	for _, statement := range parsed.Statement {
++		if statement.Resource != queueArn {
++			continue
++		}
++		for _, operator := range statement.Condition {
++			raw, ok := operator["aws:SourceArn"]
++			if !ok {
++				continue
++			}
++			var single string
++			if json.Unmarshal(raw, &single) == nil {
++				arns = append(arns, single)
++				continue
++			}
++			var multiple []string
++			require.NoError(t, json.Unmarshal(raw, &multiple))
++			arns = append(arns, multiple...)
++		}
++	}
++	return arns
++}
++
++func policyStatementCount(t *testing.T, policyJSON string) int {
++	t.Helper()
++	var parsed struct {
++		Statement []json.RawMessage `json:"Statement"`
++	}
++	require.NoError(t, json.Unmarshal([]byte(policyJSON), &parsed))
++	return len(parsed.Statement)
++}
++
++func flattenSingleSourceArn(t *testing.T, policyJSON string) string {
++	t.Helper()
++	var parsed map[string]interface{}
++	require.NoError(t, json.Unmarshal([]byte(policyJSON), &parsed))
++	statements, ok := parsed["Statement"].([]interface{})
++	require.True(t, ok)
++	for _, rawStatement := range statements {
++		statement, ok := rawStatement.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		condition, ok := statement["Condition"].(map[string]interface{})
++		if !ok {
++			continue
++		}
++		for _, rawOperator := range condition {
++			operator, ok := rawOperator.(map[string]interface{})
++			if !ok {
++				continue
++			}
++			if arns, ok := operator["aws:SourceArn"].([]interface{}); ok && len(arns) == 1 {
++				operator["aws:SourceArn"] = arns[0]
++			}
++		}
++	}
++	out, err := json.Marshal(parsed)
++	require.NoError(t, err)
++	return string(out)
++}
++
++func subscribeToTopic(t *testing.T, s *snsSqs, topic string) {
++	t.Helper()
++	require.NoError(t, s.Subscribe(s.ctx, pubsub.SubscribeRequest{Topic: topic}, nil))
++}
++
++func Test_SubscribePolicySupportsMoreThanTwentyTopics(t *testing.T) {
++	t.Parallel()
++	server, state := newFakePolicyServer(t)
++	defer server.Close()
++	s, cancel := newSnsSqsWithEndpoint(t, server.URL)
++	defer cancel()
++
++	const queueArn = "arn:aws:sqs:us-east-1:123456789012:queue"
++	snsArns := make([]string, 0, 25)
++	for i := 0; i < 25; i++ {
++		topic := fmt.Sprintf("topic-%d", i)
++		snsArns = append(snsArns, "arn:aws:sns:us-east-1:123456789012:"+topic)
++		subscribeToTopic(t, s, topic)
++	}
++
++	state.mu.Lock()
++	submitted := append([]string(nil), state.submitted...)
++	state.mu.Unlock()
++	require.NotEmpty(t, submitted)
++	for _, policy := range submitted {
++		require.LessOrEqual(t, policyStatementCount(t, policy), 20)
++	}
++	require.ElementsMatch(t, snsArns, sourceArnsForQueue(t, submitted[len(submitted)-1], queueArn))
++}
++
++func Test_SubscribePolicyPreservesExistingSingleArnString(t *testing.T) {
++	t.Parallel()
++	server, state := newFakePolicyServer(t)
++	defer server.Close()
++	s, cancel := newSnsSqsWithEndpoint(t, server.URL)
++	defer cancel()
++
++	const queueArn = "arn:aws:sqs:us-east-1:123456789012:queue"
++	firstArn := "arn:aws:sns:us-east-1:123456789012:topic-1"
++	secondArn := "arn:aws:sns:us-east-1:123456789012:topic-2"
++	subscribeToTopic(t, s, "topic-1")
++
++	state.mu.Lock()
++	state.policy = flattenSingleSourceArn(t, state.policy)
++	state.mu.Unlock()
++
++	subscribeToTopic(t, s, "topic-2")
++	state.mu.Lock()
++	finalPolicy := state.policy
++	state.mu.Unlock()
++	require.ElementsMatch(t, []string{firstArn, secondArn}, sourceArnsForQueue(t, finalPolicy, queueArn))
++}
++
+ func Test_buildARN_DefaultPartition(t *testing.T) {
+ 	t.Parallel()
+ 	r := require.New(t)

@@ -1,0 +1,304 @@
+diff --git a/pkg/cli/environment_test.go b/pkg/cli/environment_test.go
+index fadc2981..b41ab0a9 100644
+--- a/pkg/cli/environment_test.go
++++ b/pkg/cli/environment_test.go
+@@ -17,11 +17,30 @@ limitations under the License.
+ package cli
+ 
+ import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"reflect"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/spf13/pflag"
++
++	"helm.sh/helm/v3/pkg/chart"
++	"helm.sh/helm/v3/pkg/chartutil"
++	"helm.sh/helm/v3/pkg/release"
++	"helm.sh/helm/v3/pkg/storage"
++	"helm.sh/helm/v3/pkg/storage/driver"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/rest"
+ )
+ 
+ func TestEnvSettings(t *testing.T) {
+@@ -35,29 +54,52 @@ func TestEnvSettings(t *testing.T) {
+ 		// expected values
+ 		ns, kcontext string
+ 		debug        bool
++		maxhistory   int
+ 	}{
+ 		{
+-			name: "defaults",
+-			ns:   "default",
++			name:       "defaults",
++			ns:         "default",
++			maxhistory: 10,
++		},
++		{
++			name:       "with flags set",
++			args:       "--debug --namespace=myns",
++			ns:         "myns",
++			debug:      true,
++			maxhistory: 10,
+ 		},
+ 		{
+-			name:  "with flags set",
+-			args:  "--debug --namespace=myns",
+-			ns:    "myns",
+-			debug: true,
++			name:       "with envvars set",
++			envvars:    map[string]string{"HELM_DEBUG": "1", "HELM_NAMESPACE": "yourns", "HELM_MAX_HISTORY": "5"},
++			ns:         "yourns",
++			maxhistory: 5,
++			debug:      true,
+ 		},
+ 		{
+-			name:    "with envvars set",
+-			envvars: map[string]string{"HELM_DEBUG": "1", "HELM_NAMESPACE": "yourns"},
+-			ns:      "yourns",
+-			debug:   true,
++			name:       "with flags and envvars set",
++			args:       "--debug --namespace=myns",
++			envvars:    map[string]string{"HELM_DEBUG": "1", "HELM_NAMESPACE": "yourns"},
++			ns:         "myns",
++			debug:      true,
++			maxhistory: 10,
+ 		},
+ 		{
+-			name:    "with flags and envvars set",
+-			args:    "--debug --namespace=myns",
+-			envvars: map[string]string{"HELM_DEBUG": "1", "HELM_NAMESPACE": "yourns"},
+-			ns:      "myns",
+-			debug:   true,
++			name:       "with empty max history envvar",
++			envvars:    map[string]string{"HELM_MAX_HISTORY": ""},
++			ns:         "default",
++			maxhistory: 10,
++		},
++		{
++			name:       "with invalid max history envvar",
++			envvars:    map[string]string{"HELM_MAX_HISTORY": "not-a-number"},
++			ns:         "default",
++			maxhistory: 10,
++		},
++		{
++			name:       "with zero max history envvar",
++			envvars:    map[string]string{"HELM_MAX_HISTORY": "0"},
++			ns:         "default",
++			maxhistory: 0,
+ 		},
+ 	}
+ 
+@@ -65,6 +107,9 @@ func TestEnvSettings(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			defer resetEnv()()
+ 
++			// Ensure the max-history setting does not leak between cases.
++			os.Unsetenv("HELM_MAX_HISTORY")
++
+ 			for k, v := range tt.envvars {
+ 				os.Setenv(k, v)
+ 			}
+@@ -84,6 +129,14 @@ func TestEnvSettings(t *testing.T) {
+ 			if settings.KubeContext != tt.kcontext {
+ 				t.Errorf("expected kube-context %q, got %q", tt.kcontext, settings.KubeContext)
+ 			}
++			maxHistory := reflect.ValueOf(settings).Elem().FieldByName("MaxHistory")
++			if !maxHistory.IsValid() {
++				t.Errorf("EnvSettings does not expose MaxHistory")
++			} else if maxHistory.Kind() != reflect.Int {
++				t.Errorf("MaxHistory must be an int, got %s", maxHistory.Kind())
++			} else if int(maxHistory.Int()) != tt.maxhistory {
++				t.Errorf("expected maxHistory %d, got %d", tt.maxhistory, maxHistory.Int())
++			}
+ 		})
+ 	}
+ }
+@@ -103,3 +156,175 @@ func resetEnv() func() {
+ 		}
+ 	}
+ }
++
++func TestUpgradeUsesEnvironmentHistoryLimit(t *testing.T) {
++	api := &historyTestAPI{secrets: make(map[string]corev1.Secret)}
++	server := httptest.NewServer(http.HandlerFunc(api.serveHTTP))
++	defer server.Close()
++
++	kubeConfig := &rest.Config{Host: server.URL}
++	client, err := kubernetes.NewForConfig(kubeConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	chartForRelease := &chart.Chart{Metadata: &chart.Metadata{Name: "history-test", Version: "0.1.0"}}
++	seed := storage.Init(driver.NewSecrets(client.CoreV1().Secrets("default")))
++	for version := 1; version <= 12; version++ {
++		status := release.StatusSuperseded
++		if version == 12 {
++			status = release.StatusDeployed
++		}
++		rel := release.Mock(&release.MockReleaseOptions{
++			Name: "history-test", Version: version, Chart: chartForRelease, Status: status,
++		})
++		rel.Manifest = ""
++		rel.Hooks = nil
++		if err := seed.Create(rel); err != nil {
++			t.Fatalf("seeding release history: %v", err)
++		}
++	}
++
++	kubeconfigPath := filepath.Join(t.TempDir(), "config")
++	contents := fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- name: test
++  cluster:
++    server: %s
++contexts:
++- name: test
++  context:
++    cluster: test
++    user: test
++    namespace: default
++current-context: test
++users:
++- name: test
++  user: {}
++`, server.URL)
++	if err := os.WriteFile(kubeconfigPath, []byte(contents), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	chartDir := filepath.Join(t.TempDir(), "chart")
++	if err := chartutil.SaveDir(chartForRelease, filepath.Dir(chartDir)); err != nil {
++		t.Fatal(err)
++	}
++	// SaveDir uses the chart metadata name for the directory.
++	chartDir = filepath.Join(filepath.Dir(chartDir), chartForRelease.Metadata.Name)
++
++	cmd := exec.Command("go", "run", "../../cmd/helm", "upgrade", "history-test", chartDir, "--namespace", "default", "--disable-openapi-validation")
++	cmd.Env = make([]string, 0, len(os.Environ())+5)
++	for _, entry := range os.Environ() {
++		if !strings.HasPrefix(entry, "HELM_") && !strings.HasPrefix(entry, "KUBECONFIG=") {
++			cmd.Env = append(cmd.Env, entry)
++		}
++	}
++	cmd.Env = append(cmd.Env,
++		"HELM_MAX_HISTORY=37",
++		"HELM_DRIVER=secret",
++		"HELM_NAMESPACE=default",
++		"KUBECONFIG="+kubeconfigPath,
++		"HELM_CONFIG_HOME="+t.TempDir(),
++		"HELM_CACHE_HOME="+t.TempDir(),
++		"HELM_DATA_HOME="+t.TempDir(),
++	)
++	if output, err := cmd.CombinedOutput(); err != nil {
++		api.mu.Lock()
++		unhandled := strings.Join(api.unhandled, ", ")
++		api.mu.Unlock()
++		t.Fatalf("running upgrade without --history-max: %v\nunhandled API requests: %s\n%s", err, unhandled, output)
++	}
++
++	api.mu.Lock()
++	defer api.mu.Unlock()
++	if got := len(api.secrets); got != 13 {
++		t.Fatalf("upgrade retained %d release revisions; expected the 12 existing revisions and the new revision to remain under limit 37", got)
++	}
++}
++
++type historyTestAPI struct {
++	mu        sync.Mutex
++	secrets   map[string]corev1.Secret
++	unhandled []string
++}
++
++func (api *historyTestAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Content-Type", "application/json")
++	switch r.URL.Path {
++	case "/version":
++		fmt.Fprint(w, `{"major":"1","minor":"28","gitVersion":"v1.28.0","gitCommit":"test","gitTreeState":"clean","buildDate":"2024-01-01T00:00:00Z","goVersion":"go1.20","compiler":"gc","platform":"linux/amd64"}`)
++	case "/api":
++		fmt.Fprint(w, `{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[]}`)
++	case "/apis":
++		fmt.Fprint(w, `{"kind":"APIGroupList","apiVersion":"v1","groups":[]}`)
++	case "/api/v1":
++		fmt.Fprint(w, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[{"name":"secrets","singularName":"secret","namespaced":true,"kind":"Secret","verbs":["get","list","create","update","delete"]}]}`)
++	default:
++		const secretCollection = "/api/v1/namespaces/default/secrets"
++		if r.URL.Path == secretCollection {
++			api.handleSecretCollection(w, r)
++			return
++		}
++		if strings.HasPrefix(r.URL.Path, secretCollection+"/") {
++			api.handleSecret(w, r, path.Base(r.URL.Path))
++			return
++		}
++		api.mu.Lock()
++		api.unhandled = append(api.unhandled, r.Method+" "+r.URL.String())
++		api.mu.Unlock()
++		http.NotFound(w, r)
++	}
++}
++
++func (api *historyTestAPI) handleSecretCollection(w http.ResponseWriter, r *http.Request) {
++	api.mu.Lock()
++	defer api.mu.Unlock()
++	switch r.Method {
++	case http.MethodGet:
++		items := make([]corev1.Secret, 0, len(api.secrets))
++		for _, secret := range api.secrets {
++			items = append(items, secret)
++		}
++		_ = json.NewEncoder(w).Encode(corev1.SecretList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "SecretList"}, Items: items})
++	case http.MethodPost:
++		var secret corev1.Secret
++		if err := json.NewDecoder(r.Body).Decode(&secret); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		api.secrets[secret.Name] = secret
++		w.WriteHeader(http.StatusCreated)
++		_ = json.NewEncoder(w).Encode(secret)
++	default:
++		w.WriteHeader(http.StatusMethodNotAllowed)
++	}
++}
++
++func (api *historyTestAPI) handleSecret(w http.ResponseWriter, r *http.Request, name string) {
++	api.mu.Lock()
++	defer api.mu.Unlock()
++	switch r.Method {
++	case http.MethodGet:
++		secret, ok := api.secrets[name]
++		if !ok {
++			http.Error(w, "not found", http.StatusNotFound)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(secret)
++	case http.MethodPut:
++		var secret corev1.Secret
++		if err := json.NewDecoder(r.Body).Decode(&secret); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		api.secrets[name] = secret
++		_ = json.NewEncoder(w).Encode(secret)
++	case http.MethodDelete:
++		delete(api.secrets, name)
++		w.WriteHeader(http.StatusOK)
++		_, _ = fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","status":"Success"}`)
++	default:
++		w.WriteHeader(http.StatusMethodNotAllowed)
++	}
++}

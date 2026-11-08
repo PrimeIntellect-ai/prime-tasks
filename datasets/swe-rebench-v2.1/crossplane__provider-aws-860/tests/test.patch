@@ -1,0 +1,298 @@
+diff --git a/pkg/clients/elasticache/elasticache_test.go b/pkg/clients/elasticache/elasticache_test.go
+index 059ce649..95a659ec 100644
+--- a/pkg/clients/elasticache/elasticache_test.go
++++ b/pkg/clients/elasticache/elasticache_test.go
+@@ -17,7 +17,10 @@ limitations under the License.
+ package elasticache
+ 
+ import (
++	"encoding/json"
++	"os"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/aws/smithy-go/document"
+@@ -28,6 +31,7 @@ import (
+ 	"github.com/google/go-cmp/cmp"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
++	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+ 
+ 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+ 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
+@@ -293,6 +297,115 @@ func TestNewModifyReplicationGroupInput(t *testing.T) {
+ 	}
+ }
+ 
++func TestNumNodeGroupsCanBeUpdated(t *testing.T) {
++	crd, err := os.ReadFile("../../../package/crds/cache.aws.crossplane.io_replicationgroups.yaml")
++	if err != nil {
++		t.Fatalf("Read replication-group API schema: %v", err)
++	}
++	data, err := utilyaml.ToJSON(crd)
++	if err != nil {
++		t.Fatalf("Decode replication-group API schema: %v", err)
++	}
++	var definition map[string]interface{}
++	if err := json.Unmarshal(data, &definition); err != nil {
++		t.Fatalf("Parse replication-group API schema: %v", err)
++	}
++	spec := definition["spec"].(map[string]interface{})
++	versions := spec["versions"].([]interface{})
++	version := versions[0].(map[string]interface{})
++	schema := version["schema"].(map[string]interface{})["openAPIV3Schema"].(map[string]interface{})
++	properties := schema["properties"].(map[string]interface{})
++	resourceSpec := properties["spec"].(map[string]interface{})
++	forProvider := resourceSpec["properties"].(map[string]interface{})["forProvider"].(map[string]interface{})
++	nodeGroups := forProvider["properties"].(map[string]interface{})["numNodeGroups"].(map[string]interface{})
++
++	// Update admission must not require a value to remain equal to its old value.
++	if validations, ok := nodeGroups["x-kubernetes-validations"].([]interface{}); ok {
++		for _, validation := range validations {
++			rule := validation.(map[string]interface{})["rule"].(string)
++			normalizedRule := strings.ReplaceAll(rule, " ", "")
++			immutable := normalizedRule == "self==oldSelf" || normalizedRule == "oldSelf==self" ||
++				normalizedRule == "!has(oldSelf)||self==oldSelf" || normalizedRule == "!has(oldSelf)||oldSelf==self"
++			if immutable {
++				t.Errorf("numNodeGroups update validation prevents changing an existing value: %q", rule)
++			}
++		}
++	}
++}
++
++func TestNewModifyReplicationGroupShardConfigurationInput(t *testing.T) {
++	cases := []struct {
++		name     string
++		params   v1beta1.ReplicationGroupParameters
++		observed elasticachetypes.ReplicationGroup
++		want     *elasticache.ModifyReplicationGroupShardConfigurationInput
++	}{
++		{
++			name:   "ScaleUp",
++			params: replicationGroup.Spec.ForProvider,
++			observed: elasticachetypes.ReplicationGroup{
++				NodeGroups: []elasticachetypes.NodeGroup{
++					{
++						NodeGroupId: aws.String("ng-01"),
++					},
++				},
++			},
++			want: &elasticache.ModifyReplicationGroupShardConfigurationInput{
++				ApplyImmediately:   true,
++				NodeGroupCount:     2,
++				ReplicationGroupId: aws.String(name, aws.FieldRequired),
++			},
++		},
++		{
++			name:   "ScaleDown",
++			params: replicationGroup.Spec.ForProvider,
++			observed: elasticachetypes.ReplicationGroup{
++				NodeGroups: []elasticachetypes.NodeGroup{
++					{NodeGroupId: aws.String("ng-01")},
++					{NodeGroupId: aws.String("ng-02")},
++					{NodeGroupId: aws.String("ng-03")},
++				},
++			},
++			want: &elasticache.ModifyReplicationGroupShardConfigurationInput{
++				ApplyImmediately:   true,
++				NodeGroupCount:     2,
++				NodeGroupsToRemove: []string{"ng-01"},
++				ReplicationGroupId: aws.String(name),
++			},
++		},
++		{
++			name: "ApplyImmediatelyFromRG",
++			params: v1beta1.ReplicationGroupParameters{
++				ApplyModificationsImmediately: false,
++				NumNodeGroups:                 &numNodeGroups,
++			},
++			observed: elasticachetypes.ReplicationGroup{
++				NodeGroups: []elasticachetypes.NodeGroup{
++					{NodeGroupId: aws.String("ng-01")},
++					{NodeGroupId: aws.String("ng-02")},
++					{NodeGroupId: aws.String("ng-03")},
++				},
++			},
++			want: &elasticache.ModifyReplicationGroupShardConfigurationInput{
++				ApplyImmediately:   false,
++				NodeGroupCount:     2,
++				NodeGroupsToRemove: []string{"ng-01"},
++				ReplicationGroupId: aws.String(name),
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := NewModifyReplicationGroupShardConfigurationInput(tc.params, name, tc.observed)
++
++			if diff := cmp.Diff(tc.want, got, cmpopts.IgnoreTypes(document.NoSerde{}), cmpopts.EquateEmpty()); diff != "" {
++				t.Errorf("NewModifyReplicationGroupShardConfigurationInput(...): -want, +got:\n%s", diff)
++			}
++		})
++	}
++}
++
+ func TestNewDeleteReplicationGroupInput(t *testing.T) {
+ 	cases := []struct {
+ 		name string
+@@ -680,6 +793,52 @@ func TestReplicationGroupNeedsUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestReplicationGroupShardConfigurationNeedsUpdate(t *testing.T) {
++	cases := []struct {
++		name   string
++		kube   v1beta1.ReplicationGroupParameters
++		rg     elasticachetypes.ReplicationGroup
++		ccList []elasticachetypes.CacheCluster
++		want   bool
++	}{
++		{
++			name: "NodeMismatch",
++			kube: replicationGroup.Spec.ForProvider, // 2
++			rg: elasticachetypes.ReplicationGroup{
++				NodeGroups: make([]elasticachetypes.NodeGroup, 3),
++			},
++			want: true,
++		},
++		{
++			name: "UpToDate",
++			kube: replicationGroup.Spec.ForProvider,
++			rg: elasticachetypes.ReplicationGroup{
++				NodeGroups: make([]elasticachetypes.NodeGroup, numNodeGroups),
++			},
++			want: false,
++		},
++		{
++			name: "NilNumNodes",
++			kube: v1beta1.ReplicationGroupParameters{
++				NumNodeGroups: nil,
++			},
++			rg: elasticachetypes.ReplicationGroup{
++				NodeGroups: make([]elasticachetypes.NodeGroup, numNodeGroups),
++			},
++			want: false,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := ReplicationGroupShardConfigurationNeedsUpdate(tc.kube, tc.rg)
++			if got != tc.want {
++				t.Errorf("ReplicationGroupShardConfigurationNeedsUpdate(...): want %t, got %t", tc.want, got)
++			}
++		})
++	}
++}
++
+ func TestCacheClusterNeedsUpdate(t *testing.T) {
+ 	cases := []struct {
+ 		name string
+diff --git a/pkg/controller/cache/managed_test.go b/pkg/controller/cache/managed_test.go
+index 0f5664ba..9393fea2 100644
+--- a/pkg/controller/cache/managed_test.go
++++ b/pkg/controller/cache/managed_test.go
+@@ -117,6 +117,10 @@ func withTags(tagMaps ...map[string]string) replicationGroupModifier {
+ 	return func(r *v1beta1.ReplicationGroup) { r.Spec.ForProvider.Tags = tagList }
+ }
+ 
++func withNumNodeGroups(n int) replicationGroupModifier {
++	return func(r *v1beta1.ReplicationGroup) { r.Spec.ForProvider.NumNodeGroups = &n }
++}
++
+ func replicationGroup(rm ...replicationGroupModifier) *v1beta1.ReplicationGroup {
+ 	r := &v1beta1.ReplicationGroup{
+ 		ObjectMeta: objectMeta,
+@@ -452,6 +456,53 @@ func TestUpdate(t *testing.T) {
+ 			),
+ 			returnsErr: true,
+ 		},
++		{
++			name: "CallsModifyReplicationGroupShardConfiguration",
++			e: &external{client: &fake.MockClient{
++				MockDescribeReplicationGroups: func(ctx context.Context, _ *elasticache.DescribeReplicationGroupsInput, opts []func(*elasticache.Options)) (*elasticache.DescribeReplicationGroupsOutput, error) {
++					return &elasticache.DescribeReplicationGroupsOutput{
++						ReplicationGroups: []types.ReplicationGroup{{
++							Status:                 aws.String(v1beta1.StatusAvailable),
++							MemberClusters:         []string{cacheClusterID},
++							AutomaticFailover:      types.AutomaticFailoverStatusEnabled,
++							NodeGroups:             []types.NodeGroup{{NodeGroupId: aws.String("ng-01")}, {NodeGroupId: aws.String("ng-02")}},
++							CacheNodeType:          aws.String(cacheNodeType),
++							SnapshotRetentionLimit: aws.Int32(int32(snapshotRetentionLimit)),
++							SnapshotWindow:         aws.String(snapshotWindow),
++							ClusterEnabled:         aws.Bool(true),
++							ConfigurationEndpoint:  &types.Endpoint{Address: aws.String(host), Port: int32(port)},
++						}},
++					}, nil
++				},
++				MockDescribeCacheClusters: func(ctx context.Context, _ *elasticache.DescribeCacheClustersInput, opts []func(*elasticache.Options)) (*elasticache.DescribeCacheClustersOutput, error) {
++					return &elasticache.DescribeCacheClustersOutput{
++						CacheClusters: []types.CacheCluster{{
++							EngineVersion:              aws.String(engineVersion),
++							PreferredMaintenanceWindow: aws.String("never!"), // This field needs to be updated.
++						}},
++					}, nil
++
++				},
++				MockModifyReplicationGroupShardConfiguration: func(ctx context.Context, _ *elasticache.ModifyReplicationGroupShardConfigurationInput, opts []func(*elasticache.Options)) (*elasticache.ModifyReplicationGroupShardConfigurationOutput, error) {
++					return nil, errorBoom
++				},
++			}},
++			r: replicationGroup(
++				withReplicationGroupID(name),
++				withProviderStatus(v1beta1.StatusAvailable),
++				withConditions(xpv1.Available()),
++				withMemberClusters([]string{cacheClusterID}),
++				withNumNodeGroups(3),
++			),
++			want: replicationGroup(
++				withReplicationGroupID(name),
++				withProviderStatus(v1beta1.StatusAvailable),
++				withConditions(xpv1.Available()),
++				withMemberClusters([]string{cacheClusterID}),
++				withNumNodeGroups(3),
++			),
++			returnsErr: true,
++		},
+ 	}
+ 
+ 	for _, tc := range cases {
+@@ -586,3 +637,36 @@ func TestInitialize(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestObserveShardConfigurationNeedsUpdate(t *testing.T) {
++	e := &external{client: &fake.MockClient{
++		MockDescribeReplicationGroups: func(ctx context.Context, _ *elasticache.DescribeReplicationGroupsInput, opts []func(*elasticache.Options)) (*elasticache.DescribeReplicationGroupsOutput, error) {
++			return &elasticache.DescribeReplicationGroupsOutput{
++				ReplicationGroups: []types.ReplicationGroup{{
++					Status:                 aws.String(v1beta1.StatusAvailable),
++					AutomaticFailover:      types.AutomaticFailoverStatusEnabled,
++					NodeGroups:             []types.NodeGroup{{NodeGroupId: aws.String("ng-01")}, {NodeGroupId: aws.String("ng-02")}},
++					CacheNodeType:          aws.String(cacheNodeType),
++					SnapshotRetentionLimit: aws.Int32(int32(snapshotRetentionLimit)),
++					SnapshotWindow:         aws.String(snapshotWindow),
++					ClusterEnabled:         aws.Bool(true),
++					ConfigurationEndpoint:  &types.Endpoint{Address: aws.String(host), Port: int32(port)},
++				}},
++			}, nil
++		},
++	}}
++	r := replicationGroup(
++		withReplicationGroupID(name),
++		withProviderStatus(v1beta1.StatusAvailable),
++		withConditions(xpv1.Available()),
++		withNumNodeGroups(3),
++	)
++
++	observation, err := e.Observe(ctx, r)
++	if err != nil {
++		t.Fatalf("e.Observe(...): unexpected error: %v", err)
++	}
++	if observation.ResourceUpToDate {
++		t.Errorf("e.Observe(...): ResourceUpToDate: want false, got true")
++	}
++}

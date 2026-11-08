@@ -1,0 +1,861 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3b396a6..1093169 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,7 +18,8 @@
+ * Generic mappers (`Map1`, ...) have methods `NewEntities`, `NewEntitiesWith` and `RemoveEntities` for batch operations (#151)
+ * Batch-creation methods (ID-based and generic) have variants like `NewEntitiesQuery` that return a query over the created entities (#152)
+ * Notification during batch-creation is delayed until the resp. query is closed (#157)
+-* Match-remove methods (`RemoveEntities()`) return the number of removed entities (#173)
++* Batch-remove methods (`RemoveEntities()`) return the number of removed entities (#173)
++* Filters can be cached and tracked by the `World` to speed up queries when there are many archetypes (#178)
+ 
+ ### Performance
+ 
+diff --git a/README.md b/README.md
+index bb19849..e0175b7 100644
+--- a/README.md
++++ b/README.md
+@@ -111,7 +111,7 @@ Nevertheless, *Arche* can also be used for game development.
+ 
+ The `ecs.World` object is a pure and minimal ECS implementation in the sense of a data store
+ for entities and components, with query and iteration capabilities.
+-The core package `ecs` consists of less than 1500 lines of easy-to-read, clean and well-documented Go code.
++The core package `ecs` consists of only 1500 lines of easy-to-read, clean and well-documented Go code.
+ 
+ There is neither an update loop nor systems.
+ These should be implemented by the user.
+diff --git a/benchmark/arche/common/components.go b/benchmark/arche/common/components.go
+index f5370c4..4bd06a8 100644
+--- a/benchmark/arche/common/components.go
++++ b/benchmark/arche/common/components.go
+@@ -21,6 +21,7 @@ type TestStruct6 struct{ Val int32 }
+ type TestStruct7 struct{ Val int32 }
+ type TestStruct8 struct{ Val int32 }
+ type TestStruct9 struct{ Val int32 }
++type TestStruct10 struct{ Val int32 }
+ 
+ func RegisterAll(w *ecs.World) []ecs.ID {
+ 	_ = TestStruct0{1}
+@@ -33,8 +34,9 @@ func RegisterAll(w *ecs.World) []ecs.ID {
+ 	_ = TestStruct7{1}
+ 	_ = TestStruct8{1}
+ 	_ = TestStruct9{1}
++	_ = TestStruct10{1}
+ 
+-	ids := make([]ecs.ID, 10)
++	ids := make([]ecs.ID, 11)
+ 	ids[0] = ecs.ComponentID[TestStruct0](w)
+ 	ids[1] = ecs.ComponentID[TestStruct1](w)
+ 	ids[2] = ecs.ComponentID[TestStruct2](w)
+@@ -45,6 +47,7 @@ func RegisterAll(w *ecs.World) []ecs.ID {
+ 	ids[7] = ecs.ComponentID[TestStruct7](w)
+ 	ids[8] = ecs.ComponentID[TestStruct8](w)
+ 	ids[9] = ecs.ComponentID[TestStruct9](w)
++	ids[10] = ecs.ComponentID[TestStruct10](w)
+ 
+ 	return ids
+ }
+diff --git a/benchmark/profile/many_arch/main.go b/benchmark/profile/many_arch/main.go
+index 741fce6..a7e37f1 100644
+--- a/benchmark/profile/many_arch/main.go
++++ b/benchmark/profile/many_arch/main.go
+@@ -50,7 +50,7 @@ func run(rounds, iters, entities int) {
+ 			}
+ 		}
+ 
+-		filter := ecs.All(6)
++		var filter ecs.Filter = ecs.All(6)
+ 		for j := 0; j < iters; j++ {
+ 			query := world.Query(filter)
+ 			for query.Next() {
+diff --git a/ecs/cache.go b/ecs/cache.go
+new file mode 100644
+index 0000000..f88f635
+--- /dev/null
++++ b/ecs/cache.go
+@@ -0,0 +1,97 @@
++package ecs
++
++type cacheEntry struct {
++	ID         ID
++	Filter     Filter
++	Archetypes pagedPointerArr32[archetype]
++}
++
++// Cache provides [Filter] caching to speed up queries.
++//
++// Access it using [World.Cache].
++//
++// For registered filters, the relevant archetypes are tracked internally,
++// so that there are no mask checks required during iteration.
++// This is particularly helpful to avoid query iteration slowdown by a very high number of archetypes.
++// If the number of archetypes exceeds approx. 50-100, uncached filters experience a slowdown.
++// The relative slowdown increases with lower numbers of entities queried (below 10.000).
++// Cached filters avoid this slowdown.
++//
++// The overhead of tracking cached filters is very low, as updates are required only when new archetypes are created.
++type Cache struct {
++	bitPool       bitPool
++	indices       []int
++	filters       []cacheEntry
++	getArchetypes func(f Filter) pagedPointerArr32[archetype]
++}
++
++// newCache creates a new [Cache].
++func newCache() Cache {
++	indices := make([]int, MaskTotalBits)
++	for i := 0; i < MaskTotalBits; i++ {
++		indices[i] = MaskTotalBits
++	}
++	return Cache{
++		bitPool: bitPool{},
++		indices: indices,
++		filters: []cacheEntry{},
++	}
++}
++
++// Register a [Filter].
++//
++// Use the returned [CachedFilter] to construct queries:
++//
++//	filter := world.Cache().Register(ecs.All(posID, velID))
++//	query := world.Query(&filter)
++func (c *Cache) Register(f Filter) CachedFilter {
++	id := c.bitPool.Get()
++	c.filters = append(c.filters,
++		cacheEntry{
++			ID:         id,
++			Filter:     f,
++			Archetypes: c.getArchetypes(f),
++		})
++	c.indices[id] = len(c.filters) - 1
++	return CachedFilter{f, id}
++}
++
++// Unregister a filter.
++//
++// Returns the original filter.
++func (c *Cache) Unregister(f *CachedFilter) Filter {
++	idx := c.indices[f.id]
++	if idx >= MaskTotalBits {
++		panic("no filter for id found to unregister")
++	}
++	filter := c.filters[idx].Filter
++	c.indices[f.id] = MaskTotalBits
++
++	last := len(c.filters) - 1
++	if idx != last {
++		c.filters[idx], c.filters[last] = c.filters[last], c.filters[idx]
++		c.indices[c.filters[idx].ID] = idx
++	}
++	c.filters[last] = cacheEntry{}
++	c.filters = c.filters[:last]
++
++	return filter
++}
++
++func (c *Cache) get(f *CachedFilter) *cacheEntry {
++	idx := c.indices[f.id]
++	if idx < MaskTotalBits {
++		return &c.filters[idx]
++	}
++	panic("no filter for id found")
++}
++
++func (c *Cache) addArchetype(arch *archetype) {
++	ln := len(c.filters)
++	for i := 0; i < ln; i++ {
++		e := &c.filters[i]
++		if e.Filter.Matches(arch.Mask) {
++			e.Archetypes.Add(arch)
++		}
++	}
++}
+diff --git a/ecs/paged.go b/ecs/paged.go
+index eedd07c..3c8177a 100644
+--- a/ecs/paged.go
++++ b/ecs/paged.go
+@@ -31,3 +31,33 @@ func (p *pagedArr32[T]) Get(index int) *T {
+ func (p *pagedArr32[T]) Len() int {
+ 	return p.len
+ }
++
++// pagedPointerArr32 is a paged collection working with pages of length 32 arrays.
++//
++// Implements [archetypes].
++type pagedPointerArr32[T any] struct {
++	pages   [][fixedPageSize]*T
++	len     int
++	lenLast int
++}
++
++// Add adds a value to the paged array.
++func (p *pagedPointerArr32[T]) Add(value *T) {
++	if p.len == 0 || p.lenLast == fixedPageSize {
++		p.pages = append(p.pages, [fixedPageSize]*T{})
++		p.lenLast = 0
++	}
++	p.pages[len(p.pages)-1][p.lenLast] = value
++	p.len++
++	p.lenLast++
++}
++
++// Get returns the value at the given index.
++func (p *pagedPointerArr32[T]) Get(index int) *T {
++	return p.pages[index/fixedPageSize][index%fixedPageSize]
++}
++
++// Len returns the current number of items in the paged array.
++func (p *pagedPointerArr32[T]) Len() int {
++	return p.len
++}
+diff --git a/ecs/query.go b/ecs/query.go
+index 95c9f12..2ad5f7c 100644
+--- a/ecs/query.go
++++ b/ecs/query.go
+@@ -37,6 +37,17 @@ func (f dummyFilter) Matches(bits Mask) bool {
+ 	return f.Value
+ }
+ 
++// CachedFilter is a filter that is cached by the world.
++type CachedFilter struct {
++	filter Filter
++	id     ID
++}
++
++// Matches matches a filter against a mask.
++func (f *CachedFilter) Matches(bits Mask) bool {
++	return f.filter.Matches(bits)
++}
++
+ // Query is an iterator to iterate entities, filtered by a [Filter].
+ //
+ // Create queries through the [World] using [World.Query].
+@@ -165,35 +176,20 @@ func (q *Query) Close() {
+ 
+ // nextArchetype proceeds to the next archetype, and returns whether this was successful/possible.
+ func (q *Query) nextArchetype() bool {
+-	if mask, ok := q.filter.(Mask); ok {
+-		return q.nextArchetypeMask(mask)
++	switch q.filter.(type) {
++	case *CachedFilter:
++		return q.nextArchetypeCached()
++	default:
++		return q.nextArchetypeFilter()
+ 	}
+-	if mask, ok := q.filter.(*MaskFilter); ok {
+-		return q.nextArchetypeMaskFilter(mask)
+-	}
+-	return q.nextArchetypeFilter()
+-}
+-
+-func (q *Query) nextArchetypeMask(f Mask) bool {
+-	len := int(q.archetypes.Len())
+-	for i := q.index + 1; i < len; i++ {
+-		a := q.archetypes.Get(i)
+-		if f.Matches(a.Mask) && a.Len() > 0 {
+-			q.index = i
+-			q.archetypeIter = newArchetypeIter(a)
+-			return true
+-		}
+-	}
+-	q.index = len
+-	q.world.closeQuery(q)
+-	return false
+ }
+ 
+-func (q *Query) nextArchetypeMaskFilter(f *MaskFilter) bool {
++// nextArchetypeCached is called if the query is cached.
++func (q *Query) nextArchetypeCached() bool {
+ 	len := int(q.archetypes.Len())
+ 	for i := q.index + 1; i < len; i++ {
+ 		a := q.archetypes.Get(i)
+-		if f.Matches(a.Mask) && a.Len() > 0 {
++		if a.Len() > 0 {
+ 			q.index = i
+ 			q.archetypeIter = newArchetypeIter(a)
+ 			return true
+@@ -204,6 +200,7 @@ func (q *Query) nextArchetypeMaskFilter(f *MaskFilter) bool {
+ 	return false
+ }
+ 
++// nextArchetypeFilter is called if the query is not cached.
+ func (q *Query) nextArchetypeFilter() bool {
+ 	len := int(q.archetypes.Len())
+ 	for i := q.index + 1; i < len; i++ {
+diff --git a/ecs/resources.go b/ecs/resources.go
+index fd52146..d82a683 100644
+--- a/ecs/resources.go
++++ b/ecs/resources.go
+@@ -6,6 +6,7 @@ import (
+ )
+ 
+ // Resources manage a world's resources.
++//
+ // Access it using [World.Resources].
+ type Resources struct {
+ 	registry  componentRegistry[ResID]
+diff --git a/ecs/world.go b/ecs/world.go
+index bcae634..ea1530e 100644
+--- a/ecs/world.go
++++ b/ecs/world.go
+@@ -47,15 +47,16 @@ func AddResource[T any](w *World, res *T) {
+ 
+ // World is the central type holding [Entity] and component data, as well as resources.
+ type World struct {
+-	config     Config                    // World configuration.
+-	listener   func(e *EntityEvent)      // Component change listener.
+-	resources  Resources                 // World resources.
+-	entities   []entityIndex             // Mapping from entities to archetype and index.
+-	entityPool entityPool                // Pool for entities.
+-	archetypes pagedArr32[archetype]     // The archetypes.
+-	graph      pagedArr32[archetypeNode] // The archetype graph.
+-	locks      lockMask                  // World locks.
+-	registry   componentRegistry[ID]     // Component registry.
++	config      Config                    // World configuration.
++	listener    func(e *EntityEvent)      // Component change listener.
++	resources   Resources                 // World resources.
++	entities    []entityIndex             // Mapping from entities to archetype and index.
++	entityPool  entityPool                // Pool for entities.
++	archetypes  pagedArr32[archetype]     // The archetypes.
++	graph       pagedArr32[archetypeNode] // The archetype graph.
++	locks       lockMask                  // World locks.
++	registry    componentRegistry[ID]     // Component registry.
++	filterCache Cache                     // Cache for registered filters.
+ }
+ 
+ // NewWorld creates a new [World] from an optional [Config].
+@@ -80,15 +81,16 @@ func fromConfig(conf Config) World {
+ 	entities := make([]entityIndex, 1, conf.CapacityIncrement)
+ 	entities[0] = entityIndex{arch: nil, index: 0}
+ 	w := World{
+-		config:     conf,
+-		entities:   entities,
+-		entityPool: newEntityPool(conf.CapacityIncrement),
+-		registry:   newComponentRegistry(),
+-		archetypes: pagedArr32[archetype]{},
+-		graph:      pagedArr32[archetypeNode]{},
+-		locks:      lockMask{},
+-		listener:   nil,
+-		resources:  newResources(),
++		config:      conf,
++		entities:    entities,
++		entityPool:  newEntityPool(conf.CapacityIncrement),
++		registry:    newComponentRegistry(),
++		archetypes:  pagedArr32[archetype]{},
++		graph:       pagedArr32[archetypeNode]{},
++		locks:       lockMask{},
++		listener:    nil,
++		resources:   newResources(),
++		filterCache: newCache(),
+ 	}
+ 	node := w.createArchetypeNode(Mask{})
+ 	w.createArchetype(node, false)
+@@ -450,13 +452,6 @@ func (w *World) Exchange(entity Entity, add []ID, rem []ID) {
+ 	}
+ }
+ 
+-// Resources of the world.
+-//
+-// Resources are component-like data that is not associated to an entity, but unique to the world.
+-func (w *World) Resources() *Resources {
+-	return &w.resources
+-}
+-
+ // Reset removes all entities and resources from the world.
+ //
+ // Does NOT free reserved memory, remove archetypes, clear the registry etc.
+@@ -484,7 +479,7 @@ func (w *World) Reset() {
+ //
+ // Example:
+ //
+-//	filter := All(idA, idB).Without(idC)
++//	filter := ecs.All(idA, idB).Without(idC)
+ //	query := world.Query(filter)
+ //	for query.Next() {
+ //	    pos := (*position)(query.Get(posID))
+@@ -497,9 +492,21 @@ func (w *World) Reset() {
+ // Locks the world to prevent changes to component compositions.
+ func (w *World) Query(filter Filter) Query {
+ 	l := w.lock()
++	if cached, ok := filter.(*CachedFilter); ok {
++		archetypes := &w.filterCache.get(cached).Archetypes
++		return newQuery(w, cached, l, archetypes)
++	}
++
+ 	return newQuery(w, filter, l, &w.archetypes)
+ }
+ 
++// Resources of the world.
++//
++// Resources are component-like data that is not associated to an entity, but unique to the world.
++func (w *World) Resources() *Resources {
++	return &w.resources
++}
++
+ // Batch creates a [Batch] processing helper.
+ //
+ // It provides the functionality to create and remove large numbers of entities in batches,
+@@ -508,6 +515,16 @@ func (w *World) Batch() *Batch {
+ 	return &Batch{w}
+ }
+ 
++// Cache returns the [Cache] of the world, for registering filters.
++//
++// See [Cache] for details.
++func (w *World) Cache() *Cache {
++	if w.filterCache.getArchetypes == nil {
++		w.filterCache.getArchetypes = w.getArchetypes
++	}
++	return &w.filterCache
++}
++
+ // IsLocked returns whether the world is locked by any queries.
+ func (w *World) IsLocked() bool {
+ 	return w.locks.IsLocked()
+@@ -762,9 +779,24 @@ func (w *World) createArchetype(node *archetypeNode, forStorage bool) *archetype
+ 	arch := w.archetypes.Get(w.archetypes.Len() - 1)
+ 	arch.Init(node, w.config.CapacityIncrement, forStorage, types...)
+ 	node.archetype = arch
++
++	w.filterCache.addArchetype(arch)
+ 	return arch
+ }
+ 
++// Returns all archetypes that match the given filter. Used by [Cache].
++func (w *World) getArchetypes(filter Filter) pagedPointerArr32[archetype] {
++	arches := pagedPointerArr32[archetype]{}
++	len := int(w.archetypes.Len())
++	for i := 0; i < len; i++ {
++		a := w.archetypes.Get(i)
++		if filter.Matches(a.Mask) {
++			arches.Add(a)
++		}
++	}
++	return arches
++}
++
+ // componentID returns the ID for a component type, and registers it if not already registered.
+ func (w *World) componentID(tp reflect.Type) ID {
+ 	return w.registry.ComponentID(tp)
+diff --git a/generic/compiled.go b/generic/compiled.go
+index 93d31ba..55efcbc 100644
+--- a/generic/compiled.go
++++ b/generic/compiled.go
+@@ -6,9 +6,11 @@ import (
+ 
+ // compiledQuery is a helper for compiling a generic filter into a [ecs.Filter].
+ type compiledQuery struct {
+-	filter   ecs.MaskFilter
+-	Ids      []ecs.ID
+-	compiled bool
++	maskFilter   ecs.MaskFilter
++	cachedFilter ecs.CachedFilter
++	filter       ecs.Filter
++	Ids          []ecs.ID
++	compiled     bool
+ }
+ 
+ // Compile compiles a generic filter.
+@@ -17,10 +19,11 @@ func (q *compiledQuery) Compile(w *ecs.World, include, optional, exclude []Comp)
+ 		return
+ 	}
+ 	q.Ids = toIds(w, include)
+-	q.filter = ecs.MaskFilter{
++	q.maskFilter = ecs.MaskFilter{
+ 		Include: toMaskOptional(w, q.Ids, optional),
+ 		Exclude: toMask(w, exclude),
+ 	}
++	q.filter = &q.maskFilter
+ 	q.compiled = true
+ }
+ 
+diff --git a/generic/generate/query.go.txt b/generic/generate/query.go.txt
+index bd60821..55a93a2 100644
+--- a/generic/generate/query.go.txt
++++ b/generic/generate/query.go.txt
+@@ -49,7 +49,7 @@ func (q *Filter{{ .Index }}{{ .Types }}) Without(mask ...Comp) *Filter{{ .Index
+ func (q *Filter{{ .Index }}{{ .Types }}) Query(w *ecs.World) Query{{ .Index }}{{ .Types }} {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query{{ .Index }}{{ .Types }}{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		{{ .IDAssign }}
+ 	}
+ }
+@@ -60,7 +60,27 @@ func (q *Filter{{ .Index }}{{ .Types }}) Query(w *ecs.World) Query{{ .Index }}{{
+ // For the intended generic use, however, generate a generic query with [Filter{{ .Index }}.Query].
+ func (q *Filter{{ .Index }}{{ .Types }}) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter{{ .Index }}{{ .Types }}) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter{{ .Index }}{{ .Types }}) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query{{ .Index }} is a generic query iterator for {{ .NumberStr }} components.
+diff --git a/generic/query_generated.go b/generic/query_generated.go
+index 24af94f..09c52bf 100644
+--- a/generic/query_generated.go
++++ b/generic/query_generated.go
+@@ -43,7 +43,7 @@ func (q *Filter0) Without(mask ...Comp) *Filter0 {
+ func (q *Filter0) Query(w *ecs.World) Query0 {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query0{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 	}
+ }
+ 
+@@ -53,7 +53,27 @@ func (q *Filter0) Query(w *ecs.World) Query0 {
+ // For the intended generic use, however, generate a generic query with [Filter0.Query].
+ func (q *Filter0) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter0) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter0) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query0 is a generic query iterator for zero components.
+@@ -115,7 +135,7 @@ func (q *Filter1[A]) Without(mask ...Comp) *Filter1[A] {
+ func (q *Filter1[A]) Query(w *ecs.World) Query1[A] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query1[A]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 	}
+ }
+@@ -126,7 +146,27 @@ func (q *Filter1[A]) Query(w *ecs.World) Query1[A] {
+ // For the intended generic use, however, generate a generic query with [Filter1.Query].
+ func (q *Filter1[A]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter1[A]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter1[A]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query1 is a generic query iterator for one components.
+@@ -197,7 +237,7 @@ func (q *Filter2[A, B]) Without(mask ...Comp) *Filter2[A, B] {
+ func (q *Filter2[A, B]) Query(w *ecs.World) Query2[A, B] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query2[A, B]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 	}
+@@ -209,7 +249,27 @@ func (q *Filter2[A, B]) Query(w *ecs.World) Query2[A, B] {
+ // For the intended generic use, however, generate a generic query with [Filter2.Query].
+ func (q *Filter2[A, B]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter2[A, B]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter2[A, B]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query2 is a generic query iterator for two components.
+@@ -283,7 +343,7 @@ func (q *Filter3[A, B, C]) Without(mask ...Comp) *Filter3[A, B, C] {
+ func (q *Filter3[A, B, C]) Query(w *ecs.World) Query3[A, B, C] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query3[A, B, C]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 		id2:   q.compiled.Ids[2],
+@@ -296,7 +356,27 @@ func (q *Filter3[A, B, C]) Query(w *ecs.World) Query3[A, B, C] {
+ // For the intended generic use, however, generate a generic query with [Filter3.Query].
+ func (q *Filter3[A, B, C]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter3[A, B, C]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter3[A, B, C]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query3 is a generic query iterator for three components.
+@@ -373,7 +453,7 @@ func (q *Filter4[A, B, C, D]) Without(mask ...Comp) *Filter4[A, B, C, D] {
+ func (q *Filter4[A, B, C, D]) Query(w *ecs.World) Query4[A, B, C, D] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query4[A, B, C, D]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 		id2:   q.compiled.Ids[2],
+@@ -387,7 +467,27 @@ func (q *Filter4[A, B, C, D]) Query(w *ecs.World) Query4[A, B, C, D] {
+ // For the intended generic use, however, generate a generic query with [Filter4.Query].
+ func (q *Filter4[A, B, C, D]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter4[A, B, C, D]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter4[A, B, C, D]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query4 is a generic query iterator for four components.
+@@ -467,7 +567,7 @@ func (q *Filter5[A, B, C, D, E]) Without(mask ...Comp) *Filter5[A, B, C, D, E] {
+ func (q *Filter5[A, B, C, D, E]) Query(w *ecs.World) Query5[A, B, C, D, E] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query5[A, B, C, D, E]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 		id2:   q.compiled.Ids[2],
+@@ -482,7 +582,27 @@ func (q *Filter5[A, B, C, D, E]) Query(w *ecs.World) Query5[A, B, C, D, E] {
+ // For the intended generic use, however, generate a generic query with [Filter5.Query].
+ func (q *Filter5[A, B, C, D, E]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter5[A, B, C, D, E]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter5[A, B, C, D, E]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query5 is a generic query iterator for five components.
+@@ -565,7 +685,7 @@ func (q *Filter6[A, B, C, D, E, F]) Without(mask ...Comp) *Filter6[A, B, C, D, E
+ func (q *Filter6[A, B, C, D, E, F]) Query(w *ecs.World) Query6[A, B, C, D, E, F] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query6[A, B, C, D, E, F]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 		id2:   q.compiled.Ids[2],
+@@ -581,7 +701,27 @@ func (q *Filter6[A, B, C, D, E, F]) Query(w *ecs.World) Query6[A, B, C, D, E, F]
+ // For the intended generic use, however, generate a generic query with [Filter6.Query].
+ func (q *Filter6[A, B, C, D, E, F]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter6[A, B, C, D, E, F]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter6[A, B, C, D, E, F]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query6 is a generic query iterator for six components.
+@@ -667,7 +807,7 @@ func (q *Filter7[A, B, C, D, E, F, G]) Without(mask ...Comp) *Filter7[A, B, C, D
+ func (q *Filter7[A, B, C, D, E, F, G]) Query(w *ecs.World) Query7[A, B, C, D, E, F, G] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query7[A, B, C, D, E, F, G]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 		id2:   q.compiled.Ids[2],
+@@ -684,7 +824,27 @@ func (q *Filter7[A, B, C, D, E, F, G]) Query(w *ecs.World) Query7[A, B, C, D, E,
+ // For the intended generic use, however, generate a generic query with [Filter7.Query].
+ func (q *Filter7[A, B, C, D, E, F, G]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter7[A, B, C, D, E, F, G]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter7[A, B, C, D, E, F, G]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query7 is a generic query iterator for seven components.
+@@ -773,7 +933,7 @@ func (q *Filter8[A, B, C, D, E, F, G, H]) Without(mask ...Comp) *Filter8[A, B, C
+ func (q *Filter8[A, B, C, D, E, F, G, H]) Query(w *ecs.World) Query8[A, B, C, D, E, F, G, H] {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+ 	return Query8[A, B, C, D, E, F, G, H]{
+-		Query: w.Query(&q.compiled.filter),
++		Query: w.Query(q.compiled.filter),
+ 		id0:   q.compiled.Ids[0],
+ 		id1:   q.compiled.Ids[1],
+ 		id2:   q.compiled.Ids[2],
+@@ -791,7 +951,27 @@ func (q *Filter8[A, B, C, D, E, F, G, H]) Query(w *ecs.World) Query8[A, B, C, D,
+ // For the intended generic use, however, generate a generic query with [Filter8.Query].
+ func (q *Filter8[A, B, C, D, E, F, G, H]) Filter(w *ecs.World) ecs.MaskFilter {
+ 	q.compiled.Compile(w, q.include, q.optional, q.exclude)
+-	return q.compiled.filter
++	return q.compiled.maskFilter
++}
++
++// Register the filter for caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter8[A, B, C, D, E, F, G, H]) Register(w *ecs.World) {
++	q.compiled.Compile(w, q.include, q.optional, q.exclude)
++	q.compiled.cachedFilter = w.Cache().Register(q.compiled.filter)
++	q.compiled.filter = &q.compiled.cachedFilter
++}
++
++// Unregister the filter from caching.
++//
++// See [ecs.Cache] for details on filter caching.
++func (q *Filter8[A, B, C, D, E, F, G, H]) Unregister(w *ecs.World) {
++	if cf, ok := q.compiled.filter.(*ecs.CachedFilter); ok {
++		q.compiled.filter = w.Cache().Unregister(cf)
++	} else {
++		panic("can't unregister a filter that is not cached")
++	}
+ }
+ 
+ // Query8 is a generic query iterator for eight components.

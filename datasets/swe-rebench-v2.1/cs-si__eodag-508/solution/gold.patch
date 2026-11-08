@@ -1,0 +1,587 @@
+diff --git a/eodag/plugins/apis/usgs.py b/eodag/plugins/apis/usgs.py
+index 5a7162bd..ecf1b113 100644
+--- a/eodag/plugins/apis/usgs.py
++++ b/eodag/plugins/apis/usgs.py
+@@ -19,6 +19,7 @@ import copy
+ import logging
+ import shutil
+ import tarfile
++import zipfile
+ 
+ import requests
+ from jsonpath_ng.ext import parse
+@@ -35,7 +36,6 @@ from eodag.plugins.apis.base import Api
+ from eodag.plugins.download.base import (
+     DEFAULT_DOWNLOAD_TIMEOUT,
+     DEFAULT_DOWNLOAD_WAIT,
+-    DEFAULT_STREAM_REQUESTS_TIMEOUT,
+     Download,
+ )
+ from eodag.utils import (
+@@ -52,14 +52,11 @@ logger = logging.getLogger("eodag.plugins.apis.usgs")
+ class UsgsApi(Download, Api):
+     """A plugin that enables to query and download data on the USGS catalogues"""
+ 
+-    def query(
+-        self, product_type=None, items_per_page=None, page=None, count=True, **kwargs
+-    ):
+-        """Search for data on USGS catalogues"""
+-        product_type = kwargs.get("productType")
+-        if product_type is None:
+-            return [], 0
++    def authenticate(self):
++        """Login to usgs api
+ 
++        :raises: :class:`~eodag.utils.exceptions.AuthenticationError`
++        """
+         for i in range(2):
+             try:
+                 api.login(
+@@ -77,6 +74,16 @@ class UsgsApi(Download, Api):
+                     "Please check your USGS credentials."
+                 ) from None
+ 
++    def query(
++        self, product_type=None, items_per_page=None, page=None, count=True, **kwargs
++    ):
++        """Search for data on USGS catalogues"""
++        product_type = kwargs.get("productType")
++        if product_type is None:
++            return [], 0
++
++        self.authenticate()
++
+         product_type_def_params = self.config.products.get(
+             product_type, self.config.products[GENERIC_PRODUCT_TYPE]
+         )
+@@ -108,8 +115,7 @@ class UsgsApi(Download, Api):
+         else:
+             lower_left, upper_right = None, None
+         try:
+-            results = api.scene_search(
+-                usgs_dataset,
++            api_search_kwargs = dict(
+                 start_date=start_date,
+                 end_date=end_date,
+                 ll=lower_left,
+@@ -117,6 +123,29 @@ class UsgsApi(Download, Api):
+                 max_results=items_per_page,
+                 starting_number=(1 + (page - 1) * items_per_page),
+             )
++            logger.info(
++                f"Sending search request for {usgs_dataset} with {api_search_kwargs}"
++            )
++
++            results = api.scene_search(usgs_dataset, **api_search_kwargs)
++
++            # update results with storage info from download_options()
++            results_by_entity_id = {
++                res["entityId"]: res for res in results["data"]["results"]
++            }
++            logger.debug(
++                f"Adapting {len(results_by_entity_id)} plugin results to eodag product representation"
++            )
++            download_options = api.download_options(
++                usgs_dataset, list(results_by_entity_id.keys())
++            )
++            if download_options.get("data", None) is not None:
++                for download_option in download_options["data"]:
++                    if "dds" in download_option["downloadSystem"]:
++                        results_by_entity_id[download_option["entityId"]].update(
++                            download_option
++                        )
++            results["data"]["results"] = list(results_by_entity_id.values())
+ 
+             # Same method as in base.py, Search.__init__()
+             # Prepare the metadata mapping
+@@ -145,10 +174,9 @@ class UsgsApi(Download, Api):
+                 )
+         except USGSError as e:
+             logger.warning(
+-                "Product type %s does not exist on USGS EE catalog",
+-                usgs_dataset,
++                f"Product type {usgs_dataset} does not exist on USGS EE catalog"
+             )
+-            logger.warning("Skipping error: %s", e)
++            logger.warning(f"Skipping error: {e}")
+         api.logout()
+ 
+         if final:
+@@ -160,7 +188,15 @@ class UsgsApi(Download, Api):
+ 
+         return final, total_results
+ 
+-    def download(self, product, auth=None, progress_callback=None, **kwargs):
++    def download(
++        self,
++        product,
++        auth=None,
++        progress_callback=None,
++        wait=DEFAULT_DOWNLOAD_WAIT,
++        timeout=DEFAULT_DOWNLOAD_TIMEOUT,
++        **kwargs,
++    ):
+         """Download data from USGS catalogues"""
+ 
+         if progress_callback is None:
+@@ -169,130 +205,133 @@ class UsgsApi(Download, Api):
+             )
+             progress_callback = ProgressCallback(disable=True)
+ 
++        outputs_extension = self.config.products.get(
++            product.product_type, self.config.products[GENERIC_PRODUCT_TYPE]
++        ).get("outputs_extension", ".tar.gz")
++
+         fs_path, record_filename = self._prepare_download(
+             product,
+             progress_callback=progress_callback,
+-            outputs_extension=".tar.gz",
+-            **kwargs
++            outputs_extension=outputs_extension,
++            **kwargs,
+         )
+         if not fs_path or not record_filename:
+             if fs_path:
+                 product.location = path_to_uri(fs_path)
+             return fs_path
+ 
+-        try:
+-            api.login(
+-                getattr(self.config, "credentials", {}).get("username", ""),
+-                getattr(self.config, "credentials", {}).get("password", ""),
+-                save=True,
++        self.authenticate()
++
++        if "dds" in product.properties.get("downloadSystem", ""):
++            raise NotAvailableError(
++                f"No USGS products found for {product.properties['id']}"
+             )
+-        except USGSError:
+-            raise AuthenticationError("Please check your USGS credentials.") from None
+ 
+-        download_options = api.download_options(
+-            product.properties["productType"], product.properties["id"]
++        download_request = api.download_request(
++            product.properties["productType"],
++            product.properties["entityId"],
++            product.properties["productId"],
+         )
+ 
++        req_urls = []
+         try:
+-            product_ids = [
+-                p["id"]
+-                for p in download_options["data"]
+-                if p["downloadSystem"] == "dds"
+-            ]
++            if len(download_request["data"]["preparingDownloads"]) > 0:
++                req_urls.extend(
++                    [x["url"] for x in download_request["data"]["preparingDownloads"]]
++                )
++            else:
++                req_urls.extend(
++                    [x["url"] for x in download_request["data"]["availableDownloads"]]
++                )
+         except KeyError as e:
+             raise NotAvailableError(
+-                "%s not found in %s's products" % (e, product.properties["id"])
++                f"{e} not found in {product.properties['id']} download_request"
+             )
+ 
+-        if not product_ids:
+-            raise NotAvailableError(
+-                "No USGS products found for %s" % product.properties["id"]
+-            )
+-
+-        req_urls = []
+-        for product_id in product_ids:
+-            download_request = api.download_request(
+-                product.properties["productType"], product.properties["id"], product_id
+-            )
+-            try:
+-                if len(download_request["data"]["preparingDownloads"]) > 0:
+-                    req_urls.extend(
+-                        [
+-                            x["url"]
+-                            for x in download_request["data"]["preparingDownloads"]
+-                        ]
+-                    )
+-                else:
+-                    req_urls.extend(
+-                        [
+-                            x["url"]
+-                            for x in download_request["data"]["availableDownloads"]
+-                        ]
+-                    )
+-            except KeyError as e:
+-                raise NotAvailableError(
+-                    "%s not found in %s download_request"
+-                    % (e, product.properties["id"])
+-                )
+-
+         if len(req_urls) > 1:
+             logger.warning(
+-                "%s usgs products found for %s. Only first will be downloaded"
+-                % (len(req_urls), product.properties["id"])
++                f"{len(req_urls)} usgs products found for {product.properties['id']}. Only first will be downloaded"
+             )
+         elif not req_urls:
+             raise NotAvailableError(
+-                "No usgs request url was found for %s" % product.properties["id"]
++                f"No usgs request url was found for {product.properties['id']}"
+             )
+ 
+         req_url = req_urls[0]
+         progress_callback.reset()
+-        with requests.get(
+-            req_url,
+-            stream=True,
+-            timeout=DEFAULT_STREAM_REQUESTS_TIMEOUT,
+-        ) as stream:
++        logger.debug(f"Downloading {req_url}")
++
++        @self._download_retry(product, wait, timeout)
++        def download_request(product, fs_path, progress_callback, **kwargs):
+             try:
+-                stream.raise_for_status()
+-            except RequestException:
+-                import traceback as tb
++                with requests.get(
++                    req_url,
++                    stream=True,
++                    timeout=wait * 60,
++                ) as stream:
++                    try:
++                        stream.raise_for_status()
++                    except RequestException:
++                        import traceback as tb
+ 
+-                logger.error(
+-                    "Error while getting resource :\n%s",
+-                    tb.format_exc(),
+-                )
+-            else:
+-                stream_size = int(stream.headers.get("content-length", 0))
+-                progress_callback.reset(total=stream_size)
+-                with open(fs_path, "wb") as fhandle:
+-                    for chunk in stream.iter_content(chunk_size=64 * 1024):
+-                        if chunk:
+-                            fhandle.write(chunk)
+-                            progress_callback(len(chunk))
++                        logger.error(
++                            f"Error while getting resource :\n{tb.format_exc()}",
++                        )
++                    else:
++                        stream_size = int(stream.headers.get("content-length", 0))
++                        progress_callback.reset(total=stream_size)
++                        with open(fs_path, "wb") as fhandle:
++                            for chunk in stream.iter_content(chunk_size=64 * 1024):
++                                if chunk:
++                                    fhandle.write(chunk)
++                                    progress_callback(len(chunk))
++            except requests.exceptions.Timeout as e:
++                raise NotAvailableError(str(e))
++
++        download_request(product, fs_path, progress_callback, **kwargs)
+ 
+         with open(record_filename, "w") as fh:
+             fh.write(product.properties["downloadLink"])
+-        logger.debug("Download recorded in %s", record_filename)
++        logger.debug(f"Download recorded in {record_filename}")
+ 
+         api.logout()
+ 
+-        # Check that the downloaded file is really a tar file
+-        if not tarfile.is_tarfile(fs_path):
++        # Check downloaded file format
++        if (outputs_extension == ".tar.gz" and tarfile.is_tarfile(fs_path)) or (
++            outputs_extension == ".zip" and zipfile.is_zipfile(fs_path)
++        ):
++            product_path = self._finalize(
++                fs_path,
++                progress_callback=progress_callback,
++                outputs_extension=outputs_extension,
++                **kwargs,
++            )
++            product.location = path_to_uri(product_path)
++            return product_path
++        elif tarfile.is_tarfile(fs_path):
++            logger.info(
++                "Downloaded product detected as a tar File, but was was expected to be a zip file"
++            )
++            new_fs_path = fs_path[: fs_path.index(outputs_extension)] + ".tar.gz"
++            shutil.move(fs_path, new_fs_path)
++            product.location = path_to_uri(new_fs_path)
++            return new_fs_path
++        elif zipfile.is_zipfile(fs_path):
++            logger.info(
++                "Downloaded product detected as a zip File, but was was expected to be a tar file"
++            )
++            new_fs_path = fs_path[: fs_path.index(outputs_extension)] + ".zip"
++            shutil.move(fs_path, new_fs_path)
++            product.location = path_to_uri(new_fs_path)
++            return new_fs_path
++        else:
+             logger.warning(
+-                "Downloaded product is not a tar File. Please check its file type before using it"
++                "Downloaded product is not a tar or a zip File. Please check its file type before using it"
+             )
+-            new_fs_path = fs_path[: fs_path.index(".tar.gz")]
++            new_fs_path = fs_path[: fs_path.index(outputs_extension)]
+             shutil.move(fs_path, new_fs_path)
+             product.location = path_to_uri(new_fs_path)
+             return new_fs_path
+-        product_path = self._finalize(
+-            fs_path,
+-            progress_callback=progress_callback,
+-            outputs_extension=".tar.gz",
+-            **kwargs
+-        )
+-        product.location = path_to_uri(product_path)
+-        return product_path
+ 
+     def download_all(
+         self,
+@@ -302,7 +341,7 @@ class UsgsApi(Download, Api):
+         progress_callback=None,
+         wait=DEFAULT_DOWNLOAD_WAIT,
+         timeout=DEFAULT_DOWNLOAD_TIMEOUT,
+-        **kwargs
++        **kwargs,
+     ):
+         """
+         Download all using parent (base plugin) method
+@@ -314,5 +353,5 @@ class UsgsApi(Download, Api):
+             progress_callback=progress_callback,
+             wait=wait,
+             timeout=timeout,
+-            **kwargs
++            **kwargs,
+         )
+diff --git a/eodag/plugins/download/base.py b/eodag/plugins/download/base.py
+index 10130749..d3bd7b6e 100644
+--- a/eodag/plugins/download/base.py
++++ b/eodag/plugins/download/base.py
+@@ -81,7 +81,7 @@ class Download(PluginTopic):
+ 
+     def __init__(self, provider, config):
+         super(Download, self).__init__(provider, config)
+-        self.authenticate = bool(getattr(self.config, "authenticate", False))
++        self._authenticate = bool(getattr(self.config, "authenticate", False))
+ 
+     def download(
+         self,
+@@ -598,11 +598,14 @@ class Download(PluginTopic):
+                         )
+                         logger.debug(not_available_info)
+                         # Retry-After info from Response header
+-                        retry_server_info = self.stream.headers.get("Retry-After", "")
+-                        if retry_server_info:
+-                            logger.debug(
+-                                f"[{self.provider} response] Retry-After: {retry_server_info}"
++                        if hasattr(self, "stream"):
++                            retry_server_info = self.stream.headers.get(
++                                "Retry-After", ""
+                             )
++                            if retry_server_info:
++                                logger.debug(
++                                    f"[{self.provider} response] Retry-After: {retry_server_info}"
++                                )
+                         logger.info(retry_info)
+                         nb_info.display_html(retry_info)
+                         sleep(wait_seconds)
+diff --git a/eodag/resources/product_types.yml b/eodag/resources/product_types.yml
+index e453de30..96a4eb02 100644
+--- a/eodag/resources/product_types.yml
++++ b/eodag/resources/product_types.yml
+@@ -187,6 +187,20 @@ LANDSAT_C2L1:
+   title: Landsat Collection 2 Level-1 Product
+   missionStartDate: "1972-07-25T00:00:00Z"
+ 
++LANDSAT_C2L2:
++  abstract: |
++    Collection 2 Landsat OLI/TIRS Level-2 Science Products (L2SP) include
++    Surface Reflectance and Surface Temperature scene-based products.
++  instrument: OLI,TIRS
++  platform: LANDSAT
++  platformSerialIdentifier: L8,L9
++  processingLevel: L1
++  keywords: OLI,TIRS,LANDSAT,L8,L9,L2,C2,COLLECTION2
++  sensorType: OPTICAL
++  license: proprietary
++  title: Landsat OLI and TIRS Collection 2 Level-2 Science Products 30-meter multispectral data.
++  missionStartDate: "2013-02-11T00:00:00Z"
++
+ LANDSAT_C2L2_SR:
+   abstract: |
+     The Landsat Surface Reflectance (SR) product measures the fraction of incoming solar radiation that is reflected
+@@ -269,6 +283,101 @@ LANDSAT_C2L2ALB_TA:
+   title: Landsat Collection 2 Level-2 Albers Top of Atmosphere (TA) Reflectance Product
+   missionStartDate: "1982-08-22T00:00:00Z"
+ 
++LANDSAT_TM_C1:
++  abstract: |
++    Landsat 4-5 TM image data files consist of seven spectral bands (See band designations).
++    The resolution is 30 meters for bands 1 to 7.
++    (Thermal infrared band 6 was collected at 120 meters, but was resampled to 30 meters.)
++    The approximate scene size is 170 km north-south by 183 km east-west (106 mi by 114 mi).
++  instrument: TM
++  platform: LANDSAT
++  platformSerialIdentifier: L4,L5
++  processingLevel: L1
++  keywords: TM,LANDSAT,L4,L5,L1,C1,COLLECTION1
++  sensorType: OPTICAL
++  license: proprietary
++  title: Landsat 4-5 Thematic Mapper (TM) Collection-1 Level-1 Data Products
++  missionStartDate: "1982-08-22T00:00:00Z"
++  missionEndDate: "2013-06-06T00:00:00Z"
++
++LANDSAT_TM_C2L1:
++  abstract: |
++    Landsat 4-5 TM image data files consist of seven spectral bands (See band designations).
++    The resolution is 30 meters for bands 1 to 7.
++    (Thermal infrared band 6 was collected at 120 meters, but was resampled to 30 meters.)
++    The approximate scene size is 170 km north-south by 183 km east-west (106 mi by 114 mi).
++  instrument: TM
++  platform: LANDSAT
++  platformSerialIdentifier: L4,L5
++  processingLevel: L1
++  keywords: TM,LANDSAT,L4,L5,L1,C2,COLLECTION2
++  sensorType: OPTICAL
++  license: proprietary
++  title: Landsat 4-5 Thematic Mapper (TM) Collection-2 Level-1 Data Products
++  missionStartDate: "1982-08-22T00:00:00Z"
++  missionEndDate: "2013-06-06T00:00:00Z"
++
++LANDSAT_TM_C2L2:
++  abstract: |
++    Collection 2 Landsat 4-5 Thematic Mapper (TM) Level-2 Science Products (L2SP) include
++    Surface Reflectance and Surface Temperature scene-based products.
++  instrument: TM
++  platform: LANDSAT
++  platformSerialIdentifier: L4,L5
++  processingLevel: L2
++  keywords: TM,LANDSAT,L4,L5,L2,C2,COLLECTION2
++  sensorType: OPTICAL
++  license: proprietary
++  title: Landsat 4-5 Thematic Mapper (TM) Collection-2 Level-2 Data Products
++  missionStartDate: "1982-08-22T00:00:00Z"
++  missionEndDate: "2013-06-06T00:00:00Z"
++
++LANDSAT_ETM_C1:
++  abstract: |
++    Landsat 7 ETM+ images consist of eight spectral bands with a spatial resolution of 30 meters for bands 1 to 7.
++    The panchromatic band 8 has a resolution of 15 meters. All bands can collect one of two gain settings (high or low)
++    for increased radiometric sensitivity and dynamic range, while Band 6 collects both high and low gain for all
++    scenes. Approximate scene size is 170 km north-south by 183 km east-west (106 mi by 114 mi).
++  instrument: ETM+
++  platform: LANDSAT
++  platformSerialIdentifier: L7
++  processingLevel: L1
++  keywords: ETM,ETM+,LANDSAT,L7,L1,C1,COLLECTION1
++  sensorType: OPTICAL
++  license: proprietary
++  title: Enhanced Thematic Mapper Plus (ETM+) 15- to 30-meter multispectral Collection-1 Level-1 data from Landsat 7
++  missionStartDate: "1999-04-15T00:00:00Z"
++
++LANDSAT_ETM_C2L1:
++  abstract: |
++    Landsat 7 ETM+ images consist of eight spectral bands with a spatial resolution of 30 meters for bands 1 to 7.
++    The panchromatic band 8 has a resolution of 15 meters. All bands can collect one of two gain settings (high or low)
++    for increased radiometric sensitivity and dynamic range, while Band 6 collects both high and low gain for all
++    scenes. Approximate scene size is 170 km north-south by 183 km east-west (106 mi by 114 mi).
++  instrument: ETM+
++  platform: LANDSAT
++  platformSerialIdentifier: L7
++  processingLevel: L1
++  keywords: ETM,ETM+,LANDSAT,L7,L1,C2,COLLECTION2
++  sensorType: OPTICAL
++  license: proprietary
++  title: Enhanced Thematic Mapper Plus (ETM+) 15- to 30-meter multispectral Collection-2 Level-1 data from Landsat 7
++  missionStartDate: "1999-04-15T00:00:00Z"
++
++LANDSAT_ETM_C2L2:
++  abstract: |
++    Collection 2 Landsat 7 ETM+ Level-2 Science Products (L2SP) include Surface Reflectance and Surface Temperature
++    scene-based products.
++  instrument: ETM+
++  platform: LANDSAT
++  platformSerialIdentifier: L7
++  processingLevel: L2
++  keywords: ETM,ETM+,LANDSAT,L7,L2,C2,COLLECTION2
++  sensorType: OPTICAL
++  license: proprietary
++  title: Enhanced Thematic Mapper Plus (ETM+) 15- to 30-meter multispectral Collection-2 Level-2 data from Landsat 7
++  missionStartDate: "1999-04-15T00:00:00Z"
++
+ # MODIS -----------------------------------------------------------------------
+ MODIS_MCD43A4:
+   abstract: |
+diff --git a/eodag/resources/providers.yml b/eodag/resources/providers.yml
+index 7094127f..1f60a8a3 100644
+--- a/eodag/resources/providers.yml
++++ b/eodag/resources/providers.yml
+@@ -31,7 +31,7 @@
+       max_items_per_page: 5000
+       total_items_nb_key_path: '$.totalHits'
+     metadata_mapping:
+-      id: '$.entityId'
++      id: '$.displayId'
+       geometry: '$.spatialBounds'
+       productType: '$.productType'
+       title: '$.displayId'
+@@ -39,15 +39,49 @@
+       cloudCover: '$.cloudCover'
+       startTimeFromAscendingNode: '$.temporalCoverage.startDate'
+       completionTimeFromAscendingNode: '$.temporalCoverage.endDate'
+-      quicklook: '$.browse[0].thumbnailPath'
+-      # storageStatus set to ONLINE for consistency between providers
+-      storageStatus: '{$.null#replace_str("Not Available","ONLINE")}'
+-      downloadLink: 'https://dds.cr.usgs.gov/{id}'
++      publicationDate: '$.publishDate'
++      thumbnail: '$.browse[0].thumbnailPath'
++      quicklook: '$.browse[0].browsePath'
++      storageStatus: '{$.available#get_group_name((?P<ONLINE>True)|(?P<OFFLINE>False))}'
++      downloadLink: 'https://earthexplorer.usgs.gov/download/external/options/{productType}/{entityId}/M2M/'
++      # metadata needed for download
++      entityId: '$.entityId'
++      productId: '$.id'
+     extract: True
++    order_enabled: true
+   products:
+-    # datasets list http://kapadia.github.io/usgs/_sources/reference/catalog/ee.txt
++    # datasets list http://kapadia.github.io/usgs/_sources/reference/catalog/ee.txt may be outdated
++    # see also https://dds.cr.usgs.gov/ee-data/coveragemaps/shp/ee/
+     L8_OLI_TIRS_C1L1:
+       dataset: LANDSAT_8_C1
++      outputs_extension: .tar.gz
++    LANDSAT_C2L1:
++      dataset: landsat_ot_c2_l1
++      outputs_extension: .tar.gz
++    LANDSAT_C2L2:
++      dataset: landsat_ot_c2_l2
++      outputs_extension: .tar.gz
++    LANDSAT_TM_C1:
++      dataset: landsat_tm_c1
++      outputs_extension: .tar.gz
++    LANDSAT_TM_C2L1:
++      dataset: landsat_tm_c2_l1
++      outputs_extension: .tar.gz
++    LANDSAT_TM_C2L2:
++      dataset: landsat_tm_c2_l2
++      outputs_extension: .tar.gz
++    LANDSAT_ETM_C1:
++      dataset: landsat_etm_c1
++      outputs_extension: .tar.gz
++    LANDSAT_ETM_C2L1:
++      dataset: landsat_etm_c2_l1
++      outputs_extension: .tar.gz
++    LANDSAT_ETM_C2L2:
++      dataset: landsat_etm_c2_l2
++      outputs_extension: .tar.gz
++    S2_MSI_L1C:
++      dataset: SENTINEL_2A
++      outputs_extension: .zip
+     GENERIC_PRODUCT_TYPE:
+       dataset: '{productType}'
+ 

@@ -1,0 +1,232 @@
+diff --git a/modules/core/src/test/scala/org/scalasteward/core/buildtool/mill/MillAlgTest.scala b/modules/core/src/test/scala/org/scalasteward/core/buildtool/mill/MillAlgTest.scala
+index aa08dcef..6cd4e83b 100644
+--- a/modules/core/src/test/scala/org/scalasteward/core/buildtool/mill/MillAlgTest.scala
++++ b/modules/core/src/test/scala/org/scalasteward/core/buildtool/mill/MillAlgTest.scala
+@@ -28,7 +28,8 @@ class MillAlgTest extends FunSuite {
+       "show",
+       extractDeps
+     )
+-    val initial = MockState.empty.copy(commandOutputs = Map(millCmd -> List("""{"modules":[]}""")))
++    val initial =
++      MockState.empty.copy(commandOutputs = Map(millCmd -> Right(List("""{"modules":[]}"""))))
+     val state = millAlg.getDependencies(buildRoot).runS(initial).unsafeRunSync()
+     val expected = initial.copy(
+       trace = Vector(
+diff --git a/modules/core/src/test/scala/org/scalasteward/core/edit/hooks/HookExecutorTest.scala b/modules/core/src/test/scala/org/scalasteward/core/edit/hooks/HookExecutorTest.scala
+index 100172a9..4ff10e80 100644
+--- a/modules/core/src/test/scala/org/scalasteward/core/edit/hooks/HookExecutorTest.scala
++++ b/modules/core/src/test/scala/org/scalasteward/core/edit/hooks/HookExecutorTest.scala
+@@ -1,5 +1,6 @@
+ package org.scalasteward.core.edit.hooks
+ 
++import cats.data.NonEmptyList
+ import cats.syntax.all._
+ import munit.CatsEffectSuite
+ import org.scalasteward.core.TestInstances.{dummyRepoCache, dummySha1}
+@@ -12,9 +13,11 @@ import org.scalasteward.core.mock.MockContext.context.{hookExecutor, workspaceAl
+ import org.scalasteward.core.mock.MockState
+ import org.scalasteward.core.mock.MockState.TraceEntry.{Cmd, Log}
+ import org.scalasteward.core.repoconfig.{PostUpdateHookConfig, RepoConfig, ScalafmtConfig}
+-import org.scalasteward.core.scalafmt.ScalafmtAlg.opts
+-import org.scalasteward.core.scalafmt.{scalafmtArtifactId, scalafmtBinary, scalafmtGroupId}
++import org.scalasteward.core.scalafmt.{scalafmtArtifactId, scalafmtGroupId}
+ import org.scalasteward.core.util.Nel
++import org.scalasteward.core.io.process.ProcessFailedException
++import org.scalasteward.core.io.process
++import scala.collection.mutable.ListBuffer
+ 
+ class HookExecutorTest extends CatsEffectSuite {
+   private val repo = Repo("scala-steward-org", "scala-steward")
+@@ -27,73 +30,69 @@ class HookExecutorTest extends CatsEffectSuite {
+     state.map(assertEquals(_, MockState.empty))
+   }
+ 
+-  test("scalafmt: enabled by config") {
+-    val update = (scalafmtGroupId % scalafmtArtifactId % "2.7.4" %> "2.7.5").single
+-    val initial = MockState.empty.copy(commandOutputs =
+-      Map(
+-        FileGitAlg.gitCmd.toList ++
+-          List("status", "--porcelain", "--untracked-files=no", "--ignore-submodules") ->
+-          List("build.sbt"),
+-        FileGitAlg.gitCmd.toList ++ List("rev-parse", "--verify", "HEAD") ->
+-          List(dummySha1.value.value)
+-      )
+-    )
+-    val gitBlameIgnoreRevs = repoDir / gitBlameIgnoreRevsName
+-    val state = FileAlgTest.ioFileAlg.deleteForce(gitBlameIgnoreRevs) >>
+-      hookExecutor.execPostUpdateHooks(data, update).runS(initial)
++  Seq(true, false).foreach { blameRevIgnored =>
++    val ignoredText = if (blameRevIgnored) "is git ignored" else "is not git ignored"
+ 
+-    val expected = initial.copy(
+-      trace = Vector(
+-        Log(
+-          "Executing post-update hook for org.scalameta:scalafmt-core with command 'scalafmt --non-interactive'"
+-        ),
+-        Cmd(
+-          "VAR1=val1" :: "VAR2=val2" :: repoDir.toString :: scalafmtBinary :: opts.nonInteractive :: Nil
+-        ),
+-        Cmd(
+-          gitCmd(repoDir),
+-          "status",
+-          "--porcelain",
+-          "--untracked-files=no",
+-          "--ignore-submodules"
+-        ),
+-        Cmd(
+-          gitCmd(repoDir),
+-          "commit",
+-          "--all",
+-          "--no-gpg-sign",
+-          "-m",
+-          "Reformat with scalafmt 2.7.5",
+-          "-m",
+-          s"Executed command: $scalafmtBinary ${opts.nonInteractive}"
+-        ),
+-        Cmd(gitCmd(repoDir), "rev-parse", "--verify", "HEAD"),
+-        Cmd("read", gitBlameIgnoreRevs.pathAsString),
+-        Cmd("write", gitBlameIgnoreRevs.pathAsString),
+-        Cmd(gitCmd(repoDir), "add", gitBlameIgnoreRevs.pathAsString),
+-        Cmd(
+-          gitCmd(repoDir),
+-          "status",
+-          "--porcelain",
+-          "--untracked-files=no",
+-          "--ignore-submodules"
+-        ),
+-        Cmd(
+-          gitCmd(repoDir),
+-          "commit",
+-          "--all",
+-          "--no-gpg-sign",
+-          "-m",
+-          s"Add 'Reformat with scalafmt 2.7.5' to $gitBlameIgnoreRevsName"
+-        ),
+-        Cmd(gitCmd(repoDir), "rev-parse", "--verify", "HEAD")
+-      ),
+-      files = Map(
+-        gitBlameIgnoreRevs -> s"# Scala Steward: Reformat with scalafmt 2.7.5\n${dummySha1.value.value}\n"
++    test(s"scalafmt: enabled by config / $gitBlameIgnoreRevsName $ignoredText") {
++      val gitBlameIgnoreRevs = repoDir / gitBlameIgnoreRevsName
++      val path = gitBlameIgnoreRevs.pathAsString
++      val update = (scalafmtGroupId % scalafmtArtifactId % "2.7.4" %> "2.7.5").single
++      // Models git: `check-ignore` exits with 0 for ignored paths and 1 otherwise,
++      // and a plain `add` of an ignored path fails unless it is forced.
++      val ignoreOutputs: Map[List[String], Either[Throwable, List[String]]] =
++        if (blameRevIgnored)
++          Map(
++            FileGitAlg.gitCmd.toList ++ List("check-ignore", path) -> Right(List.empty),
++            FileGitAlg.gitCmd.toList ++ List("add", path) -> Left(
++              new ProcessFailedException(
++                process.Args(NonEmptyList.of("git", "add", path)),
++                ListBuffer.empty,
++                1
++              )
++            )
++          )
++        else
++          Map(
++            FileGitAlg.gitCmd.toList ++ List("check-ignore", path) -> Left(dummyProcessError)
++          )
++      val initial = MockState.empty.copy(commandOutputs =
++        Map(
++          FileGitAlg.gitCmd.toList ++
++            List("status", "--porcelain", "--untracked-files=no", "--ignore-submodules") ->
++            Right(List("build.sbt")),
++          FileGitAlg.gitCmd.toList ++ List("rev-parse", "--verify", "HEAD") ->
++            Right(List(dummySha1.value.value))
++        ) ++ ignoreOutputs
+       )
+-    )
++      val state = FileAlgTest.ioFileAlg.deleteForce(gitBlameIgnoreRevs) >>
++        hookExecutor.execPostUpdateHooks(data, update).runS(initial)
+ 
+-    state.map(assertEquals(_, expected))
++      val expectedFileContent =
++        s"# Scala Steward: Reformat with scalafmt 2.7.5\n${dummySha1.value.value}\n"
++
++      state.map { s =>
++        val commitArgs = s.trace.collect { case Cmd(args) if args.contains("commit") => args }
++        assert(
++          commitArgs.exists(_.exists(_.contains("Reformat with scalafmt 2.7.5"))),
++          s"Expected the hook's own commit, but got ${s.trace}"
++        )
++
++        if (!blameRevIgnored) {
++          assertEquals(s.files.get(gitBlameIgnoreRevs), Some(expectedFileContent))
++          val addArgs = s.trace.collect { case Cmd(args) if args.contains("add") => args }
++          assert(
++            addArgs.exists(_.lastOption.contains(path)),
++            s"Expected the blame-ignore file to be added, but got ${s.trace}"
++          )
++          assert(
++            commitArgs.exists(
++              _.contains(s"Add 'Reformat with scalafmt 2.7.5' to $gitBlameIgnoreRevsName")
++            ),
++            s"Expected the blame-ignore file to be committed, but got ${s.trace}"
++          )
++        }
++      }
++    }
+   }
+ 
+   test("scalafmt: disabled by config") {
+@@ -166,4 +165,7 @@ class HookExecutorTest extends CatsEffectSuite {
+ 
+     state.map(assertEquals(_, expected))
+   }
++
++  private val dummyProcessError =
++    new ProcessFailedException(process.Args(NonEmptyList.of("cmd")), ListBuffer.empty, 1)
+ }
+diff --git a/modules/core/src/test/scala/org/scalasteward/core/io/MockProcessAlg.scala b/modules/core/src/test/scala/org/scalasteward/core/io/MockProcessAlg.scala
+index 13af6533..388db237 100644
+--- a/modules/core/src/test/scala/org/scalasteward/core/io/MockProcessAlg.scala
++++ b/modules/core/src/test/scala/org/scalasteward/core/io/MockProcessAlg.scala
+@@ -1,19 +1,26 @@
+ package org.scalasteward.core.io
+ 
+ import cats.data.Kleisli
++import cats.effect.IO
+ import org.scalasteward.core.application.Config.ProcessCfg
+ import org.scalasteward.core.mock.MockEff
+ 
+ object MockProcessAlg {
+   def create(config: ProcessCfg): ProcessAlg[MockEff] =
+     new ProcessAlg(config)({ args =>
+-      Kleisli {
+-        _.modify { s =>
+-          val cmd = args.workingDirectory.map(_.toString).toList ++ args.command.toList
+-          val s1 = s.exec(cmd, args.extraEnv: _*)
+-          val a = s.commandOutputs.getOrElse(args.command.toList, List.empty)
+-          (s1, a)
+-        }
++      Kleisli { x =>
++        for {
++          state <- x.get
++          cmd = args.workingDirectory.map(_.toString).toList ++ args.command.toList
++          newState = state.exec(cmd, args.extraEnv: _*)
++          res <- x
++            .set(newState)
++            .flatMap { _ =>
++              state.commandOutputs
++                .getOrElse(args.command.toList, Right(List.empty))
++                .fold(err => IO.raiseError(err), a => IO.pure(a))
++            }
++        } yield res
+       }
+     })
+ }
+diff --git a/modules/core/src/test/scala/org/scalasteward/core/mock/MockState.scala b/modules/core/src/test/scala/org/scalasteward/core/mock/MockState.scala
+index d3bcf60f..61f2c89d 100644
+--- a/modules/core/src/test/scala/org/scalasteward/core/mock/MockState.scala
++++ b/modules/core/src/test/scala/org/scalasteward/core/mock/MockState.scala
+@@ -10,7 +10,7 @@ import org.scalasteward.core.mock.MockState.TraceEntry.{Cmd, Log}
+ 
+ final case class MockState(
+     trace: Vector[TraceEntry],
+-    commandOutputs: Map[List[String], List[String]],
++    commandOutputs: Map[List[String], Either[Throwable, List[String]]],
+     files: Map[File, String],
+     uris: Map[Uri, String],
+     clientResponses: HttpApp[MockEff]

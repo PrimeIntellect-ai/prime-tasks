@@ -1,0 +1,618 @@
+diff --git a/.github/workflows/msrv.yml b/.github/workflows/msrv.yml
+index 17bed76..23e8047 100644
+--- a/.github/workflows/msrv.yml
++++ b/.github/workflows/msrv.yml
+@@ -9,7 +9,7 @@ jobs:
+     strategy:
+       matrix:
+         rust:
+-          - 1.44.0
++          - 1.46.0
+           - stable
+           - beta
+           - nightly
+@@ -44,7 +44,7 @@ jobs:
+     strategy:
+       matrix:
+         rust:
+-          - 1.44.0
++          - 1.46.0
+           - stable
+           - beta
+           - nightly
+@@ -59,10 +59,18 @@ jobs:
+           override: true
+ 
+       - name: Run cargo test
+-        if: matrix.rust != 'nightly'
++        if: matrix.rust != 'nightly' && matrix.rust != '1.46.0'
++        uses: actions-rs/cargo@v1
++        with:
++          command: test
++
++      - name: Run cargo test (nightly)
++        if: matrix.rust == '1.46.0'
++        continue-on-error: true
+         uses: actions-rs/cargo@v1
+         with:
+           command: test
++          args: --tests
+ 
+       - name: Run cargo test (nightly)
+         if: matrix.rust == 'nightly'
+diff --git a/Cargo.toml b/Cargo.toml
+index 35b1ab3..f72389f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,6 +23,7 @@ ini = ["rust-ini"]
+ json5 = ["json5_rs"]
+ 
+ [dependencies]
++async-trait = "0.1.50"
+ lazy_static = "1.0"
+ serde = "1.0.8"
+ nom = "6"
+@@ -39,3 +40,7 @@ json5_rs = { version = "0.3", optional = true, package = "json5" }
+ serde_derive = "1.0.8"
+ float-cmp = "0.8"
+ chrono = { version = "0.4", features = ["serde"] }
++tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"]}
++warp = "0.3.1"
++futures = "0.3.15"
++reqwest = "0.11.3"
+diff --git a/examples/async_source/main.rs b/examples/async_source/main.rs
+new file mode 100644
+index 0000000..10befe0
+--- /dev/null
++++ b/examples/async_source/main.rs
+@@ -0,0 +1,72 @@
++use std::{collections::HashMap, error::Error};
++
++use config::{builder::AsyncState, AsyncSource, ConfigBuilder, ConfigError, FileFormat};
++
++use async_trait::async_trait;
++use futures::{select, FutureExt};
++use warp::Filter;
++
++// Example below presents sample configuration server and client.
++//
++// Server serves simple configuration on HTTP endpoint.
++// Client consumes it using custom HTTP AsyncSource built on top of reqwest.
++
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn Error>> {
++    select! {
++        r = run_server().fuse() => r,
++        r = run_client().fuse() => r
++    }
++}
++
++async fn run_server() -> Result<(), Box<dyn Error>> {
++    let service = warp::path("configuration").map(|| r#"{ "value" : 123 }"#);
++
++    println!("Running server on localhost:5001");
++
++    warp::serve(service).bind(([127, 0, 0, 1], 5001)).await;
++
++    Ok(())
++}
++
++async fn run_client() -> Result<(), Box<dyn Error>> {
++    // Good enough for an example to allow server to start
++    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
++
++    let config = ConfigBuilder::<AsyncState>::default()
++        .add_async_source(HttpSource {
++            uri: "http://localhost:5001/configuration".into(),
++            format: FileFormat::Json,
++        })
++        .build()
++        .await?;
++
++    println!("Config value is {}", config.get::<String>("value")?);
++
++    Ok(())
++}
++
++// Actual implementation of AsyncSource can be found below
++
++#[derive(Debug)]
++struct HttpSource {
++    uri: String,
++    format: FileFormat,
++}
++
++#[async_trait]
++impl AsyncSource for HttpSource {
++    async fn collect(&self) -> Result<HashMap<String, config::Value>, ConfigError> {
++        reqwest::get(&self.uri)
++            .await
++            .map_err(|e| ConfigError::Foreign(Box::new(e)))? // error conversion is possible from custom AsyncSource impls
++            .text()
++            .await
++            .map_err(|e| ConfigError::Foreign(Box::new(e)))
++            .and_then(|text| {
++                self.format
++                    .parse(Some(&self.uri), &text)
++                    .map_err(|e| ConfigError::Foreign(e))
++            })
++    }
++}
+diff --git a/src/builder.rs b/src/builder.rs
+index 627ba2a..bb88f44 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -1,7 +1,9 @@
+ use std::str::FromStr;
+ use std::{collections::HashMap, iter::IntoIterator};
+ 
+-use crate::{config::Config, error, path::Expression, source::Source, value::Value};
++use crate::error::Result;
++use crate::source::AsyncSource;
++use crate::{config::Config, path::Expression, source::Source, value::Value};
+ 
+ /// A configuration builder
+ ///
+@@ -21,15 +23,24 @@ use crate::{config::Config, error, path::Expression, source::Source, value::Valu
+ /// It happens on demand when [`build`](Self::build) (or its alternative) is called.
+ /// Therefore all errors, related to any of the [`Source`] will only show up then.
+ ///
++/// # Sync and async builder
++///
++/// [`ConfigBuilder`] uses type parameter to keep track of builder state.
++///
++/// In [`DefaultState`] builder only supports [`Source`]s
++///
++/// In [`AsyncState`] it supports both [`Source`]s and [`AsyncSource`]s at the price of building using `async fn`.
++///
+ /// # Examples
+ ///
+ /// ```rust
+ /// # use config::*;
+ /// # use std::error::Error;
+ /// # fn main() -> Result<(), Box<dyn Error>> {
+-/// let mut builder = ConfigBuilder::default()
++/// let mut builder = Config::builder()
+ ///     .set_default("default", "1")?
+ ///     .add_source(File::new("config/settings", FileFormat::Json))
++/// //  .add_async_source(...)
+ ///     .set_override("override", "1")?;
+ ///
+ /// match builder.build() {
+@@ -44,12 +55,15 @@ use crate::{config::Config, error, path::Expression, source::Source, value::Valu
+ /// # }
+ /// ```
+ ///
++/// If any [`AsyncSource`] is used, the builder will transition to [`AsyncState`].
++/// In such case, it is required to _await_ calls to [`build`](Self::build) and its non-consuming sibling.
++///
+ /// Calls can be not chained as well
+ /// ```rust
+ /// # use std::error::Error;
+ /// # use config::*;
+ /// # fn main() -> Result<(), Box<dyn Error>> {
+-/// let mut builder = ConfigBuilder::default();
++/// let mut builder = Config::builder();
+ /// builder = builder.set_default("default", "1")?;
+ /// builder = builder.add_source(File::new("config/settings", FileFormat::Json));
+ /// builder = builder.add_source(File::new("config/settings.prod", FileFormat::Json));
+@@ -57,22 +71,86 @@ use crate::{config::Config, error, path::Expression, source::Source, value::Valu
+ /// # Ok(())
+ /// # }
+ /// ```
++///
++/// Calling [`Config::builder`](Config::builder) yields builder in the default state.
++/// If having an asynchronous state as the initial state is desired, _turbofish_ notation needs to be used.
++/// ```rust
++/// # use config::{*, builder::AsyncState};
++/// let mut builder = ConfigBuilder::<AsyncState>::default();
++/// ```
++///
++/// If for some reason acquiring builder in default state is required without calling [`Config::builder`](Config::builder)
++/// it can also be achieved.
++/// ```rust
++/// # use config::{*, builder::DefaultState};
++/// let mut builder = ConfigBuilder::<DefaultState>::default();
++/// ```
+ #[derive(Debug, Clone, Default)]
+-pub struct ConfigBuilder {
++pub struct ConfigBuilder<St: BuilderState> {
+     defaults: HashMap<Expression, Value>,
+     overrides: HashMap<Expression, Value>,
++    state: St,
++}
++
++/// Represents [`ConfigBuilder`] state.
++pub trait BuilderState {}
++
++/// Represents data specific to builder in default, sychronous state, without support for async.
++#[derive(Debug, Default)]
++pub struct DefaultState {
+     sources: Vec<Box<dyn Source + Send + Sync>>,
+ }
+ 
+-impl ConfigBuilder {
++/// The asynchronous configuration builder.
++///
++/// Similar to a [`ConfigBuilder`] it maintains a set of defaults, a set of sources, and overrides.
++///
++/// Defaults do not override anything, sources override defaults, and overrides override anything else.
++/// Within those three groups order of adding them at call site matters - entities added later take precedence.
++///
++/// For more detailed description and examples see [`ConfigBuilder`].
++/// [`AsyncConfigBuilder`] is just an extension of it that takes async functions into account.
++///
++/// To obtain a [`Config`] call [`build`](AsyncConfigBuilder::build) or [`build_cloned`](AsyncConfigBuilder::build_cloned)
++///
++/// # Example
++/// Since this library does not implement any [`AsyncSource`] an example in rustdocs cannot be given.
++/// Detailed explanation about why such a source is not implemented is in [`AsyncSource`]'s documentation.
++///
++/// Refer to [`ConfigBuilder`] for similar API sample usage or to the examples folder of the crate, where such a source is implemented.
++#[derive(Debug, Clone, Default)]
++pub struct AsyncConfigBuilder {
++    defaults: HashMap<Expression, Value>,
++    overrides: HashMap<Expression, Value>,
++    sources: Vec<SourceType>,
++}
++
++/// Represents data specific to builder in asychronous state, with support for async.
++#[derive(Debug, Default)]
++pub struct AsyncState {
++    sources: Vec<SourceType>,
++}
++
++#[derive(Debug, Clone)]
++enum SourceType {
++    Sync(Box<dyn Source + Send + Sync>),
++    Async(Box<dyn AsyncSource + Send + Sync>),
++}
++
++impl BuilderState for DefaultState {}
++impl BuilderState for AsyncState {}
++
++impl<St: BuilderState> ConfigBuilder<St> {
++    // operations allowed in any state
++
+     /// Set a default `value` at `key`
+     ///
+-    /// This value can be overwritten by any [`Source`] or override.
++    /// This value can be overwritten by any [`Source`], [`AsyncSource`] or override.
+     ///
+     /// # Errors
+     ///
+     /// Fails if `Expression::from_str(key)` fails.
+-    pub fn set_default<S, T>(mut self, key: S, value: T) -> error::Result<ConfigBuilder>
++    pub fn set_default<S, T>(mut self, key: S, value: T) -> Result<ConfigBuilder<St>>
+     where
+         S: AsRef<str>,
+         T: Into<Value>,
+@@ -82,25 +160,14 @@ impl ConfigBuilder {
+         Ok(self)
+     }
+ 
+-    /// Registers new [`Source`] in this builder.
+-    ///
+-    /// Calling this method does not invoke any I/O. [`Source`] is only saved in internal register for later use.
+-    pub fn add_source<T>(mut self, source: T) -> Self
+-    where
+-        T: Source + Send + Sync + 'static,
+-    {
+-        self.sources.push(Box::new(source));
+-        self
+-    }
+-
+     /// Set an override
+     ///
+-    /// This function sets an overwrite value. It will not be altered by any default or [`Source`]
++    /// This function sets an overwrite value. It will not be altered by any default, [`Source`] nor [`AsyncSource`]
+     ///
+     /// # Errors
+     ///
+     /// Fails if `Expression::from_str(key)` fails.
+-    pub fn set_override<S, T>(mut self, key: S, value: T) -> error::Result<ConfigBuilder>
++    pub fn set_override<S, T>(mut self, key: S, value: T) -> Result<ConfigBuilder<St>>
+     where
+         S: AsRef<str>,
+         T: Into<Value>,
+@@ -109,6 +176,44 @@ impl ConfigBuilder {
+             .insert(Expression::from_str(key.as_ref())?, value.into());
+         Ok(self)
+     }
++}
++
++impl ConfigBuilder<DefaultState> {
++    // operations allowed in sync state
++
++    /// Registers new [`Source`] in this builder.
++    ///
++    /// Calling this method does not invoke any I/O. [`Source`] is only saved in internal register for later use.
++    pub fn add_source<T>(mut self, source: T) -> Self
++    where
++        T: Source + Send + Sync + 'static,
++    {
++        self.state.sources.push(Box::new(source));
++        self
++    }
++
++    /// Registers new [`AsyncSource`] in this builder and forces transition to [`AsyncState`].
++    ///
++    /// Calling this method does not invoke any I/O. [`AsyncSource`] is only saved in internal register for later use.
++    pub fn add_async_source<T>(self, source: T) -> ConfigBuilder<AsyncState>
++    where
++        T: AsyncSource + Send + Sync + 'static,
++    {
++        let async_state = ConfigBuilder {
++            state: AsyncState {
++                sources: self
++                    .state
++                    .sources
++                    .into_iter()
++                    .map(|s| SourceType::Sync(s))
++                    .collect(),
++            },
++            defaults: self.defaults,
++            overrides: self.overrides,
++        };
++
++        async_state.add_async_source(source)
++    }
+ 
+     /// Reads all registered [`Source`]s.
+     ///
+@@ -118,8 +223,8 @@ impl ConfigBuilder {
+     /// # Errors
+     /// If source collection fails, be it technical reasons or related to inability to read data as `Config` for different reasons,
+     /// this method returns error.
+-    pub fn build(self) -> error::Result<Config> {
+-        Self::build_internal(self.defaults, self.overrides, &self.sources)
++    pub fn build(self) -> Result<Config> {
++        Self::build_internal(self.defaults, self.overrides, &self.state.sources)
+     }
+ 
+     /// Reads all registered [`Source`]s.
+@@ -130,15 +235,19 @@ impl ConfigBuilder {
+     /// # Errors
+     /// If source collection fails, be it technical reasons or related to inability to read data as `Config` for different reasons,
+     /// this method returns error.
+-    pub fn build_cloned(&self) -> error::Result<Config> {
+-        Self::build_internal(self.defaults.clone(), self.overrides.clone(), &self.sources)
++    pub fn build_cloned(&self) -> Result<Config> {
++        Self::build_internal(
++            self.defaults.clone(),
++            self.overrides.clone(),
++            &self.state.sources,
++        )
+     }
+ 
+     fn build_internal(
+         defaults: HashMap<Expression, Value>,
+         overrides: HashMap<Expression, Value>,
+         sources: &[Box<dyn Source + Send + Sync>],
+-    ) -> error::Result<Config> {
++    ) -> Result<Config> {
+         let mut cache: Value = HashMap::<String, Value>::new().into();
+ 
+         // Add defaults
+@@ -157,3 +266,85 @@ impl ConfigBuilder {
+         Ok(Config::new(cache))
+     }
+ }
++
++impl ConfigBuilder<AsyncState> {
++    // operations allowed in async state
++
++    /// Registers new [`Source`] in this builder.
++    ///
++    /// Calling this method does not invoke any I/O. [`Source`] is only saved in internal register for later use.
++    pub fn add_source<T>(mut self, source: T) -> ConfigBuilder<AsyncState>
++    where
++        T: Source + Send + Sync + 'static,
++    {
++        self.state.sources.push(SourceType::Sync(Box::new(source)));
++        self
++    }
++
++    /// Registers new [`AsyncSource`] in this builder.
++    ///
++    /// Calling this method does not invoke any I/O. [`AsyncSource`] is only saved in internal register for later use.
++    pub fn add_async_source<T>(mut self, source: T) -> ConfigBuilder<AsyncState>
++    where
++        T: AsyncSource + Send + Sync + 'static,
++    {
++        self.state.sources.push(SourceType::Async(Box::new(source)));
++        self
++    }
++
++    /// Reads all registered defaults, [`Source`]s, [`AsyncSource`]s and overrides.
++    ///
++    /// This is the method that invokes all I/O operations.
++    /// For a non consuming alternative see [`build_cloned`](Self::build_cloned)
++    ///
++    /// # Errors
++    /// If source collection fails, be it technical reasons or related to inability to read data as `Config` for different reasons,
++    /// this method returns error.
++    pub async fn build(self) -> Result<Config> {
++        Self::build_internal(self.defaults, self.overrides, &self.state.sources).await
++    }
++
++    /// Reads all registered defaults, [`Source`]s, [`AsyncSource`]s and overrides.
++    ///
++    /// Similar to [`build`](Self::build), but it does not take ownership of `ConfigBuilder` to allow later reuse.
++    /// Internally it clones data to achieve it.
++    ///
++    /// # Errors
++    /// If source collection fails, be it technical reasons or related to inability to read data as `Config` for different reasons,
++    /// this method returns error.
++    pub async fn build_cloned(&self) -> Result<Config> {
++        Self::build_internal(
++            self.defaults.clone(),
++            self.overrides.clone(),
++            &self.state.sources,
++        )
++        .await
++    }
++
++    async fn build_internal(
++        defaults: HashMap<Expression, Value>,
++        overrides: HashMap<Expression, Value>,
++        sources: &[SourceType],
++    ) -> Result<Config> {
++        let mut cache: Value = HashMap::<String, Value>::new().into();
++
++        // Add defaults
++        for (key, val) in defaults.into_iter() {
++            key.set(&mut cache, val);
++        }
++
++        for source in sources.iter() {
++            match source {
++                SourceType::Sync(source) => source.collect_to(&mut cache)?,
++                SourceType::Async(source) => source.collect_to(&mut cache).await?,
++            }
++        }
++
++        // Add overrides
++        for (key, val) in overrides.into_iter() {
++            key.set(&mut cache, val);
++        }
++
++        Ok(Config::new(cache))
++    }
++}
+diff --git a/src/config.rs b/src/config.rs
+index 3d80aeb..b9c64b4 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1,7 +1,7 @@
+ use std::collections::HashMap;
+ use std::fmt::Debug;
+ 
+-use crate::builder::ConfigBuilder;
++use crate::builder::{ConfigBuilder, DefaultState};
+ use serde::de::Deserialize;
+ use serde::ser::Serialize;
+ 
+@@ -44,8 +44,8 @@ impl Config {
+     }
+ 
+     /// Creates new [`ConfigBuilder`] instance
+-    pub fn builder() -> ConfigBuilder {
+-        ConfigBuilder::default()
++    pub fn builder() -> ConfigBuilder<DefaultState> {
++        ConfigBuilder::<DefaultState>::default()
+     }
+ 
+     /// Merge in a configuration property source.
+diff --git a/src/lib.rs b/src/lib.rs
+index 60d7012..87c82bc 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -53,7 +53,7 @@ extern crate ron;
+ #[cfg(feature = "json5")]
+ extern crate json5_rs;
+ 
+-mod builder;
++pub mod builder;
+ mod config;
+ mod de;
+ mod env;
+@@ -64,11 +64,13 @@ mod ser;
+ mod source;
+ mod value;
+ 
++pub use crate::builder::AsyncConfigBuilder;
+ pub use crate::builder::ConfigBuilder;
+ pub use crate::config::Config;
+ pub use crate::env::Environment;
+ pub use crate::error::ConfigError;
+ pub use crate::file::{File, FileFormat, FileSourceFile, FileSourceString};
++pub use crate::source::AsyncSource;
+ pub use crate::source::Source;
+ pub use crate::value::Value;
+ pub use crate::value::ValueKind;
+diff --git a/src/source.rs b/src/source.rs
+index dc5f3b5..831e4c4 100644
+--- a/src/source.rs
++++ b/src/source.rs
+@@ -2,6 +2,8 @@ use std::collections::HashMap;
+ use std::fmt::Debug;
+ use std::str::FromStr;
+ 
++use async_trait::async_trait;
++
+ use crate::error::*;
+ use crate::path;
+ use crate::value::{Value, ValueKind};
+@@ -14,21 +16,65 @@ pub trait Source: Debug {
+     /// a HashMap.
+     fn collect(&self) -> Result<HashMap<String, Value>>;
+ 
++    /// Collects all configuration properties to a provided cache.
+     fn collect_to(&self, cache: &mut Value) -> Result<()> {
+         self.collect()?
+             .iter()
+-            .for_each(|(key, val)| match path::Expression::from_str(key) {
+-                // Set using the path
+-                Ok(expr) => expr.set(cache, val.clone()),
++            .for_each(|(key, val)| set_value(cache, key, val));
+ 
+-                // Set diretly anyway
+-                _ => path::Expression::Identifier(key.clone()).set(cache, val.clone()),
+-            });
++        Ok(())
++    }
++}
++
++fn set_value(cache: &mut Value, key: &str, value: &Value) {
++    match path::Expression::from_str(key) {
++        // Set using the path
++        Ok(expr) => expr.set(cache, value.clone()),
++
++        // Set diretly anyway
++        _ => path::Expression::Identifier(key.to_string()).set(cache, value.clone()),
++    }
++}
++
++/// Describes a generic _source_ of configuration properties capable of using an async runtime.
++///
++/// At the moment this library does not implement it, although it allows using its implementations
++/// within builders.  Due to the scattered landscape of asynchronous runtimes, it is impossible to
++/// cater to all needs with one implementation.  Also, this trait might be most useful with remote
++/// configuration sources, reachable via the network, probably using HTTP protocol.  Numerous HTTP
++/// libraries exist, making it even harder to find one implementation that rules them all.
++///
++/// For those reasons, it is left to other crates to implement runtime-specific or proprietary
++/// details.
++///
++/// It is advised to use `async_trait` crate while implementing this trait.
++///
++/// See examples for sample implementation.
++#[async_trait]
++pub trait AsyncSource: Debug + Sync {
++    // Sync is supertrait due to https://docs.rs/async-trait/0.1.50/async_trait/index.html#dyn-traits
++
++    /// Collects all configuration properties available from this source and return
++    /// a HashMap as an async operations.
++    async fn collect(&self) -> Result<HashMap<String, Value>>;
++
++    /// Collects all configuration properties to a provided cache.
++    async fn collect_to(&self, cache: &mut Value) -> Result<()> {
++        self.collect()
++            .await?
++            .iter()
++            .for_each(|(key, val)| set_value(cache, key, val));
+ 
+         Ok(())
+     }
+ }
+ 
++impl Clone for Box<dyn AsyncSource + Send + Sync> {
++    fn clone(&self) -> Self {
++        self.to_owned()
++    }
++}
++
+ impl Clone for Box<dyn Source + Send + Sync> {
+     fn clone(&self) -> Box<dyn Source + Send + Sync> {
+         self.clone_into_box()

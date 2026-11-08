@@ -1,0 +1,107 @@
+diff --git a/opt_einsum/tests/test_sharing.py b/opt_einsum/tests/test_sharing.py
+index b0b860a..bb049db 100644
+--- a/opt_einsum/tests/test_sharing.py
++++ b/opt_einsum/tests/test_sharing.py
+@@ -6,7 +6,7 @@ import numpy as np
+ import pytest
+ 
+ from opt_einsum import (contract_expression, contract_path, get_symbol,
+-                        helpers, shared_intermediates)
++                        contract, helpers, shared_intermediates)
+ from opt_einsum.backends import to_cupy, to_torch
+ from opt_einsum.contract import _einsum
+ from opt_einsum.parser import parse_einsum_input
+@@ -362,3 +362,93 @@ def test_chain_sharing(size, backend):
+     print('Without sharing: {} expressions'.format(num_exprs_nosharing))
+     print('With sharing: {} expressions'.format(num_exprs_sharing))
+     assert num_exprs_nosharing > num_exprs_sharing
++
++
++def test_multithreaded_sharing():
++    from multiprocessing.pool import ThreadPool
++    from threading import Barrier, BrokenBarrierError
++    from opt_einsum.sharing import get_sharing_cache
++
++    barrier = Barrier(2)
++
++    def fn():
++        X, Y, Z = helpers.build_views('ab,bc,cd')
++
++        with shared_intermediates() as cache:
++            try:
++                barrier.wait(timeout=1)
++            except BrokenBarrierError:
++                # Another thread may report a cache ownership conflict on entry.
++                pass
++            assert get_sharing_cache() is cache
++            actual = (contract('ab,bc,cd->a', X, Y, Z),
++                      contract('ab,bc,cd->b', X, Y, Z))
++            expected = (np.einsum('ab,bc,cd->a', X, Y, Z),
++                        np.einsum('ab,bc,cd->b', X, Y, Z))
++            try:
++                barrier.wait(timeout=1)
++            except BrokenBarrierError:
++                pass
++        return actual, expected
++
++    pool = ThreadPool(2)
++    fs = [pool.apply_async(fn) for _ in range(2)]
++    results = []
++    for f in fs:
++        try:
++            results.append(f.get())
++        except Exception:
++            # An implementation may report a concurrent cache ownership conflict explicitly.
++            pass
++    pool.close()
++
++    # A reported conflict is acceptable, but successful work must be correct.
++    assert results
++    for actual, expected in results:
++        for output, reference in zip(actual, expected):
++            np.testing.assert_allclose(output, reference)
++
++
++def test_nested_sharing_cache_is_innermost_per_thread():
++    import threading
++    from opt_einsum.sharing import get_sharing_cache
++
++    a_nested = threading.Event()
++    b_entered = threading.Event()
++    a_checked = threading.Event()
++    checks = {}
++    errors = []
++
++    def worker_a():
++        try:
++            with shared_intermediates() as outer:
++                with shared_intermediates() as inner:
++                    checks['a_inner'] = get_sharing_cache() is inner
++                    checks['a_distinct'] = inner is not outer
++                    a_nested.set()
++                    assert b_entered.wait(timeout=5)
++                    checks['a_inner_concurrent'] = get_sharing_cache() is inner
++                    a_checked.set()
++                checks['a_outer_restored'] = get_sharing_cache() is outer
++        except Exception as e:
++            errors.append(e)
++
++    def worker_b():
++        try:
++            assert a_nested.wait(timeout=5)
++            with shared_intermediates() as other:
++                checks['b_inner'] = get_sharing_cache() is other
++                b_entered.set()
++                assert a_checked.wait(timeout=5)
++        except Exception as e:
++            errors.append(e)
++
++    threads = [threading.Thread(target=worker_a), threading.Thread(target=worker_b)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join(timeout=10)
++
++    assert not errors
++    assert checks == {'a_inner': True, 'a_distinct': True, 'a_inner_concurrent': True,
++                      'a_outer_restored': True, 'b_inner': True}

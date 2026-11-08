@@ -1,0 +1,146 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1d04650d7..75d038cf1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ - Fixed an issue where `simpleCellAddressFromString` method was crashing when called with a non-ASCII character in an unquoted sheet name. [#1312](https://github.com/handsontable/hyperformula/issues/1312)
+ - Fixed a bug where adding a row to the very large spreadsheet resulted in `Maximum call stack size exceeded` error. [#1332](https://github.com/handsontable/hyperformula/issues/1332)
+ - Fixed a typo in the JSDoc comment of the `HyperFormula` class. [#1323](https://github.com/handsontable/hyperformula/issues/1323)
++- Fixed the `Incorrect array size` error when using column range reference to an empty sheet as a function argument. [#1147](https://github.com/handsontable/hyperformula/issues/1147)
+ - Fixed a bug where function SUBSTITUTE did not work correctly with regexp special characters. [#1289](https://github.com/handsontable/hyperformula/issues/1289)
+ 
+ ## [2.6.0] - 2023-09-19
+diff --git a/src/ArraySize.ts b/src/ArraySize.ts
+index 2772956f2..706cd55b1 100644
+--- a/src/ArraySize.ts
++++ b/src/ArraySize.ts
+@@ -8,7 +8,7 @@ import {SimpleCellAddress} from './Cell'
+ import {Config} from './Config'
+ import {FunctionRegistry} from './interpreter/FunctionRegistry'
+ import {InterpreterState} from './interpreter/InterpreterState'
+-import {FunctionArgumentType} from './interpreter/plugin/FunctionPlugin'
++import {FunctionArgumentType} from './interpreter'
+ import {Ast, AstNodeType, ProcedureAst} from './parser'
+ 
+ export class ArraySize {
+@@ -16,15 +16,7 @@ export class ArraySize {
+     public width: number,
+     public height: number,
+     public isRef: boolean = false,
+-  ) {
+-    if (width <= 0 || height <= 0) {
+-      throw Error('Incorrect array size')
+-    }
+-  }
+-
+-  public static fromArray<T>(array: T[][]): ArraySize {
+-    return new ArraySize(array.length > 0 ? array[0].length : 0, array.length)
+-  }
++  ) {}
+ 
+   public static error() {
+     return new ArraySize(1, 1, true)
+@@ -35,7 +27,7 @@ export class ArraySize {
+   }
+ 
+   isScalar(): boolean {
+-    return (this.width <= 1 && this.height <= 1) || this.isRef
++    return (this.width === 1 && this.height === 1) || this.isRef
+   }
+ }
+ 
+@@ -131,37 +123,53 @@ export class ArraySizePredictor {
+   }
+ 
+   private checkArraySizeForFunction(ast: ProcedureAst, state: InterpreterState): ArraySize {
+-    const metadata = this.functionRegistry.getMetadata(ast.procedureName)
+     const pluginArraySizeFunction = this.functionRegistry.getArraySizeFunction(ast.procedureName)
++
+     if (pluginArraySizeFunction !== undefined) {
+       return pluginArraySizeFunction(ast, state)
+     }
+-    const subChecks = ast.args.map((arg) => this.checkArraySizeForAst(arg, new InterpreterState(state.formulaAddress, state.arraysFlag || (metadata?.arrayFunction ?? false))))
+-    if (metadata === undefined || metadata.expandRanges || !state.arraysFlag || metadata.vectorizationForbidden || metadata.parameters === undefined) {
++
++    const metadata = this.functionRegistry.getMetadata(ast.procedureName)
++
++    if (
++      metadata === undefined
++      || metadata.expandRanges
++      || !state.arraysFlag
++      || metadata.vectorizationForbidden
++      || metadata.parameters === undefined
++    ) {
+       return new ArraySize(1, 1)
+     }
++
++    const subChecks = ast.args.map((arg) => this.checkArraySizeForAst(arg, new InterpreterState(state.formulaAddress, state.arraysFlag || (metadata?.arrayFunction ?? false))))
+     const argumentDefinitions = [...metadata.parameters]
+-    if (metadata.repeatLastArgs === undefined && argumentDefinitions.length < subChecks.length) {
+-      return ArraySize.error()
+-    }
+-    if (metadata.repeatLastArgs !== undefined && argumentDefinitions.length < subChecks.length &&
+-      (subChecks.length - argumentDefinitions.length) % metadata.repeatLastArgs !== 0) {
++
++    if (
++      metadata.repeatLastArgs !== undefined
++      && argumentDefinitions.length < subChecks.length
++      && (subChecks.length - argumentDefinitions.length) % metadata.repeatLastArgs !== 0
++    ) {
+       return ArraySize.error()
+     }
+ 
+     while (argumentDefinitions.length < subChecks.length) {
+-      argumentDefinitions.push(...argumentDefinitions.slice(argumentDefinitions.length - metadata.repeatLastArgs!))
++      if (metadata.repeatLastArgs === undefined) {
++        return ArraySize.error()
++      }
++
++      argumentDefinitions.push(...argumentDefinitions.slice(argumentDefinitions.length - metadata.repeatLastArgs))
+     }
+ 
+     let maxWidth = 1
+     let maxHeight = 1
++
+     for (let i = 0; i < subChecks.length; i++) {
+       if (argumentDefinitions[i].argumentType !== FunctionArgumentType.RANGE && argumentDefinitions[i].argumentType !== FunctionArgumentType.ANY) {
+         maxHeight = Math.max(maxHeight, subChecks[i].height)
+         maxWidth = Math.max(maxWidth, subChecks[i].width)
+       }
+     }
++
+     return new ArraySize(maxWidth, maxHeight)
+   }
+ }
+-
+diff --git a/src/ArrayValue.ts b/src/ArrayValue.ts
+index bd711e963..5838760ee 100644
+--- a/src/ArrayValue.ts
++++ b/src/ArrayValue.ts
+@@ -49,6 +49,10 @@ export class ArrayValue implements CellArray {
+   constructor(array: InternalScalarValue[][]) {
+     this.size = new ArraySize(array.length > 0 ? array[0].length : 0, array.length)
+     this.array = array
++
++    if (this.size.width <= 0 || this.size.height <= 0) {
++      throw Error('Incorrect array size')
++    }
+   }
+ 
+   static fromInterpreterValue(value: InterpreterValue) {
+diff --git a/src/Operations.ts b/src/Operations.ts
+index 7ab299ad7..ce2298bfb 100644
+--- a/src/Operations.ts
++++ b/src/Operations.ts
+@@ -563,6 +563,11 @@ export class Operations {
+       } else {
+         try {
+           const size = this.arraySizePredictor.checkArraySize(ast, address)
++
++          if (size.width <= 0 || size.height <= 0) {
++            throw Error('Incorrect array size')
++          }
++
+           this.setFormulaToCell(address, size, parserResult)
+         } catch (error) {
+ 

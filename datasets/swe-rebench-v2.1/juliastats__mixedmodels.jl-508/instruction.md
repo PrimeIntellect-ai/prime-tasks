@@ -1,0 +1,2 @@
+Likelihood ratio test to compare `Linear[Mixed]Model`
+Likelihood ratio tests can be used to assess the suitability of random effects terms, but it's currently not possible to directly compare a `LinearModel` and a `LinearMixedModel` to assess the suitability of no random effects vs. some random effects.  This would require adding methods to determine whether a `LinearModel` is nested within a `LinearMixedModel` and maybe a specialized test method to make sure you're getting the right likelihood value (e.g. can't use the deviance since the baseline is different for the two).

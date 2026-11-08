@@ -1,0 +1,3 @@
+Inconsistent Expectation and Implementation
+According to [spdx/tools-golang/spdx/identifier.go#L8](https://github.com/spdx/tools-golang/blob/5a270f97f4106cf989761f9143e23132c1bffb3c/spdx/identifier.go#L8), the `ElementID` must not contain _"SPDX-Ref-"_ portion.
+But while setting SPDXID in tvloader, [parse_creation_info.go#L29](https://github.com/spdx/tools-golang/blob/5a270f97f4106cf989761f9143e23132c1bffb3c/tvloader/parser2v2/parse_creation_info.go#L29) sets it as it is without trimming the **'SPDX-Ref'-** portion. Also, the test [here](https://github.com/spdx/tools-golang/blob/5a270f97f4106cf989761f9143e23132c1bffb3c/tvloader/parser2v2/parse_creation_info_test.go#L220), asserts if the **SPDXIdentifier** is _"SPDXRef-DOCUMENT"_ and not _"DOCUMENT"_

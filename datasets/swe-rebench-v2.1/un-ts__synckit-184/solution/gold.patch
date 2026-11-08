@@ -1,0 +1,153 @@
+diff --git a/.changeset/violet-laws-compare.md b/.changeset/violet-laws-compare.md
+new file mode 100644
+index 0000000..cbf4399
+--- /dev/null
++++ b/.changeset/violet-laws-compare.md
+@@ -0,0 +1,5 @@
++---
++"synckit": patch
++---
++
++fix: handle outdated message in channel queue
+diff --git a/src/index.ts b/src/index.ts
+index df193d1..9fc11e8 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -5,6 +5,7 @@ import path from 'node:path'
+ import { fileURLToPath, pathToFileURL } from 'node:url'
+ import {
+   MessageChannel,
++  MessagePort,
+   type TransferListItem,
+   Worker,
+   parentPort,
+@@ -19,6 +20,7 @@ import type {
+   AnyAsyncFn,
+   AnyFn,
+   GlobalShim,
++  MainToWorkerCommandMessage,
+   MainToWorkerMessage,
+   Syncify,
+   ValueOf,
+@@ -522,36 +524,59 @@ function startWorkerThread<R, T extends AnyAsyncFn<R>>(
+ 
+   let nextID = 0
+ 
+-  const syncFn = (...args: Parameters<T>): R => {
+-    const id = nextID++
+-
+-    const msg: MainToWorkerMessage<Parameters<T>> = { id, args }
+-
+-    worker.postMessage(msg)
+-
+-    const status = Atomics.wait(sharedBufferView!, 0, 0, timeout)
+-
+-    // Reset SharedArrayBuffer for next call
++  const receiveMessageWithId = (
++    port: MessagePort,
++    expectedId: number,
++    waitingTimeout?: number,
++  ): WorkerToMainMessage<R> => {
++    const start = Date.now()
++    const status = Atomics.wait(sharedBufferView!, 0, 0, waitingTimeout)
+     Atomics.store(sharedBufferView!, 0, 0)
+ 
+-    /* istanbul ignore if */
+     if (!['ok', 'not-equal'].includes(status)) {
++      const abortMsg: MainToWorkerCommandMessage = {
++        id: expectedId,
++        cmd: 'abort',
++      }
++      port.postMessage(abortMsg)
+       throw new Error('Internal error: Atomics.wait() failed: ' + status)
+     }
+ 
+-    const {
+-      id: id2,
+-      result,
+-      error,
+-      properties,
+-    } = (receiveMessageOnPort(mainPort) as { message: WorkerToMainMessage<R> })
+-      .message
++    const { id, ...message } = (
++      receiveMessageOnPort(mainPort) as { message: WorkerToMainMessage<R> }
++    ).message
+ 
+-    /* istanbul ignore if */
+-    if (id !== id2) {
+-      throw new Error(`Internal error: Expected id ${id} but got id ${id2}`)
++    if (id < expectedId) {
++      const waitingTime = Date.now() - start
++      return receiveMessageWithId(
++        port,
++        expectedId,
++        waitingTimeout ? waitingTimeout - waitingTime : undefined,
++      )
+     }
+ 
++    if (expectedId !== id) {
++      throw new Error(
++        `Internal error: Expected id ${expectedId} but got id ${id}`,
++      )
++    }
++
++    return { id, ...message }
++  }
++
++  const syncFn = (...args: Parameters<T>): R => {
++    const id = nextID++
++
++    const msg: MainToWorkerMessage<Parameters<T>> = { id, args }
++
++    worker.postMessage(msg)
++
++    const { result, error, properties } = receiveMessageWithId(
++      mainPort,
++      id,
++      timeout,
++    )
++
+     if (error) {
+       throw Object.assign(error as object, properties)
+     }
+@@ -587,12 +612,24 @@ export function runAsWorker<
+     ({ id, args }: MainToWorkerMessage<Parameters<T>>) => {
+       // eslint-disable-next-line @typescript-eslint/no-floating-promises
+       ;(async () => {
++        let isAborted = false
++        const handleAbortMessage = (msg: MainToWorkerCommandMessage) => {
++          if (msg.id === id && msg.cmd === 'abort') {
++            isAborted = true
++          }
++        }
++        workerPort.on('message', handleAbortMessage)
+         let msg: WorkerToMainMessage<R>
+         try {
+           msg = { id, result: await fn(...args) }
+         } catch (error: unknown) {
+           msg = { id, error, properties: extractProperties(error) }
+         }
++        workerPort.off('message', handleAbortMessage)
++        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
++        if (isAborted) {
++          return
++        }
+         workerPort.postMessage(msg)
+         Atomics.add(sharedBufferView, 0, 1)
+         Atomics.notify(sharedBufferView, 0)
+diff --git a/src/types.ts b/src/types.ts
+index b3fd751..5f75560 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -25,6 +25,11 @@ export interface MainToWorkerMessage<T extends unknown[]> {
+   args: T
+ }
+ 
++export interface MainToWorkerCommandMessage {
++  id: number
++  cmd: string
++}
++
+ export interface WorkerData {
+   sharedBuffer: SharedArrayBuffer
+   workerPort: MessagePort

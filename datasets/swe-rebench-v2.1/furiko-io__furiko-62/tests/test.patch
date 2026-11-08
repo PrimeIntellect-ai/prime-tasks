@@ -1,0 +1,415 @@
+diff --git a/pkg/execution/mutation/mutation_test.go b/pkg/execution/mutation/mutation_test.go
+index ef63a25..641b5eb 100644
+--- a/pkg/execution/mutation/mutation_test.go
++++ b/pkg/execution/mutation/mutation_test.go
+@@ -27,6 +27,7 @@ import (
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
++	admissionv1 "k8s.io/api/admission/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -43,6 +44,8 @@ import (
+ 	"github.com/furiko-io/furiko/pkg/execution/mutation"
+ 	"github.com/furiko-io/furiko/pkg/execution/tasks"
+ 	"github.com/furiko-io/furiko/pkg/execution/variablecontext"
++	"github.com/furiko-io/furiko/pkg/execution/webhooks/jobmutatingwebhook"
++	"github.com/furiko-io/furiko/pkg/runtime/controllercontext"
+ 	"github.com/furiko-io/furiko/pkg/runtime/controllercontext/mock"
+ 	"github.com/furiko-io/furiko/pkg/utils/execution/jobconfig"
+ 	"github.com/furiko-io/furiko/pkg/utils/webhook"
+@@ -210,16 +213,44 @@ var (
+ 	optionSpecHash, _ = options.HashOptionSpec(&optionSpecThree)
+ )
+ 
++func TestJobMutationWebhookHandlesJobWithoutTemplate(t *testing.T) {
++	ctrlContext := setupContext(t, nil, nil)
++	hook, err := jobmutatingwebhook.NewWebhook(ctrlContext)
++	if err != nil {
++		t.Fatalf("cannot construct Job webhook: %v", err)
++	}
++
++	job := &v1alpha1.Job{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: metav1.NamespaceDefault,
++			Name:      "job-without-template",
++		},
++	}
++	rawJob, err := json.Marshal(job)
++	if err != nil {
++		t.Fatalf("cannot encode Job admission object: %v", err)
++	}
++
++	_, _ = hook.Handle(context.Background(), &admissionv1.AdmissionRequest{
++		Operation: admissionv1.Create,
++		Kind:      metav1.GroupVersionKind(v1alpha1.GVKJob),
++		Object:    runtime.RawExtension{Raw: rawJob},
++	})
++}
++
+ func TestMutator_MutateJobConfig(t *testing.T) {
+ 	tests := []struct {
+-		name         string
+-		rjc          *v1alpha1.JobConfig
+-		want         *v1alpha1.JobConfig
+-		wantErrors   string
+-		wantWarnings []string
++		name                        string
++		rjc                         *v1alpha1.JobConfig
++		want                        *v1alpha1.JobConfig
++		wantErrors                  string
++		wantWarnings                []string
++		checkJobConfigRestartPolicy bool
++		allowJobTemplateDefaults    bool
+ 	}{
+ 		{
+-			name: "no change expected",
++			name:                     "no change expected outside JobTemplate defaults",
++			allowJobTemplateDefaults: true,
+ 			rjc: &v1alpha1.JobConfig{
+ 				ObjectMeta: objectMetaJobConfig,
+ 				Spec: v1alpha1.JobConfigSpec{
+@@ -228,7 +259,8 @@ func TestMutator_MutateJobConfig(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			name: "default JobTemplate",
++			name:                        "don't add RestartPolicy to JobConfig template",
++			checkJobConfigRestartPolicy: true,
+ 			rjc: &v1alpha1.JobConfig{
+ 				ObjectMeta: objectMetaJobConfig,
+ 				Spec: v1alpha1.JobConfigSpec{
+@@ -241,12 +273,6 @@ func TestMutator_MutateJobConfig(t *testing.T) {
+ 					},
+ 				},
+ 			},
+-			want: &v1alpha1.JobConfig{
+-				ObjectMeta: objectMetaJobConfig,
+-				Spec: v1alpha1.JobConfigSpec{
+-					Template: jobTemplateSpecBasic,
+-				},
+-			},
+ 		},
+ 		{
+ 			name: "default OptionSpec",
+@@ -297,7 +323,17 @@ func TestMutator_MutateJobConfig(t *testing.T) {
+ 				return
+ 			}
+ 
++			if tt.checkJobConfigRestartPolicy {
++				if got := newRjc.Spec.Template.Spec.Task.Template.Spec.RestartPolicy; got != "" {
++					t.Errorf("MutateJobConfig() added pod restart policy %q", got)
++				}
++				return
++			}
++
+ 			opts := []cmp.Option{cmpopts.EquateEmpty()}
++			if tt.allowJobTemplateDefaults {
++				opts = append(opts, cmpopts.IgnoreFields(v1alpha1.JobConfigSpec{}, "Template"))
++			}
+ 			if tt.want == nil {
+ 				if !cmp.Equal(newRjc, tt.rjc, opts...) {
+ 					t.Errorf("MutateJobConfig() expected no change\ndiff = %v", cmp.Diff(tt.rjc, newRjc, opts...))
+@@ -1253,10 +1289,8 @@ func (m *mockProvider) MakeVariablesFromTask(rj *v1alpha1.Job, task *tasks.TaskT
+ 	return nil
+ }
+ 
+-func setup(t *testing.T, cfgs map[configv1alpha1.ConfigName]runtime.Object, rjcs []*v1alpha1.JobConfig) *mutation.Mutator {
+-	ctx, cancel := context.WithCancel(context.Background())
+-	defer cancel()
+-
++func setupContext(t *testing.T, cfgs map[configv1alpha1.ConfigName]runtime.Object, rjcs []*v1alpha1.JobConfig) controllercontext.Context {
++	ctx := context.Background()
+ 	ctrlContext := mock.NewContext()
+ 	ctrlContext.MockConfigs().SetConfigs(cfgs)
+ 	hasSynced := ctrlContext.Informers().Furiko().Execution().V1alpha1().JobConfigs().Informer().HasSynced
+@@ -1279,6 +1313,11 @@ func setup(t *testing.T, cfgs map[configv1alpha1.ConfigName]runtime.Object, rjcs
+ 	// Replace provider
+ 	variablecontext.ContextProvider = &noopProvider{}
+ 
++	return ctrlContext
++}
++
++func setup(t *testing.T, cfgs map[configv1alpha1.ConfigName]runtime.Object, rjcs []*v1alpha1.JobConfig) *mutation.Mutator {
++	ctrlContext := setupContext(t, cfgs, rjcs)
+ 	return mutation.NewMutator(ctrlContext)
+ }
+ 
+diff --git a/pkg/execution/mutation/patcher_jobs_test.go b/pkg/execution/mutation/patcher_jobs_test.go
+new file mode 100644
+index 0000000..94f6298
+--- /dev/null
++++ b/pkg/execution/mutation/patcher_jobs_test.go
+@@ -0,0 +1,271 @@
++/*
++ * Copyright 2022 The Furiko Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package mutation_test
++
++import (
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
++	admissionv1 "k8s.io/api/admission/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/util/clock"
++	"k8s.io/utils/pointer"
++
++	"github.com/furiko-io/furiko/apis/execution/v1alpha1"
++	"github.com/furiko-io/furiko/pkg/config"
++	"github.com/furiko-io/furiko/pkg/execution/mutation"
++)
++
++func TestNewJobPatcher(t *testing.T) {
++	tests := []struct {
++		name         string
++		operation    admissionv1.Operation
++		oldRj        *v1alpha1.Job
++		rj           *v1alpha1.Job
++		want         *v1alpha1.Job
++		wantErrors   string
++		wantWarnings []string
++	}{
++		{
++			name:      "basic mutation for create with template",
++			operation: admissionv1.Create,
++			rj: &v1alpha1.Job{
++				ObjectMeta: objectMetaJob,
++				Spec: v1alpha1.JobSpec{
++					Template: &v1alpha1.JobTemplateSpec{
++						Task: v1alpha1.JobTaskSpec{
++							Template: corev1.PodTemplateSpec{
++								Spec: podTemplateSpecBare.Spec,
++							},
++						},
++					},
++				},
++			},
++			want: &v1alpha1.Job{
++				ObjectMeta: objectMetaJobWithFinalizer,
++				Spec: v1alpha1.JobSpec{
++					Type: v1alpha1.JobTypeAdhoc,
++					Template: &v1alpha1.JobTemplateSpec{
++						Task: v1alpha1.JobTaskSpec{
++							Template: corev1.PodTemplateSpec{
++								Spec: corev1.PodSpec{
++									Containers:    podTemplateSpecBare.Spec.Containers,
++									RestartPolicy: corev1.RestartPolicyNever,
++								},
++							},
++						},
++						MaxAttempts: pointer.Int32(1),
++					},
++					TTLSecondsAfterFinished: config.DefaultJobExecutionConfig.DefaultTTLSecondsAfterFinished,
++				},
++			},
++		},
++		{
++			name:      "basic mutation for create with ConfigName",
++			operation: admissionv1.Create,
++			rj: &v1alpha1.Job{
++				ObjectMeta: objectMetaJob,
++				Spec: v1alpha1.JobSpec{
++					ConfigName: objectMetaJobConfig.Name,
++				},
++			},
++			want: &v1alpha1.Job{
++				ObjectMeta: objectMetaJobWithAllReferences,
++				Spec: v1alpha1.JobSpec{
++					Type: v1alpha1.JobTypeAdhoc,
++					Template: &v1alpha1.JobTemplateSpec{
++						Task:        jobTemplateSpecBasic.Spec.Task,
++						MaxAttempts: pointer.Int32(1),
++					},
++					StartPolicy:             &startPolicyBasic,
++					TTLSecondsAfterFinished: config.DefaultJobExecutionConfig.DefaultTTLSecondsAfterFinished,
++				},
++			},
++		},
++		{
++			name:      "basic mutation for update with template",
++			operation: admissionv1.Update,
++			oldRj: &v1alpha1.Job{
++				ObjectMeta: objectMetaJob,
++				Spec: v1alpha1.JobSpec{
++					Template: &v1alpha1.JobTemplateSpec{
++						Task: v1alpha1.JobTaskSpec{
++							Template: corev1.PodTemplateSpec{
++								Spec: podTemplateSpecBare.Spec,
++							},
++						},
++					},
++				},
++			},
++			rj: &v1alpha1.Job{
++				ObjectMeta: objectMetaJob,
++				Spec: v1alpha1.JobSpec{
++					Template: &v1alpha1.JobTemplateSpec{
++						Task: v1alpha1.JobTaskSpec{
++							Template: corev1.PodTemplateSpec{
++								Spec: podTemplateSpecBare.Spec,
++							},
++						},
++					},
++				},
++			},
++			want: &v1alpha1.Job{
++				ObjectMeta: objectMetaJob,
++				Spec: v1alpha1.JobSpec{
++					Type: v1alpha1.JobTypeAdhoc,
++					Template: &v1alpha1.JobTemplateSpec{
++						Task: v1alpha1.JobTaskSpec{
++							Template: corev1.PodTemplateSpec{
++								Spec: corev1.PodSpec{
++									Containers:    podTemplateSpecBare.Spec.Containers,
++									RestartPolicy: corev1.RestartPolicyNever,
++								},
++							},
++						},
++						MaxAttempts: pointer.Int32(1),
++					},
++					TTLSecondsAfterFinished: config.DefaultJobExecutionConfig.DefaultTTLSecondsAfterFinished,
++				},
++			},
++		},
++	}
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			ctrlContext := setupContext(t, nil, []*v1alpha1.JobConfig{
++				{
++					ObjectMeta: objectMetaJobConfig,
++					Spec: v1alpha1.JobConfigSpec{
++						Template:    jobTemplateSpecBasic,
++						Concurrency: concurrencySpecBasic,
++					},
++				},
++			})
++			patcher := mutation.NewJobPatcher(ctrlContext)
++			newRj := tt.rj.DeepCopy()
++			resp := patcher.Patch(tt.operation, tt.oldRj, newRj)
++
++			if err := checkResult(resp, tt.wantErrors, tt.wantWarnings); err != "" {
++				t.Errorf("MutateJob() %v", err)
++			}
++			if tt.wantErrors != "" {
++				return
++			}
++
++			opts := []cmp.Option{cmpopts.EquateEmpty()}
++			if tt.want == nil {
++				if !cmp.Equal(newRj, tt.rj, opts...) {
++					t.Errorf("Patch() expected no change\ndiff = %v", cmp.Diff(tt.rj, newRj, opts...))
++				}
++			} else if !cmp.Equal(newRj, tt.want, opts...) {
++				t.Errorf("Patch() not equal\ndiff = %v", cmp.Diff(tt.want, newRj, opts...))
++			}
++		})
++	}
++}
++
++func TestNewJobConfigPatcher(t *testing.T) {
++	tests := []struct {
++		name         string
++		operation    admissionv1.Operation
++		oldRjc       *v1alpha1.JobConfig
++		rjc          *v1alpha1.JobConfig
++		want         *v1alpha1.JobConfig
++		wantErrors   string
++		wantWarnings []string
++		setup        func()
++	}{
++		{
++			name:      "create bumps LastUpdated for new schedule",
++			operation: admissionv1.Create,
++			setup: func() {
++				mutation.Clock = clock.NewFakeClock(mockNow.Time)
++			},
++			rjc: &v1alpha1.JobConfig{
++				ObjectMeta: objectMetaJobConfig,
++				Spec: v1alpha1.JobConfigSpec{
++					Template: jobTemplateSpecBasic,
++					Schedule: mkScheduleSpec(cronSchedule1, nil),
++				},
++			},
++			want: &v1alpha1.JobConfig{
++				ObjectMeta: objectMetaJobConfig,
++				Spec: v1alpha1.JobConfigSpec{
++					Template: jobTemplateSpecBasic,
++					Schedule: mkScheduleSpec(cronSchedule1, &mockNow),
++				},
++			},
++		},
++		{
++			name:      "update bumps LastUpdated when schedule changed",
++			operation: admissionv1.Update,
++			setup: func() {
++				mutation.Clock = clock.NewFakeClock(mockNow.Time)
++			},
++			oldRjc: &v1alpha1.JobConfig{
++				ObjectMeta: objectMetaJobConfig,
++				Spec: v1alpha1.JobConfigSpec{
++					Template: jobTemplateSpecBasic,
++					Schedule: mkScheduleSpec(cronSchedule1, &mockOldTime),
++				},
++			},
++			rjc: &v1alpha1.JobConfig{
++				ObjectMeta: objectMetaJobConfig,
++				Spec: v1alpha1.JobConfigSpec{
++					Template: jobTemplateSpecBasic,
++					Schedule: mkScheduleSpec(cronSchedule2, &mockOldTime),
++				},
++			},
++			want: &v1alpha1.JobConfig{
++				ObjectMeta: objectMetaJobConfig,
++				Spec: v1alpha1.JobConfigSpec{
++					Template: jobTemplateSpecBasic,
++					Schedule: mkScheduleSpec(cronSchedule2, &mockNow),
++				},
++			},
++		},
++	}
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			ctrlContext := setupContext(t, nil, nil)
++			if tt.setup != nil {
++				tt.setup()
++			}
++			patcher := mutation.NewJobConfigPatcher(ctrlContext)
++			newRjc := tt.rjc.DeepCopy()
++			resp := patcher.Patch(tt.operation, tt.oldRjc, newRjc)
++
++			if err := checkResult(resp, tt.wantErrors, tt.wantWarnings); err != "" {
++				t.Errorf("Patch() %v", err)
++			}
++			if tt.wantErrors != "" {
++				return
++			}
++
++			opts := []cmp.Option{cmpopts.EquateEmpty()}
++			if tt.want == nil {
++				if !cmp.Equal(newRjc, tt.rjc, opts...) {
++					t.Errorf("Patch() expected no change\ndiff = %v", cmp.Diff(tt.rjc, newRjc, opts...))
++				}
++			} else if !cmp.Equal(newRjc, tt.want, opts...) {
++				t.Errorf("Patch() not equal\ndiff = %v", cmp.Diff(tt.want, newRjc, opts...))
++			}
++		})
++	}
++}

@@ -1,0 +1,185 @@
+diff --git a/collector_test.go b/collector_test.go
+index d4b1c4b..7992fe5 100644
+--- a/collector_test.go
++++ b/collector_test.go
+@@ -14,15 +14,23 @@
+ package main
+ 
+ import (
++	"context"
++	"encoding/asn1"
+ 	"errors"
++	"io/ioutil"
++	"net"
+ 	"reflect"
+ 	"regexp"
++	"strconv"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/go-kit/kit/log"
++	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/prometheus/client_model/go"
+ 	"github.com/soniah/gosnmp"
+ 	kingpin "gopkg.in/alecthomas/kingpin.v2"
++	"gopkg.in/yaml.v2"
+ 
+ 	"github.com/prometheus/snmp_exporter/config"
+ )
+@@ -757,6 +765,144 @@ func TestParseDateAndTime(t *testing.T) {
+ 	}
+ }
+ 
++// metricFromYAML builds a config.Metric from its YAML representation so that
++// the test exercises the public configuration surface rather than depending on
++// the concrete Go struct fields used to carry enum values.
++func metricFromYAML(t *testing.T, y string) config.Metric {
++	t.Helper()
++	var m config.Metric
++	if err := yaml.Unmarshal([]byte(y), &m); err != nil {
++		t.Fatalf("unable to parse metric yaml: %v", err)
++	}
++	return m
++}
++
++func sampleLabels(t *testing.T, indexOids []int, metric *config.Metric) (labels map[string]string) {
++	t.Helper()
++	const baseOID = "1.3.6.1.4.1.99999.1"
++	metric.Oid = baseOID
++	metric.Name = "sample"
++	metric.Type = "gauge"
++	metric.Help = "sample metric"
++	requestedOID := baseOID
++	for _, component := range indexOids {
++		requestedOID += "." + strconv.Itoa(component)
++	}
++	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
++	if err != nil {
++		t.Fatalf("unable to start local SNMP responder: %v", err)
++	}
++	defer listener.Close()
++	responseErr := make(chan error, 1)
++	go func() {
++		buf := make([]byte, 2048)
++		n, addr, err := listener.ReadFromUDP(buf)
++		if err != nil {
++			responseErr <- err
++			return
++		}
++		var message asn1.RawValue
++		if _, err = asn1.Unmarshal(buf[:n], &message); err != nil {
++			responseErr <- err
++			return
++		}
++		var version, community, request asn1.RawValue
++		remaining := message.Bytes
++		for _, destination := range []*asn1.RawValue{&version, &community, &request} {
++			remaining, err = asn1.Unmarshal(remaining, destination)
++			if err != nil {
++				responseErr <- err
++				return
++			}
++		}
++		var requestID int32
++		if _, err = asn1.Unmarshal(request.Bytes, &requestID); err != nil {
++			responseErr <- err
++			return
++		}
++		packet := &gosnmp.SnmpPacket{
++			Version: gosnmp.Version2c, Community: "public", PDUType: gosnmp.GetResponse,
++			RequestID: uint32(requestID), Variables: []gosnmp.SnmpPDU{{Name: "." + requestedOID,
++				Type: gosnmp.Integer, Value: 1}},
++		}
++		var encoded []byte
++		encoded, err = packet.MarshalMsg()
++		if err == nil {
++			_, err = listener.WriteToUDP(encoded, addr)
++		}
++		responseErr <- err
++	}()
++
++	module := &config.Module{
++		WalkParams: config.WalkParams{Version: 2, Retries: 0, Timeout: time.Second},
++		Get:        []string{requestedOID}, Metrics: []*config.Metric{metric},
++	}
++	collector := collector{ctx: context.Background(), target: listener.LocalAddr().String(), module: module, logger: log.NewNopLogger()}
++	ch := make(chan prometheus.Metric, 16)
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			t.Errorf("collection panicked: %v", recovered)
++		}
++	}()
++	collector.Collect(ch)
++	if err := <-responseErr; err != nil {
++		t.Fatalf("local SNMP response failed: %v", err)
++	}
++	for len(ch) > 0 {
++		sample := <-ch
++		var emitted io_prometheus_client.Metric
++		if err := sample.Write(&emitted); err != nil {
++			continue
++		}
++		candidate := make(map[string]string, len(emitted.GetLabel()))
++		for _, label := range emitted.GetLabel() {
++			candidate[label.GetName()] = label.GetValue()
++		}
++		if len(candidate) > 0 {
++			return candidate
++		}
++	}
++	return nil
++}
++
++func TestEnumAsInfoIndexLabels(t *testing.T) {
++	t.Run("mapped code renders its configured text", func(t *testing.T) {
++		metric := metricFromYAML(t, "name: sample\ntype: gauge\nindexes:\n- labelname: l\n  type: EnumAsInfo\n  enum_values:\n    0: foo\n    1: bar\n")
++		if got := sampleLabels(t, []int{0}, &metric); got["l"] != "foo" {
++			t.Errorf("label l = %q, want mapped enum text %q", got["l"], "foo")
++		}
++	})
++
++	t.Run("subsequent index uses the remaining OID component", func(t *testing.T) {
++		metric := metricFromYAML(t, "name: sample\ntype: gauge\nindexes:\n- labelname: l\n  type: EnumAsInfo\n  enum_values:\n    0: foo\n- labelname: m\n  type: gauge\n")
++		labels := sampleLabels(t, []int{0, 5}, &metric)
++		if labels["l"] != "foo" || labels["m"] != "5" {
++			t.Errorf("emitted labels = %v, want l=foo and m=5", labels)
++		}
++	})
++}
++
++func TestUnmappedEnumAsInfoIsRejectedOrHandledSafely(t *testing.T) {
++	configText := "test:\n  metrics:\n  - name: sample\n    oid: 1.3.6.1.4.1.99999.1\n    type: gauge\n    indexes:\n    - labelname: l\n      type: EnumAsInfo\n"
++	file, err := ioutil.TempFile(t.TempDir(), "snmp-config-*.yml")
++	if err != nil {
++		t.Fatalf("unable to create temporary config: %v", err)
++	}
++	if _, err := file.WriteString(configText); err != nil {
++		t.Fatalf("unable to write temporary config: %v", err)
++	}
++	if err := file.Close(); err != nil {
++		t.Fatalf("unable to close temporary config: %v", err)
++	}
++	cfg, err := config.LoadFile(file.Name())
++	if err != nil {
++		return // Rejecting the configuration before collection is safe.
++	}
++	metric := (*cfg)["test"].Metrics[0]
++	// If accepted, collection must handle the unmapped index without an uncaught panic.
++	sampleLabels(t, []int{3}, metric)
++}
++
+ func TestIndexesToLabels(t *testing.T) {
+ 	cases := []struct {
+ 		oid      []int
+diff --git a/generator/tree_test.go b/generator/tree_test.go
+index 13fdeae..6c6f95a 100644
+--- a/generator/tree_test.go
++++ b/generator/tree_test.go
+@@ -981,6 +981,7 @@ func TestGenerateConfigModule(t *testing.T) {
+ 				},
+ 			},
+ 		},
++
+ 		// One table lookup, lookup not walked, labels kept.
+ 		{
+ 			node: &Node{Oid: "1", Label: "root",

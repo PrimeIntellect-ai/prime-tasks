@@ -1,0 +1,205 @@
+diff --git a/fxevent/console_test.go b/fxevent/console_test.go
+index fcaa41d..7c2f94a 100644
+--- a/fxevent/console_test.go
++++ b/fxevent/console_test.go
+@@ -18,7 +18,7 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ // THE SOFTWARE.
+ 
+-package fxevent
++package fxevent_test
+ 
+ import (
+ 	"bytes"
+@@ -26,11 +26,17 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
++	"go.uber.org/fx"
++	"go.uber.org/fx/fxevent"
++	. "go.uber.org/fx/fxevent"
++
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ // richError prints a different output when formatted with %+v vs %v.
+@@ -268,7 +274,6 @@ func TestConsoleLogger(t *testing.T) {
+ 		{
+ 			name: "Run",
+ 			give: &Run{Name: "bytes.NewBuffer()", Kind: "constructor"},
+-			want: "[Fx] RUN\tconstructor: bytes.NewBuffer()\n",
+ 		},
+ 		{
+ 			name: "Run with module",
+@@ -277,7 +282,6 @@ func TestConsoleLogger(t *testing.T) {
+ 				Kind:       "constructor",
+ 				ModuleName: "myModule",
+ 			},
+-			want: "[Fx] RUN\tconstructor: bytes.NewBuffer() from module \"myModule\"\n",
+ 		},
+ 		{
+ 			name: "RunError",
+@@ -286,10 +290,6 @@ func TestConsoleLogger(t *testing.T) {
+ 				Kind: "constructor",
+ 				Err:  errors.New("terrible constructor error"),
+ 			},
+-			want: joinLines(
+-				"[Fx] RUN\tconstructor: bytes.NewBuffer()",
+-				"[Fx] Error returned: terrible constructor error",
+-			),
+ 		},
+ 		{
+ 			name: "Invoking",
+@@ -407,6 +407,17 @@ func TestConsoleLogger(t *testing.T) {
+ 			var buff bytes.Buffer
+ 			(&ConsoleLogger{W: &buff}).LogEvent(tt.give)
+ 
++			if run, ok := tt.give.(*Run); ok {
++				got := buff.String()
++				assert.Contains(t, got, "[Fx] RUN\t"+run.Kind+": "+run.Name)
++				if run.ModuleName != "" {
++					assert.Contains(t, got, run.ModuleName)
++				}
++				if run.Err != nil {
++					assert.Contains(t, got, run.Err.Error())
++				}
++				return
++			}
+ 			assert.Equal(t, tt.want, buff.String())
+ 		})
+ 	}
+@@ -415,3 +426,46 @@ func TestConsoleLogger(t *testing.T) {
+ func joinLines(lines ...string) string {
+ 	return strings.Join(lines, "\n") + "\n"
+ }
++
++type runEventRecorder struct {
++	runs []*fxevent.Run
++}
++
++func (r *runEventRecorder) LogEvent(event fxevent.Event) {
++	if run, ok := event.(*fxevent.Run); ok {
++		r.runs = append(r.runs, run)
++	}
++}
++
++type runtimeProbe struct{}
++
++func slowRuntimeConstructor() runtimeProbe {
++	time.Sleep(10 * time.Millisecond)
++	return runtimeProbe{}
++}
++
++func TestRunEventIncludesConstructorRuntime(t *testing.T) {
++	recorder := new(runEventRecorder)
++	app := fx.New(
++		fx.Provide(slowRuntimeConstructor),
++		fx.Invoke(func(runtimeProbe) {}),
++		fx.WithLogger(func() fxevent.Logger { return recorder }),
++	)
++	require.NoError(t, app.Err())
++
++	for _, run := range recorder.runs {
++		if strings.Contains(run.Name, "slowRuntimeConstructor") {
++			assert.Equal(t, "provide", run.Kind)
++			runtimeField := reflect.ValueOf(run).Elem().FieldByName("Runtime")
++			if !runtimeField.IsValid() || !runtimeField.CanInterface() {
++				t.Fatal("Run does not expose a public Runtime field")
++			}
++			if runtimeField.Type() != reflect.TypeOf(time.Duration(0)) {
++				t.Fatalf("Run.Runtime has type %v, want time.Duration", runtimeField.Type())
++			}
++			assert.GreaterOrEqual(t, time.Duration(runtimeField.Int()), 10*time.Millisecond)
++			return
++		}
++	}
++	t.Fatal("Fx did not emit a Run event for the constructor")
++}
+diff --git a/fxevent/slog_test.go b/fxevent/slog_test.go
+index f8fb18e..3383283 100644
+--- a/fxevent/slog_test.go
++++ b/fxevent/slog_test.go
+@@ -474,7 +474,7 @@ func TestSlogLogger(t *testing.T) {
+ 				got := logs[0]
+ 
+ 				assert.Equal(t, tt.wantMessage, got.record.Message)
+-				assert.Equal(t, tt.wantFields, got.ContextMap())
++				assertEventFields(t, tt.give, tt.wantFields, got.ContextMap())
+ 			})
+ 		}
+ 	})
+@@ -496,7 +496,7 @@ func TestSlogLogger(t *testing.T) {
+ 					require.Len(t, logs, 1)
+ 					got := logs[0]
+ 					assert.Equal(t, tt.wantMessage, got.record.Message)
+-					assert.Equal(t, tt.wantFields, got.ContextMap())
++					assertEventFields(t, tt.give, tt.wantFields, got.ContextMap())
+ 				} else {
+ 					require.Len(t, logs, 0)
+ 				}
+@@ -575,3 +575,18 @@ func TestSlogLogger(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// assertEventFields compares the structured fields logged for an event with
++// the expected ones. Run events may carry additional fields, so for them only
++// the expected fields must be present with the expected values.
++func assertEventFields(t *testing.T, give Event, want, got map[string]interface{}) {
++	t.Helper()
++
++	if _, isRun := give.(*Run); !isRun {
++		assert.Equal(t, want, got)
++		return
++	}
++	for key, value := range want {
++		assert.Equal(t, value, got[key], "field %q", key)
++	}
++}
+diff --git a/fxevent/zap_test.go b/fxevent/zap_test.go
+index a43ae17..fb521e2 100644
+--- a/fxevent/zap_test.go
++++ b/fxevent/zap_test.go
+@@ -406,7 +406,7 @@ func TestZapLogger(t *testing.T) {
+ 				got := logs[0]
+ 
+ 				assert.Equal(t, tt.wantMessage, got.Message)
+-				assert.Equal(t, tt.wantFields, got.ContextMap())
++				assertEventFields(t, tt.give, tt.wantFields, got.ContextMap())
+ 			})
+ 		}
+ 	})
+@@ -428,7 +428,7 @@ func TestZapLogger(t *testing.T) {
+ 					require.Len(t, logs, 1)
+ 					got := logs[0]
+ 					assert.Equal(t, tt.wantMessage, got.Message)
+-					assert.Equal(t, tt.wantFields, got.ContextMap())
++					assertEventFields(t, tt.give, tt.wantFields, got.ContextMap())
+ 				} else {
+ 					require.Len(t, logs, 0)
+ 				}
+@@ -508,3 +508,18 @@ func TestZapLogger(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// assertEventFields compares the structured fields logged for an event with
++// the expected ones. Run events may carry additional fields, so for them only
++// the expected fields must be present with the expected values.
++func assertEventFields(t *testing.T, give Event, want, got map[string]interface{}) {
++	t.Helper()
++
++	if _, isRun := give.(*Run); !isRun {
++		assert.Equal(t, want, got)
++		return
++	}
++	for key, value := range want {
++		assert.Equal(t, value, got[key], "field %q", key)
++	}
++}

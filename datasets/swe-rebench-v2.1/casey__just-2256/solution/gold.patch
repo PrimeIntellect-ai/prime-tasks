@@ -1,0 +1,256 @@
+diff --git a/README.md b/README.md
+index 17bbfad2..9d4f9f6c 100644
+--- a/README.md
++++ b/README.md
+@@ -1712,6 +1712,7 @@ Recipes may be annotated with attributes that change their behavior.
+ | `[confirm]`<sup>1.17.0</sup> | Require confirmation prior to executing recipe. |
+ | `[confirm('PROMPT')]`<sup>1.23.0</sup> | Require confirmation prior to executing recipe with a custom prompt. |
+ | `[doc('DOC')]`<sup>1.27.0</sup> | Set recipe's [documentation comment](#documentation-comments) to `DOC`. |
++| `[extension('EXT')]`<sup>master</sup> | Set shebang recipe script's file extension to `EXT`. `EXT` should include a period if one is desired. |
+ | `[group('NAME')]`<sup>1.27.0</sup> | Put recipe in [recipe group](#recipe-groups) `NAME`. |
+ | `[linux]`<sup>1.8.0</sup> | Enable recipe on Linux. |
+ | `[macos]`<sup>1.8.0</sup> | Enable recipe on MacOS. |
+diff --git a/src/analyzer.rs b/src/analyzer.rs
+index 1f1cece3..bd4319ba 100644
+--- a/src/analyzer.rs
++++ b/src/analyzer.rs
+@@ -255,6 +255,20 @@ impl<'src> Analyzer<'src> {
+       continued = line.is_continuation();
+     }
+ 
++    if !recipe.shebang {
++      if let Some(attribute) = recipe
++        .attributes
++        .iter()
++        .find(|attribute| matches!(attribute, Attribute::Extension(_)))
++      {
++        return Err(recipe.name.error(InvalidAttribute {
++          item_kind: "Recipe",
++          item_name: recipe.name.lexeme(),
++          attribute: attribute.clone(),
++        }));
++      }
++    }
++
+     Ok(())
+   }
+ 
+diff --git a/src/attribute.rs b/src/attribute.rs
+index 51763646..699d1495 100644
+--- a/src/attribute.rs
++++ b/src/attribute.rs
+@@ -11,6 +11,7 @@ use super::*;
+ pub(crate) enum Attribute<'src> {
+   Confirm(Option<StringLiteral<'src>>),
+   Doc(Option<StringLiteral<'src>>),
++  Extension(StringLiteral<'src>),
+   Group(StringLiteral<'src>),
+   Linux,
+   Macos,
+@@ -27,7 +28,7 @@ impl AttributeDiscriminant {
+   fn argument_range(self) -> RangeInclusive<usize> {
+     match self {
+       Self::Confirm | Self::Doc => 0..=1,
+-      Self::Group => 1..=1,
++      Self::Group | Self::Extension => 1..=1,
+       Self::Linux
+       | Self::Macos
+       | Self::NoCd
+@@ -46,8 +47,6 @@ impl<'src> Attribute<'src> {
+     name: Name<'src>,
+     argument: Option<StringLiteral<'src>>,
+   ) -> CompileResult<'src, Self> {
+-    use AttributeDiscriminant::*;
+-
+     let discriminant = name
+       .lexeme()
+       .parse::<AttributeDiscriminant>()
+@@ -72,18 +71,19 @@ impl<'src> Attribute<'src> {
+     }
+ 
+     Ok(match discriminant {
+-      Confirm => Self::Confirm(argument),
+-      Doc => Self::Doc(argument),
+-      Group => Self::Group(argument.unwrap()),
+-      Linux => Self::Linux,
+-      Macos => Self::Macos,
+-      NoCd => Self::NoCd,
+-      NoExitMessage => Self::NoExitMessage,
+-      NoQuiet => Self::NoQuiet,
+-      PositionalArguments => Self::PositionalArguments,
+-      Private => Self::Private,
+-      Unix => Self::Unix,
+-      Windows => Self::Windows,
++      AttributeDiscriminant::Confirm => Self::Confirm(argument),
++      AttributeDiscriminant::Doc => Self::Doc(argument),
++      AttributeDiscriminant::Extension => Self::Extension(argument.unwrap()),
++      AttributeDiscriminant::Group => Self::Group(argument.unwrap()),
++      AttributeDiscriminant::Linux => Self::Linux,
++      AttributeDiscriminant::Macos => Self::Macos,
++      AttributeDiscriminant::NoCd => Self::NoCd,
++      AttributeDiscriminant::NoExitMessage => Self::NoExitMessage,
++      AttributeDiscriminant::NoQuiet => Self::NoQuiet,
++      AttributeDiscriminant::PositionalArguments => Self::PositionalArguments,
++      AttributeDiscriminant::Private => Self::Private,
++      AttributeDiscriminant::Unix => Self::Unix,
++      AttributeDiscriminant::Windows => Self::Windows,
+     })
+   }
+ 
+@@ -93,9 +93,8 @@ impl<'src> Attribute<'src> {
+ 
+   fn argument(&self) -> Option<&StringLiteral> {
+     match self {
+-      Self::Confirm(prompt) => prompt.as_ref(),
+-      Self::Doc(doc) => doc.as_ref(),
+-      Self::Group(group) => Some(group),
++      Self::Confirm(argument) | Self::Doc(argument) => argument.as_ref(),
++      Self::Extension(argument) | Self::Group(argument) => Some(argument),
+       Self::Linux
+       | Self::Macos
+       | Self::NoCd
+diff --git a/src/recipe.rs b/src/recipe.rs
+index a41ce935..2ba92470 100644
+--- a/src/recipe.rs
++++ b/src/recipe.rs
+@@ -368,7 +368,16 @@ impl<'src, D> Recipe<'src, D> {
+       io_error: error,
+     })?;
+     let mut path = tempdir.path().to_path_buf();
+-    path.push(shebang.script_filename(self.name()));
++
++    let extension = self.attributes.iter().find_map(|attribute| {
++      if let Attribute::Extension(extension) = attribute {
++        Some(extension.cooked.as_str())
++      } else {
++        None
++      }
++    });
++
++    path.push(shebang.script_filename(self.name(), extension));
+ 
+     {
+       let mut f = fs::File::create(&path).map_err(|error| Error::TempdirIo {
+diff --git a/src/shebang.rs b/src/shebang.rs
+index 067963f0..36b79dce 100644
+--- a/src/shebang.rs
++++ b/src/shebang.rs
+@@ -38,12 +38,14 @@ impl<'line> Shebang<'line> {
+       .unwrap_or(self.interpreter)
+   }
+ 
+-  pub(crate) fn script_filename(&self, recipe: &str) -> String {
+-    match self.interpreter_filename() {
+-      "cmd" | "cmd.exe" => format!("{recipe}.bat"),
+-      "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => format!("{recipe}.ps1"),
+-      _ => recipe.to_owned(),
+-    }
++  pub(crate) fn script_filename(&self, recipe: &str, extension: Option<&str>) -> String {
++    let extension = extension.unwrap_or_else(|| match self.interpreter_filename() {
++      "cmd" | "cmd.exe" => ".bat",
++      "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => ".ps1",
++      _ => "",
++    });
++
++    format!("{recipe}{extension}")
+   }
+ 
+   pub(crate) fn include_shebang_line(&self) -> bool {
+@@ -138,7 +140,9 @@ mod tests {
+   #[test]
+   fn powershell_script_filename() {
+     assert_eq!(
+-      Shebang::new("#!powershell").unwrap().script_filename("foo"),
++      Shebang::new("#!powershell")
++        .unwrap()
++        .script_filename("foo", None),
+       "foo.ps1"
+     );
+   }
+@@ -146,7 +150,7 @@ mod tests {
+   #[test]
+   fn pwsh_script_filename() {
+     assert_eq!(
+-      Shebang::new("#!pwsh").unwrap().script_filename("foo"),
++      Shebang::new("#!pwsh").unwrap().script_filename("foo", None),
+       "foo.ps1"
+     );
+   }
+@@ -156,7 +160,7 @@ mod tests {
+     assert_eq!(
+       Shebang::new("#!powershell.exe")
+         .unwrap()
+-        .script_filename("foo"),
++        .script_filename("foo", None),
+       "foo.ps1"
+     );
+   }
+@@ -164,7 +168,9 @@ mod tests {
+   #[test]
+   fn pwsh_exe_script_filename() {
+     assert_eq!(
+-      Shebang::new("#!pwsh.exe").unwrap().script_filename("foo"),
++      Shebang::new("#!pwsh.exe")
++        .unwrap()
++        .script_filename("foo", None),
+       "foo.ps1"
+     );
+   }
+@@ -172,7 +178,7 @@ mod tests {
+   #[test]
+   fn cmd_script_filename() {
+     assert_eq!(
+-      Shebang::new("#!cmd").unwrap().script_filename("foo"),
++      Shebang::new("#!cmd").unwrap().script_filename("foo", None),
+       "foo.bat"
+     );
+   }
+@@ -180,14 +186,19 @@ mod tests {
+   #[test]
+   fn cmd_exe_script_filename() {
+     assert_eq!(
+-      Shebang::new("#!cmd.exe").unwrap().script_filename("foo"),
++      Shebang::new("#!cmd.exe")
++        .unwrap()
++        .script_filename("foo", None),
+       "foo.bat"
+     );
+   }
+ 
+   #[test]
+   fn plain_script_filename() {
+-    assert_eq!(Shebang::new("#!bar").unwrap().script_filename("foo"), "foo");
++    assert_eq!(
++      Shebang::new("#!bar").unwrap().script_filename("foo", None),
++      "foo"
++    );
+   }
+ 
+   #[test]
+@@ -211,4 +222,26 @@ mod tests {
+   fn include_shebang_line_other_windows() {
+     assert!(!Shebang::new("#!foo -c").unwrap().include_shebang_line());
+   }
++
++  #[test]
++  fn filename_with_extension() {
++    assert_eq!(
++      Shebang::new("#!bar")
++        .unwrap()
++        .script_filename("foo", Some(".sh")),
++      "foo.sh"
++    );
++    assert_eq!(
++      Shebang::new("#!pwsh.exe")
++        .unwrap()
++        .script_filename("foo", Some(".sh")),
++      "foo.sh"
++    );
++    assert_eq!(
++      Shebang::new("#!cmd.exe")
++        .unwrap()
++        .script_filename("foo", Some(".sh")),
++      "foo.sh"
++    );
++  }
+ }

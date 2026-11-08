@@ -1,0 +1,244 @@
+diff --git a/tests/commands_for_test.go b/tests/commands_for_test.go
+index 8b85b48..94a6f86 100644
+--- a/tests/commands_for_test.go
++++ b/tests/commands_for_test.go
+@@ -324,6 +324,13 @@ func KeyTaint(t *testing.T, args []string) error {
+ 	return nil
+ }
+ 
++func KeyRotate(t *testing.T, args []string) ([]byte, error) {
++	t.Helper()
++	argsWithCmd := []string{"key", "rotate"}
++	argsWithCmd = append(argsWithCmd, args...)
++	return ExecuteCmd(t, argsWithCmd)
++}
++
+ func KeyUntaint(t *testing.T, args []string) error {
+ 	t.Helper()
+ 	argsWithCmd := []string{"key", "untaint"}
+@@ -705,3 +712,35 @@ func WalletList(t *testing.T, args []string) (*ListWalletsResponse, error) {
+ 	}
+ 	return resp, nil
+ }
++
++// FakeNetworkWithGRPCHost builds a network configuration whose gRPC host points
++// at the given address, so tests can observe whether a command contacts a node.
++func FakeNetworkWithGRPCHost(name, host string) string {
++	return fmt.Sprintf(`
++Name = "%s"
++Level = "info"
++TokenExpiry = "1h0m0s"
++Port = 8000
++Host = "127.0.0.1"
++
++[API.GRPC]
++Retries = 1
++Hosts = [
++    "%s",
++]
++
++[API.REST]
++Hosts = [
++    "https://example.com/rest"
++]
++
++[API.GraphQL]
++Hosts = [
++    "https://example.com/gql/query"
++]
++
++[Console]
++URL = "console.example.com"
++LocalPort = 1847
++`, name, host)
++}
+diff --git a/tests/sc_rotate_key_test.go b/tests/sc_rotate_key_test.go
+new file mode 100644
+index 0000000..e069454
+--- /dev/null
++++ b/tests/sc_rotate_key_test.go
+@@ -0,0 +1,184 @@
++package tests_test
++
++import (
++	"encoding/base64"
++	"encoding/hex"
++	"net"
++	"strings"
++	"testing"
++	"time"
++
++	commandspb "code.vegaprotocol.io/protos/vega/commands/v1"
++	vgcrypto "code.vegaprotocol.io/shared/libs/crypto"
++	"code.vegaprotocol.io/vegawallet/crypto"
++	"github.com/golang/protobuf/proto"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/encoding/protowire"
++)
++
++func TestRotateKeySucceeds(t *testing.T) {
++	home, cleanUpFn := NewTempDir(t)
++	defer cleanUpFn(t)
++	_, passphraseFilePath := NewPassphraseFile(t, home)
++	walletName := "rotation-wallet"
++	commonArgs := []string{"--home", home, "--wallet", walletName, "--passphrase-file", passphraseFilePath}
++	mnemonicFile := NewFile(t, home, "mnemonic.txt", "swing ceiling chaos green put insane ripple desk match tip melt usual shrug turkey renew icon parade veteran lens govern path rough page render")
++	_, err := WalletImport(t, []string{
++		"--home", home, "--output", "json", "--wallet", walletName,
++		"--passphrase-file", passphraseFilePath, "--mnemonic-file", mnemonicFile, "--version", "2",
++	})
++	require.NoError(t, err)
++	key, err := KeyGenerate(t, append(commonArgs, "--output", "json", "--meta", "name:key-1,role:validation"))
++	require.NoError(t, err)
++
++	output, err := KeyRotate(t, append(commonArgs,
++		"--pubkey", key.Key.KeyPair.PublicKey,
++		"--tx-height", "20",
++		"--target-height", "25",
++	))
++	require.NoError(t, err)
++
++	transactionRaw := transactionBytesFromOutput(t, output)
++	transaction := &commandspb.Transaction{}
++	require.NoError(t, proto.Unmarshal(transactionRaw, transaction))
++	require.NotEmpty(t, transaction.InputData)
++	require.Equal(t, "9df682a3c87d90567f260566a9c223ccbbb7529c38340cf163b8fe199dbf0f2e", transaction.GetPubKey())
++
++	inputFields := parseWireFields(t, transaction.InputData)
++	require.Equal(t, uint64(20), wireVarint(t, inputFields, 2), "transaction block height")
++	rotationPayload := wireBytes(t, inputFields, 2005)
++	require.NotEmpty(t, rotationPayload, "the transaction must contain a key-rotation command")
++	rotationFields := parseWireFields(t, rotationPayload)
++	require.Equal(t, uint64(25), wireVarint(t, rotationFields, 2), "key rotation target block")
++	require.Equal(t, hex.EncodeToString(vgcrypto.Hash([]byte(key.Key.KeyPair.PublicKey))), string(wireBytes(t, rotationFields, 4)))
++
++	require.NotNil(t, transaction.GetSignature())
++	signature, err := hex.DecodeString(transaction.GetSignature().Value)
++	require.NoError(t, err)
++	verified, err := crypto.VerifyMessage(&crypto.VerifyMessageRequest{
++		Message: transaction.InputData, Signature: signature, PubKey: transaction.GetPubKey(),
++	})
++	require.NoError(t, err)
++	require.True(t, verified, "the transaction signature must be valid for its sender")
++}
++
++type protobufWireField struct {
++	number protowire.Number
++	typeID protowire.Type
++	bytes  []byte
++	value  uint64
++}
++
++func parseWireFields(t *testing.T, data []byte) []protobufWireField {
++	t.Helper()
++	var fields []protobufWireField
++	for len(data) > 0 {
++		number, typeID, tagLength := protowire.ConsumeTag(data)
++		require.Greater(t, tagLength, 0, "protobuf field tag must be valid")
++		data = data[tagLength:]
++		field := protobufWireField{number: number, typeID: typeID}
++		switch typeID {
++		case protowire.BytesType:
++			value, length := protowire.ConsumeBytes(data)
++			require.GreaterOrEqual(t, length, 0, "protobuf bytes field must be valid")
++			field.bytes = append([]byte(nil), value...)
++			data = data[length:]
++		case protowire.VarintType:
++			value, length := protowire.ConsumeVarint(data)
++			require.GreaterOrEqual(t, length, 0, "protobuf varint field must be valid")
++			field.value = value
++			data = data[length:]
++		default:
++			length := protowire.ConsumeFieldValue(number, typeID, data)
++			require.Greater(t, length, 0, "protobuf field value must be valid")
++			data = data[length:]
++			continue
++		}
++		fields = append(fields, field)
++	}
++	return fields
++}
++
++func wireVarint(t *testing.T, fields []protobufWireField, number protowire.Number) uint64 {
++	t.Helper()
++	for _, field := range fields {
++		if field.number == number {
++			require.Equal(t, protowire.VarintType, field.typeID)
++			return field.value
++		}
++	}
++	require.FailNow(t, "protobuf varint field is missing", number)
++	return 0
++}
++
++func wireBytes(t *testing.T, fields []protobufWireField, number protowire.Number) []byte {
++	t.Helper()
++	for _, field := range fields {
++		if field.number == number {
++			require.Equal(t, protowire.BytesType, field.typeID)
++			return field.bytes
++		}
++	}
++	require.FailNow(t, "protobuf bytes field is missing", number)
++	return nil
++}
++
++func transactionBytesFromOutput(t *testing.T, output []byte) []byte {
++	t.Helper()
++	for _, field := range strings.Fields(string(output)) {
++		candidate, err := base64.StdEncoding.DecodeString(strings.Trim(field, "\"'[],"))
++		if err != nil {
++			continue
++		}
++		transaction := &commandspb.Transaction{}
++		if proto.Unmarshal(candidate, transaction) == nil && len(transaction.InputData) > 0 {
++			return candidate
++		}
++	}
++	require.FailNow(t, "command output did not contain a base64-encoded protobuf transaction")
++	return nil
++}
++
++func TestRotateKeyDoesNotSubmitTransactionToNetwork(t *testing.T) {
++	home, cleanUpFn := NewTempDir(t)
++	defer cleanUpFn(t)
++	_, passphraseFilePath := NewPassphraseFile(t, home)
++	walletName := "offline-wallet"
++
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer listener.Close()
++	restListener, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer restListener.Close()
++	submitted := make(chan string, 2)
++	watchEndpoint := func(name string, endpoint net.Listener) {
++		go func() {
++			conn, acceptErr := endpoint.Accept()
++			if acceptErr != nil {
++				return
++			}
++			_ = conn.Close()
++			submitted <- name
++		}()
++	}
++	watchEndpoint("gRPC", listener)
++	watchEndpoint("REST", restListener)
++
++	networkConfig := FakeNetworkWithGRPCHost("my-network", listener.Addr().String())
++	networkConfig = strings.Replace(networkConfig, "https://example.com/rest", "http://"+restListener.Addr().String(), 1)
++	networkFile := NewFile(t, home, "my-network.toml", networkConfig)
++	_, err = NetworkImport(t, []string{"--home", home, "--output", "json", "--from-file", networkFile})
++	require.NoError(t, err)
++	cmd := []string{"--home", home, "--output", "json", "--wallet", walletName, "--passphrase-file", passphraseFilePath}
++	key, err := KeyGenerate(t, append(cmd, "--meta", "name:key-1,role:validation"))
++	require.NoError(t, err)
++
++	_, err = KeyRotate(t, append(cmd, "--pubkey", key.Key.KeyPair.PublicKey, "--tx-height", "20", "--target-height", "25"))
++	require.NoError(t, err)
++	select {
++	case endpoint := <-submitted:
++		t.Fatalf("the key-rotation operation sent data to the configured %s endpoint", endpoint)
++	case <-time.After(500 * time.Millisecond):
++	}
++}

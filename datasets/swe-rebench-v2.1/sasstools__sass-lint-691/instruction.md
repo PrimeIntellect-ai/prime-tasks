@@ -1,0 +1,4 @@
+Allow configuring 'include' option as an array in sass-lint.yml
+We have our SCSS files in two separate folders, one for global styles and another where it is co-located with Angular components. From what I've seen in projects at two different companies this is a pretty typical file layout. In order to configure sass-lint to only see the actual paths we need, the only possibility at the moment is to specify `include: '**/*.scss'` and add *everything else* to the `ignore` list - but that is counter-intuitive and not really best practice since it's prone to breaking if anything in the project structure changes.
+
+IMHO this asymmetry between `include` and `ignore` should be eliminated. `include` should be specifiable as an array just like `ignore`, thus significantly reducing the configuration complexity (because `ignore` can in many cases simply be ignored). ;)

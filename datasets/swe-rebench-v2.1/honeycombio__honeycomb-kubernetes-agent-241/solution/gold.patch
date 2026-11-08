@@ -1,0 +1,247 @@
+diff --git a/config/config.go b/config/config.go
+index 879c8fb..f1d7119 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -34,6 +34,7 @@ type WatcherConfig struct {
+ 	// string means "select all pods".
+ 	LabelSelector *string  `yaml:"labelSelector"`
+ 	FilePaths     []string `yaml:"paths"`
++	ExcludePaths  []string `yaml:"exclude"`
+ 	ContainerName string   `yaml:"containerName"`
+ 	Processors    []map[string]map[string]interface{}
+ }
+diff --git a/go.mod b/go.mod
+index 67048dc..9afbaa1 100644
+--- a/go.mod
++++ b/go.mod
+@@ -3,6 +3,7 @@ module github.com/honeycombio/honeycomb-kubernetes-agent
+ go 1.12
+ 
+ require (
++	github.com/bmatcuk/doublestar/v4 v4.0.2
+ 	github.com/boltdb/bolt v1.3.1
+ 	github.com/hashicorp/golang-lru v0.5.4
+ 	github.com/honeycombio/dynsampler-go v0.2.1
+diff --git a/go.sum b/go.sum
+index 51238b6..48a5544 100644
+--- a/go.sum
++++ b/go.sum
+@@ -72,6 +72,8 @@ github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6r
+ github.com/bgentry/speakeasy v0.1.0/go.mod h1:+zsyZBPWlz7T6j88CTgSN5bM796AkVf0kBD4zp0CCIs=
+ github.com/bketelsen/crypt v0.0.4/go.mod h1:aI6NrJ0pMGgvZKL1iVgXLnfIFJtfV+bKCoqOes/6LfM=
+ github.com/blang/semver v3.5.1+incompatible/go.mod h1:kRBLl5iJ+tD4TcOOxsy/0fnwebNt5EWlYSAyrTnjyyk=
++github.com/bmatcuk/doublestar/v4 v4.0.2 h1:X0krlUVAVmtr2cRoTqR8aDMrDqnB36ht8wpWTiQ3jsA=
++github.com/bmatcuk/doublestar/v4 v4.0.2/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
+ github.com/boltdb/bolt v1.3.1 h1:JQmyP4ZBrce+ZQu0dY660FMfatumYDLun9hBCUVIkF4=
+ github.com/boltdb/bolt v1.3.1/go.mod h1:clJnj/oiGkjum5o1McbSZDSLxVThjynRyGBgiAx27Ps=
+ github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
+diff --git a/k8sagent/watcher.go b/k8sagent/watcher.go
+index f04440d..7342960 100644
+--- a/k8sagent/watcher.go
++++ b/k8sagent/watcher.go
+@@ -9,7 +9,7 @@ import (
+ 
+ 	"github.com/sirupsen/logrus"
+ 
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	v1types "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
+diff --git a/main.go b/main.go
+index aee10c4..48615b6 100644
+--- a/main.go
++++ b/main.go
+@@ -3,13 +3,14 @@ package main
+ import (
+ 	"bytes"
+ 	"fmt"
+-	"github.com/honeycombio/honeycomb-kubernetes-agent/service"
+ 	"os"
+ 	"os/signal"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+ 
++	"github.com/honeycombio/honeycomb-kubernetes-agent/service"
++
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/config"
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/handlers"
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/podtailer"
+diff --git a/podtailer/podtailer.go b/podtailer/podtailer.go
+index 48ae09e..12d5384 100644
+--- a/podtailer/podtailer.go
++++ b/podtailer/podtailer.go
+@@ -10,9 +10,10 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 
++	"github.com/bmatcuk/doublestar/v4"
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/config"
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/handlers"
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/k8sagent"
+@@ -292,12 +293,39 @@ func determineLogPattern(pod *v1.Pod, basePath string, legacyLogPaths bool) (str
+ 	return "", fmt.Errorf("Could not find specified log path for pod %s", pod.UID)
+ }
+ 
+-func determineFilterFunc(pod *v1.Pod, basePath string, containerName string, legacyLogPaths bool) func(fileName string) bool {
++func determineFilterFunc(pod *v1.Pod, basePath string, containerName string, legacyLogPaths bool, excludePaths []string) func(fileName string) bool {
++	// this is an exclude function that conforms to the filter specs -- it returns true
++	// if the file should be *included*. By default, it's nil (which is treated as true)
++	var exclusionFilter func(string) bool
++	if len(excludePaths) > 0 {
++		excludes := make([]string, 0)
++		for _, exclude := range excludePaths {
++			// don't try to evaluate patterns that we can't even parse
++			if doublestar.ValidatePattern(exclude) {
++				excludes = append(excludes, exclude)
++				logrus.WithField("exclude", exclude).Debug("Excluding path")
++			}
++		}
++		exclusionFilter = func(fileName string) bool {
++			// check if we should exclude this path
++			for _, exclude := range excludes {
++				shouldExclude, _ := doublestar.Match(exclude, fileName)
++				if shouldExclude {
++					return false // false means exclude
++				}
++			}
++			return true
++		}
++	}
+ 
+ 	if containerName == "" {
+-		logrus.Debug("No container name specified, no filter function needed")
+-		return nil
++		if len(excludePaths) == 0 {
++			logrus.Debug("No container name or exclude paths specified, no filter function needed")
++			return nil
++		}
++		return exclusionFilter
+ 	}
++
+ 	if legacyLogPaths {
+ 		re := fmt.Sprintf(
+ 			"^%s/containers/%s_%s_%s-.+\\.log",
+@@ -311,6 +339,11 @@ func determineFilterFunc(pod *v1.Pod, basePath string, containerName string, leg
+ 		}).Debug("Container filter function")
+ 
+ 		return func(fileName string) bool {
++			// first check if we should exclude this path
++			// If exclusionFilter says no, we're going to say no.
++			if exclusionFilter != nil && !exclusionFilter(fileName) {
++				return false
++			}
+ 			ok, _ := regexp.Match(re, []byte(fileName))
+ 			return ok
+ 		}
+@@ -336,15 +369,21 @@ func determineFilterFunc(pod *v1.Pod, basePath string, containerName string, leg
+ 	}).Debug("Container filter function")
+ 
+ 	return func(fileName string) bool {
+-		ok, _ := regexp.Match(re1, []byte(fileName))
++		// first check if we should exclude this path
++		// If exclusionFilter says no, we're going to say no.
++		if exclusionFilter != nil && !exclusionFilter(fileName) {
++			return false
++		}
++		// now check our patterns -- if any of them succeeds, we're good
++		ok, _ := regexp.MatchString(re1, fileName)
+ 		if ok {
+ 			return ok
+ 		}
+-		ok, _ = regexp.Match(re2, []byte(fileName))
++		ok, _ = regexp.MatchString(re2, fileName)
+ 		if ok {
+ 			return ok
+ 		}
+-		ok, _ = regexp.Match(re3, []byte(fileName))
++		ok, _ = regexp.MatchString(re3, fileName)
+ 		return ok
+ 	}
+ }
+@@ -358,7 +397,7 @@ func (pt *PodSetTailer) watcherForPod(pod *v1.Pod, containerName string, podWatc
+ 
+ 	// only watch logs for containers matching the given name, if
+ 	// one is specified
+-	filterFunc := determineFilterFunc(pod, logsBasePath, containerName, pt.legacyLogPaths)
++	filterFunc := determineFilterFunc(pod, logsBasePath, containerName, pt.legacyLogPaths, pt.config.ExcludePaths)
+ 
+ 	additionalProcessors := []processors.Processor{
+ 		&processors.KubernetesMetadataProcessor{
+diff --git a/tailer/tailer.go b/tailer/tailer.go
+index d6dd6fb..38b0bd9 100644
+--- a/tailer/tailer.go
++++ b/tailer/tailer.go
+@@ -3,16 +3,16 @@
+ package tailer
+ 
+ import (
++	"os"
+ 	"path/filepath"
+ 	"sync"
+ 	"time"
+ 
++	"github.com/bmatcuk/doublestar/v4"
+ 	"github.com/honeycombio/honeycomb-kubernetes-agent/handlers"
+ 	"github.com/hpcloud/tail"
+ 
+ 	"github.com/sirupsen/logrus"
+-
+-	"k8s.io/api/core/v1"
+ )
+ 
+ // Tailer tails a single file, passing each line off to the handler.
+@@ -123,7 +123,6 @@ type PathWatcher struct {
+ 	handlerFactory handlers.LineHandlerFactory
+ 	stateRecorder  StateRecorder
+ 	checkInterval  time.Duration
+-	pod            *v1.Pod
+ 
+ 	stop         chan bool
+ 	savedPattern string
+@@ -171,6 +170,22 @@ func (p *PathWatcher) Stop() {
+ 	}
+ }
+ 
++// This emulates filepath.Glob's behavior using doublestar,
++// which means that it now supports /**/ names in its paths.
++func doublestarGlob(pat string) ([]string, error) {
++	base, pattern := doublestar.SplitPattern(pat)
++	fsys := os.DirFS(base)
++	files, err := doublestar.Glob(fsys, pattern)
++	if err != nil {
++		return nil, err
++	}
++	var result []string
++	for _, f := range files {
++		result = append(result, filepath.Join(base, f))
++	}
++	return result, nil
++}
++
+ func (p *PathWatcher) check() {
+ 	// Have we figured out the pattern yet? If not, run our pattern function
+ 	if p.savedPattern == "" {
+@@ -188,7 +203,7 @@ func (p *PathWatcher) check() {
+ 			"log pattern": pt,
+ 		}).Info("Log pattern")
+ 	}
+-	files, err := filepath.Glob(p.savedPattern)
++	files, err := doublestarGlob(p.savedPattern)
+ 	if err != nil {
+ 		logrus.WithError(err).Error("Error globbing files")
+ 	}
+@@ -204,7 +219,7 @@ func (p *PathWatcher) check() {
+ 			if p.filter != nil && !p.filter(file) {
+ 				logrus.WithFields(logrus.Fields{
+ 					"file": file,
+-				}).Warn("File filtered out of tailing list based on containerName")
++				}).Warn("File filtered out of tailing list")
+ 				continue
+ 			}
+ 			handler := p.handlerFactory.New(file)
