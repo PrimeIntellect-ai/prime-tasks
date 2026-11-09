@@ -1,9 +1,0 @@
-You are a security engineer tasked with rotating credentials and applying security hardening to a legacy microservice. The original source code for the service has been lost, but the compiled Python bytecode is running on the system.
-
-Your objectives:
-1. **Reverse Engineering & Privilege Escalation**: The service bytecode is located at `/home/user/legacy_service.pyc` and the service is actively running on `127.0.0.1:5000`. You must decompile or analyze this file to understand its JWT-based authentication mechanism. Identify a vulnerability in the token verification (related to algorithm validation) that allows you to forge an admin token without knowing the secret key.
-2. **Rotate Credentials**: Use your forged token to authenticate as an `admin` and make a `POST` request to the `/rotate_creds` endpoint on port 5000. Extract the `new_password` from the JSON response and save exactly this string to `/home/user/new_creds.txt`.
-3. **Content Security Policy Enforcement**: The legacy service fails to set security headers. You must write a Python reverse proxy script at `/home/user/csp_proxy.py` that listens on `127.0.0.1:8080` and forwards all incoming HTTP requests to the legacy service on `127.0.0.1:5000`. Your proxy must seamlessly pass request methods, headers, and bodies. Crucially, your proxy must inject the following header into every HTTP response before returning it to the client:
-   `Content-Security-Policy: default-src 'none'; frame-ancestors 'none';`
-
-Start your proxy script in the background so it remains running. We will test your implementation by verifying the contents of `/home/user/new_creds.txt` and making requests to your proxy on port 8080 to ensure the CSP headers are correctly applied.

@@ -1,16 +1,163 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import ctypes
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import pytest
+
+INVESTIGATION = Path('/home/user/investigation')
+CORE_PATH = INVESTIGATION / 'core.c'
+RUNNER_PATH = INVESTIGATION / 'malware_runner.py'
+IMAGE_PATH = INVESTIGATION / 'fs.ext4'
+BUILD_LOG_PATH = INVESTIGATION / 'build.log'
+REPORT_PATH = INVESTIGATION / 'report.txt'
+EXPECTED_CORE = b'int generate_payload(int key) {\n    return key * 73 + 1337;\n}\n'
+
+
+def deleted_core_from_image():
+    result = subprocess.run(
+        ['fls', '-r', '-d', '-p', str(IMAGE_PATH)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=20,
+    )
+
+    inode = None
+    for line in result.stdout.splitlines():
+        match = re.search(r'\*\s+([^:]+):\s*(.+?)\s*$', line)
+        if match and match.group(2).lstrip('./') == 'core.c':
+            inode = match.group(1).strip()
+            break
+
+    assert inode is not None, 'The filesystem image has no deleted root entry named core.c.'
+    recovered = subprocess.run(
+        ['icat', '-r', str(IMAGE_PATH), inode],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+    ).stdout
+    assert recovered, 'The deleted core.c inode could not be recovered from fs.ext4.'
+    return recovered
+
+
+def leaked_secret():
+    content = BUILD_LOG_PATH.read_text()
+    match = re.search(r'^SECRET_KEY=([^\r\n]+)$', content, re.MULTILINE)
+    assert match, 'build.log does not contain the leaked SECRET_KEY configuration.'
+    return match.group(1)
+
+
+def run_runner(core_bytes, secret):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        Path(temp_dir, 'core.c').write_bytes(core_bytes)
+        env = os.environ.copy()
+        env['SECRET_KEY'] = str(secret)
+        return subprocess.run(
+            [sys.executable, str(RUNNER_PATH)],
+            cwd=temp_dir,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+
+
+def expected_from_core(core_bytes, key):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source = Path(temp_dir, 'core.c')
+        library = Path(temp_dir, 'libexpected.so')
+        source.write_bytes(core_bytes)
+        subprocess.run(
+            ['gcc', '-shared', '-fPIC', '-o', str(library), str(source)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        lib = ctypes.CDLL(str(library))
+        lib.generate_payload.argtypes = [ctypes.c_int]
+        lib.generate_payload.restype = ctypes.c_int
+        return lib.generate_payload(key)
+
+
+def test_core_c_recovered():
+    core_c_path = '/home/user/investigation/core.c'
+    assert os.path.isfile(core_c_path), f'The file {core_c_path} was not recovered.'
+    with open(core_c_path, 'r') as f:
+        content = f.read()
+    assert 'int generate_payload(int key)' in content, 'The recovered core.c does not contain the expected function.'
+    assert 'return key * 73 + 1337;' in content, 'The recovered core.c does not contain the expected logic.'
+
+    recovered_bytes = CORE_PATH.read_bytes()
+    assert recovered_bytes == EXPECTED_CORE, 'core.c is not the complete original deleted source file.'
+    assert recovered_bytes == deleted_core_from_image(), 'core.c does not match the deleted core.c inode in fs.ext4.'
+
+
+def test_malware_runner_fixed():
+    runner_path = '/home/user/investigation/malware_runner.py'
+    assert os.path.isfile(runner_path), f'The script {runner_path} is missing.'
+    with open(runner_path, 'r') as f:
+        content = f.read()
+    assert 'payload = lib.generate_payload(key)' not in content or 'int(key)' in content or 'int(os.environ' in content, \
+        'The malware_runner.py script does not appear to be fixed to handle the string environment variable.'
+
+
+def test_report_generated_and_correct():
+    report_path = '/home/user/investigation/report.txt'
+    assert os.path.isfile(report_path), f'The report file {report_path} was not generated.'
+
+    with open(report_path, 'r') as f:
+        content = f.read().strip()
+
+    expected_output = 'PAYLOAD:7248850'
+    assert content == expected_output, f"The report file does not contain the correct output. Expected '{expected_output}', got '{content}'."
+
+
+def test_runner_executes_and_report_matches_real_run():
+    core_bytes = CORE_PATH.read_bytes()
+    secret = leaked_secret()
+    result = run_runner(core_bytes, secret)
+    expected = expected_from_core(core_bytes, int(secret))
+    assert result.stdout == f'PAYLOAD:{expected}\n', 'The runner did not produce the payload generated by recovered core.c.'
+    assert REPORT_PATH.read_bytes() == result.stdout.encode(), 'report.txt is not the exact redirected output of a successful runner execution.'
+
+
+def test_runner_uses_core_and_handles_other_environment_keys():
+    core_bytes = CORE_PATH.read_bytes()
+    for key in [secrets.randbelow(200000) + 1 for _ in range(3)]:
+        expected = expected_from_core(core_bytes, key)
+        result = run_runner(core_bytes, key)
+        assert result.stdout == f'PAYLOAD:{expected}\n', f'The runner failed for SECRET_KEY={key}.'
+
+    multiplier = secrets.randbelow(80) + 2
+    offset = secrets.randbelow(5000) - 2500
+    key = secrets.randbelow(100000) + 1
+    alternate_core = (
+        'int generate_payload(int key) {\n'
+        f'    return key * {multiplier} + ({offset});\n'
+        '}\n'
+    ).encode()
+    result = run_runner(alternate_core, key)
+    expected = expected_from_core(alternate_core, key)
+    assert result.stdout == f'PAYLOAD:{expected}\n', 'The runner does not actually compile and invoke the supplied core.c implementation.'
+TEST_EOF
+
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

@@ -1,16 +1,32 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import os
+
+def test_recommendations_file_exists_and_content():
+    file_path = "/home/user/recommendations.txt"
+
+    assert os.path.exists(file_path), f"The output file {file_path} is missing."
+    assert os.path.isfile(file_path), f"The path {file_path} is not a file."
+
+    expected_lines = ["107", "104", "106"]
+
+    with open(file_path, "r") as f:
+        actual_lines = [line.strip() for line in f.readlines() if line.strip()]
+
+    assert actual_lines == expected_lines, (
+        f"The content of {file_path} is incorrect.\n"
+        f"Expected: {expected_lines}\n"
+        f"Actual: {actual_lines}"
+    )
+TEST_EOF
+
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

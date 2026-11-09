@@ -1,16 +1,31 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import os
+import pytest
+
+def test_flag_file_exists_and_correct():
+    flag_path = "/home/user/flag.txt"
+    assert os.path.isfile(flag_path), f"The file {flag_path} does not exist. You must create it."
+
+    with open(flag_path, "r") as f:
+        content = f.read().strip()
+
+    expected_password = "secure_pass_8821_alpha"
+
+    assert content == expected_password, (
+        f"The value in {flag_path} is incorrect. "
+        f"Expected '{expected_password}', but got '{content}'. "
+        "Make sure you correctly parsed the WAL file and applied only committed transactions."
+    )
+TEST_EOF
+
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

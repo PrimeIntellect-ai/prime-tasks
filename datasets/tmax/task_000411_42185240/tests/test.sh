@@ -1,16 +1,31 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+reward=0
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
-else
-    echo 0 > /logs/verifier/reward.txt
+if [ -f /home/user/forged_tokens.txt ] && [ ! -L /home/user/forged_tokens.txt ]; then
+    if verifier_output="$(python3 /app/verifier.py 2>&1)"; then
+        if SCORE_OUTPUT="$verifier_output" python3 - <<'PY'
+import math
+import os
+import sys
+
+lines = [line.strip() for line in os.environ.get("SCORE_OUTPUT", "").splitlines() if line.strip()]
+if not lines:
+    sys.exit(1)
+
+try:
+    score = float(lines[-1])
+except ValueError:
+    sys.exit(1)
+
+sys.exit(0 if math.isfinite(score) and score >= 0.95 else 1)
+PY
+        then
+            reward=1
+        fi
+    fi
 fi
 
-exit 0
+echo "$reward" > /logs/verifier/reward.txt
