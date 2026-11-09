@@ -16,7 +16,7 @@ import tomli_w
 
 UPSTREAM_REVISION = "660b33a86ed032559df0b2fdc1ad38cf7ceb83f3"
 DATASET_REVISION = "d43a66575635da0d3f6cb9a20976dc1a60f3ffc9"
-IMAGE = "prime/florian/jobbench:660b33a"
+IMAGE = "prime/primeintellect/jobbench:660b33a"
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("upstream", type=Path, help="Checkout of Job-Bench/job-bench-eval at the pinned revision")
