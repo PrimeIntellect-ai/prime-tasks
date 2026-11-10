@@ -59,15 +59,6 @@ for record in manifest["tasks"]:
     )
     (task_dir / "environment/Dockerfile").unlink()
     (task_dir / "environment/requirements.txt").unlink()
-    instruction = (task_dir / "instruction.md").read_text()
-    (task_dir / "instruction.md").write_text(
-        "\n".join(
-            line
-            for line in instruction.splitlines()
-            if not line.startswith(("- If you encounter ambiguous", "- If a file cannot be read directly"))
-        )
-        + "\n"
-    )
 
 provenance = {
     "upstream_repo": "https://github.com/Job-Bench/job-bench-eval",
