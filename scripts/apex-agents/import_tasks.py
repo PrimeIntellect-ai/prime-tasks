@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["harbor>=0.24"]
 # ///
-"""Export and verify the pinned mercor/apex-agents-1-1@1.1.1 Harbor dataset."""
+"""Verify the pinned APEX-Agents export and apply the credential transport fix."""
 
 import argparse
 import asyncio
@@ -13,15 +13,42 @@ import sys
 import tempfile
 from pathlib import Path
 
-from harbor.db.client import RegistryDB
-from harbor.publisher.packager import Packager
-
 ORG = "mercor"
 NAME = "apex-agents-1-1"
 TAG = "1.1.1"
 DATASET_HASH = "3fe2900ebd603ea5a802049819ce6ead171575ee0166a61187065ad9606c955d"
 EXPECTED_TASKS = 240
 DESTINATION = Path(__file__).resolve().parents[2] / "datasets/apex-agents"
+LOCAL_MODIFICATIONS = [
+    "tests/grade.py: pass grading settings to the runner over stdin instead of "
+    "writing judge credentials to a temporary JSON file"
+]
+
+
+def patch_grader(task_dir: Path) -> None:
+    """Apply the same narrow patch after validating the upstream content hash."""
+    path = task_dir / "tests/grade.py"
+    source = path.read_text()
+    replacements = (
+        ('        "grading_settings.json": json.dumps(judge_settings(config)),\n', ""),
+        (
+            '        "--grading-settings", str(workdir / "grading_settings.json"),',
+            '        "--grading-settings", "/dev/stdin",',
+        ),
+        (
+            "    result = subprocess.run(command, cwd=GRADING_PROJECT)",
+            "    # Keep judge credentials off disk; the runner reads this pipe as JSON.\n"
+            "    result = subprocess.run(\n"
+            "        command, cwd=GRADING_PROJECT,\n"
+            "        input=json.dumps(judge_settings(config)), text=True,\n"
+            "    )",
+        ),
+    )
+    for before, after in replacements:
+        if source.count(before) != 1:
+            raise ValueError(f"{path}: upstream grader no longer matches the stdin patch")
+        source = source.replace(before, after)
+    path.write_text(source)
 
 
 def export_from_harbor(output_dir: Path) -> Path:
@@ -43,6 +70,8 @@ def export_from_harbor(output_dir: Path) -> Path:
 
 
 async def fetch_manifest() -> tuple[str, list[tuple[str, str]]]:
+    from harbor.db.client import RegistryDB
+
     db = RegistryDB()
     _, version = await db.resolve_dataset_version(ORG, NAME, TAG)
     if version.get("content_hash") != DATASET_HASH:
@@ -59,6 +88,8 @@ async def fetch_manifest() -> tuple[str, list[tuple[str, str]]]:
 
 
 def main() -> None:
+    from harbor.publisher.packager import Packager
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
@@ -103,7 +134,13 @@ def main() -> None:
             if dst_task.exists():
                 shutil.rmtree(dst_task)
             shutil.copytree(src_task, dst_task)
-            records.append({"name": task_name, "content_hash": computed_hash})
+            patch_grader(dst_task)
+            exported_hash, _ = Packager.compute_content_hash(dst_task)
+            records.append({
+                "name": task_name,
+                "content_hash": computed_hash,
+                "exported_content_hash": exported_hash,
+            })
 
     provenance = {
         "dataset": f"{ORG}/{NAME}",
@@ -111,6 +148,7 @@ def main() -> None:
         "version": version,
         "content_hash": DATASET_HASH,
         "license": "CC-BY-4.0",
+        "local_modifications": LOCAL_MODIFICATIONS,
         "tasks": records,
     }
     (DESTINATION / "provenance.json").write_text(

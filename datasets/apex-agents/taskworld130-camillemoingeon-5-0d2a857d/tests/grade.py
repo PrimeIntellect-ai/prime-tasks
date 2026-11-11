@@ -122,7 +122,6 @@ def run_grading(config: dict[str, Any], workdir: Path) -> dict[str, Any]:
     metadata = config.get("metadata") or {}
     files = {
         "trajectory.json": json.dumps(trajectory),
-        "grading_settings.json": json.dumps(judge_settings(config)),
         "verifiers.json": json.dumps(config["verifiers"]),
         "eval_configs.json": json.dumps(config["eval_configs"]),
         "scoring_config.json": json.dumps(config["scoring_config"]),
@@ -141,7 +140,7 @@ def run_grading(config: dict[str, Any], workdir: Path) -> dict[str, Any]:
         "--initial-snapshot", str(workdir / "initial.zip"),
         "--final-snapshot", str(workdir / "final.zip"),
         "--trajectory", str(workdir / "trajectory.json"),
-        "--grading-settings", str(workdir / "grading_settings.json"),
+        "--grading-settings", "/dev/stdin",
         "--verifiers", str(workdir / "verifiers.json"),
         "--eval-configs", str(workdir / "eval_configs.json"),
         "--scoring-config", str(workdir / "scoring_config.json"),
@@ -152,7 +151,11 @@ def run_grading(config: dict[str, Any], workdir: Path) -> dict[str, Any]:
         command += ["--golden-snapshot", str(workdir / "golden.zip")]
 
     log(f"running grading runner for {task_id}")
-    result = subprocess.run(command, cwd=GRADING_PROJECT)
+    # Keep judge credentials off disk; the runner reads this pipe as JSON.
+    result = subprocess.run(
+        command, cwd=GRADING_PROJECT,
+        input=json.dumps(judge_settings(config)), text=True,
+    )
     if result.returncode != 0:
         raise GradingError(f"grading runner exited {result.returncode}")
 
