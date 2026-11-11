@@ -1,0 +1,1 @@
+Can you help me re-evaluate and state CompliSure's adjusted 2030 net income? I want it run as a 2030 sensitivity where the adjustment is driven by the new Sales & Marketing and Hosting & Infrastructure spend per the expense growth rates. Round the final answer to 2 decimal places in $M and please provide your answer directly here.

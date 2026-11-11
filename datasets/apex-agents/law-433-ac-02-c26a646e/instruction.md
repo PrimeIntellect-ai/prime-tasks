@@ -1,0 +1,1 @@
+Please review Grove’s 2023 and 2025 operations manuals. Identify every change in the 2025 manual that may present an issue for Grove’s regulatory compliance. For each one, tell me what changed in the 2025 manual and why it presents an issue. Reply back to me here.

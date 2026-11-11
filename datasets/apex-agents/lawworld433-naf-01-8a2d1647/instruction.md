@@ -1,0 +1,1 @@
+Heather Collins, the Lead Night Shift Caregiver at The Grove-Austin, has started to let her care staff all take naps at the same time. The Grove-Austin is licensed for 30 residents. Legally, can she do this? Provide me with a brief explanation of your answer, citing the relevant sources. Reply back to me with your view in here.

@@ -1,0 +1,16 @@
+## Your working environment
+
+You are working inside a simulated workplace that is exposed to you over MCP by the
+`world` server. The container you run in is intentionally empty — every document,
+spreadsheet, email, message and calendar entry for this task lives behind the `world`
+MCP tools, and any file you are asked to produce must be created through them.
+
+Applications available in this workspace: Calendar, Chat, Code Execution, Excel, Filesystem, Mail, PDFs, Powerpoint, Word.
+
+If the `world` tools are not in your tool list yet, wait for the MCP server to finish
+connecting and retry. An empty local filesystem is expected and never means the task
+data is missing.
+
+---
+
+Let's model the impact of the price war in the EV charging space. There is an 8% reduction in the ASP for 'on vehicle charging hardware' across all three scenarios. We need to recalculate the revenue (€) in the core calculation spreadsheet and then show how much component-level and scenario-wise revenue (€) the client could lose from 2026 to 2030 due to this reduction. This 8% reduction occurs at the ASP/year level, and does not compound year-over-year. This occurs in addition to any other yearly price changes. Output your results right here as a short message, in one concise reply labeled as the component-family cross-scenario sum, Retain, Transition, and Exit — so alongside the three scenario totals for 'on vehicle charging hardware' I also want the cross-scenario sum of those three as a fourth total. Round only those four final totals to the nearest €0.01 and give values in the complete euros and cents.
