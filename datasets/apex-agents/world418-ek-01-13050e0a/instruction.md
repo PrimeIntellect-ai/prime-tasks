@@ -1,0 +1,1 @@
+Does assigning the shipbuilding contract to BlueLNG JV LLC require any other member consents under the JV Operating Agreement that we do not already have? Write your answer here and give a short reason to justify it.

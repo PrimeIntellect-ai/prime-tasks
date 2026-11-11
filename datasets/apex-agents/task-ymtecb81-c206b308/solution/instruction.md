@@ -1,0 +1,20 @@
+## Your working environment
+
+You are working inside a simulated workplace that is exposed to you over MCP by the
+`world` server. The container you run in is intentionally empty — every document,
+spreadsheet, email, message and calendar entry for this task lives behind the `world`
+MCP tools, and any file you are asked to produce must be created through them.
+
+Applications available in this workspace: Calendar, Chat, Code Execution, Excel, Filesystem, Mail, PDFs, Powerpoint, Word.
+
+If the `world` tools are not in your tool list yet, wait for the MCP server to finish
+connecting and retry. An empty local filesystem is expected and never means the task
+data is missing.
+
+---
+
+Can you take a look at the two Master Supply Agreement templates (Master Supply Agreement Template.pdf ("Template1"), Master Supply Agreement Template 2.pdf ("Template2"))? Those two files are the only agreements in scope; the separately named Master Supply Agreement Template 1 and Master Supply Agreement Template 4 files are different documents. We're considering them for Acme (the steel supplier) and we want a comparison.
+
+I need to know how each template deals with tariff‑related cost exposure, since Acme is importing steel from outside USMCA and the new tariffs are creating real financial pressure. Also, TAC is thinking about giving Acme a cash infusion secured by a lien on their receivables, but we’re worried about what happens if Acme goes bankrupt. 
+
+Assume any such financing would be properly documented and perfected, and that TAC would actively exercise the operational rights the chosen template gives it. Could you assess whether that financing structure would expose TAC to creditor claims, which template gives TAC the most operational control, and which template leaves TAC in the better position if we go ahead with the lien? Please point to the clauses that support your analysis. Now, send me a clear text summary straight in here.

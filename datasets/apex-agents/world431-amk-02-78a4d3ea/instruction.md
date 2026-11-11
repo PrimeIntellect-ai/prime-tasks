@@ -1,0 +1,3 @@
+MGR Real Estate Inc. (the "Lessor") and "AI Automation Group, LLC" (the "Lessee") entered into the final lease agreement on December 5, 2025 (the “Lease”) for 2020 Main Street, Irvine, CA (the "Premises").
+
+On January 8, 2027, Lessee demanded that Lessor replace the Premises' flooring, which had cracked and splintered in many locations. The flooring is original to the Building and was already at the end of its useful life when the Lease commenced. Neither Lessee nor its agents, contractors, employees or invitees caused the damage; the flooring deteriorated through age and ordinary use. Under the Lease, can Lessor require Lessee to install new flooring at Lessee's expense? Give me a yes or no answer right here, and your explanation.

@@ -1,0 +1,3 @@
+As you know, the new artist montage reel is a hit. Unfortunately, one of the artists featured is not a fan of the wardrobe upgrade - Mara Sings sent a takedown notice, and we initially complied, but we'd like to keep the reel in production and on air.
+
+Can you draft a letter to Mara that sets out her obligations and ours under her licensing agreements and asks her permission to keep the reel on air? You can cite those agreements and California law to defend Streams' position when relevant, but the rationale shouldn't come off heavy-handed, more like lightly persuasive - a starting point for negotiations. Reply back to me here with the main body of the letter.

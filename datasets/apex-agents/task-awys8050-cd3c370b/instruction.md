@@ -1,0 +1,5 @@
+Larry Stone, a CrowdStrike shareholder, has filed a separate action against the company in U.S. district court, asserting the same claims at issue in Plymouth County Retirement Association v. CrowdStrike Holdings, Inc.: violations of Sections 10(b) and 20(a) of the Securities Exchange Act of 1934 and Rule 10b-5, based on false statements or omissions regarding the Falcon Sensor and the update that caused the July 2024 service outage. Stone claims a resulting loss in the value of his Class A stock.
+
+Assume the Plymouth class has been certified using the class definition alleged in the complaint, that Rule 23(c)(2)(B) notice has issued, and that the exclusion period has closed without Stone opting out.
+
+Reply with a short memo determining whether Stone falls within the certified class and whether CrowdStrike is likely to obtain dismissal of his separate action on the ground that he is bound by the class judgment. If dismissal is available, identify the facts establishing his class membership and the basis for dismissal. Deliver the memo as a new Word document named "Larry Stone Suit.docx".

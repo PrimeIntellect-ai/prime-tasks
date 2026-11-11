@@ -1,0 +1,1 @@
+Review the attached email (stored as a docx file), as well as the cases available in the world. Write a message to me stating whether the email exchange alone establishes that John engaged in unlawful off-label promotion.
