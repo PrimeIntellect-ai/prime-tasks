@@ -19,7 +19,7 @@ Build the verifier image from this directory:
 ```bash
 uv run prime images push \
   terminal-bench-science-verifier.x86.tess-transit-vetting:91531bf50016-run-dirs-v1 \
-  --context tess-transit-vetting/tests --private
+  --context tess-transit-vetting/tests --public
 ```
 
 The `terminal-bench-science` taskset in `prime-envs` consumes this task through a
