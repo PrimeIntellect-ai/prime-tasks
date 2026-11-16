@@ -1,0 +1,233 @@
+diff --git a/docs/content/docs/templates.md b/docs/content/docs/templates.md
+index f910ebd..a12a1ee 100644
+--- a/docs/content/docs/templates.md
++++ b/docs/content/docs/templates.md
+@@ -26,14 +26,25 @@ Tera has a few literals that can be used:
+ 
+ Variables are defined by the context given when rendering a template.
+ 
+-You can render a variable by using the `{{ name }}` construct and attributes
+-can be accessed by using the dot (`.`) like `{{ product.name }}`. 
+-Specific members of an array or tuple are accessed by using the `.i` notation, where i is a zero-based index.
++You can render a variable by using the `{{ name }}`.
+ 
+ Trying to access or render a variable that doesn't exist will result in an error.
+ 
+ A magical variable is available in every template if you want to print the current context: `__tera_context`.
+ 
++### Dot notation:
++Construct and attributes can be accessed by using the dot (`.`) like `{{ product.name }}`.
++Specific members of an array or tuple are accessed by using the `.i` notation, where i is a zero-based index.
++
++### Square bracket notation:
++A more powerful alternative to (`.`) is to use square brackets (`[ ]`).
++Variables can be rendering using the notation `{{product['name']}}` or `{{product["name"]}}`.
++
++If the item is not in quotes it will be treated as a variable allowing things like:
++- `my_field = "name"`,
++- `product = Product{name:"Fred"}`
++- `{{product[my_field]}}` which resolves to: `{{product.name}}`
++
+ ## Expressions
+ 
+ Tera allows expressions almost everywhere.
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index 84ffac6..c072d4f 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -176,7 +176,7 @@ fn parse_basic_expression(pair: Pair<Rule>) -> ExprVal {
+         Rule::fn_call => ExprVal::FunctionCall(parse_fn_call(pair)),
+         Rule::macro_call => ExprVal::MacroCall(parse_macro_call(pair)),
+         Rule::string => ExprVal::String(pair.as_str().replace("\"", "").to_string()),
+-        Rule::dotted_ident => ExprVal::Ident(pair.as_str().to_string()),
++        Rule::dotted_square_bracket_ident => ExprVal::Ident(pair.as_str().to_string()),
+         Rule::basic_expr => MATH_CLIMBER.climb(pair.into_inner(), primary, infix),
+         _ => unreachable!("Got {:?} in parse_basic_expression", pair.as_rule())
+     }
+@@ -743,8 +743,10 @@ pub fn parse(input: &str) -> TeraResult<Vec<Node>> {
+                     Rule::basic_op => "a mathematical operator".to_string(),
+                     Rule::comparison_op => "a comparison operator".to_string(),
+                     Rule::boolean => "`true` or `false`".to_string(),
+-                    Rule::ident => "an identifier".to_string(),
++                    Rule::ident => "an identifier (must start with a-z)".to_string(),
+                     Rule::dotted_ident => "a dotted identifier (identifiers separated by `.`)".to_string(),
++                    Rule::dotted_square_bracket_ident => "a square bracketed identifier (identifiers separated by `.` or `[]`s)".to_string(),
++                    Rule::square_brackets => "an identifier, string or integer inside `[]`s".to_string(),
+                     Rule::basic_expr_filter => "an expression with an optional filter".to_string(),
+                     Rule::comparison_val => "a comparison value".to_string(),
+                     Rule::basic_expr | Rule::comparison_expr => "an expression".to_string(),
+diff --git a/src/parser/tera.pest b/src/parser/tera.pest
+index 65a6c7d..325c45a 100644
+--- a/src/parser/tera.pest
++++ b/src/parser/tera.pest
+@@ -63,13 +63,21 @@ dotted_ident = @{
+     ("." ~ all_chars+)*
+ }
+ 
++square_brackets = @{
++    "[" ~ (int | string | dotted_square_bracket_ident) ~ "]"
++}
++
++dotted_square_bracket_ident = @{
++    dotted_ident ~ ( ("." ~ all_chars+) | square_brackets )*
++}
++
+ // ----------------------------------------------------
+ 
+ /// EXPRESSIONS
+ /// We'll use precedence climbing on those in the parser phase
+ 
+ // boolean first so they are not caught as identifiers
+-basic_val  = _{ boolean | test | macro_call | fn_call | dotted_ident | string | float | int }
++basic_val  = _{ boolean | test | macro_call | fn_call | dotted_square_bracket_ident | float | int | string }
+ basic_op   = _{ op_plus | op_minus | op_times | op_slash | op_modulo }
+ basic_expr = { ("(" ~ basic_expr ~ ")" | basic_val) ~ (basic_op ~ basic_val)* }
+ basic_expr_filter = { basic_expr ~ filter* }
+diff --git a/src/renderer/mod.rs b/src/renderer/mod.rs
+index 225f3a9..f316338 100644
+--- a/src/renderer/mod.rs
++++ b/src/renderer/mod.rs
+@@ -1,4 +1,5 @@
+ mod forloop;
++mod square_brackets;
+ #[cfg(test)]
+ mod tests;
+ 
+@@ -9,6 +10,7 @@ use serde_json::value::{Value, to_value, Number};
+ use serde_json::map::{Map as JsonMap};
+ 
+ use self::forloop::{ForLoop};
++use self::square_brackets::{pull_out_square_bracket};
+ use parser::ast::*;
+ use template::Template;
+ use tera::Tera;
+@@ -81,11 +83,70 @@ impl<'a> Renderer<'a> {
+             return Ok(to_value(to_string_pretty(context).unwrap()).unwrap());
+         }
+ 
++        #[inline]
++        fn evaluate_sub_variable(context: &Value, key: &str, tpl_name: &str) -> Result<String> {
++            let sub_vars_to_calc = pull_out_square_bracket(key);
++            let mut new_key = key.to_string();
++
++            for sub_var in sub_vars_to_calc.iter() {
++                // Translate from variable name to variable value
++                match find_variable(context, sub_var.as_ref(), tpl_name) {
++                    Err(e) => {
++                        bail!(format!("Variable {} can not be built because: {}", key, e));
++                    },
++                    Ok(post_var) => {
++                        let post_var_as_str = {
++                            if post_var.is_string() {
++                                post_var.as_str().unwrap().to_string()
++                            } else if post_var.is_f64() {
++                                post_var.as_f64().unwrap().to_string()
++                            } else if post_var.is_i64() {
++                                post_var.as_i64().unwrap().to_string()
++                            } else if post_var.is_boolean() {
++                                post_var.as_bool().unwrap().to_string()
++                            } else {
++                                panic!("Unknown Type")
++                            }
++                        };
++
++                        // Rebuild the original key String replacing variable name with value
++                        let nk = new_key.clone();
++                        let divider = "[".to_string() + sub_var + "]";
++                        let mut the_parts = nk.splitn(2, divider.as_str());
++
++                        new_key = the_parts.next().unwrap().to_string()
++                                + "."
++                                + post_var_as_str.as_ref()
++                                + the_parts.next().unwrap_or("");
++                    }
++                }
++            }
++            Ok(new_key
++                .replace("['", ".")
++                .replace("[\"", ".")
++                .replace("[", ".")
++                .replace("']", "")
++                .replace("\"]", "")
++                .replace("]", "")
++            )
++        }
++
+         #[inline]
+         fn find_variable(context: &Value, key: &str, tpl_name: &str) -> Result<Value> {
+-            match context.pointer(&get_json_pointer(key)) {
++            let key_s =
++                if key.contains('[') {
++                    evaluate_sub_variable(context, key, tpl_name)?
++                } else {
++                    key.into()
++                };
++
++            match context.pointer(&get_json_pointer(key_s.as_ref())) {
+                 Some(v) => Ok(v.clone()),
+-                None => bail!("Variable `{}` not found in context while rendering '{}'", key, tpl_name)
++                None => bail!(
++                    "Variable `{}` not found in context while rendering '{}'",
++                    key,
++                    tpl_name
++                ),
+             }
+         }
+ 
+diff --git a/src/renderer/square_brackets.rs b/src/renderer/square_brackets.rs
+new file mode 100644
+index 0000000..aeadfdd
+--- /dev/null
++++ b/src/renderer/square_brackets.rs
+@@ -0,0 +1,51 @@
++
++/// Return a Vec of all substrings contained in '[ ]'s
++/// Ignore quoted strings and integers.
++pub fn pull_out_square_bracket(s: &str) -> Vec<String> {
++    let mut chars = s.chars();
++    let mut results = vec![];
++    loop {
++        match chars.next() {
++            Some('[') => {
++                let c = chars.next().unwrap();
++                if c != '"' && c != '\'' {
++                    let mut inside_bracket = vec![c];
++                    let mut bracket_count = 1;
++                    loop {
++                        let c = chars.next();
++                        match c {
++                            Some(']') => bracket_count -= 1,
++                            Some('[') => bracket_count += 1,
++                            Some(_) => (),
++                            None => break,
++                        };
++                        if bracket_count == 0 {
++                            // Only store results which aren't numbers
++                            let sub :String = inside_bracket.into_iter().collect();
++                            if sub.parse::<usize>().is_err() {
++                                results.push(sub);
++                            }
++                            break;
++                        }
++                        inside_bracket.push(c.unwrap());
++                    }
++                }
++            },
++            None => break,
++            _ => (),
++        }
++    }
++    results
++}
++
++#[test]
++fn test_pull_out_square_bracket() {
++    assert_eq!(pull_out_square_bracket("hi"), Vec::<String>::new());
++    assert_eq!(pull_out_square_bracket("['hi']"), Vec::<String>::new());
++    assert_eq!(pull_out_square_bracket("[hi] a[0]"), vec!["hi"]);
++    assert_eq!(
++        pull_out_square_bracket("hi [th[e]['r']e] [fish]"),
++        vec!["th[e]['r']e", "fish"]
++    );
++}
++

@@ -1,0 +1,274 @@
+diff --git a/pkg/consts/consts.go b/pkg/consts/consts.go
+index ee5340a60..d832b28d4 100644
+--- a/pkg/consts/consts.go
++++ b/pkg/consts/consts.go
+@@ -432,6 +432,14 @@ const CreatedByTag = "k8s-azure-created-by"
+ const (
+ 	HealthProbeAnnotationPrefixPattern = "service.beta.kubernetes.io/port_%d_health-probe_"
+ 
++	// HealthProbeParamsProtocol determines the protocol for the health probe params.
++	// It always takes priority over spec.appProtocol or any other specified protocol
++	HealthProbeParamsProtocol HealthProbeParams = "protocol"
++
++	// HealthProbeParamsPort determines the probe port for the health probe params.
++	// It always takes priority over the NodePort of the spec.ports in a Service
++	HealthProbeParamsPort HealthProbeParams = "port"
++
+ 	// HealthProbeParamsProbeInterval determines the probe interval of the load balancer health probe.
+ 	// The minimum probe interval is 5 seconds and the default value is 5. The total duration of all intervals cannot exceed 120 seconds.
+ 	HealthProbeParamsProbeInterval  HealthProbeParams = "interval"
+diff --git a/pkg/provider/azure_loadbalancer.go b/pkg/provider/azure_loadbalancer.go
+index fde9fe6bc..e9018224d 100644
+--- a/pkg/provider/azure_loadbalancer.go
++++ b/pkg/provider/azure_loadbalancer.go
+@@ -2065,19 +2065,45 @@ func (az *Cloud) buildHealthProbeRulesForPort(annotations map[string]string, por
+ 
+ 	properties := &network.ProbePropertiesFormat{}
+ 	var err error
+-	if port.AppProtocol == nil {
+-		if port.AppProtocol, err = consts.GetAttributeValueInSvcAnnotation(annotations, consts.ServiceAnnotationLoadBalancerHealthProbeProtocol); err != nil {
++
++	// order - Specific Override
++	// port_ annotation
++	// global annotation
++
++	// Select Protocol
++	//
++	var protocol *string
++
++	// 1. Look up port-specific override
++	protocol, err = consts.GetHealthProbeConfigOfPortFromK8sSvcAnnotation(annotations, port.Port, consts.HealthProbeParamsProtocol)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse annotation %s: %w", consts.BuildHealthProbeAnnotationKeyForPort(port.Port, consts.HealthProbeParamsProtocol), err)
++	}
++
++	// 2. If not specified, look up from AppProtocol
++	// Note - this order is to remain compatible with previous versions
++	if protocol == nil {
++		protocol = port.AppProtocol
++	}
++
++	// 3. If protocol is still nil, check the global annotation
++	if protocol == nil {
++		protocol, err = consts.GetAttributeValueInSvcAnnotation(annotations, consts.ServiceAnnotationLoadBalancerHealthProbeProtocol)
++		if err != nil {
+ 			return nil, fmt.Errorf("failed to parse annotation %s: %w", consts.ServiceAnnotationLoadBalancerHealthProbeProtocol, err)
+ 		}
+-		if port.AppProtocol == nil {
+-			port.AppProtocol = to.StringPtr(string(network.ProtocolTCP))
+-		}
+ 	}
+-	protocol := strings.TrimSpace(*port.AppProtocol)
++
++	// 4. Finally, if protocol is still nil, default to TCP
++	if protocol == nil {
++		protocol = to.StringPtr(string(network.ProtocolTCP))
++	}
++
++	*protocol = strings.TrimSpace(*protocol)
+ 	switch {
+-	case strings.EqualFold(protocol, string(network.ProtocolTCP)):
++	case strings.EqualFold(*protocol, string(network.ProtocolTCP)):
+ 		properties.Protocol = network.ProbeProtocolTCP
+-	case strings.EqualFold(protocol, string(network.ProtocolHTTPS)):
++	case strings.EqualFold(*protocol, string(network.ProtocolHTTPS)):
+ 		//HTTPS probe is only supported in standard loadbalancer
+ 		//For backward compatibility,when unsupported protocol is used, fall back to tcp protocol in basic lb mode instead
+ 		if !az.useStandardLoadBalancer() {
+@@ -2085,13 +2111,39 @@ func (az *Cloud) buildHealthProbeRulesForPort(annotations map[string]string, por
+ 		} else {
+ 			properties.Protocol = network.ProbeProtocolHTTPS
+ 		}
+-	case strings.EqualFold(protocol, string(network.ProtocolHTTP)):
++	case strings.EqualFold(*protocol, string(network.ProtocolHTTP)):
+ 		properties.Protocol = network.ProbeProtocolHTTP
+ 	default:
+ 		//For backward compatibility,when unsupported protocol is used, fall back to tcp protocol in basic lb mode instead
+ 		properties.Protocol = network.ProbeProtocolTCP
+ 	}
+ 
++	// Lookup or Override Health Probe Port
++	properties.Port = &port.NodePort
++
++	// Look up port-specific override
++	var probePortValidator = func(val *int32) error {
++		//minimum number of unhealthy responses is 2. ref: https://docs.microsoft.com/en-us/rest/api/load-balancer/load-balancers/create-or-update#probe
++		const (
++			MinProbePort = 1
++			MaxProbePort = 65535
++		)
++		if *val < MinProbePort || *val > MaxProbePort {
++			return fmt.Errorf("the value of %s must be between %d and %d inclusive", consts.HealthProbeParamsPort, MinProbePort, MaxProbePort)
++		}
++		return nil
++	}
++
++	probePort, err := consts.GetInt32HealthProbeConfigOfPortFromK8sSvcAnnotation(annotations, port.Port, consts.HealthProbeParamsPort, probePortValidator)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse annotation %s: %w", consts.BuildHealthProbeAnnotationKeyForPort(port.Port, consts.HealthProbeParamsPort), err)
++	}
++
++	if probePort != nil {
++		properties.Port = probePort
++	}
++
++	// Select request path
+ 	if strings.EqualFold(string(properties.Protocol), string(network.ProtocolHTTPS)) || strings.EqualFold(string(properties.Protocol), string(network.ProtocolHTTP)) {
+ 		// get request path ,only used with http/https probe
+ 		path, err := consts.GetHealthProbeConfigOfPortFromK8sSvcAnnotation(annotations, port.Port, consts.HealthProbeParamsRequestPath)
+@@ -2165,7 +2217,6 @@ func (az *Cloud) buildHealthProbeRulesForPort(annotations map[string]string, por
+ 	}
+ 	properties.IntervalInSeconds = probeInterval
+ 	properties.NumberOfProbes = numberOfProbes
+-	properties.Port = &port.NodePort
+ 	probe := &network.Probe{
+ 		Name:                  &lbrule,
+ 		ProbePropertiesFormat: properties,
+@@ -2173,6 +2224,25 @@ func (az *Cloud) buildHealthProbeRulesForPort(annotations map[string]string, por
+ 	return probe, nil
+ }
+ 
++// probeKey generates a string key containing all functional probe configuration, to allow de-duplication of like probes.
++func probeKey(probe network.Probe) string {
++	var port, interval, number int32
++	var path string
++	if probe.Port != nil {
++		port = *probe.Port
++	}
++	if probe.IntervalInSeconds != nil {
++		interval = *probe.IntervalInSeconds
++	}
++	if probe.NumberOfProbes != nil {
++		number = *probe.NumberOfProbes
++	}
++	if probe.RequestPath != nil {
++		path = *probe.RequestPath
++	}
++	return fmt.Sprintf("%s-%d-%d-%d-%s", probe.Protocol, port, interval, number, path)
++}
++
+ // buildLBRules
+ // for following sku: basic loadbalancer vs standard load balancer
+ // for following scenario: internal vs external
+@@ -2184,6 +2254,7 @@ func (az *Cloud) getExpectedLBRules(
+ 
+ 	var expectedRules []network.LoadBalancingRule
+ 	var expectedProbes []network.Probe
++	uniqueProbes := make(map[string]network.Probe)
+ 
+ 	// support podPresence health check when External Traffic Policy is local
+ 	// take precedence over user defined probe configuration
+@@ -2204,7 +2275,7 @@ func (az *Cloud) getExpectedLBRules(
+ 				NumberOfProbes:    to.Int32Ptr(consts.HealthProbeDefaultNumOfProbe),
+ 			},
+ 		}
+-		expectedProbes = append(expectedProbes, *nodeEndpointHealthprobe)
++		uniqueProbes[probeKey(*nodeEndpointHealthprobe)] = *nodeEndpointHealthprobe
+ 	}
+ 
+ 	// In HA mode, lb forward traffic of all port to backend
+@@ -2231,7 +2302,7 @@ func (az *Cloud) getExpectedLBRules(
+ 					//ignore error because we only need one correct rule
+ 				}
+ 				if portprobe != nil {
+-					expectedProbes = append(expectedProbes, *portprobe)
++					uniqueProbes[probeKey(*portprobe)] = *portprobe
+ 					props.Probe = &network.SubResource{
+ 						ID: to.StringPtr(az.getLoadBalancerProbeID(lbName, az.getLoadBalancerResourceGroup(), *portprobe.Name)),
+ 					}
+@@ -2277,7 +2348,7 @@ func (az *Cloud) getExpectedLBRules(
+ 					return expectedProbes, expectedRules, err
+ 				}
+ 				if portprobe != nil {
+-					expectedProbes = append(expectedProbes, *portprobe)
++					uniqueProbes[probeKey(*portprobe)] = *portprobe
+ 					props.Probe = &network.SubResource{
+ 						ID: to.StringPtr(az.getLoadBalancerProbeID(lbName, az.getLoadBalancerResourceGroup(), *portprobe.Name)),
+ 					}
+@@ -2299,6 +2370,10 @@ func (az *Cloud) getExpectedLBRules(
+ 		}
+ 	}
+ 
++	for _, probe := range uniqueProbes {
++		expectedProbes = append(expectedProbes, probe)
++	}
++
+ 	return expectedProbes, expectedRules, nil
+ }
+ 
+diff --git a/site/content/en/topics/loadbalancer.md b/site/content/en/topics/loadbalancer.md
+index 4f3c28507..51c72ae60 100644
+--- a/site/content/en/topics/loadbalancer.md
++++ b/site/content/en/topics/loadbalancer.md
+@@ -33,6 +33,8 @@ Below is a list of annotations supported for Kubernetes services with type `Load
+ | `service.beta.kubernetes.io/azure-load-balancer-health-probe-interval` | Health probe interval | Refer to the detailed docs [here](#custom-load-balancer-health-probe) | v1.21 and later  with out-of-tree cloud provider  |
+ | `service.beta.kubernetes.io/azure-load-balancer-health-probe-num-of-probe` | The minimum number of unhealthy responses of health probe  |  Refer to the detailed docs [here](#custom-load-balancer-health-probe) |	v1.21 and later  with out-of-tree cloud provider|
+ | `service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path` | Request path of the health probe | Refer to the detailed docs [here](#custom-load-balancer-health-probe) | v1.20 and later  with out-of-tree cloud provider|
++| `service.beta.kubernetes.io/port_{port}_health-probe_protocol` | Health probe protocol | {port} is the port number in the service. Explicit protocol for the health probe for the service port {port}, overriding port.appProtocol if set.  Refer to the detailed docs [here](#custom-load-balancer-health-probe) | v1.21 and later with out-of-tree cloud provider|
++| `service.beta.kubernetes.io/port_{port}_health-probe_port` | Health probe protocol |  port} is the port number in the service. Explicit port for the health probe for the service port {port}, overriding the default value.  Refer to the detailed docs [here](#custom-load-balancer-health-probe) | v1.21 and later with out-of-tree cloud provider|
+ | `service.beta.kubernetes.io/port_{port}_health-probe_interval` | Health probe interval |  {port} is port number of service.  Refer to the detailed docs [here](#custom-load-balancer-health-probe) | v1.21 and later  with out-of-tree cloud provider|
+ | `service.beta.kubernetes.io/port_{port}_health-probe_num-of-probe` | The minimum number of unhealthy responses of health probe  | {port} is port number of service. Refer to the detailed docs [here](#custom-load-balancer-health-probe) |	v1.21 and later with out-of-tree cloud provider|
+ | `service.beta.kubernetes.io/port_{port}_health-probe_request-path` | Request path of the health probe | {port} is port number of service.  Refer to the detailed docs [here](#custom-load-balancer-health-probe) | v1.20 and later with out-of-tree cloud provider|
+@@ -189,14 +191,17 @@ Since v1.21, two service annotations `service.beta.kubernetes.io/azure-load-bala
+ 
+ 
+ ### Custom Load Balancer health probe for port
++Different ports in a service may require different health probe configurations. This could be because of service design (such as a single health endpoint controlling multiple ports), or Kubernetes features like the [MixedProtocolLBService](https://kubernetes.io/docs/concepts/services-networking/service/#load-balancers-with-mixed-protocol-types).
+ 
+-Because [MixedProtocolLBService](https://kubernetes.io/docs/concepts/services-networking/service/#load-balancers-with-mixed-protocol-types) feature is in alpha stage, Ports in one service may have different probe configurations. Following annotations are introduced to customize probe configuration for one port.
++The following annotations can be used to customize probe configuration per service port.
+ 
+-| port specific annotation | global probe annotation |
+-| --| -- |
+-|service.beta.kubernetes.io/port_{port}_health-probe_request-path|service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path|
+-|service.beta.kubernetes.io/port_{port}_health-probe_num-of-probe|service.beta.kubernetes.io/azure-load-balancer-health-probe-num-of-probe|
+-|service.beta.kubernetes.io/port_{port}_health-probe_interval    |service.beta.kubernetes.io/azure-load-balancer-health-probe-interval    |
++| port specific annotation | global probe annotation | Usage |
++| --| -- | -- |
++|service.beta.kubernetes.io/port_{port}_health-probe_protocol| N/A (no equivalent globally) | Set the health probe protocol for this service port (e.g. Http, Https, Tcp) |
++|service.beta.kubernetes.io/port_{port}_health-probe_port| N/A (no equivalent globally) | Sets the health probe port for this service port (e.g. 15021) |
++|service.beta.kubernetes.io/port_{port}_health-probe_request-path|service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path| For Http or Https, sets the health probe request path. Defaults to /|
++|service.beta.kubernetes.io/port_{port}_health-probe_num-of-probe|service.beta.kubernetes.io/azure-load-balancer-health-probe-num-of-probe| Number of consecutive probe failures before the port is considered unhealthy|
++|service.beta.kubernetes.io/port_{port}_health-probe_interval    |service.beta.kubernetes.io/azure-load-balancer-health-probe-interval    | The amount of time between probe attempts |
+ 
+ For following manifest, probe rule for port httpsserver is different from the one for httpserver because annoations for port httpsserver are specified.
+ 
+@@ -224,6 +229,38 @@ spec:
+       targetPort: 30104
+ ```
+ 
++In this manifest, the https ports use a different health probe endpoint, an HTTP readiness check at port 30000 on /healthz/ready.
++```yaml
++apiVersion: v1
++kind: Service
++metadata:
++  name: istio
++  annotations:
++    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
++    service.beta.kubernetes.io/port_443_health-probe_protocol: "http"
++    service.beta.kubernetes.io/port_443_health-probe_port: "30000"
++    service.beta.kubernetes.io/port_443_health-probe_request-path: "/healthz/ready"
++spec:
++  ports:
++    - name: https
++      protocol: TCP
++      port: 443
++      targetPort: 8443
++      appProtocol: https
++  selector:
++    app: istio-ingressgateway
++    gateway: istio-ingressgateway
++    istio: ingressgateway
++  type: LoadBalancer
++  sessionAffinity: None
++  externalTrafficPolicy: Local
++  ipFamilies:
++    - IPv4
++  ipFamilyPolicy: SingleStack
++  allocateLoadBalancerNodePorts: true
++  internalTrafficPolicy: Cluster
++```
++
+ ## Configure Load Balancer backend
+ 
+ > This feature is supported since v1.23.0

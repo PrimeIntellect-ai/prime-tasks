@@ -1,0 +1,262 @@
+diff --git a/README.markdown b/README.markdown
+index b6af86f..a229a97 100644
+--- a/README.markdown
++++ b/README.markdown
+@@ -309,12 +309,13 @@ _(Click to expand the following items.)_
+ <details>
+ <summary>🐣 Parameters of new DNS records</summary>
+ 
+-> 👉 The updater will preserve existing proxy and TTL settings until it has to create new DNS records (or recreate deleted ones). Only when it creates DNS records, the above settings will apply. To change existing proxy and TTL settings now, you can go to your [Cloudflare Dashboard](https://dash.cloudflare.com) and change them directly. If you think you have a use case where the updater should actively overwrite existing proxy and TTL settings in addition to IP addresses, please [let me know](https://github.com/favonia/cloudflare-ddns/issues/new). It is not hard to implement optional overwriting.
++> 👉 The updater will preserve existing proxy and TTL settings and other record parameters unless it has to create new DNS records (or recreate deleted ones). Only when it creates DNS records, the following settings will apply. To change existing record parameters now, you can go to your [Cloudflare Dashboard](https://dash.cloudflare.com) and change them directly. If you think you have a use case where the updater should actively overwrite existing record parameters in addition to IP addresses, please [let me know](https://github.com/favonia/cloudflare-ddns/issues/new).
+ 
+-| Name      | Valid Values                                                                                                                                                                             | Meaning                                                 | Required? | Default Value                              |
+-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | --------- | ------------------------------------------ |
+-| `PROXIED` | Boolean values, such as `true`, `false`, `0` and `1`. See [strconv.ParseBool](https://pkg.go.dev/strconv#ParseBool). 🧪 See below for experimental support of per-domain proxy settings. | Whether new DNS records should be proxied by Cloudflare | No        | `false`                                    |
+-| `TTL`     | Time-to-live (TTL) values in seconds                                                                                                                                                     | The TTL values used to create new DNS records           | No        | `1` (This means “automatic” to Cloudflare) |
++| Name             | Valid Values                                                                                                                                                                             | Meaning                                                                                                                                    | Required? | Default Value                              |
++| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------- | ------------------------------------------ |
++| `PROXIED`        | Boolean values, such as `true`, `false`, `0` and `1`. See [strconv.ParseBool](https://pkg.go.dev/strconv#ParseBool). 🧪 See below for experimental support of per-domain proxy settings. | Whether new DNS records should be proxied by Cloudflare                                                                                    | No        | `false`                                    |
++| `TTL`            | Time-to-live (TTL) values in seconds                                                                                                                                                     | The TTL values used to create new DNS records                                                                                              | No        | `1` (This means “automatic” to Cloudflare) |
++| `RECORD_COMMENT` | Strings (that consist of only [Unicode graphic characters](https://en.wikipedia.org/wiki/Graphic_character))                                                                             | The [record comment](https://developers.cloudflare.com/dns/manage-dns-records/reference/record-attributes/) used to create new DNS records | No        | `""`                                       |
+ 
+ > <details>
+ > <summary>🧪 Experimental per-domain proxy settings (subject to changes):</summary>
+diff --git a/internal/api/base.go b/internal/api/base.go
+index 084889f..0d93f9e 100644
+--- a/internal/api/base.go
++++ b/internal/api/base.go
+@@ -26,7 +26,7 @@ type Handle interface {
+ 
+ 	// CreateRecord creates one DNS record.
+ 	CreateRecord(ctx context.Context, ppfmt pp.PP, domain domain.Domain, ipNet ipnet.Type,
+-		ip netip.Addr, ttl TTL, proxied bool) (string, bool)
++		ip netip.Addr, ttl TTL, proxied bool, recordComment string) (string, bool)
+ 
+ 	// FlushCache flushes the API cache. Flushing should automatically happen when other operations encounter errors.
+ 	FlushCache()
+diff --git a/internal/api/cloudflare.go b/internal/api/cloudflare.go
+index 23e0e5a..871f094 100644
+--- a/internal/api/cloudflare.go
++++ b/internal/api/cloudflare.go
+@@ -272,7 +272,7 @@ func (h *CloudflareHandle) UpdateRecord(ctx context.Context, ppfmt pp.PP,
+ 
+ // CreateRecord creates one DNS record.
+ func (h *CloudflareHandle) CreateRecord(ctx context.Context, ppfmt pp.PP,
+-	domain domain.Domain, ipNet ipnet.Type, ip netip.Addr, ttl TTL, proxied bool,
++	domain domain.Domain, ipNet ipnet.Type, ip netip.Addr, ttl TTL, proxied bool, recordComment string,
+ ) (string, bool) {
+ 	zone, ok := h.ZoneOfDomain(ctx, ppfmt, domain)
+ 	if !ok {
+@@ -286,7 +286,7 @@ func (h *CloudflareHandle) CreateRecord(ctx context.Context, ppfmt pp.PP,
+ 		Content: ip.String(),
+ 		TTL:     ttl.Int(),
+ 		Proxied: &proxied,
+-		Comment: "Created by cloudflare-ddns",
++		Comment: recordComment,
+ 	}
+ 
+ 	res, err := h.cf.CreateDNSRecord(ctx, cloudflare.ZoneIdentifier(zone), params)
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0734dc8..757862f 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -27,6 +27,7 @@ type Config struct {
+ 	TTL              api.TTL
+ 	ProxiedTemplate  string
+ 	Proxied          map[domain.Domain]bool
++	RecordComment    string
+ 	DetectionTimeout time.Duration
+ 	UpdateTimeout    time.Duration
+ 	Monitors         []monitor.Monitor
+@@ -53,6 +54,7 @@ func Default() *Config {
+ 		TTL:              api.TTLAuto,
+ 		ProxiedTemplate:  "false",
+ 		Proxied:          map[domain.Domain]bool{},
++		RecordComment:    "",
+ 		UpdateTimeout:    time.Second * 30, //nolint:mnd
+ 		DetectionTimeout: time.Second * 5,  //nolint:mnd
+ 		Monitors:         nil,
+diff --git a/internal/config/config_print.go b/internal/config/config_print.go
+index 4094790..f0805da 100644
+--- a/internal/config/config_print.go
++++ b/internal/config/config_print.go
+@@ -3,6 +3,7 @@ package config
+ 
+ import (
+ 	"fmt"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -17,6 +18,13 @@ import (
+ 
+ const itemTitleWidth = 24
+ 
++func describeComment(c string) string {
++	if c == "" {
++		return "(empty)"
++	}
++	return strconv.Quote(c)
++}
++
+ func describeDomains(domains []domain.Domain) string {
+ 	if len(domains) == 0 {
+ 		return "(none)"
+@@ -79,11 +87,12 @@ func (c *Config) Print(ppfmt pp.PP) {
+ 
+ 	section("New DNS records:")
+ 	item("TTL:", "%s", c.TTL.Describe())
+-	if len(c.Proxied) > 0 {
++	{
+ 		_, inverseMap := getInverseMap(c.Proxied)
+ 		item("Proxied domains:", "%s", describeDomains(inverseMap[true]))
+ 		item("Unproxied domains:", "%s", describeDomains(inverseMap[false]))
+ 	}
++	item("Record comment:", "%s", describeComment(c.RecordComment))
+ 
+ 	section("Timeouts:")
+ 	item("IP detection:", "%v", c.DetectionTimeout)
+diff --git a/internal/config/config_read.go b/internal/config/config_read.go
+index bfd19e5..c78c26a 100644
+--- a/internal/config/config_read.go
++++ b/internal/config/config_read.go
+@@ -26,6 +26,7 @@ func (c *Config) ReadEnv(ppfmt pp.PP) bool {
+ 		!ReadNonnegDuration(ppfmt, "CACHE_EXPIRATION", &c.CacheExpiration) ||
+ 		!ReadTTL(ppfmt, "TTL", &c.TTL) ||
+ 		!ReadString(ppfmt, "PROXIED", &c.ProxiedTemplate) ||
++		!ReadString(ppfmt, "RECORD_COMMENT", &c.RecordComment) ||
+ 		!ReadNonnegDuration(ppfmt, "DETECTION_TIMEOUT", &c.DetectionTimeout) ||
+ 		!ReadNonnegDuration(ppfmt, "UPDATE_TIMEOUT", &c.UpdateTimeout) ||
+ 		!ReadAndAppendHealthchecksURL(ppfmt, "HEALTHCHECKS", &c.Monitors) ||
+diff --git a/internal/mocks/mock_api.go b/internal/mocks/mock_api.go
+index 5c90de5..ccb26f4 100644
+--- a/internal/mocks/mock_api.go
++++ b/internal/mocks/mock_api.go
+@@ -44,18 +44,18 @@ func (m *MockHandle) EXPECT() *MockHandleMockRecorder {
+ }
+ 
+ // CreateRecord mocks base method.
+-func (m *MockHandle) CreateRecord(arg0 context.Context, arg1 pp.PP, arg2 domain.Domain, arg3 ipnet.Type, arg4 netip.Addr, arg5 api.TTL, arg6 bool) (string, bool) {
++func (m *MockHandle) CreateRecord(arg0 context.Context, arg1 pp.PP, arg2 domain.Domain, arg3 ipnet.Type, arg4 netip.Addr, arg5 api.TTL, arg6 bool, arg7 string) (string, bool) {
+ 	m.ctrl.T.Helper()
+-	ret := m.ctrl.Call(m, "CreateRecord", arg0, arg1, arg2, arg3, arg4, arg5, arg6)
++	ret := m.ctrl.Call(m, "CreateRecord", arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+ 	ret0, _ := ret[0].(string)
+ 	ret1, _ := ret[1].(bool)
+ 	return ret0, ret1
+ }
+ 
+ // CreateRecord indicates an expected call of CreateRecord.
+-func (mr *MockHandleMockRecorder) CreateRecord(arg0, arg1, arg2, arg3, arg4, arg5, arg6 any) *HandleCreateRecordCall {
++func (mr *MockHandleMockRecorder) CreateRecord(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7 any) *HandleCreateRecordCall {
+ 	mr.mock.ctrl.T.Helper()
+-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateRecord", reflect.TypeOf((*MockHandle)(nil).CreateRecord), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
++	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateRecord", reflect.TypeOf((*MockHandle)(nil).CreateRecord), arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+ 	return &HandleCreateRecordCall{Call: call}
+ }
+ 
+@@ -71,13 +71,13 @@ func (c *HandleCreateRecordCall) Return(arg0 string, arg1 bool) *HandleCreateRec
+ }
+ 
+ // Do rewrite *gomock.Call.Do
+-func (c *HandleCreateRecordCall) Do(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool) (string, bool)) *HandleCreateRecordCall {
++func (c *HandleCreateRecordCall) Do(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool, string) (string, bool)) *HandleCreateRecordCall {
+ 	c.Call = c.Call.Do(f)
+ 	return c
+ }
+ 
+ // DoAndReturn rewrite *gomock.Call.DoAndReturn
+-func (c *HandleCreateRecordCall) DoAndReturn(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool) (string, bool)) *HandleCreateRecordCall {
++func (c *HandleCreateRecordCall) DoAndReturn(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool, string) (string, bool)) *HandleCreateRecordCall {
+ 	c.Call = c.Call.DoAndReturn(f)
+ 	return c
+ }
+diff --git a/internal/mocks/mock_setter.go b/internal/mocks/mock_setter.go
+index 2b21ad6..5b1995c 100644
+--- a/internal/mocks/mock_setter.go
++++ b/internal/mocks/mock_setter.go
+@@ -83,17 +83,17 @@ func (c *SetterDeleteCall) DoAndReturn(f func(context.Context, pp.PP, domain.Dom
+ }
+ 
+ // Set mocks base method.
+-func (m *MockSetter) Set(arg0 context.Context, arg1 pp.PP, arg2 domain.Domain, arg3 ipnet.Type, arg4 netip.Addr, arg5 api.TTL, arg6 bool) setter.ResponseCode {
++func (m *MockSetter) Set(arg0 context.Context, arg1 pp.PP, arg2 domain.Domain, arg3 ipnet.Type, arg4 netip.Addr, arg5 api.TTL, arg6 bool, arg7 string) setter.ResponseCode {
+ 	m.ctrl.T.Helper()
+-	ret := m.ctrl.Call(m, "Set", arg0, arg1, arg2, arg3, arg4, arg5, arg6)
++	ret := m.ctrl.Call(m, "Set", arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+ 	ret0, _ := ret[0].(setter.ResponseCode)
+ 	return ret0
+ }
+ 
+ // Set indicates an expected call of Set.
+-func (mr *MockSetterMockRecorder) Set(arg0, arg1, arg2, arg3, arg4, arg5, arg6 any) *SetterSetCall {
++func (mr *MockSetterMockRecorder) Set(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7 any) *SetterSetCall {
+ 	mr.mock.ctrl.T.Helper()
+-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Set", reflect.TypeOf((*MockSetter)(nil).Set), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
++	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Set", reflect.TypeOf((*MockSetter)(nil).Set), arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+ 	return &SetterSetCall{Call: call}
+ }
+ 
+@@ -109,13 +109,13 @@ func (c *SetterSetCall) Return(arg0 setter.ResponseCode) *SetterSetCall {
+ }
+ 
+ // Do rewrite *gomock.Call.Do
+-func (c *SetterSetCall) Do(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool) setter.ResponseCode) *SetterSetCall {
++func (c *SetterSetCall) Do(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool, string) setter.ResponseCode) *SetterSetCall {
+ 	c.Call = c.Call.Do(f)
+ 	return c
+ }
+ 
+ // DoAndReturn rewrite *gomock.Call.DoAndReturn
+-func (c *SetterSetCall) DoAndReturn(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool) setter.ResponseCode) *SetterSetCall {
++func (c *SetterSetCall) DoAndReturn(f func(context.Context, pp.PP, domain.Domain, ipnet.Type, netip.Addr, api.TTL, bool, string) setter.ResponseCode) *SetterSetCall {
+ 	c.Call = c.Call.DoAndReturn(f)
+ 	return c
+ }
+diff --git a/internal/setter/base.go b/internal/setter/base.go
+index 0d3e465..fd8c964 100644
+--- a/internal/setter/base.go
++++ b/internal/setter/base.go
+@@ -28,6 +28,7 @@ type Setter interface {
+ 		IP netip.Addr,
+ 		ttl api.TTL,
+ 		proxied bool,
++		recordComment string,
+ 	) ResponseCode
+ 
+ 	// Delete removes DNS records of a particular domain.
+diff --git a/internal/setter/setter.go b/internal/setter/setter.go
+index d14ad22..35ea1ab 100644
+--- a/internal/setter/setter.go
++++ b/internal/setter/setter.go
+@@ -47,7 +47,7 @@ func New(_ppfmt pp.PP, handle api.Handle) (Setter, bool) {
+ //
+ //nolint:funlen
+ func (s *setter) Set(ctx context.Context, ppfmt pp.PP,
+-	domain domain.Domain, ipnet ipnet.Type, ip netip.Addr, ttl api.TTL, proxied bool,
++	domain domain.Domain, ipnet ipnet.Type, ip netip.Addr, ttl api.TTL, proxied bool, recordComment string,
+ ) ResponseCode {
+ 	recordType := ipnet.RecordType()
+ 	domainDescription := domain.Describe()
+@@ -140,7 +140,7 @@ func (s *setter) Set(ctx context.Context, ppfmt pp.PP,
+ 	// any one of them. This leaves us no choices---we have to create a new record with the correct IP.
+ 	if !foundMatched {
+ 		if id, ok := s.Handle.CreateRecord(ctx, ppfmt,
+-			domain, ipnet, ip, ttl, proxied); ok {
++			domain, ipnet, ip, ttl, proxied, recordComment); ok {
+ 			ppfmt.Noticef(pp.EmojiCreateRecord, "Added a new %s record of %q (ID: %q)", recordType, domainDescription, id)
+ 
+ 			// Now it's up to date! unprocessedMatched and unprocessedUnmatched must both be empty at this point
+diff --git a/internal/updater/updater.go b/internal/updater/updater.go
+index 31caabe..2313ab7 100644
+--- a/internal/updater/updater.go
++++ b/internal/updater/updater.go
+@@ -59,7 +59,7 @@ func setIP(ctx context.Context, ppfmt pp.PP,
+ 		ctx, cancel := context.WithTimeoutCause(ctx, c.UpdateTimeout, errSettingTimeout)
+ 		defer cancel()
+ 
+-		resp := s.Set(ctx, ppfmt, domain, ipNet, ip, c.TTL, getProxied(ppfmt, c, domain))
++		resp := s.Set(ctx, ppfmt, domain, ipNet, ip, c.TTL, getProxied(ppfmt, c, domain), c.RecordComment)
+ 		resps.Register(resp, domain)
+ 		if resp == setter.ResponseFailed {
+ 			if ShouldDisplayHints["update-timeout"] && errors.Is(context.Cause(ctx), errSettingTimeout) {

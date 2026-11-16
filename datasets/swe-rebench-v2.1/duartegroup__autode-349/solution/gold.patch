@@ -1,0 +1,221 @@
+diff --git a/autode/opt/coordinates/dic.py b/autode/opt/coordinates/dic.py
+index 7cf3abd..44d4418 100644
+--- a/autode/opt/coordinates/dic.py
++++ b/autode/opt/coordinates/dic.py
+@@ -34,7 +34,7 @@ if TYPE_CHECKING:
+     from autode.hessians import Hessian
+ 
+ 
+-MAX_BACK_TRANSFORM_ITERS = 20
++MAX_BACK_TRANSFORM_ITERS = 50
+ 
+ 
+ class DIC(InternalCoordinates):  # lgtm [py/missing-equals]
+@@ -70,8 +70,10 @@ class DIC(InternalCoordinates):  # lgtm [py/missing-equals]
+         Returns:
+             (np.ndarray): U
+         """
+-
+-        lambd, u = np.linalg.eigh(primitives.G)
++        # calculate spectroscopic G matrix
++        B = primitives.get_B(x)
++        G = np.dot(B, B.T)
++        lambd, u = np.linalg.eigh(G)
+ 
+         # Form a transform matrix from the primitive internals by removing the
+         # redundant subspace comprised of small eigenvalues. This forms a set
+@@ -124,8 +126,9 @@ class DIC(InternalCoordinates):  # lgtm [py/missing-equals]
+ 
+         dic.U = U  # Transform matrix primitives -> non-redundant
+ 
+-        dic.B = np.matmul(U.T, primitives.B)
++        dic.B = np.matmul(U.T, primitives.get_B(x))
+         dic.B_T_inv = np.linalg.pinv(dic.B)
++        dic._q = q.copy()
+         dic._x = x.copy()
+         dic.primitives = primitives
+ 
+@@ -215,23 +218,46 @@ class DIC(InternalCoordinates):  # lgtm [py/missing-equals]
+ 
+         # Initialise
+         s_k, x_k = np.array(self, copy=True), self.to("cartesian").copy()
+-        q_init = self.primitives(x_k)
++        q_init = self._q
+         x_1 = self.to("cartesian") + np.matmul(self.B_T_inv, value)
+ 
+         success = False
+         rms_s = np.inf
++        # NOTE: J. Comput. Chem., 2013, 34, 1842 suggests if step size
++        # is larger than 0.5 bohr (= 0.2 Å), internal step can be halved
++        # for easier convergence (i.e. damp = 1/2)
++        if np.linalg.norm(value) > 0.2:
++            damp = 0.5
++        else:
++            damp = 1.0
++
++        # hybrid SIBT/IBT algorithm
+         for i in range(1, MAX_BACK_TRANSFORM_ITERS + 1):
+             try:
+-                x_k = x_k + np.matmul(self.B_T_inv, (s_new - s_k))
++                x_k = x_k + np.matmul(self.B_T_inv, damp * (s_new - s_k))
+ 
+-                # Rebuild the primitives & DIC from the back-transformed Cartesians
++                # Rebuild the DIC from back-transformed Cartesians
+                 q_k = self.primitives.close_to(x_k, q_init)
+                 s_k = np.matmul(self.U.T, q_k)
+-                self.B = np.matmul(self.U.T, self.primitives.B)
+-                self.B_T_inv = np.linalg.pinv(self.B)
+ 
++                # Rebuild the B matrix every 10 steps
++                if i % 10 == 0:
++                    self.B = np.matmul(self.U.T, self.primitives.get_B(x_k))
++                    self.B_T_inv = np.linalg.pinv(self.B)
++
++                rms_s_old = rms_s
+                 rms_s = np.sqrt(np.mean(np.square(s_k - s_new)))
+ 
++                # almost converged, turn off damping
++                if rms_s < 1e-6:
++                    damp = 1.0
++                # RMS going down, reduce damping
++                elif rms_s < rms_s_old and i > 1:
++                    damp = min(1.2 * damp, 1.0)
++                # RMS going up, increase damping
++                elif rms_s > rms_s_old:
++                    damp = max(0.7 * damp, 0.1)
++
+             # for ill-conditioned primitives, there might be math error
+             except ArithmeticError:
+                 break
+@@ -256,11 +282,13 @@ class DIC(InternalCoordinates):  # lgtm [py/missing-equals]
+                     "DIC->Cart iterative back-transform did not converge"
+                 )
+ 
+-        s_k = np.matmul(self.U.T, self.primitives(x_k))
+-        self.B = np.matmul(self.U.T, self.primitives.B)
++        q_k = self.primitives.close_to(x_k, q_init)
++        s_k = np.matmul(self.U.T, q_k)
++        self.B = np.matmul(self.U.T, self.primitives.get_B(x_k))
+         self.B_T_inv = np.linalg.pinv(self.B)
+ 
+         self[:] = s_k
++        self._q = q_k
+         self._x = x_k
+ 
+         return self
+diff --git a/autode/opt/coordinates/internals.py b/autode/opt/coordinates/internals.py
+index 421ddf7..d4b608b 100644
+--- a/autode/opt/coordinates/internals.py
++++ b/autode/opt/coordinates/internals.py
+@@ -48,9 +48,10 @@ class InternalCoordinates(OptCoordinates, ABC):  # lgtm [py/missing-equals]
+         arr = super().__new__(cls, input_array, units="Å")
+ 
+         arr._x = None
++        arr._q = None
+         arr.primitives = None
+ 
+-        for attr in ("_x", "primitives"):
++        for attr in ("_x", "primitives", "_q"):
+             setattr(arr, attr, getattr(input_array, attr, None))
+ 
+         return arr
+@@ -59,7 +60,7 @@ class InternalCoordinates(OptCoordinates, ABC):  # lgtm [py/missing-equals]
+         """See https://numpy.org/doc/stable/user/basics.subclassing.html"""
+         OptCoordinates.__array_finalize__(self, obj)
+ 
+-        for attr in ("_x", "primitives"):
++        for attr in ("_x", "primitives", "_q"):
+             setattr(self, attr, getattr(obj, attr, None))
+ 
+         return
+@@ -91,8 +92,6 @@ class PIC(list, ABC):
+         """
+         super().__init__(args)
+ 
+-        self._B: Optional[np.ndarray] = None
+-
+         if not self._are_all_primitive_coordinates(args):
+             raise ValueError(
+                 "Cannot construct primitive internal coordinates "
+@@ -107,28 +106,11 @@ class PIC(list, ABC):
+             super().append(item)
+ 
+     def append(self, item: Primitive) -> None:
+-        """Append an item to this set of primitives"""
++        """Appending directly is not allowed, use add() instead"""
+         raise NotImplementedError(
+             "Please use PIC.add() to add new primitives to the set"
+         )
+ 
+-    @property
+-    def B(self) -> np.ndarray:
+-        """Wilson B matrix"""
+-
+-        if self._B is None:
+-            raise AttributeError(
+-                f"{self} had no B matrix. Please calculate "
+-                f"the value of the primitives to determine B"
+-            )
+-
+-        return self._B
+-
+-    @property
+-    def G(self) -> np.ndarray:
+-        """Spectroscopic G matrix as the symmetrised Wilson B matrix"""
+-        return np.dot(self.B, self.B.T)
+-
+     @classmethod
+     def from_cartesian(
+         cls,
+@@ -146,7 +128,6 @@ class PIC(list, ABC):
+         """Populate Primitive-s used in the construction of set"""
+ 
+         q = self._calc_q(x)
+-        self._calc_B(x)
+ 
+         return q
+ 
+@@ -160,7 +141,6 @@ class PIC(list, ABC):
+         assert len(self) == len(other) and isinstance(other, np.ndarray)
+ 
+         q = self._calc_q(x)
+-        self._calc_B(x)
+ 
+         for i, primitive in enumerate(self):
+             if isinstance(primitive, PrimitiveDihedralAngle):
+@@ -194,7 +174,7 @@ class PIC(list, ABC):
+     def _populate_all(self, x: np.ndarray) -> None:
+         """Populate primitives from an array of cartesian coordinates"""
+ 
+-    def _calc_B(self, x: np.ndarray) -> None:
++    def get_B(self, x: np.ndarray) -> np.ndarray:
+         """Calculate the Wilson B matrix"""
+ 
+         if len(self) == 0:
+@@ -210,8 +190,7 @@ class PIC(list, ABC):
+         for i, primitive in enumerate(self):
+             B[i] = primitive.derivative(x=cart_coords)
+ 
+-        self._B = B
+-        return None
++        return B
+ 
+     @staticmethod
+     def _are_all_primitive_coordinates(args: tuple) -> bool:
+diff --git a/doc/changelog.rst b/doc/changelog.rst
+index e91f244..b66d774 100644
+--- a/doc/changelog.rst
++++ b/doc/changelog.rst
+@@ -10,10 +10,11 @@ Functionality improvements
+ - Improved constrained optimisation (:code:`CRFOptimiser`) and handling of multiple constraints
+ - Adds compatability with numpy v2.0
+ - Improved implementation of the RFO-TRM (:code:`QAOptimiser`) optimiser that can handle constraints
++- Added static internal back-transform and damping for faster and easier DIC to Cartesian coordinate transformation
+ 
+ Bug Fixes
+ *********
+-- ...
++- DIC to Cartesian transform will now always use :code:`PIC.close_to()` to ensure steps along dihedral have the smallest change, even after back-transform is complete
+ 
+ 
+ 1.4.3

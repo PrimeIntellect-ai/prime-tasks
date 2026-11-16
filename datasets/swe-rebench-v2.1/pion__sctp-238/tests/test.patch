@@ -1,0 +1,277 @@
+diff --git a/vnet_test.go b/vnet_test.go
+index bdf7994..5d62f03 100644
+--- a/vnet_test.go
++++ b/vnet_test.go
+@@ -385,13 +385,31 @@ func TestRwndFull(t *testing.T) {
+ 	})
+ }
+ 
++func streamState(stream *Stream) (string, bool) {
++	stateMethod := reflect.ValueOf(stream).MethodByName("State")
++	if !stateMethod.IsValid() {
++		return "", false
++	}
++	state := stateMethod.Call(nil)
++	if len(state) != 1 {
++		return "", false
++	}
++	return fmt.Sprint(state[0].Interface()), true
++}
++
++func assertStreamState(t *testing.T, stream *Stream, expected string) {
++	state, ok := streamState(stream)
++	if assert.True(t, ok, "stream lifecycle state should be observable") {
++		assert.Equal(t, expected, state)
++	}
++}
++
+ func TestStreamClose(t *testing.T) {
+-	lim := test.TimeOut(time.Second * 10)
++	lim := test.TimeOut(10 * time.Second)
+ 	defer lim.Stop()
+ 
+ 	loggerFactory := logging.NewDefaultLoggerFactory()
+ 	log := loggerFactory.NewLogger("test")
+-
+ 	venv, err := buildVNetEnv(&vNetEnvConfig{
+ 		loggerFactory: loggerFactory,
+ 		log:           log,
+@@ -405,160 +423,112 @@ func TestStreamClose(t *testing.T) {
+ 	defer venv.wan.Stop() // nolint:errcheck
+ 
+ 	serverStreamReady := make(chan struct{})
+-	clientStreamReady := make(chan struct{})
+-	clientStartClose := make(chan struct{})
+-	serverStreamClosed := make(chan struct{})
+-	shutDownClient := make(chan struct{})
+-	clientShutDown := make(chan struct{})
+-	serverShutDown := make(chan struct{})
+-
++	serverCloseHandled := make(chan struct{})
++	serverResetObserved := make(chan struct{})
++	serverStreamState := make(chan *Stream, 1)
++	serverDone := make(chan struct{})
+ 	go func() {
+-		defer close(serverShutDown)
+-		// connected UDP conn for server
+-		conn, err := venv.net0.DialUDP("udp4",
++		defer close(serverDone)
++		conn, innerErr := venv.net0.DialUDP("udp4",
+ 			&net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 5000},
+ 			&net.UDPAddr{IP: net.ParseIP("2.2.2.2"), Port: 5000},
+ 		)
+-		if !assert.NoError(t, err, "should succeed") {
++		if !assert.NoError(t, innerErr, "should succeed") {
+ 			return
+ 		}
+ 		defer conn.Close() // nolint:errcheck
+ 
+-		// server association
+-		assoc, err := Server(Config{
+-			NetConn:       conn,
+-			LoggerFactory: loggerFactory,
+-		})
+-		if !assert.NoError(t, err, "should succeed") {
++		assoc, innerErr := Server(Config{NetConn: conn, LoggerFactory: loggerFactory})
++		if !assert.NoError(t, innerErr, "should succeed") {
+ 			return
+ 		}
+ 		defer assoc.Close() // nolint:errcheck
+ 
+-		log.Info("server handshake complete")
+-
+-		stream, err := assoc.AcceptStream()
+-		if !assert.NoError(t, err, "should succeed") {
++		stream, innerErr := assoc.AcceptStream()
++		if !assert.NoError(t, innerErr, "should succeed") {
+ 			return
+ 		}
+ 		defer stream.Close() // nolint:errcheck
+ 
+ 		buf := make([]byte, 1500)
+-		for {
+-			n, err := stream.Read(buf)
+-			if err != nil {
+-				t.Logf("server: Read returned %v", err)
+-				break
+-			}
+-
+-			if !assert.Equal(t, "HELLO", string(buf[:n]), "should receive HELLO") {
+-				continue
+-			}
+-
+-			log.Info("server stream ready")
+-			close(serverStreamReady)
+-		}
+-
+-		close(serverStreamClosed)
+-		log.Info("server closing")
+-	}()
+-
+-	go func() {
+-		defer close(clientShutDown)
+-		// connected UDP conn for client
+-		conn, err := venv.net1.DialUDP("udp4",
+-			&net.UDPAddr{IP: net.ParseIP("2.2.2.2"), Port: 5000},
+-			&net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 5000},
+-		)
+-		if !assert.NoError(t, err, "should succeed") {
+-			return
+-		}
+-
+-		// client association
+-		assoc, err := Client(Config{
+-			NetConn:       conn,
+-			LoggerFactory: loggerFactory,
+-		})
+-		if !assert.NoError(t, err, "should succeed") {
+-			return
+-		}
+-		defer assoc.Close() // nolint:errcheck
+-
+-		log.Info("client handshake complete")
+-
+-		stream, err := assoc.OpenStream(777, PayloadTypeWebRTCBinary)
+-		if !assert.NoError(t, err, "should succeed") {
++		n, innerErr := stream.Read(buf)
++		if !assert.NoError(t, innerErr, "should receive the initial message") {
+ 			return
+ 		}
++		assert.Equal(t, "HELLO", string(buf[:n]))
++		close(serverStreamReady)
+ 
+-		stream.SetReliabilityParams(false, ReliabilityTypeReliable, 0)
+-
+-		// Send a message to let server side stream to open
+-		_, err = stream.Write([]byte("HELLO"))
+-		if !assert.NoError(t, err, "should succeed") {
++		if closeErr := stream.Close(); !assert.NoError(t, closeErr, "should initiate the server stream close") {
+ 			return
+ 		}
+-
+-		buf := make([]byte, 1500)
+-		done := make(chan struct{})
+-		go func() {
+-			for {
+-				log.Info("client read")
+-				_, err2 := stream.Read(buf)
+-				if err2 != nil {
+-					t.Logf("client: Read returned %v", err2)
+-					break
+-				}
+-			}
+-			close(done)
+-		}()
+-
+-		log.Info("client stream ready")
+-		close(clientStreamReady)
+-
+-		<-clientStartClose
+-
+-		// drop next 1 RECONFIG chunk
+-		venv.dropNextReconfigChunk(1)
+-
+-		err = stream.Close()
+-		assert.NoError(t, err, "should succeed")
+-
+-		log.Info("client wait for exit reading..")
+-		<-done
+-
+-		<-shutDownClient
+-
+-		// Check if RECONFIG was actually dropped
+-		assert.Equal(t, 0, venv.numToDropReconfig, "should be zero")
+-
+-		// Sleep enough time for reconfig response to come back
+-		time.Sleep(100 * time.Millisecond)
+-
+-		// Verify there's no more pending reconfig
+-		assoc.lock.RLock()
+-		pendingReconfigs := len(assoc.reconfigs)
+-		assoc.lock.RUnlock()
+-		assert.Equal(t, 0, pendingReconfigs, "should be zero")
+-
+-		log.Info("client closing")
++		serverStreamState <- stream
++		close(serverCloseHandled)
++		_, innerErr = stream.Read(buf)
++		assert.Error(t, innerErr, "peer reset should end the read")
++		close(serverResetObserved)
+ 	}()
+ 
+-	// wait until both establish a stream
+-	<-clientStreamReady
+-	<-serverStreamReady
++	conn, err := venv.net1.DialUDP("udp4",
++		&net.UDPAddr{IP: net.ParseIP("2.2.2.2"), Port: 5000},
++		&net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 5000},
++	)
++	if !assert.NoError(t, err, "should succeed") {
++		return
++	}
++	defer conn.Close() // nolint:errcheck
+ 
+-	log.Info("stream ready")
++	assoc, err := Client(Config{NetConn: conn, LoggerFactory: loggerFactory})
++	if !assert.NoError(t, err, "should succeed") {
++		return
++	}
++	defer assoc.Close() // nolint:errcheck
+ 
+-	// let client begin writing
+-	log.Info("client start closing")
+-	close(clientStartClose)
++	stream, err := assoc.OpenStream(777, PayloadTypeWebRTCBinary)
++	if !assert.NoError(t, err, "should succeed") {
++		return
++	}
++	assertStreamState(t, stream, "open")
++	_, err = stream.Write([]byte("HELLO"))
++	if !assert.NoError(t, err, "should open the peer stream") {
++		return
++	}
++	select {
++	case <-serverStreamReady:
++	case <-serverDone:
++		assert.Fail(t, "server stopped before accepting the stream")
++		return
++	case <-time.After(5 * time.Second):
++		assert.Fail(t, "server did not accept the stream")
++		return
++	}
++	select {
++	case <-serverCloseHandled:
++	case <-serverDone:
++		assert.Fail(t, "server stopped before closing its stream")
++		return
++	case <-time.After(5 * time.Second):
++		assert.Fail(t, "server did not close its stream")
++		return
++	}
++	peerStream := <-serverStreamState
++	assertStreamState(t, peerStream, "closing")
+ 
+-	<-serverStreamClosed
+-	close(shutDownClient)
++	if !assert.NoError(t, stream.Close(), "should initiate the client stream close") {
++		return
++	}
++	select {
++	case <-serverResetObserved:
++		assertStreamState(t, peerStream, "closed")
++	case <-serverDone:
++		assert.Fail(t, "server stopped before observing the peer reset")
++		return
++	case <-time.After(5 * time.Second):
++		assert.Fail(t, "server did not observe the peer reset")
++		return
++	}
+ 
+-	<-clientShutDown
+-	<-serverShutDown
+-	log.Info("all done")
++	_, err = stream.Write([]byte{1})
++	assert.Error(t, err, "after closed should not allow write")
+ }
+ 
+ // this test case reproduces the issue mentioned in

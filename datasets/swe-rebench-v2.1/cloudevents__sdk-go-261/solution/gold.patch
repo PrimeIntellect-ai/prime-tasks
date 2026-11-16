@@ -1,0 +1,293 @@
+diff --git a/cmd/samples/pubsub/multisender/main.go b/cmd/samples/pubsub/multisender/main.go
+index f2378cf..e4dbd1a 100644
+--- a/cmd/samples/pubsub/multisender/main.go
++++ b/cmd/samples/pubsub/multisender/main.go
+@@ -58,7 +58,7 @@ func main() {
+ 
+ 	for i, topic := range strings.Split(env.TopicIDs, ",") {
+ 		ctx := cecontext.WithTopic(context.Background(), topic)
+-		event := cloudevents.NewEvent(cloudevents.VersionV03)
++		event := cloudevents.NewEvent(cloudevents.VersionV01)
+ 		event.SetType("com.cloudevents.sample.sent")
+ 		event.SetSource("github.com/cloudevents/sdk-go/cmd/samples/pubsub/multisender/")
+ 		_ = event.SetData(&Example{
+diff --git a/cmd/samples/pubsub/sender/main.go b/cmd/samples/pubsub/sender/main.go
+index ef77c25..b448bb6 100644
+--- a/cmd/samples/pubsub/sender/main.go
++++ b/cmd/samples/pubsub/sender/main.go
+@@ -42,7 +42,7 @@ func main() {
+ 		os.Exit(1)
+ 	}
+ 
+-	event := cloudevents.NewEvent(cloudevents.VersionV03)
++	event := cloudevents.NewEvent(cloudevents.VersionV1)
+ 	event.SetType("com.cloudevents.sample.sent")
+ 	event.SetSource("github.com/cloudevents/sdk-go/cmd/samples/pubsub/sender/")
+ 	_ = event.SetData(&Example{
+diff --git a/pkg/cloudevents/transport/pubsub/codec.go b/pkg/cloudevents/transport/pubsub/codec.go
+index 951b991..4401ef7 100644
+--- a/pkg/cloudevents/transport/pubsub/codec.go
++++ b/pkg/cloudevents/transport/pubsub/codec.go
+@@ -2,9 +2,12 @@ package pubsub
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
++	"sync"
+ 
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents"
++	cecontext "github.com/cloudevents/sdk-go/pkg/cloudevents/context"
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents/transport"
+ )
+ 
+@@ -16,6 +19,9 @@ type Codec struct {
+ 
+ 	v03 *CodecV03
+ 	v1  *CodecV1
++
++	_v03 sync.Once
++	_v1  sync.Once
+ }
+ 
+ const (
+@@ -24,46 +30,83 @@ const (
+ 
+ var _ transport.Codec = (*Codec)(nil)
+ 
++func (c *Codec) loadCodec(encoding Encoding) (transport.Codec, error) {
++	switch encoding {
++	case Default:
++		fallthrough
++	case BinaryV1, StructuredV1:
++		c._v1.Do(func() {
++			c.v1 = &CodecV1{DefaultEncoding: c.Encoding}
++		})
++		return c.v1, nil
++	case BinaryV03, StructuredV03:
++		c._v03.Do(func() {
++			c.v03 = &CodecV03{DefaultEncoding: c.Encoding}
++		})
++		return c.v03, nil
++	}
++
++	return nil, fmt.Errorf("unknown encoding: %s", encoding)
++}
++
+ func (c *Codec) Encode(ctx context.Context, e cloudevents.Event) (transport.Message, error) {
+-	switch c.Encoding {
+-	case Default, BinaryV03, StructuredV03:
+-		if c.v03 == nil {
+-			c.v03 = &CodecV03{Encoding: c.Encoding}
+-		}
+-		return c.v03.Encode(ctx, e)
+-	case StructuredV1:
+-		if c.v1 == nil {
+-			c.v1 = &CodecV1{Encoding: c.Encoding}
+-		}
+-		return c.v1.Encode(ctx, e)
+-	default:
+-		return nil, transport.NewErrMessageEncodingUnknown("wrapper", TransportName)
++	encoding := c.Encoding
++	if encoding == Default && c.DefaultEncodingSelectionFn != nil {
++		encoding = c.DefaultEncodingSelectionFn(ctx, e)
++	}
++	codec, err := c.loadCodec(encoding)
++	if err != nil {
++		return nil, err
+ 	}
++	ctx = cecontext.WithEncoding(ctx, encoding.Name())
++	return codec.Encode(ctx, e)
+ }
+ 
+ func (c *Codec) Decode(ctx context.Context, msg transport.Message) (*cloudevents.Event, error) {
+-	switch encoding := c.inspectEncoding(ctx, msg); encoding {
++	codec, err := c.loadCodec(c.inspectEncoding(ctx, msg))
++	if err != nil {
++		return nil, err
++	}
++	event, err := codec.Decode(ctx, msg)
++	if err != nil {
++		return nil, err
++	}
++	return c.convertEvent(event)
++}
++
++// Give the context back as the user expects
++func (c *Codec) convertEvent(event *cloudevents.Event) (*cloudevents.Event, error) {
++	if event == nil {
++		return nil, errors.New("event is nil, can not convert")
++	}
++
++	switch c.Encoding {
++	case Default:
++		return event, nil
+ 	case BinaryV03, StructuredV03:
+-		if c.v03 == nil {
+-			c.v03 = &CodecV03{Encoding: encoding}
+-		}
+-		return c.v03.Decode(ctx, msg)
++		ca := event.Context.AsV03()
++		event.Context = ca
++		return event, nil
+ 	case BinaryV1, StructuredV1:
+-		if c.v1 == nil {
+-			c.v1 = &CodecV1{Encoding: encoding}
+-		}
+-		return c.v1.Decode(ctx, msg)
++		ca := event.Context.AsV1()
++		event.Context = ca
++		return event, nil
+ 	default:
+-		return nil, fmt.Errorf("unknown encoding: %s", encoding)
++		return nil, fmt.Errorf("unknown encoding: %s", c.Encoding)
+ 	}
+ }
+ 
+ func (c *Codec) inspectEncoding(ctx context.Context, msg transport.Message) Encoding {
+-	if c.v03 == nil {
+-		c.v03 = &CodecV03{Encoding: c.Encoding}
++	// Try v1.0.
++	_, _ = c.loadCodec(BinaryV1)
++	encoding := c.v1.inspectEncoding(ctx, msg)
++	if encoding != Unknown {
++		return encoding
+ 	}
++
+ 	// Try v0.3.
+-	encoding := c.v03.inspectEncoding(ctx, msg)
++	_, _ = c.loadCodec(BinaryV03)
++	encoding = c.v03.inspectEncoding(ctx, msg)
+ 	if encoding != Unknown {
+ 		return encoding
+ 	}
+diff --git a/pkg/cloudevents/transport/pubsub/codec_v03.go b/pkg/cloudevents/transport/pubsub/codec_v03.go
+index da90cdc..d96ab3a 100644
+--- a/pkg/cloudevents/transport/pubsub/codec_v03.go
++++ b/pkg/cloudevents/transport/pubsub/codec_v03.go
+@@ -7,6 +7,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents"
++	cecontext "github.com/cloudevents/sdk-go/pkg/cloudevents/context"
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents/transport"
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents/types"
+ )
+@@ -18,19 +19,31 @@ const (
+ type CodecV03 struct {
+ 	CodecStructured
+ 
+-	Encoding Encoding
++	DefaultEncoding Encoding
+ }
+ 
+ var _ transport.Codec = (*CodecV03)(nil)
+ 
+ func (v CodecV03) Encode(ctx context.Context, e cloudevents.Event) (transport.Message, error) {
+-	switch v.Encoding {
+-	case Default, StructuredV03:
++	encoding := v.DefaultEncoding
++	strEnc := cecontext.EncodingFrom(ctx)
++	if strEnc != "" {
++		switch strEnc {
++		case Binary:
++			encoding = BinaryV03
++		case Structured:
++			encoding = StructuredV03
++		}
++	}
++	switch encoding {
++	case Default:
++		fallthrough
++	case StructuredV03:
+ 		return v.encodeStructured(ctx, e)
+ 	case BinaryV03:
+ 		return v.encodeBinary(ctx, e)
+ 	default:
+-		return nil, fmt.Errorf("unknown encoding: %d", v.Encoding)
++		return nil, fmt.Errorf("unknown encoding: %d", encoding)
+ 	}
+ }
+ 
+diff --git a/pkg/cloudevents/transport/pubsub/codec_v1.go b/pkg/cloudevents/transport/pubsub/codec_v1.go
+index e7b3ef3..85396de 100644
+--- a/pkg/cloudevents/transport/pubsub/codec_v1.go
++++ b/pkg/cloudevents/transport/pubsub/codec_v1.go
+@@ -7,6 +7,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents"
++	cecontext "github.com/cloudevents/sdk-go/pkg/cloudevents/context"
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents/transport"
+ 	"github.com/cloudevents/sdk-go/pkg/cloudevents/types"
+ )
+@@ -14,14 +15,26 @@ import (
+ type CodecV1 struct {
+ 	CodecStructured
+ 
+-	Encoding Encoding
++	DefaultEncoding Encoding
+ }
+ 
+ var _ transport.Codec = (*CodecV1)(nil)
+ 
+ func (v CodecV1) Encode(ctx context.Context, e cloudevents.Event) (transport.Message, error) {
+-	switch v.Encoding {
+-	case Default, StructuredV1:
++	encoding := v.DefaultEncoding
++	strEnc := cecontext.EncodingFrom(ctx)
++	if strEnc != "" {
++		switch strEnc {
++		case Binary:
++			encoding = BinaryV1
++		case Structured:
++			encoding = StructuredV1
++		}
++	}
++	switch encoding {
++	case Default:
++		fallthrough
++	case StructuredV1:
+ 		return v.encodeStructured(ctx, e)
+ 	case BinaryV1:
+ 		return v.encodeBinary(ctx, e)
+diff --git a/pkg/cloudevents/transport/pubsub/encoding.go b/pkg/cloudevents/transport/pubsub/encoding.go
+index 2bdf564..33717f7 100644
+--- a/pkg/cloudevents/transport/pubsub/encoding.go
++++ b/pkg/cloudevents/transport/pubsub/encoding.go
+@@ -22,8 +22,17 @@ const (
+ 	StructuredV03
+ 	// StructuredV1 is Structured CloudEvents spec v1.0.
+ 	StructuredV1
++
+ 	// Unknown is unknown.
+ 	Unknown
++
++	// Binary is used for Context Based Encoding Selections to use the
++	// DefaultBinaryEncodingSelectionStrategy
++	Binary = "binary"
++
++	// Structured is used for Context Based Encoding Selections to use the
++	// DefaultStructuredEncodingSelectionStrategy
++	Structured = "structured"
+ )
+ 
+ // DefaultBinaryEncodingSelectionStrategy implements a selection process for
+@@ -89,3 +98,17 @@ func (e Encoding) Version() string {
+ 		return "Unknown"
+ 	}
+ }
++
++// Name creates a string to represent the the codec name.
++func (e Encoding) Name() string {
++	switch e {
++	case Default:
++		return Binary
++	case BinaryV03, BinaryV1:
++		return Binary
++	case StructuredV03, StructuredV1:
++		return Structured
++	default:
++		return Binary
++	}
++}

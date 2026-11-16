@@ -1,0 +1,230 @@
+diff --git a/pkg/v1/remote/write_test.go b/pkg/v1/remote/write_test.go
+index 09b8230..51eb7cc 100644
+--- a/pkg/v1/remote/write_test.go
++++ b/pkg/v1/remote/write_test.go
+@@ -26,6 +26,7 @@ import (
+ 	"net/http/httptest"
+ 	"net/url"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"testing"
+ 
+@@ -901,136 +902,93 @@ func TestWriteWithErrors(t *testing.T) {
+ 	}
+ }
+ 
+-func TestScopesForUploadingImage(t *testing.T) {
+-	referenceToUpload, err := name.NewTag("example.com/sample/sample:latest", name.WeakValidation)
+-	if err != nil {
+-		t.Fatalf("name.NewTag() = %v", err)
+-	}
+-
+-	anotherRepo1, err := name.NewTag("example.com/sample/another_repo1:latest", name.WeakValidation)
+-	if err != nil {
+-		t.Fatalf("name.NewTag() = %v", err)
+-	}
+-
+-	anotherRepo2, err := name.NewTag("example.com/sample/another_repo2:latest", name.WeakValidation)
+-	if err != nil {
+-		t.Fatalf("name.NewTag() = %v", err)
+-	}
+-
++func TestWriteScopesForUploadingImage(t *testing.T) {
+ 	img := setupImage(t)
+-	layers, err := img.Layers()
+-	if err != nil {
+-		t.Fatalf("img.Layers() = %v", err)
+-	}
+-	dummyLayer := layers[0]
+ 
+-	testCases := []struct {
+-		name      string
+-		reference name.Reference
+-		layers    []v1.Layer
+-		expected  []string
++	for _, tc := range []struct {
++		name             string
++		sourceOnRegistry bool
+ 	}{
+-		{
+-			name:      "empty layers",
+-			reference: referenceToUpload,
+-			layers:    []v1.Layer{},
+-			expected: []string{
+-				referenceToUpload.Scope(transport.PushScope),
+-			},
+-		},
+-		{
+-			name:      "mountable layers with single reference with no-duplicate",
+-			reference: referenceToUpload,
+-			layers: []v1.Layer{
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo1,
+-				},
+-			},
+-			expected: []string{
+-				referenceToUpload.Scope(transport.PushScope),
+-				anotherRepo1.Scope(transport.PullScope),
+-			},
+-		},
+-		{
+-			name:      "mountable layers with single reference with duplicate",
+-			reference: referenceToUpload,
+-			layers: []v1.Layer{
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo1,
+-				},
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo1,
+-				},
+-			},
+-			expected: []string{
+-				referenceToUpload.Scope(transport.PushScope),
+-				anotherRepo1.Scope(transport.PullScope),
+-			},
+-		},
+-		{
+-			name:      "mountable layers with multiple references with no-duplicates",
+-			reference: referenceToUpload,
+-			layers: []v1.Layer{
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo1,
+-				},
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo2,
+-				},
+-			},
+-			expected: []string{
+-				referenceToUpload.Scope(transport.PushScope),
+-				anotherRepo1.Scope(transport.PullScope),
+-				anotherRepo2.Scope(transport.PullScope),
+-			},
+-		},
+-		{
+-			name:      "mountable layers with multiple references with duplicates",
+-			reference: referenceToUpload,
+-			layers: []v1.Layer{
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo1,
+-				},
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo2,
+-				},
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo1,
+-				},
+-				&MountableLayer{
+-					Layer:     dummyLayer,
+-					Reference: anotherRepo2,
+-				},
+-			},
+-			expected: []string{
+-				referenceToUpload.Scope(transport.PushScope),
+-				anotherRepo1.Scope(transport.PullScope),
+-				anotherRepo2.Scope(transport.PullScope),
+-			},
+-		},
+-	}
++		{name: "different registry", sourceOnRegistry: false},
++		{name: "same registry", sourceOnRegistry: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			const expectedRepo = "write/time"
++			initiatePath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
++			manifestPath := fmt.Sprintf("/v2/%s/manifests/latest", expectedRepo)
++			headPathPrefix := fmt.Sprintf("/v2/%s/blobs/", expectedRepo)
++
++			var scopesMu sync.Mutex
++			var requestedScopes [][]string
++			var server *httptest.Server
++			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				switch {
++				case r.URL.Path == "/v2/":
++					w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="registry"`, server.URL))
++					w.WriteHeader(http.StatusUnauthorized)
++				case r.URL.Path == "/token":
++					if err := r.ParseForm(); err != nil {
++						http.Error(w, err.Error(), http.StatusBadRequest)
++						return
++					}
++					var scopes []string
++					for _, value := range r.Form["scope"] {
++						scopes = append(scopes, strings.Fields(value)...)
++					}
++					scopesMu.Lock()
++					requestedScopes = append(requestedScopes, scopes)
++					scopesMu.Unlock()
++					w.Header().Set("Content-Type", "application/json")
++					fmt.Fprint(w, `{"token":"sometoken"}`)
++				case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, headPathPrefix) && r.URL.Path != initiatePath:
++					http.Error(w, "NotFound", http.StatusNotFound)
++				case r.URL.Path == initiatePath:
++					http.Error(w, "Mounted", http.StatusCreated)
++				case r.URL.Path == manifestPath:
++					http.Error(w, "Created", http.StatusCreated)
++				default:
++					t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
++					http.Error(w, "Unexpected", http.StatusInternalServerError)
++				}
++			}))
++			defer server.Close()
++
++			u, err := url.Parse(server.URL)
++			if err != nil {
++				t.Fatalf("url.Parse(%v) = %v", server.URL, err)
++			}
++			target, err := name.NewTag(fmt.Sprintf("%s/%s:latest", u.Host, expectedRepo), name.WeakValidation)
++			if err != nil {
++				t.Fatalf("name.NewTag() = %v", err)
++			}
+ 
+-	for _, tc := range testCases {
+-		actual := scopesForUploadingImage(tc.reference, tc.layers)
++			sourceRegistry := "other-domain.com"
++			if tc.sourceOnRegistry {
++				sourceRegistry = u.Host
++			}
++			source, err := name.NewTag(fmt.Sprintf("%s/source/repo:latest", sourceRegistry), name.WeakValidation)
++			if err != nil {
++				t.Fatalf("name.NewTag() = %v", err)
++			}
++			mi := &mountableImage{Image: img, Reference: source}
+ 
+-		if want, got := tc.expected[0], actual[0]; want != got {
+-			t.Errorf("TestScopesForUploadingImage() %s: Wrong first scope; want %v, got %v", tc.name, want, got)
+-		}
++			if err := Write(target, mi); err != nil {
++				t.Fatalf("Write() = %v", err)
++			}
+ 
+-		less := func(a, b string) bool {
+-			return strings.Compare(a, b) <= -1
+-		}
+-		if diff := cmp.Diff(tc.expected[1:], actual[1:], cmpopts.SortSlices(less)); diff != "" {
+-			t.Errorf("TestScopesForUploadingImage() %s: Wrong scopes (-want +got) = %v", tc.name, diff)
+-		}
++			wantScopes := []string{target.Scope(transport.PushScope)}
++			if tc.sourceOnRegistry {
++				wantScopes = append(wantScopes, source.Scope(transport.PullScope))
++			}
++			scopesMu.Lock()
++			defer scopesMu.Unlock()
++			if len(requestedScopes) == 0 {
++				t.Fatal("Write() did not request a token")
++			}
++			if diff := cmp.Diff(wantScopes, requestedScopes[0]); diff != "" {
++				t.Errorf("token request scopes (-want +got) = %s", diff)
++			}
++		})
+ 	}
+ }
+ 

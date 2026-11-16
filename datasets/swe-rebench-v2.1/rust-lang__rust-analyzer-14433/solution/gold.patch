@@ -1,0 +1,629 @@
+diff --git a/crates/hir-def/src/attr.rs b/crates/hir-def/src/attr.rs
+index 200072c172..b32479a3f4 100644
+--- a/crates/hir-def/src/attr.rs
++++ b/crates/hir-def/src/attr.rs
+@@ -1,5 +1,8 @@
+ //! A higher level attributes based on TokenTree, with also some shortcuts.
+ 
++#[cfg(test)]
++mod tests;
++
+ use std::{hash::Hash, ops, sync::Arc};
+ 
+ use base_db::CrateId;
+@@ -238,6 +241,14 @@ impl Attrs {
+         })
+     }
+ 
++    pub fn doc_exprs(&self) -> impl Iterator<Item = DocExpr> + '_ {
++        self.by_key("doc").tt_values().map(DocExpr::parse)
++    }
++
++    pub fn doc_aliases(&self) -> impl Iterator<Item = SmolStr> + '_ {
++        self.doc_exprs().flat_map(|doc_expr| doc_expr.aliases().to_vec())
++    }
++
+     pub fn is_proc_macro(&self) -> bool {
+         self.by_key("proc_macro").exists()
+     }
+@@ -251,6 +262,107 @@ impl Attrs {
+     }
+ }
+ 
++use std::slice::Iter as SliceIter;
++#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
++pub enum DocAtom {
++    /// eg. `#[doc(hidden)]`
++    Flag(SmolStr),
++    /// eg. `#[doc(alias = "x")]`
++    ///
++    /// Note that a key can have multiple values that are all considered "active" at the same time.
++    /// For example, `#[doc(alias = "x")]` and `#[doc(alias = "y")]`.
++    KeyValue { key: SmolStr, value: SmolStr },
++}
++
++// Adapted from `CfgExpr` parsing code
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++// #[cfg_attr(test, derive(derive_arbitrary::Arbitrary))]
++pub enum DocExpr {
++    Invalid,
++    /// eg. `#[doc(hidden)]`, `#[doc(alias = "x")]`
++    Atom(DocAtom),
++    /// eg. `#[doc(alias("x", "y"))]`
++    Alias(Vec<SmolStr>),
++}
++
++impl From<DocAtom> for DocExpr {
++    fn from(atom: DocAtom) -> Self {
++        DocExpr::Atom(atom)
++    }
++}
++
++impl DocExpr {
++    fn parse<S>(tt: &tt::Subtree<S>) -> DocExpr {
++        next_doc_expr(&mut tt.token_trees.iter()).unwrap_or(DocExpr::Invalid)
++    }
++
++    pub fn aliases(&self) -> &[SmolStr] {
++        match self {
++            DocExpr::Atom(DocAtom::KeyValue { key, value }) if key == "alias" => {
++                std::slice::from_ref(value)
++            }
++            DocExpr::Alias(aliases) => aliases,
++            _ => &[],
++        }
++    }
++}
++
++fn next_doc_expr<S>(it: &mut SliceIter<'_, tt::TokenTree<S>>) -> Option<DocExpr> {
++    let name = match it.next() {
++        None => return None,
++        Some(tt::TokenTree::Leaf(tt::Leaf::Ident(ident))) => ident.text.clone(),
++        Some(_) => return Some(DocExpr::Invalid),
++    };
++
++    // Peek
++    let ret = match it.as_slice().first() {
++        Some(tt::TokenTree::Leaf(tt::Leaf::Punct(punct))) if punct.char == '=' => {
++            match it.as_slice().get(1) {
++                Some(tt::TokenTree::Leaf(tt::Leaf::Literal(literal))) => {
++                    it.next();
++                    it.next();
++                    // FIXME: escape? raw string?
++                    let value =
++                        SmolStr::new(literal.text.trim_start_matches('"').trim_end_matches('"'));
++                    DocAtom::KeyValue { key: name, value }.into()
++                }
++                _ => return Some(DocExpr::Invalid),
++            }
++        }
++        Some(tt::TokenTree::Subtree(subtree)) => {
++            it.next();
++            let subs = parse_comma_sep(subtree);
++            match name.as_str() {
++                "alias" => DocExpr::Alias(subs),
++                _ => DocExpr::Invalid,
++            }
++        }
++        _ => DocAtom::Flag(name).into(),
++    };
++
++    // Eat comma separator
++    if let Some(tt::TokenTree::Leaf(tt::Leaf::Punct(punct))) = it.as_slice().first() {
++        if punct.char == ',' {
++            it.next();
++        }
++    }
++    Some(ret)
++}
++
++fn parse_comma_sep<S>(subtree: &tt::Subtree<S>) -> Vec<SmolStr> {
++    subtree
++        .token_trees
++        .iter()
++        .filter_map(|tt| match tt {
++            tt::TokenTree::Leaf(tt::Leaf::Literal(lit)) => {
++                // FIXME: escape? raw string?
++                Some(SmolStr::new(lit.text.trim_start_matches('"').trim_end_matches('"')))
++            }
++            _ => None,
++        })
++        .collect()
++}
++
+ impl AttrsWithOwner {
+     pub(crate) fn attrs_query(db: &dyn DefDatabase, def: AttrDefId) -> Self {
+         // FIXME: this should use `Trace` to avoid duplication in `source_map` below
+diff --git a/crates/hir/src/semantics.rs b/crates/hir/src/semantics.rs
+index 9709970db1..2b2a2966c1 100644
+--- a/crates/hir/src/semantics.rs
++++ b/crates/hir/src/semantics.rs
+@@ -1644,6 +1644,7 @@ impl<'a> SemanticsScope<'a> {
+         VisibleTraits(resolver.traits_in_scope(self.db.upcast()))
+     }
+ 
++    /// Calls the passed closure `f` on all names in scope.
+     pub fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
+         let scope = self.resolver.names_in_scope(self.db.upcast());
+         for (name, entries) in scope {
+diff --git a/crates/ide-completion/src/completions.rs b/crates/ide-completion/src/completions.rs
+index c3136f6df4..b6a066f4f5 100644
+--- a/crates/ide-completion/src/completions.rs
++++ b/crates/ide-completion/src/completions.rs
+@@ -165,9 +165,9 @@ impl Completions {
+         ctx: &CompletionContext<'_>,
+         path_ctx: &PathCompletionCtx,
+     ) {
+-        ctx.process_all_names(&mut |name, res| match res {
++        ctx.process_all_names(&mut |name, res, doc_aliases| match res {
+             ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) if m.is_crate_root(ctx.db) => {
+-                self.add_module(ctx, path_ctx, m, name);
++                self.add_module(ctx, path_ctx, m, name, doc_aliases);
+             }
+             _ => (),
+         });
+@@ -179,6 +179,7 @@ impl Completions {
+         path_ctx: &PathCompletionCtx,
+         local_name: hir::Name,
+         resolution: hir::ScopeDef,
++        doc_aliases: Vec<syntax::SmolStr>,
+     ) {
+         let is_private_editable = match ctx.def_is_visible(&resolution) {
+             Visible::Yes => false,
+@@ -187,7 +188,9 @@ impl Completions {
+         };
+         self.add(
+             render_path_resolution(
+-                RenderContext::new(ctx).private_editable(is_private_editable),
++                RenderContext::new(ctx)
++                    .private_editable(is_private_editable)
++                    .doc_aliases(doc_aliases),
+                 path_ctx,
+                 local_name,
+                 resolution,
+@@ -236,12 +239,14 @@ impl Completions {
+         path_ctx: &PathCompletionCtx,
+         module: hir::Module,
+         local_name: hir::Name,
++        doc_aliases: Vec<syntax::SmolStr>,
+     ) {
+         self.add_path_resolution(
+             ctx,
+             path_ctx,
+             local_name,
+             hir::ScopeDef::ModuleDef(module.into()),
++            doc_aliases,
+         );
+     }
+ 
+diff --git a/crates/ide-completion/src/completions/attribute.rs b/crates/ide-completion/src/completions/attribute.rs
+index bb950c76f8..13c5832a51 100644
+--- a/crates/ide-completion/src/completions/attribute.rs
++++ b/crates/ide-completion/src/completions/attribute.rs
+@@ -93,7 +93,7 @@ pub(crate) fn complete_attribute_path(
+                         acc.add_macro(ctx, path_ctx, m, name)
+                     }
+                     hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+-                        acc.add_module(ctx, path_ctx, m, name)
++                        acc.add_module(ctx, path_ctx, m, name, vec![])
+                     }
+                     _ => (),
+                 }
+@@ -104,12 +104,12 @@ pub(crate) fn complete_attribute_path(
+         Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+         // only show modules in a fresh UseTree
+         Qualified::No => {
+-            ctx.process_all_names(&mut |name, def| match def {
++            ctx.process_all_names(&mut |name, def, doc_aliases| match def {
+                 hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_attr(ctx.db) => {
+                     acc.add_macro(ctx, path_ctx, m, name)
+                 }
+                 hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+-                    acc.add_module(ctx, path_ctx, m, name)
++                    acc.add_module(ctx, path_ctx, m, name, doc_aliases)
+                 }
+                 _ => (),
+             });
+diff --git a/crates/ide-completion/src/completions/attribute/derive.rs b/crates/ide-completion/src/completions/attribute/derive.rs
+index 793c22630b..a92fe6c7bc 100644
+--- a/crates/ide-completion/src/completions/attribute/derive.rs
++++ b/crates/ide-completion/src/completions/attribute/derive.rs
+@@ -34,7 +34,7 @@ pub(crate) fn complete_derive_path(
+                         acc.add_macro(ctx, path_ctx, mac, name)
+                     }
+                     ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+-                        acc.add_module(ctx, path_ctx, m, name)
++                        acc.add_module(ctx, path_ctx, m, name, vec![])
+                     }
+                     _ => (),
+                 }
+@@ -43,7 +43,7 @@ pub(crate) fn complete_derive_path(
+         Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+         // only show modules in a fresh UseTree
+         Qualified::No => {
+-            ctx.process_all_names(&mut |name, def| {
++            ctx.process_all_names(&mut |name, def, doc_aliases| {
+                 let mac = match def {
+                     ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac))
+                         if !existing_derives.contains(&mac) && mac.is_derive(ctx.db) =>
+@@ -51,7 +51,7 @@ pub(crate) fn complete_derive_path(
+                         mac
+                     }
+                     ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+-                        return acc.add_module(ctx, path_ctx, m, name);
++                        return acc.add_module(ctx, path_ctx, m, name, doc_aliases);
+                     }
+                     _ => return,
+                 };
+diff --git a/crates/ide-completion/src/completions/expr.rs b/crates/ide-completion/src/completions/expr.rs
+index cfe4787f73..70c91e6a10 100644
+--- a/crates/ide-completion/src/completions/expr.rs
++++ b/crates/ide-completion/src/completions/expr.rs
+@@ -88,7 +88,7 @@ pub(crate) fn complete_expr_path(
+                     let module_scope = module.scope(ctx.db, Some(ctx.module));
+                     for (name, def) in module_scope {
+                         if scope_def_applicable(def) {
+-                            acc.add_path_resolution(ctx, path_ctx, name, def);
++                            acc.add_path_resolution(ctx, path_ctx, name, def, vec![]);
+                         }
+                     }
+                 }
+@@ -212,7 +212,7 @@ pub(crate) fn complete_expr_path(
+                     }
+                 }
+             }
+-            ctx.process_all_names(&mut |name, def| match def {
++            ctx.process_all_names(&mut |name, def, doc_aliases| match def {
+                 ScopeDef::ModuleDef(hir::ModuleDef::Trait(t)) => {
+                     let assocs = t.items_with_supertraits(ctx.db);
+                     match &*assocs {
+@@ -220,12 +220,14 @@ pub(crate) fn complete_expr_path(
+                         // there is no associated item path that can be constructed with them
+                         [] => (),
+                         // FIXME: Render the assoc item with the trait qualified
+-                        &[_item] => acc.add_path_resolution(ctx, path_ctx, name, def),
++                        &[_item] => acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases),
+                         // FIXME: Append `::` to the thing here, since a trait on its own won't work
+-                        [..] => acc.add_path_resolution(ctx, path_ctx, name, def),
++                        [..] => acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases),
+                     }
+                 }
+-                _ if scope_def_applicable(def) => acc.add_path_resolution(ctx, path_ctx, name, def),
++                _ if scope_def_applicable(def) => {
++                    acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases)
++                }
+                 _ => (),
+             });
+ 
+diff --git a/crates/ide-completion/src/completions/item_list.rs b/crates/ide-completion/src/completions/item_list.rs
+index 60d05ae46b..5ea6a49b1a 100644
+--- a/crates/ide-completion/src/completions/item_list.rs
++++ b/crates/ide-completion/src/completions/item_list.rs
+@@ -45,7 +45,7 @@ pub(crate) fn complete_item_list(
+                         acc.add_macro(ctx, path_ctx, m, name)
+                     }
+                     hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+-                        acc.add_module(ctx, path_ctx, m, name)
++                        acc.add_module(ctx, path_ctx, m, name, vec![])
+                     }
+                     _ => (),
+                 }
+@@ -55,12 +55,12 @@ pub(crate) fn complete_item_list(
+         }
+         Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+         Qualified::No if ctx.qualifier_ctx.none() => {
+-            ctx.process_all_names(&mut |name, def| match def {
++            ctx.process_all_names(&mut |name, def, doc_aliases| match def {
+                 hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_fn_like(ctx.db) => {
+                     acc.add_macro(ctx, path_ctx, m, name)
+                 }
+                 hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+-                    acc.add_module(ctx, path_ctx, m, name)
++                    acc.add_module(ctx, path_ctx, m, name, doc_aliases)
+                 }
+                 _ => (),
+             });
+diff --git a/crates/ide-completion/src/completions/pattern.rs b/crates/ide-completion/src/completions/pattern.rs
+index 58d5bf114c..40b2c831a5 100644
+--- a/crates/ide-completion/src/completions/pattern.rs
++++ b/crates/ide-completion/src/completions/pattern.rs
+@@ -64,7 +64,7 @@ pub(crate) fn complete_pattern(
+ 
+     // FIXME: ideally, we should look at the type we are matching against and
+     // suggest variants + auto-imports
+-    ctx.process_all_names(&mut |name, res| {
++    ctx.process_all_names(&mut |name, res, _| {
+         let add_simple_path = match res {
+             hir::ScopeDef::ModuleDef(def) => match def {
+                 hir::ModuleDef::Adt(hir::Adt::Struct(strukt)) => {
+@@ -127,7 +127,7 @@ pub(crate) fn complete_pattern_path(
+                         };
+ 
+                         if add_resolution {
+-                            acc.add_path_resolution(ctx, path_ctx, name, def);
++                            acc.add_path_resolution(ctx, path_ctx, name, def, vec![]);
+                         }
+                     }
+                 }
+@@ -164,7 +164,7 @@ pub(crate) fn complete_pattern_path(
+         Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+         Qualified::No => {
+             // this will only be hit if there are brackets or braces, otherwise this will be parsed as an ident pattern
+-            ctx.process_all_names(&mut |name, res| {
++            ctx.process_all_names(&mut |name, res, doc_aliases| {
+                 // FIXME: we should check what kind of pattern we are in and filter accordingly
+                 let add_completion = match res {
+                     ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
+@@ -175,7 +175,7 @@ pub(crate) fn complete_pattern_path(
+                     _ => false,
+                 };
+                 if add_completion {
+-                    acc.add_path_resolution(ctx, path_ctx, name, res);
++                    acc.add_path_resolution(ctx, path_ctx, name, res, doc_aliases);
+                 }
+             });
+ 
+diff --git a/crates/ide-completion/src/completions/type.rs b/crates/ide-completion/src/completions/type.rs
+index 69c05a76df..2ad9520cd6 100644
+--- a/crates/ide-completion/src/completions/type.rs
++++ b/crates/ide-completion/src/completions/type.rs
+@@ -85,7 +85,7 @@ pub(crate) fn complete_type_path(
+                     let module_scope = module.scope(ctx.db, Some(ctx.module));
+                     for (name, def) in module_scope {
+                         if scope_def_applicable(def) {
+-                            acc.add_path_resolution(ctx, path_ctx, name, def);
++                            acc.add_path_resolution(ctx, path_ctx, name, def, vec![]);
+                         }
+                     }
+                 }
+@@ -141,7 +141,7 @@ pub(crate) fn complete_type_path(
+             match location {
+                 TypeLocation::TypeBound => {
+                     acc.add_nameref_keywords_with_colon(ctx);
+-                    ctx.process_all_names(&mut |name, res| {
++                    ctx.process_all_names(&mut |name, res, doc_aliases| {
+                         let add_resolution = match res {
+                             ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => {
+                                 mac.is_fn_like(ctx.db)
+@@ -152,7 +152,7 @@ pub(crate) fn complete_type_path(
+                             _ => false,
+                         };
+                         if add_resolution {
+-                            acc.add_path_resolution(ctx, path_ctx, name, res);
++                            acc.add_path_resolution(ctx, path_ctx, name, res, doc_aliases);
+                         }
+                     });
+                     return;
+@@ -215,9 +215,9 @@ pub(crate) fn complete_type_path(
+             };
+ 
+             acc.add_nameref_keywords_with_colon(ctx);
+-            ctx.process_all_names(&mut |name, def| {
++            ctx.process_all_names(&mut |name, def, doc_aliases| {
+                 if scope_def_applicable(def) {
+-                    acc.add_path_resolution(ctx, path_ctx, name, def);
++                    acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases);
+                 }
+             });
+         }
+diff --git a/crates/ide-completion/src/completions/use_.rs b/crates/ide-completion/src/completions/use_.rs
+index 2555c34aa7..546a1f4c49 100644
+--- a/crates/ide-completion/src/completions/use_.rs
++++ b/crates/ide-completion/src/completions/use_.rs
+@@ -91,10 +91,10 @@ pub(crate) fn complete_use_path(
+         // only show modules and non-std enum in a fresh UseTree
+         Qualified::No => {
+             cov_mark::hit!(unqualified_path_selected_only);
+-            ctx.process_all_names(&mut |name, res| {
++            ctx.process_all_names(&mut |name, res, doc_aliases| {
+                 match res {
+                     ScopeDef::ModuleDef(hir::ModuleDef::Module(module)) => {
+-                        acc.add_module(ctx, path_ctx, module, name);
++                        acc.add_module(ctx, path_ctx, module, name, doc_aliases);
+                     }
+                     ScopeDef::ModuleDef(hir::ModuleDef::Adt(hir::Adt::Enum(e))) => {
+                         // exclude prelude enum
+diff --git a/crates/ide-completion/src/completions/vis.rs b/crates/ide-completion/src/completions/vis.rs
+index 5e6cf4bf9a..e0a959ad0b 100644
+--- a/crates/ide-completion/src/completions/vis.rs
++++ b/crates/ide-completion/src/completions/vis.rs
+@@ -23,7 +23,7 @@ pub(crate) fn complete_vis_path(
+             if let Some(next) = next_towards_current {
+                 if let Some(name) = next.name(ctx.db) {
+                     cov_mark::hit!(visibility_qualified);
+-                    acc.add_module(ctx, path_ctx, next, name);
++                    acc.add_module(ctx, path_ctx, next, name, vec![]);
+                 }
+             }
+ 
+diff --git a/crates/ide-completion/src/context.rs b/crates/ide-completion/src/context.rs
+index 8cbf89e9c3..f6478d2ceb 100644
+--- a/crates/ide-completion/src/context.rs
++++ b/crates/ide-completion/src/context.rs
+@@ -17,7 +17,7 @@ use ide_db::{
+ };
+ use syntax::{
+     ast::{self, AttrKind, NameOrNameRef},
+-    AstNode,
++    AstNode, SmolStr,
+     SyntaxKind::{self, *},
+     SyntaxToken, TextRange, TextSize, T,
+ };
+@@ -491,21 +491,22 @@ impl<'a> CompletionContext<'a> {
+         );
+     }
+ 
+-    /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items.
+-    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
++    /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items and
++    /// passes all doc-aliases along, to funnel it into [`Completions::add_path_resolution`].
++    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef, Vec<SmolStr>)) {
+         let _p = profile::span("CompletionContext::process_all_names");
+         self.scope.process_all_names(&mut |name, def| {
+             if self.is_scope_def_hidden(def) {
+                 return;
+             }
+-
+-            f(name, def);
++            let doc_aliases = self.doc_aliases(def);
++            f(name, def, doc_aliases);
+         });
+     }
+ 
+     pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
+         let _p = profile::span("CompletionContext::process_all_names_raw");
+-        self.scope.process_all_names(&mut |name, def| f(name, def));
++        self.scope.process_all_names(f);
+     }
+ 
+     fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
+@@ -545,6 +546,14 @@ impl<'a> CompletionContext<'a> {
+         // `doc(hidden)` items are only completed within the defining crate.
+         self.krate != defining_crate && attrs.has_doc_hidden()
+     }
++
++    fn doc_aliases(&self, scope_def: ScopeDef) -> Vec<SmolStr> {
++        if let Some(attrs) = scope_def.attrs(self.db) {
++            attrs.doc_aliases().collect()
++        } else {
++            vec![]
++        }
++    }
+ }
+ 
+ // CompletionContext construction
+diff --git a/crates/ide-completion/src/item.rs b/crates/ide-completion/src/item.rs
+index bb9fa7ccac..c2c4a663c6 100644
+--- a/crates/ide-completion/src/item.rs
++++ b/crates/ide-completion/src/item.rs
+@@ -45,7 +45,7 @@ pub struct CompletionItem {
+     ///
+     /// That is, in `foo.bar$0` lookup of `abracadabra` will be accepted (it
+     /// contains `bar` sub sequence), and `quux` will rejected.
+-    pub lookup: Option<SmolStr>,
++    pub lookup: SmolStr,
+ 
+     /// Additional info to show in the UI pop up.
+     pub detail: Option<String>,
+@@ -353,12 +353,13 @@ impl CompletionItem {
+             relevance: CompletionRelevance::default(),
+             ref_match: None,
+             imports_to_add: Default::default(),
++            doc_aliases: None,
+         }
+     }
+ 
+     /// What string is used for filtering.
+     pub fn lookup(&self) -> &str {
+-        self.lookup.as_deref().unwrap_or(&self.label)
++        self.lookup.as_str()
+     }
+ 
+     pub fn ref_match(&self) -> Option<(String, text_edit::Indel, CompletionRelevance)> {
+@@ -385,6 +386,7 @@ pub(crate) struct Builder {
+     source_range: TextRange,
+     imports_to_add: SmallVec<[LocatedImport; 1]>,
+     trait_name: Option<SmolStr>,
++    doc_aliases: Option<SmolStr>,
+     label: SmolStr,
+     insert_text: Option<String>,
+     is_snippet: bool,
+@@ -413,13 +415,16 @@ impl Builder {
+         let _p = profile::span("item::Builder::build");
+ 
+         let mut label = self.label;
+-        let mut lookup = self.lookup;
++        let mut lookup = self.lookup.unwrap_or_else(|| label.clone());
+         let insert_text = self.insert_text.unwrap_or_else(|| label.to_string());
+ 
++        if let Some(doc_aliases) = self.doc_aliases {
++            label = SmolStr::from(format!("{label} (alias {doc_aliases})"));
++            lookup = SmolStr::from(format!("{lookup} {doc_aliases}"));
++        }
+         if let [import_edit] = &*self.imports_to_add {
+             // snippets can have multiple imports, but normal completions only have up to one
+             if let Some(original_path) = import_edit.original_path.as_ref() {
+-                lookup = lookup.or_else(|| Some(label.clone()));
+                 label = SmolStr::from(format!("{label} (use {original_path})"));
+             }
+         } else if let Some(trait_name) = self.trait_name {
+@@ -459,6 +464,10 @@ impl Builder {
+         self.trait_name = Some(trait_name);
+         self
+     }
++    pub(crate) fn doc_aliases(&mut self, doc_aliases: SmolStr) -> &mut Builder {
++        self.doc_aliases = Some(doc_aliases);
++        self
++    }
+     pub(crate) fn insert_text(&mut self, insert_text: impl Into<String>) -> &mut Builder {
+         self.insert_text = Some(insert_text.into());
+         self
+diff --git a/crates/ide-completion/src/lib.rs b/crates/ide-completion/src/lib.rs
+index 6fe7811140..a06b7e9577 100644
+--- a/crates/ide-completion/src/lib.rs
++++ b/crates/ide-completion/src/lib.rs
+@@ -97,7 +97,7 @@ pub use crate::{
+ 
+ /// Main entry point for completion. We run completion as a two-phase process.
+ ///
+-/// First, we look at the position and collect a so-called `CompletionContext.
++/// First, we look at the position and collect a so-called `CompletionContext`.
+ /// This is a somewhat messy process, because, during completion, syntax tree is
+ /// incomplete and can look really weird.
+ ///
+diff --git a/crates/ide-completion/src/render.rs b/crates/ide-completion/src/render.rs
+index c1f51aabb9..514a684726 100644
+--- a/crates/ide-completion/src/render.rs
++++ b/crates/ide-completion/src/render.rs
+@@ -14,6 +14,7 @@ use hir::{AsAssocItem, HasAttrs, HirDisplay, ScopeDef};
+ use ide_db::{
+     helpers::item_name, imports::import_assets::LocatedImport, RootDatabase, SnippetCap, SymbolKind,
+ };
++use itertools::Itertools;
+ use syntax::{AstNode, SmolStr, SyntaxKind, TextRange};
+ 
+ use crate::{
+@@ -32,11 +33,17 @@ pub(crate) struct RenderContext<'a> {
+     completion: &'a CompletionContext<'a>,
+     is_private_editable: bool,
+     import_to_add: Option<LocatedImport>,
++    doc_aliases: Vec<SmolStr>,
+ }
+ 
+ impl<'a> RenderContext<'a> {
+     pub(crate) fn new(completion: &'a CompletionContext<'a>) -> RenderContext<'a> {
+-        RenderContext { completion, is_private_editable: false, import_to_add: None }
++        RenderContext {
++            completion,
++            is_private_editable: false,
++            import_to_add: None,
++            doc_aliases: vec![],
++        }
+     }
+ 
+     pub(crate) fn private_editable(mut self, private_editable: bool) -> Self {
+@@ -49,6 +56,11 @@ impl<'a> RenderContext<'a> {
+         self
+     }
+ 
++    pub(crate) fn doc_aliases(mut self, doc_aliases: Vec<SmolStr>) -> Self {
++        self.doc_aliases = doc_aliases;
++        self
++    }
++
+     fn snippet_cap(&self) -> Option<SnippetCap> {
+         self.completion.config.snippet_cap
+     }
+@@ -348,6 +360,12 @@ fn render_resolution_simple_(
+     if let Some(import_to_add) = ctx.import_to_add {
+         item.add_import(import_to_add);
+     }
++
++    let doc_aliases = ctx.doc_aliases;
++    if !doc_aliases.is_empty() {
++        let doc_aliases = doc_aliases.into_iter().join(", ").into();
++        item.doc_aliases(doc_aliases);
++    }
+     item
+ }
+ 

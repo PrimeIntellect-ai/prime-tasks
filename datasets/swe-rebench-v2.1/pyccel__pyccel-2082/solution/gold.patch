@@ -1,0 +1,189 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bcf2cb4f..34098d0d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -86,6 +86,7 @@ All notable changes to this project will be documented in this file.
+ -   #2013 : Stop limiting the length of strings to 128 characters.
+ -   #2078 : Fix translation of classes containing comments.
+ -   #2041 : Include all type extension methods by default.
++-   #2082 : Allow the use of a list comprehension to initialise an array.
+ 
+ ### Changed
+ 
+diff --git a/ci_tools/check_pylint_commands.py b/ci_tools/check_pylint_commands.py
+index bce7bada..86176a06 100644
+--- a/ci_tools/check_pylint_commands.py
++++ b/ci_tools/check_pylint_commands.py
+@@ -23,6 +23,7 @@ accepted_pylint_commands = {re.compile('.*/IMPORTING_EXISTING_IDENTIFIED3.py'):[
+                             re.compile('tests/pyccel/project_class_imports/.*'):['relative-beyond-top-level'], # ignore Codacy bad pylint call
+                             re.compile('tests/errors/syntax_errors/import_star.py'):['wildcard-import'],
+                             re.compile('tests/stc_containers/leaks_check.py'):['unused-variable'],
++                            re.compile('tests/epyccel/modules/arrays.py'):['reimported'], # Repeat NumPy imports due to functions being translated individually
+                            }
+ 
+ def run_pylint(file, flag, messages):
+diff --git a/pyccel/ast/functionalexpr.py b/pyccel/ast/functionalexpr.py
+index e685fe5e..4b55e3d8 100644
+--- a/pyccel/ast/functionalexpr.py
++++ b/pyccel/ast/functionalexpr.py
+@@ -53,9 +53,12 @@ class FunctionalFor(TypedAstNode):
+                   Dummy_0 += 1
+               ```
+               Index is `Dummy_0`.
++    target_type : PyccelSymbol, optional
++        The type of the result of the functional for. This is useful at
++        the syntactic stage to pass along the final type of the lhs (list/set/array/etc).
+     """
+     __slots__ = ('_loops','_expr', '_lhs', '_indices','_index',
+-            '_shape','_class_type')
++            '_shape','_class_type', '_target_type')
+     _attribute_nodes = ('_loops','_expr', '_lhs', '_indices','_index')
+ 
+     def __init__(
+@@ -64,13 +67,15 @@ class FunctionalFor(TypedAstNode):
+         expr=None,
+         lhs=None,
+         indices=None,
+-        index=None
++        index=None,
++        target_type=None
+         ):
+         self._loops   = loops
+         self._expr    = expr
+         self._lhs     = lhs
+         self._indices = indices
+         self._index   = index
++        self._target_type = target_type
+         super().__init__()
+ 
+         if pyccel_stage != 'syntactic':
+@@ -97,6 +102,16 @@ class FunctionalFor(TypedAstNode):
+     def index(self):
+         return self._index
+ 
++    @property
++    def target_type(self):
++        """
++        The type of the result of the functional for.
++
++        The type of the result of the functional for. This is useful at
++        the syntactic stage to pass along the final type of the lhs (list/set/array/etc).
++        """
++        return self._target_type
++
+ #==============================================================================
+ class GeneratorComprehension(FunctionalFor):
+     """ Super class for all functions which reduce generator expressions to scalars
+diff --git a/pyccel/parser/semantic.py b/pyccel/parser/semantic.py
+index ab3ef5b4..13f2e3d5 100644
+--- a/pyccel/parser/semantic.py
++++ b/pyccel/parser/semantic.py
+@@ -150,6 +150,7 @@ type_container = {
+                    PythonTupleFunction : HomogeneousTupleType,
+                    PythonListFunction : HomogeneousListType,
+                    PythonSetFunction : HomogeneousSetType,
++                   NumpyArray : NumpyNDArrayType,
+                   }
+ 
+ #==============================================================================
+@@ -3796,7 +3797,7 @@ class SemanticParser(BasicParser):
+             dim = sympy_to_pyccel(dim, idx_subs)
+         except TypeError:
+             errors.report(PYCCEL_RESTRICTION_LIST_COMPREHENSION_SIZE + f'\n Deduced size : {dim}',
+-                          bounding_box=(self.current_ast_node.lineno, self.current_ast_node.col_offset),
++                          symbol=expr,
+                           severity='fatal')
+ 
+         # TODO find a faster way to calculate dim
+@@ -3816,7 +3817,35 @@ class SemanticParser(BasicParser):
+                           severity='fatal')
+ 
+         d_var['memory_handling'] = 'heap'
+-        class_type = HomogeneousListType(class_type)
++        target_type_name = expr.target_type
++        if isinstance(target_type_name, DottedName):
++            lhs = target_type_name.name[0] if len(target_type_name.name) == 2 \
++                    else DottedName(*target_type_name.name[:-1])
++            first = self._visit(lhs)
++            if isinstance(first, Module):
++                conversion_func = first[target_type_name.name[-1]]
++            else:
++                conversion_func = None
++        else:
++            conversion_func = self.scope.find(target_type_name, 'functions')
++            if conversion_func is None:
++                if target_type_name in builtin_functions_dict:
++                    conversion_func = PyccelFunctionDef(target_type_name,
++                                            builtin_functions_dict[target_type_name])
++        if conversion_func is None:
++            errors.report("Unrecognised output type from functional for.\n"+PYCCEL_RESTRICTION_TODO,
++                          symbol=expr,
++                          severity='fatal')
++
++        try:
++            class_type = type_container[conversion_func.cls_name](class_type)
++        except TypeError:
++            if class_type.rank > 0:
++                errors.report("ND comprehension expressions cannot be saved directly to an array yet.\n"+PYCCEL_RESTRICTION_TODO,
++                              symbol=expr,
++                              severity='fatal')
++
++            class_type = type_container[conversion_func.cls_name](numpy_process_dtype(class_type), rank=1, order=None)
+         d_var['class_type'] = class_type
+         shape = [dim]
+         if d_var['shape']:
+diff --git a/pyccel/parser/syntactic.py b/pyccel/parser/syntactic.py
+index 9739ce2a..0c9d4dab 100644
+--- a/pyccel/parser/syntactic.py
++++ b/pyccel/parser/syntactic.py
+@@ -1099,7 +1099,7 @@ class SyntaxParser(BasicParser):
+         if len(args) == 0:
+             args = ()
+ 
+-        if len(args) == 1 and isinstance(args[0].value, GeneratorComprehension):
++        if len(args) == 1 and isinstance(args[0].value, (GeneratorComprehension, FunctionalFor)):
+             return args[0].value
+ 
+         func = self._visit(stmt.func)
+@@ -1165,18 +1165,30 @@ class SyntaxParser(BasicParser):
+ 
+         generators = list(self._visit(stmt.generators))
+ 
+-        if not isinstance(self._context[-2],ast.Assign):
++        success = isinstance(self._context[-2],ast.Assign)
++        if not success and len(self._context) > 2:
++            success = isinstance(self._context[-3],ast.Assign) and isinstance(self._context[-2],ast.Call)
++
++        assignment = next((c for c in reversed(self._context) if isinstance(c, ast.Assign)), None)
++
++        if not success:
+             errors.report(PYCCEL_RESTRICTION_LIST_COMPREHENSION_ASSIGN,
+                           symbol = stmt,
+                           severity='error')
+             lhs = PyccelSymbol('_', is_temp=True)
+         else:
+-            lhs = self._visit(self._context[-2].targets)
++            lhs = self._visit(assignment.targets)
+             if len(lhs)==1:
+                 lhs = lhs[0]
+             else:
+                 raise NotImplementedError("A list comprehension cannot be unpacked")
+ 
++        parent = self._context[-2]
++        if isinstance(parent, ast.Call):
++            output_type = self._visit(parent.func)
++        else:
++            output_type = 'list'
++
+         index = PyccelSymbol('_', is_temp=True)
+ 
+         args = [index]
+@@ -1198,7 +1210,7 @@ class SyntaxParser(BasicParser):
+         indices = indices[::-1]
+ 
+         return FunctionalFor([assign1, generators[-1]],target.rhs, target.lhs,
+-                             indices, index)
++                             indices, index, target_type = output_type)
+ 
+     def _visit_GeneratorExp(self, stmt):
+ 

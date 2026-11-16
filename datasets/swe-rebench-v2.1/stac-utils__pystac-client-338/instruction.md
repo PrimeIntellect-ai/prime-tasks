@@ -1,0 +1,4 @@
+Pagination should terminate if it ever gets an empty page from the server
+As currently written, methods that use pagination will hang indefinitely if the server pagination implementation is broken such that it never stops returning a `next` link relation in the result ItemCollection even when there are no more results to return.
+
+For example, with an Elasticsearch implementation, there's no way to tell in a series of paginated results using the "search after" mechanism when you've finally gotten to the last page until you get an empty page of results. In stac-server and stac-fastapi-elasticsearch, you paginate until you get one final empty page of results with no next link rel. However, it would be easy to accidentally add a next link to this page that was a self-reference, and thereby pystac-client pagination would loop on that self-reference indefinitely.

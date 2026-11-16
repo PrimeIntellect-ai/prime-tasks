@@ -1,0 +1,185 @@
+diff --git a/pkg/storage/disk.go b/pkg/storage/disk.go
+index b7bf3961..6ef3618a 100644
+--- a/pkg/storage/disk.go
++++ b/pkg/storage/disk.go
+@@ -8,6 +8,7 @@ import (
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strings"
++	"syscall"
+ 
+ 	"github.com/g0rbe/go-chattr"
+ 	"github.com/pkg/errors"
+@@ -177,6 +178,8 @@ func (s *Module) DiskCreate(name string, size gridtypes.Unit) (disk pkg.VDisk, e
+ 		}
+ 	}()
+ 
++	defer syscall.Sync()
++
+ 	var file *os.File
+ 	file, err = os.Create(path)
+ 	if err != nil {
+diff --git a/pkg/storage/filesystem/btrfs.go b/pkg/storage/filesystem/btrfs.go
+index 18bb8fb5..e2862c03 100644
+--- a/pkg/storage/filesystem/btrfs.go
++++ b/pkg/storage/filesystem/btrfs.go
+@@ -243,32 +243,23 @@ func (p *btrfsPool) Usage() (usage Usage, err error) {
+ 		return usage, err
+ 	}
+ 
+-	du, err := p.utils.GetDiskUsage(context.Background(), mnt)
+-	if err != nil {
+-		return Usage{}, err
+-	}
+-
+-	return Usage{Size: p.device.Size, Used: du.Data.Used}, nil
+-}
+-
+-// Reserved is reserved size of the devices in bytes
+-func (p *btrfsPool) Reserved() (uint64, error) {
+-
+ 	volumes, err := p.Volumes()
++
+ 	if err != nil {
+-		return 0, err
++		return usage, errors.Wrapf(err, "failed to list pool '%s' volumes", mnt)
+ 	}
+ 
+-	var total uint64
++	var used uint64
+ 	for _, volume := range volumes {
+ 		usage, err := volume.Usage()
+ 		if err != nil {
+-			return 0, err
++			return Usage{}, errors.Wrapf(err, "failed to calculate volume '%s' usage", volume.Path())
+ 		}
+-		total += usage.Size
++
++		used += usage.Used
+ 	}
+ 
+-	return total, nil
++	return Usage{Size: p.device.Size, Used: used}, nil
+ }
+ 
+ func (p *btrfsPool) maintenance() error {
+@@ -369,19 +360,20 @@ func (v *btrfsVolume) Usage() (usage Usage, err error) {
+ 		return
+ 	}
+ 
+-	size := group.MaxRfer
+-	if size == 0 {
++	// used is basically amount of space reserved for this
++	// volume. We assume that's total usage of the volume
++	used := group.MaxRfer
++
++	if used == 0 {
+ 		// in case no limit is set on the subvolume, we assume
+ 		// it's size is the size of the files on that volumes
+-		size, err = FilesUsage(v.Path())
++		used, err = FilesUsage(v.Path())
+ 		if err != nil {
+ 			return usage, errors.Wrap(err, "failed to get subvolume usage")
+ 		}
+ 	}
+-	// otherwise, we return the size as maxrefer and usage as the rfer of the
+-	// associated group
+-	// todo: size should be the size of the pool, if maxrfer is 0
+-	return Usage{Used: group.Rfer, Size: size}, nil
++
++	return Usage{Used: used, Size: group.MaxRfer}, nil
+ }
+ 
+ // Limit size of volume, setting size to 0 means unlimited
+diff --git a/pkg/storage/filesystem/filesystem.go b/pkg/storage/filesystem/filesystem.go
+index 6e899292..c527d4f5 100644
+--- a/pkg/storage/filesystem/filesystem.go
++++ b/pkg/storage/filesystem/filesystem.go
+@@ -38,8 +38,6 @@ type Pool interface {
+ 	Mount() (string, error)
+ 	// UnMount the pool
+ 	UnMount() error
+-	// Reserved is reserved size of the devices in bytes
+-	Reserved() (uint64, error)
+ 	// Volumes are all subvolumes of this volume
+ 	Volumes() ([]Volume, error)
+ 	// AddVolume adds a new subvolume with the given name
+diff --git a/pkg/storage/storage.go b/pkg/storage/storage.go
+index 86b27314..bbf666c5 100644
+--- a/pkg/storage/storage.go
++++ b/pkg/storage/storage.go
+@@ -210,6 +210,16 @@ func (s *Module) initialize() error {
+ 				continue
+ 			}
+ 
++			// for development purposes only
++			if vm {
++				// force ssd device for vms
++				typ = zos.SSDDevice
++
++				if device.Path == "/dev/vdd" || device.Path == "/dev/vde" {
++					typ = zos.HDDDevice
++				}
++			}
++
+ 			log.Debug().Str("device", device.Path).Str("type", typ.String()).Msg("caching device type")
+ 			if err := s.cache.Set(device.Name(), typ); err != nil {
+ 				log.Error().Str("device", device.Path).Err(err).Msg("failed to cache device type")
+@@ -218,15 +228,6 @@ func (s *Module) initialize() error {
+ 			log.Debug().Str("device", device.Path).Str("type", typ.String()).Msg("device type loaded from cache")
+ 		}
+ 
+-		if vm {
+-			// force ssd device for vms
+-			typ = zos.SSDDevice
+-
+-			if device.Path == "/dev/vdd" || device.Path == "/dev/vde" {
+-				typ = zos.HDDDevice
+-			}
+-		}
+-
+ 		switch typ {
+ 		case zos.SSDDevice:
+ 			s.totalSSD += usage.Size
+@@ -687,19 +688,14 @@ func (s *Module) checkForCandidates(size gridtypes.Unit, mounted bool) ([]candid
+ 			continue
+ 		}
+ 
+-		reserved, err := pool.Reserved()
+-		if err != nil {
+-			log.Error().Err(err).Msgf("failed to get size of pool %s", pool.Name())
+-			continue
+-		}
+-
+ 		log.Debug().
+-			Uint64("max size", usage.Size).
+-			Uint64("reserved", reserved).
+-			Uint64("new size", reserved+uint64(size)).
++			Uint64("pool size", usage.Size).
++			Uint64("used", usage.Used).
++			Uint64("new used", usage.Used+uint64(size)).
+ 			Msgf("usage of pool %s", pool.Name())
++
+ 		// Make sure adding this filesystem would not bring us over the disk limit
+-		if reserved+uint64(size) > usage.Size*SSDOverProvisionFactor {
++		if usage.Used+uint64(size) > usage.Size*SSDOverProvisionFactor {
+ 			log.Info().Msgf("Disk does not have enough space left to hold filesystem")
+ 
+ 			if !poolIsMounted && !mounted {
+@@ -719,7 +715,7 @@ func (s *Module) checkForCandidates(size gridtypes.Unit, mounted bool) ([]candid
+ 
+ 		candidates = append(candidates, candidate{
+ 			Pool:      pool,
+-			Available: usage.Size - (reserved + uint64(size)),
++			Available: usage.Size*SSDOverProvisionFactor - (usage.Used + uint64(size)),
+ 		})
+ 
+ 		// if we are looking for not mounted pools, break here
+@@ -727,7 +723,6 @@ func (s *Module) checkForCandidates(size gridtypes.Unit, mounted bool) ([]candid
+ 			return candidates, nil
+ 		}
+ 	}
+-
+ 	sort.Slice(candidates, func(i, j int) bool {
+ 		// reverse sorting so most available is at beginning
+ 		return candidates[i].Available > candidates[j].Available

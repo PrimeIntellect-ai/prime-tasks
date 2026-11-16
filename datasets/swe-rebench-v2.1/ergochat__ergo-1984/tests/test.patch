@@ -1,0 +1,257 @@
+diff --git a/irc/fakelag_test.go b/irc/fakelag_test.go
+index bc1ff45b..214c18bb 100644
+--- a/irc/fakelag_test.go
++++ b/irc/fakelag_test.go
+@@ -4,6 +4,14 @@
+ package irc
+ 
+ import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
+ 	"testing"
+ 	"time"
+ )
+@@ -14,29 +22,20 @@ type mockTime struct {
+ 	lastCheckedSleep int
+ }
+ 
+-func (mt *mockTime) Now() (now time.Time) {
+-	return mt.now
+-}
+-
++func (mt *mockTime) Now() time.Time { return mt.now }
+ func (mt *mockTime) Sleep(dur time.Duration) {
+ 	mt.sleepList = append(mt.sleepList, dur)
+-	mt.pause(dur)
+-}
+-
+-func (mt *mockTime) pause(dur time.Duration) {
+ 	mt.now = mt.now.Add(dur)
+ }
+ 
++func (mt *mockTime) pause(dur time.Duration) { mt.now = mt.now.Add(dur) }
++
+ func (mt *mockTime) lastSleep() (slept bool, duration time.Duration) {
+ 	if mt.lastCheckedSleep == len(mt.sleepList)-1 {
+-		slept = false
+-		return
++		return false, 0
+ 	}
+-
+-	slept = true
+-	mt.lastCheckedSleep += 1
+-	duration = mt.sleepList[mt.lastCheckedSleep]
+-	return
++	mt.lastCheckedSleep++
++	return true, mt.sleepList[mt.lastCheckedSleep]
+ }
+ 
+ func newFakelagForTesting(window time.Duration, burstLimit uint, throttleMessagesPerWindow uint, cooldown time.Duration) (*Fakelag, *mockTime) {
+@@ -49,76 +48,152 @@ func newFakelagForTesting(window time.Duration, burstLimit uint, throttleMessage
+ 		Cooldown:          cooldown,
+ 	}
+ 	mt := new(mockTime)
+-	mt.now, _ = time.Parse("Mon Jan 2 15:04:05 -0700 MST 2006", "Mon Jan 2 15:04:05 -0700 MST 2006")
+ 	mt.lastCheckedSleep = -1
+ 	fl.nowFunc = mt.Now
+ 	fl.sleepFunc = mt.Sleep
+ 	return &fl, mt
+ }
+ 
+-func TestFakelag(t *testing.T) {
+-	window, _ := time.ParseDuration("1s")
+-	fl, mt := newFakelagForTesting(window, 3, 2, window)
+-
+-	fl.Touch()
+-	slept, _ := mt.lastSleep()
+-	if slept {
+-		t.Fatalf("should not have slept")
++func TestFakelagE2ETagmsgSkipsAwayRepliesOnServer(t *testing.T) {
++	root, err := filepath.Abs("..")
++	if err != nil {
++		t.Fatal(err)
+ 	}
+ 
+-	interval, _ := time.ParseDuration("100ms")
+-	for i := 0; i < 2; i++ {
+-		mt.pause(interval)
+-		fl.Touch()
+-		slept, _ := mt.lastSleep()
+-		if slept {
+-			t.Fatalf("should not have slept")
+-		}
++	tmp := t.TempDir()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, port, err := net.SplitHostPort(listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := listener.Close(); err != nil {
++		t.Fatal(err)
+ 	}
+ 
+-	mt.pause(interval)
+-	fl.Touch()
+-	if fl.state != FakelagThrottled {
+-		t.Fatalf("should be throttled")
++	config, err := os.ReadFile(filepath.Join(root, "default.yaml"))
++	if err != nil {
++		t.Fatal(err)
+ 	}
+-	slept, duration := mt.lastSleep()
+-	if !slept {
+-		t.Fatalf("should have slept due to fakelag")
++	configText := string(config)
++	listenersStart := strings.Index(configText, "    # addresses to listen on\n")
++	listenersEnd := strings.Index(configText, "    # sets the permissions for Unix listen sockets.")
++	if listenersStart < 0 || listenersEnd < 0 || listenersEnd <= listenersStart {
++		t.Fatal("could not find the listener configuration")
+ 	}
+-	expected, _ := time.ParseDuration("400ms")
+-	if duration != expected {
+-		t.Fatalf("incorrect sleep time: %v != %v", expected, duration)
++	configText = configText[:listenersStart] + fmt.Sprintf("    # addresses to listen on\n    listeners:\n        \"127.0.0.1:%s\":\n\n", port) + configText[listenersEnd:]
++	databasePath := filepath.ToSlash(filepath.Join(tmp, "ircd.db"))
++	if !strings.Contains(configText, "    path: ircd.db\n") {
++		t.Fatal("could not find the datastore path")
++	}
++	configText = strings.Replace(configText, "    path: ircd.db\n", "    path: "+databasePath+"\n", 1)
++	configPath := filepath.Join(tmp, "server.yaml")
++	if err := os.WriteFile(configPath, []byte(configText), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	binaryPath := filepath.Join(tmp, "ergo")
++	build := exec.Command("go", "build", "-o", binaryPath, ".")
++	build.Dir = root
++	if output, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("could not build server: %v\n%s", err, output)
+ 	}
+ 
+-	// send another message without a pause; we should have to sleep for 500 msec
+-	fl.Touch()
+-	if fl.state != FakelagThrottled {
+-		t.Fatalf("should be throttled")
++	var serverOutput bytes.Buffer
++	server := exec.Command(binaryPath, "run", "--conf", configPath, "--quiet")
++	server.Dir = root
++	server.Stdout = &serverOutput
++	server.Stderr = &serverOutput
++	if err := server.Start(); err != nil {
++		t.Fatal(err)
+ 	}
+-	slept, duration = mt.lastSleep()
+-	expected, _ = time.ParseDuration("500ms")
+-	if duration != expected {
+-		t.Fatalf("incorrect sleep time: %v != %v", duration, expected)
++	t.Cleanup(func() {
++		_ = server.Process.Kill()
++		_ = server.Wait()
++	})
++
++	var senderConn net.Conn
++	deadline := time.Now().Add(15 * time.Second)
++	for time.Now().Before(deadline) {
++		senderConn, err = net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 100*time.Millisecond)
++		if err == nil {
++			break
++		}
++		if server.ProcessState != nil {
++			t.Fatalf("server stopped before accepting clients: %s", serverOutput.String())
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	if err != nil {
++		t.Fatalf("server did not accept clients: %v\n%s", err, serverOutput.String())
++	}
++	defer senderConn.Close()
++	sender := bufio.NewReader(senderConn)
++	register := func(conn net.Conn, reader *bufio.Reader, nick string) {
++		t.Helper()
++		if _, err := fmt.Fprintf(conn, "NICK %s\r\nUSER %s 0 * :test user\r\n", nick, nick); err != nil {
++			t.Fatal(err)
++		}
++		if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
++			t.Fatal(err)
++		}
++		for {
++			line, err := reader.ReadString('\n')
++			if err != nil {
++				t.Fatalf("could not register %s: %v", nick, err)
++			}
++			if strings.Contains(line, " 001 ") {
++				break
++			}
++		}
++		_ = conn.SetReadDeadline(time.Time{})
+ 	}
++	register(senderConn, sender, "sender")
+ 
+-	mt.pause(interval * 6)
+-	fl.Touch()
+-	if fl.state != FakelagThrottled {
+-		t.Fatalf("should still be throttled")
++	awayConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 3*time.Second)
++	if err != nil {
++		t.Fatal(err)
+ 	}
+-	slept, duration = mt.lastSleep()
+-	if duration != 0 {
+-		t.Fatalf("we paused for long enough that we shouldn't sleep here")
++	defer awayConn.Close()
++	awayReader := bufio.NewReader(awayConn)
++	register(awayConn, awayReader, "awayuser")
++	if _, err := fmt.Fprint(awayConn, "AWAY :not here\r\n"); err != nil {
++		t.Fatal(err)
+ 	}
++	if err := awayConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	for {
++		line, err := awayReader.ReadString('\n')
++		if err != nil {
++			t.Fatalf("away status was not acknowledged: %v", err)
++		}
++		if strings.Contains(line, " 306 ") {
++			break
++		}
++	}
++	_ = awayConn.SetReadDeadline(time.Time{})
+ 
+-	mt.pause(window * 2)
+-	fl.Touch()
+-	if fl.state != FakelagBursting {
+-		t.Fatalf("should be bursting again")
++	if _, err := fmt.Fprint(senderConn, "@+test=value TAGMSG awayuser\r\n"); err != nil {
++		t.Fatal(err)
+ 	}
+-	slept, _ = mt.lastSleep()
+-	if slept {
+-		t.Fatalf("should not have slept")
++	if err := senderConn.SetReadDeadline(time.Now().Add(400 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	for {
++		line, err := sender.ReadString('\n')
++		if err != nil {
++			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
++				break
++			}
++			t.Fatalf("failed while waiting for TAGMSG response: %v", err)
++		}
++		fields := strings.Fields(line)
++		if len(fields) > 1 && fields[1] == "301" {
++			t.Fatalf("TAGMSG received an away reply: %s", strings.TrimSpace(line))
++		}
+ 	}
+ }
+ 

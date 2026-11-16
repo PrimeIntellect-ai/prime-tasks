@@ -1,0 +1,396 @@
+diff --git a/tests/test_proxy_environment.py b/tests/test_proxy_environment.py
+new file mode 100644
+index 00000000..79c2b2ec
+--- /dev/null
++++ b/tests/test_proxy_environment.py
+@@ -0,0 +1,270 @@
++# Copyright 2025, the TUF contributors
++# SPDX-License-Identifier: MIT OR Apache-2.0
++
++"""Test ngclient ProxyEnvironment"""
++
++from __future__ import annotations
++
++import http.server
++import os
++import sys
++import threading
++import unittest
++from contextlib import contextmanager
++from typing import TYPE_CHECKING, ClassVar
++from unittest.mock import patch
++
++from urllib3 import PoolManager, ProxyManager
++
++from tests import utils
++
++if TYPE_CHECKING:
++    from collections.abc import Iterator
++
++    from tuf.ngclient._internal.proxy import ProxyEnvironment
++
++
++def _proxy_environment(**kwargs: object) -> ProxyEnvironment:
++    """Construct a ProxyEnvironment (imported lazily)."""
++    from tuf.ngclient._internal.proxy import ProxyEnvironment
++
++    return ProxyEnvironment(**kwargs)
++
++
++@contextmanager
++def proxy_environment(**proxies: str) -> Iterator[None]:
++    """Set the process proxy environment variables for the duration of the block.
++
++    Keyword argument names are the proxy variable names without the ``_proxy``
++    suffix (``http``, ``https``, ``no``, ``all``). Any other proxy environment
++    variables are removed for the duration of the block.
++    """
++    env = {f"{name}_proxy": value for name, value in proxies.items()}
++    with patch.dict(os.environ, env, clear=True):
++        yield
++
++
++class _RecordingHandler(http.server.BaseHTTPRequestHandler):
++    """Minimal HTTP server that records the requests it receives."""
++
++    requests: ClassVar[list[str]] = []
++
++    def do_GET(self) -> None:
++        type(self).requests.append(self.path)
++        body = b"ok"
++        self.send_response(200)
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *args: object) -> None:
++        pass
++
++
++class TestProxyEnvironment(unittest.TestCase):
++    """Test ngclient ProxyEnvironment implementation
++
++    The proxy environment is configured by setting the process proxy
++    environment variables. The behaviour is observed through the public
++    ProxyEnvironment.get_pool_manager() and ProxyEnvironment.request()
++    endpoints.
++    """
++
++    def proxy_url(
++        self, env: ProxyEnvironment, scheme: str | None, host: str | None
++    ) -> str | None:
++        """Return the proxy url used for scheme/host (None if not proxied)."""
++        manager = env.get_pool_manager(scheme, host)
++        self.assertIsInstance(manager, PoolManager)
++        if isinstance(manager, ProxyManager):
++            return str(manager.proxy)
++        return None
++
++    def test_no_variables(self) -> None:
++        with proxy_environment():
++            env = _proxy_environment()
++            self.assertIsNone(self.proxy_url(env, "http", "example.com"))
++            self.assertIsNone(self.proxy_url(env, "https", "example.com"))
++            self.assertIsNone(
++                self.proxy_url(env, "https", "subdomain.example.com")
++            )
++            self.assertIsNone(self.proxy_url(env, "https", "differentsite.com"))
++
++    def test_proxy_set(self) -> None:
++        with proxy_environment(https="http://localhost:8888"):
++            env = _proxy_environment()
++            self.assertIsNone(self.proxy_url(env, "http", "example.com"))
++            self.assertEqual(
++                self.proxy_url(env, "https", "example.com"),
++                "http://localhost:8888",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "differentsite.com"),
++                "http://localhost:8888",
++            )
++
++    def test_proxies_set(self) -> None:
++        with proxy_environment(
++            http="http://localhost:8888", https="http://localhost:9999"
++        ):
++            env = _proxy_environment()
++            self.assertEqual(
++                self.proxy_url(env, "http", "example.com"),
++                "http://localhost:8888",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "example.com"),
++                "http://localhost:9999",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "differentsite.com"),
++                "http://localhost:9999",
++            )
++
++    def test_no_proxy_set(self) -> None:
++        with proxy_environment(
++            http="http://localhost:8888",
++            https="http://localhost:9999",
++            no="somesite.com, example.com, another.site.com",
++        ):
++            env = _proxy_environment()
++            self.assertIsNone(self.proxy_url(env, "http", "example.com"))
++            self.assertIsNone(self.proxy_url(env, "https", "example.com"))
++            self.assertEqual(
++                self.proxy_url(env, "http", "differentsite.com"),
++                "http://localhost:8888",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "differentsite.com"),
++                "http://localhost:9999",
++            )
++
++    def test_no_proxy_subdomain_match(self) -> None:
++        with proxy_environment(
++            https="http://localhost:9999",
++            no="somesite.com, example.com, another.site.com",
++        ):
++            env = _proxy_environment()
++            # subdomain.example.com matches example.com in no_proxy
++            self.assertIsNone(
++                self.proxy_url(env, "https", "subdomain.example.com")
++            )
++            # xexample.com does not match example.com in no_proxy
++            self.assertEqual(
++                self.proxy_url(env, "https", "xexample.com"),
++                "http://localhost:9999",
++            )
++
++    def test_no_proxy_wildcard(self) -> None:
++        with proxy_environment(https="http://localhost:8888", no="*"):
++            env = _proxy_environment()
++            self.assertIsNone(self.proxy_url(env, "https", "example.com"))
++            self.assertIsNone(self.proxy_url(env, "https", "differentsite.com"))
++            self.assertIsNone(
++                self.proxy_url(env, "https", "subdomain.example.com")
++            )
++
++    def test_no_proxy_leading_dot(self) -> None:
++        with proxy_environment(https="http://localhost:8888", no=".example.com"):
++            env = _proxy_environment()
++            self.assertIsNone(self.proxy_url(env, "https", "example.com"))
++            self.assertIsNone(
++                self.proxy_url(env, "https", "subdomain.example.com")
++            )
++
++    def test_all_proxy_set(self) -> None:
++        with proxy_environment(all="http://localhost:8888"):
++            env = _proxy_environment()
++            self.assertEqual(
++                self.proxy_url(env, "http", "example.com"),
++                "http://localhost:8888",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "example.com"),
++                "http://localhost:8888",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "differentsite.com"),
++                "http://localhost:8888",
++            )
++            # schemes without a host still return a usable pool manager
++            self.assertIsInstance(env.get_pool_manager("file", None), PoolManager)
++
++    def test_all_proxy_and_no_proxy_set(self) -> None:
++        with proxy_environment(
++            all="http://localhost:8888",
++            no="somesite.com, example.com, another.site.com",
++        ):
++            env = _proxy_environment()
++            self.assertIsNone(self.proxy_url(env, "http", "example.com"))
++            self.assertIsNone(self.proxy_url(env, "https", "example.com"))
++            self.assertIsNone(
++                self.proxy_url(env, "https", "subdomain.example.com")
++            )
++            self.assertEqual(
++                self.proxy_url(env, "http", "differentsite.com"),
++                "http://localhost:8888",
++            )
++            self.assertEqual(
++                self.proxy_url(env, "https", "differentsite.com"),
++                "http://localhost:8888",
++            )
++
++    def test_manager_cached_per_proxy(self) -> None:
++        with proxy_environment(https="http://localhost:8888"):
++            env = _proxy_environment()
++            proxied = env.get_pool_manager("https", "example.com")
++            # the same proxy url is reused for other hosts
++            self.assertIs(proxied, env.get_pool_manager("https", "other.com"))
++            plain = env.get_pool_manager("http", "example.com")
++            # the non-proxied manager is cached as well
++            self.assertIs(plain, env.get_pool_manager("http", "other.com"))
++            self.assertIsNot(proxied, plain)
++
++    def test_kwargs_forwarded_to_managers(self) -> None:
++        with proxy_environment(https="http://localhost:8888"):
++            env = _proxy_environment(headers={"User-Agent": "test-agent"})
++            plain = env.get_pool_manager("http", "example.com")
++            self.assertEqual(plain.headers["User-Agent"], "test-agent")
++            proxied = env.get_pool_manager("https", "example.com")
++            self.assertEqual(proxied.headers["User-Agent"], "test-agent")
++
++    def test_request_returns_response(self) -> None:
++        _RecordingHandler.requests = []
++        server = http.server.HTTPServer(("127.0.0.1", 0), _RecordingHandler)
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        try:
++            port = server.server_address[1]
++            with proxy_environment():
++                env = _proxy_environment()
++                response = env.request("GET", f"http://127.0.0.1:{port}/")
++                self.assertEqual(response.status, 200)
++                self.assertEqual(response.data, b"ok")
++        finally:
++            server.shutdown()
++            server.server_close()
++
++    def test_request_uses_proxy(self) -> None:
++        _RecordingHandler.requests = []
++        server = http.server.HTTPServer(("127.0.0.1", 0), _RecordingHandler)
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        try:
++            port = server.server_address[1]
++            with proxy_environment(http=f"http://127.0.0.1:{port}"):
++                env = _proxy_environment()
++                response = env.request("GET", "http://example.com/some/path")
++                self.assertEqual(response.status, 200)
++                self.assertEqual(response.data, b"ok")
++            # the request was routed through the proxy for the target url
++            self.assertTrue(_RecordingHandler.requests)
++            self.assertIn("example.com", _RecordingHandler.requests[-1])
++        finally:
++            server.shutdown()
++            server.server_close()
++
++
++if __name__ == "__main__":
++    utils.configure_test_logging(sys.argv)
++    unittest.main()
+diff --git a/tests/test_updater_ng.py b/tests/test_updater_ng.py
+index 9a89c1de..453bc6e5 100644
+--- a/tests/test_updater_ng.py
++++ b/tests/test_updater_ng.py
+@@ -5,11 +5,13 @@
+ 
+ from __future__ import annotations
+ 
++import http.server
+ import logging
+ import os
+ import shutil
+ import sys
+ import tempfile
++import threading
+ import unittest
+ from typing import TYPE_CHECKING, Callable, ClassVar
+ from unittest.mock import MagicMock, patch
+@@ -27,6 +29,7 @@
+     Timestamp,
+ )
+ from tuf.ngclient import Updater, UpdaterConfig
++from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Iterable
+@@ -34,6 +37,23 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++class _RecordingHandler(http.server.BaseHTTPRequestHandler):
++    """Minimal HTTP server that records the requests it receives."""
++
++    user_agents: ClassVar[list[str]] = []
++    requests: ClassVar[list[str]] = []
++
++    def do_GET(self) -> None:
++        type(self).user_agents.append(self.headers.get("User-Agent", ""))
++        type(self).requests.append(self.path)
++        self.send_response(200)
++        self.send_header("Content-Length", "0")
++        self.end_headers()
++
++    def log_message(self, *args: object) -> None:
++        pass
++
++
+ class TestUpdater(unittest.TestCase):
+     """Test the Updater class from 'tuf/ngclient/updater.py'."""
+ 
+@@ -328,25 +348,51 @@ def test_non_existing_target_file(self) -> None:
+             self.updater.download_target(info)
+ 
+     def test_user_agent(self) -> None:
+-        # test default
+-        self.updater.refresh()
+-        session = self.updater._fetcher._poolManager
+-        ua = session.headers["User-Agent"]
+-        self.assertEqual(ua[:11], "python-tuf/")
+-
+-        # test custom UA
+-        updater = Updater(
+-            self.client_directory,
+-            self.metadata_url,
+-            self.dl_dir,
+-            self.targets_url,
+-            config=UpdaterConfig(app_user_agent="MyApp/1.2.3"),
+-        )
+-        updater.refresh()
+-        session = updater._fetcher._poolManager
+-        ua = session.headers["User-Agent"]
++        _RecordingHandler.user_agents = []
++        server = http.server.HTTPServer(("127.0.0.1", 0), _RecordingHandler)
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        try:
++            url = f"http://127.0.0.1:{server.server_address[1]}/"
++
++            # test default
++            fetcher = Urllib3Fetcher()
++            fetcher.download_bytes(url, 100)
++            self.assertEqual(
++                _RecordingHandler.user_agents[-1][:11], "python-tuf/"
++            )
+ 
+-        self.assertEqual(ua[:23], "MyApp/1.2.3 python-tuf/")
++            # test custom UA
++            fetcher = Urllib3Fetcher(app_user_agent="MyApp/1.2.3")
++            fetcher.download_bytes(url, 100)
++            self.assertEqual(
++                _RecordingHandler.user_agents[-1][:23],
++                "MyApp/1.2.3 python-tuf/",
++            )
++        finally:
++            server.shutdown()
++            server.server_close()
++
++    def test_fetcher_uses_proxy_environment(self) -> None:
++        _RecordingHandler.requests = []
++        server = http.server.HTTPServer(("127.0.0.1", 0), _RecordingHandler)
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        try:
++            port = server.server_address[1]
++            with patch.dict(
++                os.environ,
++                {"http_proxy": f"http://127.0.0.1:{port}"},
++                clear=True,
++            ):
++                fetcher = Urllib3Fetcher()
++                fetcher.download_bytes("http://example.invalid/some/path", 100)
++            # the request was routed through the proxy for the target url
++            self.assertTrue(_RecordingHandler.requests)
++            self.assertIn("example.invalid", _RecordingHandler.requests[-1])
++        finally:
++            server.shutdown()
++            server.server_close()
+ 
+ 
+ if __name__ == "__main__":

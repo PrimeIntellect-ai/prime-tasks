@@ -1,0 +1,198 @@
+diff --git a/examples/custom_tile_size/custom_tile_size.mapchete b/examples/custom_tile_size/custom_tile_size.mapchete
+new file mode 100644
+index 0000000..7bec606
+--- /dev/null
++++ b/examples/custom_tile_size/custom_tile_size.mapchete
+@@ -0,0 +1,15 @@
++process: mapchete.processes.convert
++zoom_levels:
++    min: 0
++    max: 8
++pyramid:
++    grid: geodetic
++    metatiling: 1
++    tile_size: 1000
++input:
++    inp: ../../test/testdata/cleantopo_tl.tif
++output:
++    path: output
++    format: GTiff
++    dtype: uint8
++    bands: 1
+diff --git a/mapchete/commands/convert.py b/mapchete/commands/convert.py
+index 57cbcbc..9df52d2 100644
+--- a/mapchete/commands/convert.py
++++ b/mapchete/commands/convert.py
+@@ -177,7 +177,9 @@ def convert(
+                 zoom_levels=dict(
+                     min=0,
+                     max=get_best_zoom_level(
+-                        input_path, mapchete_config["pyramid"]["grid"]
++                        input_path,
++                        mapchete_config["pyramid"]["grid"],
++                        mapchete_config["pyramid"].get("tile_size", 256),
+                     ),
+                 )
+             )
+diff --git a/mapchete/config/base.py b/mapchete/config/base.py
+index 13a6f03..0f9d32a 100644
+--- a/mapchete/config/base.py
++++ b/mapchete/config/base.py
+@@ -158,15 +158,17 @@ class MapcheteConfig(object):
+         # (3) set process and output pyramids
+         logger.debug("initializing pyramids")
+         try:
+-            process_metatiling = self.parsed_config.pyramid.metatiling
+-            # output metatiling defaults to process metatiling if not set
+-            # explicitly
++            # output metatiling and tile_size default to process metatiling and tile_size
++            # if not set explicitly
+             output_metatiling = self.parsed_config.output.get(
+-                "metatiling", process_metatiling
++                "metatiling", self.parsed_config.pyramid.metatiling
++            )
++            output_tile_size = self.parsed_config.output.get(
++                "tile_size", self.parsed_config.pyramid.tile_size
+             )
+             # we cannot properly handle output tiles which are bigger than
+             # process tiles
+-            if output_metatiling > process_metatiling:
++            if output_metatiling > self.parsed_config.pyramid.metatiling:
+                 raise ValueError(
+                     "output metatiles must be smaller than process metatiles"
+                 )
+@@ -176,9 +178,10 @@ class MapcheteConfig(object):
+                 **dict(self.parsed_config.pyramid)
+             )
+             self.output_pyramid = BufferedTilePyramid(
+-                self.parsed_config.pyramid.grid,
++                self.parsed_config.pyramid.grid,  # type: ignore
+                 metatiling=output_metatiling,
+                 pixelbuffer=self.parsed_config.output.get("pixelbuffer", 0),
++                tile_size=output_tile_size,
+             )
+         except Exception as e:
+             logger.exception(e)
+@@ -535,6 +538,7 @@ class MapcheteConfig(object):
+                 self.output_pyramid.grid,
+                 pixelbuffer=self.output_pyramid.pixelbuffer,
+                 metatiling=self.process_pyramid.metatiling,
++                tile_size=self.output_pyramid.tile_size,
+             ),
+         )
+ 
+diff --git a/mapchete/config/models.py b/mapchete/config/models.py
+index 969018d..2731d67 100644
+--- a/mapchete/config/models.py
++++ b/mapchete/config/models.py
+@@ -7,7 +7,7 @@ from collections import OrderedDict
+ from typing import Any, List, Optional, Tuple, Type, Union
+ 
+ from distributed import Client
+-from pydantic import BaseModel, Field, NonNegativeInt
++from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
+ from shapely.geometry.base import BaseGeometry
+ 
+ from mapchete.bounds import Bounds
+@@ -23,12 +23,14 @@ class OutputConfigBase(BaseModel):
+     format: str
+     metatiling: MetatilingValue = 1
+     pixelbuffer: NonNegativeInt = 0
++    tile_size: PositiveInt = 256
+ 
+ 
+ class PyramidConfig(BaseModel):
+     grid: Union[str, dict]
+     metatiling: MetatilingValue = 1
+     pixelbuffer: NonNegativeInt = 0
++    tile_size: PositiveInt = 256
+ 
+ 
+ class DaskAdaptOptions(BaseModel):
+diff --git a/mapchete/config/parse.py b/mapchete/config/parse.py
+index 5f5dbac..a3dbab8 100644
+--- a/mapchete/config/parse.py
++++ b/mapchete/config/parse.py
+@@ -65,6 +65,7 @@ def raw_conf_process_pyramid(
+     return BufferedTilePyramid(
+         raw_conf["pyramid"]["grid"],
+         metatiling=raw_conf["pyramid"].get("metatiling", 1),
++        tile_size=raw_conf["pyramid"].get("tile_size", 256),
+         pixelbuffer=pixelbuffer,
+     )
+ 
+@@ -90,6 +91,9 @@ def raw_conf_output_pyramid(raw_conf: dict) -> BufferedTilePyramid:
+         pixelbuffer=raw_conf["pyramid"].get(
+             "pixelbuffer", raw_conf["pyramid"].get("pixelbuffer", 0)
+         ),
++        tile_size=raw_conf["pyramid"].get(
++            "tile_size", raw_conf["pyramid"].get("tile_size", 256)
++        ),
+     )
+ 
+ 
+diff --git a/mapchete/formats/base.py b/mapchete/formats/base.py
+index 81cc566..e475913 100644
+--- a/mapchete/formats/base.py
++++ b/mapchete/formats/base.py
+@@ -206,6 +206,7 @@ class OutputDataBase:
+             grid=output_params["grid"],
+             metatiling=output_params["metatiling"],
+             pixelbuffer=output_params["pixelbuffer"],
++            tile_size=output_params.get("tile_size", 256),
+         )
+         self.crs = self.pyramid.crs
+         self.storage_options = output_params.get("storage_options")
+diff --git a/mapchete/io/_misc.py b/mapchete/io/_misc.py
+index b08390d..a5acdf9 100644
+--- a/mapchete/io/_misc.py
++++ b/mapchete/io/_misc.py
+@@ -18,7 +18,7 @@ from mapchete.types import MPathLike
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def get_best_zoom_level(input_file, tile_pyramid_type):
++def get_best_zoom_level(input_file, tile_pyramid_type, tile_size: int = 256):
+     """
+     Determine the best base zoom level for a raster.
+ 
+@@ -33,7 +33,7 @@ def get_best_zoom_level(input_file, tile_pyramid_type):
+     -------
+     zoom : integer
+     """
+-    tile_pyramid = BufferedTilePyramid(tile_pyramid_type)
++    tile_pyramid = BufferedTilePyramid(tile_pyramid_type, tile_size=tile_size)
+     with rasterio.open(input_file, "r") as src:
+         xmin, ymin, xmax, ymax = reproject_geometry(
+             segmentize_geometry(
+diff --git a/mapchete/tile.py b/mapchete/tile.py
+index ba9855a..4f916c5 100644
+--- a/mapchete/tile.py
++++ b/mapchete/tile.py
+@@ -9,7 +9,7 @@ from typing import Generator, List, Literal, TypedDict, Union
+ 
+ import numpy as np
+ from affine import Affine
+-from pydantic import NonNegativeInt
++from pydantic import NonNegativeInt, PositiveInt
+ from rasterio.enums import Resampling
+ from rasterio.features import rasterize, shapes
+ from rasterio.transform import from_bounds
+@@ -49,7 +49,7 @@ PyramidDefinitionDict = TypedDict(
+     {
+         "grid": GridDefinitionDict,
+         "metatiling": MetatilingValue,
+-        "tile_size": NonNegativeInt,
++        "tile_size": PositiveInt,
+         "pixelbuffer": NonNegativeInt,
+     },
+ )
+@@ -74,7 +74,7 @@ class BufferedTilePyramid(TilePyramid):
+             Literal["geodetic", "mercator"], GridDefinitionDict, GridDefinition
+         ],
+         metatiling: MetatilingValue = 1,
+-        tile_size: NonNegativeInt = 256,
++        tile_size: PositiveInt = 256,
+         pixelbuffer: NonNegativeInt = 0,
+     ):
+         TilePyramid.__init__(self, grid, metatiling=metatiling, tile_size=tile_size)

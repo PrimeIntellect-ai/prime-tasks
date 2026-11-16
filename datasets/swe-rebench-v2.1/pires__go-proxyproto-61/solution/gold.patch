@@ -1,0 +1,307 @@
+diff --git a/addr_proto.go b/addr_proto.go
+index 0d0bc70..687b75d 100644
+--- a/addr_proto.go
++++ b/addr_proto.go
+@@ -13,15 +13,6 @@ const (
+ 	UnixDatagram AddressFamilyAndProtocol = '\x32'
+ )
+ 
+-var supportedTransportProtocol = map[AddressFamilyAndProtocol]bool{
+-	TCPv4:        true,
+-	UDPv4:        true,
+-	TCPv6:        true,
+-	UDPv6:        true,
+-	UnixStream:   true,
+-	UnixDatagram: true,
+-}
+-
+ // IsIPv4 returns true if the address family is IPv4 (AF_INET4), false otherwise.
+ func (ap AddressFamilyAndProtocol) IsIPv4() bool {
+ 	return 0x10 == ap&0xF0
+diff --git a/header.go b/header.go
+index f22bbc2..48d3fa7 100644
+--- a/header.go
++++ b/header.go
+@@ -16,6 +16,7 @@ var (
+ 	SIGV1 = []byte{'\x50', '\x52', '\x4F', '\x58', '\x59'}
+ 	SIGV2 = []byte{'\x0D', '\x0A', '\x0D', '\x0A', '\x00', '\x0D', '\x0A', '\x51', '\x55', '\x49', '\x54', '\x0A'}
+ 
++	ErrLineMustEndWithCrlf                  = errors.New("proxyproto: header is invalid, must end with \\r\\n")
+ 	ErrCantReadProtocolVersionAndCommand    = errors.New("proxyproto: can't read proxy protocol version and command")
+ 	ErrCantReadAddressFamilyAndProtocol     = errors.New("proxyproto: can't read address family or protocol")
+ 	ErrCantReadLength                       = errors.New("proxyproto: can't read length")
+diff --git a/protocol.go b/protocol.go
+index 9fb2df1..878ca1c 100644
+--- a/protocol.go
++++ b/protocol.go
+@@ -157,7 +157,7 @@ func (p *Conn) RemoteAddr() net.Addr {
+ // Raw returns the underlying connection which can be casted to
+ // a concrete type, allowing access to specialized functions.
+ //
+-// Use this ONLY if you know exactly what you are doing. 
++// Use this ONLY if you know exactly what you are doing.
+ func (p *Conn) Raw() net.Conn {
+ 	return p.conn
+ }
+@@ -165,7 +165,7 @@ func (p *Conn) Raw() net.Conn {
+ // TCPConn returns the underlying TCP connection,
+ // allowing access to specialized functions.
+ //
+-// Use this ONLY if you know exactly what you are doing. 
++// Use this ONLY if you know exactly what you are doing.
+ func (p *Conn) TCPConn() (conn *net.TCPConn, ok bool) {
+ 	conn, ok = p.conn.(*net.TCPConn)
+ 	return
+@@ -174,7 +174,7 @@ func (p *Conn) TCPConn() (conn *net.TCPConn, ok bool) {
+ // UnixConn returns the underlying Unix socket connection,
+ // allowing access to specialized functions.
+ //
+-// Use this ONLY if you know exactly what you are doing. 
++// Use this ONLY if you know exactly what you are doing.
+ func (p *Conn) UnixConn() (conn *net.UnixConn, ok bool) {
+ 	conn, ok = p.conn.(*net.UnixConn)
+ 	return
+@@ -183,7 +183,7 @@ func (p *Conn) UnixConn() (conn *net.UnixConn, ok bool) {
+ // UDPConn returns the underlying UDP connection,
+ // allowing access to specialized functions.
+ //
+-// Use this ONLY if you know exactly what you are doing. 
++// Use this ONLY if you know exactly what you are doing.
+ func (p *Conn) UDPConn() (conn *net.UDPConn, ok bool) {
+ 	conn, ok = p.conn.(*net.UDPConn)
+ 	return
+diff --git a/v1.go b/v1.go
+index 059faf9..0020d79 100644
+--- a/v1.go
++++ b/v1.go
+@@ -22,52 +22,73 @@ func initVersion1() *Header {
+ }
+ 
+ func parseVersion1(reader *bufio.Reader) (*Header, error) {
+-	// Make sure we have a v1 header
++	// Read until LF shows up, otherwise fail.
++	// At this point, can't be sure CR precedes LF which will be validated next.
+ 	line, err := reader.ReadString('\n')
++	if err != nil {
++		return nil, ErrLineMustEndWithCrlf
++	}
+ 	if !strings.HasSuffix(line, crlf) {
+-		return nil, ErrCantReadProtocolVersionAndCommand
++		return nil, ErrLineMustEndWithCrlf
+ 	}
++	// Check full signature.
+ 	tokens := strings.Split(line[:len(line)-2], separator)
+-	if len(tokens) < 6 {
+-		return nil, ErrCantReadProtocolVersionAndCommand
++	transportProtocol := UNSPEC // doesn't exist in v1 but fits UNKNOWN.
++	if len(tokens) > 0 {
++		// Read address family and protocol
++		switch tokens[1] {
++		case "TCP4":
++			transportProtocol = TCPv4
++		case "TCP6":
++			transportProtocol = TCPv6
++		case "UNKNOWN": // no-op as UNSPEC is set already
++		default:
++			return nil, ErrCantReadAddressFamilyAndProtocol
++		}
++
++		// Expect 6 tokens only when UNKNOWN is not present.
++		if !transportProtocol.IsUnspec() && len(tokens) < 6 {
++			return nil, ErrCantReadAddressFamilyAndProtocol
++		}
+ 	}
+ 
++	// Allocation only happens when a signature is found.
+ 	header := initVersion1()
++	// If UNKNOWN is present, set Command to LOCAL.
++	// Command is not present in v1 but set it for other parts of
++	// this library to rely on it for determining connection details.
++	header.Command = LOCAL
+ 
+-	// Read address family and protocol
+-	switch tokens[1] {
+-	case "TCP4":
+-		header.TransportProtocol = TCPv4
+-	case "TCP6":
+-		header.TransportProtocol = TCPv6
+-	default:
+-		header.TransportProtocol = UNSPEC
+-	}
++	// Transport protocol has been processed already.
++	header.TransportProtocol = transportProtocol
+ 
+-	// Read addresses and ports
+-	sourceIP, err := parseV1IPAddress(header.TransportProtocol, tokens[2])
+-	if err != nil {
+-		return nil, err
+-	}
+-	destIP, err := parseV1IPAddress(header.TransportProtocol, tokens[3])
+-	if err != nil {
+-		return nil, err
+-	}
+-	sourcePort, err := parseV1PortNumber(tokens[4])
+-	if err != nil {
+-		return nil, err
+-	}
+-	destPort, err := parseV1PortNumber(tokens[5])
+-	if err != nil {
+-		return nil, err
+-	}
+-	header.SourceAddr = &net.TCPAddr{
+-		IP:   sourceIP,
+-		Port: sourcePort,
+-	}
+-	header.DestinationAddr = &net.TCPAddr{
+-		IP:   destIP,
+-		Port: destPort,
++	// Only process further if UNKNOWN is not present.
++	if header.TransportProtocol != UNSPEC {
++		// Read addresses and ports
++		sourceIP, err := parseV1IPAddress(header.TransportProtocol, tokens[2])
++		if err != nil {
++			return nil, err
++		}
++		destIP, err := parseV1IPAddress(header.TransportProtocol, tokens[3])
++		if err != nil {
++			return nil, err
++		}
++		sourcePort, err := parseV1PortNumber(tokens[4])
++		if err != nil {
++			return nil, err
++		}
++		destPort, err := parseV1PortNumber(tokens[5])
++		if err != nil {
++			return nil, err
++		}
++		header.SourceAddr = &net.TCPAddr{
++			IP:   sourceIP,
++			Port: sourcePort,
++		}
++		header.DestinationAddr = &net.TCPAddr{
++			IP:   destIP,
++			Port: destPort,
++		}
+ 	}
+ 
+ 	return header, nil
+@@ -84,7 +105,7 @@ func (header *Header) formatVersion1() ([]byte, error) {
+ 		proto = "TCP6"
+ 	default:
+ 		// Unknown connection (short form)
+-		return []byte("PROXY UNKNOWN\r\n"), nil
++		return []byte("PROXY UNKNOWN" + crlf), nil
+ 	}
+ 
+ 	sourceAddr, sourceOK := header.SourceAddr.(*net.TCPAddr)
+diff --git a/v2.go b/v2.go
+index 7c281e3..b0fdd58 100644
+--- a/v2.go
++++ b/v2.go
+@@ -82,8 +82,13 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
+ 		return nil, ErrCantReadAddressFamilyAndProtocol
+ 	}
+ 	header.TransportProtocol = AddressFamilyAndProtocol(b14)
+-	if _, ok := supportedTransportProtocol[header.TransportProtocol]; !ok {
+-		return nil, ErrUnsupportedAddressFamilyAndProtocol
++	//  UNSPEC is only supported when LOCAL is set.
++	if header.TransportProtocol == UNSPEC {
++		if header.Command != LOCAL {
++			return nil, ErrUnsupportedAddressFamilyAndProtocol
++		}
++		// Ignore everything else.
++		return header, nil
+ 	}
+ 
+ 	// Make sure there are bytes available as specified in length
+@@ -152,48 +157,54 @@ func (header *Header) formatVersion2() ([]byte, error) {
+ 	buf.Write(SIGV2)
+ 	buf.WriteByte(header.Command.toByte())
+ 	buf.WriteByte(header.TransportProtocol.toByte())
+-	var addrSrc, addrDst []byte
+-	if header.TransportProtocol.IsIPv4() {
+-		hdrLen, err := addTLVLen(lengthV4Bytes, len(header.rawTLVs))
+-		if err != nil {
+-			return nil, err
++	// When UNSPEC, the receiver must ignore addresses and ports.
++	// Therefore there's no point in writing it.
++	if !header.TransportProtocol.IsUnspec() {
++		var addrSrc, addrDst []byte
++		if header.TransportProtocol.IsIPv4() {
++			hdrLen, err := addTLVLen(lengthV4Bytes, len(header.rawTLVs))
++			if err != nil {
++				return nil, err
++			}
++			buf.Write(hdrLen)
++			sourceIP, destIP, _ := header.IPs()
++			addrSrc = sourceIP.To4()
++			addrDst = destIP.To4()
++		} else if header.TransportProtocol.IsIPv6() {
++			hdrLen, err := addTLVLen(lengthV6Bytes, len(header.rawTLVs))
++			if err != nil {
++				return nil, err
++			}
++			buf.Write(hdrLen)
++			sourceIP, destIP, _ := header.IPs()
++			addrSrc = sourceIP.To16()
++			addrDst = destIP.To16()
++		} else if header.TransportProtocol.IsUnix() {
++			buf.Write(lengthUnixBytes)
++			sourceAddr, destAddr, ok := header.UnixAddrs()
++			if !ok {
++				return nil, ErrInvalidAddress
++			}
++			addrSrc = formatUnixName(sourceAddr.Name)
++			addrDst = formatUnixName(destAddr.Name)
+ 		}
+-		buf.Write(hdrLen)
+-		sourceIP, destIP, _ := header.IPs()
+-		addrSrc = sourceIP.To4()
+-		addrDst = destIP.To4()
+-	} else if header.TransportProtocol.IsIPv6() {
+-		hdrLen, err := addTLVLen(lengthV6Bytes, len(header.rawTLVs))
+-		if err != nil {
+-			return nil, err
+-		}
+-		buf.Write(hdrLen)
+-		sourceIP, destIP, _ := header.IPs()
+-		addrSrc = sourceIP.To16()
+-		addrDst = destIP.To16()
+-	} else if header.TransportProtocol.IsUnix() {
+-		buf.Write(lengthUnixBytes)
+-		sourceAddr, destAddr, ok := header.UnixAddrs()
+-		if !ok {
++
++		//
++		if addrSrc == nil || addrDst == nil {
+ 			return nil, ErrInvalidAddress
+ 		}
+-		addrSrc = formatUnixName(sourceAddr.Name)
+-		addrDst = formatUnixName(destAddr.Name)
+-	}
+-	if addrSrc == nil || addrDst == nil {
+-		return nil, ErrInvalidAddress
+-	}
+-	buf.Write(addrSrc)
+-	buf.Write(addrDst)
++		buf.Write(addrSrc)
++		buf.Write(addrDst)
+ 
+-	if sourcePort, destPort, ok := header.Ports(); ok {
+-		portBytes := make([]byte, 2)
++		if sourcePort, destPort, ok := header.Ports(); ok {
++			portBytes := make([]byte, 2)
+ 
+-		binary.BigEndian.PutUint16(portBytes, uint16(sourcePort))
+-		buf.Write(portBytes)
++			binary.BigEndian.PutUint16(portBytes, uint16(sourcePort))
++			buf.Write(portBytes)
+ 
+-		binary.BigEndian.PutUint16(portBytes, uint16(destPort))
+-		buf.Write(portBytes)
++			binary.BigEndian.PutUint16(portBytes, uint16(destPort))
++			buf.Write(portBytes)
++		}
+ 	}
+ 
+ 	if len(header.rawTLVs) > 0 {

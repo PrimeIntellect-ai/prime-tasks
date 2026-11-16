@@ -1,0 +1,180 @@
+diff --git a/src/testing.rs b/src/testing.rs
+index bac712a..19400ad 100644
+--- a/src/testing.rs
++++ b/src/testing.rs
+@@ -107,6 +107,7 @@ pub mod fixtures {
+             #[cfg(feature = "experimental")]
+             memory_cache: None,
+             advanced_opts: advanced,
++            ..Default::default()
+         };
+ 
+         RequestHandler {
+@@ -114,3 +115,167 @@ pub mod fixtures {
+         }
+     }
+ }
++
++/// Behavioral tests for the `log_forwarded_for` / `trusted_proxies` options.
++#[cfg(test)]
++mod tests {
++    use std::sync::{Arc, Mutex};
++
++    /// A writer that captures log output from the server's worker threads.
++    #[derive(Clone, Default)]
++    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
++
++    impl CaptureWriter {
++        fn contents(&self) -> String {
++            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
++        }
++    }
++
++    impl std::io::Write for CaptureWriter {
++        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++            self.0.lock().unwrap().extend_from_slice(buf);
++            Ok(buf.len())
++        }
++
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
++        type Writer = CaptureWriter;
++
++        fn make_writer(&'a self) -> Self::Writer {
++            self.clone()
++        }
++    }
++
++    async fn request_logs_from_cli(
++        log_forwarded_for: bool,
++        trusted_proxy: Option<&str>,
++        writer: &CaptureWriter,
++    ) -> String {
++        use clap::Parser;
++        use std::io::{Read, Write};
++        use std::net::TcpListener;
++        use std::time::Duration;
++
++        let port = TcpListener::bind(("127.0.0.1", 0))
++            .unwrap()
++            .local_addr()
++            .unwrap()
++            .port();
++        let mut args = vec![
++            "sws".to_owned(),
++            "--host".to_owned(),
++            "127.0.0.1".to_owned(),
++            "--port".to_owned(),
++            port.to_string(),
++            "--root".to_owned(),
++            ".".to_owned(),
++            "--log-remote-address".to_owned(),
++        ];
++        if log_forwarded_for {
++            args.push("--log-forwarded-for".to_owned());
++        }
++        if let Some(proxy) = trusted_proxy {
++            args.push("--trusted-proxies".to_owned());
++            args.push(proxy.to_owned());
++        }
++        let general = crate::settings::cli::General::try_parse_from(args).unwrap();
++        let server = crate::Server::new(crate::Settings {
++            general,
++            advanced: None,
++        })
++        .unwrap();
++        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
++        let server_thread = std::thread::spawn(move || {
++            let _ = server.run_standalone(Some(shutdown_rx));
++        });
++
++        let address = format!("127.0.0.1:{port}");
++        let mut ready = false;
++        for _ in 0..100 {
++            if std::net::TcpStream::connect(&address).is_ok() {
++                ready = true;
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++        assert!(ready, "server did not start listening on {address}");
++
++        writer.0.lock().unwrap().clear();
++        let mut stream = std::net::TcpStream::connect(&address).unwrap();
++        stream
++            .set_read_timeout(Some(Duration::from_secs(2)))
++            .unwrap();
++        write!(
++            stream,
++            "GET / HTTP/1.0\r\nHost: {address}\r\nX-Forwarded-For: 1.1.1.1\r\n\r\n"
++        )
++        .unwrap();
++        let mut response = String::new();
++        let _ = stream.read_to_string(&mut response);
++
++        let logs = writer.contents();
++        let _ = shutdown_tx.send(());
++        server_thread.join().unwrap();
++        logs
++    }
++
++    #[tokio::test]
++    async fn cli_forwarded_ip_options_control_server_request_logs() {
++        use tracing::Level;
++
++        let writer = CaptureWriter::default();
++        let subscriber = tracing_subscriber::fmt()
++            .with_writer(writer.clone())
++            .with_ansi(false)
++            .with_max_level(Level::INFO)
++            .finish();
++        tracing::subscriber::set_global_default(subscriber)
++            .expect("the test process should not already have a global subscriber");
++
++        let defaults = request_logs_from_cli(false, None, &writer).await;
++        assert!(
++            !defaults.contains("real_remote_ip"),
++            "forwarded-IP logging should be off by default: {defaults}"
++        );
++
++        let all_trusted = request_logs_from_cli(true, None, &writer).await;
++        assert!(
++            all_trusted.contains("real_remote_ip=1.1.1.1"),
++            "an empty proxy list should trust the request's remote address: {all_trusted}"
++        );
++
++        let trusted = request_logs_from_cli(true, Some("10.0.0.1,127.0.0.1"), &writer).await;
++        assert!(
++            trusted.contains("real_remote_ip=1.1.1.1"),
++            "an address in the comma-separated trusted-proxy list should supply the logged client IP: {trusted}"
++        );
++
++        let untrusted = request_logs_from_cli(true, Some("10.0.0.1"), &writer).await;
++        assert!(
++            !untrusted.contains("real_remote_ip"),
++            "a remote address absent from the configured proxy list should not supply the logged IP: {untrusted}"
++        );
++    }
++
++    #[test]
++    fn cli_accepts_trusted_proxies_as_comma_separated_ip_addresses() {
++        use clap::Parser;
++        crate::settings::cli::General::try_parse_from([
++            "sws",
++            "--trusted-proxies",
++            "1.1.1.1,10.0.0.1",
++        ])
++        .expect("CLI should accept a comma-separated list of trusted IP addresses");
++    }
++
++    #[test]
++    fn cli_accepts_log_forwarded_for_boolean_flag() {
++        use clap::Parser;
++        crate::settings::cli::General::try_parse_from(["sws", "--log-forwarded-for"])
++            .expect("CLI should accept --log-forwarded-for as a boolean flag");
++    }
++}

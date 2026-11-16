@@ -1,0 +1,252 @@
+diff --git a/src/cache.rs b/src/cache.rs
+index c4241f1a..b69678c5 100644
+--- a/src/cache.rs
++++ b/src/cache.rs
+@@ -90,6 +90,8 @@ pub struct NameIdEntry {
+ pub enum EntryState {
+     /// The term have just been parsed.
+     Parsed,
++    /// The term has been parsed and the imports resolved
++    ImportsResolved,
+     /// The term have been parsed and typechecked.
+     Typechecked,
+     /// The term have been parsed, possibly typechecked (but not necessarily), and transformed.
+@@ -350,7 +352,7 @@ impl Cache {
+ 
+         if *state > EntryState::Typechecked {
+             Ok(CacheOp::Cached(()))
+-        } else if *state == EntryState::Parsed {
++        } else if *state >= EntryState::Parsed {
+             type_check(t, global_env, self)?;
+             self.update_state(file_id, EntryState::Typechecked);
+             Ok(CacheOp::Done(()))
+@@ -367,7 +369,7 @@ impl Cache {
+             Some(EntryState::Transformed) => Ok(CacheOp::Cached(())),
+             Some(_) => {
+                 let (t, _) = self.terms.remove(&file_id).unwrap();
+-                let t = transformations::transform(t, self)?;
++                let t = transformations::transform(t)?;
+                 self.terms.insert(file_id, (t, EntryState::Transformed));
+                 Ok(CacheOp::Done(()))
+             }
+@@ -404,8 +406,7 @@ impl Cache {
+                             std::mem::replace(map, HashMap::new())
+                                 .into_iter()
+                                 .map(|(id, t)| {
+-                                    transformations::transform(t, self)
+-                                        .map(|t_ok| (id.clone(), t_ok))
++                                    transformations::transform(t).map(|t_ok| (id.clone(), t_ok))
+                                 })
+                                 .collect();
+                         *map = map_res?;
+@@ -420,7 +421,27 @@ impl Cache {
+         }
+     }
+ 
+-    /// Prepare a source for evaluation: parse it, typecheck it and apply program transformations,
++    /// Resolve every imports of an entry of the cache, and update its state accordingly,
++    /// or do nothing if the entry has already been transformed. Require that the corresponding
++    /// source has been parsed.
++    pub fn resolve_imports(
++        &mut self,
++        file_id: FileId,
++    ) -> Result<CacheOp<()>, CacheError<ImportError>> {
++        match self.entry_state(file_id) {
++            Some(EntryState::ImportsResolved) => Ok(CacheOp::Cached(())),
++            Some(_) => {
++                let (t, _) = self.terms.remove(&file_id).unwrap();
++                let t = transformations::resolve_imports(t, self)?;
++                self.terms.insert(file_id, (t, EntryState::ImportsResolved));
++                Ok(CacheOp::Done(()))
++            }
++            None => Err(CacheError::NotParsed),
++        }
++    }
++
++    /// Prepare a source for evaluation: parse it, resolve the imports,
++    /// typecheck it and apply program transformations,
+     /// if it was not already done.
+     pub fn prepare(
+         &mut self,
+@@ -433,6 +454,15 @@ impl Cache {
+             result = CacheOp::Done(());
+         };
+ 
++        let import_res = self.resolve_imports(file_id).map_err(|cache_err| {
++            cache_err.unwrap_error(
++                "cache::prepare(): expected source to be parsed before imports resolutions",
++            )
++        })?;
++        if import_res == CacheOp::Done(()) {
++            result = CacheOp::Done(());
++        };
++
+         let typecheck_res = self.typecheck(file_id, global_env).map_err(|cache_err| {
+             cache_err
+                 .unwrap_error("cache::prepare(): expected source to be parsed before typechecking")
+@@ -461,8 +491,9 @@ impl Cache {
+         global_env: &eval::Environment,
+     ) -> Result<RichTerm, Error> {
+         let term = self.parse_nocache(file_id)?;
++        let term = transformations::resolve_imports(term, self)?;
+         type_check(&term, global_env, self)?;
+-        let term = transformations::transform(term, self)?;
++        let term = transformations::transform(term)?;
+         Ok(term)
+     }
+ 
+diff --git a/src/eval.rs b/src/eval.rs
+index 53e09d54..652dcd6a 100644
+--- a/src/eval.rs
++++ b/src/eval.rs
+@@ -985,7 +985,7 @@ mod tests {
+     use crate::parser::{grammar, lexer};
+     use crate::term::make as mk_term;
+     use crate::term::{BinaryOp, StrChunk, UnaryOp};
+-    use crate::transformations::transform;
++    use crate::transformations::resolve_imports;
+     use crate::{mk_app, mk_fun};
+     use codespan::Files;
+ 
+@@ -1154,7 +1154,7 @@ mod tests {
+         where
+             R: ImportResolver,
+         {
+-            transform(
++            resolve_imports(
+                 mk_term::let_in(var, mk_term::import(import), body),
+                 resolver,
+             )
+diff --git a/src/program.rs b/src/program.rs
+index 94ce4032..255d4cce 100644
+--- a/src/program.rs
++++ b/src/program.rs
+@@ -110,6 +110,11 @@ impl Program {
+         self.cache.parse(self.main_id)?;
+         self.cache.load_stdlib()?;
+         let global_env = self.cache.mk_global_env().expect("program::typecheck(): stdlib has been loaded but was not found in cache on mk_global_env()");
++        self.cache
++            .resolve_imports(self.main_id)
++            .map_err(|cache_err| {
++                cache_err.unwrap_error("program::typecheck(): expected source to be parsed")
++            })?;
+         self.cache
+             .typecheck(self.main_id, &global_env)
+             .map_err(|cache_err| {
+diff --git a/src/repl/mod.rs b/src/repl/mod.rs
+index 20539bbd..dcc45ffd 100644
+--- a/src/repl/mod.rs
++++ b/src/repl/mod.rs
+@@ -118,15 +118,17 @@ impl REPLImpl {
+             .map_err(|err| ParseError::from_lalrpop(err, file_id))?
+         {
+             ExtendedTerm::RichTerm(t) => {
++                let t = transformations::resolve_imports(t, &mut self.cache)?;
+                 typecheck::type_check_in_env(&t, &self.type_env, &self.cache)?;
+-                let t = transformations::transform(t, &mut self.cache)?;
++                let t = transformations::transform(t)?;
+                 Ok(eval_function(t, &self.eval_env, &mut self.cache)?.into())
+             }
+             ExtendedTerm::ToplevelLet(id, t) => {
++                let t = transformations::resolve_imports(t, &mut self.cache)?;
+                 typecheck::type_check_in_env(&t, &self.type_env, &self.cache)?;
+                 typecheck::Envs::env_add(&mut self.type_env, id.clone(), &t);
+ 
+-                let t = transformations::transform(t, &mut self.cache)?;
++                let t = transformations::transform(t)?;
+ 
+                 let local_env = self.eval_env.clone();
+                 eval::env_add(&mut self.eval_env, id.clone(), t, local_env);
+diff --git a/src/transformations.rs b/src/transformations.rs
+index 2d482646..9db0f517 100644
+--- a/src/transformations.rs
++++ b/src/transformations.rs
+@@ -253,22 +253,35 @@ pub mod apply_contracts {
+     }
+ }
+ 
+-/// The state passed around during the program transformation. It holds a reference to the import
++/// The state passed around during the imports resolution. It holds a reference to the import
+ /// resolver, to a stack of pending imported term to be transformed and the path of the import
+ /// currently being processed, if any.
+-struct TransformState<'a, R> {
++struct ImportsResolutionState<'a, R> {
+     resolver: &'a mut R,
+     stack: &'a mut Vec<PendingImport>,
+     parent: Option<PathBuf>,
+ }
+ 
+-/// Apply all program transformations, which are currently the share normal form transformation and
++/// Apply all program transformations, which are currently the share normal form transformations and
++/// contracts application.
++pub fn transform(rt: RichTerm) -> Result<RichTerm, ImportError> {
++    rt.traverse(
++        &mut |rt: RichTerm, _| -> Result<RichTerm, ImportError> {
++            // We need to do contract generation before wrapping stuff in variables
++            let rt = apply_contracts::transform_one(rt);
++            let rt = share_normal_form::transform_one(rt);
++            Ok(rt)
++        },
++        &mut (),
++    )
++}
++
+ /// import resolution.
+ ///
+-/// All resolved imports are stacked during the transformation. Once the term has been traversed,
++/// All resolved imports are stacked during the process. Once the term has been traversed,
+ /// the elements of this stack are processed (and so on, if these elements also have non resolved
+ /// imports).
+-pub fn transform<R>(rt: RichTerm, resolver: &mut R) -> Result<RichTerm, ImportError>
++pub fn resolve_imports<R>(rt: RichTerm, resolver: &mut R) -> Result<RichTerm, ImportError>
+ where
+     R: ImportResolver,
+ {
+@@ -278,19 +291,19 @@ where
+         let path = resolver.get_path(x.src_id);
+         PathBuf::from(path)
+     });
+-    let result = transform_pass(rt, resolver, &mut stack, source_file);
++    let result = imports_pass(rt, resolver, &mut stack, source_file);
+ 
+     while let Some((t, file_id, parent)) = stack.pop() {
+-        let result = transform_pass(t, resolver, &mut stack, Some(parent))?;
++        let result = imports_pass(t, resolver, &mut stack, Some(parent))?;
+         resolver.insert(file_id, result);
+     }
+ 
+     result
+ }
+ 
+-/// Perform one full transformation pass. Put all imports encountered for the first time in
++/// Perform one full imports resolution pass. Put all imports encountered for the first time in
+ /// `stack`, but do not process them.
+-fn transform_pass<R>(
++fn imports_pass<R>(
+     rt: RichTerm,
+     resolver: &mut R,
+     stack: &mut Vec<PendingImport>,
+@@ -299,18 +312,17 @@ fn transform_pass<R>(
+ where
+     R: ImportResolver,
+ {
+-    let mut state = TransformState {
++    let mut state = ImportsResolutionState {
+         resolver,
+         stack,
+         parent,
+     };
+ 
+-    // Apply one step of each transformation. If an import is resolved, then stack it.
++    // If an import is resolved, then stack it.
+     rt.traverse(
+-        &mut |rt: RichTerm, state: &mut TransformState<R>| -> Result<RichTerm, ImportError> {
+-            // We need to do contract generation before wrapping stuff in variables
+-            let rt = apply_contracts::transform_one(rt);
+-            let rt = share_normal_form::transform_one(rt);
++        &mut |rt: RichTerm,
++              state: &mut ImportsResolutionState<R>|
++         -> Result<RichTerm, ImportError> {
+             let (rt, pending) =
+                 import_resolution::transform_one(rt, state.resolver, &state.parent)?;
+ 

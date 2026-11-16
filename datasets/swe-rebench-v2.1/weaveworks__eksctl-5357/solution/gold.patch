@@ -1,0 +1,631 @@
+diff --git a/pkg/actions/cluster/owned.go b/pkg/actions/cluster/owned.go
+index c3a4cf0e6..c9af7b848 100644
+--- a/pkg/actions/cluster/owned.go
++++ b/pkg/actions/cluster/owned.go
+@@ -67,11 +67,6 @@ func (c *OwnedCluster) Upgrade(ctx context.Context, dryRun bool) error {
+ }
+ 
+ func (c *OwnedCluster) Delete(ctx context.Context, _, podEvictionWaitPeriod time.Duration, wait, force, disableNodegroupEviction bool, parallel int) error {
+-	var (
+-		clientSet kubernetes.Interface
+-		oidc      *iamoidc.OpenIDConnectManager
+-	)
+-
+ 	clusterOperable, err := c.ctl.CanOperate(c.cfg)
+ 	if err != nil {
+ 		logger.Debug("failed to check if cluster is operable: %v", err)
+@@ -83,7 +78,7 @@ func (c *OwnedCluster) Delete(ctx context.Context, _, podEvictionWaitPeriod time
+ 		return err
+ 	}
+ 
+-	oidcSupported := true
++	var clientSet kubernetes.Interface
+ 	if clusterOperable {
+ 		var err error
+ 		clientSet, err = c.newClientSet()
+@@ -95,18 +90,6 @@ func (c *OwnedCluster) Delete(ctx context.Context, _, podEvictionWaitPeriod time
+ 			}
+ 		}
+ 
+-		oidc, err = c.ctl.NewOpenIDConnectManager(ctx, c.cfg)
+-		if err != nil {
+-			if _, ok := err.(*eks.UnsupportedOIDCError); !ok {
+-				if force {
+-					logger.Warning("error occurred during deletion: %v", err)
+-				} else {
+-					return err
+-				}
+-			}
+-			oidcSupported = false
+-		}
+-
+ 		nodeGroupManager := c.newNodeGroupManager(c.cfg, c.ctl, clientSet)
+ 		if err := drainAllNodeGroups(ctx, c.cfg, c.ctl, clientSet, allStacks, disableNodegroupEviction, parallel, nodeGroupManager, func(clusterName string, ctl *eks.ClusterProvider, clientSet kubernetes.Interface) {
+ 			attemptVpcCniDeletion(ctx, clusterName, ctl, clientSet)
+@@ -129,8 +112,10 @@ func (c *OwnedCluster) Delete(ctx context.Context, _, podEvictionWaitPeriod time
+ 		}
+ 	}
+ 
+-	deleteOIDCProvider := clusterOperable && oidcSupported
+-	tasks, err := c.stackManager.NewTasksToDeleteClusterWithNodeGroups(ctx, c.clusterStack, allStacks, deleteOIDCProvider, oidc, kubernetes.NewCachedClientSet(clientSet), wait, func(errs chan error, _ string) error {
++	newOIDCManager := func() (*iamoidc.OpenIDConnectManager, error) {
++		return c.ctl.NewOpenIDConnectManager(ctx, c.cfg)
++	}
++	tasks, err := c.stackManager.NewTasksToDeleteClusterWithNodeGroups(ctx, c.clusterStack, allStacks, clusterOperable, newOIDCManager, c.ctl.Status.ClusterInfo.Cluster, kubernetes.NewCachedClientSet(clientSet), wait, force, func(errs chan error, _ string) error {
+ 		logger.Info("trying to cleanup dangling network interfaces")
+ 		if err := c.ctl.LoadClusterVPC(ctx, c.cfg, c.stackManager); err != nil {
+ 			return errors.Wrapf(err, "getting VPC configuration for cluster %q", c.cfg.Metadata.Name)
+diff --git a/pkg/actions/cluster/unowned.go b/pkg/actions/cluster/unowned.go
+index 253ecd65e..b16f989be 100644
+--- a/pkg/actions/cluster/unowned.go
++++ b/pkg/actions/cluster/unowned.go
+@@ -110,7 +110,7 @@ func (c *UnownedCluster) Delete(ctx context.Context, waitInterval, podEvictionWa
+ 		return err
+ 	}
+ 
+-	if err := c.deleteIAMAndOIDC(ctx, wait, clusterOperable, clientSet); err != nil {
++	if err := c.deleteIAMAndOIDC(ctx, wait, clusterOperable, clientSet, force); err != nil {
+ 		if err != nil {
+ 			if force {
+ 				logger.Warning("error occurred during deletion: %v", err)
+@@ -161,26 +161,15 @@ func (c *UnownedCluster) checkClusterExists(ctx context.Context, clusterName str
+ 	return nil
+ }
+ 
+-func (c *UnownedCluster) deleteIAMAndOIDC(ctx context.Context, wait bool, clusterOperable bool, clientSet kubernetes.Interface) error {
+-	var oidc *iamoidc.OpenIDConnectManager
+-	oidcSupported := true
+-
+-	if clusterOperable {
+-		var err error
+-		oidc, err = c.ctl.NewOpenIDConnectManager(ctx, c.cfg)
+-		if err != nil {
+-			if _, ok := err.(*eks.UnsupportedOIDCError); !ok {
+-				return err
+-			}
+-			oidcSupported = false
+-		}
+-	}
+-
++func (c *UnownedCluster) deleteIAMAndOIDC(ctx context.Context, wait bool, clusterOperable bool, clientSet kubernetes.Interface, force bool) error {
+ 	tasksTree := &tasks.TaskTree{Parallel: false}
+ 
+-	if clusterOperable && oidcSupported {
++	if clusterOperable {
+ 		clientSetGetter := kubernetes.NewCachedClientSet(clientSet)
+-		serviceAccountAndOIDCTasks, err := c.stackManager.NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx, oidc, clientSetGetter)
++		newOIDCManager := func() (*iamoidc.OpenIDConnectManager, error) {
++			return c.ctl.NewOpenIDConnectManager(ctx, c.cfg)
++		}
++		serviceAccountAndOIDCTasks, err := c.stackManager.NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx, newOIDCManager, c.ctl.Status.ClusterInfo.Cluster, clientSetGetter, force)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -191,14 +180,14 @@ func (c *UnownedCluster) deleteIAMAndOIDC(ctx context.Context, wait bool, cluste
+ 		}
+ 	}
+ 
+-	deleteAddonIAMtasks, err := c.stackManager.NewTaskToDeleteAddonIAM(ctx, wait)
++	deleteAddonIAMTasks, err := c.stackManager.NewTaskToDeleteAddonIAM(ctx, wait)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	if deleteAddonIAMtasks.Len() > 0 {
+-		deleteAddonIAMtasks.IsSubTask = true
+-		tasksTree.Append(deleteAddonIAMtasks)
++	if deleteAddonIAMTasks.Len() > 0 {
++		deleteAddonIAMTasks.IsSubTask = true
++		tasksTree.Append(deleteAddonIAMTasks)
+ 	}
+ 
+ 	if tasksTree.Len() == 0 {
+@@ -277,7 +266,7 @@ func (c *UnownedCluster) deleteAndWaitForNodegroupsDeletion(ctx context.Context,
+ 		}
+ 
+ 		if isUnowned() {
+-			// if a managed ng does not have a stack, we queue if for deletion via api
++			// if a managed ng does not have a stack, we queue it for deletion via api
+ 			tasks.Append(c.stackManager.NewTaskToDeleteUnownedNodeGroup(ctx, clusterName, n, eksAPI, c.waitForUnownedNgsDeletion(ctx, waitInterval)))
+ 		}
+ 	}
+diff --git a/pkg/apis/eksctl.io/v1alpha5/types.go b/pkg/apis/eksctl.io/v1alpha5/types.go
+index 05484d2d0..bac5f0117 100644
+--- a/pkg/apis/eksctl.io/v1alpha5/types.go
++++ b/pkg/apis/eksctl.io/v1alpha5/types.go
+@@ -214,6 +214,9 @@ const (
+ 	// ClusterNameTag defines the tag of the cluster name
+ 	ClusterNameTag = "alpha.eksctl.io/cluster-name"
+ 
++	// ClusterOIDCEnabledTag determines whether OIDC is enabled or not.
++	ClusterOIDCEnabledTag = "alpha.eksctl.io/cluster-oidc-enabled"
++
+ 	// OldClusterNameTag defines the tag of the cluster name
+ 	OldClusterNameTag = "eksctl.cluster.k8s.io/v1alpha1/cluster-name"
+ 
+diff --git a/pkg/cfn/manager/api.go b/pkg/cfn/manager/api.go
+index 79270e145..bc2ec2356 100644
+--- a/pkg/cfn/manager/api.go
++++ b/pkg/cfn/manager/api.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"regexp"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -178,8 +179,10 @@ func (c *StackCollection) CreateStack(ctx context.Context, stackName string, res
+ 
+ // createClusterStack creates the cluster stack
+ func (c *StackCollection) createClusterStack(ctx context.Context, stackName string, resourceSet builder.ResourceSetReader, errCh chan error) error {
+-	// Unlike with `createNodeGroupTask`, all tags are already set for the cluster stack
+-	stack, err := c.createStackRequest(ctx, stackName, resourceSet, nil, nil)
++	clusterTags := map[string]string{
++		api.ClusterOIDCEnabledTag: strconv.FormatBool(api.IsEnabled(c.spec.IAM.WithOIDC)),
++	}
++	stack, err := c.createStackRequest(ctx, stackName, resourceSet, clusterTags, nil)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/cfn/manager/delete_tasks.go b/pkg/cfn/manager/delete_tasks.go
+index 22a67f928..6f5c490e0 100644
+--- a/pkg/cfn/manager/delete_tasks.go
++++ b/pkg/cfn/manager/delete_tasks.go
+@@ -5,9 +5,10 @@ import (
+ 	"fmt"
+ 	"time"
+ 
+-	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
+-	"github.com/aws/aws-sdk-go-v2/service/eks"
++	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+ 
++	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
++	awseks "github.com/aws/aws-sdk-go-v2/service/eks"
+ 	"github.com/kris-nova/logger"
+ 	"github.com/pkg/errors"
+ 
+@@ -22,8 +23,10 @@ import (
+ // think Jake is deleting this soon
+ func deleteAll(_ string) bool { return true }
+ 
++type NewOIDCManager func() (*iamoidc.OpenIDConnectManager, error)
++
+ // NewTasksToDeleteClusterWithNodeGroups defines tasks required to delete the given cluster along with all of its resources
+-func (c *StackCollection) NewTasksToDeleteClusterWithNodeGroups(ctx context.Context, clusterStack *Stack, nodeGroupStacks []NodeGroupStack, deleteOIDCProvider bool, oidc *iamoidc.OpenIDConnectManager, clientSetGetter kubernetes.ClientSetGetter, wait bool, cleanup func(chan error, string) error) (*tasks.TaskTree, error) {
++func (c *StackCollection) NewTasksToDeleteClusterWithNodeGroups(ctx context.Context, clusterStack *Stack, nodeGroupStacks []NodeGroupStack, clusterOperable bool, newOIDCManager NewOIDCManager, cluster *ekstypes.Cluster, clientSetGetter kubernetes.ClientSetGetter, wait, force bool, cleanup func(chan error, string) error) (*tasks.TaskTree, error) {
+ 	taskTree := &tasks.TaskTree{Parallel: false}
+ 
+ 	nodeGroupTasks, err := c.NewTasksToDeleteNodeGroups(nodeGroupStacks, deleteAll, true, cleanup)
+@@ -36,8 +39,8 @@ func (c *StackCollection) NewTasksToDeleteClusterWithNodeGroups(ctx context.Cont
+ 		taskTree.Append(nodeGroupTasks)
+ 	}
+ 
+-	if deleteOIDCProvider {
+-		serviceAccountAndOIDCTasks, err := c.NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx, oidc, clientSetGetter)
++	if clusterOperable {
++		serviceAccountAndOIDCTasks, err := c.NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx, newOIDCManager, cluster, clientSetGetter, force)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -48,14 +51,14 @@ func (c *StackCollection) NewTasksToDeleteClusterWithNodeGroups(ctx context.Cont
+ 		}
+ 	}
+ 
+-	deleteAddonIAMtasks, err := c.NewTaskToDeleteAddonIAM(ctx, wait)
++	deleteAddonIAMTasks, err := c.NewTaskToDeleteAddonIAM(ctx, wait)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	if deleteAddonIAMtasks.Len() > 0 {
+-		deleteAddonIAMtasks.IsSubTask = true
+-		taskTree.Append(deleteAddonIAMtasks)
++	if deleteAddonIAMTasks.Len() > 0 {
++		deleteAddonIAMTasks.IsSubTask = true
++		taskTree.Append(deleteAddonIAMTasks)
+ 	}
+ 
+ 	if clusterStack == nil {
+@@ -135,7 +138,7 @@ func (d *DeleteUnownedNodegroupTask) Describe() string {
+ }
+ 
+ func (d *DeleteUnownedNodegroupTask) Do() error {
+-	out, err := d.eksAPI.DeleteNodegroup(d.ctx, &eks.DeleteNodegroupInput{
++	out, err := d.eksAPI.DeleteNodegroup(d.ctx, &awseks.DeleteNodegroupInput{
+ 		ClusterName:   &d.cluster,
+ 		NodegroupName: &d.nodegroup,
+ 	})
+@@ -178,26 +181,60 @@ func (c *StackCollection) NewTaskToDeleteUnownedNodeGroup(ctx context.Context, c
+ }
+ 
+ // NewTasksToDeleteOIDCProviderWithIAMServiceAccounts defines tasks required to delete all of the iamserviceaccounts
+-// along with associated IAM ODIC provider
+-func (c *StackCollection) NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx context.Context, oidc *iamoidc.OpenIDConnectManager, clientSetGetter kubernetes.ClientSetGetter) (*tasks.TaskTree, error) {
++// along with associated IAM OIDC provider
++func (c *StackCollection) NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx context.Context, newOIDCManager NewOIDCManager, cluster *ekstypes.Cluster, clientSetGetter kubernetes.ClientSetGetter, force bool) (*tasks.TaskTree, error) {
+ 	taskTree := &tasks.TaskTree{Parallel: false}
+ 
+-	allServiceAccountsWithStacks, err := c.getAllServiceAccounts(ctx)
++	oidc, err := newOIDCManager()
+ 	if err != nil {
+-		return nil, err
++		if _, ok := err.(*iamoidc.UnsupportedOIDCError); ok {
++			logger.Debug("OIDC is not supported for this cluster")
++			return taskTree, nil
++		}
++		return nil, fmt.Errorf("error creating OIDC manager: %w", err)
+ 	}
+-	saTasks, err := c.NewTasksToDeleteIAMServiceAccounts(ctx, allServiceAccountsWithStacks, clientSetGetter, true)
++
++	allServiceAccountsWithStacks, err := c.getAllServiceAccounts(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	if saTasks.Len() > 0 {
+-		saTasks.IsSubTask = true
+-		taskTree.Append(saTasks)
++	if len(allServiceAccountsWithStacks) > 0 {
++		saTasks, err := c.NewTasksToDeleteIAMServiceAccounts(ctx, allServiceAccountsWithStacks, clientSetGetter, true)
++		if err != nil {
++			return nil, err
++		}
++
++		if saTasks.Len() > 0 {
++			saTasks.IsSubTask = true
++			taskTree.Append(saTasks)
++		}
+ 	}
+ 
+ 	providerExists, err := oidc.CheckProviderExists(ctx)
+ 	if err != nil {
++		if iamoidc.IsAccessDeniedError(err) {
++			clusterHasOIDC, foundTag := clusterHasOIDCProvider(cluster)
++			errMsg := "IAM permissions are required to delete OIDC provider"
++			switch {
++			case foundTag:
++				if clusterHasOIDC {
++					return nil, fmt.Errorf("%s: %w", errMsg, err)
++				}
++				if len(allServiceAccountsWithStacks) > 0 {
++					logger.Warning("expected an OIDC provider to be associated with the cluster; found %d service account(s)", len(allServiceAccountsWithStacks))
++				}
++			case len(allServiceAccountsWithStacks) > 0:
++				if !force {
++					return nil, fmt.Errorf("found %d IAM service account(s); %s: %w", len(allServiceAccountsWithStacks), errMsg, err)
++				}
++			default:
++				logger.Info("could not determine if cluster has an OIDC provider because of missing IAM permissions; " +
++					"if an OIDC provider was associated with the cluster (either by setting `iam.withOIDC: true` or by using `eksctl utils associate-iam-oidc-provider`), " +
++					"run `aws iam delete-open-id-connect-provider` from an authorized IAM entity to delete it")
++			}
++			return taskTree, nil
++		}
+ 		return nil, err
+ 	}
+ 
+@@ -317,3 +354,12 @@ func (c *StackCollection) NewTaskToDeleteAddonIAM(ctx context.Context, wait bool
+ 	return taskTree, nil
+ 
+ }
++
++func clusterHasOIDCProvider(cluster *ekstypes.Cluster) (hasOIDC bool, found bool) {
++	for k, v := range cluster.Tags {
++		if k == api.ClusterOIDCEnabledTag {
++			return v == "true", true
++		}
++	}
++	return false, false
++}
+diff --git a/pkg/cfn/manager/fakes/fake_stack_manager.go b/pkg/cfn/manager/fakes/fake_stack_manager.go
+index cc6860f33..a1b60370b 100644
+--- a/pkg/cfn/manager/fakes/fake_stack_manager.go
++++ b/pkg/cfn/manager/fakes/fake_stack_manager.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
+ 	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
+ 	typesb "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
++	typesc "github.com/aws/aws-sdk-go-v2/service/eks/types"
+ 	"github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
+ 	"github.com/weaveworks/eksctl/pkg/awsapi"
+ 	"github.com/weaveworks/eksctl/pkg/cfn/builder"
+@@ -645,17 +646,19 @@ type FakeStackManager struct {
+ 	newTasksToCreateIAMServiceAccountsReturnsOnCall map[int]struct {
+ 		result1 *tasks.TaskTree
+ 	}
+-	NewTasksToDeleteClusterWithNodeGroupsStub        func(context.Context, *types.Stack, []manager.NodeGroupStack, bool, *iamoidc.OpenIDConnectManager, kubernetes.ClientSetGetter, bool, func(chan error, string) error) (*tasks.TaskTree, error)
++	NewTasksToDeleteClusterWithNodeGroupsStub        func(context.Context, *types.Stack, []manager.NodeGroupStack, bool, manager.NewOIDCManager, *typesc.Cluster, kubernetes.ClientSetGetter, bool, bool, func(chan error, string) error) (*tasks.TaskTree, error)
+ 	newTasksToDeleteClusterWithNodeGroupsMutex       sync.RWMutex
+ 	newTasksToDeleteClusterWithNodeGroupsArgsForCall []struct {
+-		arg1 context.Context
+-		arg2 *types.Stack
+-		arg3 []manager.NodeGroupStack
+-		arg4 bool
+-		arg5 *iamoidc.OpenIDConnectManager
+-		arg6 kubernetes.ClientSetGetter
+-		arg7 bool
+-		arg8 func(chan error, string) error
++		arg1  context.Context
++		arg2  *types.Stack
++		arg3  []manager.NodeGroupStack
++		arg4  bool
++		arg5  manager.NewOIDCManager
++		arg6  *typesc.Cluster
++		arg7  kubernetes.ClientSetGetter
++		arg8  bool
++		arg9  bool
++		arg10 func(chan error, string) error
+ 	}
+ 	newTasksToDeleteClusterWithNodeGroupsReturns struct {
+ 		result1 *tasks.TaskTree
+@@ -697,12 +700,14 @@ type FakeStackManager struct {
+ 		result1 *tasks.TaskTree
+ 		result2 error
+ 	}
+-	NewTasksToDeleteOIDCProviderWithIAMServiceAccountsStub        func(context.Context, *iamoidc.OpenIDConnectManager, kubernetes.ClientSetGetter) (*tasks.TaskTree, error)
++	NewTasksToDeleteOIDCProviderWithIAMServiceAccountsStub        func(context.Context, manager.NewOIDCManager, *typesc.Cluster, kubernetes.ClientSetGetter, bool) (*tasks.TaskTree, error)
+ 	newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex       sync.RWMutex
+ 	newTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall []struct {
+ 		arg1 context.Context
+-		arg2 *iamoidc.OpenIDConnectManager
+-		arg3 kubernetes.ClientSetGetter
++		arg2 manager.NewOIDCManager
++		arg3 *typesc.Cluster
++		arg4 kubernetes.ClientSetGetter
++		arg5 bool
+ 	}
+ 	newTasksToDeleteOIDCProviderWithIAMServiceAccountsReturns struct {
+ 		result1 *tasks.TaskTree
+@@ -3827,7 +3832,7 @@ func (fake *FakeStackManager) NewTasksToCreateIAMServiceAccountsReturnsOnCall(i
+ 	}{result1}
+ }
+ 
+-func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroups(arg1 context.Context, arg2 *types.Stack, arg3 []manager.NodeGroupStack, arg4 bool, arg5 *iamoidc.OpenIDConnectManager, arg6 kubernetes.ClientSetGetter, arg7 bool, arg8 func(chan error, string) error) (*tasks.TaskTree, error) {
++func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroups(arg1 context.Context, arg2 *types.Stack, arg3 []manager.NodeGroupStack, arg4 bool, arg5 manager.NewOIDCManager, arg6 *typesc.Cluster, arg7 kubernetes.ClientSetGetter, arg8 bool, arg9 bool, arg10 func(chan error, string) error) (*tasks.TaskTree, error) {
+ 	var arg3Copy []manager.NodeGroupStack
+ 	if arg3 != nil {
+ 		arg3Copy = make([]manager.NodeGroupStack, len(arg3))
+@@ -3836,21 +3841,23 @@ func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroups(arg1 context
+ 	fake.newTasksToDeleteClusterWithNodeGroupsMutex.Lock()
+ 	ret, specificReturn := fake.newTasksToDeleteClusterWithNodeGroupsReturnsOnCall[len(fake.newTasksToDeleteClusterWithNodeGroupsArgsForCall)]
+ 	fake.newTasksToDeleteClusterWithNodeGroupsArgsForCall = append(fake.newTasksToDeleteClusterWithNodeGroupsArgsForCall, struct {
+-		arg1 context.Context
+-		arg2 *types.Stack
+-		arg3 []manager.NodeGroupStack
+-		arg4 bool
+-		arg5 *iamoidc.OpenIDConnectManager
+-		arg6 kubernetes.ClientSetGetter
+-		arg7 bool
+-		arg8 func(chan error, string) error
+-	}{arg1, arg2, arg3Copy, arg4, arg5, arg6, arg7, arg8})
++		arg1  context.Context
++		arg2  *types.Stack
++		arg3  []manager.NodeGroupStack
++		arg4  bool
++		arg5  manager.NewOIDCManager
++		arg6  *typesc.Cluster
++		arg7  kubernetes.ClientSetGetter
++		arg8  bool
++		arg9  bool
++		arg10 func(chan error, string) error
++	}{arg1, arg2, arg3Copy, arg4, arg5, arg6, arg7, arg8, arg9, arg10})
+ 	stub := fake.NewTasksToDeleteClusterWithNodeGroupsStub
+ 	fakeReturns := fake.newTasksToDeleteClusterWithNodeGroupsReturns
+-	fake.recordInvocation("NewTasksToDeleteClusterWithNodeGroups", []interface{}{arg1, arg2, arg3Copy, arg4, arg5, arg6, arg7, arg8})
++	fake.recordInvocation("NewTasksToDeleteClusterWithNodeGroups", []interface{}{arg1, arg2, arg3Copy, arg4, arg5, arg6, arg7, arg8, arg9, arg10})
+ 	fake.newTasksToDeleteClusterWithNodeGroupsMutex.Unlock()
+ 	if stub != nil {
+-		return stub(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
++		return stub(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10)
+ 	}
+ 	if specificReturn {
+ 		return ret.result1, ret.result2
+@@ -3864,17 +3871,17 @@ func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroupsCallCount() i
+ 	return len(fake.newTasksToDeleteClusterWithNodeGroupsArgsForCall)
+ }
+ 
+-func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroupsCalls(stub func(context.Context, *types.Stack, []manager.NodeGroupStack, bool, *iamoidc.OpenIDConnectManager, kubernetes.ClientSetGetter, bool, func(chan error, string) error) (*tasks.TaskTree, error)) {
++func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroupsCalls(stub func(context.Context, *types.Stack, []manager.NodeGroupStack, bool, manager.NewOIDCManager, *typesc.Cluster, kubernetes.ClientSetGetter, bool, bool, func(chan error, string) error) (*tasks.TaskTree, error)) {
+ 	fake.newTasksToDeleteClusterWithNodeGroupsMutex.Lock()
+ 	defer fake.newTasksToDeleteClusterWithNodeGroupsMutex.Unlock()
+ 	fake.NewTasksToDeleteClusterWithNodeGroupsStub = stub
+ }
+ 
+-func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroupsArgsForCall(i int) (context.Context, *types.Stack, []manager.NodeGroupStack, bool, *iamoidc.OpenIDConnectManager, kubernetes.ClientSetGetter, bool, func(chan error, string) error) {
++func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroupsArgsForCall(i int) (context.Context, *types.Stack, []manager.NodeGroupStack, bool, manager.NewOIDCManager, *typesc.Cluster, kubernetes.ClientSetGetter, bool, bool, func(chan error, string) error) {
+ 	fake.newTasksToDeleteClusterWithNodeGroupsMutex.RLock()
+ 	defer fake.newTasksToDeleteClusterWithNodeGroupsMutex.RUnlock()
+ 	argsForCall := fake.newTasksToDeleteClusterWithNodeGroupsArgsForCall[i]
+-	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3, argsForCall.arg4, argsForCall.arg5, argsForCall.arg6, argsForCall.arg7, argsForCall.arg8
++	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3, argsForCall.arg4, argsForCall.arg5, argsForCall.arg6, argsForCall.arg7, argsForCall.arg8, argsForCall.arg9, argsForCall.arg10
+ }
+ 
+ func (fake *FakeStackManager) NewTasksToDeleteClusterWithNodeGroupsReturns(result1 *tasks.TaskTree, result2 error) {
+@@ -4047,20 +4054,22 @@ func (fake *FakeStackManager) NewTasksToDeleteNodeGroupsReturnsOnCall(i int, res
+ 	}{result1, result2}
+ }
+ 
+-func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(arg1 context.Context, arg2 *iamoidc.OpenIDConnectManager, arg3 kubernetes.ClientSetGetter) (*tasks.TaskTree, error) {
++func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(arg1 context.Context, arg2 manager.NewOIDCManager, arg3 *typesc.Cluster, arg4 kubernetes.ClientSetGetter, arg5 bool) (*tasks.TaskTree, error) {
+ 	fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex.Lock()
+ 	ret, specificReturn := fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsReturnsOnCall[len(fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall)]
+ 	fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall = append(fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall, struct {
+ 		arg1 context.Context
+-		arg2 *iamoidc.OpenIDConnectManager
+-		arg3 kubernetes.ClientSetGetter
+-	}{arg1, arg2, arg3})
++		arg2 manager.NewOIDCManager
++		arg3 *typesc.Cluster
++		arg4 kubernetes.ClientSetGetter
++		arg5 bool
++	}{arg1, arg2, arg3, arg4, arg5})
+ 	stub := fake.NewTasksToDeleteOIDCProviderWithIAMServiceAccountsStub
+ 	fakeReturns := fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsReturns
+-	fake.recordInvocation("NewTasksToDeleteOIDCProviderWithIAMServiceAccounts", []interface{}{arg1, arg2, arg3})
++	fake.recordInvocation("NewTasksToDeleteOIDCProviderWithIAMServiceAccounts", []interface{}{arg1, arg2, arg3, arg4, arg5})
+ 	fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex.Unlock()
+ 	if stub != nil {
+-		return stub(arg1, arg2, arg3)
++		return stub(arg1, arg2, arg3, arg4, arg5)
+ 	}
+ 	if specificReturn {
+ 		return ret.result1, ret.result2
+@@ -4074,17 +4083,17 @@ func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccounts
+ 	return len(fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall)
+ }
+ 
+-func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccountsCalls(stub func(context.Context, *iamoidc.OpenIDConnectManager, kubernetes.ClientSetGetter) (*tasks.TaskTree, error)) {
++func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccountsCalls(stub func(context.Context, manager.NewOIDCManager, *typesc.Cluster, kubernetes.ClientSetGetter, bool) (*tasks.TaskTree, error)) {
+ 	fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex.Lock()
+ 	defer fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex.Unlock()
+ 	fake.NewTasksToDeleteOIDCProviderWithIAMServiceAccountsStub = stub
+ }
+ 
+-func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall(i int) (context.Context, *iamoidc.OpenIDConnectManager, kubernetes.ClientSetGetter) {
++func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall(i int) (context.Context, manager.NewOIDCManager, *typesc.Cluster, kubernetes.ClientSetGetter, bool) {
+ 	fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex.RLock()
+ 	defer fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsMutex.RUnlock()
+ 	argsForCall := fake.newTasksToDeleteOIDCProviderWithIAMServiceAccountsArgsForCall[i]
+-	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3
++	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3, argsForCall.arg4, argsForCall.arg5
+ }
+ 
+ func (fake *FakeStackManager) NewTasksToDeleteOIDCProviderWithIAMServiceAccountsReturns(result1 *tasks.TaskTree, result2 error) {
+diff --git a/pkg/cfn/manager/interface.go b/pkg/cfn/manager/interface.go
+index bcd9deeb1..2bfe79535 100644
+--- a/pkg/cfn/manager/interface.go
++++ b/pkg/cfn/manager/interface.go
+@@ -3,6 +3,8 @@ package manager
+ import (
+ 	"context"
+ 
++	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
++
+ 	"github.com/weaveworks/eksctl/pkg/awsapi"
+ 
+ 	asgtypes "github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
+@@ -87,10 +89,10 @@ type StackManager interface {
+ 	NewTaskToDeleteUnownedNodeGroup(ctx context.Context, clusterName, nodegroup string, eksAPI awsapi.EKS, waitCondition *DeleteWaitCondition) tasks.Task
+ 	NewTasksToCreateClusterWithNodeGroups(ctx context.Context, nodeGroups []*v1alpha5.NodeGroup, managedNodeGroups []*v1alpha5.ManagedNodeGroup, postClusterCreationTasks ...tasks.Task) *tasks.TaskTree
+ 	NewTasksToCreateIAMServiceAccounts(serviceAccounts []*v1alpha5.ClusterIAMServiceAccount, oidc *iamoidc.OpenIDConnectManager, clientSetGetter kubernetes.ClientSetGetter) *tasks.TaskTree
+-	NewTasksToDeleteClusterWithNodeGroups(ctx context.Context, stack *Stack, stacks []NodeGroupStack, deleteOIDCProvider bool, oidc *iamoidc.OpenIDConnectManager, clientSetGetter kubernetes.ClientSetGetter, wait bool, cleanup func(chan error, string) error) (*tasks.TaskTree, error)
++	NewTasksToDeleteClusterWithNodeGroups(ctx context.Context, clusterStack *Stack, nodeGroupStacks []NodeGroupStack, clusterOperable bool, newOIDCManager NewOIDCManager, cluster *ekstypes.Cluster, clientSetGetter kubernetes.ClientSetGetter, wait, force bool, cleanup func(chan error, string) error) (*tasks.TaskTree, error)
+ 	NewTasksToDeleteIAMServiceAccounts(ctx context.Context, serviceAccounts []string, clientSetGetter kubernetes.ClientSetGetter, wait bool) (*tasks.TaskTree, error)
+ 	NewTasksToDeleteNodeGroups(stacks []NodeGroupStack, shouldDelete func(_ string) bool, wait bool, cleanup func(chan error, string) error) (*tasks.TaskTree, error)
+-	NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx context.Context, oidc *iamoidc.OpenIDConnectManager, clientSetGetter kubernetes.ClientSetGetter) (*tasks.TaskTree, error)
++	NewTasksToDeleteOIDCProviderWithIAMServiceAccounts(ctx context.Context, newOIDCManager NewOIDCManager, cluster *ekstypes.Cluster, clientSetGetter kubernetes.ClientSetGetter, force bool) (*tasks.TaskTree, error)
+ 	NewUnmanagedNodeGroupTask(ctx context.Context, nodeGroups []*v1alpha5.NodeGroup, forceAddCNIPolicy bool, importer vpc.Importer) *tasks.TaskTree
+ 	PropagateManagedNodeGroupTagsToASG(ngName string, ngTags map[string]string, asgNames []string, errCh chan error) error
+ 	RefreshFargatePodExecutionRoleARN(ctx context.Context) error
+diff --git a/pkg/ctl/utils/associate_iam_oidc_provider.go b/pkg/ctl/utils/associate_iam_oidc_provider.go
+index 44aad9ed8..815e54060 100644
+--- a/pkg/ctl/utils/associate_iam_oidc_provider.go
++++ b/pkg/ctl/utils/associate_iam_oidc_provider.go
+@@ -2,6 +2,11 @@ package utils
+ 
+ import (
+ 	"context"
++	"fmt"
++
++	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
++
++	"github.com/aws/aws-sdk-go-v2/service/eks"
+ 
+ 	"github.com/kris-nova/logger"
+ 	"github.com/spf13/cobra"
+@@ -74,6 +79,10 @@ func doAssociateIAMOIDCProvider(cmd *cmdutils.Cmd) error {
+ 				return err
+ 			}
+ 			logger.Success("created IAM Open ID Connect provider for cluster %q in %q", meta.Name, meta.Region)
++
++			if err := addOIDCTag(ctx, ctl.AWSProvider, ctl.Status.ClusterInfo.Cluster); err != nil {
++				return err
++			}
+ 		}
+ 	} else {
+ 		logger.Info("IAM Open ID Connect provider is already associated with cluster %q in %q", meta.Name, meta.Region)
+@@ -83,3 +92,15 @@ func doAssociateIAMOIDCProvider(cmd *cmdutils.Cmd) error {
+ 
+ 	return nil
+ }
++
++func addOIDCTag(ctx context.Context, provider api.ClusterProvider, cluster *ekstypes.Cluster) error {
++	if _, err := provider.EKS().TagResource(ctx, &eks.TagResourceInput{
++		ResourceArn: cluster.Arn,
++		Tags: map[string]string{
++			api.ClusterOIDCEnabledTag: "true",
++		},
++	}); err != nil {
++		return fmt.Errorf("error tagging EKS cluster with OIDC tag: %w", err)
++	}
++	return nil
++}
+diff --git a/pkg/eks/eks.go b/pkg/eks/eks.go
+index 1900d4dfe..b8b84beba 100644
+--- a/pkg/eks/eks.go
++++ b/pkg/eks/eks.go
+@@ -156,15 +156,6 @@ func (c *ClusterProvider) ControlPlaneVPCInfo() ekstypes.VpcConfigResponse {
+ 	return *c.Status.ClusterInfo.Cluster.ResourcesVpcConfig
+ }
+ 
+-// UnsupportedOIDCError represents an unsupported OIDC error
+-type UnsupportedOIDCError struct {
+-	msg string
+-}
+-
+-func (u *UnsupportedOIDCError) Error() string {
+-	return u.msg
+-}
+-
+ // NewOpenIDConnectManager returns OpenIDConnectManager
+ func (c *ClusterProvider) NewOpenIDConnectManager(ctx context.Context, spec *api.ClusterConfig) (*iamoidc.OpenIDConnectManager, error) {
+ 	if _, err := c.CanOperateWithRefresh(ctx, spec); err != nil {
+@@ -172,7 +163,7 @@ func (c *ClusterProvider) NewOpenIDConnectManager(ctx context.Context, spec *api
+ 	}
+ 
+ 	if c.Status.ClusterInfo.Cluster == nil || c.Status.ClusterInfo.Cluster.Identity == nil || c.Status.ClusterInfo.Cluster.Identity.Oidc == nil || c.Status.ClusterInfo.Cluster.Identity.Oidc.Issuer == nil {
+-		return nil, &UnsupportedOIDCError{"unknown OIDC issuer URL"}
++		return nil, &iamoidc.UnsupportedOIDCError{Message: "unknown OIDC issuer URL"}
+ 	}
+ 
+ 	parsedARN, err := arn.Parse(spec.Status.ARN)
+diff --git a/pkg/iam/oidc/api.go b/pkg/iam/oidc/api.go
+index 90c97a524..8434dd3a0 100644
+--- a/pkg/iam/oidc/api.go
++++ b/pkg/iam/oidc/api.go
+@@ -8,6 +8,8 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 
++	"github.com/aws/smithy-go"
++
+ 	"github.com/aws/aws-sdk-go-v2/service/iam"
+ 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+ 
+@@ -37,6 +39,15 @@ type OpenIDConnectManager struct {
+ 	iam awsapi.IAM
+ }
+ 
++// UnsupportedOIDCError represents an unsupported OIDC error
++type UnsupportedOIDCError struct {
++	Message string
++}
++
++func (u *UnsupportedOIDCError) Error() string {
++	return u.Message
++}
++
+ // NewOpenIDConnectManager constructs a new IAM OIDC manager instance.
+ // It returns an error if the issuer URL is invalid
+ func NewOpenIDConnectManager(iamapi awsapi.IAM, accountID, issuer, partition string, tags map[string]string) (*OpenIDConnectManager, error) {
+@@ -181,3 +192,9 @@ func (m *OpenIDConnectManager) MakeAssumeRolePolicyDocument() cft.MapOfInterface
+ func (m *OpenIDConnectManager) hostnameAndPath() string {
+ 	return m.issuerURL.Hostname() + m.issuerURL.Path
+ }
++
++// IsAccessDeniedError returns true if err is an AccessDenied error.
++func IsAccessDeniedError(err error) bool {
++	var apiErr smithy.APIError
++	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "AccessDenied"
++}

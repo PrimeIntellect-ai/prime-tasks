@@ -1,0 +1,2 @@
+NameError: Field name "schema" shadows a BaseModel attribute; use a different field name with "alias='schema'".
+Schema that use a field called "schema" fail the pydantic post generation check. See https://pythonfix.com/error/pydantic-field-name-schema-shadows-basemodel-attribute/ and https://stackoverflow.com/questions/73828037/pydantic-field-does-not-take-value it would be nice if the generator worked around this by automatically renaming the field to "schema_" and adding = Field(..., alias='schema')

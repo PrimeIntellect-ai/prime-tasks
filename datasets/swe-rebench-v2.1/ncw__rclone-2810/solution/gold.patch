@@ -1,0 +1,424 @@
+diff --git a/backend/b2/b2.go b/backend/b2/b2.go
+index 77c2c5277..048f6b804 100644
+--- a/backend/b2/b2.go
++++ b/backend/b2/b2.go
+@@ -980,6 +980,12 @@ func (f *Fs) purge(oldOnly bool) error {
+ 			errReturn = err
+ 		}
+ 	}
++	var isUnfinishedUploadStale = func(timestamp api.Timestamp) bool {
++		if time.Since(time.Time(timestamp)).Hours() > 24 {
++			return true
++		}
++		return false
++	}
+ 
+ 	// Delete Config.Transfers in parallel
+ 	toBeDeleted := make(chan *api.File, fs.Config.Transfers)
+@@ -1003,6 +1009,9 @@ func (f *Fs) purge(oldOnly bool) error {
+ 				if object.Action == "hide" {
+ 					fs.Debugf(remote, "Deleting current version (id %q) as it is a hide marker", object.ID)
+ 					toBeDeleted <- object
++				} else if object.Action == "start" && isUnfinishedUploadStale(object.UploadTimestamp) {
++					fs.Debugf(remote, "Deleting current version (id %q) as it is a start marker (upload started at %s)", object.ID, time.Time(object.UploadTimestamp).Local())
++					toBeDeleted <- object
+ 				} else {
+ 					fs.Debugf(remote, "Not deleting current version (id %q) %q", object.ID, object.Action)
+ 				}
+diff --git a/cmd/copy/copy.go b/cmd/copy/copy.go
+index 9c919c32c..3e758d1e9 100644
+--- a/cmd/copy/copy.go
++++ b/cmd/copy/copy.go
+@@ -51,6 +51,17 @@ written a trailing / - meaning "copy the contents of this directory".
+ This applies to all commands and whether you are talking about the
+ source or destination.
+ 
++See the [--no-traverse](/docs/#no-traverse) option for controlling
++whether rclone lists the destination directory or not.  Supplying this
++option when copying a small number of files into a large destination
++can speed transfers up greatly.
++
++For example, if you have many files in /path/to/src but only a few of
++them change every day, you can to copy all the files which have
++changed recently very efficiently like this:
++
++    rclone copy --max-age 24h --no-traverse /path/to/src remote:
++
+ **Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics
+ `,
+ 	Run: func(command *cobra.Command, args []string) {
+diff --git a/cmd/move/move.go b/cmd/move/move.go
+index 38c654cb8..e70caf6ff 100644
+--- a/cmd/move/move.go
++++ b/cmd/move/move.go
+@@ -37,6 +37,11 @@ into ` + "`dest:path`" + ` then delete the original (if no errors on copy) in
+ 
+ If you want to delete empty source directories after move, use the --delete-empty-src-dirs flag.
+ 
++See the [--no-traverse](/docs/#no-traverse) option for controlling
++whether rclone lists the destination directory or not.  Supplying this
++option when moving a small number of files into a large destination
++can speed transfers up greatly.
++
+ **Important**: Since this can cause data loss, test first with the
+ --dry-run flag.
+ 
+diff --git a/docs/content/b2.md b/docs/content/b2.md
+index a7fecae25..25be69bab 100644
+--- a/docs/content/b2.md
++++ b/docs/content/b2.md
+@@ -181,8 +181,8 @@ versions of files, leaving the current ones intact.  You can also
+ supply a path and only old versions under that path will be deleted,
+ eg `rclone cleanup remote:bucket/path/to/stuff`.
+ 
+-Note that `cleanup` does not remove partially uploaded files
+-from the bucket.
++Note that `cleanup` will remove partially uploaded files from the bucket
++if they are more than a day old.
+ 
+ When you `purge` a bucket, the current and the old versions will be
+ deleted then the bucket will be deleted.
+diff --git a/docs/content/docs.md b/docs/content/docs.md
+index f84e57fbd..495ab259f 100644
+--- a/docs/content/docs.md
++++ b/docs/content/docs.md
+@@ -842,8 +842,8 @@ will fall back to the default behaviour and log an error level message
+ to the console. Note: Encrypted destinations are not supported
+ by `--track-renames`.
+ 
+-Note that `--track-renames` uses extra memory to keep track of all
+-the rename candidates.
++Note that `--track-renames` is incompatible with `--no-traverse` and
++that it uses extra memory to keep track of all the rename candidates.
+ 
+ Note also that `--track-renames` is incompatible with
+ `--delete-before` and will select `--delete-after` instead of
+@@ -1132,6 +1132,24 @@ This option defaults to `false`.
+ 
+ **This should be used only for testing.**
+ 
++### --no-traverse ###
++
++The `--no-traverse` flag controls whether the destination file system
++is traversed when using the `copy` or `move` commands.
++`--no-traverse` is not compatible with `sync` and will be ignored if
++you supply it with `sync`.
++
++If you are only copying a small number of files (or are filtering most
++of the files) and/or have a large number of files on the destination
++then `--no-traverse` will stop rclone listing the destination and save
++time.
++
++However, if you are copying a large number of files, especially if you
++are doing a copy where lots of the files under consideration haven't
++changed and won't need copying then you shouldn't use `--no-traverse`.
++
++See [rclone copy](/commands/rclone_copy/) for an example of how to use it.
++
+ Filtering
+ ---------
+ 
+diff --git a/fs/config.go b/fs/config.go
+index cf608b25d..aaa392ae4 100644
+--- a/fs/config.go
++++ b/fs/config.go
+@@ -62,6 +62,7 @@ type ConfigInfo struct {
+ 	MaxDepth              int
+ 	IgnoreSize            bool
+ 	IgnoreChecksum        bool
++	NoTraverse            bool
+ 	NoUpdateModTime       bool
+ 	DataRateUnit          string
+ 	BackupDir             string
+diff --git a/fs/config/configflags/configflags.go b/fs/config/configflags/configflags.go
+index 110755c8e..f15fbf2bf 100644
+--- a/fs/config/configflags/configflags.go
++++ b/fs/config/configflags/configflags.go
+@@ -27,7 +27,6 @@ var (
+ 	deleteAfter     bool
+ 	bindAddr        string
+ 	disableFeatures string
+-	noTraverse      bool
+ )
+ 
+ // AddFlags adds the non filing system specific flags to the command
+@@ -65,7 +64,7 @@ func AddFlags(flagSet *pflag.FlagSet) {
+ 	flags.IntVarP(flagSet, &fs.Config.MaxDepth, "max-depth", "", fs.Config.MaxDepth, "If set limits the recursion depth to this.")
+ 	flags.BoolVarP(flagSet, &fs.Config.IgnoreSize, "ignore-size", "", false, "Ignore size when skipping use mod-time or checksum.")
+ 	flags.BoolVarP(flagSet, &fs.Config.IgnoreChecksum, "ignore-checksum", "", fs.Config.IgnoreChecksum, "Skip post copy check of checksums.")
+-	flags.BoolVarP(flagSet, &noTraverse, "no-traverse", "", noTraverse, "Obsolete - does nothing.")
++	flags.BoolVarP(flagSet, &fs.Config.NoTraverse, "no-traverse", "", fs.Config.NoTraverse, "Don't traverse destination file system on copy.")
+ 	flags.BoolVarP(flagSet, &fs.Config.NoUpdateModTime, "no-update-modtime", "", fs.Config.NoUpdateModTime, "Don't update destination mod-time if files identical.")
+ 	flags.StringVarP(flagSet, &fs.Config.BackupDir, "backup-dir", "", fs.Config.BackupDir, "Make backups into hierarchy based in DIR.")
+ 	flags.StringVarP(flagSet, &fs.Config.Suffix, "suffix", "", fs.Config.Suffix, "Suffix for use with --backup-dir.")
+@@ -113,10 +112,6 @@ func SetFlags() {
+ 		}
+ 	}
+ 
+-	if noTraverse {
+-		fs.Logf(nil, "--no-traverse is obsolete and no longer needed - please remove")
+-	}
+-
+ 	if dumpHeaders {
+ 		fs.Config.Dump |= fs.DumpHeaders
+ 		fs.Logf(nil, "--dump-headers is obsolete - please use --dump headers instead")
+diff --git a/fs/march/march.go b/fs/march/march.go
+index aacef6082..01e1570ef 100644
+--- a/fs/march/march.go
++++ b/fs/march/march.go
+@@ -16,14 +16,17 @@ import (
+ )
+ 
+ // March holds the data used to traverse two Fs simultaneously,
+-// calling callback for each match
++// calling Callback for each match
+ type March struct {
+ 	// parameters
+-	ctx      context.Context
+-	fdst     fs.Fs
+-	fsrc     fs.Fs
+-	dir      string
+-	callback Marcher
++	Ctx           context.Context // context for background goroutines
++	Fdst          fs.Fs           // source Fs
++	Fsrc          fs.Fs           // dest Fs
++	Dir           string          // directory
++	NoTraverse    bool            // don't traverse the destination
++	SrcIncludeAll bool            // don't include all files in the src
++	DstIncludeAll bool            // don't include all files in the destination
++	Callback      Marcher         // object to call with results
+ 	// internal state
+ 	srcListDir listDirFn // function to call to list a directory in the src
+ 	dstListDir listDirFn // function to call to list a directory in the dst
+@@ -40,17 +43,12 @@ type Marcher interface {
+ 	Match(dst, src fs.DirEntry) (recurse bool)
+ }
+ 
+-// New sets up a march over fsrc, and fdst calling back callback for each match
+-func New(ctx context.Context, fdst, fsrc fs.Fs, dir string, callback Marcher) *March {
+-	m := &March{
+-		ctx:      ctx,
+-		fdst:     fdst,
+-		fsrc:     fsrc,
+-		dir:      dir,
+-		callback: callback,
++// init sets up a march over opt.Fsrc, and opt.Fdst calling back callback for each match
++func (m *March) init() {
++	m.srcListDir = m.makeListDir(m.Fsrc, m.SrcIncludeAll)
++	if !m.NoTraverse {
++		m.dstListDir = m.makeListDir(m.Fdst, m.DstIncludeAll)
+ 	}
+-	m.srcListDir = m.makeListDir(fsrc, false)
+-	m.dstListDir = m.makeListDir(fdst, filter.Active.Opt.DeleteExcluded)
+ 	// Now create the matching transform
+ 	// ..normalise the UTF8 first
+ 	m.transforms = append(m.transforms, norm.NFC.String)
+@@ -60,10 +58,9 @@ func New(ctx context.Context, fdst, fsrc fs.Fs, dir string, callback Marcher) *M
+ 	//                  | Yes | No  | No                 |
+ 	//                  | No  | Yes | Yes                |
+ 	//                  | Yes | Yes | Yes                |
+-	if fdst.Features().CaseInsensitive {
++	if m.Fdst.Features().CaseInsensitive {
+ 		m.transforms = append(m.transforms, strings.ToLower)
+ 	}
+-	return m
+ }
+ 
+ // list a directory into entries, err
+@@ -86,7 +83,7 @@ func (m *March) makeListDir(f fs.Fs, includeAll bool) listDirFn {
+ 		mu.Lock()
+ 		defer mu.Unlock()
+ 		if !started {
+-			dirs, dirsErr = walk.NewDirTree(f, m.dir, includeAll, fs.Config.MaxDepth)
++			dirs, dirsErr = walk.NewDirTree(f, m.Dir, includeAll, fs.Config.MaxDepth)
+ 			started = true
+ 		}
+ 		if dirsErr != nil {
+@@ -114,6 +111,8 @@ type listDirJob struct {
+ 
+ // Run starts the matching process off
+ func (m *March) Run() {
++	m.init()
++
+ 	srcDepth := fs.Config.MaxDepth
+ 	if srcDepth < 0 {
+ 		srcDepth = fs.MaxLevel
+@@ -133,7 +132,7 @@ func (m *March) Run() {
+ 			defer wg.Done()
+ 			for {
+ 				select {
+-				case <-m.ctx.Done():
++				case <-m.Ctx.Done():
+ 					return
+ 				case job, ok := <-in:
+ 					if !ok {
+@@ -147,7 +146,7 @@ func (m *March) Run() {
+ 							// jobs off for traversal in the background
+ 							for _, newJob := range jobs {
+ 								select {
+-								case <-m.ctx.Done():
++								case <-m.Ctx.Done():
+ 									// discard job if finishing
+ 									traversing.Done()
+ 								case in <- newJob:
+@@ -164,14 +163,14 @@ func (m *March) Run() {
+ 	// Start the process
+ 	traversing.Add(1)
+ 	in <- listDirJob{
+-		srcRemote: m.dir,
++		srcRemote: m.Dir,
+ 		srcDepth:  srcDepth - 1,
+-		dstRemote: m.dir,
++		dstRemote: m.Dir,
+ 		dstDepth:  dstDepth - 1,
+ 	}
+ 	go func() {
+ 		// when the context is cancelled discard the remaining jobs
+-		<-m.ctx.Done()
++		<-m.Ctx.Done()
+ 		for range in {
+ 			traversing.Done()
+ 		}
+@@ -184,7 +183,7 @@ func (m *March) Run() {
+ // Check to see if the context has been cancelled
+ func (m *March) aborting() bool {
+ 	select {
+-	case <-m.ctx.Done():
++	case <-m.Ctx.Done():
+ 		return true
+ 	default:
+ 	}
+@@ -348,7 +347,7 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 			srcList, srcListErr = m.srcListDir(job.srcRemote)
+ 		}()
+ 	}
+-	if !job.noDst {
++	if !m.NoTraverse && !job.noDst {
+ 		wg.Add(1)
+ 		go func() {
+ 			defer wg.Done()
+@@ -371,13 +370,27 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 		return nil
+ 	}
+ 
++	// If NoTraverse is set, then try to find a matching object
++	// for each item in the srcList
++	if m.NoTraverse {
++		for _, src := range srcList {
++			if srcObj, ok := src.(fs.Object); ok {
++				leaf := path.Base(srcObj.Remote())
++				dstObj, err := m.Fdst.NewObject(path.Join(job.dstRemote, leaf))
++				if err == nil {
++					dstList = append(dstList, dstObj)
++				}
++			}
++		}
++	}
++
+ 	// Work out what to do and do it
+ 	srcOnly, dstOnly, matches := matchListings(srcList, dstList, m.transforms)
+ 	for _, src := range srcOnly {
+ 		if m.aborting() {
+ 			return nil
+ 		}
+-		recurse := m.callback.SrcOnly(src)
++		recurse := m.Callback.SrcOnly(src)
+ 		if recurse && job.srcDepth > 0 {
+ 			jobs = append(jobs, listDirJob{
+ 				srcRemote: src.Remote(),
+@@ -391,7 +404,7 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 		if m.aborting() {
+ 			return nil
+ 		}
+-		recurse := m.callback.DstOnly(dst)
++		recurse := m.Callback.DstOnly(dst)
+ 		if recurse && job.dstDepth > 0 {
+ 			jobs = append(jobs, listDirJob{
+ 				dstRemote: dst.Remote(),
+@@ -404,7 +417,7 @@ func (m *March) processJob(job listDirJob) (jobs []listDirJob) {
+ 		if m.aborting() {
+ 			return nil
+ 		}
+-		recurse := m.callback.Match(match.dst, match.src)
++		recurse := m.Callback.Match(match.dst, match.src)
+ 		if recurse && job.srcDepth > 0 && job.dstDepth > 0 {
+ 			jobs = append(jobs, listDirJob{
+ 				srcRemote: match.src.Remote(),
+diff --git a/fs/operations/operations.go b/fs/operations/operations.go
+index 209a39d70..d311d880e 100644
+--- a/fs/operations/operations.go
++++ b/fs/operations/operations.go
+@@ -685,7 +685,13 @@ func CheckFn(fdst, fsrc fs.Fs, check checkFn, oneway bool) error {
+ 	}
+ 
+ 	// set up a march over fdst and fsrc
+-	m := march.New(context.Background(), fdst, fsrc, "", c)
++	m := &march.March{
++		Ctx:      context.Background(),
++		Fdst:     fdst,
++		Fsrc:     fsrc,
++		Dir:      "",
++		Callback: c,
++	}
+ 	fs.Infof(fdst, "Waiting for checks to finish")
+ 	m.Run()
+ 
+diff --git a/fs/sync/sync.go b/fs/sync/sync.go
+index 1c24fb2dc..15ee2fd56 100644
+--- a/fs/sync/sync.go
++++ b/fs/sync/sync.go
+@@ -29,6 +29,7 @@ type syncCopyMove struct {
+ 	// internal state
+ 	ctx            context.Context        // internal context for controlling go-routines
+ 	cancel         func()                 // cancel the context
++	noTraverse     bool                   // if set don't traverse the dst
+ 	deletersWg     sync.WaitGroup         // for delete before go routine
+ 	deleteFilesCh  chan fs.Object         // channel to receive deletes if delete before
+ 	trackRenames   bool                   // set if we should do server side renames
+@@ -75,6 +76,7 @@ func newSyncCopyMove(fdst, fsrc fs.Fs, deleteMode fs.DeleteMode, DoMove bool, de
+ 		dstFilesResult:     make(chan error, 1),
+ 		dstEmptyDirs:       make(map[string]fs.DirEntry),
+ 		srcEmptyDirs:       make(map[string]fs.DirEntry),
++		noTraverse:         fs.Config.NoTraverse,
+ 		toBeChecked:        newPipe(accounting.Stats.SetCheckQueue, fs.Config.MaxBacklog),
+ 		toBeUploaded:       newPipe(accounting.Stats.SetTransferQueue, fs.Config.MaxBacklog),
+ 		deleteFilesCh:      make(chan fs.Object, fs.Config.Checkers),
+@@ -84,6 +86,10 @@ func newSyncCopyMove(fdst, fsrc fs.Fs, deleteMode fs.DeleteMode, DoMove bool, de
+ 		trackRenamesCh:     make(chan fs.Object, fs.Config.Checkers),
+ 	}
+ 	s.ctx, s.cancel = context.WithCancel(context.Background())
++	if s.noTraverse && s.deleteMode != fs.DeleteModeOff {
++		fs.Errorf(nil, "Ignoring --no-traverse with sync")
++		s.noTraverse = false
++	}
+ 	if s.trackRenames {
+ 		// Don't track renames for remotes without server-side move support.
+ 		if !operations.CanServerSideMove(fdst) {
+@@ -104,6 +110,10 @@ func newSyncCopyMove(fdst, fsrc fs.Fs, deleteMode fs.DeleteMode, DoMove bool, de
+ 		if s.deleteMode != fs.DeleteModeOff {
+ 			s.deleteMode = fs.DeleteModeAfter
+ 		}
++		if s.noTraverse {
++			fs.Errorf(nil, "Ignoring --no-traverse with --track-renames")
++			s.noTraverse = false
++		}
+ 	}
+ 	// Make Fs for --backup-dir if required
+ 	if fs.Config.BackupDir != "" {
+@@ -646,7 +656,15 @@ func (s *syncCopyMove) run() error {
+ 	s.startTrackRenames()
+ 
+ 	// set up a march over fdst and fsrc
+-	m := march.New(s.ctx, s.fdst, s.fsrc, s.dir, s)
++	m := &march.March{
++		Ctx:           s.ctx,
++		Fdst:          s.fdst,
++		Fsrc:          s.fsrc,
++		Dir:           s.dir,
++		NoTraverse:    s.noTraverse,
++		Callback:      s,
++		DstIncludeAll: filter.Active.Opt.DeleteExcluded,
++	}
+ 	m.Run()
+ 
+ 	s.stopTrackRenames()

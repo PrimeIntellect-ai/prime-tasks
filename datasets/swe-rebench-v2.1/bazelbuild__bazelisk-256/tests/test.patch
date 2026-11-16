@@ -1,0 +1,210 @@
+diff --git a/httputil/httputil_test.go b/httputil/httputil_test.go
+new file mode 100644
+index 0000000..ecbba1c
+--- /dev/null
++++ b/httputil/httputil_test.go
+@@ -0,0 +1,204 @@
++package httputil
++
++import (
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++)
++
++type queuedResponse struct {
++	status  int
++	body    string
++	headers map[string]string
++}
++
++type responseTransport struct {
++	responses []queuedResponse
++	calls     int
++	before    func()
++}
++
++func (rt *responseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	rt.calls++
++	if rt.before != nil {
++		rt.before()
++	}
++	if rt.calls > len(rt.responses) {
++		return nil, fmt.Errorf("unexpected request %d", rt.calls)
++	}
++	spec := rt.responses[rt.calls-1]
++	header := make(http.Header)
++	for name, value := range spec.headers {
++		header[name] = []string{value}
++		header[http.CanonicalHeaderKey(name)] = []string{value}
++	}
++	return &http.Response{
++		StatusCode: spec.status,
++		Body:       io.NopCloser(strings.NewReader(spec.body)),
++		Header:     header,
++		Request:    req,
++	}, nil
++}
++
++func configureResponses(responses ...queuedResponse) *responseTransport {
++	transport := &responseTransport{responses: responses}
++	DefaultTransport = transport
++	return transport
++}
++
++func retryResponse(status int, headers map[string]string) queuedResponse {
++	return queuedResponse{status: status, headers: headers}
++}
++
++func TestSuccessOnFirstTry(t *testing.T) {
++	url := "http://foo"
++	transport := configureResponses(queuedResponse{status: http.StatusOK, body: "the_body"})
++	body, _, err := ReadRemoteFile(url, "")
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if got := string(body); got != "the_body" {
++		t.Fatalf("body = %q; want %q", got, "the_body")
++	}
++	if transport.calls != 1 {
++		t.Fatalf("request attempts = %d; want 1", transport.calls)
++	}
++}
++
++func TestRetriesExactlyTransientStatuses(t *testing.T) {
++	statuses := []int{429, 500, 501, 502, 503, 504}
++	for _, status := range statuses {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			transport := configureResponses(
++				retryResponse(status, map[string]string{"Retry-After": "0"}),
++				queuedResponse{status: http.StatusOK, body: "retried"},
++			)
++			body, _, err := ReadRemoteFile("http://retry", "")
++			if err != nil {
++				t.Fatalf("retry after %d failed: %v", status, err)
++			}
++			if string(body) != "retried" || transport.calls != 2 {
++				t.Fatalf("body %q after %d attempts; want successful second attempt", body, transport.calls)
++			}
++		})
++	}
++}
++
++func TestRetryHeadersOnEachRetry(t *testing.T) {
++	headerNames := []string{"Retry-After", "X-RateLimit-Reset", "Rate-Limit-Reset"}
++	for _, name := range headerNames {
++		for _, value := range []string{"11", time.Now().Add(20 * time.Second).UTC().Format(http.TimeFormat)} {
++			t.Run(name+"/"+value, func(t *testing.T) {
++				transport := configureResponses(
++					retryResponse(503, map[string]string{name: "0"}),
++					retryResponse(503, map[string]string{name: value}),
++					queuedResponse{status: http.StatusOK, body: "done"},
++				)
++				_, _, err := ReadRemoteFile("http://headers", "")
++				want := "could not fetch http://headers: unable to complete request to http://headers within 10s"
++				if err == nil || err.Error() != want {
++					t.Fatalf("error for %s=%q = %v; want %q", name, value, err, want)
++				}
++				if transport.calls != 2 {
++					t.Fatalf("request attempts = %d; want 2 before the over-budget retry wait", transport.calls)
++				}
++			})
++		}
++	}
++}
++
++func TestExponentialBackoffIncludesRandomAddition(t *testing.T) {
++	const retries = 3
++	base := 7 * time.Second
++	for sample := 0; sample < 2; sample++ {
++		responses := make([]queuedResponse, retries+1)
++		for i := range responses {
++			responses[i] = retryResponse(503, nil)
++		}
++		transport := configureResponses(responses...)
++		started := time.Now()
++		_, _, err := ReadRemoteFile("http://backoff", "")
++		elapsed := time.Since(started)
++		if err == nil {
++			t.Fatal("expected exhaustion after transient responses")
++		}
++		if transport.calls != retries+1 {
++			t.Fatalf("request attempts = %d; want %d", transport.calls, retries+1)
++		}
++		if elapsed < base || elapsed > base+3*time.Second {
++			t.Fatalf("total backoff = %v; want 7s exponential base with at most the specified random addition", elapsed)
++		}
++	}
++}
++
++func TestDefaultRetryLimitAndExhaustionError(t *testing.T) {
++	responses := make([]queuedResponse, 5)
++	for i := range responses {
++		responses[i] = retryResponse(503, map[string]string{"Retry-After": "0"})
++	}
++	transport := configureResponses(responses...)
++	_, _, err := ReadRemoteFile("http://default-limit", "")
++	want := "could not fetch http://default-limit: unable to complete request to http://default-limit after 4 retries. Most recent status: 503"
++	if err == nil || err.Error() != want {
++		t.Fatalf("error = %v; want %q", err, want)
++	}
++	if transport.calls != 5 {
++		t.Fatalf("request attempts = %d; want 5 (one initial attempt and four retries)", transport.calls)
++	}
++}
++
++func TestDeadlineIncludesRequestAndRetryWait(t *testing.T) {
++	transport := configureResponses(
++		retryResponse(503, map[string]string{"Retry-After": "3"}),
++		queuedResponse{status: http.StatusOK},
++	)
++	transport.before = func() {
++		if transport.calls == 1 {
++			time.Sleep(8 * time.Second)
++		}
++	}
++	_, _, err := ReadRemoteFile("http://deadline", "")
++	want := "could not fetch http://deadline: unable to complete request to http://deadline within 10s"
++	if err == nil || err.Error() != want {
++		t.Fatalf("error = %v; want %q", err, want)
++	}
++	if transport.calls != 1 {
++		t.Fatalf("request attempts = %d; want no retry after the total budget is exceeded", transport.calls)
++	}
++}
++
++func TestDefaultDeadlineError(t *testing.T) {
++	transport := configureResponses(
++		retryResponse(500, map[string]string{"Retry-After": "11"}),
++	)
++	_, _, err := ReadRemoteFile("http://default-deadline", "")
++	want := "could not fetch http://default-deadline: unable to complete request to http://default-deadline within 10s"
++	if err == nil || err.Error() != want {
++		t.Fatalf("error = %v; want %q", err, want)
++	}
++	if transport.calls != 1 {
++		t.Fatalf("request attempts = %d; want 1", transport.calls)
++	}
++}
++
++func TestPermanentStatusesAreNotRetried(t *testing.T) {
++	for _, status := range []int{403, 404} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			transport := configureResponses(
++				retryResponse(status, nil),
++				retryResponse(http.StatusOK, nil),
++			)
++			_, _, err := ReadRemoteFile("http://permanent", "")
++			want := fmt.Sprintf("unexpected status code while reading http://permanent: %d", status)
++			if err == nil || err.Error() != want {
++				t.Fatalf("error = %v; want %q", err, want)
++			}
++			if transport.calls != 1 {
++				t.Fatalf("request attempts = %d; want 1 for permanent status %d", transport.calls, status)
++			}
++		})
++	}
++}

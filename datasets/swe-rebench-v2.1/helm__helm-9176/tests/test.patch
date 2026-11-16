@@ -1,0 +1,373 @@
+diff --git a/pkg/chart/metadata_test.go b/pkg/chart/metadata_test.go
+index cc04f095..c8b89ae5 100644
+--- a/pkg/chart/metadata_test.go
++++ b/pkg/chart/metadata_test.go
+@@ -21,34 +21,42 @@ import (
+ 
+ func TestValidate(t *testing.T) {
+ 	tests := []struct {
+-		md  *Metadata
+-		err error
++		name string
++		md   *Metadata
++		err  error
+ 	}{
+ 		{
++			"chart without metadata",
+ 			nil,
+ 			ValidationError("chart.metadata is required"),
+ 		},
+ 		{
++			"chart without apiVersion",
+ 			&Metadata{Name: "test", Version: "1.0"},
+ 			ValidationError("chart.metadata.apiVersion is required"),
+ 		},
+ 		{
++			"chart without name",
+ 			&Metadata{APIVersion: "v2", Version: "1.0"},
+ 			ValidationError("chart.metadata.name is required"),
+ 		},
+ 		{
++			"chart without version",
+ 			&Metadata{Name: "test", APIVersion: "v2"},
+ 			ValidationError("chart.metadata.version is required"),
+ 		},
+ 		{
++			"chart with bad type",
+ 			&Metadata{Name: "test", APIVersion: "v2", Version: "1.0", Type: "test"},
+ 			ValidationError("chart.metadata.type must be application or library"),
+ 		},
+ 		{
++			"chart without dependency",
+ 			&Metadata{Name: "test", APIVersion: "v2", Version: "1.0", Type: "application"},
+ 			nil,
+ 		},
+ 		{
++			"dependency with valid alias",
+ 			&Metadata{
+ 				Name:       "test",
+ 				APIVersion: "v2",
+@@ -61,6 +69,7 @@ func TestValidate(t *testing.T) {
+ 			nil,
+ 		},
+ 		{
++			"dependency with bad characters in alias",
+ 			&Metadata{
+ 				Name:       "test",
+ 				APIVersion: "v2",
+@@ -73,6 +82,67 @@ func TestValidate(t *testing.T) {
+ 			ValidationError("dependency \"bad\" has disallowed characters in the alias"),
+ 		},
+ 		{
++			"same dependency twice",
++			&Metadata{
++				Name:       "test",
++				APIVersion: "v2",
++				Version:    "1.0",
++				Type:       "application",
++				Dependencies: []*Dependency{
++					{Name: "foo", Alias: ""},
++					{Name: "foo", Alias: ""},
++				},
++			},
++			ValidationError("more than one dependency with name or alias \"foo\""),
++		},
++		{
++			"two dependencies with alias from second dependency shadowing first one",
++			&Metadata{
++				Name:       "test",
++				APIVersion: "v2",
++				Version:    "1.0",
++				Type:       "application",
++				Dependencies: []*Dependency{
++					{Name: "foo", Alias: ""},
++					{Name: "bar", Alias: "foo"},
++				},
++			},
++			ValidationError("more than one dependency with name or alias \"foo\""),
++		},
++		{
++			// this case would make sense and could work in future versions of Helm, currently template rendering would
++			// result in undefined behaviour
++			"same dependency twice with different version",
++			&Metadata{
++				Name:       "test",
++				APIVersion: "v2",
++				Version:    "1.0",
++				Type:       "application",
++				Dependencies: []*Dependency{
++					{Name: "foo", Alias: "", Version: "1.2.3"},
++					{Name: "foo", Alias: "", Version: "1.0.0"},
++				},
++			},
++			ValidationError("more than one dependency with name or alias \"foo\""),
++		},
++		{
++			// this case would make sense and could work in future versions of Helm, currently template rendering would
++			// result in undefined behaviour
++			"two dependencies with same name but different repos",
++			&Metadata{
++				Name:       "test",
++				APIVersion: "v2",
++				Version:    "1.0",
++				Type:       "application",
++				Dependencies: []*Dependency{
++					{Name: "foo", Repository: "repo-0"},
++					{Name: "foo", Repository: "repo-1"},
++				},
++			},
++			ValidationError("more than one dependency with name or alias \"foo\""),
++		},
++		{
++			"dependencies has nil",
+ 			&Metadata{
+ 				Name:       "test",
+ 				APIVersion: "v2",
+@@ -85,6 +155,7 @@ func TestValidate(t *testing.T) {
+ 			ValidationError("dependencies must not contain empty or null nodes"),
+ 		},
+ 		{
++			"maintainer not empty",
+ 			&Metadata{
+ 				Name:       "test",
+ 				APIVersion: "v2",
+@@ -97,6 +168,7 @@ func TestValidate(t *testing.T) {
+ 			ValidationError("maintainers must not contain empty or null nodes"),
+ 		},
+ 		{
++			"version invalid",
+ 			&Metadata{APIVersion: "v2", Name: "test", Version: "1.2.3.4"},
+ 			ValidationError("chart.metadata.version \"1.2.3.4\" is invalid"),
+ 		},
+@@ -105,7 +177,7 @@ func TestValidate(t *testing.T) {
+ 	for _, tt := range tests {
+ 		result := tt.md.Validate()
+ 		if result != tt.err {
+-			t.Errorf("expected '%s', got '%s'", tt.err, result)
++			t.Errorf("expected %q, got %q in test %q", tt.err, result, tt.name)
+ 		}
+ 	}
+ }
+diff --git a/pkg/lint/rules/dependencies_test.go b/pkg/lint/rules/dependencies_test.go
+index 67b16093..b225730e 100644
+--- a/pkg/lint/rules/dependencies_test.go
++++ b/pkg/lint/rules/dependencies_test.go
+@@ -17,11 +17,14 @@ package rules
+ 
+ import (
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ 
+ 	"helm.sh/helm/v3/internal/test/ensure"
+ 	"helm.sh/helm/v3/pkg/chart"
++	"helm.sh/helm/v3/pkg/chart/loader"
+ 	"helm.sh/helm/v3/pkg/chartutil"
+ 	"helm.sh/helm/v3/pkg/lint/support"
+ )
+@@ -78,6 +81,139 @@ func TestValidateDependencyInMetadata(t *testing.T) {
+ 	}
+ }
+ 
++func TestDependenciesUnique(t *testing.T) {
++	// A chart whose declared dependencies clash must be rejected when it is
++	// loaded for templating, installation or upgrading.
++	tests := []struct {
++		name      string
++		chartYaml string
++	}{
++		{
++			"duplicate dependency names",
++			`apiVersion: v2
++name: badchart
++version: 0.1.0
++dependencies:
++  - name: foo
++    version: 1.0.0
++  - name: foo
++    version: 1.2.3
++`,
++		},
++		{
++			"alias shadowing a dependency name",
++			`apiVersion: v2
++name: badchart
++version: 0.1.0
++dependencies:
++  - name: foo
++    alias: bar
++    version: 1.0.0
++  - name: bar
++    version: 1.0.0
++`,
++		},
++		{
++			"duplicate dependency aliases",
++			`apiVersion: v2
++name: badchart
++version: 0.1.0
++dependencies:
++  - name: foo
++    alias: baz
++    version: 1.0.0
++  - name: bar
++    alias: baz
++    version: 1.0.0
++`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			dir := t.TempDir()
++			if err := os.WriteFile(filepath.Join(dir, "Chart.yaml"), []byte(tt.chartYaml), 0644); err != nil {
++				t.Fatal(err)
++			}
++			if _, err := loader.LoadDir(dir); err == nil {
++				t.Error("expected loading a chart with clashing dependencies to fail")
++			}
++		})
++	}
++}
++
++func TestDependenciesUniqueLint(t *testing.T) {
++	cases := []struct {
++		name      string
++		chartYAML string
++	}{
++		{
++			name: "duplicate names",
++			chartYAML: `apiVersion: v2
++name: badchart
++version: 0.1.0
++dependencies:
++  - name: foo
++    version: 1.0.0
++  - name: foo
++    version: 1.2.3
++`,
++		},
++		{
++			name: "duplicate aliases",
++			chartYAML: `apiVersion: v2
++name: badchart
++version: 0.1.0
++dependencies:
++  - name: foo
++    alias: baz
++    version: 1.0.0
++  - name: bar
++    alias: baz
++    version: 1.0.0
++`,
++		},
++		{
++			name: "alias shadows a dependency name",
++			chartYAML: `apiVersion: v2
++name: badchart
++version: 0.1.0
++dependencies:
++  - name: foo
++    alias: bar
++    version: 1.0.0
++  - name: bar
++    version: 1.0.0
++`,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			dir := t.TempDir()
++			if err := os.WriteFile(filepath.Join(dir, "Chart.yaml"), []byte(tc.chartYAML), 0644); err != nil {
++				t.Fatal(err)
++			}
++			for _, name := range []string{"foo", "bar"} {
++				subDir := filepath.Join(dir, "charts", name)
++				if err := os.MkdirAll(subDir, 0755); err != nil {
++					t.Fatal(err)
++				}
++				subChartYAML := "apiVersion: v2\nname: " + name + "\nversion: 1.0.0\n"
++				if err := os.WriteFile(filepath.Join(subDir, "Chart.yaml"), []byte(subChartYAML), 0644); err != nil {
++					t.Fatal(err)
++				}
++			}
++
++			linter := support.Linter{ChartDir: dir}
++			Dependencies(&linter)
++			if len(linter.Messages) == 0 {
++				t.Error("expected linting a chart with clashing dependencies to report an error")
++			}
++		})
++	}
++}
++
+ func TestDependencies(t *testing.T) {
+ 	tmp := ensure.TempDir(t)
+ 	defer os.RemoveAll(tmp)
+@@ -97,3 +233,63 @@ func TestDependencies(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestChartOperationsRejectDependencyClash(t *testing.T) {
++	root, err := filepath.Abs("../../../")
++	if err != nil {
++		t.Fatal(err)
++	}
++	cli := filepath.Join(t.TempDir(), "helm")
++	build := exec.Command("go", "build", "-o", cli, "./cmd/helm")
++	build.Dir = root
++	if output, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("building Helm CLI: %v\n%s", err, output)
++	}
++
++	chartDir := filepath.Join(t.TempDir(), "clashing-chart")
++	if err := os.MkdirAll(filepath.Join(chartDir, "charts", "foo"), 0755); err != nil {
++		t.Fatal(err)
++	}
++	chartYAML := `apiVersion: v2
++name: clashing-chart
++version: 0.1.0
++dependencies:
++  - name: foo
++    version: 1.0.0
++  - name: foo
++    version: 1.2.3
++`
++	if err := os.WriteFile(filepath.Join(chartDir, "Chart.yaml"), []byte(chartYAML), 0644); err != nil {
++		t.Fatal(err)
++	}
++	subchartYAML := `apiVersion: v2
++name: foo
++version: 1.0.0
++`
++	if err := os.WriteFile(filepath.Join(chartDir, "charts", "foo", "Chart.yaml"), []byte(subchartYAML), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	home := t.TempDir()
++	operations := []struct {
++		name string
++		args []string
++	}{
++		{name: "template", args: []string{"template", chartDir}},
++		{name: "install", args: []string{"install", "--dry-run", "clash-test", chartDir}},
++		{name: "upgrade", args: []string{"upgrade", "--dry-run", "clash-test", chartDir}},
++	}
++	for _, operation := range operations {
++		t.Run(operation.name, func(t *testing.T) {
++			cmd := exec.Command(cli, operation.args...)
++			cmd.Env = append(os.Environ(), "HOME="+home)
++			output, err := cmd.CombinedOutput()
++			if err == nil {
++				t.Fatalf("%s succeeded for a chart with clashing dependencies", operation.name)
++			}
++			if !strings.Contains(string(output), "foo") {
++				t.Fatalf("%s did not identify the conflicting dependency: %s", operation.name, output)
++			}
++		})
++	}
++}

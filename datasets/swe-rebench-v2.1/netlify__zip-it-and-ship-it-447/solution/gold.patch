@@ -1,0 +1,222 @@
+diff --git a/src/runtimes/node/bundler.js b/src/runtimes/node/bundler.js
+index f6bedfc..c9a6bc7 100644
+--- a/src/runtimes/node/bundler.js
++++ b/src/runtimes/node/bundler.js
+@@ -1,15 +1,20 @@
+-const fs = require('fs')
+-const { basename, extname, join, resolve } = require('path')
++const { basename, dirname, extname, join, resolve } = require('path')
+ const process = require('process')
+-const { promisify } = require('util')
+ 
+ const esbuild = require('esbuild')
+ const semver = require('semver')
+ 
++const { safeUnlink } = require('../../utils/fs')
++
+ const { getBundlerTarget } = require('./bundler_target')
+ const { externalNativeModulesPlugin } = require('./native_modules/plugin')
+ 
+-const pUnlink = promisify(fs.unlink)
++const supportsAsyncAPI = semver.satisfies(process.version, '>=9.x')
++
++// esbuild's async build API throws on Node 8.x, so we switch to the sync
++// version for that version range.
++// eslint-disable-next-line node/no-sync
++const buildFunction = supportsAsyncAPI ? esbuild.build : esbuild.buildSync
+ 
+ const bundleJsFile = async function ({
+   additionalModulePaths,
+@@ -25,27 +30,12 @@ const bundleJsFile = async function ({
+   const external = [...new Set([...externalModules, ...ignoredModules])]
+   const jsFilename = `${basename(destFilename, extname(destFilename))}.js`
+   const bundlePath = join(destFolder, jsFilename)
+-
+-  // esbuild's async build API throws on Node 8.x, so we switch to the sync
+-  // version for that version range.
+-  const supportsAsyncAPI = semver.satisfies(process.version, '>=9.x')
+-
+-  // eslint-disable-next-line node/no-sync
+-  const buildFunction = supportsAsyncAPI ? esbuild.build : esbuild.buildSync
+-  const cleanTempFiles = async () => {
+-    try {
+-      await pUnlink(bundlePath)
+-    } catch (_) {
+-      // no-op
+-    }
+-  }
+-
+   const nativeNodeModules = {}
+   const plugins = [externalNativeModulesPlugin(nativeNodeModules)]
+   const nodeTarget = getBundlerTarget(config.nodeVersion)
+ 
+   try {
+-    const data = await buildFunction({
++    const { metafile, warnings } = await buildFunction({
+       bundle: true,
+       entryPoints: [srcFile],
+       external,
+@@ -56,11 +46,22 @@ const bundleJsFile = async function ({
+       platform: 'node',
+       plugins: supportsAsyncAPI ? plugins : [],
+       resolveExtensions: ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.json'],
++      sourcemap: Boolean(config.nodeSourcemap),
++      sourceRoot: dirname(bundlePath),
+       target: [nodeTarget],
+     })
+-    const inputs = Object.keys(data.metafile.inputs).map((path) => resolve(path))
++    const sourcemapPath = getSourcemapPath(metafile.outputs)
++    const inputs = Object.keys(metafile.inputs).map((path) => resolve(path))
++    const cleanTempFiles = getCleanupFunction(bundlePath, sourcemapPath)
+ 
+-    return { bundlePath, cleanTempFiles, inputs, nativeNodeModules, warnings: data.warnings }
++    return {
++      bundlePath,
++      cleanTempFiles,
++      inputs,
++      nativeNodeModules,
++      sourcemapPath,
++      warnings,
++    }
+   } catch (error) {
+     error.customErrorInfo = { type: 'functionsBundling', location: { functionName: name } }
+ 
+@@ -68,4 +69,16 @@ const bundleJsFile = async function ({
+   }
+ }
+ 
++const getCleanupFunction = (...paths) => async () => {
++  await Promise.all(paths.filter(Boolean).map(safeUnlink))
++}
++
++const getSourcemapPath = (outputs) => {
++  const relativePath = Object.keys(outputs).find((path) => extname(path) === '.map')
++
++  if (relativePath) {
++    return resolve(relativePath)
++  }
++}
++
+ module.exports = { bundleJsFile }
+diff --git a/src/runtimes/node/zip_esbuild.js b/src/runtimes/node/zip_esbuild.js
+index 27cbc1c..6c5d2e3 100644
+--- a/src/runtimes/node/zip_esbuild.js
++++ b/src/runtimes/node/zip_esbuild.js
+@@ -1,4 +1,4 @@
+-const { dirname, format, normalize, parse } = require('path')
++const { dirname, format, join, normalize, relative, parse } = require('path')
+ 
+ const commonPathPrefix = require('common-path-prefix')
+ 
+@@ -9,6 +9,19 @@ const { zipNodeJs } = require('../../zip_node')
+ const { bundleJsFile } = require('./bundler')
+ const { getSrcFilesAndExternalModules } = require('./src_files')
+ 
++const getAliases = ({ bundlePath, mainFile, sourcemapPath, srcDir }) => {
++  const aliases = new Map([[bundlePath, mainFile]])
++
++  if (sourcemapPath !== undefined) {
++    const bundleDirectory = dirname(bundlePath)
++    const relativeSourcemapPath = relative(bundleDirectory, sourcemapPath)
++
++    aliases.set(sourcemapPath, join(srcDir, relativeSourcemapPath))
++  }
++
++  return aliases
++}
++
+ // Convenience method for retrieving external and ignored modules from
+ // different places and merging them together.
+ const getExternalAndIgnoredModules = async ({ config, srcDir }) => {
+@@ -40,7 +53,7 @@ const zipEsbuild = async ({
+   stat,
+ }) => {
+   const { externalModules, ignoredModules } = await getExternalAndIgnoredModules({ config, srcDir })
+-  const { bundlePath, cleanTempFiles, inputs, nativeNodeModules = {}, warnings } = await bundleJsFile({
++  const { bundlePath, cleanTempFiles, inputs, nativeNodeModules = {}, sourcemapPath, warnings } = await bundleJsFile({
+     additionalModulePaths: pluginsModulesPath ? [pluginsModulesPath] : [],
+     config,
+     destFilename: filename,
+@@ -73,10 +86,7 @@ const zipEsbuild = async ({
+ 
+   // We're adding the bundled file to the zip, but we want it to have the same
+   // name and path as the original, unbundled file. For this, we use an alias.
+-  const aliases = {
+-    [bundlePath]: normalizedMainFile,
+-  }
+-
++  const aliases = getAliases({ bundlePath, mainFile: normalizedMainFile, sourcemapPath, srcDir })
+   const dirnames = supportingSrcFiles.map((filePath) => normalize(dirname(filePath)))
+   const basePath = commonPathPrefix([...dirnames, normalize(dirname(mainFile))])
+ 
+@@ -90,7 +100,7 @@ const zipEsbuild = async ({
+       filename,
+       mainFile: normalizedMainFile,
+       pluginsModulesPath,
+-      srcFiles: [...supportingSrcFiles, bundlePath],
++      srcFiles: [...supportingSrcFiles, bundlePath, ...(sourcemapPath ? [sourcemapPath] : [])],
+     })
+ 
+     return { bundler: JS_BUNDLER_ESBUILD, bundlerWarnings, config, inputs, nativeNodeModules, path }
+diff --git a/src/utils/fs.js b/src/utils/fs.js
+index e835448..6ee7d4b 100644
+--- a/src/utils/fs.js
++++ b/src/utils/fs.js
+@@ -1,8 +1,15 @@
+-const { readdir } = require('fs')
++const { readdir, unlink } = require('fs')
+ const { join } = require('path')
+ const { promisify } = require('util')
+ 
+ const pReaddir = promisify(readdir)
++const pUnlink = promisify(unlink)
++
++const safeUnlink = async (path) => {
++  try {
++    await pUnlink(path)
++  } catch (_) {}
++}
+ 
+ const listFunctionsDirectory = async function (srcFolder) {
+   try {
+@@ -14,4 +21,4 @@ const listFunctionsDirectory = async function (srcFolder) {
+   }
+ }
+ 
+-module.exports = { listFunctionsDirectory }
++module.exports = { listFunctionsDirectory, safeUnlink }
+diff --git a/src/zip_node.js b/src/zip_node.js
+index 1cd8223..a02b66f 100644
+--- a/src/zip_node.js
++++ b/src/zip_node.js
+@@ -20,7 +20,7 @@ const pWriteFile = promisify(fs.writeFile)
+ const COPY_FILE_CONCURRENCY = os.cpus().length === 0 ? 2 : os.cpus().length * 2
+ 
+ const createDirectory = async function ({
+-  aliases = {},
++  aliases = new Map(),
+   basePath,
+   destFolder,
+   extension,
+@@ -47,7 +47,7 @@ const createDirectory = async function ({
+   await pMap(
+     srcFiles,
+     (srcFile) => {
+-      const srcPath = aliases[srcFile] || srcFile
++      const srcPath = aliases.get(srcFile) || srcFile
+       const normalizedSrcPath = normalizeFilePath(srcPath, basePath, pluginsModulesPath)
+       const destPath = join(functionFolder, normalizedSrcPath)
+ 
+@@ -118,9 +118,10 @@ const getEntryFile = ({ commonPrefix, filename, mainFile }) => {
+   }
+ }
+ 
+-const zipJsFile = function ({ srcFile, commonPrefix, pluginsModulesPath, archive, stat, aliases = {} }) {
+-  const filename = aliases[srcFile] || srcFile
++const zipJsFile = function ({ srcFile, commonPrefix, pluginsModulesPath, archive, stat, aliases = new Map() }) {
++  const filename = aliases.get(srcFile) || srcFile
+   const normalizedFilename = normalizeFilePath(filename, commonPrefix, pluginsModulesPath)
++
+   addZipFile(archive, srcFile, normalizedFilename, stat)
+ }
+ 

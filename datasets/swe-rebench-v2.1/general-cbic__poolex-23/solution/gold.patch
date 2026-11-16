@@ -1,0 +1,383 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4b3eec3..373a6d2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Overflow feature. [Example of use](docs/guides/example-of-use.md)
+ - Speeding up CI by adding dialyzer PLT files caches.
+ 
+ ### Fixed
+ 
+ - Fix links in hex documentation.
++- Added missing spec for `get_debug_info/1`.
+ 
+ ## [0.3.0] - 2023-02-03
+ 
+diff --git a/docs/guides/example-of-use.md b/docs/guides/example-of-use.md
+index 7f289fa..c7c2a57 100644
+--- a/docs/guides/example-of-use.md
++++ b/docs/guides/example-of-use.md
+@@ -38,7 +38,8 @@ defmodule PoolexExample.Application do
+   defp pool_config do
+     [
+       worker_module: PoolexExample.Worker,
+-      workers_count: 5
++      workers_count: 5,
++      max_overflow: 2
+     ]
+   end
+ 
+@@ -55,6 +56,8 @@ defmodule PoolexExample.Application do
+ end
+ ```
+ 
++Please note that 7 workers started at once. 5 of them were launched at initialization and 2 workers were started over the limit based on the `max_overflow` setting.
++
+ All supported configuration options are presented in [Getting Started guide](getting-started.md#poolex-configuration-options).
+ 
+ ## Using Poolex
+@@ -99,16 +102,18 @@ end
+ Run the test function `PoolexExample.Test.start()` and see the result:
+ 
+ ```text
+-process #PID<0.227.0> calculating square root of 5
+-process #PID<0.223.0> calculating square root of 1
+-process #PID<0.225.0> calculating square root of 3
+-process #PID<0.224.0> calculating square root of 2
+-process #PID<0.226.0> calculating square root of 4
++process #PID<0.351.0> calculating square root of 3
++process #PID<0.350.0> calculating square root of 2
++process #PID<0.349.0> calculating square root of 1
++process #PID<0.352.0> calculating square root of 4
++process #PID<0.353.0> calculating square root of 5
++process #PID<0.349.0> calculating square root of 9
++process #PID<0.353.0> calculating square root of 7
+ {:ok, 1.0}
++process #PID<0.351.0> calculating square root of 8
++process #PID<0.352.0> calculating square root of 6
++process #PID<0.350.0> calculating square root of 10
+ {:ok, 1.4142135623730951}
+ {:ok, 1.7320508075688772}
+-{:ok, 2.0}
+-{:ok, 2.23606797749979}
+-{:ok, 2.449489742783178}
+ ...
+ ```
+diff --git a/docs/guides/getting-started.md b/docs/guides/getting-started.md
+index 23bf173..b1a4cac 100644
+--- a/docs/guides/getting-started.md
++++ b/docs/guides/getting-started.md
+@@ -13,7 +13,8 @@ In general you should place it into your Supervision tree for fault tolerance.
+ ```elixir
+ pool_config = [
+   worker_module: SomeWorker,
+-  workers_count: 10
++  workers_count: 10,
++  max_overflow: 10
+ ]
+ 
+ children = [
+@@ -36,6 +37,7 @@ The second argument should contain a set of options for starting the pool.
+ | `worker_start_fun` | Name of the function that starts the worker    | `:run`         | `:start`               |
+ | `worker_args`      | List of arguments passed to the start function | `[:gg, "wp"]`  | `[]`                   |
+ | `workers_count`    | How many workers should be running in the pool | `5`            | **option is required** |
++| `max_overflow`     | How many workers can be created over the limit | `2`            | `0`                    |
+ 
+ ## Working with the pool
+ 
+diff --git a/lib/poolex.ex b/lib/poolex.ex
+index 0eff79f..ff898e4 100644
+--- a/lib/poolex.ex
++++ b/lib/poolex.ex
+@@ -19,6 +19,7 @@ defmodule Poolex do
+           | {:worker_start_fun, atom()}
+           | {:worker_args, list(any())}
+           | {:workers_count, pos_integer()}
++          | {:max_overflow, non_neg_integer()}
+ 
+   @doc """
+   Starts a Poolex process without links (outside of a supervision tree).
+@@ -52,6 +53,7 @@ defmodule Poolex do
+   | `worker_start_fun` | Name of the function that starts the worker    | `:run`         | `:start`               |
+   | `worker_args`      | List of arguments passed to the start function | `[:gg, "wp"]`  | `[]`                   |
+   | `workers_count`    | How many workers should be running in the pool | `5`            | **option is required** |
++  | `max_overflow`     | How many workers can be created over the limit | `2`            | `0`                    |
+ 
+   ## Examples
+ 
+@@ -149,10 +151,12 @@ defmodule Poolex do
+       * `busy_workers_pids` - list of busy workers.
+       * `idle_workers_count` - how many workers are ready to work.
+       * `idle_workers_pids` - list of idle workers.
+-      * `worker_module` - name of a module that describes a worker.
++      * `max_overflow` - how many workers can be created over the limit.
++      * `overflow` - current count of workers launched over limit.
++      * `waiting_caller_pids` - list of callers processes.
+       * `worker_args` - what parameters are used to start the worker.
++      * `worker_module` - name of a module that describes a worker.
+       * `worker_start_fun` - what function is used to start the worker.
+-      * `waiting_caller_pids` - list of callers processes.
+ 
+   ## Examples
+ 
+@@ -163,6 +167,7 @@ defmodule Poolex do
+       iex> debug_info.idle_workers_count
+       5
+   """
++  @spec get_debug_info(pool_id()) :: DebugInfo.t()
+   def get_debug_info(pool_id) do
+     GenServer.call(pool_id, :get_debug_info)
+   end
+@@ -174,47 +179,67 @@ defmodule Poolex do
+ 
+     worker_start_fun = Keyword.get(opts, :worker_start_fun, :start)
+     worker_args = Keyword.get(opts, :worker_args, [])
++    max_overflow = Keyword.get(opts, :max_overflow, 0)
+ 
+     {:ok, monitor_id} = Monitoring.init(pool_id)
+     {:ok, supervisor} = Poolex.Supervisor.start_link()
+ 
++    state = %State{
++      busy_workers_state: BusyWorkers.init(),
++      max_overflow: max_overflow,
++      monitor_id: monitor_id,
++      supervisor: supervisor,
++      waiting_callers_state: WaitingCallers.init(),
++      worker_args: worker_args,
++      worker_module: worker_module,
++      worker_start_fun: worker_start_fun
++    }
++
+     worker_pids =
+       Enum.map(1..workers_count, fn _ ->
+-        {:ok, worker_pid} = start_worker(worker_module, worker_start_fun, worker_args, supervisor)
++        {:ok, worker_pid} = start_worker(state)
+         Monitoring.add(monitor_id, worker_pid, :worker)
+ 
+         worker_pid
+       end)
+ 
+-    state = %State{
+-      worker_module: worker_module,
+-      worker_start_fun: worker_start_fun,
+-      worker_args: worker_args,
+-      busy_workers_state: BusyWorkers.init(),
+-      idle_workers_state: IdleWorkers.init(worker_pids),
+-      waiting_callers_state: WaitingCallers.init(),
+-      monitor_id: monitor_id,
+-      supervisor: supervisor
+-    }
+-
+-    {:ok, state}
++    {:ok, %State{state | idle_workers_state: IdleWorkers.init(worker_pids)}}
+   end
+ 
+-  @spec start_worker(module(), atom(), list(any()), pid()) :: {:ok, pid()}
+-  defp start_worker(worker_module, worker_start_fun, worker_args, supervisor) do
+-    DynamicSupervisor.start_child(supervisor, %{
++  @spec start_worker(State.t()) :: {:ok, pid()}
++  defp start_worker(%State{} = state) do
++    DynamicSupervisor.start_child(state.supervisor, %{
+       id: make_ref(),
+-      start: {worker_module, worker_start_fun, worker_args}
++      start: {state.worker_module, state.worker_start_fun, state.worker_args}
+     })
+   end
+ 
++  @spec stop_worker(Supervisor.supervisor(), pid()) :: :ok | {:error, :not_found}
++  defp stop_worker(supervisor, worker_pid) do
++    DynamicSupervisor.terminate_child(supervisor, worker_pid)
++  end
++
+   @impl GenServer
+   def handle_call(:get_idle_worker, {from_pid, _} = caller, %State{} = state) do
+     if IdleWorkers.empty?(state.idle_workers_state) do
+-      Monitoring.add(state.monitor_id, from_pid, :caller)
+-      new_callers_state = WaitingCallers.add(state.waiting_callers_state, caller)
++      if state.overflow < state.max_overflow do
++        {:ok, new_worker} = start_worker(state)
++
++        Monitoring.add(state.monitor_id, new_worker, :temporary_worker)
++
++        new_state = %State{
++          state
++          | busy_workers_state: BusyWorkers.add(state.busy_workers_state, new_worker),
++            overflow: state.overflow + 1
++        }
+ 
+-      {:noreply, %{state | waiting_callers_state: new_callers_state}}
++        {:reply, {:ok, new_worker}, new_state}
++      else
++        Monitoring.add(state.monitor_id, from_pid, :caller)
++        new_callers_state = WaitingCallers.add(state.waiting_callers_state, caller)
++
++        {:noreply, %{state | waiting_callers_state: new_callers_state}}
++      end
+     else
+       {idle_worker_pid, new_idle_workers_state} = IdleWorkers.pop(state.idle_workers_state)
+       new_busy_workers_state = BusyWorkers.add(state.busy_workers_state, idle_worker_pid)
+@@ -239,25 +264,35 @@ defmodule Poolex do
+       busy_workers_pids: BusyWorkers.to_list(state.busy_workers_state),
+       idle_workers_count: IdleWorkers.count(state.idle_workers_state),
+       idle_workers_pids: IdleWorkers.to_list(state.idle_workers_state),
+-      worker_module: state.worker_module,
++      max_overflow: state.max_overflow,
++      overflow: state.overflow,
++      waiting_callers: WaitingCallers.to_list(state.waiting_callers_state),
+       worker_args: state.worker_args,
+-      worker_start_fun: state.worker_start_fun,
+-      waiting_callers: WaitingCallers.to_list(state.waiting_callers_state)
++      worker_module: state.worker_module,
++      worker_start_fun: state.worker_start_fun
+     }
+ 
+     {:reply, debug_info, state}
+   end
+ 
+   @impl GenServer
+-  def handle_cast({:release_busy_worker, worker_pid}, state) do
++  def handle_cast({:release_busy_worker, worker_pid}, %State{} = state) do
+     if WaitingCallers.empty?(state.waiting_callers_state) do
+       if BusyWorkers.member?(state.busy_workers_state, worker_pid) do
+-        {:noreply,
+-         %State{
+-           state
+-           | busy_workers_state: BusyWorkers.remove(state.busy_workers_state, worker_pid),
+-             idle_workers_state: IdleWorkers.add(state.idle_workers_state, worker_pid)
+-         }}
++        busy_workers_state = BusyWorkers.remove(state.busy_workers_state, worker_pid)
++
++        if state.overflow > 0 do
++          stop_worker(state.supervisor, worker_pid)
++
++          {:noreply, %State{state | busy_workers_state: busy_workers_state}}
++        else
++          {:noreply,
++           %State{
++             state
++             | busy_workers_state: busy_workers_state,
++               idle_workers_state: IdleWorkers.add(state.idle_workers_state, worker_pid)
++           }}
++        end
+       else
+         {:noreply, state}
+       end
+@@ -271,17 +306,21 @@ defmodule Poolex do
+   end
+ 
+   @impl GenServer
+-
+-  def handle_info({:DOWN, monitoring_reference, _process, dead_process_pid, _reason}, state) do
++  def handle_info(
++        {:DOWN, monitoring_reference, _process, dead_process_pid, _reason},
++        %State{} = state
++      ) do
+     case Monitoring.remove(state.monitor_id, monitoring_reference) do
++      :temporary_worker ->
++        {:noreply,
++         %State{
++           state
++           | overflow: state.overflow - 1,
++             idle_workers_state: IdleWorkers.remove(state.idle_workers_state, dead_process_pid)
++         }}
++
+       :worker ->
+-        {:ok, new_worker} =
+-          start_worker(
+-            state.worker_module,
+-            state.worker_start_fun,
+-            state.worker_args,
+-            state.supervisor
+-          )
++        {:ok, new_worker} = start_worker(state)
+ 
+         Monitoring.add(state.monitor_id, new_worker, :worker)
+ 
+diff --git a/lib/poolex/debug_info.ex b/lib/poolex/debug_info.ex
+index ebbf6e5..e40e08a 100644
+--- a/lib/poolex/debug_info.ex
++++ b/lib/poolex/debug_info.ex
+@@ -9,19 +9,23 @@ defmodule Poolex.DebugInfo do
+             busy_workers_pids: [],
+             idle_workers_count: 0,
+             idle_workers_pids: [],
+-            worker_module: nil,
++            max_overflow: 0,
++            overflow: 0,
++            waiting_callers: [],
+             worker_args: [],
+-            worker_start_fun: :start,
+-            waiting_callers: []
++            worker_module: nil,
++            worker_start_fun: :start
+ 
+   @type t() :: %__MODULE__{
+           busy_workers_count: non_neg_integer(),
+           busy_workers_pids: list(pid()),
+           idle_workers_count: non_neg_integer(),
+           idle_workers_pids: list(pid()),
+-          worker_module: module(),
++          max_overflow: non_neg_integer(),
++          overflow: non_neg_integer(),
++          waiting_callers: list(pid()),
+           worker_args: list(any()),
+-          worker_start_fun: atom(),
+-          waiting_callers: list(pid())
++          worker_module: module(),
++          worker_start_fun: atom()
+         }
+ end
+diff --git a/lib/poolex/monitoring.ex b/lib/poolex/monitoring.ex
+index c921bf4..7acee15 100644
+--- a/lib/poolex/monitoring.ex
++++ b/lib/poolex/monitoring.ex
+@@ -1,7 +1,7 @@
+ defmodule Poolex.Monitoring do
+   @moduledoc false
+   @type monitor_id() :: atom() | reference()
+-  @type kind_of_process() :: :worker | :caller
++  @type kind_of_process() :: :worker | :caller | :temporary_worker
+ 
+   @spec init(Poolex.pool_id()) :: {:ok, monitor_id()}
+   @doc false
+diff --git a/lib/poolex/state.ex b/lib/poolex/state.ex
+index 4a2f73e..818dd00 100644
+--- a/lib/poolex/state.ex
++++ b/lib/poolex/state.ex
+@@ -2,21 +2,25 @@ defmodule Poolex.State do
+   @moduledoc false
+   defstruct busy_workers_state: nil,
+             idle_workers_state: nil,
++            max_overflow: 0,
++            monitor_id: nil,
++            overflow: 0,
++            supervisor: nil,
+             waiting_callers_state: nil,
+-            worker_module: nil,
+-            worker_start_fun: nil,
+             worker_args: [],
+-            monitor_id: nil,
+-            supervisor: nil
++            worker_module: nil,
++            worker_start_fun: nil
+ 
+   @type t() :: %__MODULE__{
+           busy_workers_state: Poolex.Workers.Behaviour.state(),
+           idle_workers_state: Poolex.Workers.Behaviour.state(),
++          max_overflow: non_neg_integer(),
++          monitor_id: atom() | reference(),
++          overflow: non_neg_integer(),
++          supervisor: pid(),
+           waiting_callers_state: Poolex.Callers.Behaviour.state(),
+-          worker_module: module(),
+-          worker_start_fun: atom(),
+           worker_args: list(any()),
+-          monitor_id: atom() | reference(),
+-          supervisor: pid()
++          worker_module: module(),
++          worker_start_fun: atom()
+         }
+ end

@@ -1,0 +1,164 @@
+diff --git a/src/DiskArrays.jl b/src/DiskArrays.jl
+index a4220e1..ef75fbc 100644
+--- a/src/DiskArrays.jl
++++ b/src/DiskArrays.jl
+@@ -18,12 +18,16 @@ include("mapreduce.jl")
+ include("permute.jl")
+ include("reshape.jl")
+ include("subarray.jl")
++include("rechunk.jl")
+ include("cat.jl")
+ include("generator.jl")
++include("zip.jl")
++
+ 
+ # The all-in-one macro
+ 
+ macro implement_diskarray(t)
++    # Need to do this for dispatch ambiguity
+     t = esc(t)
+     quote
+         @implement_getindex $t
+@@ -37,10 +41,23 @@ macro implement_diskarray(t)
+         @implement_subarray $t
+         @implement_batchgetindex $t
+         @implement_cat $t
++        @implement_zip $t
+         @implement_generator $t
+     end
+ end
+ 
+-@implement_diskarray AbstractDiskArray
++# We need to skip the `implement_zip` macro for dispatch
++@implement_getindex AbstractDiskArray
++@implement_setindex AbstractDiskArray
++@implement_broadcast AbstractDiskArray
++@implement_iteration AbstractDiskArray
++@implement_mapreduce AbstractDiskArray
++@implement_reshape AbstractDiskArray
++@implement_array_methods AbstractDiskArray
++@implement_permutedims AbstractDiskArray
++@implement_subarray AbstractDiskArray
++@implement_batchgetindex AbstractDiskArray
++@implement_cat AbstractDiskArray
++@implement_generator AbstractDiskArray
+ 
+ end # module
+diff --git a/src/rechunk.jl b/src/rechunk.jl
+new file mode 100644
+index 0000000..e961d75
+--- /dev/null
++++ b/src/rechunk.jl
+@@ -0,0 +1,27 @@
++# Force disk any abstractarray into a different chunking pattern.
++# This is useful in `zip` and other operations that can iterate
++# over multiple arrays with different patterns.
++
++struct RechunkedDiskArray{T,N,A<:AbstractArray{T,N},C} <: AbstractDiskArray{T,N}
++    parent::A
++    chunks::C
++end
++
++Base.parent(A::RechunkedDiskArray) = A.parent
++Base.size(A::RechunkedDiskArray) = size(parent(A))
++# These could be more efficient with memory in some cases, but this is simple
++readblock!(A::RechunkedDiskArray, data, I...) = _readblock_rechunked(A, data, I...)
++readblock!(A::RechunkedDiskArray, data, I::AbstractVector...) = _readblock_rechunked(A, data, I...)
++writeblock!(A::RechunkedDiskArray, data, I...) = writeblock!(parent(A), data, I...)
++
++haschunks(::RechunkedDiskArray) = Chunked()
++eachchunk(A::RechunkedDiskArray) = A.chunks
++
++function _readblock_rechunked(A, data, I...)
++    if haschunks(parent(A)) isa Chunked
++        readblock!(parent(A), data, I...)
++    else
++        # Handle non disk arrays that may be chunked for e.g. chunked `zip`
++        copyto!(data, view(parent(A), I...))
++    end
++end
+diff --git a/src/zip.jl b/src/zip.jl
+new file mode 100644
+index 0000000..db0dafa
+--- /dev/null
++++ b/src/zip.jl
+@@ -0,0 +1,79 @@
++
++struct DiskZip{Is<:Tuple}
++    is::Is
++end
++Base.iterate(dz::DiskZip) = Base.iterate(Iterators.Zip(dz.is))
++Base.iterate(dz::DiskZip, i) = Base.iterate(Iterators.Zip(dz.is), i)
++Base.first(dz::DiskZip) = Base.first(Iterators.Zip(dz.is))
++Base.last(dz::DiskZip) = Base.last(Iterators.Zip(dz.is))
++Base.length(dz::DiskZip) = Base.length(Iterators.Zip(dz.is))
++Base.size(dz::DiskZip) = Base.size(Iterators.Zip(dz.is))
++Base.IteratorSize(::Type{DiskZip{Is}}) where {Is<:Tuple} =
++    Base.IteratorSize(Iterators.Zip{Is})
++Base.IteratorEltype(::Type{DiskZip{Is}}) where {Is<:Tuple} =
++    Base.IteratorEltype(Iterators.Zip{Is})
++
++# Rechunk using the chunks of the first Chunked array
++# This forces the iteration order to be the same for
++# all arrays.
++
++function DiskZip(As::AbstractArray{<:Any,N}...) where N
++    map(As) do A
++        size(A) == size(first(As)) || throw(DimensionMismatch("Arrays zipped with disk arrays must be the same size"))
++    end
++    # Get the chunkes of the first Chunked array
++    chunks = reduce(As; init=nothing) do acc, A
++        if isnothing(acc) && (haschunks(A) isa Chunked)
++            eachchunk(A)
++        else
++            acc
++        end
++    end
++    if isnothing(chunks)
++        return DiskZip(As)
++    else
++        rechunked = map(As) do A
++            RechunkedDiskArray(A, chunks)
++        end
++        return DiskZip(rechunked)
++    end
++end
++# For now we only allow zip on exact same-sized arrays
++DiskZip(As...) = throw(ArgumentError("zip on disk arrays only works with other same-sized AbstractArray"))
++
++# Collect zipped disk arrays in the right order
++function Base.collect(dz::DiskZip)
++    out = similar(first(dz.is), eltype(dz))
++    i = iterate(dz)
++    for I in eachindex(first(dz.is))
++        out[I] = first(i)
++        i = iterate(dz, last(i))
++    end
++    return out
++end
++
++_zip_error() = throw(ArgumentError("Cannot `zip` a disk array with an iterator"))
++
++Base.zip(A1::AbstractDiskArray, A2::AbstractDiskArray, As::AbstractArray...) = DiskZip(A1, A2, As...)
++Base.zip(A1::AbstractDiskArray, A2::AbstractArray, As::AbstractArray...) = DiskZip(A1, A1, As...)
++Base.zip(A1::AbstractArray, A2::AbstractDiskArray, As::AbstractArray...) = DiskZip(A1, A2, As...)
++
++Base.zip(::AbstractDiskArray, x, xs...) = _zip_error()
++Base.zip(x, ::AbstractDiskArray, xs...) = _zip_error()
++Base.zip(x::AbstractDiskArray, ::AbstractDiskArray, xs...) = _zip_error()
++
++macro implement_zip(t)
++    t = esc(t)
++    quote
++        Base.zip(A1::$t, A2::$t, As::AbstractArray...) = $DiskZip(A1, A2, As...)
++        Base.zip(A1::$t, A2::AbstractArray, As::AbstractArray...) = $DiskZip(A1, A2, As...)
++        Base.zip(A1::AbstractArray, A2::$t, As::AbstractArray...) = $DiskZip(A1, A2, As...)
++
++        Base.zip(A1::AbstractDiskArray, A2::$t, As::AbstractArray...) = $DiskZip(A1, A2, As...)
++        Base.zip(A1::$t, A2::AbstractDiskArray, As::AbstractArray...) = $DiskZip(A1, A2, As...)
++
++        Base.zip(::$t, x, xs...) = $_zip_error()
++        Base.zip(x, ::$t, xs...) = $_zip_error()
++        Base.zip(x, ::$t, xs...) = $_zip_error()
++    end
++end

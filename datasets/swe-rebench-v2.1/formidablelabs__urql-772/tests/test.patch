@@ -1,0 +1,258 @@
+diff --git a/exchanges/graphcache/src/operations/query.test.ts b/exchanges/graphcache/src/operations/query.test.ts
+index a7adb78..1aa2610 100644
+--- a/exchanges/graphcache/src/operations/query.test.ts
++++ b/exchanges/graphcache/src/operations/query.test.ts
+@@ -2,6 +2,10 @@ import { Store } from '../store';
+ import gql from 'graphql-tag';
+ import { write } from './write';
+ import { query } from './query';
++import { relayPagination } from '../extras/relayPagination';
++import { createClient, ExchangeIO, Operation, OperationResult } from '@urql/core';
++import { cacheExchange } from '../cacheExchange';
++import { makeSubject, map, pipe, publish, tap } from 'wonka';
+ 
+ const TODO_QUERY = gql`
+   query Todos {
+@@ -187,4 +191,242 @@ describe('Query', () => {
+       todos: [{ __typename: 'Todo', id: '0', text: 'Solve bug' }],
+     });
+   });
++
++  it('should allow subsequent read when first result was null', () => {
++    const QUERY_WRITE = gql`
++      query writeTodos {
++        todos {
++          id
++        }
++      }
++    `;
++    const QUERY_READ = gql`
++      query getTodos {
++        todos {
++          ...MissingRead
++        }
++        todos {
++          id
++        }
++      }
++
++      fragment MissingRead on Todo {
++        id
++        text
++      }
++    `;
++    const client = createClient({ url: 'http://localhost' });
++    const data = {
++      __typename: 'Query',
++      todos: [{ __typename: 'Todo', id: '0' }],
++    };
++    const forward: ExchangeIO = ops$ =>
++      pipe(ops$, map((operation: Operation) => ({ operation, data })));
++    const { source: ops$, next } = makeSubject<Operation>();
++    const results: OperationResult[] = [];
++    pipe(
++      cacheExchange({ schema: alteredRoot })({
++        forward,
++        client,
++        dispatchDebug: jest.fn(),
++      })(ops$),
++      tap(result => results.push(result)),
++      publish
++    );
++
++    next(
++      client.createRequestOperation(
++        'query',
++        { key: 1, query: QUERY_WRITE },
++        { requestPolicy: 'network-only' }
++      )
++    );
++    next(
++      client.createRequestOperation(
++        'query',
++        { key: 2, query: QUERY_READ },
++        { requestPolicy: 'cache-only' }
++      )
++    );
++
++    const readResult = results.find(result => result.operation.key === 2);
++    expect(readResult).toBeDefined();
++    expect(readResult && readResult.data).toBeDefined();
++    expect(readResult && readResult.data).not.toBe(null);
++  });
++
++  it('reads later relay pages containing nullable nested objects', () => {
++    const relaySchema = JSON.parse(
++      JSON.stringify(require('../test-utils/relayPagination_schema.json'))
++    );
++    const itemType = relaySchema.__schema.types.find(type => type.name === 'Item');
++    itemType.fields.push({
++      name: 'nullable',
++      description: null,
++      args: [],
++      type: { kind: 'OBJECT', name: 'Nullable', ofType: null },
++      isDeprecated: false,
++      deprecationReason: null,
++    });
++    relaySchema.__schema.types.push({
++      kind: 'OBJECT',
++      name: 'Nullable',
++      description: null,
++      fields: [
++        {
++          name: 'id',
++          description: null,
++          args: [],
++          type: { kind: 'SCALAR', name: 'ID', ofType: null },
++          isDeprecated: false,
++          deprecationReason: null,
++        },
++      ],
++      inputFields: null,
++      interfaces: [],
++      enumValues: null,
++      possibleTypes: null,
++    });
++
++    const PAGE = gql`
++      query Page($cursor: String) {
++        items(first: 1, after: $cursor) {
++          edges {
++            node {
++              id
++              name
++              nullable {
++                id
++              }
++            }
++          }
++        }
++      }
++    `;
++    const READ = gql`
++      query ReadPages {
++        items(first: 1) {
++          edges {
++            node {
++              ...InvalidNullable
++            }
++          }
++        }
++        items(first: 1) {
++          edges {
++            node {
++              id
++              name
++              nullable {
++                id
++              }
++            }
++          }
++        }
++      }
++
++      fragment InvalidNullable on Item {
++        id
++        name
++        nullable {
++          id
++          unknownField
++        }
++      }
++    `;
++    const pages = [
++      {
++        __typename: 'Query',
++        items: {
++          __typename: 'ItemsConnection',
++          edges: [
++            {
++              __typename: 'ItemEdge',
++              node: { __typename: 'Item', id: '1', name: 'first', nullable: null },
++            },
++          ],
++          pageInfo: {
++            __typename: 'PageInfo',
++            hasNextPage: true,
++            endCursor: '1',
++          },
++        },
++      },
++      {
++        __typename: 'Query',
++        items: {
++          __typename: 'ItemsConnection',
++          edges: [
++            {
++              __typename: 'ItemEdge',
++              node: {
++                __typename: 'Item',
++                id: '2',
++                name: 'second',
++                nullable: { __typename: 'Nullable', id: 'nested' },
++              },
++            },
++          ],
++          pageInfo: {
++            __typename: 'PageInfo',
++            hasNextPage: false,
++            endCursor: null,
++          },
++        },
++      },
++    ];
++    const client = createClient({ url: 'http://localhost' });
++    const forward: ExchangeIO = ops$ =>
++      pipe(
++        ops$,
++        map((operation: Operation) => ({
++          operation,
++          data:
++            (operation.variables as { cursor?: string | null } | undefined)
++              ?.cursor === '1'
++              ? pages[1]
++              : pages[0],
++        }))
++      );
++    const { source: ops$, next } = makeSubject<Operation>();
++    const results: OperationResult[] = [];
++    pipe(
++      cacheExchange({
++        schema: relaySchema,
++        resolvers: { Query: { items: relayPagination() } },
++      })({ forward, client, dispatchDebug: jest.fn() })(ops$),
++      tap(result => results.push(result)),
++      publish
++    );
++
++    next(
++      client.createRequestOperation(
++        'query',
++        { key: 1, query: PAGE, variables: { cursor: null } },
++        { requestPolicy: 'network-only' }
++      )
++    );
++    next(
++      client.createRequestOperation(
++        'query',
++        { key: 2, query: PAGE, variables: { cursor: '1' } },
++        { requestPolicy: 'network-only' }
++      )
++    );
++    next(
++      client.createRequestOperation(
++        'query',
++        { key: 3, query: READ },
++        { requestPolicy: 'cache-only' }
++      )
++    );
++
++    const readResult = results.find(result => result.operation.key === 3);
++    expect(readResult).toBeDefined();
++    expect(readResult && readResult.data.items.edges).toContainEqual(
++      expect.objectContaining({
++        node: expect.objectContaining({ id: '2', name: 'second' }),
++      })
++    );
++  });
+ });

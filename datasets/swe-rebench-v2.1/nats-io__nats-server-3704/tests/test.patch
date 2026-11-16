@@ -1,0 +1,200 @@
+diff --git a/server/events_test.go b/server/events_test.go
+index 605e687f..2a86c03c 100644
+--- a/server/events_test.go
++++ b/server/events_test.go
+@@ -2178,7 +2178,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
+ 		{"JSZ", nil, &JSzOptions{}, []string{"now", "disabled"}},
+ 
+ 		{"HEALTHZ", nil, &JSzOptions{}, []string{"status"}},
+-		{"HEALTHZ", &HealthzOptions{JSEnabled: true}, &JSzOptions{}, []string{"status"}},
++		{"HEALTHZ", json.RawMessage(`{"js-enabled-only":true}`), &JSzOptions{}, []string{"status"}},
+ 		{"HEALTHZ", &HealthzOptions{JSServerOnly: true}, &JSzOptions{}, []string{"status"}},
+ 	}
+ 
+diff --git a/server/jetstream_cluster_3_test.go b/server/jetstream_cluster_3_test.go
+index fb53caf1..33449d1f 100644
+--- a/server/jetstream_cluster_3_test.go
++++ b/server/jetstream_cluster_3_test.go
+@@ -23,6 +23,7 @@ import (
+ 	"fmt"
+ 	"math/rand"
+ 	"net"
++	"net/http"
+ 	"os"
+ 	"reflect"
+ 	"strings"
+@@ -406,7 +407,6 @@ func TestJetStreamClusterDeleteConsumerWhileServerDown(t *testing.T) {
+ 	s = c.restartServer(s)
+ 	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+ 		hs := s.healthz(&HealthzOptions{
+-			JSEnabled:    true,
+ 			JSServerOnly: false,
+ 		})
+ 		if hs.Error != _EMPTY_ {
+@@ -448,7 +448,6 @@ func TestJetStreamClusterDeleteConsumerWhileServerDown(t *testing.T) {
+ 	s = c.restartServer(s)
+ 	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+ 		hs := s.healthz(&HealthzOptions{
+-			JSEnabled:    true,
+ 			JSServerOnly: false,
+ 		})
+ 		if hs.Error != _EMPTY_ {
+@@ -2134,3 +2133,50 @@ func TestJetStreamClusterLeafnodeDuplicateConsumerMessages(t *testing.T) {
+ 	require_True(t, string(msgs[0].Data) == "M-5")
+ 	require_True(t, string(msgs[1].Data) == "M-6")
+ }
++
++func TestJetStreamHealthzChecksMetaState(t *testing.T) {
++	c := createJetStreamClusterExplicit(t, "HZC", 3)
++	defer c.shutdown()
++
++	s := c.randomServer()
++	if s == nil {
++		t.Fatal("Expected a running cluster server")
++	}
++	opts := s.getOpts()
++	opts.HTTPHost = "127.0.0.1"
++	opts.HTTPPort = -1
++	require_NoError(t, s.StartMonitoring())
++
++	// Leave a single server running so the Meta group cannot maintain a leader.
++	for _, member := range c.servers {
++		if member != s {
++			member.Shutdown()
++		}
++	}
++
++	request := func(query string) int {
++		t.Helper()
++		url := fmt.Sprintf("http://%s/healthz", s.MonitorAddr())
++		if query != "" {
++			url += "?" + query
++		}
++		resp, err := http.Get(url)
++		require_NoError(t, err)
++		defer resp.Body.Close()
++		return resp.StatusCode
++	}
++
++	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
++		if status := request(""); status != http.StatusServiceUnavailable {
++			return fmt.Errorf("expected health check without parameters to include meta state, got HTTP %d", status)
++		}
++		return nil
++	})
++
++	if status := request("js-enabled-only=true"); status != http.StatusOK {
++		t.Fatalf("enabled-only check should stop before checking meta state, got HTTP %d", status)
++	}
++	if status := request("js-server-only=true"); status != http.StatusServiceUnavailable {
++		t.Fatalf("server-only check should report unavailable without a Meta Leader, got HTTP %d", status)
++	}
++}
+diff --git a/server/jetstream_test.go b/server/jetstream_test.go
+index f9cbba83..5ed99f73 100644
+--- a/server/jetstream_test.go
++++ b/server/jetstream_test.go
+@@ -17365,19 +17365,59 @@ func TestJetStreamWorkQueueSourceNamingRestart(t *testing.T) {
+ }
+ 
+ func TestJetStreamDisabledHealthz(t *testing.T) {
+-	s := RunRandClientPortServer()
++	s := RunBasicJetStreamServer()
++	if config := s.JetStreamConfig(); config != nil {
++		defer removeDir(t, config.StoreDir)
++	}
+ 	defer s.Shutdown()
+ 
+-	if s.JetStreamEnabled() {
+-		t.Fatalf("Expected JetStream to be disabled")
++	if !s.JetStreamEnabled() {
++		t.Fatalf("Expected JetStream to be enabled")
+ 	}
+ 
+-	hs := s.healthz(&HealthzOptions{JSEnabled: true})
+-	if hs.Status == "unavailable" && hs.Error == NewJSNotEnabledError().Error() {
+-		return
++	// Start the monitoring endpoint so the /healthz handler can be queried.
++	opts := s.getOpts()
++	opts.HTTPHost = "127.0.0.1"
++	opts.HTTPPort = -1
++	require_NoError(t, s.StartMonitoring())
++
++	healthz := func(query string) (int, *HealthStatus) {
++		t.Helper()
++		url := fmt.Sprintf("http://%s/healthz", s.MonitorAddr())
++		if query != _EMPTY_ {
++			url += "?" + query
++		}
++		resp, err := http.Get(url)
++		if err != nil {
++			t.Fatalf("Error getting healthz: %v", err)
++		}
++		defer resp.Body.Close()
++		var hs HealthStatus
++		if err := json.NewDecoder(resp.Body).Decode(&hs); err != nil {
++			t.Fatalf("Error decoding healthz response: %v", err)
++		}
++		return resp.StatusCode, &hs
++	}
++
++	// JetStream is enabled and running, so the health check should be ok.
++	if code, hs := healthz("js-enabled-only=true"); code != http.StatusOK || hs.Status != "ok" {
++		t.Fatalf("Expected ok healthz with JetStream running, got %d %+v", code, hs)
+ 	}
+ 
+-	t.Fatalf("Expected healthz to return error if JetStream is disabled, got status: %s", hs.Status)
++	// Disable JetStream. The config still says it should be enabled, so
++	// js-enabled-only=true should report unavailable.
++	s.DisableJetStream()
++
++	code, hs := healthz("js-enabled-only=true")
++	if code != http.StatusServiceUnavailable {
++		t.Fatalf("Expected 503, got %d", code)
++	}
++	if hs.Status != "unavailable" {
++		t.Fatalf("Expected unavailable status, got %q", hs.Status)
++	}
++	if hs.Error != NewJSNotEnabledError().Error() {
++		t.Fatalf("Expected %q, got %q", NewJSNotEnabledError().Error(), hs.Error)
++	}
+ }
+ 
+ func TestJetStreamPullMaxBytes(t *testing.T) {
+@@ -19861,3 +19901,36 @@ func TestJetStreamServerCrashOnPullConsumerDeleteWithInactiveThresholdAfterAck(t
+ 	_, err = js.StreamInfo("TEST")
+ 	require_NoError(t, err)
+ }
++
++func TestJetStreamDisabledHealthzInConfig(t *testing.T) {
++	s := RunRandClientPortServer()
++	defer s.Shutdown()
++
++	if s.JetStreamEnabled() {
++		t.Fatalf("Expected JetStream to be disabled")
++	}
++
++	// Start the monitoring endpoint so the /healthz handler can be queried.
++	opts := s.getOpts()
++	opts.HTTPHost = "127.0.0.1"
++	opts.HTTPPort = -1
++	require_NoError(t, s.StartMonitoring())
++
++	// JetStream is disabled in the config, so the health check should be ok
++	// even when only the enabled state is requested.
++	resp, err := http.Get(fmt.Sprintf("http://%s/healthz?js-enabled-only=true", s.MonitorAddr()))
++	if err != nil {
++		t.Fatalf("Error getting healthz: %v", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("Expected 200, got %d", resp.StatusCode)
++	}
++	var hs HealthStatus
++	if err := json.NewDecoder(resp.Body).Decode(&hs); err != nil {
++		t.Fatalf("Error decoding healthz response: %v", err)
++	}
++	if hs.Status != "ok" {
++		t.Fatalf("Expected ok status, got %q", hs.Status)
++	}
++}

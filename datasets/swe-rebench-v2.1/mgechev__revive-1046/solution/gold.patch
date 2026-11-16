@@ -1,0 +1,188 @@
+diff --git a/README.md b/README.md
+index 81e247d..051d789 100644
+--- a/README.md
++++ b/README.md
+@@ -480,7 +480,7 @@ List of all available rules. The rules ported from `golint` are left unchanged a
+ | [`var-naming`](./RULES_DESCRIPTIONS.md#var-naming)          |  allowlist & blocklist of initialisms   | Naming rules.                                                    |   yes    |  no   |
+ | [`package-comments`](./RULES_DESCRIPTIONS.md#package-comments)    |  n/a   | Package commenting conventions.                                  |   yes    |  no   |
+ | [`range`](./RULES_DESCRIPTIONS.md#range)               |  n/a   | Prevents redundant variables when iterating over a collection.   |   yes    |  no   |
+-| [`receiver-naming`](./RULES_DESCRIPTIONS.md#receiver-naming)     |  n/a   | Conventions around the naming of receivers.                      |   yes    |  no   |
++| [`receiver-naming`](./RULES_DESCRIPTIONS.md#receiver-naming)     |  map (optional)   | Conventions around the naming of receivers.                      |   yes    |  no   |
+ | [`indent-error-flow`](./RULES_DESCRIPTIONS.md#indent-error-flow)   |  []string   | Prevents redundant else statements.                              |   yes    |  no   |
+ | [`argument-limit`](./RULES_DESCRIPTIONS.md#argument-limit)      |  int (defaults to 8)  | Specifies the maximum number of arguments a function can receive |    no    |  no   |
+ | [`cyclomatic`](./RULES_DESCRIPTIONS.md#cyclomatic)          |  int (defaults to 10)   | Sets restriction for maximum Cyclomatic complexity.              |    no    |  no   |
+diff --git a/RULES_DESCRIPTIONS.md b/RULES_DESCRIPTIONS.md
+index 4e27930..ecd304c 100644
+--- a/RULES_DESCRIPTIONS.md
++++ b/RULES_DESCRIPTIONS.md
+@@ -389,6 +389,9 @@ declaration. The 'short' style encourages omitting repeated types for concisenes
+ whereas the 'full' style mandates explicitly stating the type for each argument
+ and return value, even if they are repeated, promoting clarity.
+ 
++_IMPORTANT_: When `short` style is used, the rule will not flag the arguments that use
++imported types. This is because the rule cannot efficiently determine the imported type.
++
+ _Configuration (1)_: (string) as a single string, it configures both argument
+ and return value styles. Accepts 'any', 'short', or 'full' (default: 'any').
+ 
+@@ -737,7 +740,14 @@ _Configuration_: N/A
+ 
+ _Description_: By convention, receiver names in a method should reflect their identity. For example, if the receiver is of type `Parts`, `p` is an adequate name for it. Contrary to other languages, it is not idiomatic to name receivers as `this` or `self`.
+ 
+-_Configuration_: N/A
++_Configuration_: (optional) list of key-value-pair-map (`[]map[string]any`).
++
++- `maxLength` : (int) max length of receiver name
++
++```toml
++[rule.receiver-naming]
++    arguments = [{maxLength=2}]
++```
+ 
+ ## redefines-builtin-id
+ 
+diff --git a/rule/enforce-repeated-arg-type-style.go b/rule/enforce-repeated-arg-type-style.go
+index 067082b..89e8c05 100644
+--- a/rule/enforce-repeated-arg-type-style.go
++++ b/rule/enforce-repeated-arg-type-style.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"go/ast"
+ 	"go/types"
++	"strings"
+ 	"sync"
+ 
+ 	"github.com/mgechev/revive/lint"
+@@ -134,7 +135,8 @@ func (r *EnforceRepeatedArgTypeStyleRule) Apply(file *lint.File, arguments lint.
+ 				var prevType ast.Expr
+ 				if fn.Type.Params != nil {
+ 					for _, field := range fn.Type.Params.List {
+-						if types.Identical(typesInfo.Types[field.Type].Type, typesInfo.Types[prevType].Type) {
++						// TODO: For invalid types we could have compared raw import names (import package alias + selector), but will it work properly in all the cases?
++						if !r.isInvalidType(typesInfo.Types[field.Type].Type) && types.Identical(typesInfo.Types[field.Type].Type, typesInfo.Types[prevType].Type) {
+ 							failures = append(failures, lint.Failure{
+ 								Confidence: 1,
+ 								Node:       field,
+@@ -166,7 +168,8 @@ func (r *EnforceRepeatedArgTypeStyleRule) Apply(file *lint.File, arguments lint.
+ 				var prevType ast.Expr
+ 				if fn.Type.Results != nil {
+ 					for _, field := range fn.Type.Results.List {
+-						if field.Names != nil && types.Identical(typesInfo.Types[field.Type].Type, typesInfo.Types[prevType].Type) {
++						// TODO: For invalid types we could have compared raw import names (import package alias + selector), but will it work properly in all the cases?
++						if !r.isInvalidType(typesInfo.Types[field.Type].Type) && field.Names != nil && types.Identical(typesInfo.Types[field.Type].Type, typesInfo.Types[prevType].Type) {
+ 							failures = append(failures, lint.Failure{
+ 								Confidence: 1,
+ 								Node:       field,
+@@ -189,3 +192,10 @@ func (r *EnforceRepeatedArgTypeStyleRule) Apply(file *lint.File, arguments lint.
+ func (*EnforceRepeatedArgTypeStyleRule) Name() string {
+ 	return "enforce-repeated-arg-type-style"
+ }
++
++// Invalid types are imported from other packages, and we can't compare them.
++// Note, we check the string suffix to cover all the cases: non-pointer, pointer, double pointer, etc.
++// See: https://github.com/mgechev/revive/issues/1032
++func (*EnforceRepeatedArgTypeStyleRule) isInvalidType(t types.Type) bool {
++	return strings.HasSuffix(t.String(), "invalid type")
++}
+diff --git a/rule/receiver-naming.go b/rule/receiver-naming.go
+index d79bb9f..afcd99b 100644
+--- a/rule/receiver-naming.go
++++ b/rule/receiver-naming.go
+@@ -3,16 +3,55 @@ package rule
+ import (
+ 	"fmt"
+ 	"go/ast"
++	"sync"
+ 
+ 	"github.com/mgechev/revive/internal/typeparams"
+ 	"github.com/mgechev/revive/lint"
+ )
+ 
+ // ReceiverNamingRule lints given else constructs.
+-type ReceiverNamingRule struct{}
++type ReceiverNamingRule struct {
++	receiverNameMaxLength int
++	sync.Mutex
++}
++
++const defaultReceiverNameMaxLength = -1 // thus will not check
++
++func (r *ReceiverNamingRule) configure(arguments lint.Arguments) {
++	r.Lock()
++	defer r.Unlock()
++	if r.receiverNameMaxLength != 0 {
++		return
++	}
++
++	r.receiverNameMaxLength = defaultReceiverNameMaxLength
++	if len(arguments) < 1 {
++		return
++	}
++
++	args, ok := arguments[0].(map[string]any)
++	if !ok {
++		panic(fmt.Sprintf("Unable to get arguments for rule %s. Expected object of key-value-pairs.", r.Name()))
++	}
++
++	for k, v := range args {
++		switch k {
++		case "maxLength":
++			value, ok := v.(int64)
++			if !ok {
++				panic(fmt.Sprintf("Invalid value %v for argument %s of rule %s, expected integer value got %T", v, k, r.Name(), v))
++			}
++			r.receiverNameMaxLength = int(value)
++		default:
++			panic(fmt.Sprintf("Unknown argument %s for %s rule.", k, r.Name()))
++		}
++	}
++}
+ 
+ // Apply applies the rule to given file.
+-func (*ReceiverNamingRule) Apply(file *lint.File, _ lint.Arguments) []lint.Failure {
++func (r *ReceiverNamingRule) Apply(file *lint.File, args lint.Arguments) []lint.Failure {
++	r.configure(args)
++
+ 	var failures []lint.Failure
+ 
+ 	fileAst := file.AST
+@@ -20,7 +59,8 @@ func (*ReceiverNamingRule) Apply(file *lint.File, _ lint.Arguments) []lint.Failu
+ 		onFailure: func(failure lint.Failure) {
+ 			failures = append(failures, failure)
+ 		},
+-		typeReceiver: map[string]string{},
++		typeReceiver:          map[string]string{},
++		receiverNameMaxLength: r.receiverNameMaxLength,
+ 	}
+ 
+ 	ast.Walk(walker, fileAst)
+@@ -34,8 +74,9 @@ func (*ReceiverNamingRule) Name() string {
+ }
+ 
+ type lintReceiverName struct {
+-	onFailure    func(lint.Failure)
+-	typeReceiver map[string]string
++	onFailure             func(lint.Failure)
++	typeReceiver          map[string]string
++	receiverNameMaxLength int
+ }
+ 
+ func (w lintReceiverName) Visit(n ast.Node) ast.Visitor {
+@@ -66,6 +107,17 @@ func (w lintReceiverName) Visit(n ast.Node) ast.Visitor {
+ 		})
+ 		return w
+ 	}
++
++	if w.receiverNameMaxLength > 0 && len([]rune(name)) > w.receiverNameMaxLength {
++		w.onFailure(lint.Failure{
++			Node:       n,
++			Confidence: 1,
++			Category:   "naming",
++			Failure:    fmt.Sprintf("receiver name %s is longer than %d characters", name, w.receiverNameMaxLength),
++		})
++		return w
++	}
++
+ 	recv := typeparams.ReceiverType(fn)
+ 	if prev, ok := w.typeReceiver[recv]; ok && prev != name {
+ 		w.onFailure(lint.Failure{

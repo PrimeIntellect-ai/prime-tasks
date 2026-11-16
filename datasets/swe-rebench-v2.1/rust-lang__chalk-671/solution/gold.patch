@@ -1,0 +1,489 @@
+diff --git a/chalk-engine/src/logic.rs b/chalk-engine/src/logic.rs
+index 97b12e9d..f8496c72 100644
+--- a/chalk-engine/src/logic.rs
++++ b/chalk-engine/src/logic.rs
+@@ -9,12 +9,13 @@ use crate::{
+     TimeStamp,
+ };
+ 
++use chalk_ir::could_match::CouldMatch;
+ use chalk_ir::interner::Interner;
+ use chalk_ir::{
+     AnswerSubst, Canonical, ConstrainedSubst, Constraints, FallibleOrFloundered, Floundered, Goal,
+-    GoalData, InEnvironment, NoSolution, Substitution, UCanonical, UniverseMap,
++    GoalData, InEnvironment, NoSolution, ProgramClause, Substitution, UCanonical, UniverseMap,
+ };
+-use chalk_solve::clauses::program_clauses_for_goal;
++use chalk_solve::clauses::program_clauses_that_could_match;
+ use chalk_solve::coinductive_goal::IsCoinductive;
+ use chalk_solve::infer::ucanonicalize::UCanonicalized;
+ use chalk_solve::infer::InferenceTable;
+@@ -237,8 +238,6 @@ impl<I: Interner> Forest<I> {
+         let goal_data = goal.canonical.value.goal.data(context.program().interner());
+         match goal_data {
+             GoalData::DomainGoal(domain_goal) => {
+-                let program = context.program();
+-
+                 let canon_domain_goal = UCanonical {
+                     canonical: Canonical {
+                         binders: goal.canonical.binders,
+@@ -249,16 +248,34 @@ impl<I: Interner> Forest<I> {
+                     },
+                     universes: goal.universes,
+                 };
+-                let clauses = program_clauses_for_goal(program, &canon_domain_goal);
+-                let (infer, subst, InEnvironment { environment, goal }) =
+-                    chalk_solve::infer::InferenceTable::from_canonical(
+-                        context.program().interner(),
+-                        canon_domain_goal.universes,
+-                        canon_domain_goal.canonical,
+-                    );
+ 
+-                match clauses {
+-                    Ok(clauses) => {
++                let db = context.program();
++                let canon_goal = canon_domain_goal.canonical.value.goal.clone();
++                let could_match = |c: &ProgramClause<I>| {
++                    c.could_match(db.interner(), db.unification_database(), &canon_goal)
++                };
++
++                match program_clauses_that_could_match(db, &canon_domain_goal) {
++                    Ok(mut clauses) => {
++                        clauses.retain(could_match);
++                        clauses.extend(db.custom_clauses().into_iter().filter(could_match));
++
++                        let (infer, subst, goal) =
++                            chalk_solve::infer::InferenceTable::from_canonical(
++                                context.program().interner(),
++                                canon_domain_goal.universes,
++                                canon_domain_goal.canonical,
++                            );
++
++                        clauses.extend(
++                            db.program_clauses_for_env(&goal.environment)
++                                .iter(db.interner())
++                                .cloned()
++                                .filter(could_match),
++                        );
++
++                        let InEnvironment { environment, goal } = goal;
++
+                         for clause in clauses {
+                             info!("program clause = {:#?}", clause);
+                             let mut infer = infer.clone();
+diff --git a/chalk-ir/src/fold.rs b/chalk-ir/src/fold.rs
+index 9a9c751d..42616453 100644
+--- a/chalk-ir/src/fold.rs
++++ b/chalk-ir/src/fold.rs
+@@ -385,7 +385,7 @@ where
+                     // This variable was bound within the binders that
+                     // we folded over, so just return a bound
+                     // variable.
+-                    TyKind::<I>::BoundVar(*bound_var).intern(folder.interner())
++                    self
+                 }
+             }
+             TyKind::Dyn(clauses) => TyKind::Dyn(clauses.clone().fold_with(folder, outer_binder)?)
+@@ -514,7 +514,7 @@ where
+                     // This variable was bound within the binders that
+                     // we folded over, so just return a bound
+                     // variable.
+-                    Ok(LifetimeData::<I>::BoundVar(*bound_var).intern(folder.interner()))
++                    Ok(self)
+                 }
+             }
+             LifetimeData::InferenceVar(var) => folder.fold_inference_lifetime(*var, outer_binder),
+@@ -567,7 +567,7 @@ where
+                 if let Some(bound_var1) = bound_var.shifted_out_to(outer_binder) {
+                     folder.fold_free_var_const(ty.clone(), bound_var1, outer_binder)
+                 } else {
+-                    Ok(bound_var.to_const(interner, fold_ty()?))
++                    Ok(self)
+                 }
+             }
+             ConstValue::InferenceVar(var) => {
+diff --git a/chalk-ir/src/lib.rs b/chalk-ir/src/lib.rs
+index 8fc2df88..940a1153 100644
+--- a/chalk-ir/src/lib.rs
++++ b/chalk-ir/src/lib.rs
+@@ -2744,15 +2744,7 @@ impl<I: Interner> Substitution<I> {
+     where
+         T: Fold<I>,
+     {
+-        value
+-            .fold_with(
+-                &mut &SubstFolder {
+-                    interner,
+-                    subst: self,
+-                },
+-                DebruijnIndex::INNERMOST,
+-            )
+-            .unwrap()
++        Substitute::apply(self, value, interner)
+     }
+ 
+     /// Gets an iterator of all type parameters.
+@@ -2763,16 +2755,16 @@ impl<I: Interner> Substitution<I> {
+     }
+ }
+ 
+-struct SubstFolder<'i, I: Interner> {
++struct SubstFolder<'i, I: Interner, A: AsParameters<I>> {
+     interner: &'i I,
+-    subst: &'i Substitution<I>,
++    subst: &'i A,
+ }
+ 
+-impl<I: Interner> SubstFolder<'_, I> {
++impl<I: Interner, A: AsParameters<I>> SubstFolder<'_, I, A> {
+     /// Index into the list of parameters.
+     pub fn at(&self, index: usize) -> &GenericArg<I> {
+         let interner = self.interner;
+-        &self.subst.as_slice(interner)[index]
++        &self.subst.as_parameters(interner)[index]
+     }
+ }
+ 
+@@ -2816,6 +2808,30 @@ where
+     }
+ }
+ 
++/// An extension trait to anything that can be represented as list of `GenericArg`s that signifies
++/// that it can applied as a substituion to a value
++pub trait Substitute<I: Interner>: AsParameters<I> {
++    /// Apply the substitution to a value.
++    fn apply<T: Fold<I>>(&self, value: T, interner: &I) -> T::Result;
++}
++
++impl<I: Interner, A: AsParameters<I>> Substitute<I> for A {
++    fn apply<T>(&self, value: T, interner: &I) -> T::Result
++    where
++        T: Fold<I>,
++    {
++        value
++            .fold_with(
++                &mut &SubstFolder {
++                    interner,
++                    subst: self,
++                },
++                DebruijnIndex::INNERMOST,
++            )
++            .unwrap()
++    }
++}
++
+ /// Utility for converting a list of all the binders into scope
+ /// into references to those binders. Simply pair the binders with
+ /// the indices, and invoke `to_generic_arg()` on the `(binder,
+@@ -2839,7 +2855,7 @@ impl<'a, I: Interner> ToGenericArg<I> for (usize, &'a VariableKind<I>) {
+     }
+ }
+ 
+-impl<'i, I: Interner> Folder<'i, I> for &SubstFolder<'i, I> {
++impl<'i, I: Interner, A: AsParameters<I>> Folder<'i, I> for &SubstFolder<'i, I, A> {
+     fn as_dyn(&mut self) -> &mut dyn Folder<'i, I> {
+         self
+     }
+diff --git a/chalk-recursive/src/solve.rs b/chalk-recursive/src/solve.rs
+index d2d70a3b..d531c7e4 100644
+--- a/chalk-recursive/src/solve.rs
++++ b/chalk-recursive/src/solve.rs
+@@ -1,14 +1,14 @@
+ use super::combine;
+ use super::fulfill::Fulfill;
+ use crate::{Minimums, UCanonicalGoal};
++use chalk_ir::could_match::CouldMatch;
+ use chalk_ir::fold::Fold;
+ use chalk_ir::interner::{HasInterner, Interner};
+ use chalk_ir::{
+-    Binders, Canonical, ClausePriority, DomainGoal, Fallible, Floundered, Goal, GoalData,
+-    InEnvironment, NoSolution, ProgramClause, ProgramClauseData, ProgramClauseImplication,
+-    Substitution, UCanonical,
++    Canonical, ClausePriority, DomainGoal, Fallible, Floundered, Goal, GoalData, InEnvironment,
++    NoSolution, ProgramClause, ProgramClauseData, Substitution, UCanonical,
+ };
+-use chalk_solve::clauses::program_clauses_for_goal;
++use chalk_solve::clauses::program_clauses_that_could_match;
+ use chalk_solve::debug_span;
+ use chalk_solve::infer::InferenceTable;
+ use chalk_solve::{Guidance, RustIrDatabase, Solution};
+@@ -71,13 +71,7 @@ pub(super) trait SolveIteration<I: Interner>: SolveDatabase<I> {
+                 let (prog_solution, prog_prio) = {
+                     debug_span!("prog_clauses");
+ 
+-                    let prog_clauses = self.program_clauses_for_goal(&canonical_goal);
+-                    match prog_clauses {
+-                        Ok(clauses) => self.solve_from_clauses(&canonical_goal, clauses, minimums),
+-                        Err(Floundered) => {
+-                            (Ok(Solution::Ambig(Guidance::Unknown)), ClausePriority::High)
+-                        }
+-                    }
++                    self.solve_from_clauses(&canonical_goal, minimums)
+                 };
+                 debug!(?prog_solution);
+ 
+@@ -124,15 +118,37 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
+     /// See whether we can solve a goal by implication on any of the given
+     /// clauses. If multiple such solutions are possible, we attempt to combine
+     /// them.
+-    fn solve_from_clauses<C>(
++    fn solve_from_clauses(
+         &mut self,
+         canonical_goal: &UCanonical<InEnvironment<DomainGoal<I>>>,
+-        clauses: C,
+         minimums: &mut Minimums,
+-    ) -> (Fallible<Solution<I>>, ClausePriority)
+-    where
+-        C: IntoIterator<Item = ProgramClause<I>>,
+-    {
++    ) -> (Fallible<Solution<I>>, ClausePriority) {
++        let mut clauses = vec![];
++
++        let db = self.db();
++        let could_match = |c: &ProgramClause<I>| {
++            c.could_match(
++                db.interner(),
++                db.unification_database(),
++                &canonical_goal.canonical.value.goal,
++            )
++        };
++        clauses.extend(db.custom_clauses().into_iter().filter(could_match));
++        match program_clauses_that_could_match(db, canonical_goal) {
++            Ok(goal_clauses) => clauses.extend(goal_clauses.into_iter().filter(could_match)),
++            Err(Floundered) => {
++                return (Ok(Solution::Ambig(Guidance::Unknown)), ClausePriority::High);
++            }
++        }
++
++        let (infer, subst, goal) = self.new_inference_table(&canonical_goal);
++        clauses.extend(
++            db.program_clauses_for_env(&goal.environment)
++                .iter(db.interner())
++                .cloned()
++                .filter(could_match),
++        );
++
+         let mut cur_solution = None;
+         for program_clause in clauses {
+             debug_span!("solve_from_clauses", clause = ?program_clause);
+@@ -143,7 +159,13 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
+             }
+ 
+             let ProgramClauseData(implication) = program_clause.data(self.interner());
+-            let res = self.solve_via_implication(canonical_goal, implication, minimums);
++            let infer = infer.clone();
++            let subst = subst.clone();
++            let goal = goal.clone();
++            let res = match Fulfill::new_with_clause(self, infer, subst, goal, &implication) {
++                Ok(fulfill) => (fulfill.solve(minimums), implication.skip_binders().priority),
++                Err(e) => (Err(e), ClausePriority::High),
++            };
+ 
+             if let (Ok(solution), priority) = res {
+                 debug!(?solution, ?priority, "Ok");
+@@ -165,21 +187,6 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
+         cur_solution.map_or((Err(NoSolution), ClausePriority::High), |(s, p)| (Ok(s), p))
+     }
+ 
+-    /// Modus ponens! That is: try to apply an implication by proving its premises.
+-    #[instrument(level = "info", skip(self, minimums))]
+-    fn solve_via_implication(
+-        &mut self,
+-        canonical_goal: &UCanonical<InEnvironment<DomainGoal<I>>>,
+-        clause: &Binders<ProgramClauseImplication<I>>,
+-        minimums: &mut Minimums,
+-    ) -> (Fallible<Solution<I>>, ClausePriority) {
+-        let (infer, subst, goal) = self.new_inference_table(canonical_goal);
+-        match Fulfill::new_with_clause(self, infer, subst, goal, clause) {
+-            Ok(fulfill) => (fulfill.solve(minimums), clause.skip_binders().priority),
+-            Err(e) => (Err(e), ClausePriority::High),
+-        }
+-    }
+-
+     fn new_inference_table<T: Fold<I, Result = T> + HasInterner<Interner = I> + Clone>(
+         &self,
+         ucanonical_goal: &UCanonical<InEnvironment<T>>,
+@@ -191,13 +198,6 @@ trait SolveIterationHelpers<I: Interner>: SolveDatabase<I> {
+         );
+         (infer, subst, canonical_goal)
+     }
+-
+-    fn program_clauses_for_goal(
+-        &self,
+-        canonical_goal: &UCanonical<InEnvironment<DomainGoal<I>>>,
+-    ) -> Result<Vec<ProgramClause<I>>, Floundered> {
+-        program_clauses_for_goal(self.db(), &canonical_goal)
+-    }
+ }
+ 
+ impl<S, I> SolveIterationHelpers<I> for S
+diff --git a/chalk-solve/src/clauses.rs b/chalk-solve/src/clauses.rs
+index ea685133..0d44bf25 100644
+--- a/chalk-solve/src/clauses.rs
++++ b/chalk-solve/src/clauses.rs
+@@ -378,7 +378,7 @@ pub fn program_clauses_for_goal<'db, I: Interner>(
+ /// more precise you can make it, the more efficient solving will
+ /// be.
+ #[instrument(level = "debug", skip(db))]
+-fn program_clauses_that_could_match<I: Interner>(
++pub fn program_clauses_that_could_match<I: Interner>(
+     db: &dyn RustIrDatabase<I>,
+     goal: &UCanonical<InEnvironment<DomainGoal<I>>>,
+ ) -> Result<Vec<ProgramClause<I>>, Floundered> {
+@@ -873,18 +873,41 @@ fn match_ty<I: Interner>(
+             .db
+             .fn_def_datum(*fn_def_id)
+             .to_program_clauses(builder, environment),
++        TyKind::Str | TyKind::Never | TyKind::Scalar(_) | TyKind::Foreign(_) => {
++            // These have no substitutions, so they are trivially WF
++            builder.push_fact(WellFormed::Ty(ty.clone()));
++        }
++        TyKind::Raw(mutbl, _) => {
++            builder.push_bound_ty(|builder, ty| {
++                builder.push_fact(WellFormed::Ty(
++                    TyKind::Raw(*mutbl, ty).intern(builder.interner()),
++                ));
++            });
++        }
++        TyKind::Ref(mutbl, _, _) => {
++            builder.push_bound_ty(|builder, ty| {
++                builder.push_bound_lifetime(|builder, lifetime| {
++                    builder.push_fact(WellFormed::Ty(
++                        TyKind::Ref(*mutbl, lifetime, ty).intern(builder.interner()),
++                    ));
++                })
++            });
++        }
++        TyKind::Slice(_) => {
++            builder.push_bound_ty(|builder, ty| {
++                builder.push_fact(WellFormed::Ty(TyKind::Slice(ty).intern(builder.interner())));
++            });
++        }
+         TyKind::Tuple(_, _)
+-        | TyKind::Scalar(_)
+-        | TyKind::Str
+-        | TyKind::Slice(_)
+-        | TyKind::Raw(_, _)
+-        | TyKind::Ref(_, _, _)
+         | TyKind::Array(_, _)
+-        | TyKind::Never
+         | TyKind::Closure(_, _)
+-        | TyKind::Foreign(_)
+         | TyKind::Generator(_, _)
+-        | TyKind::GeneratorWitness(_, _) => builder.push_fact(WellFormed::Ty(ty.clone())),
++        | TyKind::GeneratorWitness(_, _) => {
++            let ty = generalize::Generalize::apply(builder.db.interner(), ty.clone());
++            builder.push_binders(ty, |builder, ty| {
++                builder.push_fact(WellFormed::Ty(ty.clone()));
++            });
++        }
+         TyKind::Placeholder(_) => {
+             builder.push_clause(WellFormed::Ty(ty.clone()), Some(FromEnv::Ty(ty.clone())));
+         }
+@@ -897,7 +920,10 @@ fn match_ty<I: Interner>(
+             .opaque_ty_data(opaque_ty.opaque_ty_id)
+             .to_program_clauses(builder, environment),
+         TyKind::Function(_quantified_ty) => {
+-            builder.push_fact(WellFormed::Ty(ty.clone()));
++            let ty = generalize::Generalize::apply(builder.db.interner(), ty.clone());
++            builder.push_binders(ty, |builder, ty| {
++                builder.push_fact(WellFormed::Ty(ty.clone()))
++            });
+         }
+         TyKind::BoundVar(_) => return Err(Floundered),
+         TyKind::Dyn(dyn_ty) => {
+@@ -949,6 +975,7 @@ fn match_alias_ty<I: Interner>(
+     }
+ }
+ 
++#[instrument(level = "debug", skip(db))]
+ pub fn program_clauses_for_env<'db, I: Interner>(
+     db: &'db dyn RustIrDatabase<I>,
+     environment: &Environment<I>,
+diff --git a/chalk-solve/src/clauses/env_elaborator.rs b/chalk-solve/src/clauses/env_elaborator.rs
+index de65c106..1466623e 100644
+--- a/chalk-solve/src/clauses/env_elaborator.rs
++++ b/chalk-solve/src/clauses/env_elaborator.rs
+@@ -26,34 +26,23 @@ pub(super) fn elaborate_env_clauses<I: Interner>(
+     environment: &Environment<I>,
+ ) {
+     let mut this_round = vec![];
+-    in_clauses.visit_with(
+-        &mut EnvElaborator::new(db, &mut this_round, environment),
+-        DebruijnIndex::INNERMOST,
+-    );
++    let builder = &mut ClauseBuilder::new(db, &mut this_round);
++    let mut elaborater = EnvElaborator {
++        db,
++        builder,
++        environment,
++    };
++    in_clauses.visit_with(&mut elaborater, DebruijnIndex::INNERMOST);
+     out.extend(this_round);
+ }
+ 
+-struct EnvElaborator<'me, I: Interner> {
++struct EnvElaborator<'me, 'builder, I: Interner> {
+     db: &'me dyn RustIrDatabase<I>,
+-    builder: ClauseBuilder<'me, I>,
++    builder: &'builder mut ClauseBuilder<'me, I>,
+     environment: &'me Environment<I>,
+ }
+ 
+-impl<'me, I: Interner> EnvElaborator<'me, I> {
+-    fn new(
+-        db: &'me dyn RustIrDatabase<I>,
+-        out: &'me mut Vec<ProgramClause<I>>,
+-        environment: &'me Environment<I>,
+-    ) -> Self {
+-        EnvElaborator {
+-            db,
+-            builder: ClauseBuilder::new(db, out),
+-            environment,
+-        }
+-    }
+-}
+-
+-impl<'me, I: Interner> Visitor<'me, I> for EnvElaborator<'me, I> {
++impl<'me, 'builder, I: Interner> Visitor<'me, I> for EnvElaborator<'me, 'builder, I> {
+     type BreakTy = ();
+ 
+     fn as_dyn(&mut self) -> &mut dyn Visitor<'me, I, BreakTy = Self::BreakTy> {
+@@ -66,9 +55,7 @@ impl<'me, I: Interner> Visitor<'me, I> for EnvElaborator<'me, I> {
+     #[instrument(level = "debug", skip(self, _outer_binder))]
+     fn visit_ty(&mut self, ty: &Ty<I>, _outer_binder: DebruijnIndex) -> ControlFlow<()> {
+         match ty.kind(self.interner()) {
+-            TyKind::Alias(alias_ty) => {
+-                match_alias_ty(&mut self.builder, self.environment, alias_ty)
+-            }
++            TyKind::Alias(alias_ty) => match_alias_ty(self.builder, self.environment, alias_ty),
+             TyKind::Placeholder(_) => {}
+ 
+             // FIXME(#203) -- We haven't fully figured out the implied
+@@ -79,7 +66,7 @@ impl<'me, I: Interner> Visitor<'me, I> for EnvElaborator<'me, I> {
+ 
+             _ => {
+                 // This shouldn't fail because of the above clauses
+-                match_ty(&mut self.builder, self.environment, &ty)
++                match_ty(self.builder, self.environment, &ty)
+                     .map_err(|_| ())
+                     .unwrap()
+             }
+@@ -98,7 +85,7 @@ impl<'me, I: Interner> Visitor<'me, I> for EnvElaborator<'me, I> {
+                 FromEnv::Trait(trait_ref) => {
+                     let trait_datum = self.db.trait_datum(trait_ref.trait_id);
+ 
+-                    trait_datum.to_program_clauses(&mut self.builder, self.environment);
++                    trait_datum.to_program_clauses(self.builder, self.environment);
+ 
+                     // If we know that `T: Iterator`, then we also know
+                     // things about `<T as Iterator>::Item`, so push those
+@@ -106,7 +93,7 @@ impl<'me, I: Interner> Visitor<'me, I> for EnvElaborator<'me, I> {
+                     for &associated_ty_id in &trait_datum.associated_ty_ids {
+                         self.db
+                             .associated_ty_data(associated_ty_id)
+-                            .to_program_clauses(&mut self.builder, self.environment);
++                            .to_program_clauses(self.builder, self.environment);
+                     }
+                     ControlFlow::CONTINUE
+                 }

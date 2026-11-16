@@ -1,0 +1,264 @@
+diff --git a/internal/namespace/configreload_test.go b/internal/namespace/configreload_test.go
+index d2738c79..df885a5e 100644
+--- a/internal/namespace/configreload_test.go
++++ b/internal/namespace/configreload_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"io/ioutil"
++	"os"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -28,6 +29,7 @@ import (
+ 	"github.com/hyperledger/firefly-common/pkg/config"
+ 	"github.com/hyperledger/firefly-common/pkg/fftypes"
+ 	"github.com/hyperledger/firefly-common/pkg/log"
++	"github.com/hyperledger/firefly/internal/cache"
+ 	"github.com/hyperledger/firefly/internal/coreconfig"
+ 	"github.com/hyperledger/firefly/pkg/core"
+ 	"github.com/hyperledger/firefly/pkg/database"
+@@ -447,10 +449,12 @@ func namespaceInitWaiter(t *testing.T, nmm *nmMocks, namespaces []string) *sync.
+ 	wg := &sync.WaitGroup{}
+ 	for _, ns := range namespaces {
+ 		_ns := ns
+-		for _, mei := range nmm.mei {
++		count := len(nmm.mei)
++		for i, mei := range nmm.mei {
++			idx := i + 1
+ 			wg.Add(1)
+ 			mei.On("NamespaceRestarted", _ns, mock.Anything).Return().Run(func(args mock.Arguments) {
+-				log.L(context.Background()).Infof("WAITER: Namespace started '%s'", _ns)
++				log.L(context.Background()).Infof("WAITER: Namespace started (cb=%d/%d) '%s'", idx, count, _ns)
+ 				wg.Done()
+ 			}).Once()
+ 		}
+@@ -458,23 +462,30 @@ func namespaceInitWaiter(t *testing.T, nmm *nmMocks, namespaces []string) *sync.
+ 	return wg
+ }
+ 
++func renameWriteFile(t *testing.T, filename string, data []byte) {
++	tempFile := fmt.Sprintf("%s-%s", t.TempDir(), fftypes.NewUUID())
++	err := ioutil.WriteFile(tempFile, data, 0664)
++	assert.NoError(t, err)
++	err = os.Rename(tempFile, filename)
++	assert.NoError(t, err)
++}
++
+ func TestConfigListenerE2E(t *testing.T) {
+ 
+ 	testDir := t.TempDir()
+ 	configFilename := fmt.Sprintf("%s/firefly.core", testDir)
+-	err := ioutil.WriteFile(configFilename, []byte(exampleConfig1base), 0664)
+-	assert.NoError(t, err)
++	renameWriteFile(t, configFilename, []byte(exampleConfig1base))
+ 
+ 	coreconfig.Reset()
+ 	InitConfig()
+-	err = config.ReadConfig("core", configFilename)
++	err := config.ReadConfig("core", configFilename)
+ 	assert.NoError(t, err)
+ 	config.Set(coreconfig.ConfigAutoReload, true)
+ 
+ 	nm := NewNamespaceManager().(*namespaceManager)
+ 	nmm := mockPluginFactories(nm)
+ 	mockInitConfig(nmm)
+-	waitInit := namespaceInitWaiter(t, nmm, []string{"ns1", "ns2", "ns3"})
++	waitInit := namespaceInitWaiter(t, nmm, []string{"ns1", "ns2"})
+ 
+ 	ctx, cancelCtx := context.WithCancel(context.Background())
+ 	err = nm.Init(ctx, cancelCtx, make(chan bool), func() error {
+@@ -490,12 +501,11 @@ func TestConfigListenerE2E(t *testing.T) {
+ 	err = nm.Start()
+ 	assert.NoError(t, err)
+ 
+-	err = ioutil.WriteFile(configFilename, []byte(exampleConfig2extraNS), 0664)
+-	assert.NoError(t, err)
++	waitInit.Wait()
+ 
+-	for nm.namespaces["ns3"] == nil {
+-		time.Sleep(10 * time.Millisecond)
+-	}
++	waitInit = namespaceInitWaiter(t, nmm, []string{"ns3"})
++
++	renameWriteFile(t, configFilename, []byte(exampleConfig2extraNS))
+ 
+ 	waitInit.Wait()
+ 
+@@ -525,8 +535,7 @@ func TestConfigListenerUnreadableYAML(t *testing.T) {
+ 	err = nm.Start()
+ 	assert.NoError(t, err)
+ 
+-	err = ioutil.WriteFile(configFilename, []byte(`--\n: ! YAML !!!: !`), 0664)
+-	assert.NoError(t, err)
++	renameWriteFile(t, configFilename, []byte(`--\n: ! YAML !!!: !`))
+ 
+ 	// Should stop itself
+ 	<-nm.ctx.Done()
+@@ -548,7 +557,7 @@ func TestConfigReload1to2(t *testing.T) {
+ 	defer cancelCtx()
+ 
+ 	mockInitConfig(nmm)
+-	waitInit := namespaceInitWaiter(t, nmm, []string{"ns1", "ns2", "ns3"})
++	waitInit := namespaceInitWaiter(t, nmm, []string{"ns1", "ns2"})
+ 
+ 	err = nm.Init(ctx, cancelCtx, make(chan bool), func() error { return nil })
+ 	assert.NoError(t, err)
+@@ -556,6 +565,9 @@ func TestConfigReload1to2(t *testing.T) {
+ 	err = nm.Start()
+ 	assert.NoError(t, err)
+ 
++	waitInit.Wait()
++	waitInit = namespaceInitWaiter(t, nmm, []string{"ns3"})
++
+ 	originalPlugins := nm.plugins
+ 	originalPluginHashes := make(map[string]*fftypes.Bytes32)
+ 	for k, v := range originalPlugins {
+@@ -1036,3 +1048,112 @@ namespaces:
+ 	nm.WaitStop()
+ 
+ }
++
++// assertNamespaceCachePurged waits for the reload to purge the cache entry for the namespace
++func assertNamespaceCachePurged(t *testing.T, ctx context.Context, nm *namespaceManager, ns, key string) {
++	assert.Eventually(t, func() bool {
++		c, err := nm.cacheManager.GetCache(cache.NewCacheConfig(ctx, "cache.batch.limit", "cache.batch.ttl", ns))
++		return err == nil && c.Get(key) == nil
++	}, 10*time.Second, 10*time.Millisecond, "cache for namespace %s was not purged on reload", ns)
++}
++
++func TestConfigReloadPurgesCachesOnNamespaceDeletion(t *testing.T) {
++	logrus.SetLevel(logrus.TraceLevel)
++
++	testDir := t.TempDir()
++	configFilename := fmt.Sprintf("%s/firefly.core", testDir)
++	renameWriteFile(t, configFilename, []byte(exampleConfig1base))
++
++	coreconfig.Reset()
++	InitConfig()
++	err := config.ReadConfig("core", configFilename)
++	assert.NoError(t, err)
++	config.Set(coreconfig.ConfigAutoReload, true)
++
++	nm := NewNamespaceManager().(*namespaceManager)
++	nmm := mockPluginFactories(nm)
++	mockInitConfig(nmm)
++	waitInit := namespaceInitWaiter(t, nmm, []string{"ns1", "ns2"})
++
++	ctx, cancelCtx := context.WithCancel(context.Background())
++	err = nm.Init(ctx, cancelCtx, make(chan bool), func() error {
++		coreconfig.Reset()
++		return config.ReadConfig("core", configFilename)
++	})
++	assert.NoError(t, err)
++	defer func() {
++		cancelCtx()
++		nm.WaitStop()
++	}()
++	nmm.mo.On("WaitStop").Return(nil).Maybe()
++
++	err = nm.Start()
++	assert.NoError(t, err)
++	waitInit.Wait()
++
++	// Populate a cache entry for each namespace, as the orchestrator would
++	ns2Cache, err := nm.cacheManager.GetCache(cache.NewCacheConfig(ctx, "cache.batch.limit", "cache.batch.ttl", "ns2"))
++	assert.NoError(t, err)
++	ns2Cache.Set("key2", "value2")
++
++	// Same configuration, with the definition of ns2 removed
++	ns2Definition := "    - defaultKey: 0x630659A26fa005d50Fa9706D8a4e242fd4169A61\n      name: ns2\n      plugins:\n        - database0\n        - blockchain-ns2\n        - test_user_auth-ns2\n      multiparty: {}\n"
++	configNoNS2 := strings.Replace(exampleConfig1base, ns2Definition, "", 1)
++	assert.NotEqual(t, exampleConfig1base, configNoNS2)
++
++	// Delete ns2 in the configuration
++	renameWriteFile(t, configFilename, []byte(configNoNS2))
++
++	// The cache for the deleted namespace must have been purged
++	assertNamespaceCachePurged(t, ctx, nm, "ns2", "key2")
++}
++
++func TestConfigReloadPurgesCachesOnNamespaceChange(t *testing.T) {
++	logrus.SetLevel(logrus.TraceLevel)
++
++	testDir := t.TempDir()
++	configFilename := fmt.Sprintf("%s/firefly.core", testDir)
++	renameWriteFile(t, configFilename, []byte(exampleConfig1base))
++
++	coreconfig.Reset()
++	InitConfig()
++	err := config.ReadConfig("core", configFilename)
++	assert.NoError(t, err)
++	config.Set(coreconfig.ConfigAutoReload, true)
++
++	nm := NewNamespaceManager().(*namespaceManager)
++	nmm := mockPluginFactories(nm)
++	mockInitConfig(nmm)
++	waitInit := namespaceInitWaiter(t, nmm, []string{"ns1", "ns2"})
++
++	ctx, cancelCtx := context.WithCancel(context.Background())
++	err = nm.Init(ctx, cancelCtx, make(chan bool), func() error {
++		coreconfig.Reset()
++		return config.ReadConfig("core", configFilename)
++	})
++	assert.NoError(t, err)
++	defer func() {
++		cancelCtx()
++		nm.WaitStop()
++	}()
++	nmm.mo.On("WaitStop").Return(nil).Maybe()
++
++	err = nm.Start()
++	assert.NoError(t, err)
++	waitInit.Wait()
++
++	// Populate a cache entry for ns1, as the orchestrator would
++	ns1Cache, err := nm.cacheManager.GetCache(cache.NewCacheConfig(ctx, "cache.batch.limit", "cache.batch.ttl", "ns1"))
++	assert.NoError(t, err)
++	ns1Cache.Set("key1", "value1")
++
++	// Change the configuration of ns1
++	waitInit = namespaceInitWaiter(t, nmm, []string{"ns1", "ns2"})
++
++	renameWriteFile(t, configFilename, []byte(exampleConfig3NSchanges))
++
++	waitInit.Wait()
++
++	// The cache for the changed namespace must have been purged
++	assertNamespaceCachePurged(t, ctx, nm, "ns1", "key1")
++}
+diff --git a/internal/namespace/manager_test.go b/internal/namespace/manager_test.go
+index c19bd43b..faa7952d 100644
+--- a/internal/namespace/manager_test.go
++++ b/internal/namespace/manager_test.go
+@@ -321,7 +321,7 @@ func TestInitComponentsPluginsFail(t *testing.T) {
+ 	nm.plugins = map[string]*plugin{
+ 		"basicauth": nm.plugins["basicauth"],
+ 	}
+-	err := nm.initComponents(context.Background())
++	err := nm.initPlugins(nm.plugins)
+ 	assert.Regexp(t, "pop", err)
+ }
+ 
+@@ -421,11 +421,8 @@ func TestInitOrchestratorFail(t *testing.T) {
+ 	nmm.mdi.On("GetNamespace", mock.Anything, "default").Return(nil, nil)
+ 	nmm.mdi.On("UpsertNamespace", mock.Anything, mock.AnythingOfType("*core.Namespace"), true).Return(nil)
+ 
+-	err := nm.initComponents(nm.ctx)
+-	assert.NoError(t, err)
+-
+ 	nm.preInitNamespace(nm.namespaces["default"])
+-	err = nm.initNamespace(nm.namespaces["default"])
++	err := nm.initNamespace(nm.namespaces["default"])
+ 	assert.Regexp(t, "pop", err)
+ }
+ 
+@@ -442,7 +439,7 @@ func TestInitConfigListenerFail(t *testing.T) {
+ 	viper.SetConfigFile(fmt.Sprintf("%s/problem", badDir))
+ 	config.Set(coreconfig.ConfigAutoReload, true)
+ 
+-	err := nm.initComponents(nm.ctx)
++	err := nm.startConfigListener()
+ 	assert.Regexp(t, "FF00194", err)
+ }
+ 

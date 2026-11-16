@@ -1,0 +1,269 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 11813b8..2f18845 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
+ import os
++import datetime
+ import socket
+ import asyncio
+ import pytest  # noqa F401 Needed to run the tests
+@@ -162,20 +163,23 @@ async def instance(
+         # mock Cloud SQL Admin API calls
+         with aioresponses() as mocked:
+             mocked.get(
+-                "https://sqladmin.googleapis.com/sql/v1beta4/projects/my-project/instances/my-instance/connectSettings",
++                f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{mock_instance.project}/instances/{mock_instance.name}/connectSettings",
+                 status=200,
+                 body=mock_instance.connect_settings(),
+                 repeat=True,
+             )
+             mocked.post(
+-                "https://sqladmin.googleapis.com/sql/v1beta4/projects/my-project/instances/my-instance:generateEphemeralCert",
++                f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{mock_instance.project}/instances/{mock_instance.name}:generateEphemeralCert",
+                 status=200,
+                 body=mock_instance.generate_ephemeral(client_key),
+                 repeat=True,
+             )
+ 
+             instance = Instance(
+-                "my-project:my-region:my-instance", "pg8000", keys, event_loop
++                f"{mock_instance.project}:{mock_instance.region}:{mock_instance.name}",
++                "pg8000",
++                keys,
++                event_loop,
+             )
+ 
+             yield instance
+@@ -183,15 +187,24 @@ async def instance(
+ 
+ 
+ @pytest.fixture
+-async def connector(fake_credentials: Credentials) -> AsyncGenerator[Connector, None]:
++async def connector(
++    fake_credentials: Credentials, request: pytest.FixtureRequest
++) -> AsyncGenerator[Connector, None]:
+     instance_connection_name = "my-project:my-region:my-instance"
+     project, region, instance_name = instance_connection_name.split(":")
+     # initialize connector
+-    connector = Connector()
++    settings = getattr(request, "param", {})
++    enable_iam_auth = settings.get("enable_iam_auth", False)
++    db_version = settings.get("db_version", "POSTGRES_14")
++    if enable_iam_auth:
++        fake_credentials.expiry = datetime.datetime.max
++    connector = Connector(enable_iam_auth=enable_iam_auth)
+     with patch("google.auth.default") as mock_auth:
+         mock_auth.return_value = fake_credentials, None
+         # mock Cloud SQL Admin API calls
+-        mock_instance = FakeCSQLInstance(project, region, instance_name)
++        mock_instance = FakeCSQLInstance(
++            project, region, instance_name, db_version=db_version
++        )
+ 
+         async def wait_for_keys(future: asyncio.Future) -> Tuple[bytes, str]:
+             """
+@@ -222,7 +235,12 @@ async def connector(fake_credentials: Credentials) -> AsyncGenerator[Connector,
+             )
+             # initialize Instance using mocked API calls
+             instance = Instance(
+-                instance_connection_name, "pg8000", connector._keys, connector._loop
++                instance_connection_name,
++                "pg8000",
++                connector._keys,
++                connector._loop,
++                fake_credentials,
++                enable_iam_auth,
+             )
+ 
+             connector._instances[instance_connection_name] = instance
+diff --git a/tests/system/test_connector_object.py b/tests/system/test_connector_object.py
+index 909aa9c..71e3e0a 100644
+--- a/tests/system/test_connector_object.py
++++ b/tests/system/test_connector_object.py
+@@ -15,6 +15,7 @@ limitations under the License.
+ """
+ import asyncio
+ import os
++import pytest
+ import pymysql
+ import sqlalchemy
+ import logging
+@@ -25,6 +26,16 @@ import concurrent.futures
+ from threading import Thread
+ 
+ 
++
++integration_resources_required = pytest.mark.skipif(
++    not all(
++        os.environ.get(name)
++        for name in ("GOOGLE_APPLICATION_CREDENTIALS", "MYSQL_CONNECTION_NAME")
++    ),
++    reason="Cloud SQL integration environment is not configured",
++)
++
++
+ def init_connection_engine(
+     custom_connector: Connector,
+ ) -> sqlalchemy.engine.Engine:
+@@ -45,6 +56,7 @@ def init_connection_engine(
+     return pool
+ 
+ 
++@integration_resources_required
+ def test_connector_with_credentials() -> None:
+     """Test Connector object connection with credentials loaded from file."""
+     credentials, project = google.auth.load_credentials_from_file(
+@@ -63,6 +75,7 @@ def test_connector_with_credentials() -> None:
+     custom_connector.close()
+ 
+ 
++@integration_resources_required
+ def test_multiple_connectors() -> None:
+     """Test that same Cloud SQL instance can connect with two Connector objects."""
+     first_connector = Connector()
+@@ -92,6 +105,7 @@ def test_multiple_connectors() -> None:
+     second_connector.close()
+ 
+ 
++@integration_resources_required
+ def test_connector_in_ThreadPoolExecutor() -> None:
+     """Test that Connector can connect from ThreadPoolExecutor thread.
+     This helps simulate how connector works in Cloud Run and Cloud Functions.
+@@ -117,6 +131,7 @@ def test_connector_in_ThreadPoolExecutor() -> None:
+         assert isinstance(return_value, datetime.datetime)
+ 
+ 
++@integration_resources_required
+ def test_connector_as_context_manager() -> None:
+     """Test that Connector can be used as a context manager."""
+     with Connector() as connector:
+@@ -126,6 +141,7 @@ def test_connector_as_context_manager() -> None:
+             conn.execute("SELECT 1")
+ 
+ 
++@integration_resources_required
+ def test_connector_with_custom_loop() -> None:
+     """Test that Connector can be used with custom loop in background thread."""
+     # create new event loop and start it in thread
+@@ -141,3 +157,78 @@ def test_connector_with_custom_loop() -> None:
+         assert result[0] == 1
+         # assert that Connector does not start its own thread
+         assert connector._thread is None
++
++
++@pytest.mark.parametrize(
++    "connector",
++    [
++        {"enable_iam_auth": True, "db_version": "MYSQL_8_0"},
++        {"enable_iam_auth": True, "db_version": "SQLSERVER_2019_STANDARD"},
++    ],
++    indirect=True,
++)
++def test_connector_iam_auth_unsupported(
++    connector: Connector, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A public connection attempt rejects unsupported automatic IAM auth."""
++    import pg8000
++
++    monkeypatch.setattr(pg8000.dbapi, "connect", lambda *args, **kwargs: object())
++    with pytest.raises(Exception):
++        connector.connect(
++            "my-project:my-region:my-instance",
++            "pg8000",
++            user="my-user",
++            db="my-db",
++        )
++
++
++@pytest.mark.parametrize(
++    "connector",
++    [{"enable_iam_auth": True, "db_version": "POSTGRES_14"}],
++    indirect=True,
++)
++def test_connector_iam_auth_supported_postgres(
++    connector: Connector, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A supported PostgreSQL IAM request is not rejected as unsupported."""
++    import pg8000
++
++    connection = object()
++    monkeypatch.setattr(pg8000.dbapi, "connect", lambda *args, **kwargs: connection)
++
++    result = connector.connect(
++        "my-project:my-region:my-instance",
++        "pg8000",
++        user="my-user",
++        db="my-db",
++    )
++
++    assert result is not None
++
++
++@pytest.mark.parametrize(
++    "connector",
++    [
++        {"enable_iam_auth": False, "db_version": "MYSQL_8_0"},
++        {"enable_iam_auth": False, "db_version": "SQLSERVER_2019_STANDARD"},
++    ],
++    indirect=True,
++)
++def test_connector_without_iam_auth_accepts_unsupported_engines(
++    connector: Connector, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Unsupported IAM engines can be connected to without requesting IAM auth."""
++    import pg8000
++
++    connection = object()
++    monkeypatch.setattr(pg8000.dbapi, "connect", lambda *args, **kwargs: connection)
++
++    result = connector.connect(
++        "my-project:my-region:my-instance",
++        "pg8000",
++        user="my-user",
++        db="my-db",
++    )
++
++    assert result is connection
+diff --git a/tests/unit/mocks.py b/tests/unit/mocks.py
+index 9e53e50..84b66fa 100644
+--- a/tests/unit/mocks.py
++++ b/tests/unit/mocks.py
+@@ -178,11 +178,17 @@ async def create_ssl_context() -> ssl.SSLContext:
+ 
+ 
+ class FakeCSQLInstance:
+-    def __init__(self, project: str, region: str, name: str) -> None:
++    def __init__(
++        self,
++        project: str = "my-project",
++        region: str = "my-region",
++        name: str = "my-instance",
++        db_version: str = "POSTGRES_14",
++    ) -> None:
+         self.project = project
+         self.region = region
+         self.name = name
+-        self.db_version = "POSTGRES_14"  # arbitrary value
++        self.db_version = db_version
+         self.ip_addrs = {"PRIMARY": "0.0.0.0", "PRIVATE": "1.1.1.1"}
+         self.backend_type = "SECOND_GEN"
+ 
+diff --git a/tests/unit/test_refresh_utils.py b/tests/unit/test_refresh_utils.py
+index 010c059..bcb4a9d 100644
+--- a/tests/unit/test_refresh_utils.py
++++ b/tests/unit/test_refresh_utils.py
+@@ -164,8 +164,9 @@ async def test_get_metadata(
+                 instance,
+             )
+ 
+-    assert result["ip_addresses"] is not None and isinstance(
+-        result["server_ca_cert"], str
++    assert (
++        result["ip_addresses"] is not None
++        and isinstance(result["server_ca_cert"], str)
+     )
+ 
+ 

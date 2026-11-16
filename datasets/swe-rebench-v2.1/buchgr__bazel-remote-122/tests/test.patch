@@ -1,0 +1,170 @@
+diff --git a/server/grpc_test.go b/server/grpc_test.go
+index 9cb00e0..7bb16bd 100644
+--- a/server/grpc_test.go
++++ b/server/grpc_test.go
+@@ -114,6 +114,15 @@ func checkBadDigestErr(t *testing.T, err error, bd badDigest) {
+ 	}
+ }
+ 
++// withoutMetadata returns a copy of ar with ExecutionMetadata removed, so that
++// tests can compare ActionResults without depending on whether the server
++// chooses to enrich them with metadata.
++func withoutMetadata(ar *pb.ActionResult) *pb.ActionResult {
++	clone := proto.Clone(ar).(*pb.ActionResult)
++	clone.ExecutionMetadata = nil
++	return clone
++}
++
+ func TestGrpcAc(t *testing.T) {
+ 	ar := pb.ActionResult{
+ 		StdoutRaw: []byte("pretend action stdout"),
+@@ -173,7 +182,9 @@ func TestGrpcAc(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	if !proto.Equal(&ar, upACResp) {
++	// The contract does not require ExecutionMetadata to be added, but if
++	// it is then it must not affect the rest of the ActionResult.
++	if !proto.Equal(withoutMetadata(&ar), withoutMetadata(upACResp)) {
+ 		t.Fatal("Error: uploaded and returned ActionResult differ")
+ 	}
+ 
+@@ -202,11 +213,15 @@ func TestGrpcAc(t *testing.T) {
+ 		ActionDigest: &zeroDigest,
+ 		ActionResult: &zeroActionResult,
+ 	}
+-	_, err = acClient.UpdateActionResult(ctx, &zeroReq)
+-	s, ok = status.FromError(err)
+-	if !ok || s.Code() != codes.InvalidArgument ||
+-		err.Error() != errEmptyActionResult.Error() {
+-		t.Fatal("expected empty ActionResult to be rejected", err)
++	// A zero-length serialized ActionResult is a legitimate value and must
++	// not be rejected.
++	zeroResp, err := acClient.UpdateActionResult(ctx, &zeroReq)
++	if err != nil {
++		t.Fatal("expected a zero-length ActionResult to be accepted", err)
++	}
++
++	if !proto.Equal(withoutMetadata(zeroReq.ActionResult), withoutMetadata(zeroResp)) {
++		t.Fatal("expected returned ActionResult to match the request")
+ 	}
+ 
+ 	// GetActionResultRequest again, expect cache hit.
+@@ -216,7 +231,7 @@ func TestGrpcAc(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	if !proto.Equal(&ar, gacrResp) {
++	if !proto.Equal(withoutMetadata(&ar), withoutMetadata(gacrResp)) {
+ 		t.Fatal("Error: uploaded and returned ActionResult differ")
+ 	}
+ }
+diff --git a/server/http_test.go b/server/http_test.go
+index 3811c61..fc5d94f 100644
+--- a/server/http_test.go
++++ b/server/http_test.go
+@@ -17,9 +17,11 @@ import (
+ 	"testing"
+ 
+ 	"github.com/buchgr/bazel-remote/cache"
+-
+ 	"github.com/buchgr/bazel-remote/cache/disk"
+ 	"github.com/buchgr/bazel-remote/utils"
++
++	pb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
++	"github.com/golang/protobuf/proto"
+ )
+ 
+ func TestDownloadFile(t *testing.T) {
+@@ -220,7 +222,7 @@ func TestUploadEmptyActionResult(t *testing.T) {
+ 
+ 	r, err := http.NewRequest("PUT", "/ac/"+hash, bytes.NewReader(data))
+ 	if err != nil {
+-		t.Error(err)
++		t.Fatal(err)
+ 	}
+ 
+ 	c := disk.New(cacheDir, 2048)
+@@ -230,26 +232,34 @@ func TestUploadEmptyActionResult(t *testing.T) {
+ 	handler := http.HandlerFunc(h.CacheHandler)
+ 	handler.ServeHTTP(rr, r)
+ 
+-	if status := rr.Code; status != http.StatusBadRequest {
+-		t.Error("Handler returned wrong status code",
+-			"expected ", http.StatusBadRequest,
++	if status := rr.Code; status != http.StatusOK {
++		t.Fatal("Handler returned wrong status code",
++			"expected ", http.StatusOK,
+ 			"got ", status)
+ 	}
+ 
+-	// Check that no file was saved in the cache
+-	f, err := os.Open(cacheDir)
+-	defer f.Close()
++	// The empty ActionResult should have been accepted and cached.
++	cacheFile := filepath.Join(cacheDir, "ac", hash[:2], hash)
++	cachedData, err := ioutil.ReadFile(cacheFile)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	entries, err := f.Readdir(-1)
++
++	ar := pb.ActionResult{}
++	err = proto.Unmarshal(cachedData, &ar)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	for _, fileEntry := range entries {
+-		if !fileEntry.IsDir() {
+-			t.Error("Unexpected file in the cache ", fileEntry.Name())
+-		}
++
++	// The implementation may add ExecutionMetadata, but the rest of the
++	// ActionResult must be unchanged (i.e. still empty).
++	ar.ExecutionMetadata = nil
++	remarshaled, err := proto.Marshal(&ar)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(remarshaled) != 0 {
++		t.Fatal("expected the cached ActionResult to be empty apart from optional metadata")
+ 	}
+ }
+ 
+diff --git a/utils/testutils.go b/utils/testutils.go
+index d42a822..70ad301 100644
+--- a/utils/testutils.go
++++ b/utils/testutils.go
+@@ -20,19 +20,19 @@ func TempDir(t *testing.T) string {
+ 
+ func CreateRandomFile(dir string, size int64) (string, error) {
+ 	data, hash := RandomDataAndHash(size)
+-	os.MkdirAll(dir, os.FileMode(0744))
++	os.MkdirAll(dir, os.ModePerm)
+ 	filepath := dir + "/" + hash
+ 
+-	return hash, ioutil.WriteFile(filepath, data, 0744)
++	return hash, ioutil.WriteFile(filepath, data, os.ModePerm)
+ }
+ 
+ func CreateCacheFile(dir string, size int64) (string, error) {
+ 	data, hash := RandomDataAndHash(size)
+ 	subdir := dir + "/" + hash[0:2]
+-	os.MkdirAll(subdir, os.FileMode(0744))
++	os.MkdirAll(subdir, os.ModePerm)
+ 	filepath := subdir + "/" + hash
+ 
+-	return hash, ioutil.WriteFile(filepath, data, 0744)
++	return hash, ioutil.WriteFile(filepath, data, os.ModePerm)
+ }
+ 
+ func RandomDataAndHash(size int64) ([]byte, string) {
+@@ -48,7 +48,7 @@ func CreateTmpCacheDirs(t *testing.T) string {
+ 	if err != nil {
+ 		t.Error("Couldn't create tmp dir", err)
+ 	}
+-	os.MkdirAll(path, os.FileMode(0744))
++	os.MkdirAll(path, os.ModePerm)
+ 	return path
+ }
+ 

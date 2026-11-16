@@ -1,0 +1,254 @@
+diff --git a/BUILD b/BUILD
+index ea6dba2..7254d33 100644
+--- a/BUILD
++++ b/BUILD
+@@ -51,9 +51,7 @@ go_library(
+ 
+ go_test(
+     name = "go_default_test",
+-    srcs = [
+-        "bazelisk_version_test.go",
+-    ],
++    srcs = ["bazelisk_version_test.go"],
+     data = [
+         "sample-issues-migration.json",
+     ],
+@@ -63,7 +61,6 @@ go_test(
+         "//core:go_default_library",
+         "//httputil:go_default_library",
+         "//repositories:go_default_library",
+-        "//runfiles:go_default_library",
+         "//versions:go_default_library",
+     ],
+ )
+diff --git a/WORKSPACE b/WORKSPACE
+index 334b506..49c72bf 100644
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -60,11 +60,12 @@ load("@build_bazel_rules_nodejs//:index.bzl", "node_repositories")
+ node_repositories()
+ 
+ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
++
+ http_archive(
+     name = "platforms",
++    sha256 = "079945598e4b6cc075846f7fd6a9d0857c33a7afc0de868c2ccb96405225135d",
+     urls = [
+         "https://mirror.bazel.build/github.com/bazelbuild/platforms/releases/download/0.0.4/platforms-0.0.4.tar.gz",
+         "https://github.com/bazelbuild/platforms/releases/download/0.0.4/platforms-0.0.4.tar.gz",
+     ],
+-    sha256 = "079945598e4b6cc075846f7fd6a9d0857c33a7afc0de868c2ccb96405225135d",
+ )
+diff --git a/httputil/BUILD b/httputil/BUILD
+index 7374867..44049d0 100644
+--- a/httputil/BUILD
++++ b/httputil/BUILD
+@@ -1,8 +1,21 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
++load("@bazel_gazelle//:def.bzl", "gazelle")
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
++
++# gazelle:prefix github.com/bazelbuild/bazelisk/httputil
++gazelle(name = "gazelle")
+ 
+ go_library(
+     name = "go_default_library",
+-    srcs = ["httputil.go"],
++    srcs = [
++        "fake.go",
++        "httputil.go",
++    ],
+     importpath = "github.com/bazelbuild/bazelisk/httputil",
+     visibility = ["//visibility:public"],
+ )
++
++go_test(
++    name = "go_default_test",
++    srcs = ["httputil_test.go"],
++    embed = [":go_default_library"],
++)
+diff --git a/httputil/fake.go b/httputil/fake.go
+new file mode 100644
+index 0000000..c674104
+--- /dev/null
++++ b/httputil/fake.go
+@@ -0,0 +1,69 @@
++package httputil
++
++import (
++	"bytes"
++	"io/ioutil"
++	"net/http"
++)
++
++type FakeTransport struct {
++	responses map[string]*responseCollection
++}
++
++func NewFakeTransport() *FakeTransport {
++	return &FakeTransport{
++		responses: make(map[string]*responseCollection),
++	}
++}
++
++func (ft *FakeTransport) AddResponse(url string, status int, body string, headers map[string]string) {
++	if _, ok := ft.responses[url]; !ok {
++		ft.responses[url] = &responseCollection{}
++	}
++
++	ft.responses[url].Add(createResponse(status, body, headers))
++}
++
++func (ft *FakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	if responses, ok := ft.responses[req.URL.String()]; ok {
++		return responses.Next(), nil
++	}
++	return notFound(), nil
++}
++
++type responseCollection struct {
++	all  []*http.Response
++	next int
++}
++
++func (rc *responseCollection) Add(resp *http.Response) {
++	rc.all = append(rc.all, resp)
++}
++
++func (rc *responseCollection) Next() *http.Response {
++	if rc.next >= len(rc.all) {
++		return notFound()
++	}
++	rc.next++
++	return rc.all[rc.next-1]
++}
++
++func createResponse(status int, body string, headers map[string]string) *http.Response {
++	return &http.Response{
++		StatusCode: status,
++		Body:       ioutil.NopCloser(bytes.NewBufferString(body)),
++		Header:     transformHeaders(headers),
++	}
++}
++
++func transformHeaders(original map[string]string) http.Header {
++	result := make(map[string][]string)
++	for k, v := range original {
++		result[k] = []string{v}
++	}
++	return result
++}
++
++func notFound() *http.Response {
++	return createResponse(http.StatusNotFound, "", nil)
++}
+diff --git a/httputil/httputil.go b/httputil/httputil.go
+index 1035a20..9afe1db 100644
+--- a/httputil/httputil.go
++++ b/httputil/httputil.go
+@@ -6,10 +6,12 @@ import (
+ 	"io"
+ 	"io/ioutil"
+ 	"log"
++	"math/rand"
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"strconv"
+ 	"time"
+ )
+ 
+@@ -18,9 +20,33 @@ var (
+ 	DefaultTransport = http.DefaultTransport
+ 	UserAgent = "Bazelisk"
+ 	linkPattern = regexp.MustCompile(`<(.*?)>; rel="(\w+)"`)
++
++	RetryClock = Clock(&realClock{})
++	MaxRetries = 4
++	// MaxRequestDuration defines the maximum amount of time that a request and its retries may take in total
++	MaxRequestDuration = time.Second * 10
++	retryHeaders = []string{"Retry-After", "X-RateLimit-Reset", "Rate-Limit-Reset"}
+ )
+ 
++type Clock interface {
++	Sleep(time.Duration)
++	Now() time.Time
++}
++
++type realClock struct {}
++
++func (*realClock) Sleep(d time.Duration) {
++	time.Sleep(d)
++}
++
++func (*realClock) Now() time.Time {
++	return time.Now()
++}
++
+ // ReadRemoteFile returns the contents of the given file, using the supplied Authorization token, if set. It also returns the HTTP headers.
++// If the request fails with a transient error it will retry the request for at most MaxRetries times.
++// It obeys HTTP headers such as "Retry-After" when calculating the start time of the next attempt.
++// If no such header is present, it uses an exponential backoff strategy.
+ func ReadRemoteFile(url string, token string) ([]byte, http.Header, error) {
+ 	res, err := get(url, token)
+ 	if err != nil {
+@@ -50,7 +76,57 @@ func get(url, token string) (*http.Response, error) {
+ 		req.Header.Set("Authorization", "token "+token)
+ 	}
+ 	client := &http.Client{Transport: DefaultTransport}
+-	return client.Do(req)
++	deadline := RetryClock.Now().Add(MaxRequestDuration)
++	lastStatus := 0
++	for attempt := 0; attempt <= MaxRetries; attempt++ {
++		res, err := client.Do(req)
++		// Do not retry on success and permanent/fatal errors
++		if err != nil || !shouldRetry(res) {
++			return res, err
++		}
++
++		lastStatus = res.StatusCode
++		waitFor, err := getWaitPeriod(res, attempt)
++		if err != nil {
++			return nil, err
++		}
++
++		nextTryAt := RetryClock.Now().Add(waitFor)
++		if nextTryAt.After(deadline) {
++			return nil, fmt.Errorf("unable to complete request to %s within %v", url, MaxRequestDuration)
++		}
++		if attempt < MaxRetries {
++			RetryClock.Sleep(waitFor)
++		}
++	}
++	return nil, fmt.Errorf("unable to complete request to %s after %d retries. Most recent status: %d", url, MaxRetries, lastStatus)
++}
++
++func shouldRetry(res *http.Response) bool {
++	return res.StatusCode == 429 || (500 <= res.StatusCode && res.StatusCode <= 504)
++}
++
++func getWaitPeriod(res *http.Response, attempt int) (time.Duration, error) {
++	// Check if the server told us when to retry
++	for _, header := range retryHeaders {
++		if value := res.Header[header]; len(value) > 0 {
++			return parseRetryHeader(value[0])
++		}
++	}
++	// Let's just use exponential backoff: 1s + d1, 2s + d2, 4s + d3, 8s + d4 with dx being a random value in [0ms, 500ms]
++	return time.Duration(1 << attempt) * time.Second + time.Duration(rand.Intn(500)) * time.Millisecond, nil
++}
++
++func parseRetryHeader(value string) (time.Duration, error) {
++	// Depending on the server the header value can be a number of seconds (how long to wait) or an actual date (when to retry).
++	if seconds, err := strconv.Atoi(value); err == nil {
++		return time.Second * time.Duration(seconds), nil
++	}
++	t, err := http.ParseTime(value)
++	if err != nil {
++		return 0, err
++	}
++	return time.Until(t), nil
+ }
+ 
+ // DownloadBinary downloads a file from the given URL into the specified location, marks it executable and returns its full path.

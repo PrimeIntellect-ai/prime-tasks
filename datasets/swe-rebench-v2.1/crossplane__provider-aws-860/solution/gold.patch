@@ -1,0 +1,125 @@
+diff --git a/pkg/clients/elasticache/elasticache.go b/pkg/clients/elasticache/elasticache.go
+index a4eb769a5..2df149f19 100644
+--- a/pkg/clients/elasticache/elasticache.go
++++ b/pkg/clients/elasticache/elasticache.go
+@@ -59,6 +59,8 @@ type Client interface {
+ 	CreateCacheCluster(context.Context, *elasticache.CreateCacheClusterInput, ...func(*elasticache.Options)) (*elasticache.CreateCacheClusterOutput, error)
+ 	DeleteCacheCluster(context.Context, *elasticache.DeleteCacheClusterInput, ...func(*elasticache.Options)) (*elasticache.DeleteCacheClusterOutput, error)
+ 	ModifyCacheCluster(context.Context, *elasticache.ModifyCacheClusterInput, ...func(*elasticache.Options)) (*elasticache.ModifyCacheClusterOutput, error)
++
++	ModifyReplicationGroupShardConfiguration(context.Context, *elasticache.ModifyReplicationGroupShardConfigurationInput, ...func(*elasticache.Options)) (*elasticache.ModifyReplicationGroupShardConfigurationOutput, error)
+ }
+ 
+ // NewClient returns a new ElastiCache client. Credentials must be passed as
+@@ -147,6 +149,26 @@ func NewModifyReplicationGroupInput(g v1beta1.ReplicationGroupParameters, id str
+ 	}
+ }
+ 
++// NewModifyReplicationGroupShardConfigurationInput returns ElastiCache replication group
++// shard configuration modification input suitable for use with the AWS API.
++func NewModifyReplicationGroupShardConfigurationInput(g v1beta1.ReplicationGroupParameters, id string, rg elasticachetypes.ReplicationGroup) *elasticache.ModifyReplicationGroupShardConfigurationInput {
++	input := &elasticache.ModifyReplicationGroupShardConfigurationInput{
++		ApplyImmediately:   g.ApplyModificationsImmediately,
++		NodeGroupCount:     int32(*g.NumNodeGroups),
++		ReplicationGroupId: aws.String(id),
++	}
++
++	// For scale down we must name the nodes. This code picks the oldest rg
++	// now, but there might be a better algorithm, such as the one with least
++	// data
++	remove := len(rg.NodeGroups) - int(input.NodeGroupCount)
++	for i := 0; i < remove; i++ {
++		input.NodeGroupsToRemove = append(input.NodeGroupsToRemove, aws.ToString(rg.NodeGroups[i].NodeGroupId))
++	}
++
++	return input
++}
++
+ // NewDeleteReplicationGroupInput returns ElastiCache replication group deletion
+ // input suitable for use with the AWS API.
+ func NewDeleteReplicationGroupInput(id string) *elasticache.DeleteReplicationGroupInput {
+@@ -208,6 +230,12 @@ func LateInitialize(s *v1beta1.ReplicationGroupParameters, rg elasticachetypes.R
+ 	}
+ }
+ 
++// ReplicationGroupShardConfigurationNeedsUpdate returns true if the supplied ReplicationGroup and
++// the configuration shards.
++func ReplicationGroupShardConfigurationNeedsUpdate(kube v1beta1.ReplicationGroupParameters, rg elasticachetypes.ReplicationGroup) bool {
++	return kube.NumNodeGroups != nil && *kube.NumNodeGroups != len(rg.NodeGroups)
++}
++
+ // ReplicationGroupNeedsUpdate returns true if the supplied ReplicationGroup and
+ // the configuration of its member clusters differ from given desired state.
+ func ReplicationGroupNeedsUpdate(kube v1beta1.ReplicationGroupParameters, rg elasticachetypes.ReplicationGroup, ccList []elasticachetypes.CacheCluster) bool {
+diff --git a/pkg/clients/elasticache/fake/fake.go b/pkg/clients/elasticache/fake/fake.go
+index cd145b307..5dd619edb 100644
+--- a/pkg/clients/elasticache/fake/fake.go
++++ b/pkg/clients/elasticache/fake/fake.go
+@@ -40,6 +40,8 @@ type MockClient struct {
+ 	MockCreateCacheCluster    func(context.Context, *elasticache.CreateCacheClusterInput, []func(*elasticache.Options)) (*elasticache.CreateCacheClusterOutput, error)
+ 	MockDeleteCacheCluster    func(context.Context, *elasticache.DeleteCacheClusterInput, []func(*elasticache.Options)) (*elasticache.DeleteCacheClusterOutput, error)
+ 	MockModifyCacheCluster    func(context.Context, *elasticache.ModifyCacheClusterInput, []func(*elasticache.Options)) (*elasticache.ModifyCacheClusterOutput, error)
++
++	MockModifyReplicationGroupShardConfiguration func(context.Context, *elasticache.ModifyReplicationGroupShardConfigurationInput, []func(*elasticache.Options)) (*elasticache.ModifyReplicationGroupShardConfigurationOutput, error)
+ }
+ 
+ // DescribeReplicationGroups calls the underlying
+@@ -72,6 +74,12 @@ func (c *MockClient) DescribeCacheClusters(ctx context.Context, i *elasticache.D
+ 	return c.MockDescribeCacheClusters(ctx, i, opts)
+ }
+ 
++// ModifyReplicationGroupShardConfiguration calls the underlying
++// MockModifyReplicationGroupShardConfiguration method.
++func (c *MockClient) ModifyReplicationGroupShardConfiguration(ctx context.Context, i *elasticache.ModifyReplicationGroupShardConfigurationInput, opts ...func(*elasticache.Options)) (*elasticache.ModifyReplicationGroupShardConfigurationOutput, error) {
++	return c.MockModifyReplicationGroupShardConfiguration(ctx, i, opts)
++}
++
+ // DescribeCacheSubnetGroups calls the underlying
+ // MockDescribeCacheSubnetGroups method.
+ func (c *MockClient) DescribeCacheSubnetGroups(ctx context.Context, i *elasticache.DescribeCacheSubnetGroupsInput, opts ...func(*elasticache.Options)) (*elasticache.DescribeCacheSubnetGroupsOutput, error) {
+diff --git a/pkg/controller/cache/managed.go b/pkg/controller/cache/managed.go
+index 96102a9d0..1cde583ba 100644
+--- a/pkg/controller/cache/managed.go
++++ b/pkg/controller/cache/managed.go
+@@ -55,6 +55,7 @@ const (
+ 	errCreateReplicationGroup   = "cannot create ElastiCache replication group"
+ 	errModifyReplicationGroup   = "cannot modify ElastiCache replication group"
+ 	errDeleteReplicationGroup   = "cannot delete ElastiCache replication group"
++	errModifyReplicationGroupSC = "cannot modify ElastiCache replication group shard configuration"
+ )
+ 
+ // SetupReplicationGroup adds a controller that reconciles ReplicationGroups.
+@@ -146,7 +147,7 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
+ 
+ 	return managed.ExternalObservation{
+ 		ResourceExists:    true,
+-		ResourceUpToDate:  !elasticache.ReplicationGroupNeedsUpdate(cr.Spec.ForProvider, rg, ccList),
++		ResourceUpToDate:  !elasticache.ReplicationGroupNeedsUpdate(cr.Spec.ForProvider, rg, ccList) && !elasticache.ReplicationGroupShardConfigurationNeedsUpdate(cr.Spec.ForProvider, rg),
+ 		ConnectionDetails: elasticache.ConnectionEndpoint(rg),
+ 	}, nil
+ }
+@@ -195,7 +196,23 @@ func (e *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
+ 	if cr.Status.AtProvider.Status != v1beta1.StatusAvailable {
+ 		return managed.ExternalUpdate{}, nil
+ 	}
+-	_, err := e.client.ModifyReplicationGroup(ctx, elasticache.NewModifyReplicationGroupInput(cr.Spec.ForProvider, meta.GetExternalName(cr)))
++
++	rsp, err := e.client.DescribeReplicationGroups(ctx, elasticache.NewDescribeReplicationGroupsInput(meta.GetExternalName(cr)))
++	if err != nil {
++		return managed.ExternalUpdate{}, awsclient.Wrap(err, errDescribeReplicationGroup)
++	}
++	rg := rsp.ReplicationGroups[0]
++
++	if elasticache.ReplicationGroupShardConfigurationNeedsUpdate(cr.Spec.ForProvider, rg) {
++		_, err = e.client.ModifyReplicationGroupShardConfiguration(ctx, elasticache.NewModifyReplicationGroupShardConfigurationInput(cr.Spec.ForProvider, meta.GetExternalName(cr), rg))
++		if err != nil {
++			return managed.ExternalUpdate{}, awsclient.Wrap(err, errModifyReplicationGroupSC)
++		}
++		// we can only do one change at a time, so we'll have to return early here
++		return managed.ExternalUpdate{}, nil
++	}
++
++	_, err = e.client.ModifyReplicationGroup(ctx, elasticache.NewModifyReplicationGroupInput(cr.Spec.ForProvider, meta.GetExternalName(cr)))
+ 	return managed.ExternalUpdate{}, awsclient.Wrap(err, errModifyReplicationGroup)
+ }
+ 

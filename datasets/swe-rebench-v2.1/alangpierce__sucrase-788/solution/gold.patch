@@ -1,0 +1,228 @@
+diff --git a/README.md b/README.md
+index 82faa7b..90e13dd 100644
+--- a/README.md
++++ b/README.md
+@@ -66,10 +66,9 @@ for methodology and caveats.
+ The main configuration option in Sucrase is an array of transform names. These
+ transforms are available:
+ 
+-* **jsx**: Transforms JSX syntax to `React.createElement`, e.g. `<div a={b} />`
+-  becomes `React.createElement('div', {a: b})`. Behaves like Babel 7's
+-  [React preset](https://github.com/babel/babel/tree/main/packages/babel-preset-react),
+-  including adding `createReactClass` display names and JSX context information.
++* **jsx**: Enables JSX syntax. By default, JSX is transformed to `React.createClass`,
++  but may be preserved or transformed to `_jsx()` by setting the `jsxRuntime` option.
++  Also adds `createReactClass` display names and JSX context information.
+ * **typescript**: Compiles TypeScript code to JavaScript, removing type
+   annotations and handling features like enums. Does not check types. Sucrase
+   transforms each file independently, so you should enable the `isolatedModules`
+@@ -134,7 +133,7 @@ by your JS runtime. For example:
+ By default, JSX is compiled to React functions in development mode. This can be
+ configured with a few options:
+ 
+-* **jsxRuntime**: A string specifying the transform mode, which can be one of two values:
++* **jsxRuntime**: A string specifying the transform mode, which can be one of three values:
+   * `"classic"` (default): The original JSX transform that calls `React.createElement` by default.
+     To configure for non-React use cases, specify:
+     * **jsxPragma**: Element creation function, defaults to `React.createElement`.
+@@ -143,6 +142,7 @@ configured with a few options:
+       introduced with React 17, which calls `jsx` functions and auto-adds import statements.
+     To configure for non-React use cases, specify:
+     * **jsxImportSource**: Package name for auto-generated import statements, defaults to `react`.
++  * `"preserve"`: Don't transform JSX, and instead emit it as-is in the output code.
+ * **production**: If `true`, use production version of functions and don't include debugging
+   information. When using React in production mode with the automatic transform, this *must* be
+   set to true to avoid an error about `jsxDEV` being missing.
+diff --git a/src/Options-gen-types.ts b/src/Options-gen-types.ts
+index 8708363..9a407fd 100644
+--- a/src/Options-gen-types.ts
++++ b/src/Options-gen-types.ts
+@@ -20,7 +20,7 @@ export const SourceMapOptions = t.iface([], {
+ export const Options = t.iface([], {
+   transforms: t.array("Transform"),
+   disableESTransforms: t.opt("boolean"),
+-  jsxRuntime: t.opt(t.union(t.lit("classic"), t.lit("automatic"))),
++  jsxRuntime: t.opt(t.union(t.lit("classic"), t.lit("automatic"), t.lit("preserve"))),
+   production: t.opt("boolean"),
+   jsxImportSource: t.opt("string"),
+   jsxPragma: t.opt("string"),
+diff --git a/src/Options.ts b/src/Options.ts
+index 7eff553..3f59007 100644
+--- a/src/Options.ts
++++ b/src/Options.ts
+@@ -26,14 +26,15 @@ export interface Options {
+    */
+   disableESTransforms?: boolean;
+   /**
+-   * Transformation mode for the JSX transform. The automatic transform refers
+-   * to the transform behavior released with React 17, where the `jsx` function
+-   * (or a variation) is automatically imported. The classic transform refers to
+-   * the previous behavior using `React.createElement`.
++   * Transformation mode for the JSX transform.
++   * - "classic" refers to the original behavior using `React.createElement`.
++   * - "automatic" refers to the transform behavior released with React 17,
++   *   where the `jsx` function (or a variation) is automatically imported.
++   * - "preserve" leaves the JSX as-is.
+    *
+-   * Default value: "classic"
++   * Default value: "classic".
+    */
+-  jsxRuntime?: "classic" | "automatic";
++  jsxRuntime?: "classic" | "automatic" | "preserve";
+   /**
+    * Compile code for production use. Currently only applies to the JSX
+    * transform.
+diff --git a/src/parser/plugins/jsx/index.ts b/src/parser/plugins/jsx/index.ts
+index 5e1bb82..0b9ac38 100644
+--- a/src/parser/plugins/jsx/index.ts
++++ b/src/parser/plugins/jsx/index.ts
+@@ -129,11 +129,25 @@ function jsxParseNamespacedName(identifierRole: IdentifierRole): void {
+ // Parses element name in any form - namespaced, member
+ // or single identifier.
+ function jsxParseElementName(): void {
++  const firstTokenIndex = state.tokens.length;
+   jsxParseNamespacedName(IdentifierRole.Access);
++  let hadDot = false;
+   while (match(tt.dot)) {
++    hadDot = true;
+     nextJSXTagToken();
+     jsxParseIdentifier();
+   }
++  // For tags like <div> with a lowercase letter and no dots, the name is
++  // actually *not* an identifier access, since it's referring to a built-in
++  // tag name. Remove the identifier role in this case so that it's not
++  // accidentally transformed by the imports transform when preserving JSX.
++  if (!hadDot) {
++    const firstToken = state.tokens[firstTokenIndex];
++    const firstChar = input.charCodeAt(firstToken.start);
++    if (firstChar >= charCodes.lowercaseA && firstChar <= charCodes.lowercaseZ) {
++      firstToken.identifierRole = null;
++    }
++  }
+ }
+ 
+ // Parses any type of JSX attribute value.
+diff --git a/src/transformers/JSXTransformer.ts b/src/transformers/JSXTransformer.ts
+index 876e43c..11a7984 100644
+--- a/src/transformers/JSXTransformer.ts
++++ b/src/transformers/JSXTransformer.ts
+@@ -563,7 +563,7 @@ export default class JSXTransformer extends Transformer {
+  * Spec for identifiers: https://tc39.github.io/ecma262/#prod-IdentifierStart.
+  *
+  * Really only treat anything starting with a-z as tag names.  `_`, `$`, `é`
+- * should be treated as copmonent names
++ * should be treated as component names
+  */
+ export function startsWithLowerCase(s: string): boolean {
+   const firstChar = s.charCodeAt(0);
+diff --git a/src/transformers/RootTransformer.ts b/src/transformers/RootTransformer.ts
+index 5a1aae1..3326080 100644
+--- a/src/transformers/RootTransformer.ts
++++ b/src/transformers/RootTransformer.ts
+@@ -51,9 +51,11 @@ export default class RootTransformer {
+     }
+ 
+     if (transforms.includes("jsx")) {
+-      this.transformers.push(
+-        new JSXTransformer(this, tokenProcessor, importProcessor, this.nameManager, options),
+-      );
++      if (options.jsxRuntime !== "preserve") {
++        this.transformers.push(
++          new JSXTransformer(this, tokenProcessor, importProcessor, this.nameManager, options),
++        );
++      }
+       this.transformers.push(
+         new ReactDisplayNameTransformer(this, tokenProcessor, importProcessor, options),
+       );
+diff --git a/website/src/SucraseOptionsBox.tsx b/website/src/SucraseOptionsBox.tsx
+index d97fb68..287a9ba 100644
+--- a/website/src/SucraseOptionsBox.tsx
++++ b/website/src/SucraseOptionsBox.tsx
+@@ -97,7 +97,7 @@ function JSXRuntimeOption({options, onUpdateOptions}: JSXRuntimeOptionProps): JS
+       <span className={css(styles.optionName)}>
+         jsxRuntime:{" "}
+         <SimpleSelect
+-          options={["classic", "automatic"]}
++          options={["classic", "automatic", "preserve"]}
+           value={options.jsxRuntime}
+           onChange={(value) => {
+             onUpdateOptions({...options, jsxRuntime: value});
+@@ -164,11 +164,13 @@ export default function SucraseOptionsBox({
+               {options.transforms.includes("jsx") && (
+                 <>
+                   <JSXRuntimeOption options={options} onUpdateOptions={onUpdateOptions} />
+-                  <BooleanOption
+-                    optionName="production"
+-                    options={options}
+-                    onUpdateOptions={onUpdateOptions}
+-                  />
++                  {options.jsxRuntime !== "preserve" && (
++                    <BooleanOption
++                      optionName="production"
++                      options={options}
++                      onUpdateOptions={onUpdateOptions}
++                    />
++                  )}
+                   {options.jsxRuntime === "classic" && (
+                     <>
+                       <StringOption
+diff --git a/website/src/Worker.worker.ts b/website/src/Worker.worker.ts
+index 50c468a..4020e55 100644
+--- a/website/src/Worker.worker.ts
++++ b/website/src/Worker.worker.ts
+@@ -1,6 +1,6 @@
+ /* eslint-disable no-restricted-globals */
+ import * as Sucrase from "sucrase";
+-import type {ModuleKind, JsxEmit} from "typescript";
++import type {JsxEmit, ModuleKind} from "typescript";
+ 
+ import getTokens from "./getTokens";
+ import {compressCode} from "./URLHashState";
+@@ -114,20 +114,24 @@ function runBabel(): {code: string; time: number | null} {
+   const presets: Array<string | [string, unknown]> = [];
+ 
+   if (sucraseOptions.transforms.includes("jsx")) {
+-    presets.push([
+-      "react",
+-      {
+-        development: !sucraseOptions.production,
+-        runtime: sucraseOptions.jsxRuntime,
+-        ...(sucraseOptions.jsxRuntime === "automatic" && {
+-          importSource: sucraseOptions.jsxImportSource,
+-        }),
+-        ...(sucraseOptions.jsxRuntime === "classic" && {
+-          pragma: sucraseOptions.jsxPragma,
+-          pragmaFrag: sucraseOptions.jsxFragmentPragma,
+-        }),
+-      },
+-    ]);
++    if (sucraseOptions.jsxRuntime === "preserve") {
++      plugins.push("syntax-jsx");
++    } else {
++      presets.push([
++        "react",
++        {
++          development: !sucraseOptions.production,
++          runtime: sucraseOptions.jsxRuntime,
++          ...(sucraseOptions.jsxRuntime === "automatic" && {
++            importSource: sucraseOptions.jsxImportSource,
++          }),
++          ...(sucraseOptions.jsxRuntime === "classic" && {
++            pragma: sucraseOptions.jsxPragma,
++            pragmaFrag: sucraseOptions.jsxFragmentPragma,
++          }),
++        },
++      ]);
++    }
+   }
+   if (sucraseOptions.transforms.includes("typescript")) {
+     presets.push(["typescript", {allowDeclareFields: true}]);
+@@ -205,6 +209,8 @@ function runTypeScript(): {code: string; time: number | null} {
+   if (sucraseOptions.transforms.includes("jsx")) {
+     if (sucraseOptions.jsxRuntime === "classic") {
+       jsxEmit = JsxEmit.React;
++    } else if (sucraseOptions.jsxRuntime === "preserve") {
++      jsxEmit = JsxEmit.Preserve;
+     } else if (sucraseOptions.production) {
+       jsxEmit = JsxEmit.ReactJSX;
+     } else {

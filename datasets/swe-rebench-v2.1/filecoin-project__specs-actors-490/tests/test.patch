@@ -1,0 +1,211 @@
+diff --git a/actors/builtin/miner/miner_test.go b/actors/builtin/miner/miner_test.go
+index 5fe5839..ce570ea 100644
+--- a/actors/builtin/miner/miner_test.go
++++ b/actors/builtin/miner/miner_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"encoding/binary"
+ 	"fmt"
++	"reflect"
+ 	"testing"
+ 
+ 	addr "github.com/filecoin-project/go-address"
+@@ -22,7 +23,9 @@ import (
+ 	"github.com/filecoin-project/specs-actors/actors/builtin/miner"
+ 	"github.com/filecoin-project/specs-actors/actors/builtin/power"
+ 	"github.com/filecoin-project/specs-actors/actors/crypto"
++	actorRuntime "github.com/filecoin-project/specs-actors/actors/runtime"
+ 	"github.com/filecoin-project/specs-actors/actors/runtime/exitcode"
++	adt "github.com/filecoin-project/specs-actors/actors/util/adt"
+ 	"github.com/filecoin-project/specs-actors/support/mock"
+ 	tutil "github.com/filecoin-project/specs-actors/support/testing"
+ )
+@@ -516,6 +519,157 @@ func TestExtendSectorExpiration(t *testing.T) {
+ 	})
+ }
+ 
++// claimedPowerRuntime adapts the test runtime with runtime-like caller validation, without
++// requiring a particular validation API from the actor.
++type claimedPowerRuntime struct {
++	actorRuntime.Runtime
++	callerCode cid.Cid
++}
++
++func (rt *claimedPowerRuntime) ValidateImmediateCallerType(types ...cid.Cid) {
++	for _, allowed := range types {
++		if rt.callerCode.Equals(allowed) {
++			return
++		}
++	}
++	rt.Runtime.Abortf(exitcode.ErrForbidden, "caller type is forbidden")
++}
++
++func (rt *claimedPowerRuntime) ValidateImmediateCallerIs(addrs ...addr.Address) {
++	for _, allowed := range addrs {
++		if rt.Message().Caller() == allowed {
++			return
++		}
++	}
++	rt.Runtime.Abortf(exitcode.ErrForbidden, "caller address is forbidden")
++}
++
++func (rt *claimedPowerRuntime) ValidateImmediateCallerAcceptAny() {}
++
++func (rt *claimedPowerRuntime) GetActorCodeCID(actorAddr addr.Address) (cid.Cid, bool) {
++	if actorAddr == rt.Message().Caller() {
++		return rt.callerCode, true
++	}
++	return rt.Runtime.GetActorCodeCID(actorAddr)
++}
++
++func updateClaimedPowerCall(t *testing.T, actor power.Actor, callerCode cid.Cid, raw, qa abi.StoragePower) (interface{}, interface{}) {
++	t.Helper()
++	method, found := reflect.TypeOf(actor).MethodByName("UpdateClaimedPower")
++	require.True(t, found, "power actor must expose UpdateClaimedPower")
++	params := reflect.New(method.Type.In(2).Elem())
++	params.Elem().FieldByName("RawByteDelta").Set(reflect.ValueOf(raw))
++	params.Elem().FieldByName("QualityAdjustedDelta").Set(reflect.ValueOf(qa))
++	runtimeType := reflect.TypeOf((*actorRuntime.Runtime)(nil)).Elem()
++	callType := reflect.FuncOf([]reflect.Type{runtimeType, method.Type.In(2)}, []reflect.Type{method.Type.Out(0)}, false)
++	call := reflect.MakeFunc(callType, func(args []reflect.Value) []reflect.Value {
++		wrappedRuntime := &claimedPowerRuntime{
++			Runtime: args[0].Interface().(actorRuntime.Runtime), callerCode: callerCode,
++		}
++		return method.Func.Call([]reflect.Value{reflect.ValueOf(actor), reflect.ValueOf(wrappedRuntime), args[1]})
++	})
++	return call.Interface(), params.Interface()
++}
++
++// TestUpdateClaimedPower exercises the power actor's UpdateClaimedPower method directly,
++// verifying caller validation and that both raw and quality-adjusted deltas (positive or
++// negative) are applied to the calling miner's claimed power.
++func TestUpdateClaimedPower(t *testing.T) {
++	actor := power.Actor{}
++	minerAddr := tutil.NewIDAddr(t, 101)
++	otherAddr := tutil.NewIDAddr(t, 102)
++
++	builder := mock.NewBuilder(context.Background(), builtin.StoragePowerActorAddr).
++		WithCaller(builtin.SystemActorAddr, builtin.SystemActorCodeID)
++
++	// setupState initializes the power actor state with a zero-power claim for the miner.
++	setupState := func(t *testing.T, rt *mock.Runtime, initialRaw, initialQA abi.StoragePower) {
++		emptyMap, err := adt.MakeEmptyMap(adt.AsStore(rt)).Root()
++		require.NoError(t, err)
++		emptyMMap, err := adt.MakeEmptyMultimap(adt.AsStore(rt)).Root()
++		require.NoError(t, err)
++		st := power.ConstructState(emptyMap, emptyMMap)
++		claims, err := adt.AsMap(adt.AsStore(rt), st.Claims)
++		require.NoError(t, err)
++		require.NoError(t, claims.Put(power.AddrKey(minerAddr), &power.Claim{RawBytePower: initialRaw, QualityAdjPower: initialQA}))
++		st.Claims, err = claims.Root()
++		require.NoError(t, err)
++		rt.Create(st)
++	}
++
++	getClaim := func(t *testing.T, rt *mock.Runtime) power.Claim {
++		var st power.State
++		rt.GetState(&st)
++		claims, err := adt.AsMap(adt.AsStore(rt), st.Claims)
++		require.NoError(t, err)
++		var claim power.Claim
++		found, err := claims.Get(power.AddrKey(minerAddr), &claim)
++		require.NoError(t, err)
++		require.True(t, found)
++		return claim
++	}
++
++	update := func(t *testing.T, rt *mock.Runtime, raw, qa abi.StoragePower) {
++		rt.SetCaller(minerAddr, builtin.StorageMinerActorCodeID)
++		method, params := updateClaimedPowerCall(t, actor, builtin.StorageMinerActorCodeID, raw, qa)
++		ret := rt.Call(method, params)
++		require.Nil(t, ret)
++		rt.Verify()
++	}
++
++	t.Run("applies positive deltas to the calling miner's claim", func(t *testing.T) {
++		rt := builder.Build(t)
++		setupState(t, rt, big.Zero(), big.Zero())
++
++		update(t, rt, abi.NewStoragePower(10), abi.NewStoragePower(20))
++
++		claim := getClaim(t, rt)
++		assert.Equal(t, abi.NewStoragePower(10), claim.RawBytePower)
++		assert.Equal(t, abi.NewStoragePower(20), claim.QualityAdjPower)
++	})
++
++	t.Run("applies negative deltas to the calling miner's claim", func(t *testing.T) {
++		rt := builder.Build(t)
++		setupState(t, rt, big.Zero(), big.Zero())
++
++		update(t, rt, abi.NewStoragePower(100), abi.NewStoragePower(200))
++		update(t, rt, abi.NewStoragePower(-30), abi.NewStoragePower(-50))
++
++		claim := getClaim(t, rt)
++		assert.Equal(t, abi.NewStoragePower(70), claim.RawBytePower)
++		assert.Equal(t, abi.NewStoragePower(150), claim.QualityAdjPower)
++	})
++
++	t.Run("applies each delta independently when signs differ", func(t *testing.T) {
++		rt := builder.Build(t)
++		setupState(t, rt, abi.NewStoragePower(100), abi.NewStoragePower(100))
++
++		update(t, rt, abi.NewStoragePower(30), abi.NewStoragePower(-40))
++		update(t, rt, abi.NewStoragePower(-20), abi.NewStoragePower(10))
++
++		claim := getClaim(t, rt)
++		assert.Equal(t, abi.NewStoragePower(110), claim.RawBytePower)
++		assert.Equal(t, abi.NewStoragePower(70), claim.QualityAdjPower)
++	})
++
++	t.Run("rejects a caller that is not a miner actor", func(t *testing.T) {
++		rt := builder.Build(t)
++		setupState(t, rt, big.Zero(), big.Zero())
++
++		rt.SetCaller(otherAddr, builtin.AccountActorCodeID)
++		method, params := updateClaimedPowerCall(t, actor, builtin.AccountActorCodeID, abi.NewStoragePower(1), abi.NewStoragePower(1))
++		rt.ExpectAbort(exitcode.ErrForbidden, func() {
++			rt.Call(method, params)
++		})
++		rt.Verify()
++
++		// The rejected call must not have changed the claim.
++		claim := getClaim(t, rt)
++		assert.Equal(t, big.Zero(), claim.RawBytePower)
++		assert.Equal(t, big.Zero(), claim.QualityAdjPower)
++	})
++}
++
+ type actorHarness struct {
+ 	a miner.Actor
+ 	t testing.TB
+@@ -807,18 +961,21 @@ func (h *actorHarness) extendSector(rt *mock.Runtime, sector *miner.SectorOnChai
+ 	rt.ExpectValidateCallerAddr(h.worker)
+ 
+ 	st := getState(rt)
+-	rawBytePower := big.NewIntUnsigned(uint64(st.Info.SectorSize))
+ 	newSector := *sector
+ 	newSector.Info.Expiration += extension
+-
++	qaDelta := big.Sub(miner.QAPowerForSector(st.Info.SectorSize, &newSector), miner.QAPowerForSector(st.Info.SectorSize, sector))
++
++	method, found := reflect.TypeOf(builtin.MethodsPower).FieldByName("UpdateClaimedPower")
++	require.True(h.t, found, "power method table must expose UpdateClaimedPower")
++	methodNum := abi.MethodNum(reflect.ValueOf(builtin.MethodsPower).FieldByIndex(method.Index).Uint())
++	powerActorMethod, found := reflect.TypeOf(power.Actor{}).MethodByName("UpdateClaimedPower")
++	require.True(h.t, found, "power actor must expose UpdateClaimedPower")
++	powerParams := reflect.New(powerActorMethod.Type.In(2).Elem())
++	powerParams.Elem().FieldByName("RawByteDelta").Set(reflect.ValueOf(big.Zero()))
++	powerParams.Elem().FieldByName("QualityAdjustedDelta").Set(reflect.ValueOf(qaDelta))
+ 	rt.ExpectSend(builtin.StoragePowerActorAddr,
+-		builtin.MethodsPower.OnSectorModifyWeightDesc,
+-		&power.OnSectorModifyWeightDescParams{
+-			PrevRawBytePower:         rawBytePower,
+-			NewRawBytePower:          rawBytePower,
+-			PrevQualityAdjustedPower: miner.QAPowerForSector(st.Info.SectorSize, sector),
+-			NewQualityAdjustedPower:  miner.QAPowerForSector(st.Info.SectorSize, &newSector),
+-		},
++		methodNum,
++		powerParams.Interface().(actorRuntime.CBORMarshaler),
+ 		abi.NewTokenAmount(0),
+ 		nil,
+ 		exitcode.Ok,

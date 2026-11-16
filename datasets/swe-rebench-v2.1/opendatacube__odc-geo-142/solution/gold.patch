@@ -1,0 +1,160 @@
+diff --git a/odc/geo/cog/_tifffile.py b/odc/geo/cog/_tifffile.py
+index e69f93d..6d95bd9 100644
+--- a/odc/geo/cog/_tifffile.py
++++ b/odc/geo/cog/_tifffile.py
+@@ -11,6 +11,7 @@ import itertools
+ from functools import partial
+ from io import BytesIO
+ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
++from xml.sax.saxutils import escape as xml_escape
+ 
+ import numpy as np
+ import xarray as xr
+@@ -39,10 +40,11 @@ if TYPE_CHECKING:
+ 
+ 
+ def _render_gdal_metadata(
+-    band_stats: list[dict[str, float]] | dict[str, float],
++    band_stats: list[dict[str, float]] | dict[str, float] | None,
+     precision: int = 10,
+     pad: int = 0,
+     eol: str = "",
++    gdal_metadata_extra: Optional[List[str]] = None,
+ ) -> str:
+     def _item(sample: int, stats: dict[str, float]) -> str:
+         return eol.join(
+@@ -52,10 +54,17 @@ def _render_gdal_metadata(
+             ]
+         )
+ 
++    if band_stats is None:
++        band_stats = []
+     if isinstance(band_stats, dict):
+         band_stats = [band_stats]
+ 
+-    body = eol.join([_item(sample, stats) for sample, stats in enumerate(band_stats)])
++    gdal_metadata_extra = [] if gdal_metadata_extra is None else gdal_metadata_extra
++
++    body = eol.join(
++        [_item(sample, stats) for sample, stats in enumerate(band_stats)]
++        + gdal_metadata_extra
++    )
+     return eol.join(["<GDALMetadata>", body, "</GDALMetadata>"])
+ 
+ 
+@@ -469,6 +478,7 @@ def _patch_hdr(
+     meta: CogMeta,
+     hdr0: bytes,
+     stats: Optional[list[dict[str, float]]] = None,
++    gdal_metadata_extra: Optional[List[str]] = None,
+ ) -> bytes:
+     # pylint: disable=import-outside-toplevel,import-error
+     from tifffile import TiffFile, TiffPage
+@@ -479,10 +489,12 @@ def _patch_hdr(
+     _bio = BytesIO(hdr0)
+     with TiffFile(_bio, mode="r+", name=":mem:") as tr:
+         assert len(tile_info) == len(tr.pages)
+-        if stats is not None:
++        if stats is not None or gdal_metadata_extra:
+             md_tag = tr.pages.first.tags.get(42112, None)
+             assert md_tag is not None
+-            gdal_metadata = _render_gdal_metadata(stats, precision=6)
++            gdal_metadata = _render_gdal_metadata(
++                stats, precision=6, gdal_metadata_extra=gdal_metadata_extra
++            )
+             md_tag.overwrite(gdal_metadata)
+ 
+         hdr_sz = len(_bio.getbuffer())
+@@ -573,6 +585,40 @@ def _norm_compression_tifffile(
+     return (predictor, compression, compressionargs)
+ 
+ 
++def _gdal_sample_description(sample: int, description: str) -> str:
++    """Make XML line of GDAL metadata.
++
++    :param band: Sample / band number in data array.
++    :param description: Band name in data array.
++
++    :return: GDAL XML metadata line to place in TIFF file.
++    """
++    # GDAL does double escaping; see frmts/gtiff/geotiff.cpp.
++    # We also double escape to maximize compatibility with tools expecting GDAL-generated metadata.
++    double_escaped_description = xml_escape(xml_escape(description))
++    return f'<Item name="DESCRIPTION" sample="{sample}" role="description">{double_escaped_description}</Item>'
++
++
++def _band_names(xx: xr.DataArray) -> List[str]:
++    if "band" in xx.coords and xx.coords["band"].dtype.type is np.str_:
++        return list(xx["band"].values)
++    if "long_name" in xx.attrs:
++        long_name = xx.attrs["long_name"]
++        return [long_name] if isinstance(long_name, str) else long_name
++    return []
++
++
++def _gdal_sample_descriptions(descriptions: List[str]) -> List[str]:
++    """Convert band names to GDAL sample descriptions.
++
++    :return: List of GDAL XML metadata lines to place in TIFF file.
++    """
++    return [
++        _gdal_sample_description(sample, description)
++        for sample, description in enumerate(descriptions)
++    ]
++
++
+ def save_cog_with_dask(
+     xx: xr.DataArray,
+     dst: str = "",
+@@ -635,7 +681,10 @@ def save_cog_with_dask(
+     if isinstance(blocksize, Unset):
+         blocksize = [data_chunks, int(max(*data_chunks) // 2)]
+ 
+-    gdal_metadata = None if stats is False else ""
++    band_names = _band_names(xx)
++    sample_descriptions_metadata = _gdal_sample_descriptions(band_names)
++    no_metadata = (stats is False) and not band_names
++    gdal_metadata = None if no_metadata else ""
+ 
+     meta, hdr0 = _make_empty_cog(
+         xx.shape,
+@@ -652,6 +701,11 @@ def save_cog_with_dask(
+     )
+     hdr0 = bytes(hdr0)
+ 
++    if band_names and len(band_names) != meta.nsamples:
++        raise ValueError(
++            f"Found {len(band_names)} band names ({band_names}) but there are {meta.nsamples} bands."
++        )
++
+     layers = _pyramids_from_cog_metadata(xx, meta, resampling=overview_resampling)
+ 
+     if stats is True:
+@@ -695,7 +749,12 @@ def save_cog_with_dask(
+             tiles_write_order,
+             write,
+             mk_header=_patch_hdr,
+-            user_kw={"meta": meta, "hdr0": hdr0, "stats": _stats},
++            user_kw={
++                "meta": meta,
++                "hdr0": hdr0,
++                "stats": _stats,
++                "gdal_metadata_extra": sample_descriptions_metadata,
++            },
+             **upload_params,
+         )
+ 
+@@ -710,7 +769,12 @@ def save_cog_with_dask(
+     return s3_sink.upload(
+         tiles_write_order,
+         mk_header=_patch_hdr,
+-        user_kw={"meta": meta, "hdr0": hdr0, "stats": _stats},
++        user_kw={
++            "meta": meta,
++            "hdr0": hdr0,
++            "stats": _stats,
++            "gdal_metadata_extra": sample_descriptions_metadata,
++        },
+         client=client,
+         **upload_params,
+     )

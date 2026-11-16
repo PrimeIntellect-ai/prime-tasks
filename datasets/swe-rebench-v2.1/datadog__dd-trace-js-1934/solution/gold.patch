@@ -1,0 +1,230 @@
+diff --git a/packages/datadog-instrumentations/src/helpers/hook.js b/packages/datadog-instrumentations/src/helpers/hook.js
+new file mode 100644
+index 000000000..b2a6187ad
+--- /dev/null
++++ b/packages/datadog-instrumentations/src/helpers/hook.js
+@@ -0,0 +1,44 @@
++'use strict'
++
++const path = require('path')
++const iitm = require('../../../dd-trace/src/iitm')
++const ritm = require('../../../dd-trace/src/ritm')
++
++function Hook (modules, onrequire) {
++  if (!(this instanceof Hook)) return new Hook(modules, onrequire)
++
++  this._patched = Object.create(null)
++
++  const safeHook = (moduleExports, moduleName, moduleBaseDir) => {
++    const parts = [moduleBaseDir, moduleName].filter(v => v)
++    const filename = path.join(...parts)
++
++    if (this._patched[filename]) return moduleExports
++
++    this._patched[filename] = true
++
++    return onrequire(moduleExports, moduleName, moduleBaseDir)
++  }
++
++  this._ritmHook = ritm(modules, {}, safeHook)
++  this._iitmHook = iitm(modules, {}, (moduleExports, moduleName, moduleBaseDir) => {
++    // TODO: Move this logic to import-in-the-middle and only do it for CommonJS
++    // modules and not ESM. In the meantime, all the modules we instrument are
++    // CommonJS modules for which the default export is always moved to
++    // `default` anyway.
++    if (moduleExports && moduleExports.default) {
++      moduleExports.default = safeHook(moduleExports.default, moduleName, moduleBaseDir)
++      return moduleExports
++    } else {
++      return safeHook(moduleExports, moduleName, moduleBaseDir)
++    }
++  })
++}
++
++Hook.prototype.unhook = function () {
++  this._ritmHook.unhook()
++  this._iitmHook.unhook()
++  this._patched = Object.create(null)
++}
++
++module.exports = Hook
+diff --git a/packages/datadog-instrumentations/src/helpers/instrument.js b/packages/datadog-instrumentations/src/helpers/instrument.js
+index 6689e9d8d..589c43000 100644
+--- a/packages/datadog-instrumentations/src/helpers/instrument.js
++++ b/packages/datadog-instrumentations/src/helpers/instrument.js
+@@ -3,11 +3,10 @@
+ const dc = require('diagnostics_channel')
+ const path = require('path')
+ const semver = require('semver')
+-const iitm = require('../../../dd-trace/src/iitm')
+-const ritm = require('../../../dd-trace/src/ritm')
+-const parse = require('module-details-from-path')
++const Hook = require('./hook')
+ const requirePackageJson = require('../../../dd-trace/src/require-package-json')
+ const { AsyncResource } = require('async_hooks')
++const log = require('../../../dd-trace/src/log')
+ 
+ const pathSepExpr = new RegExp(`\\${path.sep}`, 'g')
+ const channelMap = {}
+@@ -21,16 +20,21 @@ exports.channel = function channel (name) {
+ 
+ exports.addHook = function addHook ({ name, versions, file }, hook) {
+   const fullFilename = filename(name, file)
+-  const loaderHook = (moduleExports, moduleName, moduleBaseDir) => {
++
++  Hook([name], (moduleExports, moduleName, moduleBaseDir) => {
+     moduleName = moduleName.replace(pathSepExpr, '/')
++
+     if (moduleName !== fullFilename || !matchVersion(getVersion(moduleBaseDir), versions)) {
+       return moduleExports
+     }
+-    return hook(moduleExports)
+-  }
+-  ritm([name], loaderHook)
+-  cjsPostLoad({ name, versions, file }, hook)
+-  iitm([name], loaderHook)
++
++    try {
++      return hook(moduleExports)
++    } catch (e) {
++      log.error(e)
++      return moduleExports
++    }
++  })
+ }
+ 
+ function matchVersion (version, ranges) {
+@@ -47,47 +51,6 @@ function filename (name, file) {
+   return [name, file].filter(val => val).join('/')
+ }
+ 
+-// TODO this is basically Loader#_getModules + running the hook. DRY up.
+-function cjsPostLoad (instrumentation, hook) {
+-  const ids = Object.keys(require.cache)
+-
+-  let pkg
+-
+-  for (let i = 0, l = ids.length; i < l; i++) {
+-    if (ids[i] === instrumentation.name) {
+-      hook(require.cache[ids[i]].exports)
+-      continue
+-    }
+-
+-    const id = ids[i].replace(pathSepExpr, '/')
+-
+-    if (!id.includes(`/node_modules/${instrumentation.name}/`)) continue
+-
+-    if (instrumentation.file) {
+-      if (!id.endsWith(`/node_modules/${filename(instrumentation.name, instrumentation.file)}`)) continue
+-
+-      const basedir = getBasedir(ids[i])
+-
+-      pkg = requirePackageJson(basedir, module)
+-    } else {
+-      const basedir = getBasedir(ids[i])
+-
+-      pkg = requirePackageJson(basedir, module)
+-
+-      const mainFile = path.posix.normalize(pkg.main || 'index.js')
+-      if (!id.endsWith(`/node_modules/${instrumentation.name}/${mainFile}`)) continue
+-    }
+-
+-    if (!matchVersion(pkg.version, instrumentation.versions)) continue
+-
+-    hook(require.cache[ids[i]].exports)
+-  }
+-}
+-
+-function getBasedir (id) {
+-  return parse(id).basedir.replace(pathSepExpr, '/')
+-}
+-
+ // AsyncResource.bind exists and binds `this` properly only from 17.8.0 and up.
+ // https://nodejs.org/api/async_context.html#asyncresourcebindfn-thisarg
+ if (semver.satisfies(process.versions.node, '>=17.8.0')) {
+diff --git a/packages/dd-trace/src/iitm.js b/packages/dd-trace/src/iitm.js
+index 10d202062..dae756b63 100644
+--- a/packages/dd-trace/src/iitm.js
++++ b/packages/dd-trace/src/iitm.js
+@@ -8,5 +8,9 @@ if (semver.satisfies(process.versions.node, '^12.20.0 || >=14.13.1')) {
+ } else {
+   logger.warn('ESM is not fully supported by this version of Node.js, ' +
+     'so dd-trace will not intercept ESM loading.')
+-  module.exports = () => {}
++  module.exports = () => ({
++    unhook: () => {}
++  })
++  module.exports.addHook = () => {}
++  module.exports.removeHook = () => {}
+ }
+diff --git a/packages/dd-trace/src/loader.js b/packages/dd-trace/src/loader.js
+index 268fd7863..ba2e3db2a 100644
+--- a/packages/dd-trace/src/loader.js
++++ b/packages/dd-trace/src/loader.js
+@@ -1,8 +1,7 @@
+ 'use strict'
+ 
+ const semver = require('semver')
+-const hook = require('./ritm')
+-const esmHook = require('./iitm')
++const Hook = require('../../datadog-instrumentations/src/helpers/hook')
+ const parse = require('module-details-from-path')
+ const path = require('path')
+ const uniq = require('lodash.uniq')
+@@ -18,6 +17,7 @@ class Loader {
+ 
+   reload (plugins) {
+     this._plugins = plugins
++    this._patched = []
+ 
+     const instrumentations = Array.from(this._plugins.keys())
+       .reduce((prev, current) => prev.concat(current), [])
+@@ -29,10 +29,9 @@ class Loader {
+       .map(instrumentation => filename(instrumentation)))
+ 
+     this._hook && this._hook.unhook()
+-    this._hook = hook(instrumentedModules, this._hookModule.bind(this))
+-
+-    this._esmHook && this._esmHook.unhook()
+-    this._esmHook = esmHook(instrumentedModules, this._hookModule.bind(this))
++    this._hook = Hook(instrumentedModules, (moduleExports, moduleName, moduleBaseDir) => {
++      return this._hookModule(moduleExports, moduleName, moduleBaseDir)
++    })
+   }
+ 
+   load (instrumentation, config) {
+diff --git a/packages/dd-trace/src/ritm.js b/packages/dd-trace/src/ritm.js
+index cf7b9b410..0adeeccb4 100644
+--- a/packages/dd-trace/src/ritm.js
++++ b/packages/dd-trace/src/ritm.js
+@@ -11,8 +11,8 @@ const origRequire = Module.prototype.require
+ module.exports = Hook
+ 
+ let moduleHooks = Object.create(null)
+-let cache = {}
+-let patching = {}
++let cache = Object.create(null)
++let patching = Object.create(null)
+ let patchedRequire = null
+ 
+ function Hook (modules, options, onrequire) {
+@@ -53,7 +53,7 @@ function Hook (modules, options, onrequire) {
+     let name, basedir, hooks
+ 
+     // return known patched modules immediately
+-    if (cache.hasOwnProperty(filename)) {
++    if (cache[filename]) {
+       // require.cache was potentially altered externally
+       if (require.cache[filename] && require.cache[filename].exports !== cache[filename].original) {
+         return require.cache[filename].exports
+@@ -121,8 +121,8 @@ function Hook (modules, options, onrequire) {
+ Hook.reset = function () {
+   Module.prototype.require = origRequire
+   patchedRequire = null
+-  patching = {}
+-  cache = {}
++  patching = Object.create(null)
++  cache = Object.create(null)
+   moduleHooks = Object.create(null)
+ }
+ 

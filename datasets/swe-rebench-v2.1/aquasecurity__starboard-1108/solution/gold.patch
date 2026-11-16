@@ -1,0 +1,259 @@
+diff --git a/deploy/helm/templates/config.yaml b/deploy/helm/templates/config.yaml
+index 7bd5511..923b136 100644
+--- a/deploy/helm/templates/config.yaml
++++ b/deploy/helm/templates/config.yaml
+@@ -24,6 +24,9 @@ data:
+   {{- if .Values.operator.kubernetesBenchmarkEnabled }}
+   kube-bench.imageRef: {{ required ".Values.kubeBench.imageRef is required" .Values.kubeBench.imageRef | quote }}
+   {{- end }}
++  {{- if .Values.operator.clusterComplianceEnabled }}
++  compliance.failEntriesLimit: {{ required ".Values.compliance.failEntriesLimit is required" .Values.compliance.failEntriesLimit | quote }}
++  {{- end }}
+ ---
+ apiVersion: v1
+ kind: Secret
+diff --git a/deploy/helm/values.yaml b/deploy/helm/values.yaml
+index 3447e93..fb8fb30 100644
+--- a/deploy/helm/values.yaml
++++ b/deploy/helm/values.yaml
+@@ -47,7 +47,7 @@ operator:
+   configAuditScannerBuiltIn: true
+   # kubernetesBenchmarkEnabled the flag to enable CIS Kubernetes Benchmark scanner
+   kubernetesBenchmarkEnabled: true
+-  # clusterComplianceEnabled the flag to enable CIS Kubernetes Benchmark scanner
++  # clusterComplianceEnabled the flag to enable cluster compliance report generation
+   clusterComplianceEnabled: true
+   # batchDeleteLimit the maximum number of config audit reports deleted by the operator when the plugin's config has changed.
+   batchDeleteLimit: 10
+@@ -176,7 +176,9 @@ trivy:
+   # Trivy client to Trivy server. Only applicable in ClientServer mode.
+   #
+   # serverCustomHeaders: "foo=bar"
+-
++compliance:
++  # failEntriesLimit the flag to limit the number of fail entries per control check in the cluster compliance detail report
++  failEntriesLimit: 10
+ kubeBench:
+   imageRef: docker.io/aquasec/kube-bench:v0.6.6
+ 
+diff --git a/deploy/static/03-starboard-operator.config.yaml b/deploy/static/03-starboard-operator.config.yaml
+index 86f509f..d971a72 100644
+--- a/deploy/static/03-starboard-operator.config.yaml
++++ b/deploy/static/03-starboard-operator.config.yaml
+@@ -35,6 +35,7 @@ data:
+   vulnerabilityReports.scanner: "Trivy"
+   configAuditReports.scanner: "Polaris"
+   kube-bench.imageRef: "docker.io/aquasec/kube-bench:v0.6.6"
++  compliance.failEntriesLimit: "10"
+ ---
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/deploy/static/starboard.yaml b/deploy/static/starboard.yaml
+index df106b3..9728056 100644
+--- a/deploy/static/starboard.yaml
++++ b/deploy/static/starboard.yaml
+@@ -809,6 +809,7 @@ data:
+   vulnerabilityReports.scanner: "Trivy"
+   configAuditReports.scanner: "Polaris"
+   kube-bench.imageRef: "docker.io/aquasec/kube-bench:v0.6.6"
++  compliance.failEntriesLimit: "10"
+ ---
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/docs/settings.md b/docs/settings.md
+index b4da09c..bb079cd 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -63,6 +63,7 @@ configuration settings for common use cases. For example, switch Trivy from [Sta
+ | `kube-bench.imageRef`                          | `docker.io/aquasec/kube-bench:v0.6.6` | kube-bench image reference                                                                                                                                                                                                          |
+ | `kube-hunter.imageRef`                         | `docker.io/aquasec/kube-hunter:0.6.5` | kube-hunter image reference                                                                                                                                                                                                         |
+ | `kube-hunter.quick`                            | `"false"`                             | Whether to use kube-hunter's "quick" scanning mode (subnet 24). Set to `"true"` to enable.                                                                                                                                          |
++| `compliance.failEntriesLimit`                  | `"10"`                                | Limit the number of fail entries per control check in the cluster compliance detail report.                                                                                                                                         |
+ 
+ !!! tip
+     You can find it handy to delete a configuration key, which was not created by default by the `starboard install`
+diff --git a/pkg/cmd/get_clustercompliancereport.go b/pkg/cmd/get_clustercompliancereport.go
+index 9b42aa4..470778d 100644
+--- a/pkg/cmd/get_clustercompliancereport.go
++++ b/pkg/cmd/get_clustercompliancereport.go
+@@ -3,11 +3,14 @@ package cmd
+ import (
+ 	"context"
+ 	"fmt"
++	"io"
++
++	"k8s.io/client-go/kubernetes"
++
+ 	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
+ 	"github.com/aquasecurity/starboard/pkg/compliance"
+ 	"github.com/aquasecurity/starboard/pkg/starboard"
+ 	"github.com/spf13/cobra"
+-	"io"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/cli-runtime/pkg/genericclioptions"
+@@ -49,8 +52,15 @@ func NewGetClusterComplianceReportsCmd(executable string, cf *genericclioptions.
+ 			if err != nil {
+ 				return err
+ 			}
+-			// generate compliance and compliance failure detail reports
+-			complianceMgr := compliance.NewMgr(kubeClient, logger)
++			kubeClientset, err := kubernetes.NewForConfig(kubeConfig)
++			if err != nil {
++				return err
++			}
++			starboardConfig, err := starboard.NewConfigManager(kubeClientset, starboard.NamespaceName).Read(ctx)
++			if err != nil {
++				return err
++			}
++			complianceMgr := compliance.NewMgr(kubeClient, logger, starboardConfig)
+ 			err = complianceMgr.GenerateComplianceReport(ctx, report.Spec)
+ 			if err != nil {
+ 				return fmt.Errorf("failed to generate report: %w", err)
+diff --git a/pkg/compliance/clustercompliancereport.go b/pkg/compliance/clustercompliancereport.go
+index b13aa8a..5dea59a 100644
+--- a/pkg/compliance/clustercompliancereport.go
++++ b/pkg/compliance/clustercompliancereport.go
+@@ -7,7 +7,6 @@ import (
+ 
+ 	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
+ 	"github.com/aquasecurity/starboard/pkg/ext"
+-	"github.com/aquasecurity/starboard/pkg/operator/etc"
+ 	"github.com/aquasecurity/starboard/pkg/utils"
+ 	"github.com/go-logr/logr"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+@@ -20,7 +19,6 @@ import (
+ 
+ type ClusterComplianceReportReconciler struct {
+ 	logr.Logger
+-	etc.Config
+ 	client.Client
+ 	Mgr
+ 	ext.Clock
+diff --git a/pkg/compliance/io.go b/pkg/compliance/io.go
+index c0acb17..a2e106c 100644
+--- a/pkg/compliance/io.go
++++ b/pkg/compliance/io.go
+@@ -5,6 +5,8 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
++	"github.com/aquasecurity/starboard/pkg/starboard"
++
+ 	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
+ 	"github.com/aquasecurity/starboard/pkg/ext"
+ 	"github.com/emirpasic/gods/sets/hashset"
+@@ -23,16 +25,18 @@ type Mgr interface {
+ 	GenerateComplianceReport(ctx context.Context, spec v1alpha1.ReportSpec) error
+ }
+ 
+-func NewMgr(client client.Client, log logr.Logger) Mgr {
++func NewMgr(client client.Client, log logr.Logger, config starboard.ConfigData) Mgr {
+ 	return &cm{
+ 		client: client,
+ 		log:    log,
++		config: config,
+ 	}
+ }
+ 
+ type cm struct {
+ 	client client.Client
+ 	log    logr.Logger
++	config starboard.ConfigData
+ }
+ 
+ type summaryTotal struct {
+@@ -242,16 +246,19 @@ func (w *cm) createScanCheckResult(results []*ScannerCheckResult) []v1alpha1.Sca
+ 	ctta := make([]v1alpha1.ScannerCheckResult, 0)
+ 	for _, checkResult := range results {
+ 		var ctt v1alpha1.ScannerCheckResult
+-		rds := make([]v1alpha1.ResultDetails, 0)
++		failedResultEntries := make([]v1alpha1.ResultDetails, 0)
+ 		for _, crd := range checkResult.Details {
++			if len(failedResultEntries) >= w.config.ComplianceFailEntriesLimit() {
++				continue
++			}
+ 			//control check detail relevant to fail checks only
+ 			if crd.Status == v1alpha1.PassStatus || crd.Status == v1alpha1.WarnStatus {
+ 				continue
+ 			}
+-			rds = append(rds, v1alpha1.ResultDetails{Name: crd.Name, Namespace: crd.Namespace, Msg: crd.Msg, Status: crd.Status})
++			failedResultEntries = append(failedResultEntries, v1alpha1.ResultDetails{Name: crd.Name, Namespace: crd.Namespace, Msg: crd.Msg, Status: crd.Status})
+ 		}
+-		if len(rds) > 0 {
+-			ctt = v1alpha1.ScannerCheckResult{ID: checkResult.ID, ObjectType: checkResult.ObjectType, Remediation: checkResult.Remediation, Details: rds}
++		if len(failedResultEntries) > 0 {
++			ctt = v1alpha1.ScannerCheckResult{ID: checkResult.ID, ObjectType: checkResult.ObjectType, Remediation: checkResult.Remediation, Details: failedResultEntries}
+ 			ctta = append(ctta, ctt)
+ 		}
+ 	}
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index 2fe5e48..6b60d0f 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -252,9 +252,8 @@ func Start(ctx context.Context, buildInfo starboard.BuildInfo, operatorConfig et
+ 		logger := ctrl.Log.WithName("reconciler").WithName("clustercompliancereport")
+ 		cc := &compliance.ClusterComplianceReportReconciler{
+ 			Logger: logger,
+-			Config: operatorConfig,
+ 			Client: mgr.GetClient(),
+-			Mgr:    compliance.NewMgr(mgr.GetClient(), logger),
++			Mgr:    compliance.NewMgr(mgr.GetClient(), logger, starboardConfig),
+ 			Clock:  ext.NewSystemClock(),
+ 		}
+ 		if err := cc.SetupWithManager(mgr); err != nil {
+diff --git a/pkg/starboard/config.go b/pkg/starboard/config.go
+index a33aec4..404f11d 100644
+--- a/pkg/starboard/config.go
++++ b/pkg/starboard/config.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"strconv"
+ 	"strings"
+ 
+ 	embedded "github.com/aquasecurity/starboard"
+@@ -62,6 +63,7 @@ const (
+ 	keyScanJobTolerations                = "scanJob.tolerations"
+ 	keyScanJobAnnotations                = "scanJob.annotations"
+ 	keyScanJobPodTemplateLabels          = "scanJob.podTemplateLabels"
++	keyComplianceFailEntriesLimit        = "compliance.failEntriesLimit"
+ )
+ 
+ // ConfigData holds Starboard configuration settings as a set of key-value
+@@ -81,9 +83,10 @@ func GetDefaultConfig() ConfigData {
+ 		keyVulnerabilityReportsScanner: "Trivy",
+ 		keyConfigAuditReportsScanner:   "Polaris",
+ 
+-		"kube-bench.imageRef":  "docker.io/aquasec/kube-bench:v0.6.6",
+-		"kube-hunter.imageRef": "docker.io/aquasec/kube-hunter:0.6.5",
+-		"kube-hunter.quick":    "false",
++		"kube-bench.imageRef":         "docker.io/aquasec/kube-bench:v0.6.6",
++		"kube-hunter.imageRef":        "docker.io/aquasec/kube-hunter:0.6.5",
++		"kube-hunter.quick":           "false",
++		"compliance.failEntriesLimit": "10",
+ 	}
+ }
+ 
+@@ -209,6 +212,20 @@ func GetVersionFromImageRef(imageRef string) (string, error) {
+ 	return version, nil
+ }
+ 
++func (c ConfigData) ComplianceFailEntriesLimit() int {
++	const defaultValue = 10
++	var value string
++	var ok bool
++	if value, ok = c[keyComplianceFailEntriesLimit]; !ok {
++		return defaultValue
++	}
++	intVal, err := strconv.Atoi(value)
++	if err != nil {
++		return defaultValue
++	}
++	return intVal
++}
++
+ // NewConfigManager constructs a new ConfigManager that is using kubernetes.Interface
+ // to manage ConfigData backed by the ConfigMap stored in the specified namespace.
+ func NewConfigManager(client kubernetes.Interface, namespace string) ConfigManager {

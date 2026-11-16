@@ -1,0 +1,285 @@
+diff --git a/src/rez/config.py b/src/rez/config.py
+index cdb7bcd4..32a42625 100644
+--- a/src/rez/config.py
++++ b/src/rez/config.py
+@@ -401,6 +401,7 @@ config_schema = Schema({
+     "env_var_separators":                           Dict,
+     "variant_select_mode":                          VariantSelectMode_,
+     "package_filter":                               OptionalDictOrDictList,
++    "package_orderers":                             OptionalDictOrDictList,
+     "new_session_popen_args":                       OptionalDict,
+     "context_tracking_amqp":                        OptionalDict,
+     "context_tracking_extra_fields":                OptionalDict,
+diff --git a/src/rez/package_order.py b/src/rez/package_order.py
+index 73ccd2ee..f481202e 100644
+--- a/src/rez/package_order.py
++++ b/src/rez/package_order.py
+@@ -1,6 +1,10 @@
+ from inspect import isclass
+ from hashlib import sha1
+ 
++from rez.config import config
++from rez.utils.data_utils import cached_class_property
++from rez.vendor.version.version import Version
++
+ 
+ class PackageOrder(object):
+     """Package reorderer base class."""
+@@ -36,7 +40,16 @@ class PackageOrder(object):
+ 
+     @property
+     def sha1(self):
+-        return sha1(repr(self)).hexdigest()
++        return sha1(repr(self).encode('utf-8')).hexdigest()
++
++    def __str__(self):
++        raise NotImplementedError
++
++    def __eq__(self, other):
++        raise NotImplementedError
++
++    def __ne__(self, other):
++        return not self == other
+ 
+     def __repr__(self):
+         return "%s(%s)" % (self.__class__.__name__, str(self))
+@@ -57,6 +70,9 @@ class NullPackageOrder(PackageOrder):
+     def __str__(self):
+         return "{}"
+ 
++    def __eq__(self, other):
++        return type(self) == type(other)
++
+     def to_pod(self):
+         """
+         Example (in yaml):
+@@ -86,6 +102,12 @@ class SortedOrder(PackageOrder):
+     def __str__(self):
+         return str(self.descending)
+ 
++    def __eq__(self, other):
++        return (
++            type(self) == type(other) and
++            self.descending == other.descending
++        )
++
+     def to_pod(self):
+         """
+         Example (in yaml):
+@@ -138,6 +160,13 @@ class PerFamilyOrder(PackageOrder):
+         items = sorted((x[0], str(x[1])) for x in self.order_dict.items())
+         return str((items, str(self.default_order)))
+ 
++    def __eq__(self, other):
++        return (
++            type(other) == type(self) and
++            self.order_dict == other.order_dict and
++            self.default_order == other.default_order
++        )
++
+     def to_pod(self):
+         """
+         Example (in yaml):
+@@ -238,6 +267,12 @@ class VersionSplitPackageOrder(PackageOrder):
+     def __str__(self):
+         return str(self.first_version)
+ 
++    def __eq__(self, other):
++        return (
++            type(other) == type(self) and
++            self.first_version == other.first_version
++        )
++
+     def to_pod(self):
+         """
+         Example (in yaml):
+@@ -245,11 +280,11 @@ class VersionSplitPackageOrder(PackageOrder):
+             type: version_split
+             first_version: "3.0.0"
+         """
+-        return dict(first_version=self.first_version)
++        return dict(first_version=str(self.first_version))
+ 
+     @classmethod
+     def from_pod(cls, data):
+-        return cls(data["first_version"])
++        return cls(Version(data["first_version"]))
+ 
+ 
+ class TimestampPackageOrder(PackageOrder):
+@@ -304,7 +339,6 @@ class TimestampPackageOrder(PackageOrder):
+         self.rank = rank
+ 
+     def reorder(self, iterable, key=None):
+-        reordered = []
+         first_after = None
+         key = key or (lambda x: x)
+ 
+@@ -372,6 +406,13 @@ class TimestampPackageOrder(PackageOrder):
+     def __str__(self):
+         return str((self.timestamp, self.rank))
+ 
++    def __eq__(self, other):
++        return (
++            type(other) == type(self) and
++            self.timestamp == other.timestamp and
++            self.rank == other.rank
++        )
++
+     def to_pod(self):
+         """
+         Example (in yaml):
+@@ -385,8 +426,30 @@ class TimestampPackageOrder(PackageOrder):
+ 
+     @classmethod
+     def from_pod(cls, data):
+-        return cls(timestamp=data["timestamp"],
+-                   rank=data["rank"])
++        return cls(timestamp=data["timestamp"], rank=data.get("rank", 0))
++
++
++class PackageOrderList(list):
++    """A list of package orderer.
++    """
++    def to_pod(self):
++        data = []
++        for f in self:
++            data.append(to_pod(f))
++        return data
++
++    @classmethod
++    def from_pod(cls, data):
++        flist = PackageOrderList()
++        for dict_ in data:
++            f = from_pod(dict_)
++            flist.append(f)
++        return flist
++
++    @cached_class_property
++    def singleton(cls):
++        """Filter list as configured by rezconfig.package_filter."""
++        return cls.from_pod(config.package_orderers)
+ 
+ 
+ def to_pod(orderer):
+diff --git a/src/rez/resolved_context.py b/src/rez/resolved_context.py
+index cdac6262..0f90334b 100644
+--- a/src/rez/resolved_context.py
++++ b/src/rez/resolved_context.py
+@@ -21,6 +21,7 @@ from rez.rex_bindings import VersionBinding, VariantBinding, \
+ from rez import package_order
+ from rez.packages import get_variant, iter_packages
+ from rez.package_filter import PackageFilterList
++from rez.package_order import PackageOrderList
+ from rez.shells import create_shell
+ from rez.exceptions import ResolvedContextError, PackageCommandError, \
+     RezError, _NeverError
+@@ -32,13 +33,10 @@ from rez.vendor import yaml
+ from rez.utils import json
+ from rez.utils.yaml import dump_yaml
+ 
+-from tempfile import mkdtemp
+ from functools import wraps
+ import getpass
+ import socket
+ import threading
+-import traceback
+-import inspect
+ import time
+ import sys
+ import os
+@@ -172,6 +170,7 @@ class ResolvedContext(object):
+                 packages. Defaults to settings from config.package_filter. Use
+                 `package_filter.no_filter` to remove all filtering.
+             package_orderers (list of `PackageOrder`): Custom package ordering.
++                Defaults to settings from config.package_orderers.
+             add_implicit_packages: If True, the implicit package list defined
+                 by config.implicit_packages is appended to the request.
+             max_fails (int): Abort the resolve if the number of failed steps is
+@@ -216,7 +215,10 @@ class ResolvedContext(object):
+         self.package_filter = (PackageFilterList.singleton if package_filter is None
+                                else package_filter)
+ 
+-        self.package_orderers = package_orderers
++        self.package_orderers = (
++            PackageOrderList.singleton if package_orderers is None
++            else package_orders
++        )
+ 
+         # patch settings
+         self.default_patch_lock = PatchLock.no_lock
+diff --git a/src/rez/rezconfig.py b/src/rez/rezconfig.py
+index e0b3f5da..84576f1a 100644
+--- a/src/rez/rezconfig.py
++++ b/src/rez/rezconfig.py
+@@ -289,6 +289,70 @@ variant_select_mode = "version_priority"
+ # foo-5+              | Same as range(foo-5+)
+ package_filter = None
+ 
++# Package order. One or more "orderers" can be listed.
++# This will affect the order of version resolution.
++# This can be used to ensure that specific version have priority over others.
++# Higher versions can still be accessed if required.
++#
++# A common use case is to ease migration from python-2 to python-3:
++#
++#     package_orderers = [
++#         {
++#            "type": "per_family",
++#            "orderers": [
++#                 {
++#                     "packages": ["python"],
++#                     "type": "version_split",
++#                     "first_version": "2.7.16"
++#                 }
++#             ]
++#         }
++#     ]
++#
++# This will ensure that for the "python" package, versions equals or lower than "2.7.16" will have priority.
++# Considering the following versions: "2.7.4", "2.7.16", "3.7.4":
++#
++# example             | result
++# --------------------|----------------------------------------------------
++# rez-env python      | python-2.7.16
++# rez-env python-3    | python-3.7.4
++#
++# Here's another example, using another orderer: "soft_timestamp".
++# This orderer will prefer packages released before a provided timestamp.
++# The following example will prefer package released before 2019-09-09.
++#
++#     package_orderers = [
++#         {
++#             "type": "soft_timestamp",
++#             "timestamp": 1568001600,  # 2019-09-09
++#             "rank": 3
++#         }
++#     ]
++#
++# A timestamp can be generated with python:
++#
++#     $ python -c "import datetime, time; print(int(time.mktime(datetime.date(2019, 9, 9).timetuple())))"
++#     1568001600
++#
++# The rank can be used to allow some versions released after the timestamp to still be considered.
++# When using semantic versionnng, a value of 3 is the most common.
++# This will let version with a different patch number to be accepted.
++#
++# Considering a package "foo" with the following versions:
++# - "1.0.0" was released at 2019-09-07
++# - "2.0.0" was released at 2019-09-08
++# - "2.0.1" was released at 2019-09-10
++# - "2.1.0" was released at 2019-09-11
++# - "3.0.0" was released at 2019-09-12
++#
++# example             | timestamp  | rank | result
++# --------------------|------------|---------------------------------------
++# rez-env foo         | 2019-09-09 | 0    | foo-2.0.0
++# rez-env foo         | 2019-09-09 | 3    | foo-2.0.1
++# rez-env foo         | 2019-09-09 | 2    | foo-2.1.0
++# rez-env foo         | 2019-09-09 | 1    | foo-3.0.0
++package_orderers = None
++
+ # If True, unversioned packages are allowed. Solve times are slightly better if
+ # this value is False.
+ allow_unversioned_packages = True

@@ -1,0 +1,355 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index ff68877..cd86710 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -1,4 +1,4 @@
+-[target.wasm32-wasi]
++[target.wasm32-wasip1]
+ runner = ["./scripts/wasmtime-wrapper.sh"]
+ 
+ [target.aarch64-unknown-linux-gnu]
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a3d29a6..28fe1b9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,9 @@ All notable changes to MiniJinja are documented here.
+ ## 2.7.0
+ 
+ - Removed string interning.  #675
++- `loop.nextitem` is now a lazy operation.  This prevents issues when
++  iterating over one-shot iterators combined with `{% break %}` and
++  it now ensures that the iterator is not running "one item ahead".  #677
+ 
+ ## 2.6.0
+ 
+diff --git a/Makefile b/Makefile
+index 7eac203..62a0fcf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -26,7 +26,7 @@ test: test-msrv test-cli
+ 
+ .PHONY: wasi-test
+ wasi-test:
+-	@cd minijinja; cargo test --all-features --target=wasm32-wasi -- --nocapture
++	@cd minijinja; cargo test --all-features --target=wasm32-wasip1 -- --nocapture
+ 
+ .PHONY: python-test
+ python-test:
+diff --git a/minijinja/src/syntax.rs b/minijinja/src/syntax.rs
+index 0f47e73..7415ca4 100644
+--- a/minijinja/src/syntax.rs
++++ b/minijinja/src/syntax.rs
+@@ -746,6 +746,11 @@
+ //! {%- endfor %}
+ //! ```
+ //!
++//! **Note on one-shot iterators:** if you break from a loop but you have
++//! accessed the `loop.nextitem` special variable, then you will lose one item.
++//! This is because accessing that attribute will peak into the iterator and
++//! there is no support for "putting values back".
++//!
+ #![cfg_attr(
+     feature = "custom_syntax",
+     doc = r###"
+diff --git a/minijinja/src/vm/context.rs b/minijinja/src/vm/context.rs
+index 1145f4d..e1157dc 100644
+--- a/minijinja/src/vm/context.rs
++++ b/minijinja/src/vm/context.rs
+@@ -1,29 +1,20 @@
+ use std::borrow::Cow;
+ use std::collections::{BTreeMap, HashSet};
+ use std::fmt;
++
++#[cfg(any(feature = "macros", feature = "multi_template"))]
+ use std::sync::Arc;
+ 
+ use crate::environment::Environment;
+ use crate::error::{Error, ErrorKind};
+-use crate::value::{Value, ValueIter};
+-use crate::vm::loop_object::Loop;
++use crate::value::Value;
++use crate::vm::loop_object::LoopState;
+ 
+ #[cfg(feature = "macros")]
+ use crate::vm::closure_object::Closure;
+ 
+ type Locals<'env> = BTreeMap<&'env str, Value>;
+ 
+-pub(crate) struct LoopState {
+-    pub(crate) with_loop_var: bool,
+-    pub(crate) recurse_jump_target: Option<usize>,
+-    // if we're popping the frame, do we want to jump somewhere?  The
+-    // first item is the target jump instruction, the second argument
+-    // tells us if we need to end capturing.
+-    pub(crate) current_recursion_jump: Option<(usize, bool)>,
+-    pub(crate) iterator: ValueIter,
+-    pub(crate) object: Arc<Loop>,
+-}
+-
+ pub(crate) struct Frame<'env> {
+     pub(crate) locals: Locals<'env>,
+     pub(crate) ctx: Value,
+diff --git a/minijinja/src/vm/loop_object.rs b/minijinja/src/vm/loop_object.rs
+index d3f5783..785d189 100644
+--- a/minijinja/src/vm/loop_object.rs
++++ b/minijinja/src/vm/loop_object.rs
+@@ -3,15 +3,126 @@ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+ use crate::error::{Error, ErrorKind};
+-use crate::value::{Enumerator, Object, Value};
++use crate::value::{Enumerator, Object, Value, ValueIter};
+ use crate::vm::state::State;
+ 
++pub(crate) struct LoopState {
++    pub(crate) with_loop_var: bool,
++    pub(crate) recurse_jump_target: Option<usize>,
++
++    // if we're popping the frame, do we want to jump somewhere?  The
++    // first item is the target jump instruction, the second argument
++    // tells us if we need to end capturing.
++    pub(crate) current_recursion_jump: Option<(usize, bool)>,
++
++    // Depending on if adjacent_loop_items is enabled or not, the iterator
++    // is stored either on the loop state or in the loop object.  This is
++    // done because when the feature is disabled, we can avoid using a mutex.
++    pub(crate) object: Arc<Loop>,
++    #[cfg(not(feature = "adjacent_loop_items"))]
++    iter: crate::value::ValueIter,
++}
++
++impl LoopState {
++    pub fn new(
++        iter: ValueIter,
++        depth: usize,
++        with_loop_var: bool,
++        recurse_jump_target: Option<usize>,
++        current_recursion_jump: Option<(usize, bool)>,
++    ) -> LoopState {
++        // for an iterator where the lower and upper bound are matching we can
++        // consider them to have ExactSizeIterator semantics.  We do however not
++        // expect ExactSizeIterator bounds themselves to support iteration by
++        // other means.
++        let len = match iter.size_hint() {
++            (lower, Some(upper)) if lower == upper => Some(lower),
++            _ => None,
++        };
++        LoopState {
++            with_loop_var,
++            recurse_jump_target,
++            current_recursion_jump,
++            object: Arc::new(Loop {
++                idx: AtomicUsize::new(!0usize),
++                len,
++                depth,
++                #[cfg(feature = "adjacent_loop_items")]
++                iter: Mutex::new(AdjacentLoopItemIterWrapper::new(iter)),
++                last_changed_value: Mutex::default(),
++            }),
++            #[cfg(not(feature = "adjacent_loop_items"))]
++            iter,
++        }
++    }
++
++    pub fn did_not_iterate(&self) -> bool {
++        self.object.idx.load(Ordering::Relaxed) == 0
++    }
++
++    pub fn next(&mut self) -> Option<Value> {
++        self.object.idx.fetch_add(1, Ordering::Relaxed);
++        #[cfg(feature = "adjacent_loop_items")]
++        {
++            self.object.iter.lock().unwrap().next()
++        }
++        #[cfg(not(feature = "adjacent_loop_items"))]
++        {
++            self.iter.next()
++        }
++    }
++}
++
++#[cfg(feature = "adjacent_loop_items")]
++pub(crate) struct AdjacentLoopItemIterWrapper {
++    prev_item: Option<Value>,
++    current_item: Option<Value>,
++    next_item: Option<Value>,
++    iter: ValueIter,
++}
++
++#[cfg(feature = "adjacent_loop_items")]
++impl AdjacentLoopItemIterWrapper {
++    pub fn new(iterator: ValueIter) -> AdjacentLoopItemIterWrapper {
++        AdjacentLoopItemIterWrapper {
++            prev_item: None,
++            current_item: None,
++            next_item: None,
++            iter: iterator,
++        }
++    }
++
++    pub fn next(&mut self) -> Option<Value> {
++        self.prev_item = self.current_item.take();
++        self.current_item = if let Some(ref next) = self.next_item.take() {
++            Some(next.clone())
++        } else {
++            self.next_item = None;
++            self.iter.next()
++        };
++        self.current_item.clone()
++    }
++
++    pub fn next_item(&mut self) -> Value {
++        if let Some(ref next) = self.next_item {
++            next.clone()
++        } else {
++            self.next_item = self.iter.next();
++            self.next_item.clone().unwrap_or_default()
++        }
++    }
++
++    pub fn prev_item(&self) -> Value {
++        self.prev_item.clone().unwrap_or_default()
++    }
++}
++
+ pub(crate) struct Loop {
+     pub len: Option<usize>,
+     pub idx: AtomicUsize,
+     pub depth: usize,
+     #[cfg(feature = "adjacent_loop_items")]
+-    pub value_triple: Mutex<(Option<Value>, Option<Value>, Option<Value>)>,
++    pub iter: Mutex<AdjacentLoopItemIterWrapper>,
+     pub last_changed_value: Mutex<Option<Vec<Value>>>,
+ }
+ 
+@@ -107,23 +218,9 @@ impl Object for Loop {
+             "depth" => Some(Value::from(self.depth + 1)),
+             "depth0" => Some(Value::from(self.depth)),
+             #[cfg(feature = "adjacent_loop_items")]
+-            "previtem" => Some(
+-                self.value_triple
+-                    .lock()
+-                    .unwrap()
+-                    .0
+-                    .clone()
+-                    .unwrap_or(Value::UNDEFINED),
+-            ),
++            "previtem" => Some(self.iter.lock().unwrap().prev_item()),
+             #[cfg(feature = "adjacent_loop_items")]
+-            "nextitem" => Some(
+-                self.value_triple
+-                    .lock()
+-                    .unwrap()
+-                    .2
+-                    .clone()
+-                    .unwrap_or(Value::UNDEFINED),
+-            ),
++            "nextitem" => Some(self.iter.lock().unwrap().next_item()),
+             _ => None,
+         }
+     }
+diff --git a/minijinja/src/vm/mod.rs b/minijinja/src/vm/mod.rs
+index 4ecb90e..a52ed84 100644
+--- a/minijinja/src/vm/mod.rs
++++ b/minijinja/src/vm/mod.rs
+@@ -1,7 +1,8 @@
+ use std::collections::BTreeMap;
+ use std::mem;
+-use std::sync::atomic::{AtomicUsize, Ordering};
+-use std::sync::{Arc, Mutex};
++
++#[cfg(any(feature = "macros", feature = "multi_template"))]
++use std::sync::Arc;
+ 
+ use crate::compiler::instructions::{
+     Instruction, Instructions, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
+@@ -12,8 +13,8 @@ use crate::output::{CaptureMode, Output};
+ use crate::utils::{untrusted_size_hint, AutoEscape, UndefinedBehavior};
+ use crate::value::namespace_object::Namespace;
+ use crate::value::{ops, value_map_with_capacity, Kwargs, ObjectRepr, Value, ValueMap};
+-use crate::vm::context::{Frame, LoopState, Stack};
+-use crate::vm::loop_object::Loop;
++use crate::vm::context::{Frame, Stack};
++use crate::vm::loop_object::LoopState;
+ use crate::vm::state::BlockStack;
+ 
+ #[cfg(feature = "macros")]
+@@ -498,24 +499,7 @@ impl<'env> Vm<'env> {
+                     ctx_ok!(self.push_loop(state, a, *flags, pc, next_loop_recursion_jump.take()));
+                 }
+                 Instruction::Iterate(jump_target) => {
+-                    let l = state.ctx.current_loop().unwrap();
+-                    l.object.idx.fetch_add(1, Ordering::Relaxed);
+-
+-                    let next = {
+-                        #[cfg(feature = "adjacent_loop_items")]
+-                        {
+-                            let mut triple = l.object.value_triple.lock().unwrap();
+-                            triple.0 = triple.1.take();
+-                            triple.1 = triple.2.take();
+-                            triple.2 = l.iterator.next();
+-                            triple.1.clone()
+-                        }
+-                        #[cfg(not(feature = "adjacent_loop_items"))]
+-                        {
+-                            l.iterator.next()
+-                        }
+-                    };
+-                    match next {
++                    match state.ctx.current_loop().unwrap().next() {
+                         Some(item) => stack.push(assert_valid!(item)),
+                         None => {
+                             pc = *jump_target;
+@@ -525,7 +509,7 @@ impl<'env> Vm<'env> {
+                 }
+                 Instruction::PushDidNotIterate => {
+                     let l = state.ctx.current_loop().unwrap();
+-                    stack.push(Value::from(l.object.idx.load(Ordering::Relaxed) == 0));
++                    stack.push(Value::from(l.did_not_iterate()));
+                 }
+                 Instruction::Jump(jump_target) => {
+                     pc = *jump_target;
+@@ -984,15 +968,7 @@ impl<'env> Vm<'env> {
+         current_recursion_jump: Option<(usize, bool)>,
+     ) -> Result<(), Error> {
+         #[allow(unused_mut)]
+-        let mut iterator = ok!(state.undefined_behavior().try_iter(iterable));
+-        // for an iterator where the lower and upper bound are matching we can
+-        // consider them to have ExactSizeIterator semantics.  We do however not
+-        // expect ExactSizeIterator bounds themselves to support iteration by
+-        // other means.
+-        let len = match iterator.size_hint() {
+-            (lower, Some(upper)) if lower == upper => Some(lower),
+-            _ => None,
+-        };
++        let mut iter = ok!(state.undefined_behavior().try_iter(iterable));
+         let depth = state
+             .ctx
+             .current_loop()
+@@ -1001,20 +977,13 @@ impl<'env> Vm<'env> {
+         let recursive = flags & LOOP_FLAG_RECURSIVE != 0;
+         let with_loop_var = flags & LOOP_FLAG_WITH_LOOP_VAR != 0;
+         ok!(state.ctx.push_frame(Frame {
+-            current_loop: Some(LoopState {
++            current_loop: Some(LoopState::new(
++                iter,
++                depth,
+                 with_loop_var,
+-                recurse_jump_target: if recursive { Some(pc) } else { None },
+-                current_recursion_jump,
+-                object: Arc::new(Loop {
+-                    idx: AtomicUsize::new(!0usize),
+-                    len,
+-                    depth,
+-                    #[cfg(feature = "adjacent_loop_items")]
+-                    value_triple: Mutex::new((None, None, iterator.next())),
+-                    last_changed_value: Mutex::default(),
+-                }),
+-                iterator,
+-            }),
++                if recursive { Some(pc) } else { None },
++                current_recursion_jump
++            )),
+             ..Frame::default()
+         }));
+         Ok(())

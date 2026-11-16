@@ -1,0 +1,119 @@
+diff --git a/jax/_src/dtypes.py b/jax/_src/dtypes.py
+index d1e5b7bf4..ae3516ea6 100644
+--- a/jax/_src/dtypes.py
++++ b/jax/_src/dtypes.py
+@@ -279,6 +279,12 @@ def to_inexact_dtype(dtype: DTypeLike) -> DType:
+   return _dtype_to_inexact.get(dtype_, dtype_)
+ 
+ 
++def to_floating_dtype(dtype: DTypeLike) -> DType:
++  """Promotes a dtype to a non-complex floating dtype."""
++  dtype_ = np.dtype(dtype)
++  return finfo(_dtype_to_inexact.get(dtype_, dtype_)).dtype
++
++
+ def to_complex_dtype(dtype: DTypeLike) -> DType:
+   ftype = to_inexact_dtype(dtype)
+   if ftype in [np.dtype('float64'), np.dtype('complex128')]:
+diff --git a/jax/_src/scipy/signal.py b/jax/_src/scipy/signal.py
+index d950cd2ea..565909e8a 100644
+--- a/jax/_src/scipy/signal.py
++++ b/jax/_src/scipy/signal.py
+@@ -1071,7 +1071,7 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
+     noverlap: Number of points to overlap between segments (default: ``nperseg // 2``).
+     nfft: Number of FFT points used in the STFT. If ``None`` (default), the
+       value is determined from the size of ``Zxx``.
+-    input_onesided: If Tru` (default), interpret the input as a one-sided STFT
++    input_onesided: If True (default), interpret the input as a one-sided STFT
+       (positive frequencies only). If False, interpret the input as a two-sided STFT.
+     boundary: If True (default), it is assumed that the input signal was extended at
+       its boundaries by ``stft``. If `False`, the input signal is assumed to have been truncated at the boundaries by `stft`.
+@@ -1108,7 +1108,7 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
+     raise ValueError('Must specify differing time and frequency axes!')
+ 
+   Zxx = jnp.asarray(Zxx, dtype=jax.dtypes.canonicalize_dtype(
+-      np.result_type(Zxx, np.complex64)))
++    dtypes.to_complex_dtype(Zxx.dtype)))
+ 
+   n_default = (2 * (Zxx.shape[freq_axis] - 1) if input_onesided
+                else Zxx.shape[freq_axis])
+@@ -1147,7 +1147,7 @@ def istft(Zxx: Array, fs: ArrayLike = 1.0, window: str = 'hann',
+   xsubs = ifunc(Zxx, axis=-2, n=nfft)[..., :nperseg_int, :]
+ 
+   # Get window as array
+-  if window == 'hann':
++  if isinstance(window, str) and window == 'hann':
+     # Implement the default case without scipy
+     win = jnp.array([1.0]) if nperseg_int == 1 else jnp.sin(jnp.linspace(0, jnp.pi, nperseg_int, endpoint=False)) ** 2
+     win = win.astype(xsubs.dtype)
+diff --git a/jaxlib/py_device_list.cc b/jaxlib/py_device_list.cc
+index c5004dc57..c80602e14 100644
+--- a/jaxlib/py_device_list.cc
++++ b/jaxlib/py_device_list.cc
+@@ -366,14 +366,21 @@ void PyDeviceList::PopulateMemoryKindInfo() {
+     throw nb::value_error("Unrecognized DeviceList type");
+   }
+   MemoryKindInfo info;
+-  if (std::get<0>(device_list_)->size() == 0) {
++  xla::ifrt::Device* addressable_device = nullptr;
++  const int process_index = py_client_ ? py_client_->process_index() : 0;
++  for (xla::ifrt::Device* device : std::get<0>(device_list_)->devices()) {
++    if (device->ProcessIndex() == process_index) {
++      addressable_device = device;
++      break;
++    }
++  }
++  if (addressable_device == nullptr) {
+     info.default_memory_kind = nb::none();
+     memory_kind_info_ = std::move(info);
+     return;
+   }
+-  xla::ifrt::Device* device = std::get<0>(device_list_)->devices()[0];
+ 
+-  auto default_memory = device->DefaultMemory();
++  auto default_memory = addressable_device->DefaultMemory();
+   if (!default_memory.ok()) {
+     // Cache the error.
+     memory_kind_info_ = default_memory.status();
+@@ -381,9 +388,9 @@ void PyDeviceList::PopulateMemoryKindInfo() {
+   }
+   info.default_memory_kind = nb::cast(*(*default_memory)->Kind().memory_kind());
+   nb::tuple memory_kinds =
+-      nb::steal<nb::tuple>(PyTuple_New(device->Memories().size()));
+-  for (size_t i = 0; i < device->Memories().size(); ++i) {
+-    auto* memory = device->Memories()[i];
++      nb::steal<nb::tuple>(PyTuple_New(addressable_device->Memories().size()));
++  for (size_t i = 0; i < addressable_device->Memories().size(); ++i) {
++    auto* memory = addressable_device->Memories()[i];
+     nb::str s = nb::str(memory->Kind().memory_kind()->data(),
+                         memory->Kind().memory_kind()->size());
+     PyTuple_SET_ITEM(memory_kinds.ptr(), i, s.release().ptr());
+@@ -395,17 +402,24 @@ void PyDeviceList::PopulateMemoryKindInfo() {
+ void PyDeviceList::PopulateMemoryKindInfoForDuckTypedDevices() {
+   MemoryKindInfo info;
+   try {
+-    if (std::get<1>(device_list_).size() == 0) {
++    nb::handle addressable_device;
++    for (nb::handle device : std::get<1>(device_list_)) {
++      if (nb::cast<int>(device.attr("process_index")) ==
++          nb::cast<int>(device.attr("client").attr("process_index")())) {
++        addressable_device = device;
++        break;
++      }
++    }
++    if (!addressable_device) {
+       info.default_memory_kind = nb::none();
+       // info.memory_kinds is default-initialized to an empty tuple.
+       memory_kind_info_ = std::move(info);
+       return;
+     }
+-    nb::handle device = std::get<1>(device_list_)[0];
+-    auto default_memory = device.attr("default_memory")();
++    auto default_memory = addressable_device.attr("default_memory")();
+     info.default_memory_kind = default_memory.attr("kind");
+     info.memory_kinds = nb::tuple(
+-        nb::object(device.attr("addressable_memories")()));
++        nb::object(addressable_device.attr("addressable_memories")()));
+     memory_kind_info_ = std::move(info);
+   } catch (nb::python_error& e) {
+     // Cache the error.

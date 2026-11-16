@@ -1,0 +1,678 @@
+diff --git a/src/controller/eme-controller.ts b/src/controller/eme-controller.ts
+index cbeef66f2..8d393fbc6 100644
+--- a/src/controller/eme-controller.ts
++++ b/src/controller/eme-controller.ts
+@@ -9,12 +9,11 @@ import { logger } from '../utils/logger';
+ import {
+   getKeySystemsForConfig,
+   getSupportedMediaKeySystemConfigurations,
+-  keySystemDomainToKeySystemFormat as keySystemToKeySystemFormat,
+-  KeySystemFormats,
+   keySystemFormatToKeySystemDomain,
+-  KeySystemIds,
+   keySystemIdToKeySystemDomain,
+   KeySystems,
++  keySystemDomainToKeySystemFormat as keySystemToKeySystemFormat,
++  parsePlayReadyWRM,
+   requestMediaKeySystemAccess,
+ } from '../utils/mediakeys-helper';
+ import { strToUtf8array } from '../utils/keysystem-util';
+@@ -45,6 +44,7 @@ import type {
+   LoaderConfiguration,
+   LoaderContext,
+ } from '../types/loader';
++import type { KeySystemFormats } from '../utils/mediakeys-helper';
+ 
+ const LOGGER_PREFIX = '[eme]';
+ 
+@@ -94,8 +94,6 @@ class EMEController implements ComponentAPI {
+   private setMediaKeysQueue: Promise<void>[] = EMEController.CDMCleanupPromise
+     ? [EMEController.CDMCleanupPromise]
+     : [];
+-  private onMediaEncrypted = this._onMediaEncrypted.bind(this);
+-  private onWaitingForKey = this._onWaitingForKey.bind(this);
+ 
+   private debug: (msg: any) => void = logger.debug.bind(logger, LOGGER_PREFIX);
+   private log: (msg: any) => void = logger.log.bind(logger, LOGGER_PREFIX);
+@@ -117,13 +115,9 @@ class EMEController implements ComponentAPI {
+     config.licenseXhrSetup = config.licenseResponseCallback = undefined;
+     config.drmSystems = config.drmSystemOptions = {};
+     // @ts-ignore
+-    this.hls =
+-      this.onMediaEncrypted =
+-      this.onWaitingForKey =
+-      this.keyIdToKeySessionPromise =
+-        null as any;
++    this.hls = this.config = this.keyIdToKeySessionPromise = null;
+     // @ts-ignore
+-    this.config = null;
++    this.onMediaEncrypted = this.onWaitingForKey = null;
+   }
+ 
+   private registerListeners() {
+@@ -140,7 +134,7 @@ class EMEController implements ComponentAPI {
+     this.hls.off(Events.MANIFEST_LOADED, this.onManifestLoaded, this);
+   }
+ 
+-  private getLicenseServerUrl(keySystem: KeySystems): string | never {
++  private getLicenseServerUrl(keySystem: KeySystems): string | undefined {
+     const { drmSystems, widevineLicenseUrl } = this.config;
+     const keySystemConfiguration = drmSystems[keySystem];
+ 
+@@ -152,10 +146,16 @@ class EMEController implements ComponentAPI {
+     if (keySystem === KeySystems.WIDEVINE && widevineLicenseUrl) {
+       return widevineLicenseUrl;
+     }
++  }
+ 
+-    throw new Error(
+-      `no license server URL configured for key-system "${keySystem}"`,
+-    );
++  private getLicenseServerUrlOrThrow(keySystem: KeySystems): string | never {
++    const url = this.getLicenseServerUrl(keySystem);
++    if (url === undefined) {
++      throw new Error(
++        `no license server URL configured for key-system "${keySystem}"`,
++      );
++    }
++    return url;
+   }
+ 
+   private getServerCertificateUrl(keySystem: KeySystems): string | void {
+@@ -527,7 +527,7 @@ class EMEController implements ComponentAPI {
+     return this.attemptKeySystemAccess(keySystemsToAttempt);
+   }
+ 
+-  private _onMediaEncrypted(event: MediaEncryptedEvent) {
++  private onMediaEncrypted = (event: MediaEncryptedEvent) => {
+     const { initDataType, initData } = event;
+     const logMessage = `"${event.type}" event: init data type: "${initDataType}"`;
+     this.debug(logMessage);
+@@ -537,133 +537,191 @@ class EMEController implements ComponentAPI {
+       return;
+     }
+ 
+-    let keyId: Uint8Array | undefined;
+-    let keySystemDomain: KeySystems | undefined;
++    if (!this.keyFormatPromise) {
++      let keySystems = Object.keys(
++        this.keySystemAccessPromises,
++      ) as KeySystems[];
++      if (!keySystems.length) {
++        keySystems = getKeySystemsForConfig(this.config);
++      }
++      const keyFormats = keySystems
++        .map(keySystemToKeySystemFormat)
++        .filter((k) => !!k) as KeySystemFormats[];
++      this.keyFormatPromise = this.getKeyFormatPromise(keyFormats);
++    }
+ 
+-    if (
+-      initDataType === 'sinf' &&
+-      this.config.drmSystems[KeySystems.FAIRPLAY]
+-    ) {
+-      // Match sinf keyId to playlist skd://keyId=
+-      const json = bin2str(new Uint8Array(initData));
+-      try {
+-        const sinf = base64Decode(JSON.parse(json).sinf);
+-        const tenc = parseSinf(new Uint8Array(sinf));
+-        if (!tenc) {
+-          throw new Error(
+-            `'schm' box missing or not cbcs/cenc with schi > tenc`,
++    this.keyFormatPromise.then((keySystemFormat) => {
++      const keySystem = keySystemFormatToKeySystemDomain(keySystemFormat);
++
++      let keyId: Uint8Array | null | undefined;
++      let keySystemDomain: KeySystems | undefined;
++
++      if (initDataType === 'sinf') {
++        if (keySystem !== KeySystems.FAIRPLAY) {
++          this.warn(
++            `Ignoring unexpected "${event.type}" event with init data type: "${initDataType}" for selected key-system ${keySystem}`,
+           );
++          return;
+         }
+-        keyId = tenc.subarray(8, 24);
+-        keySystemDomain = KeySystems.FAIRPLAY;
+-      } catch (error) {
+-        this.warn(`${logMessage} Failed to parse sinf: ${error}`);
+-        return;
+-      }
+-    } else {
+-      // Support Widevine clear-lead key-session creation (otherwise depend on playlist keys)
+-      const psshResults = parseMultiPssh(initData);
+-      const psshInfo = psshResults.filter(
+-        (pssh): pssh is PsshData => pssh.systemId === KeySystemIds.WIDEVINE,
+-      )[0];
+-      if (!psshInfo) {
++        // Match sinf keyId to playlist skd://keyId=
++        const json = bin2str(new Uint8Array(initData));
++        try {
++          const sinf = base64Decode(JSON.parse(json).sinf);
++          const tenc = parseSinf(sinf);
++          if (!tenc) {
++            throw new Error(
++              `'schm' box missing or not cbcs/cenc with schi > tenc`,
++            );
++          }
++          keyId = tenc.subarray(8, 24);
++          keySystemDomain = KeySystems.FAIRPLAY;
++        } catch (error) {
++          this.warn(`${logMessage} Failed to parse sinf: ${error}`);
++          return;
++        }
++      } else {
+         if (
+-          psshResults.length === 0 ||
+-          psshResults.some((pssh): pssh is PsshInvalidResult => !pssh.systemId)
++          keySystem !== KeySystems.WIDEVINE &&
++          keySystem !== KeySystems.PLAYREADY
+         ) {
+-          this.warn(`${logMessage} contains incomplete or invalid pssh data`);
+-        } else {
+-          this.log(
+-            `ignoring ${logMessage} for ${(psshResults as PsshData[])
+-              .map((pssh) => keySystemIdToKeySystemDomain(pssh.systemId))
+-              .join(',')} pssh data in favor of playlist keys`,
++          this.warn(
++            `Ignoring unexpected "${event.type}" event with init data type: "${initDataType}" for selected key-system ${keySystem}`,
+           );
++          return;
+         }
+-        return;
+-      }
+-      keySystemDomain = keySystemIdToKeySystemDomain(psshInfo.systemId);
+-      if (psshInfo.version === 0 && psshInfo.data) {
+-        const offset = psshInfo.data.length - 22;
+-        keyId = psshInfo.data.subarray(offset, offset + 16);
+-      }
+-    }
+-
+-    if (!keySystemDomain || !keyId) {
+-      return;
+-    }
++        // Support Widevine/PlayReady clear-lead key-session creation (otherwise depend on playlist keys)
++        const psshResults = parseMultiPssh(initData);
+ 
+-    const keyIdHex = Hex.hexDump(keyId);
+-    const { keyIdToKeySessionPromise, mediaKeySessions } = this;
++        const psshInfos = psshResults.filter(
++          (pssh): pssh is PsshData =>
++            !!pssh.systemId &&
++            keySystemIdToKeySystemDomain(pssh.systemId) === keySystem,
++        );
+ 
+-    let keySessionContextPromise = keyIdToKeySessionPromise[keyIdHex];
+-    for (let i = 0; i < mediaKeySessions.length; i++) {
+-      // Match playlist key
+-      const keyContext = mediaKeySessions[i];
+-      const decryptdata = keyContext.decryptdata;
+-      if (!decryptdata.keyId) {
+-        continue;
+-      }
+-      const oldKeyIdHex = Hex.hexDump(decryptdata.keyId);
+-      if (
+-        keyIdHex === oldKeyIdHex ||
+-        decryptdata.uri.replace(/-/g, '').indexOf(keyIdHex) !== -1
+-      ) {
+-        keySessionContextPromise = keyIdToKeySessionPromise[oldKeyIdHex];
+-        if (decryptdata.pssh) {
+-          break;
++        if (psshInfos.length > 1) {
++          this.warn(
++            `${logMessage} Using first of ${psshInfos.length} pssh found for selected key-system ${keySystem}`,
++          );
+         }
+-        delete keyIdToKeySessionPromise[oldKeyIdHex];
+-        decryptdata.pssh = new Uint8Array(initData);
+-        decryptdata.keyId = keyId;
+-        keySessionContextPromise = keyIdToKeySessionPromise[keyIdHex] =
+-          keySessionContextPromise.then(() => {
+-            return this.generateRequestWithPreferredKeySession(
+-              keyContext,
+-              initDataType,
+-              initData,
+-              'encrypted-event-key-match',
++
++        const psshInfo = psshInfos[0];
++
++        if (!psshInfo) {
++          if (
++            psshResults.length === 0 ||
++            psshResults.some(
++              (pssh): pssh is PsshInvalidResult => !pssh.systemId,
++            )
++          ) {
++            this.warn(`${logMessage} contains incomplete or invalid pssh data`);
++          } else {
++            this.log(
++              `ignoring ${logMessage} for ${(psshResults as PsshData[])
++                .map((pssh) => keySystemIdToKeySystemDomain(pssh.systemId))
++                .join(',')} pssh data in favor of playlist keys`,
+             );
+-          });
+-        break;
++          }
++          return;
++        }
++
++        keySystemDomain = keySystemIdToKeySystemDomain(psshInfo.systemId);
++        if (psshInfo.version === 0 && psshInfo.data) {
++          if (keySystemDomain === KeySystems.WIDEVINE) {
++            const offset = psshInfo.data.length - 22;
++            keyId = psshInfo.data.subarray(offset, offset + 16);
++          } else if (keySystemDomain === KeySystems.PLAYREADY) {
++            keyId = parsePlayReadyWRM(psshInfo.data);
++          }
++        }
+       }
+-    }
+ 
+-    if (!keySessionContextPromise) {
+-      // Clear-lead key (not encountered in playlist)
+-      keySessionContextPromise = keyIdToKeySessionPromise[keyIdHex] =
+-        this.getKeySystemSelectionPromise([keySystemDomain]).then(
+-          ({ keySystem, mediaKeys }) => {
+-            this.throwIfDestroyed();
+-            const decryptdata = new LevelKey(
+-              'ISO-23001-7',
+-              keyIdHex,
+-              keySystemToKeySystemFormat(keySystem) ?? '',
+-            );
+-            decryptdata.pssh = new Uint8Array(initData);
+-            decryptdata.keyId = keyId as Uint8Array;
+-            return this.attemptSetMediaKeys(keySystem, mediaKeys).then(() => {
+-              this.throwIfDestroyed();
+-              const keySessionContext = this.createMediaKeySessionContext({
+-                decryptdata,
+-                keySystem,
+-                mediaKeys,
+-              });
++      if (!keySystemDomain || !keyId) {
++        this.log(`Unable to handle ${logMessage} with key-system ${keySystem}`);
++        return;
++      }
++
++      const keyIdHex = Hex.hexDump(keyId);
++      const { keyIdToKeySessionPromise, mediaKeySessions } = this;
++
++      let keySessionContextPromise = keyIdToKeySessionPromise[keyIdHex];
++      for (let i = 0; i < mediaKeySessions.length; i++) {
++        // Match playlist key
++        const keyContext = mediaKeySessions[i];
++        const decryptdata = keyContext.decryptdata;
++        if (!decryptdata.keyId) {
++          continue;
++        }
++        const oldKeyIdHex = Hex.hexDump(decryptdata.keyId);
++        if (
++          keyIdHex === oldKeyIdHex ||
++          decryptdata.uri.replace(/-/g, '').indexOf(keyIdHex) !== -1
++        ) {
++          keySessionContextPromise = keyIdToKeySessionPromise[oldKeyIdHex];
++          if (decryptdata.pssh) {
++            break;
++          }
++          delete keyIdToKeySessionPromise[oldKeyIdHex];
++          decryptdata.pssh = new Uint8Array(initData);
++          decryptdata.keyId = keyId;
++          keySessionContextPromise = keyIdToKeySessionPromise[keyIdHex] =
++            keySessionContextPromise.then(() => {
+               return this.generateRequestWithPreferredKeySession(
+-                keySessionContext,
++                keyContext,
+                 initDataType,
+                 initData,
+-                'encrypted-event-no-match',
++                'encrypted-event-key-match',
+               );
+             });
+-          },
+-        );
+-    }
+-    keySessionContextPromise.catch((error) => this.handleError(error));
+-  }
++          keySessionContextPromise.catch((error) => this.handleError(error));
++          break;
++        }
++      }
++
++      if (!keySessionContextPromise) {
++        if (keySystemDomain !== keySystem) {
++          this.log(
++            `Ignoring "${logMessage}" with ${keySystemDomain} init data for selected key-system ${keySystem}`,
++          );
++          return;
++        }
++        // "Clear-lead" (misc key not encountered in playlist)
++        keySessionContextPromise = keyIdToKeySessionPromise[keyIdHex] =
++          this.getKeySystemSelectionPromise([keySystemDomain]).then(
++            ({ keySystem, mediaKeys }) => {
++              this.throwIfDestroyed();
++
++              const decryptdata = new LevelKey(
++                'ISO-23001-7',
++                keyIdHex,
++                keySystemToKeySystemFormat(keySystem) ?? '',
++              );
++              decryptdata.pssh = new Uint8Array(initData);
++              decryptdata.keyId = keyId as Uint8Array;
++              return this.attemptSetMediaKeys(keySystem, mediaKeys).then(() => {
++                this.throwIfDestroyed();
++                const keySessionContext = this.createMediaKeySessionContext({
++                  decryptdata,
++                  keySystem,
++                  mediaKeys,
++                });
++                return this.generateRequestWithPreferredKeySession(
++                  keySessionContext,
++                  initDataType,
++                  initData,
++                  'encrypted-event-no-match',
++                );
++              });
++            },
++          );
+ 
+-  private _onWaitingForKey(event: Event) {
++        keySessionContextPromise.catch((error) => this.handleError(error));
++      }
++    });
++  };
++
++  private onWaitingForKey = (event: Event) => {
+     this.log(`"${event.type}" event`);
+-  }
++  };
+ 
+   private attemptSetMediaKeys(
+     keySystem: KeySystems,
+@@ -1111,7 +1169,7 @@ class EMEController implements ComponentAPI {
+   ): Promise<ArrayBuffer> {
+     const keyLoadPolicy = this.config.keyLoadPolicy.default;
+     return new Promise((resolve, reject) => {
+-      const url = this.getLicenseServerUrl(keySessionContext.keySystem);
++      const url = this.getLicenseServerUrlOrThrow(keySessionContext.keySystem);
+       this.log(`Sending license request to URL: ${url}`);
+       const xhr = new XMLHttpRequest();
+       xhr.responseType = 'arraybuffer';
+@@ -1216,6 +1274,8 @@ class EMEController implements ComponentAPI {
+     // keep reference of media
+     this.media = media;
+ 
++    media.removeEventListener('encrypted', this.onMediaEncrypted);
++    media.removeEventListener('waitingforkey', this.onWaitingForKey);
+     media.addEventListener('encrypted', this.onMediaEncrypted);
+     media.addEventListener('waitingforkey', this.onWaitingForKey);
+   }
+diff --git a/src/loader/key-loader.ts b/src/loader/key-loader.ts
+index 71545063b..5c903f85c 100644
+--- a/src/loader/key-loader.ts
++++ b/src/loader/key-loader.ts
+@@ -112,7 +112,12 @@ export default class KeyLoader implements ComponentAPI {
+   }
+ 
+   load(frag: Fragment): Promise<KeyLoadedData> {
+-    if (!frag.decryptdata && frag.encrypted && this.emeController) {
++    if (
++      !frag.decryptdata &&
++      frag.encrypted &&
++      this.emeController &&
++      this.config.emeEnabled
++    ) {
+       // Multiple keys, but none selected, resolve in eme-controller
+       return this.emeController
+         .selectKeySystemFormat(frag)
+diff --git a/src/loader/level-key.ts b/src/loader/level-key.ts
+index 3db1b2582..169c25021 100644
+--- a/src/loader/level-key.ts
++++ b/src/loader/level-key.ts
+@@ -2,7 +2,7 @@ import {
+   changeEndianness,
+   convertDataUriToArrayBytes,
+ } from '../utils/keysystem-util';
+-import { KeySystemFormats } from '../utils/mediakeys-helper';
++import { KeySystemFormats, parsePlayReadyWRM } from '../utils/mediakeys-helper';
+ import { mp4pssh } from '../utils/mp4-tools';
+ import { logger } from '../utils/logger';
+ import { base64Decode } from '../utils/numeric-encoding-utils';
+@@ -121,6 +121,8 @@ export class LevelKey implements DecryptData {
+     if (keyBytes) {
+       switch (this.keyFormat) {
+         case KeySystemFormats.WIDEVINE:
++          // Setting `pssh` on this LevelKey/DecryptData allows HLS.js to generate a session using
++          // the playlist-key before the "encrypted" event. (Comment out to only use "encrypted" path.)
+           this.pssh = keyBytes;
+           // In case of widevine keyID is embedded in PSSH box. Read Key ID.
+           if (keyBytes.length >= 22) {
+@@ -136,38 +138,12 @@ export class LevelKey implements DecryptData {
+             0x5b, 0xe0, 0x88, 0x5f, 0x95,
+           ]);
+ 
++          // Setting `pssh` on this LevelKey/DecryptData allows HLS.js to generate a session using
++          // the playlist-key before the "encrypted" event. (Comment out to only use "encrypted" path.)
+           this.pssh = mp4pssh(PlayReadyKeySystemUUID, null, keyBytes);
+ 
+-          const keyBytesUtf16 = new Uint16Array(
+-            keyBytes.buffer,
+-            keyBytes.byteOffset,
+-            keyBytes.byteLength / 2,
+-          );
+-          const keyByteStr = String.fromCharCode.apply(
+-            null,
+-            Array.from(keyBytesUtf16),
+-          );
++          this.keyId = parsePlayReadyWRM(keyBytes);
+ 
+-          // Parse Playready WRMHeader XML
+-          const xmlKeyBytes = keyByteStr.substring(
+-            keyByteStr.indexOf('<'),
+-            keyByteStr.length,
+-          );
+-          const parser = new DOMParser();
+-          const xmlDoc = parser.parseFromString(xmlKeyBytes, 'text/xml');
+-          const keyData = xmlDoc.getElementsByTagName('KID')[0];
+-          if (keyData) {
+-            const keyId = keyData.childNodes[0]
+-              ? keyData.childNodes[0].nodeValue
+-              : keyData.getAttribute('VALUE');
+-            if (keyId) {
+-              const keyIdArray = base64Decode(keyId).subarray(0, 16);
+-              // KID value in PRO is a base64-encoded little endian GUID interpretation of UUID
+-              // KID value in ‘tenc’ is a big endian UUID GUID interpretation of UUID
+-              changeEndianness(keyIdArray);
+-              this.keyId = keyIdArray;
+-            }
+-          }
+           break;
+         }
+         default: {
+diff --git a/src/utils/level-helper.ts b/src/utils/level-helper.ts
+index c407f591d..86fa28139 100644
+--- a/src/utils/level-helper.ts
++++ b/src/utils/level-helper.ts
+@@ -8,7 +8,12 @@ import { LevelDetails } from '../loader/level-details';
+ import type { Level } from '../types/level';
+ import { DateRange } from '../loader/date-range';
+ 
+-type FragmentIntersection = (oldFrag: Fragment, newFrag: Fragment) => void;
++type FragmentIntersection = (
++  oldFrag: Fragment,
++  newFrag: Fragment,
++  newFragIndex: number,
++  newFragments: Fragment[],
++) => void;
+ type PartIntersection = (oldPart: Part, newPart: Part) => void;
+ 
+ export function updatePTS(
+@@ -106,7 +111,7 @@ export function updateFragPTSDTS(
+   if (!details || sn < details.startSN || sn > details.endSN) {
+     return 0;
+   }
+-  let i;
++  let i: number;
+   const fragIdx = sn - details.startSN;
+   const fragments = details.fragments;
+   // update frag reference in fragments array
+@@ -152,18 +157,19 @@ export function mergeDetails(
+     delete oldDetails.fragmentHint.endPTS;
+   }
+   // check if old/new playlists have fragments in common
+-  // loop through overlapping SN and update startPTS , cc, and duration if any found
+-  let ccOffset = 0;
+-  let PTSFrag;
++  // loop through overlapping SN and update startPTS, cc, and duration if any found
++  let PTSFrag: Fragment | undefined;
+   mapFragmentIntersection(
+     oldDetails,
+     newDetails,
+-    (oldFrag: Fragment, newFrag: Fragment) => {
+-      if (oldFrag.relurl) {
+-        // Do not compare CC if the old fragment has no url. This is a level.fragmentHint used by LL-HLS parts.
+-        // It maybe be off by 1 if it was created before any parts or discontinuity tags were appended to the end
+-        // of the playlist.
+-        ccOffset = oldFrag.cc - newFrag.cc;
++    (oldFrag, newFrag, newFragIndex, newFragments) => {
++      if (newDetails.skippedSegments) {
++        if (newFrag.cc !== oldFrag.cc) {
++          const ccOffset = oldFrag.cc - newFrag.cc;
++          for (let i = newFragIndex; i < newFragments.length; i++) {
++            newFragments[i].cc += ccOffset;
++          }
++        }
+       }
+       if (
+         Number.isFinite(oldFrag.startPTS) &&
+@@ -196,10 +202,11 @@ export function mergeDetails(
+     },
+   );
+ 
++  const newFragments = newDetails.fragments;
+   if (currentInitSegment) {
+     const fragmentsToCheck = newDetails.fragmentHint
+-      ? newDetails.fragments.concat(newDetails.fragmentHint)
+-      : newDetails.fragments;
++      ? newFragments.concat(newDetails.fragmentHint)
++      : newFragments;
+     fragmentsToCheck.forEach((frag) => {
+       if (
+         frag &&
+@@ -212,34 +219,26 @@ export function mergeDetails(
+   }
+ 
+   if (newDetails.skippedSegments) {
+-    newDetails.deltaUpdateFailed = newDetails.fragments.some((frag) => !frag);
++    newDetails.deltaUpdateFailed = newFragments.some((frag) => !frag);
+     if (newDetails.deltaUpdateFailed) {
+       logger.warn(
+         '[level-helper] Previous playlist missing segments skipped in delta playlist',
+       );
+       for (let i = newDetails.skippedSegments; i--; ) {
+-        newDetails.fragments.shift();
++        newFragments.shift();
++      }
++      newDetails.startSN = newFragments[0].sn as number;
++    } else {
++      if (newDetails.canSkipDateRanges) {
++        newDetails.dateRanges = mergeDateRanges(
++          oldDetails.dateRanges,
++          newDetails.dateRanges,
++          newDetails.recentlyRemovedDateranges,
++        );
+       }
+-      newDetails.startSN = newDetails.fragments[0].sn as number;
+-      newDetails.startCC = newDetails.fragments[0].cc;
+-    } else if (newDetails.canSkipDateRanges) {
+-      newDetails.dateRanges = mergeDateRanges(
+-        oldDetails.dateRanges,
+-        newDetails.dateRanges,
+-        newDetails.recentlyRemovedDateranges,
+-      );
+-    }
+-  }
+-
+-  const newFragments = newDetails.fragments;
+-  if (ccOffset) {
+-    logger.warn('discontinuity sliding from playlist, take drift into account');
+-    for (let i = 0; i < newFragments.length; i++) {
+-      newFragments[i].cc += ccOffset;
+     }
+-  }
+-  if (newDetails.skippedSegments) {
+     newDetails.startCC = newDetails.fragments[0].cc;
++    newDetails.endCC = newFragments[newFragments.length - 1].cc;
+   }
+ 
+   // Merge parts
+@@ -257,10 +256,10 @@ export function mergeDetails(
+     updateFragPTSDTS(
+       newDetails,
+       PTSFrag,
+-      PTSFrag.startPTS,
+-      PTSFrag.endPTS,
+-      PTSFrag.startDTS,
+-      PTSFrag.endDTS,
++      PTSFrag.startPTS as number,
++      PTSFrag.endPTS as number,
++      PTSFrag.startDTS as number,
++      PTSFrag.endDTS as number,
+     );
+   } else {
+     // ensure that delta is within oldFragments range
+@@ -371,7 +370,7 @@ export function mapFragmentIntersection(
+       newFrag = newDetails.fragments[i] = oldFrag;
+     }
+     if (oldFrag && newFrag) {
+-      intersectionFn(oldFrag, newFrag);
++      intersectionFn(oldFrag, newFrag, i, newFrags);
+     }
+   }
+ }
+diff --git a/src/utils/mediakeys-helper.ts b/src/utils/mediakeys-helper.ts
+index 426fb43a0..d5443b48e 100755
+--- a/src/utils/mediakeys-helper.ts
++++ b/src/utils/mediakeys-helper.ts
+@@ -1,5 +1,7 @@
+-import type { DRMSystemOptions, EMEControllerConfig } from '../config';
+ import { optionalSelf } from './global';
++import { changeEndianness } from './keysystem-util';
++import { base64Decode } from './numeric-encoding-utils';
++import type { DRMSystemOptions, EMEControllerConfig } from '../config';
+ 
+ /**
+  * @see https://developer.mozilla.org/en-US/docs/Web/API/Navigator/requestMediaKeySystemAccess
+@@ -163,3 +165,34 @@ function createMediaKeySystemConfigurations(
+ 
+   return [baseConfig];
+ }
++
++export function parsePlayReadyWRM(keyBytes: Uint8Array): Uint8Array | null {
++  const keyBytesUtf16 = new Uint16Array(
++    keyBytes.buffer,
++    keyBytes.byteOffset,
++    keyBytes.byteLength / 2,
++  );
++  const keyByteStr = String.fromCharCode.apply(null, Array.from(keyBytesUtf16));
++
++  // Parse Playready WRMHeader XML
++  const xmlKeyBytes = keyByteStr.substring(
++    keyByteStr.indexOf('<'),
++    keyByteStr.length,
++  );
++  const parser = new DOMParser();
++  const xmlDoc = parser.parseFromString(xmlKeyBytes, 'text/xml');
++  const keyData = xmlDoc.getElementsByTagName('KID')[0];
++  if (keyData) {
++    const keyId = keyData.childNodes[0]
++      ? keyData.childNodes[0].nodeValue
++      : keyData.getAttribute('VALUE');
++    if (keyId) {
++      const keyIdArray = base64Decode(keyId).subarray(0, 16);
++      // KID value in PRO is a base64-encoded little endian GUID interpretation of UUID
++      // KID value in ‘tenc’ is a big endian UUID GUID interpretation of UUID
++      changeEndianness(keyIdArray);
++      return keyIdArray;
++    }
++  }
++  return null;
++}

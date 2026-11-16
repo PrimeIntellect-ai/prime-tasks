@@ -1,0 +1,479 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 12a1c1c2..ea725a61 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ## Unreleased
+ 
+ - Fix issues [#277](https://github.com/ron-rs/ron/issues/277) and [#405](https://github.com/ron-rs/ron/issues/405) with `Value::Map` `IntoIter` and extraneous item check for `Value::Seq` ([#406](https://github.com/ron-rs/ron/pull/406))
++- Fix issue [#401](https://github.com/ron-rs/ron/issues/401) with correct raw struct name identifier parsing ([#402](https://github.com/ron-rs/ron/pull/402))
+ 
+ ## [0.8.0] - 2022-08-17
+ 
+diff --git a/docs/grammar.md b/docs/grammar.md
+index 5c88107e..e119c9d8 100644
+--- a/docs/grammar.md
++++ b/docs/grammar.md
+@@ -138,3 +138,14 @@ enum_variant_unit = ident;
+ enum_variant_tuple = ident, ws, tuple;
+ enum_variant_named = ident, ws, "(", [named_field, { comma, named_field }, [comma]], ")";
+ ```
++
++## Identifier
++
++```ebnf
++ident = ident_std | ident_raw;
++ident_std = ident_std_first, { ident_std_rest };
++ident_std_first = "A" | ... | "Z" | "a" | ... | "z" | "_";
++ident_std_rest = ident_std_first | digit;
++ident_raw = "r", "#", ident_raw_rest, { ident_raw_rest };
++ident_raw_rest = ident_std_rest | "." | "+" | "-";
++```
+diff --git a/src/de/mod.rs b/src/de/mod.rs
+index 4af28cdf..9c5b6f99 100644
+--- a/src/de/mod.rs
++++ b/src/de/mod.rs
+@@ -124,13 +124,56 @@ impl<'de> Deserializer<'de> {
+                 // first argument is technically incorrect, but ignored anyway
+                 self.deserialize_tuple(0, visitor)
+             } else {
+-                // first two arguments are technically incorrect, but ignored anyway
+-                self.deserialize_struct("", &[], visitor)
++                // giving no name results in worse errors but is necessary here
++                self.handle_struct_after_name("", visitor)
+             }
+         } else {
+             visitor.visit_unit()
+         }
+     }
++
++    /// Called from `deserialize_struct`, `struct_variant`, and `handle_any_struct`.
++    /// Handles deserialising the enclosing parentheses and everything in between.
++    ///
++    /// This method assumes there is no struct name identifier left.
++    fn handle_struct_after_name<V>(
++        &mut self,
++        name_for_pretty_errors_only: &'static str,
++        visitor: V,
++    ) -> Result<V::Value>
++    where
++        V: Visitor<'de>,
++    {
++        if self.newtype_variant || self.bytes.consume("(") {
++            let old_newtype_variant = self.newtype_variant;
++            self.newtype_variant = false;
++
++            let value = visitor
++                .visit_map(CommaSeparated::new(b')', self))
++                .map_err(|err| {
++                    struct_error_name(
++                        err,
++                        if !old_newtype_variant && !name_for_pretty_errors_only.is_empty() {
++                            Some(name_for_pretty_errors_only)
++                        } else {
++                            None
++                        },
++                    )
++                })?;
++
++            self.bytes.comma()?;
++
++            if old_newtype_variant || self.bytes.consume(")") {
++                Ok(value)
++            } else {
++                Err(Error::ExpectedStructLikeEnd)
++            }
++        } else if name_for_pretty_errors_only.is_empty() {
++            Err(Error::ExpectedStructLike)
++        } else {
++            Err(Error::ExpectedNamedStructLike(name_for_pretty_errors_only))
++        }
++    }
+ }
+ 
+ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+@@ -512,7 +555,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+     }
+ 
+     fn deserialize_struct<V>(
+-        mut self,
++        self,
+         name: &'static str,
+         _fields: &'static [&'static str],
+         visitor: V,
+@@ -526,35 +569,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+ 
+         self.bytes.skip_ws()?;
+ 
+-        if self.newtype_variant || self.bytes.consume("(") {
+-            let old_newtype_variant = self.newtype_variant;
+-            self.newtype_variant = false;
+-
+-            let value = visitor
+-                .visit_map(CommaSeparated::new(b')', self))
+-                .map_err(|err| {
+-                    struct_error_name(
+-                        err,
+-                        if !old_newtype_variant && !name.is_empty() {
+-                            Some(name)
+-                        } else {
+-                            None
+-                        },
+-                    )
+-                })?;
+-
+-            self.bytes.comma()?;
+-
+-            if old_newtype_variant || self.bytes.consume(")") {
+-                Ok(value)
+-            } else {
+-                Err(Error::ExpectedStructLikeEnd)
+-            }
+-        } else if name.is_empty() {
+-            Err(Error::ExpectedStructLike)
+-        } else {
+-            Err(Error::ExpectedNamedStructLike(name))
+-        }
++        self.handle_struct_after_name(name, visitor)
+     }
+ 
+     fn deserialize_enum<V>(
+@@ -769,7 +784,7 @@ impl<'de, 'a> de::VariantAccess<'de> for Enum<'a, 'de> {
+         self.de.deserialize_tuple(len, visitor)
+     }
+ 
+-    fn struct_variant<V>(self, fields: &'static [&'static str], visitor: V) -> Result<V::Value>
++    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
+     where
+         V: Visitor<'de>,
+     {
+@@ -778,7 +793,7 @@ impl<'de, 'a> de::VariantAccess<'de> for Enum<'a, 'de> {
+         self.de.bytes.skip_ws()?;
+ 
+         self.de
+-            .deserialize_struct("", fields, visitor)
++            .handle_struct_after_name("", visitor)
+             .map_err(|err| struct_error_name(err, struct_variant))
+     }
+ }
+diff --git a/src/error.rs b/src/error.rs
+index d6457545..6c815345 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -2,6 +2,8 @@ use std::{error::Error as StdError, fmt, io, str::Utf8Error, string::FromUtf8Err
+ 
+ use serde::{de, ser};
+ 
++use crate::parse::{is_ident_first_char, is_ident_other_char, is_ident_raw_char};
++
+ /// This type represents all possible errors that can occur when
+ /// serializing or deserializing RON data.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -86,6 +88,8 @@ pub enum Error {
+         field: &'static str,
+         outer: Option<String>,
+     },
++    InvalidIdentifier(String),
++    SuggestRawIdentifier(String),
+ }
+ 
+ impl fmt::Display for SpannedError {
+@@ -125,10 +129,19 @@ impl fmt::Display for Error {
+             Error::ExpectedDifferentStructName {
+                 expected,
+                 ref found,
+-            } => write!(f, "Expected struct `{}` but found `{}`", expected, found),
++            } => write!(
++                f,
++                "Expected struct {} but found {}",
++                Identifier(expected),
++                Identifier(found)
++            ),
+             Error::ExpectedStructLike => f.write_str("Expected opening `(`"),
+             Error::ExpectedNamedStructLike(name) => {
+-                write!(f, "Expected opening `(` for struct `{}`", name)
++                if name.is_empty() {
++                    f.write_str("Expected only opening `(`, no name, for un-nameable struct")
++                } else {
++                    write!(f, "Expected opening `(` for struct {}", Identifier(name))
++                }
+             }
+             Error::ExpectedStructLikeEnd => f.write_str("Expected closing `)`"),
+             Error::ExpectedUnit => f.write_str("Expected unit"),
+@@ -137,7 +150,9 @@ impl fmt::Display for Error {
+             Error::ExpectedIdentifier => f.write_str("Expected identifier"),
+             Error::InvalidEscape(s) => f.write_str(s),
+             Error::IntegerOutOfBounds => f.write_str("Integer is out of bounds"),
+-            Error::NoSuchExtension(ref name) => write!(f, "No RON extension named `{}`", name),
++            Error::NoSuchExtension(ref name) => {
++                write!(f, "No RON extension named {}", Identifier(name))
++            }
+             Error::Utf8Error(ref e) => fmt::Display::fmt(e, f),
+             Error::UnclosedBlockComment => f.write_str("Unclosed block comment"),
+             Error::UnderscoreAtBeginning => {
+@@ -176,10 +191,10 @@ impl fmt::Display for Error {
+                     f.write_str("enum ")?;
+                 }
+ 
+-                write!(f, "variant named `{}`", found)?;
++                write!(f, "variant named {}", Identifier(found))?;
+ 
+                 if let Some(outer) = outer {
+-                    write!(f, "in enum `{}`", outer)?;
++                    write!(f, "in enum {}", Identifier(outer))?;
+                 }
+ 
+                 write!(
+@@ -196,10 +211,10 @@ impl fmt::Display for Error {
+                 ref found,
+                 ref outer,
+             } => {
+-                write!(f, "Unexpected field named `{}`", found)?;
++                write!(f, "Unexpected field named {}", Identifier(found))?;
+ 
+                 if let Some(outer) = outer {
+-                    write!(f, "in `{}`", outer)?;
++                    write!(f, "in {}", Identifier(outer))?;
+                 }
+ 
+                 write!(
+@@ -212,21 +227,27 @@ impl fmt::Display for Error {
+                 )
+             }
+             Error::MissingStructField { field, ref outer } => {
+-                write!(f, "Unexpected missing field `{}`", field)?;
++                write!(f, "Unexpected missing field {}", Identifier(field))?;
+ 
+                 match outer {
+-                    Some(outer) => write!(f, " in `{}`", outer),
++                    Some(outer) => write!(f, " in {}", Identifier(outer)),
+                     None => Ok(()),
+                 }
+             }
+             Error::DuplicateStructField { field, ref outer } => {
+-                write!(f, "Unexpected duplicate field `{}`", field)?;
++                write!(f, "Unexpected duplicate field {}", Identifier(field))?;
+ 
+                 match outer {
+-                    Some(outer) => write!(f, " in `{}`", outer),
++                    Some(outer) => write!(f, " in {}", Identifier(outer)),
+                     None => Ok(()),
+                 }
+             }
++            Error::InvalidIdentifier(ref invalid) => write!(f, "Invalid identifier {:?}", invalid),
++            Error::SuggestRawIdentifier(ref identifier) => write!(
++                f,
++                "Found invalid std identifier `{}`, try the raw identifier `r#{}` instead",
++                identifier, identifier
++            ),
+         }
+     }
+ }
+@@ -383,13 +404,18 @@ impl fmt::Display for OneOf {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self.alts {
+             [] => write!(f, "there are no {}", self.none),
+-            [a1] => write!(f, "expected `{}` instead", a1),
+-            [a1, a2] => write!(f, "expected either `{}` or `{}` instead", a1, a2),
++            [a1] => write!(f, "expected {} instead", Identifier(a1)),
++            [a1, a2] => write!(
++                f,
++                "expected either {} or {} instead",
++                Identifier(a1),
++                Identifier(a2)
++            ),
+             [a1, ref alts @ ..] => {
+-                write!(f, "expected one of `{}`", a1)?;
++                write!(f, "expected one of {}", Identifier(a1))?;
+ 
+                 for alt in alts {
+-                    write!(f, ", `{}`", alt)?;
++                    write!(f, ", {}", Identifier(alt))?;
+                 }
+ 
+                 f.write_str(" instead")
+@@ -397,3 +423,21 @@ impl fmt::Display for OneOf {
+         }
+     }
+ }
++
++struct Identifier<'a>(&'a str);
++
++impl<'a> fmt::Display for Identifier<'a> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if self.0.is_empty() || !self.0.as_bytes().iter().copied().all(is_ident_raw_char) {
++            return write!(f, "{:?}_[invalid identifier]", self.0);
++        }
++
++        let mut bytes = self.0.as_bytes().iter().copied();
++
++        if !bytes.next().map_or(false, is_ident_first_char) || !bytes.all(is_ident_other_char) {
++            write!(f, "`r#{}`", self.0)
++        } else {
++            write!(f, "`{}`", self.0)
++        }
++    }
++}
+diff --git a/src/parse.rs b/src/parse.rs
+index b0cc632f..6c91d40d 100644
+--- a/src/parse.rs
++++ b/src/parse.rs
+@@ -77,7 +77,7 @@ pub const fn is_ident_other_char(c: u8) -> bool {
+     ENCODINGS[c as usize] & IDENT_OTHER_CHAR != 0
+ }
+ 
+-const fn is_ident_raw_char(c: u8) -> bool {
++pub const fn is_ident_raw_char(c: u8) -> bool {
+     ENCODINGS[c as usize] & IDENT_RAW_CHAR != 0
+ }
+ 
+@@ -175,7 +175,7 @@ impl<'a> Bytes<'a> {
+ 
+     fn any_integer<T: Num>(&mut self, sign: i8) -> Result<T> {
+         let base = if self.peek() == Some(b'0') {
+-            match self.bytes.get(1).cloned() {
++            match self.bytes.get(1).copied() {
+                 Some(b'x') => 16,
+                 Some(b'b') => 2,
+                 Some(b'o') => 8,
+@@ -450,27 +450,25 @@ impl<'a> Bytes<'a> {
+ 
+     pub fn consume_struct_name(&mut self, ident: &'static str) -> Result<bool> {
+         if self.check_ident("") {
+-            Ok(false)
+-        } else if ident.is_empty() {
+-            Err(Error::ExpectedStructLike)
+-        } else if self.check_ident(ident) {
+-            let _ = self.advance(ident.len());
+-
+-            Ok(true)
+-        } else {
+-            // If the following is not even an identifier, then a missing
+-            //  opening `(` seems more likely
+-            let maybe_ident = self
+-                .identifier()
+-                .map_err(|_| Error::ExpectedNamedStructLike(ident))?;
++            return Ok(false);
++        }
+ 
+-            let found = std::str::from_utf8(maybe_ident).map_err(Error::from)?;
++        let found_ident = match self.identifier() {
++            Ok(maybe_ident) => std::str::from_utf8(maybe_ident)?,
++            Err(Error::SuggestRawIdentifier(found_ident)) if found_ident == ident => {
++                return Err(Error::SuggestRawIdentifier(found_ident))
++            }
++            Err(_) => return Err(Error::ExpectedNamedStructLike(ident)),
++        };
+ 
+-            Err(Error::ExpectedDifferentStructName {
++        if found_ident != ident {
++            return Err(Error::ExpectedDifferentStructName {
+                 expected: ident,
+-                found: String::from(found),
+-            })
++                found: String::from(found_ident),
++            });
+         }
++
++        Ok(true)
+     }
+ 
+     pub fn consume(&mut self, s: &str) -> bool {
+@@ -584,6 +582,14 @@ impl<'a> Bytes<'a> {
+     pub fn identifier(&mut self) -> Result<&'a [u8]> {
+         let next = self.peek_or_eof()?;
+         if !is_ident_first_char(next) {
++            if is_ident_raw_char(next) {
++                let ident_bytes = &self.bytes[..self.next_bytes_contained_in(is_ident_raw_char)];
++
++                if let Ok(ident) = std::str::from_utf8(ident_bytes) {
++                    return Err(Error::SuggestRawIdentifier(String::from(ident)));
++                }
++            }
++
+             return Err(Error::ExpectedIdentifier);
+         }
+ 
+@@ -593,7 +599,7 @@ impl<'a> Bytes<'a> {
+             match self.bytes.get(1).ok_or(Error::Eof)? {
+                 b'"' => return Err(Error::ExpectedIdentifier),
+                 b'#' => {
+-                    let after_next = self.bytes.get(2).cloned().unwrap_or_default();
++                    let after_next = self.bytes.get(2).copied().unwrap_or_default();
+                     // Note: it's important to check this before advancing forward, so that
+                     // the value-type deserializer can fall back to parsing it differently.
+                     if !is_ident_raw_char(after_next) {
+@@ -603,10 +609,30 @@ impl<'a> Bytes<'a> {
+                     let _ = self.advance(2);
+                     self.next_bytes_contained_in(is_ident_raw_char)
+                 }
+-                _ => self.next_bytes_contained_in(is_ident_other_char),
++                _ => {
++                    let std_ident_length = self.next_bytes_contained_in(is_ident_other_char);
++                    let raw_ident_length = self.next_bytes_contained_in(is_ident_raw_char);
++
++                    if raw_ident_length > std_ident_length {
++                        if let Ok(ident) = std::str::from_utf8(&self.bytes[..raw_ident_length]) {
++                            return Err(Error::SuggestRawIdentifier(String::from(ident)));
++                        }
++                    }
++
++                    std_ident_length
++                }
+             }
+         } else {
+-            self.next_bytes_contained_in(is_ident_other_char)
++            let std_ident_length = self.next_bytes_contained_in(is_ident_other_char);
++            let raw_ident_length = self.next_bytes_contained_in(is_ident_raw_char);
++
++            if raw_ident_length > std_ident_length {
++                if let Ok(ident) = std::str::from_utf8(&self.bytes[..raw_ident_length]) {
++                    return Err(Error::SuggestRawIdentifier(String::from(ident)));
++                }
++            }
++
++            std_ident_length
+         };
+ 
+         let ident = &self.bytes[..length];
+@@ -656,11 +682,11 @@ impl<'a> Bytes<'a> {
+     }
+ 
+     pub fn peek(&self) -> Option<u8> {
+-        self.bytes.first().cloned()
++        self.bytes.first().copied()
+     }
+ 
+     pub fn peek_or_eof(&self) -> Result<u8> {
+-        self.bytes.first().cloned().ok_or(Error::Eof)
++        self.bytes.first().copied().ok_or(Error::Eof)
+     }
+ 
+     pub fn signed_integer<T>(&mut self) -> Result<T>
+diff --git a/src/ser/mod.rs b/src/ser/mod.rs
+index 507f9f60..109a5255 100644
+--- a/src/ser/mod.rs
++++ b/src/ser/mod.rs
+@@ -6,7 +6,7 @@ use crate::{
+     error::{Error, Result},
+     extensions::Extensions,
+     options::Options,
+-    parse::{is_ident_first_char, is_ident_other_char, LargeSInt, LargeUInt},
++    parse::{is_ident_first_char, is_ident_other_char, is_ident_raw_char, LargeSInt, LargeUInt},
+ };
+ 
+ #[cfg(test)]
+@@ -367,8 +367,11 @@ impl<W: io::Write> Serializer<W> {
+         Ok(())
+     }
+ 
+-    fn write_identifier(&mut self, name: &str) -> io::Result<()> {
+-        let mut bytes = name.as_bytes().iter().cloned();
++    fn write_identifier(&mut self, name: &str) -> Result<()> {
++        if name.is_empty() || !name.as_bytes().iter().copied().all(is_ident_raw_char) {
++            return Err(Error::InvalidIdentifier(name.into()));
++        }
++        let mut bytes = name.as_bytes().iter().copied();
+         if !bytes.next().map_or(false, is_ident_first_char) || !bytes.all(is_ident_other_char) {
+             self.output.write_all(b"r#")?;
+         }

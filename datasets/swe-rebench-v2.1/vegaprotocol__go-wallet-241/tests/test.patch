@@ -1,0 +1,143 @@
+diff --git a/service/service_test.go b/service/service_test.go
+index 160bf73..80f5744 100644
+--- a/service/service_test.go
++++ b/service/service_test.go
+@@ -2,27 +2,32 @@ package service_test
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io/ioutil"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"sync"
+ 	"testing"
+ 
+ 	"code.vegaprotocol.io/go-wallet/crypto"
++	"code.vegaprotocol.io/go-wallet/node"
+ 	"code.vegaprotocol.io/go-wallet/service"
+ 	"code.vegaprotocol.io/go-wallet/service/mocks"
+ 	"code.vegaprotocol.io/go-wallet/wallet"
+-	"code.vegaprotocol.io/protos/vega/api"
+ 	commandspb "code.vegaprotocol.io/protos/vega/commands/v1"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/golang/mock/gomock"
++	"github.com/golang/protobuf/ptypes/empty"
+ 	"github.com/julienschmidt/httprouter"
+ 	"github.com/stretchr/testify/assert"
+ 	"go.uber.org/zap"
++	"google.golang.org/grpc"
+ )
+ 
+ // this tests in general ensure request / response contracts are not broken for the service
+@@ -665,7 +670,7 @@ func testSigningTransactionSucceeds(t *testing.T) {
+ 		Times(1).
+ 		Return(&commandspb.Transaction{}, nil)
+ 	s.nodeForward.EXPECT().
+-		SendTx(gomock.Any(), &commandspb.Transaction{}, api.SubmitTransactionV2Request_TYPE_ASYNC).
++		SendTx(gomock.Any(), &commandspb.Transaction{}, gomock.Any()).
+ 		Times(0)
+ 	s.nodeForward.EXPECT().LastBlockHeight(gomock.Any()).
+ 		Times(1).Return(uint64(42), nil)
+@@ -699,7 +704,7 @@ func testSigningTransactionWithPropagationSucceeds(t *testing.T) {
+ 		Times(1).
+ 		Return(&commandspb.Transaction{}, nil)
+ 	s.nodeForward.EXPECT().
+-		SendTx(gomock.Any(), &commandspb.Transaction{}, api.SubmitTransactionV2Request_TYPE_SYNC).
++		SendTx(gomock.Any(), &commandspb.Transaction{}, gomock.Any()).
+ 		Times(1).
+ 		Return(nil)
+ 	s.nodeForward.EXPECT().LastBlockHeight(gomock.Any()).
+@@ -734,7 +739,7 @@ func testSigningTransactionWithFailedPropagationFails(t *testing.T) {
+ 		Times(1).
+ 		Return(&commandspb.Transaction{}, nil)
+ 	s.nodeForward.EXPECT().
+-		SendTx(gomock.Any(), &commandspb.Transaction{}, api.SubmitTransactionV2Request_TYPE_SYNC).
++		SendTx(gomock.Any(), &commandspb.Transaction{}, gomock.Any()).
+ 		Times(1).
+ 		Return(errors.New("failure"))
+ 	s.nodeForward.EXPECT().LastBlockHeight(gomock.Any()).
+@@ -911,3 +916,77 @@ func unmarshalResponse(r *http.Response, into interface{}) {
+ 		panic(err)
+ 	}
+ }
++
++// recordingTradingService records the RPC methods invoked on it. It is
++// deliberately type-agnostic so the test observes which RPC the forwarder
++// actually calls on the wire.
++type recordingTradingService struct {
++	mu    sync.Mutex
++	calls int
++}
++
++func (s *recordingTradingService) record() {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.calls++
++}
++
++func (s *recordingTradingService) callCount() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.calls
++}
++
++func recordingSubmitTransactionHandler(srv interface{}, _ context.Context, dec func(interface{}) error, _ grpc.UnaryServerInterceptor) (interface{}, error) {
++	if err := dec(&empty.Empty{}); err != nil {
++		return nil, err
++	}
++	srv.(*recordingTradingService).record()
++	return &empty.Empty{}, nil
++}
++
++var recordingTradingServiceDesc = grpc.ServiceDesc{
++	ServiceName: "api.v1.TradingService",
++	HandlerType: (*interface{})(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "SubmitTransaction",
++			Handler:    recordingSubmitTransactionHandler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "trading.proto",
++}
++
++// TestForwarderSendTxUsesSubmitTransactionRPC ensures the concrete node
++// forwarder submits transactions through the renamed SubmitTransaction RPC.
++func TestForwarderSendTxUsesSubmitTransactionRPC(t *testing.T) {
++	lis, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++
++	srv := grpc.NewServer()
++	recorder := &recordingTradingService{}
++	srv.RegisterService(&recordingTradingServiceDesc, recorder)
++	go func() {
++		_ = srv.Serve(lis)
++	}()
++	defer srv.Stop()
++
++	// wait until the server is accepting connections
++	conn, err := grpc.Dial(lis.Addr().String(), grpc.WithInsecure(), grpc.WithBlock())
++	require.NoError(t, err)
++	_ = conn.Close()
++
++	forwarder, err := node.NewForwarder(zap.NewNop(), node.NodesConfig{
++		Hosts:   []string{lis.Addr().String()},
++		Retries: 3,
++	})
++	require.NoError(t, err)
++	defer forwarder.Stop()
++
++	tx := &commandspb.Transaction{}
++	err = forwarder.SendTx(context.Background(), tx, 0)
++	require.NoError(t, err)
++
++	require.GreaterOrEqual(t, recorder.callCount(), 1)
++}

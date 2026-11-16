@@ -1,0 +1,389 @@
+diff --git a/HISTORY.md b/HISTORY.md
+index 97ceb0e..f9a37aa 100644
+--- a/HISTORY.md
++++ b/HISTORY.md
+@@ -10,8 +10,12 @@
+   * `get_message_by_id()`
+   * `get_unread_meassage_count()`
+ 
++### Media
++The following changes apply to `upload()`, `create_observation()`, and `update_observation()`:
++* Add support for uploading observation photo & sound files from URLs
++* Add support for attaching previously uploaded photos to an observation by photo ID
++
+ ### Other Changes
+-* Add support for uploading photo & sound files from URLs in `upload()`, `create_observation()`, and `update_observation()`
+ * Remove `pyinaturalist.user_agent` global variable and API function keyword args, and recommend
+   setting on session object instead
+ * Fix `count_only=True`/`per_page=0` to not run full query
+diff --git a/pyinaturalist/converters.py b/pyinaturalist/converters.py
+index 3a72926..ea97b66 100644
+--- a/pyinaturalist/converters.py
++++ b/pyinaturalist/converters.py
+@@ -1,14 +1,20 @@
+ """Type conversion utilities"""
++import re
+ from datetime import date, datetime, timedelta
++from io import BytesIO
+ from logging import getLogger
+-from typing import Any, Dict, List, MutableSequence, Optional, Union
++from os.path import abspath, expanduser
++from pathlib import Path
++from typing import IO, Any, Dict, List, MutableSequence, Optional, Union
+ from warnings import catch_warnings, simplefilter
+ 
+ from dateutil.parser import UnknownTimezoneWarning  # type: ignore  # (missing from type stubs)
+ from dateutil.parser import parse as parse_date
+ from dateutil.tz import tzlocal, tzoffset
++from requests import Session
+ 
+ from pyinaturalist.constants import (
++    AnyFile,
+     Coordinates,
+     Dimensions,
+     HistogramResponse,
+@@ -27,6 +33,9 @@ OBSERVATION_TIME_FIELDS = (
+     'time_zone_offset',
+ )
+ 
++# Extremely simplified URL regex, just enough to differentiate from local paths
++URL_PATTERN = re.compile(r'^https?://.+')
++
+ logger = getLogger(__name__)
+ 
+ 
+@@ -254,10 +263,28 @@ def strip_empty_values(values: Dict) -> Dict:
+     return {k: v for k, v in values.items() if v or v in [False, 0, 0.0]}
+ 
+ 
+-# Type conversion functions for collections
++# Type conversion functions for files and collections
+ # -------------------
+ 
+ 
++def ensure_file_obj(value: AnyFile, session: Session = None) -> IO:
++    """Given a file path or URL, load data into a file-like object"""
++    # Load from URL
++    if isinstance(value, str) and URL_PATTERN.match(value):
++        session = session or Session()
++        return session.get(value).raw
++
++    # Load from local file path
++    if isinstance(value, (str, Path)):
++        file_path = abspath(expanduser(value))
++        logger.info(f'Reading from file: {file_path}')
++        with open(file_path, 'rb') as f:
++            return BytesIO(f.read())
++
++    # Otherwise, assume it's already a file or file-like object
++    return value
++
++
+ def ensure_list(
+     value: Any, convert_csv: bool = False, delimiter: str = ','
+ ) -> MutableSequence[Any]:
+diff --git a/pyinaturalist/docs/templates.py b/pyinaturalist/docs/templates.py
+index 2d131c4..65e4c8e 100644
+--- a/pyinaturalist/docs/templates.py
++++ b/pyinaturalist/docs/templates.py
+@@ -2,8 +2,10 @@
+ Each template function contains all or part of an endpoint's request parameters, type annotations,
+ and docstrings. These are then applied with :py:func:`.copy_doc_signature`.
+ 
+-This is intended to reduce large amounts of duplicated code + docs. For request functions with a
+-smaller number of params, using a template isn't necessary.
++This is intended to reduce large amounts of duplicated function signatures and corresponding
++docstrings. If you're a contributor looking to add a new endpoint, using these templates isn't
++necessary. If the new function(s) have a large number of parameters and/or have many parameters in
++common with other functions, consider using a template function.
+ 
+ Note: Since the templates are applied dynamically at import time, this adds a tiny amount of overhead
+ (about 20 milliseconds as of v0.14) to the import time of the library. If this ever becomes a problem,
+@@ -374,6 +376,7 @@ def _create_observation(
+     local_photos: MultiFile = None,
+     photos: MultiFile = None,
+     sounds: MultiFile = None,
++    photo_ids: MultiIntOrStr = None,
+ ):
+     """Args:
+     species_guess: Equivalent to the 'What did you see?' field on the observation form.
+@@ -402,6 +405,7 @@ def _create_observation(
+         their Facebook and iNat accounts connected, and the user must own the photo on Facebook.
+     photos: One or more image files, file-like objects, file paths, or URLs
+     sounds: One or more sound files, file-like objects, file paths, or URLs
++    photo_ids: One or more IDs of previously uploaded photos to attach to the observation
+     """
+ 
+ 
+diff --git a/pyinaturalist/request_params.py b/pyinaturalist/request_params.py
+index 5feb31d..3c32dd6 100644
+--- a/pyinaturalist/request_params.py
++++ b/pyinaturalist/request_params.py
+@@ -109,7 +109,7 @@ def convert_list_params(params: RequestParams) -> RequestParams:
+ 
+ 
+ def convert_observation_params(params):
+-    """Some common conversions needed by observation CRUD endpoints"""
++    """Some common parameter conversions needed by observation CRUD endpoints"""
+     params = convert_observation_field_params(params)
+     if params.get('observed_on'):
+         params['observed_on_string'] = params.pop('observed_on')
+@@ -118,9 +118,16 @@ def convert_observation_params(params):
+     photos = ensure_list(params.pop('local_photos', None))
+     photos.extend(ensure_list(params.pop('photos', None)))  # Alias for 'local_photos'
+     sounds = ensure_list(params.pop('sounds', None))
++    photo_ids = ensure_list(params.pop('photo_ids', None))
+ 
++    # Split API request params from common function args
+     params, kwargs = split_common_params(params)
+-    return params, photos, sounds, kwargs
++
++    # ignore_photos must be 1 rather than true; 0 does not work, so just remove if false
++    if params.pop('ignore_photos', True):
++        kwargs['ignore_photos'] = 1
++
++    return photos, sounds, photo_ids, params, kwargs
+ 
+ 
+ def convert_observation_field_params(params: RequestParams) -> RequestParams:
+@@ -202,7 +209,7 @@ def is_int_list(values: Any) -> bool:
+ 
+ 
+ def split_common_params(params: RequestParams) -> Tuple[RequestParams, RequestParams]:
+-    """Separate common keyword args from request params"""
++    """Split out common keyword args (for pyinaturalist functions) from request params (for API)"""
+     kwargs = {k: params.pop(k, None) for k in COMMON_PARAMS}
+     return params, kwargs
+ 
+diff --git a/pyinaturalist/session.py b/pyinaturalist/session.py
+index 01fbb7f..32386d3 100644
+--- a/pyinaturalist/session.py
++++ b/pyinaturalist/session.py
+@@ -1,12 +1,8 @@
+ """Session class and related functions for preparing and sending API requests"""
+-import re
+ import threading
+-from io import BytesIO
+ from logging import getLogger
+ from os import getenv
+-from os.path import abspath, expanduser
+-from pathlib import Path
+-from typing import IO, Dict
++from typing import Dict
+ from unittest.mock import Mock
+ from warnings import warn
+ 
+@@ -31,11 +27,11 @@ from pyinaturalist.constants import (
+     REQUESTS_PER_SECOND,
+     RETRY_BACKOFF,
+     WRITE_HTTP_METHODS,
+-    AnyFile,
+     FileOrPath,
+     MultiInt,
+     RequestParams,
+ )
++from pyinaturalist.converters import ensure_file_obj
+ from pyinaturalist.formatters import format_request
+ from pyinaturalist.request_params import (
+     convert_url_ids,
+@@ -47,9 +43,6 @@ from pyinaturalist.request_params import (
+ MOCK_RESPONSE = Mock(spec=Response)
+ MOCK_RESPONSE.json.return_value = {'results': [], 'total_results': 0, 'access_token': ''}
+ 
+-# Extremely simplified URL regex, just enough to differentiate from local paths
+-URL_PATTERN = re.compile(r'^https?://.+')
+-
+ logger = getLogger('pyinaturalist')
+ thread_local = threading.local()
+ 
+@@ -261,24 +254,6 @@ def put(url: str, **kwargs) -> Response:
+     return request('PUT', url, **kwargs)
+ 
+ 
+-def ensure_file_obj(value: AnyFile, session: Session = None) -> IO:
+-    """Given a file path or URL, load data into a file-like object"""
+-    # Load from URL
+-    if isinstance(value, str) and URL_PATTERN.match(value):
+-        session = session or get_local_session()
+-        return session.get(value).raw
+-
+-    # Load from local file path
+-    if isinstance(value, (str, Path)):
+-        file_path = abspath(expanduser(value))
+-        logger.info(f'Reading from file: {file_path}')
+-        with open(file_path, 'rb') as f:
+-            return BytesIO(f.read())
+-
+-    # Otherwise, assume it's already a file or file-like object
+-    return value
+-
+-
+ def env_to_bool(environment_variable: str) -> bool:
+     """Translate an environment variable to a boolean value, accounting for minor
+     variations (case, None vs. False, etc.)
+diff --git a/pyinaturalist/v0/observations.py b/pyinaturalist/v0/observations.py
+index 9a27d6f..ef74545 100644
+--- a/pyinaturalist/v0/observations.py
++++ b/pyinaturalist/v0/observations.py
+@@ -124,7 +124,7 @@ def create_observation(**params) -> ListResponse:
+     Raises:
+         :py:exc:`~urllib3.exceptions.HTTPError`: If the call is not successful. The exception's ``response`` attribute gives more details about the errors.
+     """
+-    params, photos, sounds, kwargs = convert_observation_params(params)
++    photos, sounds, _, params, kwargs = convert_observation_params(params)
+     response = post(
+         url=f'{API_V0_BASE_URL}/observations.json',
+         json={'observation': params},
+@@ -182,11 +182,10 @@ def update_observation(observation_id: int, **params) -> ListResponse:
+     Raises:
+         :py:exc:`~urllib3.exceptions.HTTPError`: if the call is not successful. iNaturalist returns an error 410 if the observation doesn't exists or belongs to another user.
+     """
+-    params, photos, sounds, kwargs = convert_observation_params(params)
++    photos, sounds, _, params, kwargs = convert_observation_params(params)
+     response = put(
+         url=f'{API_V0_BASE_URL}/observations/{observation_id}.json',
+         json={'observation': params},
+-        ignore_photos=1,
+         **kwargs,
+     )
+ 
+diff --git a/pyinaturalist/v1/observations.py b/pyinaturalist/v1/observations.py
+index 054e6fd..0edf0b0 100644
+--- a/pyinaturalist/v1/observations.py
++++ b/pyinaturalist/v1/observations.py
+@@ -1,3 +1,5 @@
++from logging import getLogger
++
+ from pyinaturalist.constants import (
+     V1_OBS_ORDER_BY_PROPERTIES,
+     HistogramResponse,
+@@ -5,6 +7,7 @@ from pyinaturalist.constants import (
+     JsonResponse,
+     ListResponse,
+     MultiFile,
++    MultiIntOrStr,
+ )
+ from pyinaturalist.converters import (
+     convert_all_coordinates,
+@@ -21,6 +24,8 @@ from pyinaturalist.paginator import paginate_all
+ from pyinaturalist.request_params import convert_observation_params, validate_multiple_choice_param
+ from pyinaturalist.v1 import delete_v1, get_v1, post_v1, put_v1
+ 
++logger = getLogger(__name__)
++
+ 
+ @document_common_args
+ def get_observation(observation_id: int, **params) -> JsonResponse:
+@@ -341,12 +346,12 @@ def create_observation(**params) -> JsonResponse:
+     Returns:
+         JSON response containing the newly created observation(s)
+     """
+-    params, photos, sounds, kwargs = convert_observation_params(params)
++    photos, sounds, photo_ids, params, kwargs = convert_observation_params(params)
+     response = post_v1('observations', json={'observation': params}, **kwargs)
+     response_json = response.json()
+     observation_id = response_json['id']
+ 
+-    upload(observation_id, photos=photos, sounds=sounds, **kwargs)
++    upload(observation_id, photos=photos, sounds=sounds, photo_ids=photo_ids, **kwargs)
+     return response_json
+ 
+ 
+@@ -381,24 +386,36 @@ def update_observation(observation_id: int, **params) -> ListResponse:
+     Returns:
+         JSON response containing the newly updated observation(s)
+     """
+-    params, photos, sounds, kwargs = convert_observation_params(params)
+-    response = put_v1(
+-        f'observations/{observation_id}',
+-        json={'observation': params},
+-        ignore_photos=True,
+-        **kwargs,
+-    )
+-
++    photos, sounds, photo_ids, params, kwargs = convert_observation_params(params)
++    payload = {'observation': params}
++
++    # If adding photos by ID, they must be appended to the list of existing photo IDs
++    if photo_ids:
++        logger.info(f'Adding {len(photo_ids)} existing photos')
++        obs = get_observation(observation_id)
++        combined_photo_ids = [p['id'] for p in obs['photos']]
++        combined_photo_ids.extend(ensure_list(photo_ids))
++        payload['local_photos'] = {str(observation_id): combined_photo_ids}
++        kwargs.pop('ignore_photos', None)
++
++    response = put_v1(f'observations/{observation_id}', json=payload, **kwargs)
+     upload(observation_id, photos=photos, sounds=sounds, **kwargs)
+     return response.json()
+ 
+ 
+ @document_common_args
+ def upload(
+-    observation_id: int, photos: MultiFile = None, sounds: MultiFile = None, **params
++    observation_id: int,
++    photos: MultiFile = None,
++    sounds: MultiFile = None,
++    photo_ids: MultiIntOrStr = None,
++    **params,
+ ) -> ListResponse:
+     """Upload one or more local photo and/or sound files, and add them to an existing observation.
+ 
++    You may also attach a previously uploaded photo by photo ID, e.g. if your photo contains
++    multiple organisms and you want to create a separate observation for each one.
++
+     .. rubric:: Notes
+ 
+     * :fa:`lock` :ref:`Requires authentication <auth>`
+@@ -411,6 +428,7 @@ def upload(
+         ...     1234,
+         ...     photos=['~/observations/2020_09_01_140031.jpg', '~/observations/2020_09_01_140042.jpg'],
+         ...     sounds='~/observations/2020_09_01_140031.mp3',
++        ...     photo_ids=[1234, 5678],
+         ...     access_token=token,
+         ... )
+ 
+@@ -424,6 +442,7 @@ def upload(
+         observation_id: the ID of the observation
+         photos: One or more image files, file-like objects, file paths, or URLs
+         sounds: One or more audio files, file-like objects, file paths, or URLs
++        photo_ids: One or more IDs of previously uploaded photos to attach to the observation
+         access_token: Access token for user authentication, as returned by :func:`get_access_token()`
+ 
+     Returns:
+@@ -431,9 +450,11 @@ def upload(
+     """
+     params['raise_for_status'] = False
+     responses = []
++    photos, sounds = ensure_list(photos), ensure_list(sounds)
++    logger.info(f'Uploading {len(photos)} photos and {len(sounds)} sounds')
+ 
+     # Upload photos
+-    for photo in ensure_list(photos):
++    for photo in photos:
+         response = post_v1(
+             'observation_photos',
+             files=photo,
+@@ -443,7 +464,7 @@ def upload(
+         responses.append(response)
+ 
+     # Upload sounds
+-    for sound in ensure_list(sounds):
++    for sound in sounds:
+         response = post_v1(
+             'observation_sounds',
+             files=sound,
+@@ -452,6 +473,13 @@ def upload(
+         )
+         responses.append(response)
+ 
++    # Attach previously uploaded photos by ID
++    if photo_ids:
++        response = update_observation(
++            observation_id, photo_ids=photo_ids, access_token=params.get('access_token', None)
++        )
++        responses.append(response)
++
+     # Wait until all uploads complete to raise errors for any failed uploads
+     for response in responses:
+         response.raise_for_status()

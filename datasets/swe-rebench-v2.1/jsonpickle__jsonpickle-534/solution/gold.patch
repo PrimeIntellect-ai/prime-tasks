@@ -1,0 +1,474 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index b510619..085d74a 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -18,6 +18,11 @@ Upcoming
+     * ``yaml`` is now supported as a jsonpickle backend. (+528)
+     * `OSSFuzz <https://github.com/google/oss-fuzz>`_ scripts are now available in
+       the ``fuzzing/`` directory. (+525)
++    * Pure-python dtypes are now preserved across ``encode()``/``decode()`` roundtrips
++      for the pandas extension. (#407) (+534)
++    * Pandas dataframe columns with an ``object`` dtype that contain multiple different
++      types within (e.g. a column of type ``list[Union[str, int]]``) now preserve the types
++      upon being roundtripped. (#457) (#358) (+534)
+ 
+ v3.3.0
+ ======
+diff --git a/jsonpickle/ext/pandas.py b/jsonpickle/ext/pandas.py
+index 475b77e..fd18634 100644
+--- a/jsonpickle/ext/pandas.py
++++ b/jsonpickle/ext/pandas.py
+@@ -1,10 +1,12 @@
++import warnings
+ import zlib
+-from io import StringIO
+ 
+ import pandas as pd
++import numpy as np
+ 
+ from .. import decode, encode
+ from ..handlers import BaseHandler, register, unregister
++from ..tags_pd import TYPE_MAP, REVERSE_TYPE_MAP
+ from ..util import b64decode, b64encode
+ from .numpy import register_handlers as register_numpy_handlers
+ from .numpy import unregister_handlers as unregister_numpy_handlers
+@@ -12,6 +14,50 @@ from .numpy import unregister_handlers as unregister_numpy_handlers
+ __all__ = ['register_handlers', 'unregister_handlers']
+ 
+ 
++def pd_encode(obj, **kwargs):
++    if isinstance(obj, np.generic):
++        # convert pandas/numpy scalar to native Python type
++        return obj.item()
++    return encode(obj, **kwargs)
++
++
++def pd_decode(s, **kwargs):
++    return decode(s, **kwargs)
++
++
++def rle_encode(types_list):
++    """
++    Encodes a list of type codes using Run-Length Encoding (RLE). This allows for object columns in dataframes to contain items of different types without massively bloating the encoded representation.
++    """
++    if not types_list:
++        return []
++
++    encoded = []
++    current_type = types_list[0]
++    count = 1
++
++    for typ in types_list[1:]:
++        if typ == current_type:
++            count += 1
++        else:
++            encoded.append([current_type, count])
++            current_type = typ
++            count = 1
++    encoded.append([current_type, count])
++
++    return encoded
++
++
++def rle_decode(encoded_list):
++    """
++    Decodes a Run-Length Encoded (RLE) list back into the original list of type codes.
++    """
++    decoded = []
++    for typ, count in encoded_list:
++        decoded.extend([typ] * count)
++    return decoded
++
++
+ class PandasProcessor(object):
+     def __init__(self, size_threshold=500, compression=zlib):
+         """
+@@ -85,44 +131,143 @@ def make_read_csv_params(meta, context):
+ 
+ 
+ class PandasDfHandler(BaseHandler):
+-    pp = PandasProcessor()
+-
+     def flatten(self, obj, data):
+-        dtype = obj.dtypes.to_dict()
+-
++        pp = PandasProcessor()
++        # handle multiindex columns
++        if isinstance(obj.columns, pd.MultiIndex):
++            columns = [tuple(col) for col in obj.columns]
++            column_names = obj.columns.names
++            is_multicolumns = True
++        else:
++            columns = obj.columns.tolist()
++            column_names = obj.columns.name
++            is_multicolumns = False
++
++        # handle multiindex index
++        if isinstance(obj.index, pd.MultiIndex):
++            index_values = [tuple(idx) for idx in obj.index.values]
++            index_names = obj.index.names
++            is_multiindex = True
++        else:
++            index_values = obj.index.tolist()
++            index_names = obj.index.name
++            is_multiindex = False
++
++        data_columns = {}
++        type_codes = []
++        for col in obj.columns:
++            col_data = obj[col]
++            dtype_name = col_data.dtype.name
++
++            if dtype_name == "object":
++                # check if items are complex types
++                if col_data.apply(
++                    lambda x: isinstance(x, (list, dict, set, tuple, np.ndarray))
++                ).any():
++                    # if items are complex, erialize each item individually
++                    serialized_values = col_data.apply(lambda x: encode(x)).tolist()
++                    data_columns[col] = serialized_values
++                    type_codes.append("py/jp")
++                else:
++                    # treat it as regular object dtype
++                    data_columns[col] = col_data.tolist()
++                    type_codes.append(TYPE_MAP.get(dtype_name, "object"))
++            else:
++                # for other dtypes, store their values directly
++                data_columns[col] = col_data.tolist()
++                type_codes.append(TYPE_MAP.get(dtype_name, "object"))
++
++        # store index data
++        index_encoded = encode(index_values, keys=True)
++
++        rle_types = rle_encode(type_codes)
++        # prepare metadata
+         meta = {
+-            'dtypes': self.context.flatten(
+-                {k: str(dtype[k]) for k in dtype}, reset=False
+-            ),
+-            'index': encode(obj.index),
+-            'column_level_names': obj.columns.names,
+-            'header': list(range(len(obj.columns.names))),
++            "dtypes_rle": rle_types,
++            "index": index_encoded,
++            "index_names": index_names,
++            "columns": encode(columns, keys=True),
++            "column_names": column_names,
++            "is_multiindex": is_multiindex,
++            "is_multicolumns": is_multicolumns,
+         }
+ 
+-        data = self.pp.flatten_pandas(
+-            obj.reset_index(drop=True).to_csv(index=False), data, meta
+-        )
++        # serialize data_columns with keys=True to allow for non-object keys
++        data_encoded = encode(data_columns, keys=True)
++
++        # use PandasProcessor to flatten
++        data = pp.flatten_pandas(data_encoded, data, meta)
+         return data
+ 
+-    def restore(self, data):
+-        csv, meta = self.pp.restore_pandas(data)
+-        params, timedeltas, parse_datetime_v2 = make_read_csv_params(meta, self.context)
+-        # None makes it compatible with objects serialized before
+-        # column_levels_names has been introduced.
+-        column_level_names = meta.get('column_level_names', None)
+-        df = (
+-            pd.read_csv(StringIO(csv), **params)
+-            if data['values'].strip()
+-            else pd.DataFrame()
+-        )
+-        for col in timedeltas:
+-            df[col] = pd.to_timedelta(df[col])
+-        df = df.astype(parse_datetime_v2)
+-
+-        df.set_index(decode(meta['index']), inplace=True)
+-        # restore the column level(s) name(s)
+-        if column_level_names:
+-            df.columns.names = column_level_names
++    def restore(self, obj):
++        pp = PandasProcessor()
++        data_encoded, meta = pp.restore_pandas(obj)
++
++        data_columns = decode(data_encoded, keys=True)
++
++        # get type codes, un-RLE-ed
++        rle_types = meta["dtypes_rle"]
++        type_codes = rle_decode(rle_types)
++
++        # handle multicolumns
++        columns_decoded = decode(meta["columns"], keys=True)
++        if meta.get("is_multicolumns", False):
++            columns = pd.MultiIndex.from_tuples(
++                columns_decoded, names=meta.get("column_names")
++            )
++        else:
++            columns = columns_decoded
++
++        # progressively reconstruct dataframe as a dict
++        df_data = {}
++        dtypes = {}
++        for col, type_code in zip(columns, type_codes):
++            col_data = data_columns[col]
++            if type_code == "py/jp":
++                # deserialize each item in the column
++                col_values = [decode(item) for item in col_data]
++                df_data[col] = col_values
++            else:
++                df_data[col] = col_data
++                # used later to get correct dtypes
++                dtype_str = REVERSE_TYPE_MAP.get(type_code, "object")
++                dtypes[col] = dtype_str
++
++        # turn dict into df
++        df = pd.DataFrame(df_data)
++        df.columns = columns
++
++        # apply dtypes
++        for col in df.columns:
++            dtype_str = dtypes.get(col, "object")
++            try:
++                dtype = np.dtype(dtype_str)
++                df[col] = df[col].astype(dtype)
++            except Exception:
++                msg = (
++                    f"jsonpickle was unable to properly deserialize "
++                    f"the column {col} into its inferred dtype. "
++                    f"Please file a bugreport on the jsonpickle GitHub! "
++                )
++                warnings.warn(msg)
++
++        # decode and set the index
++        index_values = decode(meta["index"], keys=True)
++        if meta.get("is_multiindex", False):
++            index = pd.MultiIndex.from_tuples(
++                index_values, names=meta.get("index_names")
++            )
++        else:
++            index = pd.Index(index_values, name=meta.get("index_names"))
++        df.index = index
++
++        # restore column names for easy readability
++        if "column_names" in meta:
++            if meta.get("is_multicolumns", False):
++                df.columns.names = meta.get("column_names")
++            else:
++                df.columns.name = meta.get("column_names")
++
+         return df
+ 
+ 
+diff --git a/jsonpickle/tags_pd.py b/jsonpickle/tags_pd.py
+new file mode 100644
+index 0000000..314b986
+--- /dev/null
++++ b/jsonpickle/tags_pd.py
+@@ -0,0 +1,207 @@
++"""
++This file exists to automatically generate tags for numpy/pandas extensions. Because numpy/pandas follow a (relatively) rapid release schedule, updating types for new versions as bug reports come in could be infeasible, so we auto-generate them. Unfortunately, this file can't go into the ext folder because then the imports would break.
++"""
++
++import re
++
++import numpy as np
++import pandas as pd
++from pandas.api.extensions import ExtensionDtype
++
++
++def split_letters_numbers_brackets(s):
++    """
++    Split the string into letters, numbers, and brackets (with their content).
++    This is a helper function for getting the smallest unique substring, for determining tags.
++    """
++    # extract brackets and their content
++    brackets_match = re.search(r"\[.*?\]", s)
++    if brackets_match:
++        brackets_part = brackets_match.group()
++        s_clean = s.replace(brackets_part, "")
++    else:
++        brackets_part = ""
++        s_clean = s
++
++    # find where the trailing digits start
++    index = len(s_clean)
++    while index > 0 and s_clean[index - 1].isdigit():
++        index -= 1
++    letters_part = s_clean[:index]
++    numbers_part = s_clean[index:]
++    return letters_part, numbers_part, brackets_part
++
++
++def get_smallest_unique_substrings(strings, prefix="np"):
++    used_substrings = set()
++    used_letters_parts = set()
++    result = {}
++
++    for s in strings:
++        if not isinstance(s, str):
++            s2 = s.__name__
++        else:
++            s2 = s
++        letters_part, numbers_part, brackets_part = split_letters_numbers_brackets(s2)
++        letters_part = letters_part.lower()
++        unique_substring_found = False
++
++        # handle the weird datetime64[...] and timedelta64[...] cases
++        if letters_part == "datetime" and numbers_part == "64" and brackets_part:
++            substr = "d64" + brackets_part
++            if substr not in used_substrings:
++                result[s] = substr
++                used_substrings.add(substr)
++                unique_substring_found = True
++        elif letters_part == "timedelta" and numbers_part == "64" and brackets_part:
++            substr = "t64" + brackets_part
++            if substr not in used_substrings:
++                result[s] = substr
++                used_substrings.add(substr)
++                unique_substring_found = True
++        else:
++            if letters_part in used_letters_parts:
++                # letters have been seen before, so use letters + numbers_part + brackets_part
++                if numbers_part or brackets_part:
++                    # try first letter + numbers_part + brackets_part
++                    substr = letters_part[0]
++                    if numbers_part:
++                        substr += numbers_part
++                    if brackets_part:
++                        substr += brackets_part
++                    if substr not in used_substrings:
++                        result[s] = substr
++                        used_substrings.add(substr)
++                        unique_substring_found = True
++                    else:
++                        # try letters_part + numbers_part + brackets_part
++                        substr = letters_part
++                        if numbers_part:
++                            substr += numbers_part
++                        if brackets_part:
++                            substr += brackets_part
++                        if substr not in used_substrings:
++                            result[s] = substr
++                            used_substrings.add(substr)
++                            unique_substring_found = True
++                else:
++                    # find a unique substring of just letters_part
++                    for length in range(1, len(letters_part) + 1):
++                        substr = letters_part[:length]
++                        if substr not in used_substrings:
++                            result[s] = substr
++                            used_substrings.add(substr)
++                            unique_substring_found = True
++                            break
++            else:
++                # assign the smallest substring of letters_part
++                for length in range(1, len(letters_part) + 1):
++                    substr = letters_part[:length]
++                    if substr not in used_substrings:
++                        result[s] = substr
++                        used_substrings.add(substr)
++                        unique_substring_found = True
++                        break
++                used_letters_parts.add(letters_part)
++
++        # last resort: assign the entire string
++        if not unique_substring_found:
++            result[s] = s
++            used_substrings.add(s)
++
++    for key in result:
++        result[key] = f"{prefix}/" + result[key]
++
++    return result
++
++
++def all_subclasses(cls):
++    # use a set to avoid adding duplicates
++    subclasses = set()
++    for subclass in cls.__subclasses__():
++        subclasses.add(subclass)
++        subclasses.update(all_subclasses(subclass))
++    return list(subclasses)
++
++
++def get_all_numpy_dtype_strings():
++    dtypes = []
++
++    # sctypeDict is the dict of all possible numpy dtypes + some invalid dtypes too
++    for dtype in np.sctypeDict.values():
++        try:
++            dtype_obj = np.dtype(dtype)
++            dtypes.append(dtype_obj.name.lower())
++        except TypeError:
++            continue
++
++    try:
++        char_codes = np._typing._char_codes
++        # datetime64 and timedelta64 are special, they have multiple variants
++        # python internally compiles and caches regex like this to speed it up
++        dt_variants = list(
++            dict.fromkeys(
++                [
++                    "datetime64[" + re.search(r"\[(.*?)\]", var).group(1) + "]"
++                    for var in char_codes._DT64Codes.__args__
++                    if re.search(r"\[(.*?)\]", var)
++                ]
++            )
++        )
++        td_variants = list(
++            dict.fromkeys(
++                [
++                    "timedelta64[" + re.search(r"\[(.*?)\]", var).group(1) + "]"
++                    for var in char_codes._TD64Codes.__args__
++                    if re.search(r"\[(.*?)\]", var)
++                ]
++            )
++        )
++    except AttributeError:
++        # AttributeError happens on numpy <1.25 because _typing isn't exposed to users
++        dt_variants = ['datetime64[Y]', 'datetime64[M]', 'datetime64[W]', 'datetime64[D]', 'datetime64[h]', 'datetime64[m]', 'datetime64[s]', 'datetime64[ms]', 'datetime64[us]', 'datetime64[ns]', 'datetime64[ps]', 'datetime64[fs]', 'datetime64[as]']
++        td_variants = ['timedelta64[Y]', 'timedelta64[M]', 'timedelta64[W]', 'timedelta64[D]', 'timedelta64[h]', 'timedelta64[m]', 'timedelta64[s]', 'timedelta64[ms]', 'timedelta64[us]', 'timedelta64[ns]', 'timedelta64[ps]', 'timedelta64[fs]', 'timedelta64[as]']
++
++    dtypes += dt_variants + td_variants
++
++    return list(dict.fromkeys(dtypes))
++
++
++def get_all_pandas_dtype_strings():
++    dtypes = []
++
++    # get all pandas dtypes since it doesnt have a built-in api
++    extension_dtypes = all_subclasses(ExtensionDtype)
++
++    for dtype_cls in extension_dtypes:
++        # some ExtensionDtype subclasses might not have a name attribute
++        if hasattr(dtype_cls, "name"):
++            try:
++                dtype_name = dtype_cls.name
++                dtypes.append(dtype_name.lower())
++            except Exception:
++                continue
++
++    # use the class object for things that np.dtype can't reconstruct
++    dtypes.extend([pd.Timestamp, pd.Timedelta, pd.Period, pd.Interval])
++
++    return list(dict.fromkeys(dtypes))
++
++
++np_dtypes = list(
++    dict.fromkeys(
++        [dtype for dtype in get_all_numpy_dtype_strings() if isinstance(dtype, str)]
++    )
++)
++
++pd_dtypes = list(
++    dict.fromkeys(
++        [dtype for dtype in get_all_pandas_dtype_strings() if isinstance(dtype, str)]
++    )
++)
++
++
++TYPE_MAP = get_smallest_unique_substrings(np_dtypes, prefix="np")
++TYPE_MAP.update(get_smallest_unique_substrings(pd_dtypes, prefix="pd"))
++
++REVERSE_TYPE_MAP = {v: k for k, v in TYPE_MAP.items()}

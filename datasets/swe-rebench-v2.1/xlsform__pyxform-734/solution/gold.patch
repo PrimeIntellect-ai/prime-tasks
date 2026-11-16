@@ -1,0 +1,596 @@
+diff --git a/pyxform/parsing/expression.py b/pyxform/parsing/expression.py
+index de99b66..af91985 100644
+--- a/pyxform/parsing/expression.py
++++ b/pyxform/parsing/expression.py
+@@ -1,13 +1,108 @@
++import re
+ from collections.abc import Iterable
++from functools import lru_cache
++from typing import NamedTuple
+ 
+-from pyxform.utils import parse_expression
++
++def get_expression_lexer() -> re.Scanner:
++    """
++    Get a expression lexer (scanner) for parsing.
++    """
++    # ncname regex adapted from eulxml https://github.com/emory-libraries/eulxml/blob/2e1a9f71ffd1fd455bd8326ec82125e333b352e0/eulxml/xpath/lexrules.py
++    # (C) 2010,2011 Emory University Libraries [Apache v2.0 License]
++    # They in turn adapted it from https://www.w3.org/TR/REC-xml/#NT-NameStartChar
++    # and https://www.w3.org/TR/REC-xml-names/#NT-NCName
++    namestartchar = (
++        r"([A-Z]|_|[a-z]|\xc0-\xd6]|[\xd8-\xf6]|[\xf8-\u02ff]|"
++        + r"[\u0370-\u037d]|[\u037f-\u1fff]|[\u200c-\u200d]|[\u2070-\u218f]|"
++        + r"[\u2c00-\u2fef]|[\u3001-\uD7FF]|[\uF900-\uFDCF]|[\uFDF0-\uFFFD]"
++        + r"|[\U00010000-\U000EFFFF])"
++    )
++    # additional characters allowed in NCNames after the first character
++    namechar_extra = r"[-.0-9\xb7\u0300-\u036f\u203f-\u2040]"
++    ncname_regex = (
++        r"(" + namestartchar + r")(" + namestartchar + r"|" + namechar_extra + r")*"
++    )
++    ncname_regex = ncname_regex + r"(:" + ncname_regex + r")?"
++
++    date_regex = r"-?\d{4}-\d{2}-\d{2}"
++    time_regex = r"\d{2}:\d{2}:\d{2}(\.\s+)?(((\+|\-)\d{2}:\d{2})|Z)?"
++    date_time_regex = date_regex + "T" + time_regex
++
++    # Rule order is significant - match priority runs top to bottom.
++    lexer_rules = {
++        # https://www.w3.org/TR/xmlschema-2/#dateTime
++        "DATETIME": date_time_regex,
++        "DATE": date_regex,
++        "TIME": time_regex,
++        "NUMBER": r"-?\d+\.\d*|-?\.\d+|-?\d+",
++        # https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
++        "OPS_MATH": r"[\*\+\-]|mod|div",
++        "OPS_COMP": r"\=|\!\=|\<|\>|\<=|>=",
++        "OPS_BOOL": r"and|or",
++        "OPS_UNION": r"\|",
++        "OPEN_PAREN": r"\(",
++        "CLOSE_PAREN": r"\)",
++        "BRACKET": r"\[\]\{\}",
++        "PARENT_REF": r"\.\.",
++        "SELF_REF": r"\.",
++        "PATH_SEP": r"\/",  # javarosa.xpath says "//" is an "unsupported construct".
++        "SYSTEM_LITERAL": r""""[^"]*"|'[^']*'""",
++        "COMMA": r",",
++        "WHITESPACE": r"\s+",
++        "PYXFORM_REF": r"\$\{" + ncname_regex + r"(#" + ncname_regex + r")?" + r"\}",
++        "FUNC_CALL": ncname_regex + r"\(",
++        "XPATH_PRED_START": ncname_regex + r"\[",
++        "XPATH_PRED_END": r"\]",
++        "URI_SCHEME": ncname_regex + r"://",
++        "NAME": ncname_regex,  # Must be after rules containing ncname_regex.
++        "PYXFORM_REF_START": r"\$\{",
++        "PYXFORM_REF_END": r"\}",
++        "OTHER": r".+?",  # Catch any other character so that parsing doesn't stop.
++    }
++
++    def get_tokenizer(name):
++        def tokenizer(scan, value):
++            return ExpLexerToken(name, value, scan.match.start(), scan.match.end())
++
++        return tokenizer
++
++    lexicon = [(v, get_tokenizer(k)) for k, v in lexer_rules.items()]
++    # re.Scanner is undocumented but has been around since at least 2003
++    # https://mail.python.org/pipermail/python-dev/2003-April/035075.html
++    return re.Scanner(lexicon)
++
++
++# Scanner takes a few 100ms to compile so use this shared instance.
++class ExpLexerToken(NamedTuple):
++    name: str
++    value: str
++    start: int
++    end: int
++
++
++_EXPRESSION_LEXER = get_expression_lexer()
++
++
++@lru_cache(maxsize=1024)
++def parse_expression(text: str) -> tuple[list[ExpLexerToken], str]:
++    """
++    Parse an expression.
++
++    Use this function instead of _EXPRESSION_LEXER to take advantage of caching.
++
++    :param text: The expression.
++    :return: The parsed tokens, and any remaining unparsed text.
++    """
++    tokens, remainder = _EXPRESSION_LEXER.scan(text)
++    return tokens, remainder
+ 
+ 
+ def is_single_token_expression(expression: str, token_types: Iterable[str]) -> bool:
+     """
+     Does the expression contain single token of one of the provided token types?
+     """
+-    tokens, _ = parse_expression(text=expression.strip())
++    tokens, _ = parse_expression(expression.strip())
+     if 1 == len(tokens) and tokens[0].name in token_types:
+         return True
+     else:
+diff --git a/pyxform/parsing/instance_expression.py b/pyxform/parsing/instance_expression.py
+index 09ee91c..4b3f82e 100644
+--- a/pyxform/parsing/instance_expression.py
++++ b/pyxform/parsing/instance_expression.py
+@@ -1,7 +1,7 @@
+-import re
+ from typing import TYPE_CHECKING
+ 
+-from pyxform.utils import BRACKETED_TAG_REGEX, EXPRESSION_LEXER, ExpLexerToken, node
++from pyxform.parsing.expression import ExpLexerToken, parse_expression
++from pyxform.utils import BRACKETED_TAG_REGEX, node
+ 
+ if TYPE_CHECKING:
+     from pyxform.survey import Survey
+@@ -37,7 +37,7 @@ def find_boundaries(xml_text: str) -> list[tuple[int, int]]:
+     path_enter = False
+     pred_enter = False
+     last_token = None
+-    tokens, _ = EXPRESSION_LEXER.scan(xml_text)
++    tokens, _ = parse_expression(xml_text)
+     boundaries = []
+ 
+     for t in tokens:
+@@ -111,8 +111,7 @@ def replace_with_output(xml_text: str, context: "SurveyElement", survey: "Survey
+             old_str = xml_text[start:end]
+             # Pass the new string through the pyxform reference replacer.
+             # noinspection PyProtectedMember
+-            new_str = re.sub(
+-                BRACKETED_TAG_REGEX,
++            new_str = BRACKETED_TAG_REGEX.sub(
+                 lambda m: survey._var_repl_function(m, context),
+                 old_str,
+             )
+diff --git a/pyxform/utils.py b/pyxform/utils.py
+index 5e362e8..37e5a84 100644
+--- a/pyxform/utils.py
++++ b/pyxform/utils.py
+@@ -9,7 +9,7 @@ import os
+ import re
+ from io import StringIO
+ from json.decoder import JSONDecodeError
+-from typing import Any, NamedTuple
++from typing import Any
+ from xml.dom import Node
+ from xml.dom.minidom import Element, Text, _write_data
+ 
+@@ -17,11 +17,10 @@ from defusedxml.minidom import parseString
+ 
+ from pyxform import constants as const
+ from pyxform.errors import PyXFormError
++from pyxform.parsing.expression import parse_expression
+ 
+ SEP = "_"
+-
+-INVALID_XFORM_TAG_REGEXP = r"[^a-zA-Z:_][^a-zA-Z:_0-9\-.]*"
+-
++INVALID_XFORM_TAG_REGEXP = re.compile(r"[^a-zA-Z:_][^a-zA-Z:_0-9\-.]*")
+ LAST_SAVED_INSTANCE_NAME = "__last-saved"
+ BRACKETED_TAG_REGEX = re.compile(r"\${(last-saved#)?(.*?)}")
+ LAST_SAVED_REGEX = re.compile(r"\${last-saved#(.*?)}")
+@@ -334,94 +333,5 @@ def levenshtein_distance(a: str, b: str) -> int:
+     return v0[n]
+ 
+ 
+-def get_expression_lexer() -> re.Scanner:
+-    """
+-    Get a expression lexer (scanner) for parsing.
+-    """
+-    # ncname regex adapted from eulxml https://github.com/emory-libraries/eulxml/blob/2e1a9f71ffd1fd455bd8326ec82125e333b352e0/eulxml/xpath/lexrules.py
+-    # (C) 2010,2011 Emory University Libraries [Apache v2.0 License]
+-    # They in turn adapted it from https://www.w3.org/TR/REC-xml/#NT-NameStartChar
+-    # and https://www.w3.org/TR/REC-xml-names/#NT-NCName
+-    namestartchar = (
+-        r"([A-Z]|_|[a-z]|\xc0-\xd6]|[\xd8-\xf6]|[\xf8-\u02ff]|"
+-        + r"[\u0370-\u037d]|[\u037f-\u1fff]|[\u200c-\u200d]|[\u2070-\u218f]|"
+-        + r"[\u2c00-\u2fef]|[\u3001-\uD7FF]|[\uF900-\uFDCF]|[\uFDF0-\uFFFD]"
+-        + r"|[\U00010000-\U000EFFFF])"
+-    )
+-    # additional characters allowed in NCNames after the first character
+-    namechar_extra = r"[-.0-9\xb7\u0300-\u036f\u203f-\u2040]"
+-    ncname_regex = (
+-        r"(" + namestartchar + r")(" + namestartchar + r"|" + namechar_extra + r")*"
+-    )
+-    ncname_regex = ncname_regex + r"(:" + ncname_regex + r")?"
+-
+-    date_regex = r"-?\d{4}-\d{2}-\d{2}"
+-    time_regex = r"\d{2}:\d{2}:\d{2}(\.\s+)?(((\+|\-)\d{2}:\d{2})|Z)?"
+-    date_time_regex = date_regex + "T" + time_regex
+-
+-    # Rule order is significant - match priority runs top to bottom.
+-    lexer_rules = {
+-        # https://www.w3.org/TR/xmlschema-2/#dateTime
+-        "DATETIME": date_time_regex,
+-        "DATE": date_regex,
+-        "TIME": time_regex,
+-        "NUMBER": r"-?\d+\.\d*|-?\.\d+|-?\d+",
+-        # https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+-        "OPS_MATH": r"[\*\+\-]|mod|div",
+-        "OPS_COMP": r"\=|\!\=|\<|\>|\<=|>=",
+-        "OPS_BOOL": r"and|or",
+-        "OPS_UNION": r"\|",
+-        "OPEN_PAREN": r"\(",
+-        "CLOSE_PAREN": r"\)",
+-        "BRACKET": r"\[\]\{\}",
+-        "PARENT_REF": r"\.\.",
+-        "SELF_REF": r"\.",
+-        "PATH_SEP": r"\/",  # javarosa.xpath says "//" is an "unsupported construct".
+-        "SYSTEM_LITERAL": r""""[^"]*"|'[^']*'""",
+-        "COMMA": r",",
+-        "WHITESPACE": r"\s+",
+-        "PYXFORM_REF": r"\$\{" + ncname_regex + r"(#" + ncname_regex + r")?" + r"\}",
+-        "FUNC_CALL": ncname_regex + r"\(",
+-        "XPATH_PRED_START": ncname_regex + r"\[",
+-        "XPATH_PRED_END": r"\]",
+-        "URI_SCHEME": ncname_regex + r"://",
+-        "NAME": ncname_regex,  # Must be after rules containing ncname_regex.
+-        "OTHER": r".+?",  # Catch any other character so that parsing doesn't stop.
+-    }
+-
+-    def get_tokenizer(name):
+-        def tokenizer(scan, value):
+-            return ExpLexerToken(name, value, scan.match.start(), scan.match.end())
+-
+-        return tokenizer
+-
+-    lexicon = [(v, get_tokenizer(k)) for k, v in lexer_rules.items()]
+-    # re.Scanner is undocumented but has been around since at least 2003
+-    # https://mail.python.org/pipermail/python-dev/2003-April/035075.html
+-    return re.Scanner(lexicon)
+-
+-
+-# Scanner takes a few 100ms to compile so use this shared instance.
+-class ExpLexerToken(NamedTuple):
+-    name: str
+-    value: str
+-    start: int
+-    end: int
+-
+-
+-EXPRESSION_LEXER = get_expression_lexer()
+-
+-
+-def parse_expression(text: str) -> tuple[list[ExpLexerToken], str]:
+-    """
+-    Parse a "default" expression, well enough to identify dynamic defaults vs. not.
+-
+-    :param text: The expression.
+-    :return: The parsed tokens, and any remaining unparsed text.
+-    """
+-    tokens, remainder = EXPRESSION_LEXER.scan(text)
+-    return tokens, remainder
+-
+-
+ def coalesce(*args):
+     return next((a for a in args if a is not None), None)
+diff --git a/pyxform/validators/error_cleaner.py b/pyxform/validators/error_cleaner.py
+index 8305780..642645e 100644
+--- a/pyxform/validators/error_cleaner.py
++++ b/pyxform/validators/error_cleaner.py
+@@ -4,6 +4,8 @@ Cleans up error messages from the validators.
+ 
+ import re
+ 
++ERROR_MESSAGE_REGEX = re.compile(r"(/[a-z0-9\-_]+(?:/[a-z0-9\-_]+)+)", flags=re.I)
++
+ 
+ class ErrorCleaner:
+     """Cleans up raw error messages from XForm validators for end users."""
+@@ -22,9 +24,9 @@ class ErrorCleaner:
+ 
+     @staticmethod
+     def _cleanup_errors(error_message):
+-        pattern = r"(/[a-z0-9\-_]+(?:/[a-z0-9\-_]+)+)"
+-        error_message = re.sub(
+-            pattern, ErrorCleaner._replace_xpath_with_tokens, error_message, flags=re.I
++        error_message = ERROR_MESSAGE_REGEX.sub(
++            ErrorCleaner._replace_xpath_with_tokens,
++            error_message,
+         )
+         lines = str(error_message).strip().splitlines()
+         no_dupes = [
+diff --git a/pyxform/validators/pyxform/pyxform_reference.py b/pyxform/validators/pyxform/pyxform_reference.py
+new file mode 100644
+index 0000000..e55a408
+--- /dev/null
++++ b/pyxform/validators/pyxform/pyxform_reference.py
+@@ -0,0 +1,53 @@
++from pyxform import constants as co
++from pyxform.errors import PyXFormError
++from pyxform.parsing.expression import parse_expression
++
++PYXFORM_REFERENCE_INVALID = (
++    "[row : {row_number}] On the '{sheet}' sheet, the '{column}' value is invalid. "
++    "Reference expressions must only include question names, and end with '}}'."
++)
++
++
++def validate_pyxform_reference_syntax(
++    value: str, sheet_name: str, row_number: int, key: str
++) -> None:
++    # Skip columns in potentially large sheets where references are not allowed.
++    if sheet_name == co.SURVEY:
++        if key in (co.TYPE, co.NAME):
++            return
++    elif sheet_name == co.CHOICES:
++        if key in (co.LIST_NAME_S, co.LIST_NAME_U, co.NAME):
++            return
++    elif sheet_name == co.ENTITIES:
++        if key == (co.LIST_NAME_S, co.LIST_NAME_U):
++            return
++
++    tokens, _ = parse_expression(value)
++    start_token = None
++
++    for t in tokens:
++        # The start of an expression.
++        if t is not None and t.name == "PYXFORM_REF_START" and start_token is None:
++            start_token = t
++        # Tokens that are part of an expression.
++        elif start_token is not None:
++            if t.name == "NAME":
++                continue
++            elif t.name == "PYXFORM_REF_END":
++                start_token = None
++            elif t.name in ("PYXFORM_REF_START", "PYXFORM_REF"):
++                msg = PYXFORM_REFERENCE_INVALID.format(
++                    sheet=sheet_name, row_number=row_number, column=key
++                )
++                raise PyXFormError(msg)
++            else:
++                msg = PYXFORM_REFERENCE_INVALID.format(
++                    sheet=sheet_name, row_number=row_number, column=key
++                )
++                raise PyXFormError(msg)
++
++    if start_token is not None:
++        msg = PYXFORM_REFERENCE_INVALID.format(
++            sheet=sheet_name, row_number=row_number, column=key
++        )
++        raise PyXFormError(msg)
+diff --git a/pyxform/validators/pyxform/question_types.py b/pyxform/validators/pyxform/question_types.py
+index 48f49db..7ec18ed 100644
+--- a/pyxform/validators/pyxform/question_types.py
++++ b/pyxform/validators/pyxform/question_types.py
+@@ -2,8 +2,6 @@
+ Validations for question types.
+ """
+ 
+-import re
+-
+ from pyxform.errors import PyXFormError
+ from pyxform.parsing.expression import is_single_token_expression
+ from pyxform.utils import PYXFORM_REFERENCE_REGEX
+@@ -37,7 +35,7 @@ def validate_background_geopoint_trigger(row: dict, row_num: int) -> bool:
+ def validate_references(referrers: list[tuple[dict, int]], questions: set[str]) -> bool:
+     """Triggers must refer to a question that exists."""
+     for row, row_num in referrers:
+-        matches = re.match(PYXFORM_REFERENCE_REGEX, row["trigger"])
++        matches = PYXFORM_REFERENCE_REGEX.match(row["trigger"])
+         if matches is not None:
+             trigger = matches.groups()[0]
+             if trigger not in questions:
+diff --git a/pyxform/validators/pyxform/translations_checks.py b/pyxform/validators/pyxform/translations_checks.py
+index 588814a..b74d2b3 100644
+--- a/pyxform/validators/pyxform/translations_checks.py
++++ b/pyxform/validators/pyxform/translations_checks.py
+@@ -8,7 +8,7 @@ from pyxform.errors import PyXFormError
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+ 
+-    SheetData = tuple[tuple[str, ...]]
++    SheetData = tuple[tuple[str, ...], ...]
+     Warnings = list[str]
+ 
+ 
+diff --git a/pyxform/xls2json.py b/pyxform/xls2json.py
+index 37c3ca1..1e340b3 100644
+--- a/pyxform/xls2json.py
++++ b/pyxform/xls2json.py
+@@ -26,11 +26,14 @@ from pyxform.utils import PYXFORM_REFERENCE_REGEX, coalesce, default_is_dynamic
+ from pyxform.validators.pyxform import parameters_generic, select_from_file
+ from pyxform.validators.pyxform import question_types as qt
+ from pyxform.validators.pyxform.android_package_name import validate_android_package_name
++from pyxform.validators.pyxform.pyxform_reference import validate_pyxform_reference_syntax
+ from pyxform.validators.pyxform.translations_checks import SheetTranslations
+ from pyxform.xls2json_backends import csv_to_dict, xls_to_dict, xlsx_to_dict
+ from pyxform.xlsparseutils import find_sheet_misspellings, is_valid_xml_tag
+ 
+ SMART_QUOTES = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
++RE_SMART_QUOTES = re.compile(r"|".join(re.escape(old) for old in SMART_QUOTES))
++RE_WHITESPACE = re.compile(r"( )+")
+ 
+ 
+ def print_pyobj_to_json(pyobj, path=None):
+@@ -87,18 +90,6 @@ def list_to_nested_dict(lst):
+         return lst[0]
+ 
+ 
+-def replace_smart_quotes_in_dict(_d):
+-    for key, value in _d.items():
+-        _changed = False
+-        for smart_quote, dumb_quote in SMART_QUOTES.items():
+-            if isinstance(value, str):
+-                if smart_quote in value:
+-                    value = value.replace(smart_quote, dumb_quote)
+-                    _changed = True
+-        if _changed:
+-            _d[key] = value
+-
+-
+ class DealiasAndGroupHeadersResult:
+     __slots__ = ("headers", "data")
+ 
+@@ -184,42 +175,24 @@ def dealias_types(dict_array):
+     return dict_array
+ 
+ 
+-def clean_text_values(dict_array):
++def clean_text_values(sheet_name: str, data: list[dict], strip_whitespace: bool = False):
+     """
+     Go though the dict array and strips all text values.
+     Also replaces multiple spaces with single spaces.
+     """
+-    for row in dict_array:
+-        replace_smart_quotes_in_dict(row)
++    for row_number, row in enumerate(data, start=2):
+         for key, value in row.items():
+             if isinstance(value, str):
+-                row[key] = re.sub(r"( )+", " ", value.strip())
+-    return dict_array
+-
+-
+-# This is currently unused because name uniqueness is checked in json2xform.
+-def check_name_uniqueness(dict_array):
+-    """
+-    Make sure all names are unique
+-    Raises and exception if a duplicate is found
+-    """
+-    # This set is used to validate the uniqueness of names.
+-    name_set = set()
+-    row_number = 0  # TODO: There might be a bug with row numbers...
+-    for row in dict_array:
+-        row_number += 1
+-        name = row.get(constants.NAME)
+-        if name:
+-            if name in name_set:
+-                raise PyXFormError(
+-                    "Question name is not unique: "
+-                    + str(name)
+-                    + " Row: "
+-                    + str(row_number)
++                # Remove extraneous whitespace characters.
++                if strip_whitespace:
++                    value = RE_WHITESPACE.sub(" ", value.strip())
++                # Replace "smart" quotes with regular quotes.
++                row[key] = RE_SMART_QUOTES.sub(lambda m: SMART_QUOTES[m.group(0)], value)
++                # Check cross reference syntax.
++                validate_pyxform_reference_syntax(
++                    value=value, sheet_name=sheet_name, row_number=row_number, key=key
+                 )
+-            else:
+-                name_set.add(name)
+-    return dict_array
++    return data
+ 
+ 
+ def group_dictionaries_by_key(list_of_dicts, key, remove_key=True):
+@@ -487,7 +460,10 @@ def workbook_to_json(
+         use_double_colons=use_double_colons,
+     )
+     settings = settings_sheet.data[0] if len(settings_sheet.data) > 0 else {}
+-    replace_smart_quotes_in_dict(settings)
++    settings = clean_text_values(sheet_name=constants.SETTINGS, data=[settings])[0]
++    clean_text_values_enabled = aliases.yes_no.get(
++        settings.get("clean_text_values", "true()")
++    )
+ 
+     default_language = settings.get(constants.DEFAULT_LANGUAGE_KEY, default_language)
+ 
+@@ -522,9 +498,9 @@ def workbook_to_json(
+ 
+     # ########## External Choices sheet ##########
+     external_choices_sheet = workbook_dict.get(constants.EXTERNAL_CHOICES, [])
+-    for choice_item in external_choices_sheet:
+-        replace_smart_quotes_in_dict(choice_item)
+-
++    external_choices_sheet = clean_text_values(
++        sheet_name=constants.EXTERNAL_CHOICES, data=external_choices_sheet
++    )
+     external_choices_sheet = dealias_and_group_headers(
+         dict_array=external_choices_sheet,
+         header_aliases=aliases.list_header,
+@@ -537,8 +513,7 @@ def workbook_to_json(
+ 
+     # ########## Choices sheet ##########
+     choices_sheet = workbook_dict.get(constants.CHOICES, [])
+-    for choice_item in choices_sheet:
+-        replace_smart_quotes_in_dict(choice_item)
++    choices_sheet = clean_text_values(sheet_name=constants.CHOICES, data=choices_sheet)
+     choices_sheet = dealias_and_group_headers(
+         dict_array=choices_sheet,
+         header_aliases=aliases.list_header,
+@@ -617,6 +592,7 @@ def workbook_to_json(
+ 
+     # ########## Entities sheet ###########
+     entities_sheet = workbook_dict.get(constants.ENTITIES, [])
++    entities_sheet = clean_text_values(sheet_name=constants.ENTITIES, data=entities_sheet)
+     entities_sheet = dealias_and_group_headers(
+         dict_array=entities_sheet,
+         header_aliases=aliases.entities_header,
+@@ -629,11 +605,10 @@ def workbook_to_json(
+     # ########## Survey sheet ###########
+     survey_sheet = workbook_dict[constants.SURVEY]
+     # Process the headers:
+-    clean_text_values_enabled = aliases.yes_no.get(
+-        settings.get("clean_text_values", "true()")
+-    )
+     if clean_text_values_enabled:
+-        survey_sheet = clean_text_values(survey_sheet)
++        survey_sheet = clean_text_values(
++            sheet_name=constants.SURVEY, data=survey_sheet, strip_whitespace=True
++        )
+     survey_sheet = dealias_and_group_headers(
+         dict_array=survey_sheet,
+         header_aliases=aliases.survey_header,
+@@ -662,8 +637,6 @@ def workbook_to_json(
+     # #################################
+ 
+     # Parse the survey sheet while generating a survey in our json format:
+-    row_number = 1  # We start at 1 because the column header row is not
+-    #                 included in the survey sheet (presumably).
+     # A stack is used to keep track of begin/end expressions
+     stack = [
+         {
+@@ -703,8 +676,7 @@ def workbook_to_json(
+     trigger_references = []
+ 
+     # row by row, validate questions, throwing errors and adding warnings where needed.
+-    for row in survey_sheet.data:
+-        row_number += 1
++    for row_number, row in enumerate(survey_sheet.data, start=2):
+         if stack[-1] is not None:
+             prev_control_type = stack[-1]["control_type"]
+             parent_children_array = stack[-1]["parent_children"]
+@@ -730,7 +702,6 @@ def workbook_to_json(
+         # Get question type
+         question_type = row.get(constants.TYPE)
+         question_name = row.get(constants.NAME)
+-        question_names.add(question_name)
+ 
+         if not question_type:
+             # if name and label are also missing,
+@@ -1117,6 +1088,9 @@ def workbook_to_json(
+                 )
+                 continue
+ 
++        # Assuming a question is anything not processed above as a loop/repeat/group.
++        question_names.add(question_name)
++
+         # Try to parse question as a select:
+         select_parse = select_regexp.search(question_type)
+         if select_parse:
+diff --git a/pyxform/xlsparseutils.py b/pyxform/xlsparseutils.py
+index 73d0782..280f706 100644
+--- a/pyxform/xlsparseutils.py
++++ b/pyxform/xlsparseutils.py
+@@ -7,7 +7,7 @@ from pyxform.utils import levenshtein_distance
+ # http://www.w3.org/TR/REC-xml/
+ TAG_START_CHAR = r"[a-zA-Z:_]"
+ TAG_CHAR = r"[a-zA-Z:_0-9\-.]"
+-XFORM_TAG_REGEXP = f"{TAG_START_CHAR}{TAG_CHAR}*"
++XFORM_TAG_REGEXP = re.compile(rf"^{TAG_START_CHAR}{TAG_CHAR}*$")
+ 
+ 
+ def find_sheet_misspellings(key: str, keys: "KeysView") -> "str | None":
+@@ -42,4 +42,4 @@ def is_valid_xml_tag(tag):
+     """
+     Use a regex to see if there are any invalid characters (i.e. spaces).
+     """
+-    return re.search(r"^" + XFORM_TAG_REGEXP + r"$", tag)
++    return re.search(XFORM_TAG_REGEXP, tag)

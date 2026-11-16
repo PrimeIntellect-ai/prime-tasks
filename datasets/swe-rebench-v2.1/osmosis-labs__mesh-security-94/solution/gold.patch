@@ -1,0 +1,203 @@
+diff --git a/contracts/consumer/converter/README.md b/contracts/consumer/converter/README.md
+index ad13546..d0bcd23 100644
+--- a/contracts/consumer/converter/README.md
++++ b/contracts/consumer/converter/README.md
+@@ -14,5 +14,3 @@ too much logic.
+ 
+ It is bound 1-to-1 with a virtual staking contract, and requires a price feed
+ contract to provide valid price data.
+-
+-**TODO** More details on IBC comms
+diff --git a/contracts/provider/external-staking/src/contract.rs b/contracts/provider/external-staking/src/contract.rs
+index b185296..cddd92e 100644
+--- a/contracts/provider/external-staking/src/contract.rs
++++ b/contracts/provider/external-staking/src/contract.rs
+@@ -22,8 +22,8 @@ use crate::error::ContractError;
+ use crate::ibc::{packet_timeout, IBC_CHANNEL};
+ use crate::msg::{
+     AllPendingRewards, AllTxsResponse, AuthorizedEndpointResponse, ConfigResponse,
+-    IbcChannelResponse, ListRemoteValidatorsResponse, MaybePendingRewards, ReceiveVirtualStake,
+-    StakeInfo, StakesResponse, TxResponse, ValidatorPendingRewards,
++    IbcChannelResponse, ListRemoteValidatorsResponse, MaybePendingRewards, MaybeStake,
++    ReceiveVirtualStake, StakeInfo, StakesResponse, TxResponse, ValidatorPendingRewards,
+ };
+ use crate::state::{Config, Distribution, Stake};
+ 
+@@ -867,14 +867,16 @@ impl ExternalStakingContract<'_> {
+         ctx: QueryCtx,
+         user: String,
+         validator: String,
+-    ) -> Result<Stake, ContractError> {
++    ) -> Result<MaybeStake, ContractError> {
+         let user = ctx.deps.api.addr_validate(&user)?;
+         let stake_lock = self
+             .stakes
+             .may_load(ctx.deps.storage, (&user, &validator))?
+             .unwrap_or_default();
+-        let stake = stake_lock.read()?;
+-        Ok(stake.clone())
++        match stake_lock.read() {
++            Ok(stake) => Ok(MaybeStake::Stake(stake.clone())),
++            Err(_) => Ok(MaybeStake::Locked {}),
++        }
+     }
+ 
+     /// Paginated list of user stakes.
+@@ -902,7 +904,10 @@ impl ExternalStakingContract<'_> {
+                     Ok::<StakeInfo, ContractError>(StakeInfo {
+                         owner: user.to_string(),
+                         validator,
+-                        stake: stake_lock.read()?.stake,
++                        stake: match stake_lock.read() {
++                            Ok(stake) => MaybeStake::Stake(stake.clone()),
++                            Err(_) => MaybeStake::Locked {},
++                        },
+                     })
+                 })?
+             })
+diff --git a/contracts/provider/external-staking/src/msg.rs b/contracts/provider/external-staking/src/msg.rs
+index f801759..d48c400 100644
+--- a/contracts/provider/external-staking/src/msg.rs
++++ b/contracts/provider/external-staking/src/msg.rs
+@@ -1,6 +1,7 @@
+ use cosmwasm_schema::cw_serde;
+-use cosmwasm_std::{coin, Coin, IbcChannel, Uint128};
++use cosmwasm_std::{coin, Coin, IbcChannel};
+ 
++use crate::state::Stake;
+ use crate::{error::ContractError, state::Config};
+ 
+ #[cw_serde]
+@@ -57,12 +58,39 @@ impl From<Config> for ConfigResponse {
+     }
+ }
+ 
++/// Response for stake query on one user and validator
++#[cw_serde]
++pub enum MaybeStake {
++    Stake(Stake),
++    Locked {},
++}
++
++impl MaybeStake {
++    /// Designed for test code, unwrap or panic if Locked
++    pub fn unwrap(self) -> Stake {
++        match self {
++            MaybeStake::Stake(stake) => stake,
++            MaybeStake::Locked {} => panic!("Stake is locked"),
++        }
++    }
++}
++
+ /// Stake-related information including user address and validator
+ #[cw_serde]
+ pub struct StakeInfo {
+     pub owner: String,
+     pub validator: String,
+-    pub stake: Uint128,
++    pub stake: MaybeStake,
++}
++
++impl StakeInfo {
++    pub fn new(owner: &str, validator: &str, stake: &Stake) -> Self {
++        Self {
++            owner: owner.to_string(),
++            validator: validator.to_string(),
++            stake: MaybeStake::Stake(stake.clone()),
++        }
++    }
+ }
+ 
+ /// Aggregated multiple stakes response
+diff --git a/contracts/provider/external-staking/src/state.rs b/contracts/provider/external-staking/src/state.rs
+index e2245cd..fd85cde 100644
+--- a/contracts/provider/external-staking/src/state.rs
++++ b/contracts/provider/external-staking/src/state.rs
+@@ -40,6 +40,16 @@ pub struct Stake {
+     pub withdrawn_funds: Uint128,
+ }
+ 
++impl Stake {
++    /// Create simplified stake (mostly for tests)
++    pub fn from_amount(amount: Uint128) -> Self {
++        Self {
++            stake: amount,
++            ..Default::default()
++        }
++    }
++}
++
+ /// Description of tokens in unbonding period
+ #[cw_serde]
+ pub struct PendingUnbond {
+diff --git a/contracts/provider/vault/src/contract.rs b/contracts/provider/vault/src/contract.rs
+index 6c36ca7..ce3b4a6 100644
+--- a/contracts/provider/vault/src/contract.rs
++++ b/contracts/provider/vault/src/contract.rs
+@@ -20,7 +20,7 @@ use crate::error::ContractError;
+ use crate::msg;
+ use crate::msg::{
+     AccountClaimsResponse, AllAccountsResponse, AllAccountsResponseItem, AllTxsResponse,
+-    AllTxsResponseItem, ConfigResponse, LienInfo, MaybeAccountResponse, StakingInitInfo,
++    AllTxsResponseItem, ConfigResponse, MaybeAccountResponse, MaybeLienResponse, StakingInitInfo,
+     TxResponse,
+ };
+ use crate::state::{Config, Lien, LocalStaking, UserInfo};
+@@ -331,11 +331,13 @@ impl VaultContract<'_> {
+             .range(ctx.deps.storage, bound, None, Order::Ascending)
+             .map(|item| {
+                 let (lienholder, lien) = item?;
+-                let lien = lien.read()?;
+-                Ok::<LienInfo, ContractError>(LienInfo {
+-                    lienholder: lienholder.into(),
+-                    amount: lien.amount,
+-                })
++                match lien.read() {
++                    Ok(lien) => Ok::<_, ContractError>(MaybeLienResponse::new_unlocked(
++                        lienholder,
++                        lien.amount,
++                    )),
++                    Err(_) => Ok(MaybeLienResponse::Locked {}),
++                }
+             })
+             .take(limit)
+             .collect::<Result<_, _>>()?;
+diff --git a/contracts/provider/vault/src/msg.rs b/contracts/provider/vault/src/msg.rs
+index 3009afc..217fc29 100644
+--- a/contracts/provider/vault/src/msg.rs
++++ b/contracts/provider/vault/src/msg.rs
+@@ -1,6 +1,6 @@
+ use crate::msg::MaybeAccountResponse::{Account, Locked};
+ use cosmwasm_schema::cw_serde;
+-use cosmwasm_std::{Binary, Uint128};
++use cosmwasm_std::{Addr, Binary, Uint128};
+ use mesh_sync::Tx;
+ 
+ /// This is the info used to construct the native staking contract
+@@ -60,13 +60,22 @@ pub struct AllAccountsResponseItem {
+ 
+ #[cw_serde]
+ pub struct AccountClaimsResponse {
+-    pub claims: Vec<LienInfo>,
++    pub claims: Vec<MaybeLienResponse>,
+ }
+ 
+ #[cw_serde]
+-pub struct LienInfo {
+-    pub lienholder: String,
+-    pub amount: Uint128,
++pub enum MaybeLienResponse {
++    Lien { lienholder: String, amount: Uint128 },
++    Locked {},
++}
++
++impl MaybeLienResponse {
++    pub fn new_unlocked(lienholder: Addr, amount: Uint128) -> Self {
++        MaybeLienResponse::Lien {
++            lienholder: lienholder.into(),
++            amount,
++        }
++    }
+ }
+ 
+ #[cw_serde]

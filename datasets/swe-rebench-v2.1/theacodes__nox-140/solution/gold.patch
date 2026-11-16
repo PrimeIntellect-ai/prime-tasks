@@ -1,0 +1,233 @@
+diff --git a/docs/usage.rst b/docs/usage.rst
+index 5160b09..0f68542 100644
+--- a/docs/usage.rst
++++ b/docs/usage.rst
+@@ -104,6 +104,14 @@ By default nox will continue to run all sessions even if one fails. You can use
+     nox --stop-on-first-error
+ 
+ 
++Failing sessions when the interpreter is missing
++------------------------------------------------
++
++By default, Nox will skip sessions where the Python interpreter can't be found. If you want Nox to mark these sessions as failed, you can use ``--error-on-missing-interpreters``::
++
++    nox --error-on-missing-interpreters
++
++
+ Controlling color output
+ ------------------------
+ 
+diff --git a/nox/__main__.py b/nox/__main__.py
+index 37578b8..0f35bf5 100644
+--- a/nox/__main__.py
++++ b/nox/__main__.py
+@@ -39,6 +39,7 @@ class GlobalConfig:
+         self.list_sessions = args.list_sessions
+         self.reuse_existing_virtualenvs = args.reuse_existing_virtualenvs
+         self.stop_on_first_error = args.stop_on_first_error
++        self.error_on_missing_interpreters = args.error_on_missing_interpreters
+         self.posargs = args.posargs
+         self.report = args.report
+ 
+@@ -81,7 +82,15 @@ def main():
+         help="Re-use existing virtualenvs instead of recreating them.",
+     )
+     parser.add_argument(
+-        "--stop-on-first-error", action="store_true", help="Stop after the first error."
++        "-x",
++        "--stop-on-first-error",
++        action="store_true",
++        help="Stop after the first error.",
++    )
++    parser.add_argument(
++        "--error-on-missing-interpreters",
++        action="store_true",
++        help="Error instead of skip if an interpreter can not be located.",
+     )
+     parser.add_argument(
+         "--report", default=None, help="Output a report of all sessions."
+diff --git a/nox/sessions.py b/nox/sessions.py
+index 69951e7..edb3ebd 100644
+--- a/nox/sessions.py
++++ b/nox/sessions.py
+@@ -239,15 +239,11 @@ class Session:
+ 
+     def error(self, *args, **kwargs):
+         """Immediately aborts the session and optionally logs an error."""
+-        if args or kwargs:
+-            logger.error(*args, **kwargs)
+-        raise _SessionQuit()
++        raise _SessionQuit(*args, **kwargs)
+ 
+     def skip(self, *args, **kwargs):
+         """Immediately skips the session and optionally logs a warning."""
+-        if args or kwargs:
+-            logger.warning(*args, **kwargs)
+-        raise _SessionSkip()
++        raise _SessionSkip(*args, **kwargs)
+ 
+ 
+ class SessionRunner:
+@@ -304,11 +300,17 @@ class SessionRunner:
+             # Nothing went wrong; return a success.
+             return Result(self, Status.SUCCESS)
+ 
+-        except _SessionQuit:
+-            return Result(self, Status.ABORTED)
++        except nox.virtualenv.InterpreterNotFound as exc:
++            if self.global_config.error_on_missing_interpreters:
++                return Result(self, Status.FAILED, reason=str(exc))
++            else:
++                return Result(self, Status.SKIPPED, reason=str(exc))
+ 
+-        except _SessionSkip:
+-            return Result(self, Status.SKIPPED)
++        except _SessionQuit as exc:
++            return Result(self, Status.ABORTED, reason=str(exc))
++
++        except _SessionSkip as exc:
++            return Result(self, Status.SKIPPED, reason=str(exc))
+ 
+         except nox.command.CommandFailed:
+             return Result(self, Status.FAILED)
+@@ -325,16 +327,18 @@ class SessionRunner:
+ class Result:
+     """An object representing the result of a session."""
+ 
+-    def __init__(self, session, status):
++    def __init__(self, session, status, reason=None):
+         """Initialize the Result object.
+ 
+         Args:
+             session (~nox.sessions.SessionRunner):
+                 The session runner which ran.
+             status (~nox.sessions.Status): The final result status.
++            reason (str): Additional info.
+         """
+         self.session = session
+         self.status = status
++        self.reason = reason
+ 
+     def __bool__(self):
+         return self.status.value > 0
+@@ -351,7 +355,11 @@ class Result:
+         """
+         if self.status == Status.SUCCESS:
+             return "was successful"
+-        return self.status.name.lower()
++        status = self.status.name.lower()
++        if self.reason:
++            return "{}: {}".format(status, self.reason)
++        else:
++            return status
+ 
+     def log(self, message):
+         """Log a message using the appropriate log function.
+diff --git a/nox/virtualenv.py b/nox/virtualenv.py
+index ac6f627..4a88181 100644
+--- a/nox/virtualenv.py
++++ b/nox/virtualenv.py
+@@ -31,6 +31,12 @@ _BLACKLISTED_ENV_VARS = frozenset(
+ _SYSTEM = platform.system()
+ 
+ 
++class InterpreterNotFound(OSError):
++    def __init__(self, interpreter):
++        super().__init__("Python interpreter {} not found".format(interpreter))
++        self.interpreter = interpreter
++
++
+ class ProcessEnv:
+     """A environment with a 'bin' directory and a set of 'env' vars."""
+ 
+@@ -124,7 +130,7 @@ class VirtualEnv(ProcessEnv):
+         """
+         # If there is no assigned interpreter, then use the same one used by
+         # Nox.
+-        if isinstance(self._resolved, RuntimeError):
++        if isinstance(self._resolved, Exception):
+             raise self._resolved
+ 
+         if self._resolved is not None:
+@@ -134,59 +140,46 @@ class VirtualEnv(ProcessEnv):
+             self._resolved = sys.executable
+             return self._resolved
+ 
++        # Otherwise we need to divine the path to the interpreter. This is
++        # designed to accept strings in the form of "2", "2.7", "2.7.13",
++        # "2.7.13-32", "python2", "python2.4", etc.
++        xy_version = ""
++        cleaned_interpreter = self.interpreter
++
+         # If this is just a X, X.Y, or X.Y.Z string, extract just the X / X.Y
+         # part and add Python to the front of it.
+         match = re.match(r"^(?P<xy_ver>\d(\.\d)?)(\.\d+)?$", self.interpreter)
+-        xy_version = ""
+-        cleaned_interpreter = self.interpreter
+         if match:
+             xy_version = match.group("xy_ver")
+             cleaned_interpreter = "python{}".format(xy_version)
+ 
+-        # The value of ``cleaned_interpreter`` may be a valid script on the ``PATH``
+-        # or may be a full path to an interpreter in the filesystem; accept this.
++        # If the cleaned interpreter is on the PATH, go ahead and return it.
+         if py.path.local.sysfind(cleaned_interpreter):
+             self._resolved = cleaned_interpreter
+             return self._resolved
+ 
++        # The rest of this is only applicable to Windows, so if we don't have
++        # an interpreter by now, raise.
++        if _SYSTEM != "Windows":
++            self._resolved = InterpreterNotFound(self.interpreter)
++            raise self._resolved
++
+         # Allow versions of the form ``X.Y-32`` for Windows.
+-        if not xy_version:
+-            match = re.match(r"^\d\.\d-32?$", cleaned_interpreter)
+-            if match:
+-                xy_version = cleaned_interpreter
++        match = re.match(r"^\d\.\d-32?$", cleaned_interpreter)
++        if match:
++            # preserve the "-32" suffix, as the Python launcher expects
++            # it.
++            xy_version = cleaned_interpreter
+ 
+-        # Sanity check: We only need the rest of this behavior on Windows.
+-        if _SYSTEM != "Windows":
+-            if xy_version.endswith("-32"):
+-                self._resolved = RuntimeError(
+-                    "Locating 32-bit Python ({!r}) is "
+-                    "only supported on Windows.".format(cleaned_interpreter)
+-                )
+-                raise self._resolved
++        path_from_launcher = locate_via_py(xy_version)
+ 
+-            self._resolved = cleaned_interpreter
++        if path_from_launcher:
++            self._resolved = path_from_launcher
+             return self._resolved
+ 
+-        # From here on out, we are on Windows. If ``self.interpreter`` has
+-        # not produced a valid ``xy_version``, then we do one last check for
+-        # a standard "pythonX" or "pythonX.Y".
+-        if not xy_version:
+-            match = re.match(r"^python(?P<ver>\d(\.\d)?)$", cleaned_interpreter)
+-            if match:
+-                xy_version = match.group("ver")
+-
+-        # Ask the Python launcher to find the interpreter.
+-        if xy_version:
+-            path_from_launcher = locate_via_py(xy_version)
+-            if path_from_launcher:
+-                self._resolved = path_from_launcher
+-                return self._resolved
+-
+         # If we got this far, then we were unable to resolve the interpreter
+         # to an actual executable; raise an exception.
+-        self._resolved = RuntimeError(
+-            'Unable to locate Python interpreter "{}".'.format(self.interpreter)
+-        )
++        self._resolved = InterpreterNotFound(self.interpreter)
+         raise self._resolved
+ 
+     @property

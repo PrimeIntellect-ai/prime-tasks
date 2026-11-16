@@ -1,0 +1,281 @@
+diff --git a/tests/unit/test_connector.py b/tests/unit/test_connector.py
+index b8e38e5..b43c462 100644
+--- a/tests/unit/test_connector.py
++++ b/tests/unit/test_connector.py
+@@ -14,12 +14,68 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
+ 
++import asyncio
++import concurrent.futures
++import datetime
++from typing import Any, Dict
++from unittest.mock import MagicMock, patch
++
+ import pytest  # noqa F401 Needed to run the tests
+-from google.cloud.sql.connector.instance_connection_manager import IPTypes
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++from cryptography.x509.oid import NameOID
++
+ from google.cloud.sql.connector import connector
+-import asyncio
+-from unittest.mock import patch
+-from typing import Any
++from google.cloud.sql.connector.instance_connection_manager import (
++    InstanceConnectionManager,
++    InstanceMetadata,
++    IPTypes,
++)
++
++
++def _build_keys_and_metadata() -> Any:
++    """Build a key pair (as a completed future) and a matching
++    InstanceMetadata object for use in tests."""
++    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    priv_key = key.private_bytes(
++        encoding=serialization.Encoding.PEM,
++        format=serialization.PrivateFormat.TraditionalOpenSSL,
++        encryption_algorithm=serialization.NoEncryption(),
++    )
++    pub_key = (
++        key.public_key()
++        .public_bytes(
++            encoding=serialization.Encoding.PEM,
++            format=serialization.PublicFormat.SubjectPublicKeyInfo,
++        )
++        .decode("UTF-8")
++    )
++    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test")])
++    cert = (
++        x509.CertificateBuilder()
++        .subject_name(name)
++        .issuer_name(name)
++        .public_key(key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(datetime.datetime.utcnow())
++        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
++        .sign(key, hashes.SHA256())
++    )
++    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("UTF-8")
++
++    keys: concurrent.futures.Future = concurrent.futures.Future()
++    keys.set_result((priv_key, pub_key))
++
++    metadata = InstanceMetadata(
++        cert_pem,
++        {"PRIMARY": "1.2.3.4", "PRIVATE": "5.6.7.8"},
++        priv_key,
++        cert_pem,
++        datetime.datetime.utcnow() + datetime.timedelta(days=1),
++        False,
++    )
++    return keys, cert_pem, metadata
+ 
+ 
+ class MockInstanceConnectionManager:
+@@ -28,20 +84,21 @@ class MockInstanceConnectionManager:
+     def __init__(
+         self,
+         enable_iam_auth: bool = False,
++        metadata: Any = None,
+     ) -> None:
+         self._enable_iam_auth = enable_iam_auth
++        self._metadata = metadata
+ 
+-    async def connect(
+-        self,
+-        driver: str,
+-        ip_type: IPTypes,
+-        **kwargs: Any,
+-    ) -> Any:
+-        return True
++    async def connect_info(self, ip_type: IPTypes) -> Any:
++        return self._metadata, self._metadata.get_preferred_ip(ip_type)
++
++    async def connect(self, driver: str, ip_type: IPTypes, **kwargs: Any) -> Any:
++        # Legacy entry point used before the connect -> connect_info refactor.
++        return "legacy-connect-result"
+ 
+ 
+ async def timeout_stub(*args: Any, **kwargs: Any) -> None:
+-    """Timeout stub for InstanceConnectionManager.connect()"""
++    """Timeout stub for InstanceConnectionManager.connect_info()"""
+     # sleep 10 seconds
+     await asyncio.sleep(10)
+ 
+@@ -51,14 +108,15 @@ def test_connect_timeout() -> None:
+     connect_string = "test-project:test-region:test-instance"
+ 
+     icm = MockInstanceConnectionManager()
+-    setattr(icm, "connect", timeout_stub)
+-
+     mock_instances = {}
+     mock_instances[connect_string] = icm
+-    mock_connector = connector.Connector()
+-    connector._default_connector = mock_connector
++    # stub icm to raise timeout
++    setattr(icm, "connect_info", timeout_stub)
++    # set default connector
++    default_connector = connector.Connector()
++    connector._default_connector = default_connector
+     # attempt to connect with timeout set to 5s
+-    with patch.dict(mock_connector._instances, mock_instances):
++    with patch.dict(default_connector._instances, mock_instances):
+         pytest.raises(
+             TimeoutError,
+             connector.connect,
+@@ -72,17 +130,14 @@ def test_connect_enable_iam_auth_error() -> None:
+     """Test that calling connect() with different enable_iam_auth
+     argument values throws error."""
+     connect_string = "my-project:my-region:my-instance"
++    # create mock ICM with enable_iam_auth=False
++    icm = MockInstanceConnectionManager(enable_iam_auth=False)
++    mock_instances = {}
++    mock_instances[connect_string] = icm
++    # set default connector
+     default_connector = connector.Connector()
+-    with patch(
+-        "google.cloud.sql.connector.connector.InstanceConnectionManager"
+-    ) as mock_icm:
+-        mock_icm.return_value = MockInstanceConnectionManager(enable_iam_auth=False)
+-        conn = default_connector.connect(
+-            connect_string,
+-            "pg8000",
+-            enable_iam_auth=False,
+-        )
+-        assert conn is True
++    connector._default_connector = default_connector
++    with patch.dict(default_connector._instances, mock_instances):
+         # try to connect using enable_iam_auth=True, should raise error
+         pytest.raises(
+             ValueError,
+@@ -91,8 +146,125 @@ def test_connect_enable_iam_auth_error() -> None:
+             "pg8000",
+             enable_iam_auth=True,
+         )
+-        # remove mock_icm to avoid destructor warnings
+-        default_connector._instances = {}
++    # remove mock_icm to avoid destructor warnings
++    default_connector._instances = {}
++
++
++def test_connect_unsupported_driver_raises_keyerror() -> None:
++    """Test that connect() raises KeyError for an unsupported driver."""
++    connect_string = "test-project:test-region:test-instance"
++    _, _, metadata = _build_keys_and_metadata()
++    icm = MockInstanceConnectionManager(metadata=metadata)
++    default_connector = connector.Connector()
++    connector._default_connector = default_connector
++    with patch.dict(default_connector._instances, {connect_string: icm}):
++        with pytest.raises(KeyError):
++            connector.connect(connect_string, "unsupported-driver")
++    default_connector._instances = {}
++
++
++@pytest.mark.parametrize(
++    ("driver", "driver_target", "driver_kwargs"),
++    [
++        ("pymysql", "pymysql.Connection", {"user": "user", "password": "pass"}),
++        (
++            "pg8000",
++            "pg8000.dbapi.connect",
++            {"user": "user", "db": "db", "password": "pass"},
++        ),
++        ("pytds", "pytds.connect", {"user": "user", "db": "db", "password": "pass"}),
++    ],
++)
++def test_connect_invokes_driver_connect_routine(
++    driver: str, driver_target: str, driver_kwargs: Dict[str, Any]
++) -> None:
++    """Each supported driver dials the selected IP address, wraps the socket
++    with the instance SSL context, and its result is returned to the caller."""
++    connect_string = "test-project:test-region:test-instance"
++    _, _, metadata = _build_keys_and_metadata()
++    # A mock SSL context lets the socket wrapping be observed without a server.
++    ctx = MagicMock()
++    metadata.context = ctx
++    icm = MockInstanceConnectionManager(metadata=metadata)
++    default_connector = connector.Connector()
++    connector._default_connector = default_connector
++    with patch.dict(default_connector._instances, {connect_string: icm}):
++        with patch("socket.create_connection") as mock_create_connection, patch(
++            driver_target
++        ) as mock_driver:
++            expected = MagicMock()
++            mock_driver.return_value = expected
++            result = connector.connect(
++                connect_string, driver, ip_type=IPTypes.PRIVATE, **driver_kwargs
++            )
++            assert result is expected
++            # The selected private IP reaches the network layer, either as the
++            # dialed address or as an argument handed to the driver.
++            observed = repr(mock_create_connection.call_args) + repr(
++                mock_driver.call_args
++            )
++            assert "5.6.7.8" in observed
++            # The instance SSL context is used, either to wrap the socket or
++            # passed straight to the driver.
++            driver_call = mock_driver.call_args
++            driver_args = [*driver_call.args, *driver_call.kwargs.values()]
++            assert ctx.wrap_socket.called or any(a is ctx for a in driver_args)
++    default_connector._instances = {}
++
++
++def test_driver_connect_routines_available_at_connector_level() -> None:
++    """Test that the driver-specific connect routines are exposed as
++    module-level functions in the connector package."""
++    import google.cloud.sql.connector.pg8000 as pg8000_module
++    import google.cloud.sql.connector.pymysql as pymysql_module
++    import google.cloud.sql.connector.pytds as pytds_module
++
++    assert callable(pymysql_module.connect)
++    assert callable(pg8000_module.connect)
++    assert callable(pytds_module.connect)
++
++
++@pytest.mark.asyncio
++async def test_connect_info_returns_metadata_and_ip(
++    fake_credentials: Any, event_loop: asyncio.AbstractEventLoop
++) -> None:
++    """Test that InstanceConnectionManager.connect_info returns the
++    refreshed instance metadata together with the selected IP address."""
++    keys, cert_pem, _ = _build_keys_and_metadata()
++
++    async def _fake_get_metadata(*args: Any, **kwargs: Any) -> Any:
++        return {
++            "ip_addresses": {"PRIMARY": "1.2.3.4", "PRIVATE": "5.6.7.8"},
++            "server_ca_cert": cert_pem,
++        }
++
++    async def _fake_get_ephemeral(*args: Any, **kwargs: Any) -> Any:
++        return cert_pem
++
++    with patch("google.auth.default") as mock_auth, patch(
++        "google.cloud.sql.connector.instance_connection_manager._get_metadata",
++        _fake_get_metadata,
++    ), patch(
++        "google.cloud.sql.connector.instance_connection_manager._get_ephemeral",
++        _fake_get_ephemeral,
++    ):
++        mock_auth.return_value = (fake_credentials, None)
++        icm = InstanceConnectionManager(
++            "test-project:test-region:test-instance",
++            "pymysql",
++            keys,
++            event_loop,
++        )
++        result = await icm.connect_info(IPTypes.PUBLIC)
++        assert isinstance(result, tuple)
++        assert len(result) == 2
++        instance_data, ip_address = result
++        assert isinstance(instance_data, InstanceMetadata)
++        assert ip_address == "1.2.3.4"
++        assert ip_address == instance_data.get_preferred_ip(IPTypes.PUBLIC)
++        _, private_ip = await icm.connect_info(IPTypes.PRIVATE)
++        assert private_ip == "5.6.7.8"
++        await icm.close()
+ 
+ 
+ def test_default_Connector_Init() -> None:

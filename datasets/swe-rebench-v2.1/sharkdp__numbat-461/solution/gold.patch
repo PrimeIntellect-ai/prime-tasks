@@ -1,0 +1,255 @@
+diff --git a/numbat/src/bytecode_interpreter.rs b/numbat/src/bytecode_interpreter.rs
+index aa7b11d..29b91e4 100644
+--- a/numbat/src/bytecode_interpreter.rs
++++ b/numbat/src/bytecode_interpreter.rs
+@@ -17,7 +17,7 @@ use crate::unit::{CanonicalName, Unit};
+ use crate::unit_registry::{UnitMetadata, UnitRegistry};
+ use crate::value::FunctionReference;
+ use crate::vm::{Constant, ExecutionContext, Op, Vm};
+-use crate::{decorator, ffi};
++use crate::{decorator, ffi, Type};
+ 
+ #[derive(Debug, Clone, Default)]
+ pub struct LocalMetadata {
+@@ -187,9 +187,15 @@ impl BytecodeInterpreter {
+                 self.vm
+                     .add_op2(Op::BuildStructInstance, struct_info_idx, exprs.len() as u16);
+             }
+-            Expression::AccessField(_span, _full_span, expr, attr, struct_info, _result_type) => {
++            Expression::AccessField(_span, _full_span, expr, attr, struct_type, _result_type) => {
+                 self.compile_expression_with_simplify(expr)?;
+ 
++                let Type::Struct(ref struct_info) = struct_type.to_concrete_type() else {
++                    unreachable!(
++                        "Field access of non-struct type should be prevented by the type checker"
++                    );
++                };
++
+                 let idx = struct_info.fields.get_index_of(attr).unwrap();
+ 
+                 self.vm.add_op1(Op::AccessStructField, idx as u16);
+diff --git a/numbat/src/traversal.rs b/numbat/src/traversal.rs
+index 313d31c..21656d8 100644
+--- a/numbat/src/traversal.rs
++++ b/numbat/src/traversal.rs
+@@ -57,10 +57,10 @@ impl ForAllTypeSchemes for Expression {
+                 }
+                 info.for_all_type_schemes(f);
+             }
+-            Expression::AccessField(_, _, expr, _, info, type_) => {
++            Expression::AccessField(_, _, expr, _, struct_type, field_type) => {
+                 expr.for_all_type_schemes(f);
+-                info.for_all_type_schemes(f);
+-                f(type_);
++                f(struct_type);
++                f(field_type);
+             }
+             Expression::List(_, elements, type_) => {
+                 for element in elements {
+diff --git a/numbat/src/typechecker/constraints.rs b/numbat/src/typechecker/constraints.rs
+index b828e11..e770c08 100644
+--- a/numbat/src/typechecker/constraints.rs
++++ b/numbat/src/typechecker/constraints.rs
+@@ -180,6 +180,7 @@ pub enum Constraint {
+     Equal(Type, Type),
+     IsDType(Type),
+     EqualScalar(DType),
++    HasField(Type, String, Type),
+ }
+ 
+ impl Constraint {
+@@ -208,6 +209,10 @@ impl Constraint {
+                 TrivialResultion::Violated
+             }
+             Constraint::EqualScalar(_) => TrivialResultion::Unknown,
++            Constraint::HasField(_, _, _) => {
++                // Trivial resolution handling for structs is done directly in the type checker
++                TrivialResultion::Unknown
++            }
+         }
+     }
+ 
+@@ -293,6 +298,23 @@ impl Constraint {
+                 }
+                 _ => None,
+             },
++            Constraint::HasField(struct_type, field_name, field_type)
++                if struct_type.is_closed() =>
++            {
++                if let Type::Struct(info) = struct_type {
++                    if let Some((_, actual_field_type)) = info.fields.get(field_name) {
++                        Some(Satisfied::with_new_constraints(vec![Constraint::Equal(
++                            actual_field_type.clone(),
++                            field_type.clone(),
++                        )]))
++                    } else {
++                        None
++                    }
++                } else {
++                    None
++                }
++            }
++            Constraint::HasField(_, _, _) => None,
+         }
+     }
+ 
+@@ -303,6 +325,12 @@ impl Constraint {
+             }
+             Constraint::IsDType(t) => format!("  {}: DType", t),
+             Constraint::EqualScalar(d) => format!("  {} = Scalar", d),
++            Constraint::HasField(struct_type, field_name, field_type) => {
++                format!(
++                    "HasField({}, \"{}\", {})",
++                    struct_type, field_name, field_type
++                )
++            }
+         }
+     }
+ 
+@@ -327,6 +355,10 @@ impl ApplySubstitution for Constraint {
+                 t.apply(substitution)?;
+             }
+             Constraint::EqualScalar(d) => d.apply(substitution)?,
++            Constraint::HasField(struct_type, _, field_type) => {
++                struct_type.apply(substitution)?;
++                field_type.apply(substitution)?;
++            }
+         }
+         Ok(())
+     }
+diff --git a/numbat/src/typechecker/mod.rs b/numbat/src/typechecker/mod.rs
+index 9d4da92..c0942d7 100644
+--- a/numbat/src/typechecker/mod.rs
++++ b/numbat/src/typechecker/mod.rs
+@@ -964,38 +964,52 @@ impl TypeChecker {
+                     struct_info.clone(),
+                 )
+             }
+-            ast::Expression::AccessField(full_span, ident_span, expr, attr) => {
++            ast::Expression::AccessField(full_span, ident_span, expr, field_name) => {
+                 let expr_checked = self.elaborate_expression(expr)?;
+ 
+                 let type_ = expr_checked.get_type();
+ 
+-                let Type::Struct(struct_info) = type_.clone() else {
+-                    return Err(TypeCheckError::FieldAccessOfNonStructType(
+-                        *ident_span,
+-                        expr.full_span(),
+-                        attr.to_string(),
+-                        type_.clone(),
+-                    ));
+-                };
++                let field_type = if type_.is_closed() {
++                    let Type::Struct(ref struct_info) = type_ else {
++                        return Err(TypeCheckError::FieldAccessOfNonStructType(
++                            *ident_span,
++                            expr.full_span(),
++                            field_name.to_string(),
++                            type_.clone(),
++                        ));
++                    };
+ 
+-                let Some((_, result_type)) = struct_info.fields.get(attr) else {
+-                    return Err(TypeCheckError::UnknownFieldAccess(
+-                        *ident_span,
+-                        expr.full_span(),
+-                        attr.to_string(),
+-                        type_.clone(),
+-                    ));
+-                };
++                    let Some((_, field_type)) = struct_info.fields.get(field_name) else {
++                        return Err(TypeCheckError::UnknownFieldAccess(
++                            *ident_span,
++                            expr.full_span(),
++                            field_name.to_string(),
++                            type_.clone(),
++                        ));
++                    };
++
++                    field_type.clone()
++                } else {
++                    let field_type = self.fresh_type_variable();
+ 
+-                let result_type = result_type.to_owned();
++                    self.constraints
++                        .add(Constraint::HasField(
++                            type_.clone(),
++                            field_name.clone(),
++                            field_type.clone(),
++                        ))
++                        .ok();
++
++                    field_type
++                };
+ 
+                 Expression::AccessField(
+                     *ident_span,
+                     *full_span,
+                     Box::new(expr_checked),
+-                    attr.to_owned(),
+-                    struct_info,
+-                    TypeScheme::concrete(result_type),
++                    field_name.to_owned(),
++                    TypeScheme::concrete(type_),
++                    TypeScheme::concrete(field_type),
+                 )
+             }
+             ast::Expression::List(span, elements) => {
+diff --git a/numbat/src/typechecker/substitutions.rs b/numbat/src/typechecker/substitutions.rs
+index 4e4db48..353616e 100644
+--- a/numbat/src/typechecker/substitutions.rs
++++ b/numbat/src/typechecker/substitutions.rs
+@@ -194,10 +194,10 @@ impl ApplySubstitution for Expression {
+                 }
+                 info.apply(s)
+             }
+-            Expression::AccessField(_, _, instance, _, info, type_) => {
++            Expression::AccessField(_, _, instance, _, struct_type, field_type) => {
+                 instance.apply(s)?;
+-                info.apply(s)?;
+-                type_.apply(s)
++                struct_type.apply(s)?;
++                field_type.apply(s)
+             }
+             Expression::List(_, elements, element_type) => {
+                 for element in elements {
+diff --git a/numbat/src/typed_ast.rs b/numbat/src/typed_ast.rs
+index 890ee25..bdaa4a3 100644
+--- a/numbat/src/typed_ast.rs
++++ b/numbat/src/typed_ast.rs
+@@ -518,7 +518,14 @@ pub enum Expression {
+     Condition(Span, Box<Expression>, Box<Expression>, Box<Expression>),
+     String(Span, Vec<StringPart>),
+     InstantiateStruct(Span, Vec<(String, Expression)>, StructInfo),
+-    AccessField(Span, Span, Box<Expression>, String, StructInfo, TypeScheme),
++    AccessField(
++        Span,
++        Span,
++        Box<Expression>,
++        String,     // field name
++        TypeScheme, // struct type
++        TypeScheme, // resulting field type
++    ),
+     List(Span, Vec<Expression>, TypeScheme),
+     TypedHole(Span, TypeScheme),
+ }
+@@ -661,7 +668,9 @@ impl Expression {
+             Expression::Condition(_, _, then_, _) => then_.get_type(),
+             Expression::String(_, _) => Type::String,
+             Expression::InstantiateStruct(_, _, info_) => Type::Struct(info_.clone()),
+-            Expression::AccessField(_, _, _, _, _, type_) => type_.unsafe_as_concrete(),
++            Expression::AccessField(_, _, _, _, _struct_type, field_type) => {
++                field_type.unsafe_as_concrete()
++            }
+             Expression::List(_, _, element_type) => {
+                 Type::List(Box::new(element_type.unsafe_as_concrete()))
+             }
+@@ -685,7 +694,7 @@ impl Expression {
+             Expression::InstantiateStruct(_, _, info_) => {
+                 TypeScheme::make_quantified(Type::Struct(info_.clone()))
+             }
+-            Expression::AccessField(_, _, _, _, _, type_) => type_.clone(),
++            Expression::AccessField(_, _, _, _, _struct_type, field_type) => field_type.clone(),
+             Expression::List(_, _, inner) => match inner {
+                 TypeScheme::Concrete(t) => TypeScheme::Concrete(Type::List(Box::new(t.clone()))),
+                 TypeScheme::Quantified(ngen, qt) => TypeScheme::Quantified(

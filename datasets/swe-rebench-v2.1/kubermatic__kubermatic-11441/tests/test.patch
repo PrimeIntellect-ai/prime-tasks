@@ -1,0 +1,112 @@
+diff --git a/pkg/defaulting/cluster_test.go b/pkg/defaulting/cluster_test.go
+index 411390df1..b9a8353db 100644
+--- a/pkg/defaulting/cluster_test.go
++++ b/pkg/defaulting/cluster_test.go
+@@ -17,13 +17,22 @@ limitations under the License.
+ package defaulting
+ 
+ import (
++	"context"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 
+ 	kubermaticv1 "k8c.io/kubermatic/v2/pkg/apis/kubermatic/v1"
++	"k8c.io/kubermatic/v2/pkg/resources"
++	"k8c.io/kubermatic/v2/pkg/resources/csi"
++	"k8c.io/kubermatic/v2/pkg/semver"
+ 
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/utils/pointer"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+ 
+ func TestDefaultClusterNetwork(t *testing.T) {
+@@ -225,10 +234,82 @@ func TestDefaultClusterNetwork(t *testing.T) {
+ 		},
+ 	}
+ 
++	seed := &kubermaticv1.Seed{
++		Spec: kubermaticv1.SeedSpec{
++			Datacenters: map[string]kubermaticv1.Datacenter{
++				"test-dc": {},
++			},
++		},
++	}
++
+ 	for _, tc := range testCases {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			tc.spec.ClusterNetwork = DefaultClusterNetwork(tc.spec.ClusterNetwork, kubermaticv1.ProviderType(tc.spec.Cloud.ProviderName))
+-			assert.Equal(t, tc.expectedChangedSpec, tc.spec)
++			spec := tc.spec
++			spec.Cloud.DatacenterName = "test-dc"
++			if spec.Cloud.ProviderName == string(kubermaticv1.KubevirtCloudProvider) {
++				spec.Cloud.Kubevirt = &kubermaticv1.KubevirtCloudSpec{}
++			} else {
++				spec.Cloud.Fake = &kubermaticv1.FakeCloudSpec{}
++			}
++
++			if err := DefaultClusterSpec(context.Background(), spec, nil, seed, nil, nil); err != nil {
++				t.Fatalf("failed to default cluster spec: %v", err)
++			}
++
++			assert.Equal(t, tc.expectedChangedSpec.ClusterNetwork, spec.ClusterNetwork)
+ 		})
+ 	}
+ }
++
++func TestKubeVirtCSIControllerDoesNotReserveHostPorts(t *testing.T) {
++	const namespace = "cluster-test"
++
++	cluster := &kubermaticv1.Cluster{
++		ObjectMeta: metav1.ObjectMeta{Name: "test"},
++		Spec: kubermaticv1.ClusterSpec{
++			Cloud: kubermaticv1.CloudSpec{
++				ProviderName: string(kubermaticv1.KubevirtCloudProvider),
++				Kubevirt:     &kubermaticv1.KubevirtCloudSpec{},
++			},
++			ClusterNetwork: kubermaticv1.ClusterNetworkingConfig{
++				DNSDomain: "cluster.local",
++			},
++		},
++		Status: kubermaticv1.ClusterStatus{
++			NamespaceName: namespace,
++			Versions: kubermaticv1.ClusterVersionsStatus{
++				ControllerManager: *semver.NewSemverOrDie("1.28.0"),
++			},
++		},
++	}
++
++	client := fake.NewClientBuilder().WithObjects(
++		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: resources.AdminKubeconfigSecretName}},
++		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: resources.KubeVirtCSISecretName}},
++		&corev1.Service{
++			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: resources.DNSResolverServiceName},
++			Spec:       corev1.ServiceSpec{ClusterIP: "10.240.16.10"},
++		},
++	).Build()
++
++	data := resources.NewTemplateDataBuilder().
++		WithContext(context.Background()).
++		WithClient(client).
++		WithCluster(cluster).
++		Build()
++
++	creators := csi.DeploymentsCreators(data)
++	require.NotEmpty(t, creators, "expected CSI deployments for a KubeVirt cluster")
++
++	for _, getter := range creators {
++		name, create := getter()
++		deployment, err := create(&appsv1.Deployment{})
++		require.NoError(t, err, "failed to create deployment %q", name)
++
++		for _, container := range deployment.Spec.Template.Spec.Containers {
++			for _, port := range container.Ports {
++				assert.Zero(t, port.HostPort, "container %q of deployment %q must not reserve host port %d, otherwise a replacement pod cannot be scheduled on a single-node seed while the old pod runs", container.Name, name, port.HostPort)
++			}
++		}
++	}
++}

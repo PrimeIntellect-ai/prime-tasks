@@ -1,0 +1,164 @@
+diff --git a/dbt/adapters/athena/impl.py b/dbt/adapters/athena/impl.py
+index 4d6dccc..676ec2d 100755
+--- a/dbt/adapters/athena/impl.py
++++ b/dbt/adapters/athena/impl.py
+@@ -44,7 +44,13 @@ from dbt.adapters.athena.relation import (
+     get_table_type,
+ )
+ from dbt.adapters.athena.s3 import S3DataNaming
+-from dbt.adapters.athena.utils import clean_sql_comment, get_catalog_id, get_chunks
++from dbt.adapters.athena.utils import (
++    AthenaCatalogType,
++    clean_sql_comment,
++    get_catalog_id,
++    get_catalog_type,
++    get_chunks,
++)
+ from dbt.adapters.base import ConstraintSupport, available
+ from dbt.adapters.base.relation import BaseRelation, InformationSchema
+ from dbt.adapters.sql import SQLAdapter
+@@ -411,6 +417,29 @@ class AthenaAdapter(SQLAdapter):
+             for idx, col in enumerate(table["StorageDescriptor"]["Columns"] + table.get("PartitionKeys", []))
+         ]
+ 
++    def _get_one_table_for_non_glue_catalog(
++        self, table: TableTypeDef, schema: str, database: str
++    ) -> List[Dict[str, Any]]:
++        table_catalog = {
++            "table_database": database,
++            "table_schema": schema,
++            "table_name": table["Name"],
++            "table_type": RELATION_TYPE_MAP[table.get("TableType", "EXTERNAL_TABLE")].value,
++            "table_comment": table.get("Parameters", {}).get("comment", ""),
++        }
++        return [
++            {
++                **table_catalog,
++                **{
++                    "column_name": col["Name"],
++                    "column_index": idx,
++                    "column_type": col["Type"],
++                    "column_comment": col.get("Comment", ""),
++                },
++            }
++            for idx, col in enumerate(table["Columns"] + table.get("PartitionKeys", []))
++        ]
++
+     def _get_one_catalog(
+         self,
+         information_schema: InformationSchema,
+@@ -418,29 +447,55 @@ class AthenaAdapter(SQLAdapter):
+         manifest: Manifest,
+     ) -> agate.Table:
+         data_catalog = self._get_data_catalog(information_schema.path.database)
+-        catalog_id = get_catalog_id(data_catalog)
++        data_catalog_type = get_catalog_type(data_catalog)
++
+         conn = self.connections.get_thread_connection()
+         client = conn.handle
+-        with boto3_client_lock:
+-            glue_client = client.session.client("glue", region_name=client.region_name, config=get_boto3_config())
+-
+-        catalog = []
+-        paginator = glue_client.get_paginator("get_tables")
+-        for schema, relations in schemas.items():
+-            kwargs = {
+-                "DatabaseName": schema,
+-                "MaxResults": 100,
+-            }
+-            # If the catalog is `awsdatacatalog` we don't need to pass CatalogId as boto3 infers it from the account Id.
+-            if catalog_id:
+-                kwargs["CatalogId"] = catalog_id
++        if data_catalog_type == AthenaCatalogType.GLUE:
++            with boto3_client_lock:
++                glue_client = client.session.client("glue", region_name=client.region_name, config=get_boto3_config())
++
++            catalog = []
++            paginator = glue_client.get_paginator("get_tables")
++            for schema, relations in schemas.items():
++                kwargs = {
++                    "DatabaseName": schema,
++                    "MaxResults": 100,
++                }
++                # If the catalog is `awsdatacatalog` we don't need to pass CatalogId as boto3
++                # infers it from the account Id.
++                catalog_id = get_catalog_id(data_catalog)
++                if catalog_id:
++                    kwargs["CatalogId"] = catalog_id
++
++                for page in paginator.paginate(**kwargs):
++                    for table in page["TableList"]:
++                        if relations and table["Name"] in relations:
++                            catalog.extend(self._get_one_table_for_catalog(table, information_schema.path.database))
++            table = agate.Table.from_object(catalog)
++        else:
++            with boto3_client_lock:
++                athena_client = client.session.client(
++                    "athena", region_name=client.region_name, config=get_boto3_config()
++                )
+ 
+-            for page in paginator.paginate(**kwargs):
+-                for table in page["TableList"]:
+-                    if relations and table["Name"] in relations:
+-                        catalog.extend(self._get_one_table_for_catalog(table, information_schema.path.database))
++            catalog = []
++            paginator = athena_client.get_paginator("list_table_metadata")
++            for schema, relations in schemas.items():
++                for page in paginator.paginate(
++                    CatalogName=information_schema.path.database,
++                    DatabaseName=schema,
++                    MaxResults=50,  # Limit supported by this operation
++                ):
++                    for table in page["TableMetadataList"]:
++                        if relations and table["Name"] in relations:
++                            catalog.extend(
++                                self._get_one_table_for_non_glue_catalog(
++                                    table, schema, information_schema.path.database
++                                )
++                            )
++            table = agate.Table.from_object(catalog)
+ 
+-        table = agate.Table.from_object(catalog)
+         filtered_table = self._catalog_filter_table(table, manifest)
+         return self._join_catalog_table_owners(filtered_table, manifest)
+ 
+diff --git a/dbt/adapters/athena/relation.py b/dbt/adapters/athena/relation.py
+index bb07393..680f9e0 100644
+--- a/dbt/adapters/athena/relation.py
++++ b/dbt/adapters/athena/relation.py
+@@ -79,6 +79,7 @@ class AthenaSchemaSearchMap(Dict[InformationSchema, Dict[str, Set[Optional[str]]
+ 
+ RELATION_TYPE_MAP = {
+     "EXTERNAL_TABLE": TableType.TABLE,
++    "EXTERNAL": TableType.TABLE,  # type returned by federated query tables
+     "MANAGED_TABLE": TableType.TABLE,
+     "VIRTUAL_VIEW": TableType.VIEW,
+     "table": TableType.TABLE,
+diff --git a/dbt/adapters/athena/utils.py b/dbt/adapters/athena/utils.py
+index 778fb4c..dcd7491 100644
+--- a/dbt/adapters/athena/utils.py
++++ b/dbt/adapters/athena/utils.py
+@@ -1,3 +1,4 @@
++from enum import Enum
+ from typing import Generator, List, Optional, TypeVar
+ 
+ from mypy_boto3_athena.type_defs import DataCatalogTypeDef
+@@ -9,7 +10,17 @@ def clean_sql_comment(comment: str) -> str:
+ 
+ 
+ def get_catalog_id(catalog: Optional[DataCatalogTypeDef]) -> Optional[str]:
+-    return catalog["Parameters"]["catalog-id"] if catalog else None
++    return catalog["Parameters"]["catalog-id"] if catalog and catalog["Type"] == AthenaCatalogType.GLUE.value else None
++
++
++class AthenaCatalogType(Enum):
++    GLUE = "GLUE"
++    LAMBDA = "LAMBDA"
++    HIVE = "HIVE"
++
++
++def get_catalog_type(catalog: Optional[DataCatalogTypeDef]) -> Optional[AthenaCatalogType]:
++    return AthenaCatalogType(catalog["Type"]) if catalog else None
+ 
+ 
+ T = TypeVar("T")

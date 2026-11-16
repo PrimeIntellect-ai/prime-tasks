@@ -1,0 +1,219 @@
+diff --git a/pkg/filter/expr_filter_test.go b/pkg/filter/expr_filter_test.go
+index dd7ee4c34..06ca4c4b9 100644
+--- a/pkg/filter/expr_filter_test.go
++++ b/pkg/filter/expr_filter_test.go
+@@ -14,9 +14,14 @@
+ package filter
+ 
+ import (
++	"fmt"
+ 	"testing"
+ 
+ 	"github.com/pingcap/errors"
++	timodel "github.com/pingcap/tidb/pkg/meta/model"
++	"github.com/pingcap/tidb/pkg/sessionctx"
++	"github.com/pingcap/tidb/pkg/table"
++	"github.com/pingcap/tidb/pkg/types"
+ 	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
+ 	"github.com/pingcap/tiflow/cdc/model"
+ 	"github.com/pingcap/tiflow/dm/pkg/utils"
+@@ -25,6 +30,29 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// adjustBinaryProtocolForDatumWithoutVirtualCol converts the data in binlog to TiDB datum.
++func adjustBinaryProtocolForDatumWithoutVirtualCol(ctx sessionctx.Context, data []interface{}, cols []*timodel.ColumnInfo) ([]types.Datum, error) {
++	ret := make([]types.Datum, 0, len(data))
++	colIndex := 0
++	for _, d := range data {
++		datum := types.NewDatum(d)
++		// Find the next physical column corresponding to this row datum.
++		for colIndex < len(cols) && !model.IsColCDCVisible(cols[colIndex]) {
++			colIndex++
++		}
++		if colIndex >= len(cols) {
++			return nil, fmt.Errorf("colIndex out of bounds")
++		}
++		castDatum, err := table.CastValue(ctx, datum, cols[colIndex], false, false)
++		if err != nil {
++			return nil, err
++		}
++		ret = append(ret, castDatum)
++		colIndex++
++	}
++	return ret, nil
++}
++
+ func TestShouldSkipDMLBasic(t *testing.T) {
+ 	helper := newTestHelper(t)
+ 	defer helper.close()
+@@ -177,6 +205,47 @@ func TestShouldSkipDMLBasic(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		// test table with vitual columns
++		{
++			ddl: "create table test.student_score(id int primary key, name char(50), score int, total_score INT GENERATED ALWAYS AS (score + 10) VIRTUAL, gender char(10))",
++			cfg: &config.FilterConfig{
++				EventFilters: []*config.EventFilterRule{
++					{
++						Matcher:               []string{"test.student_score"},
++						IgnoreInsertValueExpr: "score >= 20 or gender = 'female'",
++					},
++				},
++			},
++			cases: []innerCase{
++				{ // insert
++					schema: "test",
++					table:  "student_score",
++					columns: []*model.ColumnData{
++						{ColumnID: 0},
++					},
++					row:    []interface{}{1, "Dongmen", 20, "male"},
++					ignore: true,
++				},
++				{ // insert
++					schema: "test",
++					table:  "student_score",
++					columns: []*model.ColumnData{
++						{ColumnID: 0},
++					},
++					row:    []interface{}{2, "Rustin", 18, "male"},
++					ignore: false,
++				},
++				{ // insert
++					schema: "test",
++					table:  "student_score",
++					columns: []*model.ColumnData{
++						{ColumnID: 0},
++					},
++					row:    []interface{}{3, "Susan", 3, "female"},
++					ignore: true,
++				},
++			},
++		},
+ 		{
+ 			ddl: "create table test.computer(id int primary key, brand char(50), price int)",
+ 			cfg: &config.FilterConfig{
+@@ -325,9 +394,9 @@ func TestShouldSkipDMLBasic(t *testing.T) {
+ 		f, err := newExprFilter("", tc.cfg)
+ 		require.Nil(t, err)
+ 		for _, c := range tc.cases {
+-			rowDatums, err := utils.AdjustBinaryProtocolForDatum(sessCtx, c.row, tableInfo.Columns)
++			rowDatums, err := adjustBinaryProtocolForDatumWithoutVirtualCol(sessCtx, c.row, tableInfo.Columns)
+ 			require.Nil(t, err)
+-			preRowDatums, err := utils.AdjustBinaryProtocolForDatum(sessCtx, c.preRow, tableInfo.Columns)
++			preRowDatums, err := adjustBinaryProtocolForDatumWithoutVirtualCol(sessCtx, c.preRow, tableInfo.Columns)
+ 			require.Nil(t, err)
+ 			row := &model.RowChangedEvent{
+ 				TableInfo: &model.TableInfo{
+diff --git a/tests/integration_tests/event_filter/conf/cf.toml b/tests/integration_tests/event_filter/conf/cf.toml
+index 4597fe3e4..952f1bd0d 100644
+--- a/tests/integration_tests/event_filter/conf/cf.toml
++++ b/tests/integration_tests/event_filter/conf/cf.toml
+@@ -6,6 +6,11 @@ matcher = ["event_filter.t1"]
+ ignore-event = ["drop table", "delete"]
+ ignore-insert-value-expr = "id = 2 or city = 'tokyo'"
+ 
++# Filter rules for virtual column table
++[[filter.event-filters]]
++matcher = ["event_filter.t_virtual"]
++ignore-insert-value-expr = "id = 2 or category = 'furniture'"
++
+ [[filter.event-filters]]
+ matcher = ["event_filter.t_truncate"]
+ ignore-event = ["truncate table"]
+@@ -16,4 +21,4 @@ ignore-event = ["alter table"]
+ 
+ [[filter.event-filters]]
+ matcher = ["event_filter.t_name*"]
+-ignore-event = ["rename table"]
+\ No newline at end of file
++ignore-event = ["rename table"]
+diff --git a/tests/integration_tests/event_filter/data/test.sql b/tests/integration_tests/event_filter/data/test.sql
+index 5ffd396ae..6549ac449 100644
+--- a/tests/integration_tests/event_filter/data/test.sql
++++ b/tests/integration_tests/event_filter/data/test.sql
+@@ -38,6 +38,31 @@ WHERE id = 4;
+ /* ignore by event type*/
+ DROP TABLE t1;
+ 
++
++-- Table with virtual columns for testing ignore-insert-value-expr
++CREATE TABLE t_virtual (
++    id INT PRIMARY KEY,
++    price DECIMAL(10,2),
++    quantity INT,
++    total_price DECIMAL(10,2) AS (price * quantity) VIRTUAL,
++    discount DECIMAL(10,2) AS (CASE WHEN quantity > 10 THEN price * 0.9 ELSE price END) VIRTUAL,
++    category VARCHAR(20),
++    is_discounted BOOLEAN AS (quantity > 10) VIRTUAL
++);
++
++-- These inserts should be filtered based on the rules:
++-- 1. id = 2
++-- 2. category = 'furniture'
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (2, 100.00, 5, 'electronics');  -- filtered by id=2
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (3, 200.00, 15, 'furniture');  -- filtered by category
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (5, 300.00, 20, 'electronics'); -- not filtered
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (6, 400.00, 12, 'clothing');   -- not filtered
++
++-- These inserts should not be filtered
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (1, 50.00, 2, 'clothing');
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (4, 150.00, 1, 'books');
++INSERT INTO t_virtual (id, price, quantity, category) VALUES (7, 250.00, 8, 'electronics');
++
+ /* all event of t_normal will be replicated to downstream */
+ CREATE TABLE t_normal (
+                     id INT,
+@@ -110,4 +135,4 @@ CREATE TABLE t_name3 (
+                     id INT,
+                     name varchar(128),
+                     PRIMARY KEY (id)
+-);
+\ No newline at end of file
++);
+diff --git a/tests/integration_tests/event_filter/run.sh b/tests/integration_tests/event_filter/run.sh
+index 4cfa71b1a..181484cca 100644
+--- a/tests/integration_tests/event_filter/run.sh
++++ b/tests/integration_tests/event_filter/run.sh
+@@ -48,6 +48,7 @@ function run() {
+ 	check_table_exists "event_filter.t_name1" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+ 	check_table_exists "event_filter.t_name2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+ 	check_table_exists "event_filter.t_name3" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_table_exists "event_filter.t_virtual" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+ 
+ 	# check those rows that are not filtered are synced to downstream
+ 	run_sql "select count(1) from event_filter.t1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+@@ -61,6 +62,31 @@ function run() {
+ 	run_sql "select count(5) from event_filter.t1 where id=4;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+ 	check_contains "count(5): 1"
+ 
++	# check filtering on a physical column following virtual columns
++	run_sql "select count(1) from event_filter.t_virtual;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 5" # Rows matching id or category are filtered
++
++	run_sql "select count(1) from event_filter.t_virtual where id=1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 1"
++
++	run_sql "select count(1) from event_filter.t_virtual where id=2;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 0" # filtered by id=2
++
++	run_sql "select count(1) from event_filter.t_virtual where id=3;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 0" # filtered by category
++
++	run_sql "select count(1) from event_filter.t_virtual where id=4;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 1"
++
++	run_sql "select count(1) from event_filter.t_virtual where id=5;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 1"
++
++	run_sql "select count(1) from event_filter.t_virtual where id=6;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 1"
++
++	run_sql "select count(1) from event_filter.t_virtual where id=7;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
++	check_contains "count(1): 1"
++
+ 	run_sql "TRUNCATE TABLE event_filter.t_truncate;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+ 	run_sql_file $CUR/data/test_truncate.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+ 	run_sql "ALTER TABLE event_filter.t_alter MODIFY t_bigint BIGINT;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}

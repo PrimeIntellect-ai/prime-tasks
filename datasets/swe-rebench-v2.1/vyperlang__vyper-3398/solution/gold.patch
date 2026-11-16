@@ -1,0 +1,146 @@
+diff --git a/vyper/ast/grammar.lark b/vyper/ast/grammar.lark
+index cf15e13a..046dcc1f 100644
+--- a/vyper/ast/grammar.lark
++++ b/vyper/ast/grammar.lark
+@@ -174,10 +174,13 @@ loop_variable: NAME [":" NAME]
+ loop_iterator: _expr
+ for_stmt: "for" loop_variable "in" loop_iterator ":" body
+ 
++// ternary operator
++ternary: _expr "if" _expr "else" _expr
+ 
+ // Expressions
+ _expr: operation
+      | dict
++     | ternary
+ 
+ get_item: variable_access "[" _expr "]"
+ get_attr: variable_access "." NAME
+diff --git a/vyper/ast/nodes.py b/vyper/ast/nodes.py
+index 5e6f8473..7bb0a627 100644
+--- a/vyper/ast/nodes.py
++++ b/vyper/ast/nodes.py
+@@ -1430,6 +1430,10 @@ class If(Stmt):
+     __slots__ = ("test", "body", "orelse")
+ 
+ 
++class IfExp(ExprNode):
++    __slots__ = ("test", "body", "orelse")
++
++
+ class For(Stmt):
+     __slots__ = ("iter", "target", "body")
+     _only_empty_fields = ("orelse",)
+diff --git a/vyper/ast/nodes.pyi b/vyper/ast/nodes.pyi
+index 93563516..d47e420d 100644
+--- a/vyper/ast/nodes.pyi
++++ b/vyper/ast/nodes.pyi
+@@ -238,6 +238,11 @@ class If(VyperNode):
+     body: list = ...
+     orelse: list = ...
+ 
++class IfExp(ExprNode):
++    test: ExprNode = ...
++    body: ExprNode = ...
++    orelse: ExprNode = ...
++
+ class For(VyperNode): ...
+ class Break(VyperNode): ...
+ class Continue(VyperNode): ...
+diff --git a/vyper/codegen/expr.py b/vyper/codegen/expr.py
+index 87293a47..506a2694 100644
+--- a/vyper/codegen/expr.py
++++ b/vyper/codegen/expr.py
+@@ -701,6 +701,29 @@ class Expr:
+         multi_ir = IRnode.from_list(["multi"] + tuple_elements, typ=typ)
+         return multi_ir
+ 
++    def parse_IfExp(self):
++        test = Expr.parse_value_expr(self.expr.test, self.context)
++        assert test.typ == BoolT()  # sanity check
++
++        body = Expr(self.expr.body, self.context).ir_node
++        orelse = Expr(self.expr.orelse, self.context).ir_node
++
++        # if they are in the same location, we can skip copying
++        # into memory. also for the case where either body or orelse are
++        # literal `multi` values (ex. for tuple or arrays), copy to
++        # memory (to avoid crashing in make_setter, XXX fixme).
++        if body.location != orelse.location or body.value == "multi":
++            body = ensure_in_memory(body, self.context)
++            orelse = ensure_in_memory(orelse, self.context)
++
++        assert body.location == orelse.location
++        # check this once compare_type has no side effects:
++        # assert body.typ.compare_type(orelse.typ)
++
++        typ = self.expr._metadata["type"]
++        location = body.location
++        return IRnode.from_list(["if", test, body, orelse], typ=typ, location=location)
++
+     @staticmethod
+     def struct_literals(expr, name, context):
+         member_subs = {}
+diff --git a/vyper/semantics/analysis/annotation.py b/vyper/semantics/analysis/annotation.py
+index 3d2397f3..a14c0b97 100644
+--- a/vyper/semantics/analysis/annotation.py
++++ b/vyper/semantics/analysis/annotation.py
+@@ -5,7 +5,7 @@ from vyper.semantics.analysis.utils import (
+     get_exact_type_from_node,
+     get_possible_types_from_node,
+ )
+-from vyper.semantics.types import TYPE_T, EnumT, EventT, SArrayT, StructT, is_type_t
++from vyper.semantics.types import TYPE_T, BoolT, EnumT, EventT, SArrayT, StructT, is_type_t
+ from vyper.semantics.types.function import ContractFunctionT, MemberFunctionT
+ 
+ 
+@@ -258,3 +258,14 @@ class ExpressionAnnotationVisitor(_AnnotationVisitorBase):
+                 type_ = type_.pop()
+         node._metadata["type"] = type_
+         self.visit(node.operand, type_)
++
++    def visit_IfExp(self, node, type_):
++        if type_ is None:
++            ts = get_common_types(node.body, node.orelse)
++            if len(type_) == 1:
++                type_ = ts.pop()
++
++        node._metadata["type"] = type_
++        self.visit(node.test, BoolT())
++        self.visit(node.body, type_)
++        self.visit(node.orelse, type_)
+diff --git a/vyper/semantics/analysis/local.py b/vyper/semantics/analysis/local.py
+index 5de03d61..23ccc216 100644
+--- a/vyper/semantics/analysis/local.py
++++ b/vyper/semantics/analysis/local.py
+@@ -596,3 +596,8 @@ class _LocalExpressionVisitor(VyperNodeVisitorBase):
+ 
+     def visit_UnaryOp(self, node: vy_ast.UnaryOp) -> None:
+         self.visit(node.operand)  # type: ignore[attr-defined]
++
++    def visit_IfExp(self, node: vy_ast.IfExp) -> None:
++        self.visit(node.test)
++        self.visit(node.body)
++        self.visit(node.orelse)
+diff --git a/vyper/semantics/analysis/utils.py b/vyper/semantics/analysis/utils.py
+index 7aaf9647..f50f3243 100644
+--- a/vyper/semantics/analysis/utils.py
++++ b/vyper/semantics/analysis/utils.py
+@@ -363,6 +363,17 @@ class _ExprAnalyser:
+         types_list = self.get_possible_types_from_node(node.operand)
+         return _validate_op(node, types_list, "validate_numeric_op")
+ 
++    def types_from_IfExp(self, node):
++        validate_expected_type(node.test, BoolT())
++        types_list = get_common_types(node.body, node.orelse)
++
++        if not types_list:
++            a = get_possible_types_from_node(node.body)[0]
++            b = get_possible_types_from_node(node.orelse)[0]
++            raise TypeMismatch(f"Dislike types: {a} and {b}", node)
++
++        return types_list
++
+ 
+ def _is_empty_list(node):
+     # Checks if a node is a `List` node with an empty list for `elements`,

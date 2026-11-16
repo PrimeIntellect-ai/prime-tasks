@@ -1,0 +1,132 @@
+diff --git a/tests/async_builder.rs b/tests/async_builder.rs
+new file mode 100644
+index 0000000..63dfaf6
+--- /dev/null
++++ b/tests/async_builder.rs
+@@ -0,0 +1,126 @@
++use config::*;
++use std::collections::HashMap;
++use std::future::Future;
++use std::mem::ManuallyDrop;
++use std::pin::Pin;
++use std::sync::{
++    atomic::{AtomicUsize, Ordering},
++    Arc,
++};
++use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
++use std::thread;
++
++fn raw_waker(thread: Arc<thread::Thread>) -> RawWaker {
++    RawWaker::new(Arc::into_raw(thread) as *const (), &WAKER_VTABLE)
++}
++
++unsafe fn clone_waker(data: *const ()) -> RawWaker {
++    let thread = Arc::<thread::Thread>::from_raw(data as *const thread::Thread);
++    raw_waker(Arc::clone(&thread))
++}
++
++unsafe fn wake_waker(data: *const ()) {
++    Arc::<thread::Thread>::from_raw(data as *const thread::Thread).unpark();
++}
++
++unsafe fn wake_waker_by_ref(data: *const ()) {
++    ManuallyDrop::new(Arc::<thread::Thread>::from_raw(
++        data as *const thread::Thread,
++    ))
++    .unpark();
++}
++
++unsafe fn drop_waker(data: *const ()) {
++    drop(Arc::<thread::Thread>::from_raw(
++        data as *const thread::Thread,
++    ));
++}
++
++static WAKER_VTABLE: RawWakerVTable =
++    RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker);
++
++struct YieldOnce(bool);
++
++impl Future for YieldOnce {
++    type Output = ();
++
++    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.get_mut();
++        if this.0 {
++            Poll::Ready(())
++        } else {
++            this.0 = true;
++            context.waker().wake_by_ref();
++            Poll::Pending
++        }
++    }
++}
++
++fn run_on_independent_executor<F: Future>(future: F) -> F::Output {
++    let waker = unsafe { Waker::from_raw(raw_waker(Arc::new(thread::current()))) };
++    let mut context = Context::from_waker(&waker);
++    let mut future = Box::pin(future);
++
++    loop {
++        match future.as_mut().poll(&mut context) {
++            Poll::Ready(output) => return output,
++            Poll::Pending => thread::park(),
++        }
++    }
++}
++
++#[derive(Debug)]
++struct CountingSyncSource(Arc<AtomicUsize>);
++
++impl Source for CountingSyncSource {
++    fn clone_into_box(&self) -> Box<dyn Source + Send + Sync> {
++        Box::new(Self(Arc::clone(&self.0)))
++    }
++
++    fn collect(&self) -> Result<HashMap<String, Value>, ConfigError> {
++        self.0.fetch_add(1, Ordering::SeqCst);
++        let mut values = HashMap::new();
++        values.insert("sync_value".to_owned(), Value::from(11));
++        Ok(values)
++    }
++}
++
++#[derive(Debug)]
++struct CountingAsyncSource(Arc<AtomicUsize>);
++
++#[async_trait::async_trait]
++impl AsyncSource for CountingAsyncSource {
++    async fn collect(&self) -> Result<HashMap<String, Value>, ConfigError> {
++        self.0.fetch_add(1, Ordering::SeqCst);
++        YieldOnce(false).await;
++
++        let mut values = HashMap::new();
++        values.insert("async_value".to_owned(), Value::from(22));
++        Ok(values)
++    }
++}
++
++#[test]
++fn async_build_defers_collection_and_works_on_an_independent_executor() {
++    let sync_calls = Arc::new(AtomicUsize::new(0));
++    let async_calls = Arc::new(AtomicUsize::new(0));
++    let builder = Config::builder()
++        .add_source(CountingSyncSource(Arc::clone(&sync_calls)))
++        .add_async_source(CountingAsyncSource(Arc::clone(&async_calls)));
++
++    assert_eq!(0, sync_calls.load(Ordering::SeqCst));
++    assert_eq!(0, async_calls.load(Ordering::SeqCst));
++
++    let config = thread::Builder::new()
++        .name("independent-test-executor".to_owned())
++        .spawn(move || run_on_independent_executor(builder.build()))
++        .unwrap()
++        .join()
++        .unwrap()
++        .unwrap();
++
++    assert!(sync_calls.load(Ordering::SeqCst) > 0);
++    assert!(async_calls.load(Ordering::SeqCst) > 0);
++    assert_eq!(11, config.get::<i32>("sync_value").unwrap());
++    assert_eq!(22, config.get::<i32>("async_value").unwrap());
++}

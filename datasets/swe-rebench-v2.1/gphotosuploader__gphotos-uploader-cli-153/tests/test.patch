@@ -1,0 +1,304 @@
+diff --git a/upload/album_test.go b/upload/album_test.go
+new file mode 100644
+index 0000000..bd7b8b7
+--- /dev/null
++++ b/upload/album_test.go
+@@ -0,0 +1,266 @@
++package upload
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	gphotos "github.com/gphotosuploader/google-photos-api-client-go/lib-gphotos"
++
++	"github.com/gphotosuploader/gphotos-uploader-cli/config"
++	"github.com/gphotosuploader/gphotos-uploader-cli/log"
++)
++
++func TestAlbumNameUsingTemplate(t *testing.T) {
++	var testData = []struct {
++		in       string
++		template string
++		out      string
++	}{
++		{in: "foo/bar/xyz", template: "folderPath", out: "foo_bar"},
++		{in: "foo/bar/xyz", template: "folderName", out: "bar"},
++		{in: "foo/bar/xyz/file", template: "folderPath", out: "foo_bar_xyz"},
++		{in: "foo/bar/xyz/file", template: "folderName", out: "xyz"},
++		{in: "foo/bar/xyz", template: "invalidTemplate", out: ""},
++	}
++	for _, tt := range testData {
++		got := albumNameUsingTemplate(tt.in, tt.template)
++		if got != tt.out {
++			t.Errorf("albumNameUsingTemplate for '%s' failed: in: '%s', expected '%s', got '%s'", tt.template, tt.in, tt.out, got)
++		}
++	}
++}
++
++func TestAlbumNameUsingFolderPath(t *testing.T) {
++	var testData = []struct {
++		in  string
++		out string
++	}{
++		{in: "", out: ""},
++		{in: "foo", out: ""},
++		{in: "foo/", out: "foo"},
++		{in: "foo/bar", out: "foo"},
++		{in: "foo/bar/", out: "foo_bar"},
++	}
++	for _, tt := range testData {
++		got := albumNameUsingFolderPath(tt.in)
++		if got != tt.out {
++			t.Errorf("albumNameUsingFolderPath for '%s' failed: expected '%s', got '%s'", tt.in, tt.out, got)
++		}
++	}
++}
++
++func TestAlbumNameUsingFolderName(t *testing.T) {
++	var testData = []struct {
++		in  string
++		out string
++	}{
++		{in: "", out: ""},
++		{in: "foo", out: ""},
++		{in: "foo/", out: "foo"},
++		{in: "foo/bar", out: "foo"},
++		{in: "foo/bar/", out: "bar"},
++	}
++	for _, tt := range testData {
++		got := albumNameUsingFolderName(tt.in)
++		if got != tt.out {
++			t.Errorf("albumNameUsingFolderName for '%s' failed: expected '%s', got '%s'", tt.in, tt.out, got)
++		}
++	}
++}
++
++// noopFileTracker is a FileTracker that never reports a file as already uploaded.
++type noopFileTracker struct{}
++
++func (noopFileTracker) CacheAsAlreadyUploaded(string) error    { return nil }
++func (noopFileTracker) IsAlreadyUploaded(string) (bool, error) { return false, nil }
++func (noopFileTracker) RemoveAsAlreadyUploaded(string) error   { return nil }
++
++// albumRecorder records the titles of the albums created through the Google
++// Photos API.
++type albumRecorder struct {
++	mu     sync.Mutex
++	titles []string
++}
++
++func (r *albumRecorder) add(title string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.titles = append(r.titles, title)
++}
++
++func (r *albumRecorder) all() []string {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return append([]string(nil), r.titles...)
++}
++
++// newAlbumRecordingClient returns a gphotos client backed by a fake Google
++// Photos API that records the title of every album it is asked to create.
++func newAlbumRecordingClient(t *testing.T) (*gphotos.Client, *albumRecorder) {
++	t.Helper()
++
++	rec := &albumRecorder{}
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case r.Method == http.MethodGet && r.URL.Path == "/v1/albums":
++			fmt.Fprint(w, `{"albums":[]}`)
++		case r.Method == http.MethodPost && r.URL.Path == "/v1/albums":
++			var req struct {
++				Album struct {
++					Title string `json:"title"`
++				} `json:"album"`
++			}
++			_ = json.NewDecoder(r.Body).Decode(&req)
++			rec.add(req.Album.Title)
++			fmt.Fprintf(w, `{"id":"album-id","title":%q}`, req.Album.Title)
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	t.Cleanup(srv.Close)
++
++	client, err := gphotos.NewClient(srv.Client())
++	if err != nil {
++		t.Fatalf("failed to create gphotos client: %v", err)
++	}
++	client.BasePath = srv.URL + "/"
++	return client, rec
++}
++
++// TestJob_ScanFolder_AlbumName verifies that the album created for an uploaded
++// item follows the configured naming strategy. Two files living in folders that
++// share the same last component ("2018/Christmas" and "2019/Christmas") must
++// not collide when the full folder path is used.
++func TestJob_ScanFolder_AlbumName(t *testing.T) {
++	source := t.TempDir()
++	for _, p := range []string{"2018/Christmas/photo.jpg", "2019/Christmas/photo.jpg"} {
++		full := filepath.Join(source, filepath.FromSlash(p))
++		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	t.Run("folderPath", func(t *testing.T) {
++		client, rec := newAlbumRecordingClient(t)
++		opt := NewJobOptions(true, "folderPath", false, NewFilter([]string{"*"}, nil, true))
++		job := NewFolderUploadJob(client, noopFileTracker{}, source, opt)
++		items, err := job.ScanFolder(log.Discard)
++		if err != nil {
++			t.Fatalf("ScanFolder failed: %v", err)
++		}
++		if len(items) != 2 {
++			t.Errorf("ScanFolder returned %d items, want the 2 eligible files", len(items))
++		}
++
++		titles := rec.all()
++		if len(titles) < 2 {
++			t.Fatalf("expected an album per folder, got %v", titles)
++		}
++		var has2018, has2019 bool
++		for _, title := range titles {
++			if strings.Contains(title, "2018") && strings.Contains(title, "Christmas") {
++				has2018 = true
++			}
++			if strings.Contains(title, "2019") && strings.Contains(title, "Christmas") {
++				has2019 = true
++			}
++		}
++		if !has2018 || !has2019 {
++			t.Errorf("folderPath must use more than the last folder component, got %v", titles)
++		}
++	})
++
++	t.Run("folderName", func(t *testing.T) {
++		client, rec := newAlbumRecordingClient(t)
++		opt := NewJobOptions(true, "folderName", false, NewFilter([]string{"*"}, nil, true))
++		job := NewFolderUploadJob(client, noopFileTracker{}, source, opt)
++		items, err := job.ScanFolder(log.Discard)
++		if err != nil {
++			t.Fatalf("ScanFolder failed: %v", err)
++		}
++		if len(items) != 2 {
++			t.Errorf("ScanFolder returned %d items, want the 2 eligible files", len(items))
++		}
++
++		titles := rec.all()
++		if len(titles) == 0 {
++			t.Fatal("expected at least one album to be created")
++		}
++		for _, title := range titles {
++			if title != "Christmas" {
++				t.Errorf("folderName must use only the last folder component, got %v", titles)
++			}
++		}
++	})
++}
++
++func TestConfiguredAlbumStrategyUsedByFolderUpload(t *testing.T) {
++	source := t.TempDir()
++	for _, p := range []string{"2018/Christmas/photo.jpg", "2019/Christmas/photo.jpg"} {
++		full := filepath.Join(source, filepath.FromSlash(p))
++		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	configDir := t.TempDir()
++	configText := fmt.Sprintf(`{
++  SecretsBackendType: auto,
++  APIAppCredentials: { ClientID: "client", ClientSecret: "secret" },
++  jobs: [{
++    account: "user@example.com",
++    sourceFolder: %q,
++    makeAlbums: { enabled: true, use: "folderPath" },
++    deleteAfterUpload: false,
++    uploadVideos: true,
++    includePatterns: ["*"],
++    excludePatterns: []
++  }]
++}`, source)
++	if err := os.WriteFile(filepath.Join(configDir, "config.hjson"), []byte(configText), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	cfg, err := config.LoadConfig(configDir)
++	if err != nil {
++		t.Fatalf("LoadConfig failed: %v", err)
++	}
++	jobConfig := cfg.Jobs[0]
++	client, rec := newAlbumRecordingClient(t)
++	options := NewJobOptions(jobConfig.MakeAlbums.Enabled, jobConfig.MakeAlbums.Use, jobConfig.DeleteAfterUpload,
++		NewFilter(jobConfig.IncludePatterns, jobConfig.ExcludePatterns, jobConfig.UploadVideos))
++	job := NewFolderUploadJob(client, noopFileTracker{}, jobConfig.SourceFolder, options)
++	items, err := job.ScanFolder(log.Discard)
++	if err != nil {
++		t.Fatalf("ScanFolder failed: %v", err)
++	}
++	if len(items) != 2 {
++		t.Errorf("ScanFolder returned %d items, want the 2 eligible files", len(items))
++	}
++
++	want := map[string]bool{"2018_Christmas": false, "2019_Christmas": false}
++	for _, title := range rec.all() {
++		if _, ok := want[title]; ok {
++			want[title] = true
++		}
++	}
++	for title, found := range want {
++		if !found {
++			t.Errorf("configured folderPath strategy did not create album %q; got %v", title, rec.all())
++		}
++	}
++}
+diff --git a/utils/filesystem/filesystem_test.go b/utils/filesystem/filesystem_test.go
+index c0ad535..f09e060 100644
+--- a/utils/filesystem/filesystem_test.go
++++ b/utils/filesystem/filesystem_test.go
+@@ -132,3 +132,27 @@ func TestIsDir(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestRelativePath(t *testing.T) {
++	var objectsTest = []struct {
++		base string
++		in   string
++		out  string
++	}{
++		{base: "/foo/bar", in: "/foo/bar/xyz", out: "xyz"},
++		{base: "/foo/bar/", in: "/foo/bar/xyz", out: "xyz"},
++		{base: "/foo/bar", in: "/foo/bar/xyz/", out: "xyz"},
++		{base: "/foo/bar", in: "foo/bar/xyz", out: "foo/bar/xyz"},
++		{base: "/foo/bar", in: "/foo/bar", out: "."},
++		{base: "/foo/bar/", in: "/foo/bar", out: "."},
++		{base: "/foo/bar", in: "/foo/bar/", out: "."},
++		{base: "", in: "/foo/bar", out: "/foo/bar"},
++		{base: "/foo/bar", in: "/abc/def", out: "/abc/def"},
++	}
++	for _, tt := range objectsTest {
++		got := filesystem.RelativePath(tt.base, tt.in)
++		if got != tt.out {
++			t.Errorf("failed for base '%s', path '%s': expected '%s', got '%s'", tt.base, tt.in, tt.out, got)
++		}
++	}
++}

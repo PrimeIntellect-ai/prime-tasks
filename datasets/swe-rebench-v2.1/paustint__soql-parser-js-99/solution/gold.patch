@@ -1,0 +1,205 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b0996c5..ba4aeb5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,13 @@
+ # Changelog
+ 
++## 2.5.0
++
++April 3, 2020
++
++1. Passing in null or undefined to compose query no longer throws an exception, but instead returns an empty string. (#95)
++2. Regular fields in a select clause now allow aliases because this is allowed if the field is used as part of a group by clause. (#97)
++3. `getFlattenedFields()` now considers if a relationship field was used as part of a group by, and if so it returns just the field name instead of the entire field path, as this is how Salesforce will return the records. (#98)
++
+ ## 2.4.1
+ 
+ Mar 22, 2020
+diff --git a/src/api/public-utils.ts b/src/api/public-utils.ts
+index a212900..bc1b58c 100644
+--- a/src/api/public-utils.ts
++++ b/src/api/public-utils.ts
+@@ -118,8 +118,19 @@ export function getFlattenedFields(
+   query: SoqlModels.Query | SoqlModels.Subquery | SoqlModels.FieldSubquery,
+   isAggregateResult?: boolean,
+ ): string[] {
++  if (!query) {
++    return [];
++  }
+   query = isFieldSubquery(query) ? query.subquery : query;
+   const fields = query.fields;
++  // if a relationship field is used in a group by, then Salesforce removes the relationship portion of the field in the returned records
++  const groupByFields: { [field: string]: string } = {};
++  if (!!query.groupBy && Array.isArray(query.groupBy.field)) {
++    query.groupBy.field.reduce((output, field) => {
++      output[field.toLocaleLowerCase()] = field;
++      return output;
++    }, groupByFields);
++  }
+   let currUnAliasedAggExp = -1;
+   let sObject = (isSubquery(query) ? query.relationshipName : query.sObject || '').toLowerCase();
+   let sObjectAlias = (query.sObjectAlias || '').toLowerCase();
+@@ -167,11 +178,16 @@ export function getFlattenedFields(
+         }
+         case 'FieldRelationship': {
+           const firstRelationship = field.relationships[0].toLowerCase();
++          if (field.alias) {
++            return field.alias;
++          }
++          // If relationship field is used in groupby, then return field instead of full path
++          if (field.rawValue && groupByFields[field.rawValue.toLocaleLowerCase()]) {
++            return field.field;
++          }
++          // If first object is the same object queried, remove the object
+           if (firstRelationship === sObjectAlias || firstRelationship === sObject) {
+-            return field.relationships
+-              .concat([field.field])
+-              .slice(1)
+-              .join('.');
++            return field.relationships.concat([field.field]).slice(1).join('.');
+           }
+           return field.relationships.concat([field.field]).join('.');
+         }
+diff --git a/src/composer/composer.ts b/src/composer/composer.ts
+index 9c7d2f3..ae0b4f0 100644
+--- a/src/composer/composer.ts
++++ b/src/composer/composer.ts
+@@ -42,6 +42,10 @@ export function formatQuery(soql: string, formatOptions?: FormatOptions) {
+  * @returns query
+  */
+ export function composeQuery(soql: Query, config: Partial<SoqlComposeConfig> = {}): string {
++  if (!soql) {
++    return '';
++  }
++  config = config || {};
+   config.format = config.format ? true : false;
+   if (config.logging) {
+     console.time('composer');
+@@ -242,7 +246,7 @@ export class Compose {
+       const objPrefix = (field as any).objectPrefix ? `${(field as any).objectPrefix}.` : '';
+       switch (field.type) {
+         case 'Field': {
+-          return `${objPrefix}${field.field}`;
++          return `${objPrefix}${field.field}${field.alias ? ` ${field.alias}` : ''}`;
+         }
+         case 'FieldFunctionExpression': {
+           let params = '';
+@@ -254,7 +258,7 @@ export class Compose {
+           return `${field.functionName}(${params})${field.alias ? ` ${field.alias}` : ''}`;
+         }
+         case 'FieldRelationship': {
+-          return `${objPrefix}${field.relationships.join('.')}.${field.field}`;
++          return `${objPrefix}${field.relationships.join('.')}.${field.field}${field.alias ? ` ${field.alias}` : ''}`;
+         }
+         case 'FieldSubquery': {
+           return this.formatter.formatSubquery(this.parseQuery(field.subquery));
+diff --git a/src/models.ts b/src/models.ts
+index 286fa11..08d5a7d 100644
+--- a/src/models.ts
++++ b/src/models.ts
+@@ -65,6 +65,11 @@ export interface SelectClauseTypeOfContext extends WithIdentifier {
+   selectClauseTypeOfElse?: CstNode[];
+ }
+ 
++export interface SelectClauseIdentifierContext extends WithIdentifier {
++  field: IToken[];
++  alias?: IToken[];
++}
++
+ export interface SelectClauseTypeOfThenContext extends WithIdentifier {
+   typeOfField: IToken[];
+   field: IToken[];
+diff --git a/src/parser/lexer.ts b/src/parser/lexer.ts
+index d233cbd..7b6484b 100644
+--- a/src/parser/lexer.ts
++++ b/src/parser/lexer.ts
+@@ -740,7 +740,7 @@ export const CurrencyPrefixedInteger = createToken({
+   name: 'CURRENCY_PREFIXED_INTEGER',
+   pattern: /[a-zA-Z]{3}[0-9]+/,
+   longer_alt: Identifier,
+-  categories: [DecimalNumberIdentifier],
++  categories: [DecimalNumberIdentifier, Identifier],
+ });
+ export const SignedInteger = createToken({
+   name: 'SIGNED_INTEGER',
+diff --git a/src/parser/parser.ts b/src/parser/parser.ts
+index 771e219..db0aa7c 100644
+--- a/src/parser/parser.ts
++++ b/src/parser/parser.ts
+@@ -117,7 +117,7 @@ export class SoqlParser extends CstParser {
+               { ALT: () => this.SUBRULE(this.selectClauseFunctionIdentifier, { LABEL: 'field' }) },
+               { ALT: () => this.SUBRULE(this.selectClauseSubqueryIdentifier, { LABEL: 'field' }) },
+               { ALT: () => this.SUBRULE(this.selectClauseTypeOf, { LABEL: 'field' }) },
+-              { ALT: () => this.CONSUME(lexer.Identifier, { LABEL: 'field' }) },
++              { ALT: () => this.SUBRULE(this.selectClauseIdentifier, { LABEL: 'field' }) },
+             ]),
+         );
+       },
+@@ -157,6 +157,11 @@ export class SoqlParser extends CstParser {
+     this.CONSUME(lexer.End);
+   });
+ 
++  private selectClauseIdentifier = this.RULE('selectClauseIdentifier', () => {
++    this.CONSUME(lexer.Identifier, { LABEL: 'field' });
++    this.OPTION(() => this.CONSUME1(lexer.Identifier, { LABEL: 'alias' }));
++  });
++
+   private selectClauseTypeOfThen = this.RULE('selectClauseTypeOfThen', () => {
+     this.CONSUME(lexer.When);
+     this.CONSUME(lexer.Identifier, { LABEL: 'typeOfField' });
+diff --git a/src/parser/visitor.ts b/src/parser/visitor.ts
+index ef5a3cd..ae40a58 100644
+--- a/src/parser/visitor.ts
++++ b/src/parser/visitor.ts
+@@ -21,6 +21,7 @@ import {
+   Subquery,
+   WhereClause,
+   WithDataCategoryCondition,
++  Field,
+ } from '../api/api-models';
+ import {
+   ApexBindVariableExpressionContext,
+@@ -59,6 +60,7 @@ import {
+   GeoLocationFunctionContext,
+   OrderByLocationExpressionContext,
+   GroupByFieldListContext,
++  SelectClauseIdentifierContext,
+ } from '../models';
+ import { isSubqueryFromFlag, isToken } from '../utils';
+ import { parse, ParseQueryConfig, SoqlParser } from './parser';
+@@ -273,6 +275,34 @@ class SOQLVisitor extends BaseSoqlVisitor {
+       conditions,
+     };
+   }
++
++  selectClauseIdentifier(ctx: SelectClauseIdentifierContext): Field | FieldRelationship {
++    const item = ctx.field[0];
++    const alias = !!ctx.alias ? ctx.alias[0].image : undefined;
++    const field: string = item.image;
++    let output: FieldType;
++    if (!field.includes('.')) {
++      output = {
++        type: 'Field',
++        field: field,
++        // objectPrefix: undefined, // TODO: we cannot add this until the very und when we see if the sobject is aliased
++      };
++    } else {
++      const splitFields = field.split('.');
++      output = {
++        type: 'FieldRelationship',
++        field: splitFields[splitFields.length - 1],
++        relationships: splitFields.slice(0, splitFields.length - 1),
++        // objectPrefix: undefined, // TODO: we cannot add this until the very und when we see if the sobject is aliased
++        rawValue: field,
++      };
++    }
++    if (alias) {
++      output.alias = alias;
++    }
++    return output;
++  }
++
+   selectClauseTypeOfThen(ctx: SelectClauseTypeOfThenContext): FieldTypeOfCondition {
+     return {
+       type: 'WHEN',

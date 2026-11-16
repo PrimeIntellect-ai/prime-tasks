@@ -1,0 +1,144 @@
+diff --git a/e2e/cp_test.go b/e2e/cp_test.go
+index cf8d2dd..f95a832 100644
+--- a/e2e/cp_test.go
++++ b/e2e/cp_test.go
+@@ -24,12 +24,19 @@ package e2e
+ 
+ import (
+ 	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
++	"strings"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/igungor/gofakes3"
++	"github.com/igungor/gofakes3/backend/s3mem"
+ 	"gotest.tools/v3/assert"
+ 	"gotest.tools/v3/fs"
+ 	"gotest.tools/v3/icmd"
+@@ -4146,3 +4153,119 @@ func TestCopyExpectExitCode1OnUnreachableHost(t *testing.T) {
+ 
+ 	result.Assert(t, icmd.Expected{ExitCode: 1})
+ }
++
++// s3ServerWithNoSuchUploadFault starts an S3-compatible server that fails a
++// configured number of CompleteMultipartUpload requests with NoSuchUpload.
++// Subsequent requests are forwarded to the underlying fake S3 backend.
++func s3ServerWithNoSuchUploadFault(t *testing.T, failures int32) (string, *int32, func()) {
++	t.Helper()
++
++	backend := s3mem.New()
++	faker := gofakes3.New(backend)
++	handler := faker.Server()
++
++	var injected int32
++	faulty := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodPost && r.URL.Query().Get("uploadId") != "" {
++			attempt := atomic.AddInt32(&injected, 1)
++			if attempt <= failures {
++				w.Header().Set("Content-Type", "application/xml")
++				w.WriteHeader(http.StatusNotFound)
++				io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
++					`<Error><Code>NoSuchUpload</Code>`+
++					`<Message>The specified upload does not exist.</Message></Error>`)
++				return
++			}
++		}
++		handler.ServeHTTP(w, r)
++	})
++
++	srv := httptest.NewServer(faulty)
++	return srv.URL, &injected, srv.Close
++}
++
++func TestCopySingleFileToS3RetriesOnNoSuchUpload(t *testing.T) {
++	t.Parallel()
++
++	bucket := s3BucketFromTestName(t)
++
++	endpoint, injected, srvCleanup := s3ServerWithNoSuchUploadFault(t, 1)
++	defer srvCleanup()
++
++	s3client, s5cmd, cleanup := setup(t, withEndpointURL(endpoint))
++	defer cleanup()
++
++	createBucket(t, s3client, bucket)
++
++	const filename = "example.txt"
++	// The file must be larger than the part size so that the upload is
++	// performed as a multipart upload.
++	content := strings.Repeat("a", 6*1024*1024)
++
++	workdir := fs.NewDir(t, bucket, fs.WithFile(filename, content))
++	defer workdir.Remove()
++
++	srcpath := filepath.ToSlash(workdir.Join(filename))
++	dstpath := fmt.Sprintf("s3://%v/", bucket)
++
++	cmd := s5cmd("cp", "--part-size", "5", "--no-such-upload-retry-count", "5", srcpath, dstpath)
++	result := icmd.RunCmd(cmd)
++
++	result.Assert(t, icmd.Success)
++
++	// The injected NoSuchUpload error must have been observed, otherwise the
++	// retry path was never exercised.
++	assert.Assert(t, atomic.LoadInt32(injected) > 0)
++	assert.Assert(t, ensureS3Object(s3client, bucket, filename, content))
++}
++
++func TestCopySingleFileToS3NoSuchUploadRetryDefaultIsZero(t *testing.T) {
++	t.Parallel()
++
++	bucket := s3BucketFromTestName(t)
++	endpoint, attempts, srvCleanup := s3ServerWithNoSuchUploadFault(t, 1)
++	defer srvCleanup()
++
++	s3client, s5cmd, cleanup := setup(t, withEndpointURL(endpoint))
++	defer cleanup()
++	createBucket(t, s3client, bucket)
++
++	const filename = "example.txt"
++	content := strings.Repeat("a", 6*1024*1024)
++	workdir := fs.NewDir(t, bucket, fs.WithFile(filename, content))
++	defer workdir.Remove()
++
++	srcpath := filepath.ToSlash(workdir.Join(filename))
++	dstpath := fmt.Sprintf("s3://%v/", bucket)
++	result := icmd.RunCmd(s5cmd("cp", "--part-size", "5", srcpath, dstpath))
++
++	result.Assert(t, icmd.Expected{ExitCode: 1})
++	assert.Equal(t, atomic.LoadInt32(attempts), int32(1))
++}
++
++func TestCopySingleFileToS3NoSuchUploadRetriesAreLimited(t *testing.T) {
++	t.Parallel()
++
++	const retryCount = int32(2)
++	bucket := s3BucketFromTestName(t)
++	endpoint, attempts, srvCleanup := s3ServerWithNoSuchUploadFault(t, 10)
++	defer srvCleanup()
++
++	s3client, s5cmd, cleanup := setup(t, withEndpointURL(endpoint))
++	defer cleanup()
++	createBucket(t, s3client, bucket)
++
++	const filename = "example.txt"
++	content := strings.Repeat("a", 6*1024*1024)
++	workdir := fs.NewDir(t, bucket, fs.WithFile(filename, content))
++	defer workdir.Remove()
++
++	srcpath := filepath.ToSlash(workdir.Join(filename))
++	dstpath := fmt.Sprintf("s3://%v/", bucket)
++	result := icmd.RunCmd(s5cmd("cp", "--part-size", "5", "--no-such-upload-retry-count", "2", srcpath, dstpath))
++
++	result.Assert(t, icmd.Expected{ExitCode: 1})
++	gotAttempts := atomic.LoadInt32(attempts)
++	assert.Assert(t, gotAttempts > 0)
++	assert.Assert(t, gotAttempts <= retryCount+1)
++}

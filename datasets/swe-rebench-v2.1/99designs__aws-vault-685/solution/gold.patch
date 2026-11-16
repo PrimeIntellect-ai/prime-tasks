@@ -1,0 +1,203 @@
+diff --git a/USAGE.md b/USAGE.md
+index 1f6fc37..7910c8b 100644
+--- a/USAGE.md
++++ b/USAGE.md
+@@ -102,6 +102,21 @@ include_profile = root
+ role_arn=arn:aws:iam::123456789:role/administrators
+ ```
+ 
++#### `session_tags` and `transitive_session_tags`
++
++It is possible to set [session tags](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_session-tags.html) when `AssumeRole` is used. Two custom config variables could be defined for that: `session_tags` and `transitive_session_tags`. The former defines a comma separated key=value list of tags and the latter is a comma separated list of tags that should be persited during role chaining:
++
++```ini
++[profile root]
++region=eu-west-1
++
++[profile order-dev]
++source_profile = root
++role_arn=arn:aws:iam::123456789:role/developers
++session_tags = key1=value1,key2=value2,key3=value3
++transitive_session_tags = key1,key2
++```
++
+ 
+ ### Environment variables
+ 
+@@ -132,6 +147,10 @@ To override session durations (used in `exec` and `login`):
+ 
+ Note that the session durations above expect a unit after the number (e.g. 12h or 43200s).
+ 
++To override or set session tagging (used in `exec`):
++* `AWS_ROLE_TAGS`: Comma separated key-value list of tags passed with the `AssumeRole` call, overrides `session_tags` profile config variable
++* `AWS_TRANSITIVE_TAGS`: Comma separated list of transitive tags passed with the `AssumeRole` call, overrides `transitive_session_tags` profile config variable
++
+ 
+ ## Backends
+ 
+diff --git a/vault/assumeroleprovider.go b/vault/assumeroleprovider.go
+index c57dbb3..28ff70f 100644
+--- a/vault/assumeroleprovider.go
++++ b/vault/assumeroleprovider.go
+@@ -12,12 +12,14 @@ import (
+ 
+ // AssumeRoleProvider retrieves temporary credentials from STS using AssumeRole
+ type AssumeRoleProvider struct {
+-	StsClient       *sts.STS
+-	RoleARN         string
+-	RoleSessionName string
+-	ExternalID      string
+-	Duration        time.Duration
+-	ExpiryWindow    time.Duration
++	StsClient         *sts.STS
++	RoleARN           string
++	RoleSessionName   string
++	ExternalID        string
++	Duration          time.Duration
++	ExpiryWindow      time.Duration
++	Tags              map[string]string
++	TransitiveTagKeys []string
+ 	Mfa
+ 	credentials.Expiry
+ }
+@@ -67,6 +69,21 @@ func (p *AssumeRoleProvider) assumeRole() (*sts.Credentials, error) {
+ 		}
+ 	}
+ 
++	if len(p.Tags) > 0 {
++		input.Tags = make([]*sts.Tag, 0)
++		for key, value := range p.Tags {
++			tag := &sts.Tag{
++				Key:   aws.String(key),
++				Value: aws.String(value),
++			}
++			input.Tags = append(input.Tags, tag)
++		}
++	}
++
++	if len(p.TransitiveTagKeys) > 0 {
++		input.TransitiveTagKeys = aws.StringSlice(p.TransitiveTagKeys)
++	}
++
+ 	log.Printf("Using STS endpoint %s", p.StsClient.Endpoint)
+ 
+ 	resp, err := p.StsClient.AssumeRole(input)
+diff --git a/vault/config.go b/vault/config.go
+index 9a3750f..b7385a7 100644
+--- a/vault/config.go
++++ b/vault/config.go
+@@ -145,6 +145,8 @@ type ProfileSection struct {
+ 	WebIdentityTokenFile    string `ini:"web_identity_token_file,omitempty"`
+ 	WebIdentityTokenProcess string `ini:"web_identity_token_process,omitempty"`
+ 	STSRegionalEndpoints    string `ini:"sts_regional_endpoints,omitempty"`
++	SessionTags             string `ini:"session_tags,omitempty"`
++	TransitiveSessionTags   string `ini:"transitive_session_tags,omitempty"`
+ }
+ 
+ func (s ProfileSection) IsEmpty() bool {
+@@ -326,6 +328,15 @@ func (cl *ConfigLoader) populateFromConfigFile(config *Config, profileName strin
+ 	if config.STSRegionalEndpoints == "" {
+ 		config.STSRegionalEndpoints = psection.STSRegionalEndpoints
+ 	}
++	if sessionTags := psection.SessionTags; sessionTags != "" && config.SessionTags == nil {
++		err := config.SetSessionTags(sessionTags)
++		if err != nil {
++			return fmt.Errorf("Failed to parse session_tags profile setting: %s", err)
++		}
++	}
++	if transitiveSessionTags := psection.TransitiveSessionTags; transitiveSessionTags != "" && config.TransitiveSessionTags == nil {
++		config.SetTransitiveSessionTags(transitiveSessionTags)
++	}
+ 
+ 	if psection.ParentProfile != "" {
+ 		fmt.Fprint(os.Stderr, "Warning: parent_profile is deprecated, please use include_profile instead in your AWS config\n")
+@@ -406,7 +417,7 @@ func (cl *ConfigLoader) populateFromEnv(profile *Config) {
+ 		}
+ 	}
+ 
+-	// AWS_ROLE_ARN and AWS_ROLE_SESSION_NAME only apply to the target profile
++	// AWS_ROLE_ARN, AWS_ROLE_SESSION_NAME, AWS_SESSION_TAGS and AWS_TRANSITIVE_TAGS only apply to the target profile
+ 	if profile.ProfileName == cl.ActiveProfile {
+ 		if roleARN := os.Getenv("AWS_ROLE_ARN"); roleARN != "" && profile.RoleARN == "" {
+ 			log.Printf("Using role_arn %q from AWS_ROLE_ARN", roleARN)
+@@ -417,6 +428,19 @@ func (cl *ConfigLoader) populateFromEnv(profile *Config) {
+ 			log.Printf("Using role_session_name %q from AWS_ROLE_SESSION_NAME", roleSessionName)
+ 			profile.RoleSessionName = roleSessionName
+ 		}
++
++		if sessionTags := os.Getenv("AWS_SESSION_TAGS"); sessionTags != "" && profile.SessionTags == nil {
++			err := profile.SetSessionTags(sessionTags)
++			if err != nil {
++				log.Fatalf("Failed to parse AWS_SESSION_TAGS environment variable: %s", err)
++			}
++			log.Printf("Using session_tags %v from AWS_SESSION_TAGS", profile.SessionTags)
++		}
++
++		if transitiveSessionTags := os.Getenv("AWS_TRANSITIVE_TAGS"); transitiveSessionTags != "" && profile.TransitiveSessionTags == nil {
++			profile.SetTransitiveSessionTags(transitiveSessionTags)
++			log.Printf("Using transitive_session_tags %v from AWS_TRANSITIVE_TAGS", profile.TransitiveSessionTags)
++		}
+ 	}
+ }
+ 
+@@ -511,6 +535,35 @@ type Config struct {
+ 
+ 	// SSORoleName specifies the AWS SSO Role name to target.
+ 	SSORoleName string
++
++	// SessionTags specifies assumed role Session Tags
++	SessionTags map[string]string
++
++	// TransitiveSessionTags specifies assumed role Transitive Session Tags keys
++	TransitiveSessionTags []string
++}
++
++// SetSessionTags parses a comma separated key=vaue string and sets Config.SessionTags map
++func (c *Config) SetSessionTags(s string) error {
++	c.SessionTags = make(map[string]string)
++	for _, tag := range strings.Split(s, ",") {
++		kvPair := strings.SplitN(tag, "=", 2)
++		if len(kvPair) != 2 {
++			return errors.New("session tags string must be <key1>=<value1>,[<key2>=<value2>[,...]]")
++		}
++		c.SessionTags[strings.TrimSpace(kvPair[0])] = strings.TrimSpace(kvPair[1])
++	}
++
++	return nil
++}
++
++// SetTransitiveSessionTags parses a comma separated string and sets Config.TransitiveSessionTags
++func (c *Config) SetTransitiveSessionTags(s string) {
++	for _, tag := range strings.Split(s, ",") {
++		if tag = strings.TrimSpace(tag); tag != "" {
++			c.TransitiveSessionTags = append(c.TransitiveSessionTags, tag)
++		}
++	}
+ }
+ 
+ func (c *Config) IsChained() bool {
+diff --git a/vault/vault.go b/vault/vault.go
+index 7bcf688..5dd6f6c 100644
+--- a/vault/vault.go
++++ b/vault/vault.go
+@@ -129,12 +129,14 @@ func NewAssumeRoleProvider(creds *credentials.Credentials, k keyring.Keyring, co
+ 	}
+ 
+ 	p := &AssumeRoleProvider{
+-		StsClient:       sts.New(sess),
+-		RoleARN:         config.RoleARN,
+-		RoleSessionName: config.RoleSessionName,
+-		ExternalID:      config.ExternalID,
+-		Duration:        config.AssumeRoleDuration,
+-		ExpiryWindow:    defaultExpirationWindow,
++		StsClient:         sts.New(sess),
++		RoleARN:           config.RoleARN,
++		RoleSessionName:   config.RoleSessionName,
++		ExternalID:        config.ExternalID,
++		Duration:          config.AssumeRoleDuration,
++		ExpiryWindow:      defaultExpirationWindow,
++		Tags:              config.SessionTags,
++		TransitiveTagKeys: config.TransitiveSessionTags,
+ 		Mfa: Mfa{
+ 			MfaSerial:       config.MfaSerial,
+ 			MfaToken:        config.MfaToken,

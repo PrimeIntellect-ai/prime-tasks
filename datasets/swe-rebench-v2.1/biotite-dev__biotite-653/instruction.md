@@ -1,0 +1,2 @@
+`chem_comp_bond` written by `biotite.structure.io.pdbx` contains duplicate residues
+If `set_structure()` is called with `include_bonds=True`, intra-residue bonds are written into `chem_comp_bond`. However currently this category will have multiple copies of the same residue, if the structure contains that residue multiple times. This can render the created file quite large and increases parsing time.

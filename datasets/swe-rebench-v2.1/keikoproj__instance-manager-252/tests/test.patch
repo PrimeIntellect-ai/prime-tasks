@@ -1,0 +1,171 @@
+diff --git a/controllers/provisioners/eks/update_test.go b/controllers/provisioners/eks/update_test.go
+index 079f4d2..6be2f7c 100644
+--- a/controllers/provisioners/eks/update_test.go
++++ b/controllers/provisioners/eks/update_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"testing"
+ 
+ 	kubeprovider "github.com/keikoproj/instance-manager/controllers/providers/kubernetes"
++	"github.com/keikoproj/instance-manager/controllers/provisioners"
+ 	"github.com/keikoproj/instance-manager/controllers/provisioners/eks/scaling"
+ 
+ 	"github.com/aws/aws-sdk-go/aws"
+@@ -27,11 +28,13 @@ import (
+ 	"github.com/aws/aws-sdk-go/service/ec2"
+ 	"github.com/aws/aws-sdk-go/service/eks"
+ 	"github.com/aws/aws-sdk-go/service/iam"
++	"github.com/ghodss/yaml"
+ 	"github.com/keikoproj/instance-manager/api/v1alpha1"
+ 	"github.com/onsi/gomega"
+ 	"github.com/pkg/errors"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/util/intstr"
+ )
+ 
+@@ -49,10 +52,12 @@ func TestUpdateWithDriftRotationPositive(t *testing.T) {
+ 
+ 	w := MockAwsWorker(asgMock, iamMock, eksMock, ec2Mock)
+ 	ctx := MockContext(ig, k, w)
++	configuration.SetRoleName("existing-role")
+ 
+ 	mockScalingGroup := &autoscaling.Group{
+-		AutoScalingGroupName: aws.String("some-scaling-group"),
+-		DesiredCapacity:      aws.Int64(1),
++		AutoScalingGroupName:    aws.String("some-scaling-group"),
++		LaunchConfigurationName: aws.String("old-launch-configuration"),
++		DesiredCapacity:         aws.Int64(1),
+ 		Instances: []*autoscaling.Instance{
+ 			{
+ 				InstanceId:              aws.String("i-1234"),
+@@ -110,6 +115,7 @@ func TestUpdateWithDriftRotationPositive(t *testing.T) {
+ 		InstanceProfile: &iam.InstanceProfile{
+ 			Arn: aws.String("some-instance-arn"),
+ 		},
++		IAMRole:      &iam.Role{Arn: aws.String("arn:aws:iam::123456789012:role/existing-role")},
+ 		ClusterNodes: nodes,
+ 		Cluster:      MockEksCluster("1.15"),
+ 	})
+@@ -117,7 +123,8 @@ func TestUpdateWithDriftRotationPositive(t *testing.T) {
+ 	err = ctx.Update()
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+ 	g.Expect(ctx.TagsUpdateNeeded()).To(gomega.BeTrue())
+-	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileInitUpgrade))
++	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileModifying))
++	g.Expect(provisioners.IsRetryable(ig)).To(gomega.BeTrue())
+ }
+ 
+ func TestUpdateWithLaunchTemplate(t *testing.T) {
+@@ -214,7 +221,7 @@ func TestUpdateWithLaunchTemplate(t *testing.T) {
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+ 	g.Expect(ec2Mock.CreateLaunchTemplateVersionCallCount).To(gomega.Equal(1))
+ 	g.Expect(ec2Mock.ModifyLaunchTemplateCallCount).To(gomega.Equal(1))
+-	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileInitUpgrade))
++	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileModifying))
+ 
+ 	state := ctx.GetDiscoveredState()
+ 	ec2Mock.CreateLaunchTemplateVersionCallCount = 0
+@@ -264,7 +271,7 @@ func TestUpdateWithLaunchTemplate(t *testing.T) {
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+ 	g.Expect(ec2Mock.CreateLaunchTemplateVersionCallCount).To(gomega.Equal(1))
+ 	g.Expect(ec2Mock.ModifyLaunchTemplateCallCount).To(gomega.Equal(1))
+-	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileInitUpgrade))
++	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileModifying))
+ 
+ 	ec2Mock.CreateLaunchTemplateVersionCallCount = 0
+ 	ec2Mock.ModifyLaunchTemplateCallCount = 0
+@@ -292,7 +299,7 @@ func TestUpdateWithLaunchTemplate(t *testing.T) {
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+ 	g.Expect(ec2Mock.CreateLaunchTemplateVersionCallCount).To(gomega.Equal(1))
+ 	g.Expect(ec2Mock.ModifyLaunchTemplateCallCount).To(gomega.Equal(1))
+-	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileInitUpgrade))
++	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileModifying))
+ }
+ 
+ func TestUpdateWithRotationPositive(t *testing.T) {
+@@ -369,7 +376,7 @@ func TestUpdateWithRotationPositive(t *testing.T) {
+ 
+ 	err = ctx.Update()
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+-	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileInitUpgrade))
++	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileModifying))
+ }
+ 
+ func TestLaunchConfigurationDrifted(t *testing.T) {
+@@ -552,6 +559,75 @@ func TestUpdateScalingGroupNegative(t *testing.T) {
+ 	g.Expect(ctx.GetState()).To(gomega.Equal(v1alpha1.ReconcileModifying))
+ }
+ 
++func TestUpgradeLeavesOtherScalingGroupsResourcesAlone(t *testing.T) {
++	g := gomega.NewGomegaWithT(t)
++	k := MockKubernetesClientSet()
++	ig := MockInstanceGroup()
++	cr := MockCustomResourceSpec()
++	crd := MockCustomResourceDefinition()
++	asgMock := NewAutoScalingMocker()
++	iamMock := NewIamMocker()
++	eksMock := NewEksMocker()
++	ec2Mock := NewEc2Mocker()
++
++	w := MockAwsWorker(asgMock, iamMock, eksMock, ec2Mock)
++	ctx := MockContext(ig, k, w)
++	crYAML, err := yaml.Marshal(cr.Object)
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	strategy := MockAwsCRDStrategy(string(crYAML))
++	strategy.CRDType.SetConcurrencyPolicy(v1alpha1.ReplaceConcurrencyPolicy)
++	ig.SetUpgradeStrategy(strategy)
++	ig.SetState(v1alpha1.ReconcileModifying)
++	ig.Status.SetActiveScalingGroupName("current-asg")
++
++	crdGVR := kubeprovider.GetGVR(crd, "customresourcedefinitions")
++	crGVR := kubeprovider.GetGVR(cr, "dogs")
++	_, err = k.KubeDynamic.Resource(crdGVR).Create(context.Background(), crd, metav1.CreateOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	otherGroupResource := MockCustomResourceSpec()
++	otherGroupResource.SetName("captain-other-launch")
++	kubeprovider.AddAnnotation(otherGroupResource, kubeprovider.OwnershipAnnotationKey, kubeprovider.OwnershipAnnotationValue)
++	kubeprovider.AddAnnotation(otherGroupResource, kubeprovider.ScopeAnnotationKey, "another-asg")
++	_, err = k.KubeDynamic.Resource(crGVR).Namespace("default").Create(context.Background(), otherGroupResource, metav1.CreateOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	completedResource := MockCustomResourceSpec()
++	completedResource.SetName("captain-completed-launch")
++	completedResource.Object["status"] = map[string]interface{}{"dogStatus": "woof"}
++	kubeprovider.AddAnnotation(completedResource, kubeprovider.OwnershipAnnotationKey, kubeprovider.OwnershipAnnotationValue)
++	kubeprovider.AddAnnotation(completedResource, kubeprovider.ScopeAnnotationKey, "current-asg")
++	_, err = k.KubeDynamic.Resource(crGVR).Namespace("default").Create(context.Background(), completedResource, metav1.CreateOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	scalingGroup := &autoscaling.Group{
++		AutoScalingGroupName:    aws.String("current-asg"),
++		LaunchConfigurationName: aws.String("my-lc-0123"),
++	}
++	ctx.SetDiscoveredState(&DiscoveredState{
++		Publisher:    kubeprovider.EventPublisher{Client: k.Kubernetes},
++		ScalingGroup: scalingGroup,
++		ScalingConfiguration: &scaling.LaunchConfiguration{
++			TargetResource: &autoscaling.LaunchConfiguration{LaunchConfigurationName: aws.String("my-lc-0123")},
++		},
++	})
++
++	_ = ctx.UpgradeNodes()
++	otherResource, err := k.KubeDynamic.Resource(crGVR).Namespace("default").Get(context.Background(), "captain-other-launch", metav1.GetOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++	g.Expect(otherResource.GetAnnotations()[kubeprovider.ScopeAnnotationKey]).To(gomega.Equal("another-asg"))
++	resourceName := ig.GetStatus().GetStrategyResourceName()
++	g.Expect(resourceName).NotTo(gomega.BeEmpty())
++	g.Expect(resourceName).NotTo(gomega.Equal("captain-other-launch"))
++	g.Expect(resourceName).NotTo(gomega.Equal("captain-completed-launch"))
++	selectedResource, err := k.KubeDynamic.Resource(crGVR).Namespace("default").Get(context.Background(), resourceName, metav1.GetOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++	g.Expect(selectedResource.GetAnnotations()[kubeprovider.ScopeAnnotationKey]).To(gomega.Equal("current-asg"))
++	selectedStatus, _, _ := unstructured.NestedString(selectedResource.Object, "status", "dogStatus")
++	g.Expect(selectedStatus).NotTo(gomega.Equal("woof"))
++}
++
+ func TestScalingGroupUpdatePredicate(t *testing.T) {
+ 	var (
+ 		g             = gomega.NewGomegaWithT(t)

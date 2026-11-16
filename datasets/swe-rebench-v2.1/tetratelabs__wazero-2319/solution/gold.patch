@@ -1,0 +1,146 @@
+diff --git a/internal/sysfs/file.go b/internal/sysfs/file.go
+index fdbf1fde..1b6d5f3d 100644
+--- a/internal/sysfs/file.go
++++ b/internal/sysfs/file.go
+@@ -269,7 +269,7 @@ func (f *fsFile) Readdir(n int) (dirents []experimentalsys.Dirent, errno experim
+ 
+ 	if f.reopenDir { // re-open the directory if needed.
+ 		f.reopenDir = false
+-		if errno = adjustReaddirErr(f, f.closed, f.reopen()); errno != 0 {
++		if errno = adjustReaddirErr(f, f.closed, f.rewindDir()); errno != 0 {
+ 			return
+ 		}
+ 	}
+@@ -418,19 +418,25 @@ func seek(s io.Seeker, offset int64, whence int) (int64, experimentalsys.Errno)
+ 	return newOffset, experimentalsys.UnwrapOSError(err)
+ }
+ 
+-// reopenFile allows re-opening a file for reasons such as applying flags or
+-// directory iteration.
+-type reopenFile func() experimentalsys.Errno
+-
+-// compile-time check to ensure fsFile.reopen implements reopenFile.
+-var _ reopenFile = (*fsFile)(nil).reopen
+-
+-// reopen implements the same method as documented on reopenFile.
+-func (f *fsFile) reopen() experimentalsys.Errno {
+-	_ = f.close()
+-	var err error
+-	f.file, err = f.fs.Open(f.name)
+-	return experimentalsys.UnwrapOSError(err)
++func (f *fsFile) rewindDir() experimentalsys.Errno {
++	// Reopen the directory to rewind it.
++	file, err := f.fs.Open(f.name)
++	if err != nil {
++		return experimentalsys.UnwrapOSError(err)
++	}
++	fi, err := file.Stat()
++	if err != nil {
++		return experimentalsys.UnwrapOSError(err)
++	}
++	// Can't check if it's still the same file,
++	// but is it still a directory, at least?
++	if !fi.IsDir() {
++		return experimentalsys.ENOTDIR
++	}
++	// Only update f on success.
++	_ = f.file.Close()
++	f.file = file
++	return 0
+ }
+ 
+ // readdirFile allows masking the `Readdir` function on os.File.
+diff --git a/internal/sysfs/osfile.go b/internal/sysfs/osfile.go
+index 490f0fa6..a9b01eb6 100644
+--- a/internal/sysfs/osfile.go
++++ b/internal/sysfs/osfile.go
+@@ -83,21 +83,12 @@ func (f *osFile) SetAppend(enable bool) (errno experimentalsys.Errno) {
+ 		f.flag &= ^experimentalsys.O_APPEND
+ 	}
+ 
+-	// Clear any create or trunc flag, as we are re-opening, not re-creating.
+-	f.flag &= ^(experimentalsys.O_CREAT | experimentalsys.O_TRUNC)
+-
+-	// appendMode (bool) cannot be changed later, so we have to re-open the
+-	// file. https://github.com/golang/go/blob/go1.20/src/os/file_unix.go#L60
++	// appendMode cannot be changed later, so we have to re-open the file
++	// https://github.com/golang/go/blob/go1.23/src/os/file_unix.go#L60
+ 	return fileError(f, f.closed, f.reopen())
+ }
+ 
+-// compile-time check to ensure osFile.reopen implements reopenFile.
+-var _ reopenFile = (*osFile)(nil).reopen
+-
+ func (f *osFile) reopen() (errno experimentalsys.Errno) {
+-	// Clear any create flag, as we are re-opening, not re-creating.
+-	f.flag &= ^experimentalsys.O_CREAT
+-
+ 	var (
+ 		isDir  bool
+ 		offset int64
+@@ -116,22 +107,47 @@ func (f *osFile) reopen() (errno experimentalsys.Errno) {
+ 		}
+ 	}
+ 
+-	_ = f.close()
+-	f.file, errno = OpenFile(f.path, f.flag, f.perm)
++	// Clear any create or trunc flag, as we are re-opening, not re-creating.
++	flag := f.flag &^ (experimentalsys.O_CREAT | experimentalsys.O_TRUNC)
++	file, errno := OpenFile(f.path, flag, f.perm)
++	if errno != 0 {
++		return errno
++	}
++	errno = f.checkSameFile(file)
+ 	if errno != 0 {
+ 		return errno
+ 	}
+ 
+ 	if !isDir {
+-		_, err = f.file.Seek(offset, io.SeekStart)
++		_, err = file.Seek(offset, io.SeekStart)
+ 		if err != nil {
++			_ = file.Close()
+ 			return experimentalsys.UnwrapOSError(err)
+ 		}
+ 	}
+ 
++	// Only update f on success.
++	_ = f.file.Close()
++	f.file = file
++	f.fd = file.Fd()
+ 	return 0
+ }
+ 
++func (f *osFile) checkSameFile(osf *os.File) experimentalsys.Errno {
++	fi1, err := f.file.Stat()
++	if err != nil {
++		return experimentalsys.UnwrapOSError(err)
++	}
++	fi2, err := osf.Stat()
++	if err != nil {
++		return experimentalsys.UnwrapOSError(err)
++	}
++	if os.SameFile(fi1, fi2) {
++		return 0
++	}
++	return experimentalsys.ENOENT
++}
++
+ // IsNonblock implements the same method as documented on fsapi.File
+ func (f *osFile) IsNonblock() bool {
+ 	return isNonblock(f)
+diff --git a/sys/stat.go b/sys/stat.go
+index bb7b9e5d..32888554 100644
+--- a/sys/stat.go
++++ b/sys/stat.go
+@@ -29,9 +29,7 @@ type EpochNanos = int64
+ // # Notes
+ //
+ //   - This is used for WebAssembly ABI emulating the POSIX `stat` system call.
+-//     Fields included are required for WebAssembly ABI including wasip1
+-//     (a.k.a. wasix) and wasi-filesystem (a.k.a. wasip2). See
+-//     https://pubs.opengroup.org/onlinepubs/9699919799/functions/stat.html
++//     See https://pubs.opengroup.org/onlinepubs/9699919799/functions/stat.html
+ //   - Fields here are required for WebAssembly ABI including wasip1
+ //     (a.k.a. wasix) and wasi-filesystem (a.k.a. wasip2).
+ //   - This isn't the same as syscall.Stat_t because wazero supports Windows,

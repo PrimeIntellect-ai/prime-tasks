@@ -1,0 +1,2 @@
+rebaseStalePrs: should ignore PR that is already edited manually
+For example, renovate makes a PR for new version of my linter-config package, which will usually cause build failed, I have to fix linter error in that PR before merging, but with `rebaseStalePrs` enabled it'll always override my edited branch (once per hour I think?), though I can just `git push -f` back from my local branch, it'd be better to not override those edited branch.

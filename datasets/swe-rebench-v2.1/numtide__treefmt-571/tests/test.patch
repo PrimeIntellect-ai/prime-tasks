@@ -1,0 +1,192 @@
+diff --git a/cmd/root_test.go b/cmd/root_test.go
+index 60fc54d..4161e97 100644
+--- a/cmd/root_test.go
++++ b/cmd/root_test.go
+@@ -1531,6 +1531,57 @@ func TestGit(t *testing.T) {
+ 	)
+ }
+ 
++func TestCommandConfiguredTreeRootTraversal(t *testing.T) {
++	tempDir := test.TempExamples(t)
++	configPath := filepath.Join(tempDir, "/treefmt.toml")
++
++	test.ChangeWorkDir(t, tempDir)
++
++	cfg := &config.Config{
++		FormatterConfigs: map[string]*config.Formatter{
++			"echo": {
++				Command:  "echo",
++				Includes: []string{"*"},
++			},
++		},
++	}
++	test.WriteConfig(t, configPath, cfg)
++
++	treeRootCmd := func(output string) string {
++		return fmt.Sprintf("bash -c 'echo %s'", output)
++	}
++
++	// A configured command selects the directory treefmt traverses.
++	treefmt(t,
++		withArgs("--tree-root-cmd", treeRootCmd(tempDir)),
++		withNoError(t),
++		withConfig(configPath, cfg),
++		withStats(t, map[stats.Type]int{
++			stats.Traversed: 32,
++			stats.Matched:   32,
++			stats.Formatted: 32,
++			stats.Changed:   0,
++		}),
++	)
++
++	// The command can also be supplied through the environment.
++	treefmt(t,
++		withArgs("-C", filepath.Join(tempDir, "go")),
++		withEnv(map[string]string{
++			"TREEFMT_TREE_ROOT_CMD": treeRootCmd(filepath.Join(tempDir, "go")),
++		}),
++		withNoError(t),
++		withConfig(configPath, cfg),
++		withStats(t, map[stats.Type]int{
++			stats.Traversed: 2,
++			stats.Matched:   2,
++			stats.Formatted: 2,
++			stats.Changed:   0,
++		}),
++	)
++
++}
++
+ func TestPathsArg(t *testing.T) {
+ 	as := require.New(t)
+ 
+diff --git a/config/config_test.go b/config/config_test.go
+index 279771e..22366cc 100644
+--- a/config/config_test.go
++++ b/config/config_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -26,6 +27,17 @@ func newViper(t *testing.T) (*viper.Viper, *pflag.FlagSet) {
+ 	tempDir := t.TempDir()
+ 	v.SetConfigFile(filepath.Join(tempDir, "treefmt.toml"))
+ 
++	// initialise a git repo to help with tree-root-cmd testing
++	cmd := exec.Command("git", "init")
++	cmd.Dir = tempDir
++
++	if err = cmd.Run(); err != nil {
++		t.Fatal(err)
++	}
++
++	// change working directory to the temp dir
++	t.Chdir(tempDir)
++
+ 	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+ 	config.SetFlags(flags)
+ 
+@@ -36,7 +48,7 @@ func newViper(t *testing.T) (*viper.Viper, *pflag.FlagSet) {
+ 	return v, flags
+ }
+ 
+-func readValue(t *testing.T, v *viper.Viper, cfg *config.Config, test func(*config.Config)) {
++func writeAndReadBack(t *testing.T, v *viper.Viper, cfg *config.Config) {
+ 	t.Helper()
+ 
+ 	// serialise the config and read it into viper
+@@ -48,6 +60,25 @@ func readValue(t *testing.T, v *viper.Viper, cfg *config.Config, test func(*conf
+ 	} else if err = v.ReadConfig(bufio.NewReader(buf)); err != nil {
+ 		t.Fatal(fmt.Errorf("failed to read config: %w", err))
+ 	}
++}
++
++func readError(t *testing.T, v *viper.Viper, cfg *config.Config, test func(error)) {
++	t.Helper()
++
++	writeAndReadBack(t, v, cfg)
++
++	_, err := config.FromViper(v)
++	if err == nil {
++		t.Fatal("error was expected but none was thrown")
++	}
++
++	test(err)
++}
++
++func readValue(t *testing.T, v *viper.Viper, cfg *config.Config, test func(*config.Config)) {
++	t.Helper()
++
++	writeAndReadBack(t, v, cfg)
+ 
+ 	//
+ 	decodedCfg, err := config.FromViper(v)
+@@ -457,6 +488,64 @@ func TestTreeRootFile(t *testing.T) {
+ 	checkValue(tempDir, ".git/config")
+ }
+ 
++func TestCommandConfiguredTreeRootValues(t *testing.T) {
++	as := require.New(t)
++
++	cfg := &config.Config{}
++	v, flags := newViper(t)
++
++	checkValue := func(treeRoot string) {
++		readValue(t, v, cfg, func(cfg *config.Config) {
++			as.Equal(treeRoot, cfg.TreeRoot)
++		})
++	}
++
++	tempDir := t.TempDir()
++	as.NoError(os.MkdirAll(filepath.Join(tempDir, "foo"), 0o755))
++	as.NoError(os.MkdirAll(filepath.Join(tempDir, "bar"), 0o755))
++
++	// default with no flag, env or config
++	// should match the absolute path of the directory in which the config file is located
++	checkValue(filepath.Dir(v.ConfigFileUsed()))
++
++	// set config value
++	as.NoError(v.ReadConfig(bytes.NewBufferString(fmt.Sprintf("tree-root-cmd = %q\n", "echo "+tempDir))))
++	decoded, err := config.FromViper(v)
++	as.NoError(err)
++	as.Equal(tempDir, decoded.TreeRoot)
++
++	// env override
++	// should match the directory above
++	t.Setenv("TREEFMT_TREE_ROOT_CMD", fmt.Sprintf("echo \"%s/foo\"", tempDir))
++	checkValue(filepath.Join(tempDir, "foo"))
++
++	// flag override
++	// should match the root of the temp directory structure
++	as.NoError(flags.Set("tree-root-cmd", fmt.Sprintf("echo '%s/bar'", tempDir)))
++	checkValue(filepath.Join(tempDir, "bar"))
++
++	// empty output from tree-root-cmd
++	// should throw an error
++	as.NoError(flags.Set("tree-root-cmd", "echo ''"))
++	readError(t, v, cfg, func(err error) {
++		as.Error(err)
++	})
++}
++
++func TestTreeRootCmdUsesWorkingDirectory(t *testing.T) {
++	as := require.New(t)
++	cfg := &config.Config{}
++	v, flags := newViper(t)
++	wantedDir := t.TempDir()
++	// A command can learn the effective directory from its working directory or an argument.
++	v.Set("tree-root-cmd", `bash -c 'for dir in "$@" "$0"; do if [ -d "$dir" ]; then printf "%s\n" "$dir"; exit 0; fi; done; pwd'`)
++	as.NoError(flags.Set("working-dir", wantedDir))
++
++	readValue(t, v, cfg, func(decoded *config.Config) {
++		as.Equal(wantedDir, decoded.TreeRoot)
++	})
++}
++
+ func TestVerbosity(t *testing.T) {
+ 	as := require.New(t)
+ 

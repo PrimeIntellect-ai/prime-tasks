@@ -1,0 +1,333 @@
+diff --git a/harmonica/tests/test_prism.py b/harmonica/tests/test_prism.py
+index 325072f..899beb8 100644
+--- a/harmonica/tests/test_prism.py
++++ b/harmonica/tests/test_prism.py
+@@ -7,6 +7,10 @@
+ """
+ Test forward modelling for prisms.
+ """
++import importlib
++import sys
++import types
++
+ import numpy as np
+ import numpy.testing as npt
+ import pytest
+@@ -381,3 +385,161 @@ def test_prisms_parallel_vs_serial():
+             coordinates, prisms, densities, field=field, parallel=False
+         )
+         npt.assert_allclose(result_parallel, result_serial)
++
++
++def _fake_progress_bar_factory():
++    """
++    Build a numba-compatible fake ``ProgressBar`` that records its usage.
++
++    The returned factory mimics the public interface of
++    ``numba_progress.ProgressBar``: it is instantiated with a ``total``
++    argument, its instances expose ``update`` and ``close`` methods and can be
++    used as context managers. Each instance also stores the ``total`` value,
++    the number of updated steps and whether it was closed, so tests can check
++    how the progress bar was used.
++    """
++    from numba import types
++    from numba.core import cgutils
++    from numba.core.boxing import unbox_array
++    from numba.extending import (
++        NativeValue,
++        make_attribute_wrapper,
++        models,
++        overload_method,
++        register_model,
++        typeof_impl,
++        unbox,
++    )
++
++    class FakeProgressBar:
++        instances = []
++
++        def __init__(self, total=None, **kwargs):
++            self.total = total
++            self.hook = np.zeros(1, dtype=np.uint64)
++            self.closed = 0
++            FakeProgressBar.instances.append(self)
++
++        @property
++        def updates(self):
++            return int(self.hook[0])
++
++        def update(self, n=1):
++            self.hook[0] += n
++
++        def close(self):
++            self.closed = 1
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, exc_type, exc_value, traceback):
++            self.close()
++
++    class FakeProgressBarType(types.Type):
++        def __init__(self):
++            super().__init__(name="FakeProgressBar")
++
++    fake_type = FakeProgressBarType()
++
++    @typeof_impl.register(FakeProgressBar)
++    def _typeof_fake_progress_bar(val, c):
++        return fake_type
++
++    @register_model(FakeProgressBarType)
++    class FakeProgressBarModel(models.StructModel):
++        def __init__(self, dmm, fe_type):
++            members = [("hook", types.Array(types.uint64, 1, "C"))]
++            models.StructModel.__init__(self, dmm, fe_type, members)
++
++    make_attribute_wrapper(FakeProgressBarType, "hook", "hook")
++
++    @unbox(FakeProgressBarType)
++    def _unbox_fake_progress_bar(typ, obj, c):
++        hook_obj = c.pyapi.object_getattr_string(obj, "hook")
++        fake = cgutils.create_struct_proxy(typ)(c.context, c.builder)
++        fake.hook = unbox_array(types.Array(types.uint64, 1, "C"), hook_obj, c).value
++        c.pyapi.decref(hook_obj)
++        is_error = cgutils.is_not_null(c.builder, c.pyapi.err_occurred())
++        return NativeValue(fake._getvalue(), is_error=is_error)
++
++    @overload_method(FakeProgressBarType, "update")
++    def _overload_update(self, n=1):
++        if isinstance(self, FakeProgressBarType):
++
++            def impl(self, n=1):
++                self.hook[0] += n
++
++            return impl
++
++    return FakeProgressBar
++
++
++def _install_fake_numba_progress(monkeypatch):
++    """
++    Make ``numba_progress`` importable as a fake module and reload ``prism``.
++
++    Reloading the module makes the fake available both to implementations that
++    import ``ProgressBar`` at module level and to ones that import it lazily.
++    Returns the fake ``ProgressBar`` factory.
++    """
++    import harmonica.forward.prism as prism_module
++
++    fake_progress_bar = _fake_progress_bar_factory()
++    fake_module = types.ModuleType("numba_progress")
++    fake_module.ProgressBar = fake_progress_bar
++    monkeypatch.setitem(sys.modules, "numba_progress", fake_module)
++    importlib.reload(prism_module)
++    return fake_progress_bar
++
++
++def test_progress_bar(monkeypatch):
++    """Progress feedback advances without changing the calculated fields."""
++    import harmonica.forward.prism as prism_module
++
++    prisms = [
++        [-100, 0, -100, 0, -10, 0],
++        [0, 100, -100, 0, -10, 0],
++        [-100, 0, 0, 100, -10, 0],
++        [0, 100, 0, 100, -10, 0],
++    ]
++    densities = [2000, 3000, 4000, 5000]
++    coordinates = vd.grid_coordinates(
++        region=(-100, 100, -100, 100), spacing=20, extra_coords=10
++    )
++    fake_progress_bar = _install_fake_numba_progress(monkeypatch)
++
++    def calculate_with_progress(field):
++        fake_progress_bar.instances.clear()
++        try:
++            return prism_module.prism_gravity(
++                coordinates,
++                prisms,
++                densities,
++                field=field,
++                progressbar=True,
++                parallel=False,
++            )
++        except TypeError:
++            progress = fake_progress_bar(total=coordinates[0].size)
++            return prism_module.prism_gravity(
++                coordinates,
++                prisms,
++                densities,
++                field=field,
++                progress=progress,
++                parallel=False,
++            )
++
++    try:
++        for field in ("potential", "g_z"):
++            result_with_progress = calculate_with_progress(field)
++            updates = sum(bar.updates for bar in fake_progress_bar.instances)
++            result_without_progress = prism_module.prism_gravity(
++                coordinates, prisms, densities, field=field, parallel=False
++            )
++            npt.assert_allclose(result_with_progress, result_without_progress)
++            assert updates > 0
++    finally:
++        monkeypatch.undo()
++        importlib.reload(prism_module)
+diff --git a/harmonica/tests/test_prism_layer.py b/harmonica/tests/test_prism_layer.py
+index ddcbe57..7cad883 100644
+--- a/harmonica/tests/test_prism_layer.py
++++ b/harmonica/tests/test_prism_layer.py
+@@ -7,6 +7,9 @@
+ """
+ Test prisms layer
+ """
++import importlib
++import sys
++import types
+ import warnings
+ 
+ import numpy as np
+@@ -422,3 +425,141 @@ def test_to_pyvista(dummy_layer, properties):
+         assert pv_grid.array_names == ["density"]
+         assert pv_grid.get_array("density").ndim == 1
+         npt.assert_allclose(pv_grid.get_array("density"), layer.density.values.ravel())
++
++
++def _fake_progress_bar_factory():
++    """
++    Build a numba-compatible fake ``ProgressBar`` that records its usage.
++
++    The returned factory mimics the public interface of
++    ``numba_progress.ProgressBar``: it is instantiated with a ``total``
++    argument, its instances expose ``update`` and ``close`` methods and can be
++    used as context managers. Each instance also stores the ``total`` value,
++    the number of updated steps and whether it was closed, so tests can check
++    how the progress bar was used.
++    """
++    from numba import types
++    from numba.core import cgutils
++    from numba.core.boxing import unbox_array
++    from numba.extending import (
++        NativeValue,
++        make_attribute_wrapper,
++        models,
++        overload_method,
++        register_model,
++        typeof_impl,
++        unbox,
++    )
++
++    class FakeProgressBar:
++        instances = []
++
++        def __init__(self, total=None, **kwargs):
++            self.total = total
++            self.hook = np.zeros(1, dtype=np.uint64)
++            self.closed = 0
++            FakeProgressBar.instances.append(self)
++
++        @property
++        def updates(self):
++            return int(self.hook[0])
++
++        def update(self, n=1):
++            self.hook[0] += n
++
++        def close(self):
++            self.closed = 1
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, exc_type, exc_value, traceback):
++            self.close()
++
++    class FakeProgressBarType(types.Type):
++        def __init__(self):
++            super().__init__(name="FakeProgressBar")
++
++    fake_type = FakeProgressBarType()
++
++    @typeof_impl.register(FakeProgressBar)
++    def _typeof_fake_progress_bar(val, c):
++        return fake_type
++
++    @register_model(FakeProgressBarType)
++    class FakeProgressBarModel(models.StructModel):
++        def __init__(self, dmm, fe_type):
++            members = [("hook", types.Array(types.uint64, 1, "C"))]
++            models.StructModel.__init__(self, dmm, fe_type, members)
++
++    make_attribute_wrapper(FakeProgressBarType, "hook", "hook")
++
++    @unbox(FakeProgressBarType)
++    def _unbox_fake_progress_bar(typ, obj, c):
++        hook_obj = c.pyapi.object_getattr_string(obj, "hook")
++        fake = cgutils.create_struct_proxy(typ)(c.context, c.builder)
++        fake.hook = unbox_array(types.Array(types.uint64, 1, "C"), hook_obj, c).value
++        c.pyapi.decref(hook_obj)
++        is_error = cgutils.is_not_null(c.builder, c.pyapi.err_occurred())
++        return NativeValue(fake._getvalue(), is_error=is_error)
++
++    @overload_method(FakeProgressBarType, "update")
++    def _overload_update(self, n=1):
++        if isinstance(self, FakeProgressBarType):
++
++            def impl(self, n=1):
++                self.hook[0] += n
++
++            return impl
++
++    return FakeProgressBar
++
++
++def _install_fake_numba_progress(monkeypatch):
++    """
++    Make ``numba_progress`` importable as a fake module and reload ``prism``.
++
++    Reloading the module makes the fake available both to implementations that
++    import ``ProgressBar`` at module level and to ones that import it lazily.
++    Returns the fake ``ProgressBar`` factory.
++    """
++    import harmonica.forward.prism as prism_module
++
++    fake_progress_bar = _fake_progress_bar_factory()
++    fake_module = types.ModuleType("numba_progress")
++    fake_module.ProgressBar = fake_progress_bar
++    monkeypatch.setitem(sys.modules, "numba_progress", fake_module)
++    importlib.reload(prism_module)
++    return fake_progress_bar
++
++
++def test_progress_bar(dummy_layer, monkeypatch):
++    """Layer progress feedback advances without changing the calculated field."""
++    import harmonica.forward.prism as prism_module
++
++    coordinates = vd.grid_coordinates((1, 3, 7, 10), spacing=1, extra_coords=30.0)
++    (easting, northing), surface, reference, density = dummy_layer
++    layer = prism_layer(
++        (easting, northing), surface, reference, properties={"density": density}
++    )
++    fake_progress_bar = _install_fake_numba_progress(monkeypatch)
++    try:
++        fake_progress_bar.instances.clear()
++        try:
++            result_with_progress = layer.prism_layer.gravity(
++                coordinates, field="g_z", progressbar=True, parallel=False
++            )
++        except TypeError:
++            progress = fake_progress_bar(total=coordinates[0].size)
++            result_with_progress = layer.prism_layer.gravity(
++                coordinates, field="g_z", progress=progress, parallel=False
++            )
++        updates = sum(bar.updates for bar in fake_progress_bar.instances)
++        result_without_progress = layer.prism_layer.gravity(
++            coordinates, field="g_z", parallel=False
++        )
++        npt.assert_allclose(result_with_progress, result_without_progress)
++        assert updates > 0
++    finally:
++        monkeypatch.undo()
++        importlib.reload(prism_module)

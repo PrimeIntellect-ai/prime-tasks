@@ -1,0 +1,196 @@
+diff --git a/docs/src/api.md b/docs/src/api.md
+index e71c04ff..e31cd25a 100644
+--- a/docs/src/api.md
++++ b/docs/src/api.md
+@@ -34,6 +34,7 @@ Optimisers.OptimiserChain
+ Optimisers.setup
+ Optimisers.update
+ Optimisers.update!
++Optimisers.adjust(::Any, ::Real)
+ ```
+ 
+ Calling `Functors.@functor` on your model's layer types by default causes the
+@@ -57,4 +58,5 @@ Optimisers.apply!
+ Optimisers.init
+ Optimisers.@..
+ Optimisers.@lazy
++Optimisers.adjust(::AbstractRule, ::Real)
+ ```
+diff --git a/docs/src/index.md b/docs/src/index.md
+index 2da7b009..aaee5d7f 100644
+--- a/docs/src/index.md
++++ b/docs/src/index.md
+@@ -8,13 +8,13 @@ These act on one array of parameters:
+ ```julia
+ # Define a container to hold any optimiser specific parameters (if any):
+ struct DecayDescent{T} <: Optimisers.AbstractRule
+-  η::T
++  eta::T
+ end
+ 
+ # Define an `apply!` rule which encodes how the gradients will be used to
+ # update the parameters:
+ function Optimisers.apply!(o::DecayDescent, state, x, x̄)
+-  newx̄ = (o.η / √state) .* x̄
++  newx̄ = (o.eta / √state) .* x̄
+   nextstate = state + 1
+   return nextstate, newx̄
+ end
+diff --git a/src/Optimisers.jl b/src/Optimisers.jl
+index 668c00f6..e6ca6c14 100644
+--- a/src/Optimisers.jl
++++ b/src/Optimisers.jl
+@@ -6,6 +6,8 @@ using LinearAlgebra
+ include("interface.jl")
+ export AbstractRule
+ 
++include("adjust.jl")
++
+ include("destructure.jl")
+ export destructure
+ 
+diff --git a/src/adjust.jl b/src/adjust.jl
+new file mode 100644
+index 00000000..d6f3647d
+--- /dev/null
++++ b/src/adjust.jl
+@@ -0,0 +1,71 @@
++
++"""
++    Optimisers.adjust(tree, η) -> tree
++
++Alters the state `tree = setup(rule, model)` to change the parameters of the
++optimisation rule, without destroying its stored state. Typically used mid-way
++through training.
++
++To change just the learning rate, provide a number `η::Real`.
++
++# Example
++```jldoctest
++julia> m = (vec = rand(Float32, 2), fun = sin);
++
++julia> st = Optimisers.setup(Nesterov(), m)  # stored momentum is initialised to zero
++(vec = Leaf(Nesterov{Float32}(0.001, 0.9), Float32[0.0, 0.0]), fun = nothing)
++
++julia> st, m = Optimisers.update(st, m, (vec = [16, 88], fun = nothing));  # with fake gradient
++
++julia> st
++(vec = Leaf(Nesterov{Float32}(0.001, 0.9), Float32[-0.016, -0.088]), fun = nothing)
++
++julia> st = Optimisers.adjust(st, 0.123)  # change learning rate, stored momentum untouched
++(vec = Leaf(Nesterov{Float32}(0.123, 0.9), Float32[-0.016, -0.088]), fun = nothing)
++```
++
++To change other parameters, `adjust` also accepts keyword arguments matching the field
++names of the optimisation rule's type.
++
++```
++julia> fieldnames(Adam)
++(:eta, :beta, :epsilon)
++
++julia> st2 = Optimisers.setup(OptimiserChain(ClipGrad(), Adam()), m)
++(vec = Leaf(OptimiserChain(ClipGrad{Float32}(10.0), Adam{Float32}(0.001, (0.9, 0.999), 1.19209f-7)), [nothing, (Float32[0.0, 0.0], Float32[0.0, 0.0], (0.9, 0.999))]), fun = nothing)
++
++julia> Optimisers.adjust(st2; beta = (0.777, 0.909), delta = 11.1)  # delta acts on ClipGrad
++(vec = Leaf(OptimiserChain(ClipGrad{Float32}(11.1), Adam{Float32}(0.001, (0.777, 0.909), 1.19209f-7)), [nothing, (Float32[0.0, 0.0], Float32[0.0, 0.0], (0.9, 0.999))]), fun = nothing)
++
++julia> Optimisers.adjust(st; beta = "no such field")  # silently ignored!
++(vec = Leaf(Nesterov{Float32}(0.001, 0.9), Float32[-0.016, -0.088]), fun = nothing)
++```
++"""
++adjust(tree, eta::Real) = map(st -> adjust(st, eta), tree)
++adjust(tree; kw...) = map(st -> adjust(st; kw...), tree)
++
++adjust(::Nothing, ::Real) = nothing
++adjust(::Nothing; kw...) = nothing
++
++adjust(ℓ::Leaf, eta::Real) = Leaf(adjust(ℓ.rule, eta), ℓ.state)
++adjust(ℓ::Leaf; kw...) = Leaf(adjust(ℓ.rule; kw...), ℓ.state)
++
++
++"""
++    Optimisers.adjust(rule::RuleType, η::Real) -> rule
++
++If a new optimisation rule has a learning rate which is *not* stored in field `rule.eta`,
++then you may should add a method to `adjust`. (But simpler to just use the standard name.)
++"""
++adjust(r::AbstractRule, eta::Real) = _adjust(r, (; eta))
++adjust(r::AbstractRule; kw...) = _adjust(r, NamedTuple(kw))
++
++function _adjust(r::T, nt::NamedTuple) where T <: AbstractRule
++  isempty(nt) && throw(ArgumentError("adjust must be given something to act on!"))
++  fs = fieldnames(T)
++  vals = map(fs) do field
++    get(nt, field, getfield(r, field))
++  end
++  T(vals...)  # relies on having the default constructor
++end
++
+diff --git a/src/rules.jl b/src/rules.jl
+index 63b6a247..32e7dd25 100644
+--- a/src/rules.jl
++++ b/src/rules.jl
+@@ -129,11 +129,16 @@ function apply!(o::RMSProp, state, x, dx)
+   return (quad, lin), dx′
+ end
+ 
++function adjust(r::RMSProp; kw...)
++  :centred in keys(kw) && throw(ArgumentError("adjust(::RMSProp; centred) is not allowed, as the variants store different states"))
++  _adjust(r, NamedTuple(kw))  # that's why _adjust exists!
++end
++
+ function Base.show(io::IO, o::RMSProp)
+-    show(io, typeof(o))
+-    print(io, "(")
+-    join(io, [o.eta, o.rho, o.epsilon], ", ")
+-    print(io, "; centred = ", o.centred, ")")
++  show(io, typeof(o))
++  print(io, "(")
++  join(io, [o.eta, o.rho, o.epsilon], ", ")
++  print(io, "; centred = ", o.centred, ")")
+ end
+ 
+ 
+@@ -542,7 +547,7 @@ See also [`ClipNorm`](@ref).
+ struct ClipGrad{T<:Real} <: AbstractRule
+   delta::T
+ end
+-ClipGrad() = ClipGrad(10f0)
++ClipGrad(δ::Integer = 10) = ClipGrad(Float32(δ))  # float is to ensure adjust can change this
+ 
+ init(o::ClipGrad, x::AbstractArray) = nothing
+ 
+@@ -569,7 +574,7 @@ struct ClipNorm{T<:Real} <: AbstractRule
+   p::T
+   throw::Bool
+ end
+-ClipNorm(ω = 10f0, p = 2; throw::Bool = true) = ClipNorm{typeof(ω)}(ω, p, throw)
++ClipNorm(ω = 10f0, p = 2; throw::Bool = true) = ClipNorm{float(typeof(ω))}(ω, p, throw)
+ 
+ init(o::ClipNorm, x::AbstractArray) = nothing
+ 
+@@ -595,12 +600,12 @@ This is equivalent to `Descent(1)`.
+ 
+ # Example
+ ```jldoctest
+-julia> o = OptimiserChain(ClipGrad(1), Descent(0.1));
++julia> o = OptimiserChain(ClipGrad(1.0), Descent(0.1));
+ 
+ julia> m = (zeros(3),);
+ 
+ julia> s = Optimisers.setup(o, m)
+-(Leaf(OptimiserChain(ClipGrad{Int64}(1), Descent{Float64}(0.1)), [nothing, nothing]),)
++(Leaf(OptimiserChain(ClipGrad{Float64}(1.0), Descent{Float64}(0.1)), [nothing, nothing]),)
+ 
+ julia> Optimisers.update(s, m, ([0.3, 1, 7],))[2]  # clips before discounting
+ ([-0.03, -0.1, -0.1],)
+@@ -626,4 +631,7 @@ function Base.show(io::IO, c::OptimiserChain)
+   print(io, "OptimiserChain(")
+   join(io, c.opts, ", ")
+   print(io, ")")
+-end
+\ No newline at end of file
++end
++
++adjust(ℓ::OptimiserChain, eta::Real) = OptimiserChain(map(opt -> adjust(opt, eta), ℓ.opts)...)
++adjust(ℓ::OptimiserChain; kw...) = OptimiserChain(map(opt -> adjust(opt; kw...), ℓ.opts)...)

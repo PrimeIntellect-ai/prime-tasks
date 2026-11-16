@@ -1,0 +1,2 @@
+Compatibility with sktime 0.22.0 and beyond
+New updates in sktime 0.22.0 changed some column naming ([release notes here](https://www.sktime.net/en/latest/changelog.html#forecasting-change-of-column-naming-for-univariate-probabilistic-forecasts)) - let's get this up to date since it will continue for future versions. Associated test failures can be seen [here](https://github.com/alteryx/evalml/actions/runs/5905221237/job/16018907515?pr=4280).

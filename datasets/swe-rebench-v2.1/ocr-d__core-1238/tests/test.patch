@@ -1,0 +1,152 @@
+diff --git a/tests/processor/test_processor.py b/tests/processor/test_processor.py
+index be4cc56e..435f1481 100644
+--- a/tests/processor/test_processor.py
++++ b/tests/processor/test_processor.py
+@@ -1,26 +1,36 @@
+ import json
++from contextlib import ExitStack
+ 
+ from tempfile import TemporaryDirectory
+-from os.path import join
+-from tests.base import CapturingTestCase as TestCase, assets, main # pylint: disable=import-error, no-name-in-module
++from pathlib import Path
++from os import environ
++from tests.base import CapturingTestCase as TestCase, assets, main, copy_of_directory # pylint: disable=import-error, no-name-in-module
+ from tests.data import DummyProcessor, DummyProcessorWithRequiredParameters, DummyProcessorWithOutput, IncompleteProcessor
+ 
+ from ocrd_utils import MIMETYPE_PAGE, pushd_popd, initLogging, disableLogging
+ from ocrd.resolver import Resolver
+ from ocrd.processor.base import Processor, run_processor, run_cli
+ 
++from unittest import mock
+ import pytest
+ 
+ class TestProcessor(TestCase):
+ 
+     def setUp(self):
+         super().setUp()
+-        self.resolver = Resolver()
+-        self.workspace = self.resolver.workspace_from_url(assets.url_of('SBB0000F29300010000/data/mets.xml'))
++        # make sure we get an isolated temporary copy of the testdata each time
++        # as long as we are not using pytest but unittest, we need to manage contexts
++        # (enterContext is only supported starting with py311)
++        with ExitStack() as stack:
++            self.resolver = Resolver()
++            self.workdir = stack.enter_context(copy_of_directory(assets.path_to('SBB0000F29300010000/data')))
++            stack.enter_context(pushd_popd(self.workdir))
++            self.workspace = self.resolver.workspace_from_url('mets.xml')
++            self.addCleanup(stack.pop_all().close)
+ 
+     def test_incomplete_processor(self):
+         proc = IncompleteProcessor(None)
+-        with self.assertRaisesRegex(Exception, 'Must be implemented'):
++        with self.assertRaises(Exception):
+             proc.process()
+ 
+     def test_no_resolver(self):
+@@ -48,8 +58,8 @@ class TestProcessor(TestCase):
+         assert [f.mimetype for f in processor.input_files] == [MIMETYPE_PAGE, MIMETYPE_PAGE]
+ 
+     def test_parameter(self):
+-        with TemporaryDirectory() as tempdir:
+-            jsonpath = join(tempdir, 'params.json')
++        with TemporaryDirectory():
++            jsonpath = Path('params.json').name
+             with open(jsonpath, 'w') as f:
+                 f.write('{"baz": "quux"}')
+             with open(jsonpath, 'r') as f:
+@@ -73,6 +83,57 @@ class TestProcessor(TestCase):
+         with self.assertRaisesRegex(Exception, 'is a required property'):
+             DummyProcessorWithRequiredParameters(workspace=self.workspace)
+ 
++    def test_params_preset_resolve(self):
++        with pushd_popd(tempdir=True) as tempdir:
++            with mock.patch.dict(environ, {'XDG_DATA_HOME': str(tempdir)}):
++                path = Path(tempdir) / 'ocrd-resources' / 'ocrd-dummy'
++                path.mkdir(parents=True)
++                path = str(path / 'preset.json')
++                with open(path, 'w') as out:
++                    # it would be nicer to test some existing processor which does take params
++                    out.write('{}')
++                assert 0 == run_cli("ocrd-dummy",
++                                    resolver=Resolver(),
++                                    mets_url=self.workspace.mets_target,
++                                    input_file_grp="OCR-D-IMG",
++                                    output_file_grp="DUMMY",
++                                    parameter=path)
++                assert 0 == run_cli("ocrd-dummy",
++                                    resolver=Resolver(),
++                                    mets_url=self.workspace.mets_target,
++                                    input_file_grp="OCR-D-IMG",
++                                    output_file_grp="DUMMY",
++                                    parameter='preset.json',
++                                    overwrite=True)
++
++    def test_resolve_resource(self):
++        with pushd_popd(tempdir=True) as tempdir:
++            with mock.patch.dict(environ, {'XDG_DATA_HOME': str(tempdir)}):
++                path = Path(tempdir) / 'ocrd-resources' / 'ocrd-dummy'
++                path.mkdir(parents=True)
++                res = path / 'preset.json'
++                res.write_text('{}')
++                self.capture_out_err()
++                Processor(workspace=None,
++                          ocrd_tool={'executable': 'ocrd-dummy',
++                                     'parameters': {'i-am-required': {'required': True}}},
++                          resolve_resource='preset.json')
++                out, err = self.capture_out_err()
++                assert str(res) in out
++
++    def test_resolve_resource_does_not_process(self):
++        with pushd_popd(tempdir=True) as tempdir:
++            with mock.patch.dict(environ, {'XDG_DATA_HOME': str(tempdir)}):
++                resource_dir = Path(tempdir) / 'ocrd-resources' / 'ocrd-test'
++                resource_dir.mkdir(parents=True)
++                resource = resource_dir / 'preset.json'
++                resource.write_text('{}')
++                self.capture_out_err()
++                DummyProcessor(workspace=self.workspace, resolve_resource='preset.json')
++                out, _ = self.capture_out_err()
++                assert str(resource.resolve()) in out
++                assert '{"baz"' not in out
++
+     def test_params(self):
+         proc = Processor(workspace=self.workspace)
+         self.assertEqual(proc.parameter, {})
+diff --git a/tests/test_decorators.py b/tests/test_decorators.py
+index 992e173d..0a91d6ea 100644
+--- a/tests/test_decorators.py
++++ b/tests/test_decorators.py
+@@ -3,7 +3,10 @@ import click
+ from contextlib import contextmanager
+ from click.testing import CliRunner
+ from tempfile import TemporaryDirectory
++from pathlib import Path
++from unittest import mock
+ from os.path import join, exists
++import pytest
+ 
+ from tests.base import CapturingTestCase as TestCase, assets, main, copy_of_directory # pylint: disable=import-error, no-name-in-module
+ from tests.data import DummyProcessor
+@@ -105,6 +108,21 @@ class TestDecorators(TestCase):
+                 exit_code, out, err = self.invoke_cli(cli_dummy_processor, ['-p', '{"baz": "forty-two"}', '--mets', 'mets.xml', *DEFAULT_IN_OUT])
+                 assert not exit_code
+ 
++    def test_cli_parameter_resource_filename(self):
++        with TemporaryDirectory() as data_home:
++            resource_dir = Path(data_home) / 'ocrd-resources' / 'ocrd-test'
++            resource_dir.mkdir(parents=True)
++            (resource_dir / 'preset.json').write_text('{"baz": "preset-value"}')
++            with mock.patch.dict('os.environ', {'XDG_DATA_HOME': data_home}):
++                with copy_of_directory(assets.path_to('SBB0000F29300010000/data')) as tempdir:
++                    with pushd_popd(tempdir):
++                        code, out, _ = self.invoke_cli(
++                            cli_dummy_processor,
++                            ['--parameter', 'preset.json', '--mets', 'mets.xml', *DEFAULT_IN_OUT])
++                assert not code
++                assert json.loads(out.strip()) == {'baz': 'preset-value'}
++
++    @pytest.mark.skip(reason="now deferred to ocrd_cli_wrap_processor (to resolve preset resources)")
+     def test_param_merging(self):
+         json1 = '{"foo": 23, "bar": 100}'
+         json2 = '{"foo": 42}'

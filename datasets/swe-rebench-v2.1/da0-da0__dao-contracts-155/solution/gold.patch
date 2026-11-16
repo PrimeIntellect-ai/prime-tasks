@@ -1,0 +1,661 @@
+diff --git a/README.md b/README.md
+index 89b136bd..c2a4851f 100644
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,13 @@
+ # DAO DAO Contracts
+ 
+-| Contract                                     | Description                                                        |
+-| :------------------------------------------- | :------------------------------------------------------------------|
+-| [cw-distribution](contracts/cw-distribution) | A contract for distributing staking rewards.                       |
+-| [cw3-dao](contracts/cw3-dao)                 | A DAO with voting power based on staked governance tokens.         |
+-| [cw3-multisig](contracts/cw3-multisig)       | A multisig contract.                                               |
+-| [cw4-registry](contracts/cw4-registry)       | A contract for indexing multisig group members.                    |
+-| [stake-cw20](contracts/stake-cw20)           | A cw20 staking contract.                                           |
+-| [stake-cw20-gov](contracts/stake-cw20-gov)   | A cw20 staking contract, with vote delegation (used by `cw3-dao`). |
++| Contract                                     | Description                                                |
++| :------------------------------------------- | :--------------------------------------------------------- |
++| [cw-distribution](contracts/cw-distribution) | A contract for distributing staking rewards.               |
++| [cw3-dao](contracts/cw3-dao)                 | A DAO with voting power based on staked governance tokens. |
++| [cw3-multisig](contracts/cw3-multisig)       | A multisig contract.                                       |
++| [cw4-registry](contracts/cw4-registry)       | A contract for indexing multisig group members.            |
++| [stake-cw20](contracts/stake-cw20)           | A cw20 staking contract.                                   |
++| [stake-cw20-gov](contracts/stake-cw20-gov)   | A cw20 staking contract, with vote delegation.             |
+ 
+ NOTE: _These contracts have yet to be audited. Please see the [disclaimer](#Disclaimer)._
+ 
+diff --git a/contracts/cw3-dao/schema/execute_msg.json b/contracts/cw3-dao/schema/execute_msg.json
+index d59a0d73..dd4fc8d2 100644
+--- a/contracts/cw3-dao/schema/execute_msg.json
++++ b/contracts/cw3-dao/schema/execute_msg.json
+@@ -74,6 +74,27 @@
+       },
+       "additionalProperties": false
+     },
++    {
++      "description": "Pauses DAO governance (can only be called by DAO contract)",
++      "type": "object",
++      "required": [
++        "pause_d_a_o"
++      ],
++      "properties": {
++        "pause_d_a_o": {
++          "type": "object",
++          "required": [
++            "expiration"
++          ],
++          "properties": {
++            "expiration": {
++              "$ref": "#/definitions/Expiration"
++            }
++          }
++        }
++      },
++      "additionalProperties": false
++    },
+     {
+       "description": "Update DAO config (can only be called by DAO contract)",
+       "type": "object",
+@@ -117,6 +138,27 @@
+         }
+       },
+       "additionalProperties": false
++    },
++    {
++      "description": "Update Staking Contract (can only be called by DAO contract) WARNING: this changes the contract controlling voting",
++      "type": "object",
++      "required": [
++        "update_staking_contract"
++      ],
++      "properties": {
++        "update_staking_contract": {
++          "type": "object",
++          "required": [
++            "new_staking_contract"
++          ],
++          "properties": {
++            "new_staking_contract": {
++              "$ref": "#/definitions/Addr"
++            }
++          }
++        }
++      },
++      "additionalProperties": false
+     }
+   ],
+   "definitions": {
+diff --git a/contracts/cw3-dao/src/contract.rs b/contracts/cw3-dao/src/contract.rs
+index cd1ab41b..d048c0f1 100644
+--- a/contracts/cw3-dao/src/contract.rs
++++ b/contracts/cw3-dao/src/contract.rs
+@@ -10,7 +10,7 @@ use crate::query::{
+     VoteTallyResponse, VoterResponse,
+ };
+ use crate::state::{
+-    next_id, Ballot, Config, Proposal, Votes, BALLOTS, CONFIG, GOV_TOKEN, PROPOSALS,
++    next_id, Ballot, Config, Proposal, Votes, BALLOTS, CONFIG, DAO_PAUSED, GOV_TOKEN, PROPOSALS,
+     STAKING_CONTRACT, STAKING_CONTRACT_CODE_ID, STAKING_CONTRACT_UNSTAKING_DURATION,
+     TREASURY_TOKENS,
+ };
+@@ -174,6 +174,7 @@ pub fn execute(
+         }
+         ExecuteMsg::Execute { proposal_id } => execute_execute(deps, env, info, proposal_id),
+         ExecuteMsg::Close { proposal_id } => execute_close(deps, env, info, proposal_id),
++        ExecuteMsg::PauseDAO { expiration } => execute_pause_dao(deps, env, info, expiration),
+         ExecuteMsg::UpdateConfig(config) => execute_update_config(deps, env, info, config),
+         ExecuteMsg::UpdateCw20TokenList { to_add, to_remove } => {
+             execute_update_cw20_token_list(deps, env, info, to_add, to_remove)
+@@ -194,6 +195,14 @@ pub fn execute_propose(
+     // we ignore earliest
+     latest: Option<Expiration>,
+ ) -> Result<Response<Empty>, ContractError> {
++    // Check if DAO is Paused
++    let paused = DAO_PAUSED.may_load(deps.storage)?;
++    if let Some(expiration) = paused {
++        if !expiration.is_expired(&env.block) {
++            return Err(ContractError::Paused {});
++        }
++    }
++
+     let cfg = CONFIG.load(deps.storage)?;
+     let gov_token = GOV_TOKEN.load(deps.storage)?;
+ 
+@@ -256,6 +265,14 @@ pub fn execute_vote(
+     proposal_id: u64,
+     vote: Vote,
+ ) -> Result<Response<Empty>, ContractError> {
++    // Check if DAO is Paused
++    let paused = DAO_PAUSED.may_load(deps.storage)?;
++    if let Some(expiration) = paused {
++        if !expiration.is_expired(&env.block) {
++            return Err(ContractError::Paused {});
++        }
++    }
++
+     // Ensure proposal exists and can be voted on
+     let mut prop = PROPOSALS.load(deps.storage, proposal_id)?;
+     if prop.status != Status::Open {
+@@ -296,10 +313,18 @@ pub fn execute_vote(
+ 
+ pub fn execute_execute(
+     deps: DepsMut,
+-    _env: Env,
++    env: Env,
+     info: MessageInfo,
+     proposal_id: u64,
+ ) -> Result<Response, ContractError> {
++    // Check if DAO is Paused
++    let paused = DAO_PAUSED.may_load(deps.storage)?;
++    if let Some(expiration) = paused {
++        if !expiration.is_expired(&env.block) {
++            return Err(ContractError::Paused {});
++        }
++    }
++
+     let gov_token = GOV_TOKEN.load(deps.storage)?;
+ 
+     // Anyone can trigger this if the vote passed
+@@ -332,6 +357,14 @@ pub fn execute_close(
+     info: MessageInfo,
+     proposal_id: u64,
+ ) -> Result<Response<Empty>, ContractError> {
++    // Check if DAO is Paused
++    let paused = DAO_PAUSED.may_load(deps.storage)?;
++    if let Some(expiration) = paused {
++        if !expiration.is_expired(&env.block) {
++            return Err(ContractError::Paused {});
++        }
++    }
++
+     let gov_token = GOV_TOKEN.load(deps.storage)?;
+ 
+     // Anyone can trigger this if the vote passed
+@@ -367,6 +400,24 @@ pub fn execute_close(
+         .add_attribute("proposal_id", proposal_id.to_string()))
+ }
+ 
++pub fn execute_pause_dao(
++    deps: DepsMut,
++    env: Env,
++    info: MessageInfo,
++    expiration: Expiration,
++) -> Result<Response<Empty>, ContractError> {
++    // Only contract can call this method
++    if env.contract.address != info.sender {
++        return Err(ContractError::Unauthorized {});
++    }
++
++    DAO_PAUSED.save(deps.storage, &expiration)?;
++
++    Ok(Response::new()
++        .add_attribute("action", "pause_dao")
++        .add_attribute("expiration", expiration.to_string()))
++}
++
+ pub fn execute_update_config(
+     deps: DepsMut,
+     env: Env,
+diff --git a/contracts/cw3-dao/src/error.rs b/contracts/cw3-dao/src/error.rs
+index 4c63eb7d..43b9c777 100644
+--- a/contracts/cw3-dao/src/error.rs
++++ b/contracts/cw3-dao/src/error.rs
+@@ -39,7 +39,7 @@ pub enum ContractError {
+     #[error("Already voted on this proposal")]
+     AlreadyVoted {},
+ 
+-    #[error("Proposal must have passed and not yet been executed")]
++    #[error("Cannot execute completed or unpassed proposals")]
+     WrongExecuteStatus {},
+ 
+     #[error("Cannot close completed or passed proposals")]
+@@ -50,4 +50,7 @@ pub enum ContractError {
+ 
+     #[error("Request size ({size}) is above limit of ({max})")]
+     OversizedRequest { size: u64, max: u64 },
++
++    #[error("DAO is paused")]
++    Paused {},
+ }
+diff --git a/contracts/cw3-dao/src/helpers.rs b/contracts/cw3-dao/src/helpers.rs
+index 336cb11a..f37168c4 100644
+--- a/contracts/cw3-dao/src/helpers.rs
++++ b/contracts/cw3-dao/src/helpers.rs
+@@ -90,7 +90,7 @@ pub fn get_voting_power_at_height(deps: Deps, address: Addr, height: u64) -> Std
+     // Get voting power at height
+     let balance: VotingPowerAtHeightResponse = deps.querier.query_wasm_smart(
+         staking_contract,
+-        &StakingContractQueryMsg::VotingPowerAtHeight {
++        &StakingContractQueryMsg::StakedBalanceAtHeight {
+             address: address.to_string(),
+             height: Some(height),
+         },
+diff --git a/contracts/cw3-dao/src/msg.rs b/contracts/cw3-dao/src/msg.rs
+index 29bc74ef..3a98e7be 100644
+--- a/contracts/cw3-dao/src/msg.rs
++++ b/contracts/cw3-dao/src/msg.rs
+@@ -155,6 +155,8 @@ pub enum ExecuteMsg {
+     Execute { proposal_id: u64 },
+     /// Close a failed proposal
+     Close { proposal_id: u64 },
++    /// Pauses DAO governance (can only be called by DAO contract)
++    PauseDAO { expiration: Expiration },
+     /// Update DAO config (can only be called by DAO contract)
+     UpdateConfig(Config),
+     /// Updates token list
+diff --git a/contracts/cw3-dao/src/state.rs b/contracts/cw3-dao/src/state.rs
+index fdfd3074..4df171f1 100644
+--- a/contracts/cw3-dao/src/state.rs
++++ b/contracts/cw3-dao/src/state.rs
+@@ -150,6 +150,7 @@ pub struct Ballot {
+ // Unique items
+ pub const CONFIG: Item<Config> = Item::new("config");
+ pub const PROPOSAL_COUNT: Item<u64> = Item::new("proposal_count");
++pub const DAO_PAUSED: Item<Expiration> = Item::new("dao_paused");
+ 
+ // Total weight and voters are queried from this contract
+ pub const STAKING_CONTRACT: Item<Addr> = Item::new("staking_contract");
+diff --git a/types/contracts/cw3-dao/execute_msg.d.ts b/types/contracts/cw3-dao/execute_msg.d.ts
+index e8737222..898a4da5 100644
+--- a/types/contracts/cw3-dao/execute_msg.d.ts
++++ b/types/contracts/cw3-dao/execute_msg.d.ts
+@@ -15,6 +15,11 @@ proposal_id: number
+ [k: string]: unknown
+ }
+ } | {
++pause_d_a_o: {
++expiration: Expiration
++[k: string]: unknown
++}
++} | {
+ update_config: Config
+ } | {
+ update_cw20_token_list: {
+@@ -22,6 +27,11 @@ to_add: Addr[]
+ to_remove: Addr[]
+ [k: string]: unknown
+ }
++} | {
++update_staking_contract: {
++new_staking_contract: Addr
++[k: string]: unknown
++}
+ })
+ 
+ export interface ProposeMsg {
+diff --git a/types/contracts/stake-cw20-gov/execute_msg.d.ts b/types/contracts/stake-cw20-gov/execute_msg.d.ts
+index e709ee3f..8b935bf0 100644
+--- a/types/contracts/stake-cw20-gov/execute_msg.d.ts
++++ b/types/contracts/stake-cw20-gov/execute_msg.d.ts
+@@ -16,6 +16,30 @@ delegate_votes: {
+ recipient: string
+ [k: string]: unknown
+ }
++} | {
++update_config: {
++admin: Addr
++duration?: (Duration | null)
++[k: string]: unknown
++}
++})
++/**
++ * A human readable address.
++ * 
++ * In Cosmos, this is typically bech32 encoded. But for multi-chain smart contracts no assumptions should be made other than being UTF-8 encoded and of reasonable length.
++ * 
++ * This type represents a validated address. It can be created in the following ways 1. Use `Addr::unchecked(input)` 2. Use `let checked: Addr = deps.api.addr_validate(input)?` 3. Use `let checked: Addr = deps.api.addr_humanize(canonical_addr)?` 4. Deserialize from JSON. This must only be done from JSON that was validated before such as a contract's state. `Addr` must not be used in messages sent by the user because this would result in unvalidated instances.
++ * 
++ * This type is immutable. If you really need to mutate it (Really? Are you sure?), create a mutable copy using `let mut mutable = Addr::to_string()` and operate on that `String` instance.
++ */
++export type Addr = string
++/**
++ * Duration is a delta of time. You can add it to a BlockInfo or Expiration to move that further in the future. Note that an height-based Duration and a time-based Expiration cannot be combined
++ */
++export type Duration = ({
++height: number
++} | {
++time: number
+ })
+ 
+ /**
+diff --git a/types/contracts/stake-cw20-gov/query_msg.d.ts b/types/contracts/stake-cw20-gov/query_msg.d.ts
+index e64c76fe..8e584c8c 100644
+--- a/types/contracts/stake-cw20-gov/query_msg.d.ts
++++ b/types/contracts/stake-cw20-gov/query_msg.d.ts
+@@ -21,7 +21,7 @@ height?: (number | null)
+ [k: string]: unknown
+ }
+ } | {
+-unstaking_duration: {
++get_config: {
+ [k: string]: unknown
+ }
+ } | {
+diff --git a/types/contracts/stake-cw20/execute_msg.d.ts b/types/contracts/stake-cw20/execute_msg.d.ts
+index 41d6bf25..a50b64cd 100644
+--- a/types/contracts/stake-cw20/execute_msg.d.ts
++++ b/types/contracts/stake-cw20/execute_msg.d.ts
+@@ -1,85 +1,36 @@
+-import { Binary, Expiration, Logo, Uint128 } from "./shared-types";
++import { Addr, Duration, Uint128 } from "./shared-types";
+ 
+ export type ExecuteMsg = ({
+-transfer: {
+-amount: Uint128
+-recipient: string
+-[k: string]: unknown
+-}
+-} | {
+-burn: {
+-amount: Uint128
+-[k: string]: unknown
+-}
+-} | {
+-send: {
+-amount: Uint128
+-contract: string
+-msg: Binary
+-[k: string]: unknown
+-}
++receive: Cw20ReceiveMsg
+ } | {
+-increase_allowance: {
++unstake: {
+ amount: Uint128
+-expires?: (Expiration | null)
+-spender: string
+ [k: string]: unknown
+ }
+ } | {
+-decrease_allowance: {
+-amount: Uint128
+-expires?: (Expiration | null)
+-spender: string
++claim: {
+ [k: string]: unknown
+ }
+ } | {
+-transfer_from: {
+-amount: Uint128
+-owner: string
+-recipient: string
++update_config: {
++admin: Addr
++duration?: (Duration | null)
+ [k: string]: unknown
+ }
+-} | {
+-send_from: {
++})
++/**
++ * Binary is a wrapper around Vec<u8> to add base64 de/serialization with serde. It also adds some helper methods to help encode inline.
++ * 
++ * This is only needed as serde-json-{core,wasm} has a horrible encoding for Vec<u8>
++ */
++export type Binary = string
++
++/**
++ * Cw20ReceiveMsg should be de/serialized under `Receive()` variant in a ExecuteMsg
++ */
++export interface Cw20ReceiveMsg {
+ amount: Uint128
+-contract: string
+ msg: Binary
+-owner: string
+-[k: string]: unknown
+-}
+-} | {
+-burn_from: {
+-amount: Uint128
+-owner: string
++sender: string
+ [k: string]: unknown
+ }
+-} | {
+-mint: {
+-amount: Uint128
+-recipient: string
+-[k: string]: unknown
+-}
+-} | {
+-update_marketing: {
+-description?: (string | null)
+-marketing?: (string | null)
+-project?: (string | null)
+-[k: string]: unknown
+-}
+-} | {
+-upload_logo: Logo
+-} | {
+-stake: {
+-amount: Uint128
+-[k: string]: unknown
+-}
+-} | {
+-unstake: {
+-amount: Uint128
+-[k: string]: unknown
+-}
+-} | {
+-claim: {
+-[k: string]: unknown
+-}
+-})
+diff --git a/types/contracts/stake-cw20/get_config_response.d.ts b/types/contracts/stake-cw20/get_config_response.d.ts
+new file mode 100644
+index 00000000..0e87c3b3
+--- /dev/null
++++ b/types/contracts/stake-cw20/get_config_response.d.ts
+@@ -0,0 +1,8 @@
++import { Addr, Duration } from "./shared-types";
++
++export interface GetConfigResponse {
++admin: Addr
++token_address: Addr
++unstaking_duration?: (Duration | null)
++[k: string]: unknown
++}
+diff --git a/types/contracts/stake-cw20/index.ts b/types/contracts/stake-cw20/index.ts
+index 0b986bb5..68c32bc3 100644
+--- a/types/contracts/stake-cw20/index.ts
++++ b/types/contracts/stake-cw20/index.ts
+@@ -4,10 +4,13 @@ export * from "./allowance_response";
+ export * from "./balance_response";
+ export * from "./claims_response";
+ export * from "./execute_msg";
++export * from "./get_config_response";
+ export * from "./instantiate_msg";
+ export * from "./query_msg";
+ export * from "./shared-types";
+ export * from "./staked_balance_at_height_response";
++export * from "./staked_value_response";
+ export * from "./token_info_response";
+ export * from "./total_staked_at_height_response";
++export * from "./total_value_response";
+ export * from "./unstaking_duration_response";
+diff --git a/types/contracts/stake-cw20/instantiate_msg.d.ts b/types/contracts/stake-cw20/instantiate_msg.d.ts
+index c056df99..a91ac8ef 100644
+--- a/types/contracts/stake-cw20/instantiate_msg.d.ts
++++ b/types/contracts/stake-cw20/instantiate_msg.d.ts
+@@ -1,36 +1,8 @@
+-import { Duration, Logo, Uint128 } from "./shared-types";
++import { Addr, Duration } from "./shared-types";
+ 
+ export interface InstantiateMsg {
+-cw20_base: InstantiateMsg1
++admin: Addr
++token_address: Addr
+ unstaking_duration?: (Duration | null)
+ [k: string]: unknown
+ }
+-export interface InstantiateMsg1 {
+-decimals: number
+-initial_balances: Cw20Coin[]
+-marketing?: (InstantiateMarketingInfo | null)
+-mint?: (MinterResponse | null)
+-name: string
+-symbol: string
+-[k: string]: unknown
+-}
+-export interface Cw20Coin {
+-address: string
+-amount: Uint128
+-[k: string]: unknown
+-}
+-export interface InstantiateMarketingInfo {
+-description?: (string | null)
+-logo?: (Logo | null)
+-marketing?: (string | null)
+-project?: (string | null)
+-[k: string]: unknown
+-}
+-export interface MinterResponse {
+-/**
+- * cap is a hard cap on total supply that can be achieved by minting. Note that this refers to total_supply. If None, there is unlimited cap.
+- */
+-cap?: (Uint128 | null)
+-minter: string
+-[k: string]: unknown
+-}
+diff --git a/types/contracts/stake-cw20/query_msg.d.ts b/types/contracts/stake-cw20/query_msg.d.ts
+index bb4f6970..a26bba43 100644
+--- a/types/contracts/stake-cw20/query_msg.d.ts
++++ b/types/contracts/stake-cw20/query_msg.d.ts
+@@ -1,56 +1,25 @@
+ export type QueryMsg = ({
+-balance: {
++staked_balance_at_height: {
+ address: string
++height?: (number | null)
+ [k: string]: unknown
+ }
+ } | {
+-token_info: {
+-[k: string]: unknown
+-}
+-} | {
+-minter: {
+-[k: string]: unknown
+-}
+-} | {
+-allowance: {
+-owner: string
+-spender: string
+-[k: string]: unknown
+-}
+-} | {
+-all_allowances: {
+-limit?: (number | null)
+-owner: string
+-start_after?: (string | null)
+-[k: string]: unknown
+-}
+-} | {
+-all_accounts: {
+-limit?: (number | null)
+-start_after?: (string | null)
+-[k: string]: unknown
+-}
+-} | {
+-marketing_info: {
+-[k: string]: unknown
+-}
+-} | {
+-download_logo: {
++total_staked_at_height: {
++height?: (number | null)
+ [k: string]: unknown
+ }
+ } | {
+-staked_balance_at_height: {
++staked_value: {
+ address: string
+-height?: (number | null)
+ [k: string]: unknown
+ }
+ } | {
+-total_staked_at_height: {
+-height?: (number | null)
++total_value: {
+ [k: string]: unknown
+ }
+ } | {
+-unstaking_duration: {
++get_config: {
+ [k: string]: unknown
+ }
+ } | {
+diff --git a/types/contracts/stake-cw20/shared-types.d.ts b/types/contracts/stake-cw20/shared-types.d.ts
+index 15e3c16e..9276df5c 100644
+--- a/types/contracts/stake-cw20/shared-types.d.ts
++++ b/types/contracts/stake-cw20/shared-types.d.ts
+@@ -49,27 +49,15 @@ export type Timestamp = Uint64;
+  */
+ export type Uint64 = string;
+ /**
+- * Binary is a wrapper around Vec<u8> to add base64 de/serialization with serde. It also adds some helper methods to help encode inline.
++ * A human readable address.
+  *
+- * This is only needed as serde-json-{core,wasm} has a horrible encoding for Vec<u8>
+- */
+-export type Binary = string;
+-/**
+- * This is used for uploading logo data, or setting it in InstantiateData
+- */
+-export type Logo = ({
+-    url: string
+-    } | {
+-    embedded: EmbeddedLogo
+-    });
+-/**
+- * This is used to store the logo on the blockchain in an accepted format. Enforce maximum size of 5KB on all variants.
++ * In Cosmos, this is typically bech32 encoded. But for multi-chain smart contracts no assumptions should be made other than being UTF-8 encoded and of reasonable length.
++ *
++ * This type represents a validated address. It can be created in the following ways 1. Use `Addr::unchecked(input)` 2. Use `let checked: Addr = deps.api.addr_validate(input)?` 3. Use `let checked: Addr = deps.api.addr_humanize(canonical_addr)?` 4. Deserialize from JSON. This must only be done from JSON that was validated before such as a contract's state. `Addr` must not be used in messages sent by the user because this would result in unvalidated instances.
++ *
++ * This type is immutable. If you really need to mutate it (Really? Are you sure?), create a mutable copy using `let mut mutable = Addr::to_string()` and operate on that `String` instance.
+  */
+-export type EmbeddedLogo = ({
+-    svg: Binary
+-    } | {
+-    png: Binary
+-    });
++export type Addr = string;
+ /**
+  * Duration is a delta of time. You can add it to a BlockInfo or Expiration to move that further in the future. Note that an height-based Duration and a time-based Expiration cannot be combined
+  */
+diff --git a/types/contracts/stake-cw20/staked_value_response.d.ts b/types/contracts/stake-cw20/staked_value_response.d.ts
+new file mode 100644
+index 00000000..26f311db
+--- /dev/null
++++ b/types/contracts/stake-cw20/staked_value_response.d.ts
+@@ -0,0 +1,6 @@
++import { Uint128 } from "./shared-types";
++
++export interface StakedValueResponse {
++value: Uint128
++[k: string]: unknown
++}
+diff --git a/types/contracts/stake-cw20/total_value_response.d.ts b/types/contracts/stake-cw20/total_value_response.d.ts
+new file mode 100644
+index 00000000..6745d1b2
+--- /dev/null
++++ b/types/contracts/stake-cw20/total_value_response.d.ts
+@@ -0,0 +1,6 @@
++import { Uint128 } from "./shared-types";
++
++export interface TotalValueResponse {
++total: Uint128
++[k: string]: unknown
++}
+diff --git a/types/package.json b/types/package.json
+index 49a1763b..1075d7a9 100644
+--- a/types/package.json
++++ b/types/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@dao-dao/types",
+-  "version": "0.0.8",
++  "version": "0.0.9",
+   "description": "",
+   "main": "build/codegen.js",
+   "scripts": {

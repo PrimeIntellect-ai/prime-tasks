@@ -1,0 +1,182 @@
+diff --git a/tests/test_sns/test_publish_batch.py b/tests/test_sns/test_publish_batch.py
+index a0d65162..517d1f2f 100644
+--- a/tests/test_sns/test_publish_batch.py
++++ b/tests/test_sns/test_publish_batch.py
+@@ -100,7 +100,7 @@ def test_publish_batch_standard_with_message_group_id():
+         {
+             "Id": "id_2",
+             "Code": "InvalidParameter",
+-            "Message": "Invalid parameter: Value mgid for parameter MessageGroupId is invalid. Reason: The request include parameter that is not valid for this queue type.",
++            "Message": "Invalid parameter: MessageGroupId Reason: The request includes MessageGroupId parameter that is not valid for this topic type",
+             "SenderFault": True,
+         }
+     )
+diff --git a/tests/test_sns/test_publishing_boto3.py b/tests/test_sns/test_publishing_boto3.py
+index 76c44116..8449b34c 100644
+--- a/tests/test_sns/test_publishing_boto3.py
++++ b/tests/test_sns/test_publishing_boto3.py
+@@ -1,14 +1,15 @@
+ import base64
+ import json
++import re
++from unittest import SkipTest
++from xml.etree import ElementTree
+ 
+ import boto3
+-import re
+-from freezegun import freeze_time
++import pytest
++import requests
+ import sure  # noqa # pylint: disable=unused-import
+-
+ from botocore.exceptions import ClientError
+-from unittest import SkipTest
+-import pytest
++from freezegun import freeze_time
+ from moto import mock_sns, mock_sqs, settings
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
+ from moto.core.models import responses_mock
+@@ -103,6 +104,65 @@ def test_publish_to_sqs_fifo():
+     topic.publish(Message="message", MessageGroupId="message_group_id")
+ 
+ 
++@pytest.mark.parametrize("raw_delivery", [False, True])
++@mock_sns
++@mock_sqs
++def test_publish_to_sqs_fifo_forwards_deduplication_id(raw_delivery):
++    sns = boto3.client("sns", region_name="us-east-1")
++    topic_arn = sns.create_topic(
++        Name="topic.fifo", Attributes={"FifoTopic": "true"}
++    )["TopicArn"]
++    endpoint = "https://sqs.us-east-1.amazonaws.com/"
++    create_response = requests.post(
++        endpoint,
++        data={
++            "Action": "CreateQueue",
++            "Version": "2012-11-05",
++            "QueueName": "queue.fifo",
++            "Attribute.1.Name": "FifoQueue",
++            "Attribute.1.Value": "true",
++        },
++    )
++    queue_url = ElementTree.fromstring(create_response.content).findtext(
++        ".//QueueUrl"
++    )
++    queue_arn = f"arn:aws:sqs:us-east-1:{ACCOUNT_ID}:queue.fifo"
++    subscription_attributes = {"RawMessageDelivery": "true"} if raw_delivery else {}
++    sns.subscribe(
++        TopicArn=topic_arn,
++        Protocol="sqs",
++        Endpoint=queue_arn,
++        Attributes=subscription_attributes,
++    )
++
++    sns.publish(
++        TopicArn=topic_arn,
++        Message="message",
++        MessageGroupId="message_group_id",
++        MessageDeduplicationId="message_deduplication_id",
++        MessageAttributes={"kind": {"DataType": "String", "StringValue": "value"}},
++    )
++
++    receive_response = requests.post(
++        endpoint,
++        data={
++            "Action": "ReceiveMessage",
++            "Version": "2012-11-05",
++            "QueueUrl": queue_url,
++            "AttributeName.1": "MessageDeduplicationId",
++        },
++    )
++    received = ElementTree.fromstring(receive_response.content).findall(
++        ".//{*}ReceiveMessageResult/{*}Message"
++    )
++    assert len(received) == 1
++    message_attributes = {
++        attribute.findtext("{*}Name"): attribute.findtext("{*}Value")
++        for attribute in received[0].findall("./{*}Attribute")
++    }
++    assert message_attributes["MessageDeduplicationId"] == "message_deduplication_id"
++
++
+ @mock_sqs
+ @mock_sns
+ def test_publish_to_sqs_bad():
+@@ -528,7 +588,7 @@ def test_publish_group_id_to_non_fifo():
+ 
+     with pytest.raises(
+         ClientError,
+-        match="The request include parameter that is not valid for this queue type",
++        match="The request includes MessageGroupId parameter that is not valid for this topic type",
+     ):
+         topic.publish(Message="message", MessageGroupId="message_group_id")
+ 
+@@ -536,6 +596,68 @@ def test_publish_group_id_to_non_fifo():
+     topic.publish(Message="message")
+ 
+ 
++@mock_sns
++def test_publish_fifo_needs_deduplication_id():
++    sns = boto3.resource("sns", region_name="us-east-1")
++    topic = sns.create_topic(
++        Name="topic.fifo",
++        Attributes={"FifoTopic": "true"},
++    )
++
++    with pytest.raises(
++        ClientError,
++        match="The topic should either have ContentBasedDeduplication enabled or MessageDeduplicationId provided explicitly",
++    ):
++        topic.publish(Message="message", MessageGroupId="message_group_id")
++
++    # message deduplication id included - OK
++    topic.publish(
++        Message="message",
++        MessageGroupId="message_group_id",
++        MessageDeduplicationId="message_deduplication_id",
++    )
++
++
++@mock_sns
++def test_publish_fifo_with_content_based_deduplication():
++    sns = boto3.client("sns", region_name="us-east-1")
++    topic_arn = sns.create_topic(
++        Name="topic.fifo",
++        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
++    )["TopicArn"]
++
++    response = sns.publish(
++        TopicArn=topic_arn, Message="message", MessageGroupId="message_group_id"
++    )
++    assert response["MessageId"]
++
++
++@mock_sns
++def test_publish_deduplication_id_to_non_fifo():
++    sns = boto3.resource("sns", region_name="us-east-1")
++    topic = sns.create_topic(Name="topic")
++
++    with pytest.raises(
++        ClientError,
++        match="The request includes MessageDeduplicationId parameter that is not valid for this topic type",
++    ):
++        topic.publish(
++            Message="message", MessageDeduplicationId="message_deduplication_id"
++        )
++
++    # message group not included - OK
++    topic.publish(Message="message")
++
++
++@mock_sns
++def test_publish_returns_message_id():
++    client = boto3.client("sns", region_name="us-east-1")
++    topic_arn = client.create_topic(Name="some-topic")["TopicArn"]
++
++    response = client.publish(TopicArn=topic_arn, Message="my message")
++    assert response["MessageId"]
++
++
+ def _setup_filter_policy_test(filter_policy):
+     sns = boto3.resource("sns", region_name="us-east-1")
+     topic = sns.create_topic(Name="some-topic")

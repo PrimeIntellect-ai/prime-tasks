@@ -1,0 +1,191 @@
+diff --git a/src/ldp/representation/RepresentationPreference.ts b/src/ldp/representation/RepresentationPreference.ts
+index 7ca5306c0..880899745 100644
+--- a/src/ldp/representation/RepresentationPreference.ts
++++ b/src/ldp/representation/RepresentationPreference.ts
+@@ -7,7 +7,12 @@ export interface RepresentationPreference {
+    */
+   value: string;
+   /**
+-   * How important this preference is in a value going from 0 to 1.
++   * How preferred this value is in a number going from 0 to 1.
++   * Follows the quality values rule from RFC 7231:
++   *
++   * "The weight is normalized to a real number in the range 0 through 1,
++   * where 0.001 is the least preferred and 1 is the most preferred; a
++   * value of 0 means "not acceptable"."
+    */
+   weight: number;
+ }
+diff --git a/src/storage/RepresentationConvertingStore.ts b/src/storage/RepresentationConvertingStore.ts
+index 8fd746b7f..7cb26710c 100644
+--- a/src/storage/RepresentationConvertingStore.ts
++++ b/src/storage/RepresentationConvertingStore.ts
+@@ -2,9 +2,10 @@ import type { Representation } from '../ldp/representation/Representation';
+ import type { RepresentationPreferences } from '../ldp/representation/RepresentationPreferences';
+ import type { ResourceIdentifier } from '../ldp/representation/ResourceIdentifier';
+ import { getLoggerFor } from '../logging/LogUtil';
+-import { matchingMediaType } from '../util/Util';
++import { InternalServerError } from '../util/errors/InternalServerError';
+ import type { Conditions } from './Conditions';
+-import type { RepresentationConverter } from './conversion/RepresentationConverter';
++import { matchingTypes } from './conversion/ConversionUtil';
++import type { RepresentationConverter, RepresentationConverterArgs } from './conversion/RepresentationConverter';
+ import { PassthroughStore } from './PassthroughStore';
+ import type { ResourceStore } from './ResourceStore';
+ 
+@@ -48,11 +49,7 @@ export class RepresentationConvertingStore<T extends ResourceStore = ResourceSto
+   public async getRepresentation(identifier: ResourceIdentifier, preferences: RepresentationPreferences,
+     conditions?: Conditions): Promise<Representation> {
+     const representation = await super.getRepresentation(identifier, preferences, conditions);
+-    if (!this.outConverter || this.matchesPreferences(representation, preferences)) {
+-      return representation;
+-    }
+-    this.logger.info(`Convert ${identifier.path} from ${representation.metadata.contentType} to ${preferences.type}`);
+-    return this.outConverter.handleSafe({ identifier, representation, preferences });
++    return this.convertRepresentation({ identifier, representation, preferences }, this.outConverter);
+   }
+ 
+   public async addResource(container: ResourceIdentifier, representation: Representation,
+@@ -69,28 +66,46 @@ export class RepresentationConvertingStore<T extends ResourceStore = ResourceSto
+     return this.source.setRepresentation(identifier, representation, conditions);
+   }
+ 
++  /**
++   * Helper function that checks if the given representation matches the given preferences.
++   */
+   private matchesPreferences(representation: Representation, preferences: RepresentationPreferences): boolean {
+-    if (!preferences.type) {
+-      return true;
+-    }
+     const { contentType } = representation.metadata;
+-    return Boolean(
+-      contentType &&
+-      preferences.type.some((type): boolean =>
+-        type.weight > 0 &&
+-        matchingMediaType(type.value, contentType)),
+-    );
++
++    if (!contentType) {
++      throw new InternalServerError('Content-Type is required for data conversion.');
++    }
++
++    // Check if there is a result if we try to map the preferences to the content-type
++    return matchingTypes(preferences, [ contentType ]).length > 0;
+   }
+ 
++  /**
++   * Helper function that converts a Representation using the given args and converter,
++   * if the conversion is necessary and there is a converter.
++   */
++  private async convertRepresentation(args: RepresentationConverterArgs, converter?: RepresentationConverter):
++  Promise<Representation> {
++    if (!converter || !args.preferences.type || this.matchesPreferences(args.representation, args.preferences)) {
++      return args.representation;
++    }
++
++    const typeStr = args.preferences.type.map((pref): string => `${pref.value};q=${pref.weight}`).join(', ');
++    this.logger.info(`Convert ${args.identifier.path} from ${args.representation.metadata.contentType} to ${typeStr}`);
++
++    return converter.handleSafe(args);
++  }
++
++  /**
++   * Helper function that converts an incoming representation if necessary.
++   */
+   private async convertInRepresentation(identifier: ResourceIdentifier, representation: Representation):
+   Promise<Representation> {
+     if (!this.inType) {
+       return representation;
+     }
+-    const inPreferences: RepresentationPreferences = { type: [{ value: this.inType, weight: 1 }]};
+-    if (!inPreferences || !this.inConverter || this.matchesPreferences(representation, inPreferences)) {
+-      return representation;
+-    }
+-    return this.inConverter.handleSafe({ identifier, representation, preferences: inPreferences });
++    const preferences: RepresentationPreferences = { type: [{ value: this.inType, weight: 1 }]};
++
++    return this.convertRepresentation({ identifier, representation, preferences }, this.inConverter);
+   }
+ }
+diff --git a/src/storage/conversion/ConversionUtil.ts b/src/storage/conversion/ConversionUtil.ts
+index 72a5ec8c6..b13d2fc0d 100644
+--- a/src/storage/conversion/ConversionUtil.ts
++++ b/src/storage/conversion/ConversionUtil.ts
+@@ -1,26 +1,60 @@
+ import type { RepresentationPreference } from '../../ldp/representation/RepresentationPreference';
+ import type { RepresentationPreferences } from '../../ldp/representation/RepresentationPreferences';
++import { INTERNAL_ALL } from '../../util/ContentTypes';
++import { InternalServerError } from '../../util/errors/InternalServerError';
+ import { UnsupportedHttpError } from '../../util/errors/UnsupportedHttpError';
+ import { matchingMediaType } from '../../util/Util';
+ import type { RepresentationConverterArgs } from './RepresentationConverter';
+ 
+ /**
+- * Filters out the media types from the preferred types that correspond to one of the supported types.
++ * Filters media types based on the given preferences.
++ * Based on RFC 7231 - Content negotiation.
++ * Will add a default `internal/*;q=0` to the preferences to prevent accidental use of internal types.
++ * Since more specific media ranges override less specific ones,
++ * this will be ignored if there is a specific internal type preference.
++ *
+  * @param preferences - Preferences for output type.
+- * @param supported - Types supported by the parser.
++ * @param types - Media types to compare to the preferences.
+  *
+  * @throws UnsupportedHttpError
+- * If the type preferences are undefined.
++ * If the type preferences are undefined or if there are duplicate preferences.
+  *
+- * @returns The filtered list of preferences.
++ * @returns The weighted and filtered list of matching types.
+  */
+-export const matchingTypes = (preferences: RepresentationPreferences, supported: string[]):
++export const matchingTypes = (preferences: RepresentationPreferences, types: string[]):
+ RepresentationPreference[] => {
+   if (!Array.isArray(preferences.type)) {
+     throw new UnsupportedHttpError('Output type required for conversion.');
+   }
+-  return preferences.type.filter(({ value, weight }): boolean => weight > 0 &&
+-    supported.some((type): boolean => matchingMediaType(value, type)));
++
++  const prefMap = preferences.type.reduce((map: Record<string, number>, pref): Record<string, number> => {
++    if (map[pref.value]) {
++      throw new UnsupportedHttpError(`Duplicate type preference found: ${pref.value}`);
++    }
++    map[pref.value] = pref.weight;
++    return map;
++  }, {});
++
++  // Prevent accidental use of internal types
++  if (!prefMap[INTERNAL_ALL]) {
++    prefMap[INTERNAL_ALL] = 0;
++  }
++
++  // RFC 7231
++  //    Media ranges can be overridden by more specific media ranges or
++  //    specific media types.  If more than one media range applies to a
++  //    given type, the most specific reference has precedence.
++  const weightedSupported = types.map((type): RepresentationPreference => {
++    const match = /^([^/]+)\/([^\s;]+)/u.exec(type);
++    if (!match) {
++      throw new InternalServerError(`Unexpected type preference: ${type}`);
++    }
++    const [ , main, sub ] = match;
++    const weight = prefMap[type] ?? prefMap[`${main}/${sub}`] ?? prefMap[`${main}/*`] ?? prefMap['*/*'] ?? 0;
++    return { value: type, weight };
++  });
++
++  return weightedSupported.filter((preference): boolean => preference.weight !== 0);
+ };
+ 
+ /**
+diff --git a/src/util/ContentTypes.ts b/src/util/ContentTypes.ts
+index 3c22a6e75..f4fdf0f48 100644
+--- a/src/util/ContentTypes.ts
++++ b/src/util/ContentTypes.ts
+@@ -4,4 +4,5 @@ export const APPLICATION_OCTET_STREAM = 'application/octet-stream';
+ export const APPLICATION_SPARQL_UPDATE = 'application/sparql-update';
+ 
+ // Internal (non-exposed) content types
++export const INTERNAL_ALL = 'internal/*';
+ export const INTERNAL_QUADS = 'internal/quads';

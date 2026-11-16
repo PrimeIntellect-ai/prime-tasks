@@ -1,0 +1,197 @@
+diff --git a/lib/worker.js b/lib/worker.js
+index 976b660b0..6680c156a 100644
+--- a/lib/worker.js
++++ b/lib/worker.js
+@@ -16,7 +16,7 @@ module.exports = {
+   processPackageFile,
+   findUpgrades,
+   processUpgrades,
+-  updateDependency,
++  updateBranch,
+   assignDepConfigs,
+   getDepTypeConfig,
+   maintainYarnLock,
+@@ -173,45 +173,52 @@ async function findUpgrades(dependencies) {
+ }
+ 
+ async function processUpgrades(upgrades) {
+-  if (Object.keys(upgrades).length) {
++  if (upgrades.length) {
+     logger.verbose('Processing upgrades');
+   } else {
+     logger.verbose('No upgrades to process');
+   }
+   logger.verbose(`All upgrades: ${JSON.stringify(upgrades)}`);
+-  // We are processing each upgrade sequentially for two major reasons:
+-  // 1. Reduce chances of GitHub API rate limiting
+-  // 2. Edge case collision of branch name, e.g. dependency also listed as dev dependency
++  const branchUpgrades = {};
+   for (const upgrade of upgrades) {
+     const flattened = Object.assign({}, upgrade.config, upgrade);
+     delete flattened.config;
+-    await module.exports.updateDependency(flattened);
++    if (flattened.upgradeType === 'pin') {
++      flattened.isPin = true;
++    } else if (flattened.upgradeType === 'major') {
++      flattened.isMajor = true;
++    } else if (flattened.upgradeType === 'minor') {
++      flattened.isMinor = true;
++    }
++    const branchName = handlebars.compile(flattened.branchName)(flattened);
++    if (!branchUpgrades[branchName]) {
++      branchUpgrades[branchName] = [];
++    }
++    branchUpgrades[branchName].push(flattened);
++  }
++  logger.verbose(`Branched upgrades: ${JSON.stringify(branchUpgrades)}`);
++  for (const branch of Object.keys(branchUpgrades)) {
++    await module.exports.updateBranch(branchUpgrades[branch]);
+   }
+ }
+ 
+-async function updateDependency(upgrade) {
+-  // Helpers for templating
+-  const params = Object.assign({}, upgrade);
+-  if (upgrade.upgradeType === 'pin') {
+-    params.isPin = true;
+-  } else if (upgrade.upgradeType === 'major') {
+-    params.isMajor = true;
+-  } else if (upgrade.upgradeType === 'minor') {
+-    params.isMinor = true;
+-  }
++async function updateBranch(upgrades) {
+   // Use templates to generate strings
+-  const branchName = handlebars.compile(params.branchName)(params);
+-  const prTitle = handlebars.compile(params.prTitle)(params);
++  const upgrade0 = upgrades[0];
++  const branchName = handlebars.compile(upgrade0.branchName)(upgrade0);
++  const prTitle = handlebars.compile(upgrade0.prTitle)(upgrade0);
++
++  logger.verbose(`branchName '${branchName}' length is ${upgrades.length}`);
+ 
+   try {
+-    if (!params.recreateClosed && await params.api.checkForClosedPr(branchName, prTitle)) {
+-      logger.verbose(`Skipping ${params.depName} upgrade as matching closed PR already existed`);
++    if (!upgrade0.recreateClosed && await upgrade0.api.checkForClosedPr(branchName, prTitle)) {
++      logger.verbose(`Skipping ${branchName} upgrade as matching closed PR already existed`);
+       return;
+     }
+-    await branchWorker.ensureBranch(params);
+-    await prWorker.ensurePr(params);
++    await branchWorker.ensureBranch(upgrades);
++    await prWorker.ensurePr(upgrade0);
+   } catch (error) {
+-    logger.error(`Error updating dependency ${params.depName}: ${error}`);
++    logger.error(`Error updating branch ${branchName}: ${error}`);
+     // Don't throw here - we don't want to stop the other renovations
+   }
+ }
+diff --git a/lib/workers/branch.js b/lib/workers/branch.js
+index 0bd1968d1..8936dbdf4 100644
+--- a/lib/workers/branch.js
++++ b/lib/workers/branch.js
+@@ -51,18 +51,18 @@ async function getParentBranch(branchName, config) {
+   return branchName;
+ }
+ 
+-async function getYarnLockFile(packageJson, config) {
++async function getYarnLockFile(packageFile, packageContent, api) {
+   // Detect if a yarn.lock file is in use
+-  const yarnLockFileName = path.join(path.dirname(config.packageFile), 'yarn.lock');
+-  if (!await config.api.getFileContent(yarnLockFileName)) {
++  const yarnLockFileName = path.join(path.dirname(packageFile), 'yarn.lock');
++  if (!await api.getFileContent(yarnLockFileName)) {
+     return null;
+   }
+-  // Copy over custom config files
+-  const npmrcContent = await config.api.getFileContent('.npmrc');
+-  const yarnrcContent = await config.api.getFileContent('.yarnrc');
++  // Copy over custom config commitFiles
++  const npmrcContent = await api.getFileContent('.npmrc');
++  const yarnrcContent = await api.getFileContent('.yarnrc');
+   // Generate yarn.lock using shell command
+   const newYarnLockContent =
+-    await yarnHelper.generateLockFile(packageJson, npmrcContent, yarnrcContent);
++    await yarnHelper.generateLockFile(packageContent, npmrcContent, yarnrcContent);
+   // Return file object
+   return ({
+     name: yarnLockFileName,
+@@ -71,34 +71,52 @@ async function getYarnLockFile(packageJson, config) {
+ }
+ 
+ // Ensure branch exists with appropriate content
+-async function ensureBranch(config) {
+-  const branchName = handlebars.compile(config.branchName)(config);
++async function ensureBranch(upgrades) {
++  logger.verbose(`ensureBranch(${JSON.stringify(upgrades)})`);
++  // Use the first upgrade for all the templates
++  const branchName = handlebars.compile(upgrades[0].branchName)(upgrades[0]);
+   // parentBranch is the branch we will base off
+   // If undefined, this will mean the defaultBranch
+-  const parentBranch = await module.exports.getParentBranch(branchName, config);
+-  // If we are rebasing then existing content will be from master
+-  const existingContent = await config.api.getFileContent(config.packageFile, parentBranch);
+-  const newContent = packageJsonHelper.setNewValue(
+-    existingContent,
+-    config.depType,
+-    config.depName,
+-    config.newVersion);
+-  // This should only happen if updating a branch
+-  if (newContent === existingContent) {
+-    logger.debug(`Branch ${parentBranch} is already up-to-date`);
+-    return;
++  const parentBranch = await module.exports.getParentBranch(branchName, upgrades[0]);
++  const commitMessage = handlebars.compile(upgrades[0].commitMessage)(upgrades[0]);
++  const api = upgrades[0].api;
++  const packageFiles = {};
++  for (const upgrade of upgrades) {
++    // See if this is the first time editing this file
++    if (!packageFiles[upgrade.packageFile]) {
++      // If we are rebasing then existing content will be from master
++      packageFiles[upgrade.packageFile] =
++        await api.getFileContent(upgrade.packageFile, parentBranch);
++    }
++    const newContent = packageJsonHelper.setNewValue(
++      packageFiles[upgrade.packageFile],
++      upgrade.depType,
++      upgrade.depName,
++      upgrade.newVersion);
++    if (packageFiles[upgrade.packageFile] === newContent) {
++      logger.debug('packageFile content unchanged');
++      delete packageFiles[upgrade.packageFile];
++    } else {
++      logger.debug('Updating packageFile content');
++      packageFiles[upgrade.packageFile] = newContent;
++    }
+   }
+-  // We always have a package.json
+-  const files = [{
+-    name: config.packageFile,
+-    contents: newContent,
+-  }];
+-  const yarnLockFile = await module.exports.getYarnLockFile(newContent, config);
+-  if (yarnLockFile) {
+-    // Add new yarn.lock file too
+-    files.push(yarnLockFile);
++  if (Object.keys(packageFiles).length > 0) {
++    const commitFiles = [];
++    for (const packageFile of Object.keys(packageFiles)) {
++      commitFiles.push({
++        name: packageFile,
++        contents: packageFiles[packageFile],
++      });
++      const yarnLockFile =
++        await module.exports.getYarnLockFile(packageFile, packageFiles[packageFile], api);
++      if (yarnLockFile) {
++        // Add new yarn.lock file too
++        commitFiles.push(yarnLockFile);
++      }
++    }
++
++    // API will know whether to create new branch or not
++    await api.commitFilesToBranch(branchName, commitFiles, commitMessage, parentBranch);
+   }
+-  const commitMessage = handlebars.compile(config.commitMessage)(config);
+-  // API will know whether to create new branch or not
+-  await config.api.commitFilesToBranch(branchName, files, commitMessage, parentBranch);
+ }

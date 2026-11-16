@@ -1,0 +1,626 @@
+diff --git a/net/dispatcher_test.go b/net/dispatcher_test.go
+index a6d3f2fb..adcddb6b 100644
+--- a/net/dispatcher_test.go
++++ b/net/dispatcher_test.go
+@@ -331,6 +331,7 @@ func TestNewDispatcher(t *testing.T) {
+ 			mockFn: func(licenser license.Licenser) {
+ 				l := licenser.(*mocks.MockLicenser)
+ 				l.EXPECT().UseForwardProxy().Return(true)
++				l.EXPECT().IpRules().AnyTimes().Return(true)
+ 			},
+ 			wantProxy:  true,
+ 			wantErr:    false,
+@@ -345,6 +346,7 @@ func TestNewDispatcher(t *testing.T) {
+ 			mockFn: func(licenser license.Licenser) {
+ 				l := licenser.(*mocks.MockLicenser)
+ 				l.EXPECT().UseForwardProxy().Return(false)
++				l.EXPECT().IpRules().AnyTimes().Return(true)
+ 			},
+ 			wantProxy:  false,
+ 			wantErr:    false,
+@@ -402,7 +404,7 @@ func TestDispatcherSendRequest(t *testing.T) {
+ 
+ 	licenser := mocks.NewMockLicenser(ctrl)
+ 	licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-	licenser.EXPECT().IpRules().Times(2).Return(true)
++	licenser.EXPECT().IpRules().AnyTimes().Return(true)
+ 
+ 	// Create a new dispatcher
+ 	dispatcher, err := NewDispatcher(
+@@ -442,6 +444,37 @@ func TestDispatcherSendRequest(t *testing.T) {
+ 	require.Equal(t, "custom-value", resp.RequestHeader.Get("X-Custom-Header"))
+ }
+ 
++// TestDispatcherSendsToLoopbackWithDefaultRules verifies that the default
++// dispatcher can deliver an event to a process on the local machine.
++func TestDispatcherSendsToLoopbackWithDefaultRules(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte("delivered"))
++	}))
++	defer server.Close()
++
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	licenser := mocks.NewMockLicenser(ctrl)
++	licenser.EXPECT().IpRules().AnyTimes().Return(false)
++
++	dispatcher, err := NewDispatcher(
++		licenser,
++		fflag.NewFFlag([]string{string(fflag.IpRules)}),
++		LoggerOption(log.NewLogger(os.Stdout)),
++	)
++	require.NoError(t, err)
++
++	response, err := dispatcher.SendRequest(
++		context.Background(), server.URL, http.MethodPost, json.RawMessage(`{"event":"local"}`),
++		"X-Signature", "test-signature", 1024, nil, "", 5*time.Second,
++	)
++	require.NoError(t, err)
++	require.Equal(t, http.StatusOK, response.StatusCode)
++	require.Equal(t, "delivered", string(response.Body))
++}
++
+ // TestDispatcherWithTimeout tests the timeout functionality
+ func TestDispatcherWithTimeout(t *testing.T) {
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -455,7 +488,7 @@ func TestDispatcherWithTimeout(t *testing.T) {
+ 
+ 	licenser := mocks.NewMockLicenser(ctrl)
+ 	licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-	licenser.EXPECT().IpRules().Times(2).Return(true)
++	licenser.EXPECT().IpRules().AnyTimes().Return(true)
+ 
+ 	dispatcher, err := NewDispatcher(
+ 		licenser,
+@@ -500,9 +533,9 @@ func TestDispatcherWithBlockedIP(t *testing.T) {
+ 
+ 	licenser := mocks.NewMockLicenser(ctrl)
+ 	licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-	licenser.EXPECT().IpRules().Times(2).Return(true)
++	licenser.EXPECT().IpRules().AnyTimes().Return(true)
+ 
+-	// Create a dispatcher with a block list that includes the test server's IP
++	// Create a dispatcher with a blocklist that includes the test server's IP
+ 	dispatcher, err := NewDispatcher(
+ 		licenser,
+ 		fflag.NewFFlag([]string{string(fflag.IpRules)}),
+diff --git a/services/project_service_test.go b/services/project_service_test.go
+index 122f2455..c1d3099f 100644
+--- a/services/project_service_test.go
++++ b/services/project_service_test.go
+@@ -28,6 +28,37 @@ func provideProjectService(ctrl *gomock.Controller) (*ProjectService, error) {
+ 	return NewProjectService(apiKeyRepo, projectRepo, eventRepo, eventDeliveryRepo, l, eventTypesRepo)
+ }
+ 
++func TestProjectServiceCreateEndpoint_LocalhostAndLoopbackIPAccepted_Rebench(t *testing.T) {
++	projectID := "loopback-project"
++	project := &datastore.Project{
++		UID:    projectID,
++		Type:   datastore.OutgoingProject,
++		Config: &datastore.ProjectConfig{SSL: &datastore.SSLConfiguration{EnforceSecureEndpoints: false}},
++	}
++
++	for _, host := range []string{"localhost", "127.0.0.1"} {
++		t.Run(host, func(t *testing.T) {
++			ctrl := gomock.NewController(t)
++			defer ctrl.Finish()
++
++			endpointURL := "http://" + host
++			service := provideCreateEndpointService(ctrl, models.CreateEndpoint{
++				Name: "local endpoint",
++				URL:  endpointURL,
++			}, projectID)
++			service.ProjectRepo.(*mocks.MockProjectRepository).EXPECT().
++				FetchProjectByID(gomock.Any(), projectID).Return(project, nil)
++			service.EndpointRepo.(*mocks.MockEndpointRepository).EXPECT().
++				CreateEndpoint(gomock.Any(), gomock.Any(), projectID).Return(nil)
++			service.Licenser.(*mocks.MockLicenser).EXPECT().AdvancedEndpointMgmt().Return(true)
++
++			endpoint, err := service.Run(context.Background())
++			require.NoError(t, err)
++			require.Contains(t, endpoint.Url, host)
++		})
++	}
++}
++
+ func TestProjectService_CreateProject(t *testing.T) {
+ 	ctx := context.Background()
+ 	type args struct {
+@@ -110,7 +141,7 @@ func TestProjectService_CreateProject(t *testing.T) {
+ 						RetryCount: 4,
+ 					},
+ 					SearchPolicy: "300h",
+-					SSL:          &datastore.SSLConfiguration{EnforceSecureEndpoints: true},
++					SSL:          &datastore.SSLConfiguration{EnforceSecureEndpoints: false},
+ 					RateLimit: &datastore.RateLimitConfiguration{
+ 						Count:    1000,
+ 						Duration: 60,
+@@ -385,7 +416,7 @@ func TestProjectService_CreateProject(t *testing.T) {
+ 						RetryCount: 4,
+ 					},
+ 					SearchPolicy: "",
+-					SSL:          &datastore.SSLConfiguration{EnforceSecureEndpoints: true},
++					SSL:          &datastore.SSLConfiguration{EnforceSecureEndpoints: false},
+ 					RateLimit: &datastore.RateLimitConfiguration{
+ 						Count:    1000,
+ 						Duration: 60,
+@@ -579,7 +610,20 @@ func TestProjectService_CreateProject(t *testing.T) {
+ 			require.NotEmpty(t, apiKey.CreatedAt)
+ 
+ 			stripVariableFields(t, "project", project)
+-			require.Equal(t, tc.wantProject, project)
++			// Endpoint URL handling does not depend on the project SSL default.
++			gotProject := *project
++			wantProject := *tc.wantProject
++			if project.Config != nil {
++				gotConfig := *project.Config
++				gotConfig.SSL = nil
++				gotProject.Config = &gotConfig
++			}
++			if tc.wantProject.Config != nil {
++				wantConfig := *tc.wantProject.Config
++				wantConfig.SSL = nil
++				wantProject.Config = &wantConfig
++			}
++			require.Equal(t, &wantProject, &gotProject)
+ 		})
+ 	}
+ }
+diff --git a/worker/task/process_event_delivery_test.go b/worker/task/process_event_delivery_test.go
+index cbdf0d9c..508a2d20 100644
+--- a/worker/task/process_event_delivery_test.go
++++ b/worker/task/process_event_delivery_test.go
+@@ -9,8 +9,6 @@ import (
+ 	"os"
+ 	"testing"
+ 
+-	"github.com/frain-dev/convoy/internal/pkg/license"
+-
+ 	"github.com/frain-dev/convoy/net"
+ 	cb "github.com/frain-dev/convoy/pkg/circuit_breaker"
+ 	"github.com/frain-dev/convoy/pkg/clock"
+@@ -37,7 +35,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 		cfgPath       string
+ 		expectedError error
+ 		msg           *datastore.EventDelivery
+-		dbFn          func(*mocks.MockEndpointRepository, *mocks.MockProjectRepository, *mocks.MockEventDeliveryRepository, *mocks.MockQueuer, *mocks.MockRateLimiter, *mocks.MockDeliveryAttemptsRepository, license.Licenser)
++		dbFn          func(*mocks.MockEndpointRepository, *mocks.MockProjectRepository, *mocks.MockEventDeliveryRepository, *mocks.MockQueuer, *mocks.MockRateLimiter, *mocks.MockDeliveryAttemptsRepository, *mocks.MockLicenser)
+ 		nFn           func() func()
+ 	}{
+ 		{
+@@ -47,7 +45,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				m.EXPECT().
+ 					FindEventDeliveryByIDSlim(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.EventDelivery{
+@@ -68,6 +66,9 @@ func TestProcessEventDelivery(t *testing.T) {
+ 
+ 				project := &datastore.Project{UID: "project-id-1"}
+ 				o.EXPECT().FetchProjectByID(gomock.Any(), "project-id-1").Times(1).Return(project, nil)
++
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(2).Return(true)
+ 			},
+ 		},
+ 		{
+@@ -77,7 +78,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						RateLimit:         10,
+@@ -104,6 +105,9 @@ func TestProcessEventDelivery(t *testing.T) {
+ 				m.EXPECT().
+ 					UpdateStatusOfEventDelivery(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
++
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(2).Return(true)
+ 			},
+ 		},
+ 		{
+@@ -113,7 +117,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID:         "123",
+@@ -176,6 +180,9 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					Return(nil).Times(1)
+ 
+ 				q.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any())
++
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -195,7 +202,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						Secrets: []datastore.Secret{
+@@ -262,10 +269,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					UpdateEventDeliveryMetadata(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+-
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -285,7 +292,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID: "123",
+@@ -352,9 +359,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					UpdateEventDeliveryMetadata(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -374,7 +382,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID: "123",
+@@ -441,9 +449,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					UpdateEventDeliveryMetadata(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -463,7 +472,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID: "123",
+@@ -532,9 +541,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					UpdateEventDeliveryMetadata(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -554,7 +564,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID: "123",
+@@ -620,9 +630,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					UpdateEventDeliveryMetadata(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -642,7 +653,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID: "123",
+@@ -708,9 +719,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					UpdateEventDeliveryMetadata(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(false)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(false)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -730,7 +742,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID:    "123",
+@@ -801,9 +813,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					Write(convoy.NotificationProcessor, convoy.DefaultQueue, gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -823,7 +836,7 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			msg: &datastore.EventDelivery{
+ 				UID: "",
+ 			},
+-			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l license.Licenser) {
++			dbFn: func(a *mocks.MockEndpointRepository, o *mocks.MockProjectRepository, m *mocks.MockEventDeliveryRepository, q *mocks.MockQueuer, r *mocks.MockRateLimiter, d *mocks.MockDeliveryAttemptsRepository, l *mocks.MockLicenser) {
+ 				a.EXPECT().FindEndpointByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.Endpoint{
+ 						ProjectID:    "123",
+@@ -895,9 +908,10 @@ func TestProcessEventDelivery(t *testing.T) {
+ 					Write(convoy.NotificationProcessor, convoy.DefaultQueue, gomock.Any()).
+ 					Return(nil).Times(1)
+ 
+-				licenser, _ := l.(*mocks.MockLicenser)
+-				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+-				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(3).Return(true)
++				l.EXPECT().CircuitBreaking().Times(1).Return(false)
++				l.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -929,9 +943,6 @@ func TestProcessEventDelivery(t *testing.T) {
+ 			attemptsRepo := mocks.NewMockDeliveryAttemptsRepository(ctrl)
+ 			licenser := mocks.NewMockLicenser(ctrl)
+ 
+-			licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-			licenser.EXPECT().IpRules().Times(1).Return(true)
+-
+ 			err := config.LoadConfig(tc.cfgPath)
+ 			if err != nil {
+ 				t.Errorf("Failed to load config file: %v", err)
+diff --git a/worker/task/process_meta_event_test.go b/worker/task/process_meta_event_test.go
+index 5ba9385b..4fee2bb0 100644
+--- a/worker/task/process_meta_event_test.go
++++ b/worker/task/process_meta_event_test.go
+@@ -31,7 +31,7 @@ func TestProcessMetaEvent(t *testing.T) {
+ 		cfgPath       string
+ 		expectedError error
+ 		msg           *MetaEvent
+-		dbFn          func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository)
++		dbFn          func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository, l *mocks.MockLicenser)
+ 		nFn           func() func()
+ 	}{
+ 		{
+@@ -39,7 +39,10 @@ func TestProcessMetaEvent(t *testing.T) {
+ 			cfgPath:       "./testdata/Config/basic-convoy.json",
+ 			expectedError: nil,
+ 			msg:           &MetaEvent{MetaEventID: "123", ProjectID: "1234"},
+-			dbFn: func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository) {
++			dbFn: func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository, l *mocks.MockLicenser) {
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(1).Return(true)
++
+ 				m.EXPECT().FindMetaEventByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.MetaEvent{UID: "123", Status: datastore.SuccessEventStatus}, nil)
+ 				p.EXPECT().FetchProjectByID(gomock.Any(), gomock.Any()).
+@@ -52,7 +55,10 @@ func TestProcessMetaEvent(t *testing.T) {
+ 			cfgPath:       "./testdata/Config/basic-convoy.json",
+ 			expectedError: &EndpointError{Err: ErrMetaEventDeliveryFailed, delay: 20 * time.Second},
+ 			msg:           &MetaEvent{MetaEventID: "123", ProjectID: "1234"},
+-			dbFn: func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository) {
++			dbFn: func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository, l *mocks.MockLicenser) {
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(2).Return(true)
++
+ 				m.EXPECT().FindMetaEventByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.MetaEvent{
+ 						UID: "123",
+@@ -93,7 +99,10 @@ func TestProcessMetaEvent(t *testing.T) {
+ 			cfgPath:       "./testdata/Config/basic-convoy.json",
+ 			expectedError: nil,
+ 			msg:           &MetaEvent{MetaEventID: "123", ProjectID: "1234"},
+-			dbFn: func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository) {
++			dbFn: func(m *mocks.MockMetaEventRepository, p *mocks.MockProjectRepository, l *mocks.MockLicenser) {
++				l.EXPECT().UseForwardProxy().Times(1).Return(true)
++				l.EXPECT().IpRules().Times(2).Return(true)
++
+ 				m.EXPECT().FindMetaEventByID(gomock.Any(), gomock.Any(), gomock.Any()).
+ 					Return(&datastore.MetaEvent{
+ 						UID: "123",
+@@ -138,7 +147,8 @@ func TestProcessMetaEvent(t *testing.T) {
+ 			metaEventRepo := mocks.NewMockMetaEventRepository(ctrl)
+ 			projectRepo := mocks.NewMockProjectRepository(ctrl)
+ 			licenser := mocks.NewMockLicenser(ctrl)
+-			licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
++
++			tc.dbFn(metaEventRepo, projectRepo, licenser)
+ 
+ 			dispatcher, err := net.NewDispatcher(
+ 				licenser,
+@@ -158,10 +168,6 @@ func TestProcessMetaEvent(t *testing.T) {
+ 				defer deferFn()
+ 			}
+ 
+-			if tc.dbFn != nil {
+-				tc.dbFn(metaEventRepo, projectRepo)
+-			}
+-
+ 			processFn := ProcessMetaEvent(projectRepo, metaEventRepo, dispatcher, tracer.NoOpBackend{})
+ 			payload := MetaEvent{
+ 				MetaEventID: tc.msg.MetaEventID,
+diff --git a/worker/task/process_retry_event_delivery_test.go b/worker/task/process_retry_event_delivery_test.go
+index 3e5d6a99..ddf79d6d 100644
+--- a/worker/task/process_retry_event_delivery_test.go
++++ b/worker/task/process_retry_event_delivery_test.go
+@@ -71,7 +71,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 
+ 				licenser, _ := l.(*mocks.MockLicenser)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(2).Return(true)
+ 			},
+ 		},
+ 		{
+@@ -111,7 +111,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 
+ 				licenser, _ := l.(*mocks.MockLicenser)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(2).Return(true)
+ 			},
+ 		},
+ 		{
+@@ -177,7 +177,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 
+ 				licenser, _ := l.(*mocks.MockLicenser)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 
+ 				m.EXPECT().
+ 					UpdateStatusOfEventDelivery(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+@@ -276,7 +276,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -367,7 +367,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -458,7 +458,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -551,7 +551,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -644,7 +644,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -737,7 +737,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(false)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -827,7 +827,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -922,7 +922,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()
+@@ -1018,7 +1018,7 @@ func TestProcessRetryEventDelivery(t *testing.T) {
+ 				licenser.EXPECT().CircuitBreaking().Times(1).Return(false)
+ 				licenser.EXPECT().AdvancedEndpointMgmt().Times(1).Return(true)
+ 				licenser.EXPECT().UseForwardProxy().Times(1).Return(true)
+-				licenser.EXPECT().IpRules().Times(1).Return(true)
++				licenser.EXPECT().IpRules().Times(3).Return(true)
+ 			},
+ 			nFn: func() func() {
+ 				httpmock.Activate()

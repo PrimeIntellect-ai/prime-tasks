@@ -1,0 +1,115 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index af2c046..15f99fe 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@ Inspired from [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+ - Adds support for OpenSearch 2.14 ([#552](https://github.com/opensearch-project/opensearch-go/pull/552))
+ - Adds the `Caches` field to Node stats ([#572](https://github.com/opensearch-project/opensearch-go/pull/572))
+ - Adds the `SeqNo` and `PrimaryTerm` fields in `SearchHit` ([#574](https://github.com/opensearch-project/opensearch-go/pull/574))
++- Adds guide on configuring the client with retry and backoff ([#540](https://github.com/opensearch-project/opensearch-go/pull/540))
+ 
+ ### Changed
+ - Security roles get response struct has its own sub structs without omitempty ([#572](https://github.com/opensearch-project/opensearch-go/pull/572))
+@@ -26,6 +27,8 @@ Inspired from [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+ - Adjust security Role struct for FLS from string to []string ([#572](https://github.com/opensearch-project/opensearch-go/pull/572))
+ - Fixes wrong response parsing for indices mapping and recovery ([#572](https://github.com/opensearch-project/opensearch-go/pull/572))
+ - Fixes wrong response parsing for security get requests ([#572](https://github.com/opensearch-project/opensearch-go/pull/572))
++- Fixes opensearchtransport ignores request context cancellation when `retryBackoff` is configured ([#540](https://github.com/opensearch-project/opensearch-go/pull/540))
++- Fixes opensearchtransport sleeps unexpectedly after the last retry ([#540](https://github.com/opensearch-project/opensearch-go/pull/540))
+ 
+ ### Security
+ 
+diff --git a/USER_GUIDE.md b/USER_GUIDE.md
+index 012ccc9..03294ea 100644
+--- a/USER_GUIDE.md
++++ b/USER_GUIDE.md
+@@ -396,3 +396,4 @@ func getCredentialProvider(accessKey, secretAccessKey, token string) aws.Credent
+ - [Advanced Index Actions](guides/advanced_index_actions.md)
+ - [Index Templates](guides/index_template.md)
+ - [Data Streams](guides/data_streams.md)
++- [Retry and Backoff](guides/retry_backoff.md)
+diff --git a/guides/retry_backoff.md b/guides/retry_backoff.md
+new file mode 100644
+index 0000000..aa11f56
+--- /dev/null
++++ b/guides/retry_backoff.md
+@@ -0,0 +1,53 @@
++# Configure the client with retry and backoff
++
++The OpenSearch client will retry on certain errors, such as `503 Service Unavailable`. And it will retry right after receiving the error. You can customize the retry behavior.
++
++## Setup
++
++Let's create a client instance:
++
++```go
++package main
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"time"
++
++	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
++)
++
++func main() {
++	if err := example(); err != nil {
++		fmt.Println(fmt.Sprintf("Error: %s", err))
++		os.Exit(1)
++	}
++}
++
++func example() error {
++	client, err := opensearchapi.NewClient(opensearchapi.Config{
++                // Retry on 429 TooManyRequests statuses as well (502, 503, 504 are default values)
++                RetryOnStatus: []int{502, 503, 504, 429},
++
++                // A simple incremental backoff function
++                RetryBackoff: func(i int) time.Duration { return time.Duration(i) * 100 * time.Millisecond },
++
++                // Retry up to 5 attempts (1 initial + 4 retries)
++                MaxRetries: 4,
++	})
++	if err != nil {
++		return err
++	}
++```
++
++If you do not want to wait too long when the server is not responsive, then control the total duration of the requests with a context. The on-going request and the backoff will be canceled when the context is canceled.
++
++```go
++	rootCtx := context.Background()
++	ctx := context.WithTimeout(rootCtx, time.Second)
++
++	infoResp, err := client.Info(ctx, nil)
++	return nil
++}
++```
+diff --git a/opensearchtransport/opensearchtransport.go b/opensearchtransport/opensearchtransport.go
+index c93b2cd..8e49259 100644
+--- a/opensearchtransport/opensearchtransport.go
++++ b/opensearchtransport/opensearchtransport.go
+@@ -382,8 +382,19 @@ func (c *Client) Perform(req *http.Request) (*http.Response, error) {
+ 		}
+ 
+ 		// Delay the retry if a backoff function is configured
+-		if c.retryBackoff != nil {
+-			time.Sleep(c.retryBackoff(i + 1))
++		if c.retryBackoff != nil && i < c.maxRetries {
++			var cancelled bool
++			timer := time.NewTimer(c.retryBackoff(i + 1))
++			select {
++			case <-req.Context().Done():
++				timer.Stop()
++				err = req.Context().Err()
++				cancelled = true
++			case <-timer.C:
++			}
++			if cancelled {
++				break
++			}
+ 		}
+ 	}
+ 	// Read, close and replace the http response body to close the connection

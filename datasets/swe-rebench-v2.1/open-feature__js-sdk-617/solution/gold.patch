@@ -1,0 +1,263 @@
+diff --git a/packages/client/src/provider/in-memory-provider/flag-configuration.ts b/packages/client/src/provider/in-memory-provider/flag-configuration.ts
+new file mode 100644
+index 00000000..2bbfc917
+--- /dev/null
++++ b/packages/client/src/provider/in-memory-provider/flag-configuration.ts
+@@ -0,0 +1,36 @@
++/**
++ * Don't export types from this file publicly.
++ * It might cause confusion since these types are not a part of the general API,
++ * but just for the in-memory provider.
++ */
++import { EvaluationContext, JsonValue } from '@openfeature/core';
++
++type Variants<T> = Record<string, T>;
++
++/**
++ * A Feature Flag definition, containing it's specification
++ */
++export type Flag = {
++  /**
++   * An object containing all possible flags mappings (variant -> flag value)
++   */
++  variants: Variants<boolean> | Variants<string> | Variants<number> | Variants<JsonValue>;
++  /**
++   * The variant it will resolve to in STATIC evaluation
++   */
++  defaultVariant: string;
++  /**
++   * Determines if flag evaluation is enabled or not for this flag.
++   * If false, falls back to the default value provided to the client
++   */
++  disabled: boolean;
++  /**
++   * Function used in order to evaluate a flag to a specific value given the provided context.
++   * It should return a variant key.
++   * If it does not return a valid variant it falls back to the default value provided to the client
++   * @param EvaluationContext
++   */
++  contextEvaluator?: (ctx: EvaluationContext) => string;
++};
++
++export type FlagConfiguration = Record<string, Flag>;
+diff --git a/packages/client/src/provider/in-memory-provider/in-memory-provider.ts b/packages/client/src/provider/in-memory-provider/in-memory-provider.ts
+new file mode 100644
+index 00000000..46a8165f
+--- /dev/null
++++ b/packages/client/src/provider/in-memory-provider/in-memory-provider.ts
+@@ -0,0 +1,179 @@
++import {
++  EvaluationContext,
++  FlagNotFoundError,
++  FlagValueType,
++  GeneralError,
++  JsonValue,
++  Logger,
++  OpenFeatureError,
++  ProviderEvents,
++  ResolutionDetails,
++  StandardResolutionReasons,
++  TypeMismatchError,
++  ProviderStatus,
++} from '@openfeature/core';
++import { Provider } from '../provider';
++import { OpenFeatureEventEmitter } from '../../events';
++import { FlagConfiguration, Flag } from './flag-configuration';
++import { VariantNotFoundError } from './variant-not-found-error';
++
++/**
++ * A simple OpenFeature provider intended for demos and as a test stub.
++ */
++export class InMemoryProvider implements Provider {
++  public readonly events = new OpenFeatureEventEmitter();
++  public readonly runsOn = 'client';
++  status: ProviderStatus = ProviderStatus.NOT_READY;
++  readonly metadata = {
++    name: 'in-memory',
++  } as const;
++  private _flagConfiguration: FlagConfiguration;
++  private _context: EvaluationContext | undefined;
++
++  constructor(flagConfiguration: FlagConfiguration = {}) {
++    this._flagConfiguration = { ...flagConfiguration };
++  }
++
++  async initialize(context?: EvaluationContext | undefined): Promise<void> {
++    try {
++
++      for (const key in this._flagConfiguration) {
++        this.resolveFlagWithReason(key, context);
++      }
++
++      this._context = context;
++      // set the provider's state, but don't emit events manually;
++      // the SDK does this based on the resolution/rejection of the init promise
++      this.status = ProviderStatus.READY;
++    } catch (error) {
++      this.status = ProviderStatus.ERROR;
++      throw error;
++    }
++  }
++
++  /**
++   * Overwrites the configured flags.
++   * @param { FlagConfiguration } flagConfiguration new flag configuration
++   */
++  async putConfiguration(flagConfiguration: FlagConfiguration) {
++    const flagsChanged = Object.entries(flagConfiguration)
++      .filter(([key, value]) => this._flagConfiguration[key] !== value)
++      .map(([key]) => key);
++
++    this.status = ProviderStatus.STALE;
++    this.events.emit(ProviderEvents.Stale);
++
++    this._flagConfiguration = { ...flagConfiguration };
++    this.events.emit(ProviderEvents.ConfigurationChanged, { flagsChanged });
++
++    try {
++      await this.initialize(this._context);
++      // we need to emit our own events in this case, since it's not part of the init flow.
++      this.events.emit(ProviderEvents.Ready);
++    } catch (err) {
++      this.events.emit(ProviderEvents.Error);
++      throw err;
++    }
++  }
++
++  resolveBooleanEvaluation(
++    flagKey: string,
++    defaultValue: boolean,
++    context?: EvaluationContext,
++    logger?: Logger,
++  ): ResolutionDetails<boolean> {
++    return this.resolveAndCheckFlag<boolean>(flagKey, defaultValue, context || this._context, logger);
++  }
++
++  resolveNumberEvaluation(
++    flagKey: string,
++    defaultValue: number,
++    context?: EvaluationContext,
++    logger?: Logger,
++  ): ResolutionDetails<number> {
++    return this.resolveAndCheckFlag<number>(flagKey, defaultValue, context || this._context, logger);
++  }
++
++  resolveStringEvaluation(
++    flagKey: string,
++    defaultValue: string,
++    context?: EvaluationContext,
++    logger?: Logger,
++  ): ResolutionDetails<string> {
++    return this.resolveAndCheckFlag<string>(flagKey, defaultValue, context || this._context, logger);
++  }
++
++  resolveObjectEvaluation<T extends JsonValue>(
++    flagKey: string,
++    defaultValue: T,
++    context?: EvaluationContext,
++    logger?: Logger,
++  ): ResolutionDetails<T> {
++    return this.resolveAndCheckFlag<T>(flagKey, defaultValue, context || this._context, logger);
++  }
++
++  private resolveAndCheckFlag<T extends JsonValue | FlagValueType>(flagKey: string,
++    defaultValue: T, context?: EvaluationContext, logger?: Logger): ResolutionDetails<T> {
++    if (!(flagKey in this._flagConfiguration)) {
++      const message = `no flag found with key ${flagKey}`;
++      logger?.debug(message);
++      throw new FlagNotFoundError(message);
++    }
++
++    if (this._flagConfiguration[flagKey].disabled) {
++      return { value: defaultValue, reason: StandardResolutionReasons.DISABLED };
++    }
++
++    const resolvedFlag = this.resolveFlagWithReason(flagKey, context) as ResolutionDetails<T>;
++
++    if (resolvedFlag.value === undefined) {
++      const message = `no value associated with variant provided for ${flagKey} found`;
++      logger?.error(message);
++      throw new VariantNotFoundError(message);
++    }
++
++    if (typeof resolvedFlag.value != typeof defaultValue) {
++      throw new TypeMismatchError();
++    }
++
++    return resolvedFlag;
++  }
++
++  private resolveFlagWithReason<T extends JsonValue | FlagValueType>(
++    flagKey: string,
++    ctx?: EvaluationContext,
++  ): ResolutionDetails<T> {
++    try {
++      const resolutionResult = this.lookupFlagValue<T>(flagKey, ctx);
++
++      return resolutionResult;
++    } catch (error: unknown) {
++      if (!(error instanceof OpenFeatureError)) {
++        throw new GeneralError((error as Error)?.message || 'unknown error');
++      }
++      throw error;
++    }
++  }
++
++  private lookupFlagValue<T extends JsonValue | FlagValueType>(
++    flagKey: string,
++    ctx?: EvaluationContext,
++  ): ResolutionDetails<T> {
++    const flagSpec: Flag = this._flagConfiguration[flagKey];
++
++    const isContextEval = ctx && flagSpec?.contextEvaluator;
++    const variant = isContextEval ? flagSpec.contextEvaluator?.(ctx) : flagSpec.defaultVariant;
++
++    const value = variant && flagSpec?.variants[variant];
++
++    const evalReason = isContextEval ? StandardResolutionReasons.TARGETING_MATCH : StandardResolutionReasons.STATIC;
++
++    const reason = this.status === ProviderStatus.STALE ? StandardResolutionReasons.CACHED : evalReason;
++
++    return {
++      value: value as T,
++      ...(variant && { variant }),
++      reason,
++    };
++  }
++}
+diff --git a/packages/client/src/provider/in-memory-provider/index.ts b/packages/client/src/provider/in-memory-provider/index.ts
+new file mode 100644
+index 00000000..1bf0d537
+--- /dev/null
++++ b/packages/client/src/provider/in-memory-provider/index.ts
+@@ -0,0 +1,1 @@
++export * from './in-memory-provider';
+diff --git a/packages/client/src/provider/in-memory-provider/variant-not-found-error.ts b/packages/client/src/provider/in-memory-provider/variant-not-found-error.ts
+new file mode 100644
+index 00000000..8b643982
+--- /dev/null
++++ b/packages/client/src/provider/in-memory-provider/variant-not-found-error.ts
+@@ -0,0 +1,15 @@
++import { ErrorCode, OpenFeatureError } from '@openfeature/core';
++
++/**
++ * A custom error for the in-memory provider.
++ * Indicates the resolved or default variant doesn't exist.
++ */
++export class VariantNotFoundError extends OpenFeatureError {
++  code: ErrorCode;
++  constructor(message?: string) {
++    super(message);
++    Object.setPrototypeOf(this, VariantNotFoundError.prototype);
++    this.name = 'VariantNotFoundError';
++    this.code = ErrorCode.GENERAL;
++  }
++}
+diff --git a/packages/client/src/provider/index.ts b/packages/client/src/provider/index.ts
+index 79eff210..33e12fea 100644
+--- a/packages/client/src/provider/index.ts
++++ b/packages/client/src/provider/index.ts
+@@ -1,2 +1,3 @@
+ export * from './provider';
+ export * from './no-op-provider';
++export * from './in-memory-provider';

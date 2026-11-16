@@ -1,0 +1,215 @@
+diff --git a/config/config_small_test.go b/config/config_small_test.go
+index e186030..0f2b2cb 100644
+--- a/config/config_small_test.go
++++ b/config/config_small_test.go
+@@ -57,6 +57,8 @@ read_buffer_size = 43210
+ nats_max_pending_size = "100MB"
+ max_time_delta = "789s"
+ 
++stats_interval = "5s"
++
+ probe_port = 6789
+ pprof_port = 5432
+ `
+@@ -83,6 +85,7 @@ pprof_port = 5432
+ 	assert.Equal(t, "spout-monitor", conf.NATSSubjectMonitor, "Monitor subject must match")
+ 	assert.Equal(t, "nats://localhost:4222", conf.NATSAddress, "Address must match")
+ 
++	assert.Equal(t, 5*time.Second, conf.StatsInterval.Duration)
+ 	assert.Equal(t, 6789, conf.ProbePort)
+ 	assert.Equal(t, 5432, conf.PprofPort)
+ }
+@@ -109,6 +112,7 @@ func TestAllDefaults(t *testing.T) {
+ 	assert.Equal(t, 4*datasize.MB, conf.ReadBufferSize)
+ 	assert.Equal(t, 200*datasize.MB, conf.NATSMaxPendingSize)
+ 	assert.Equal(t, 10*time.Minute, conf.MaxTimeDelta.Duration)
++	assert.Equal(t, 3*time.Second, conf.StatsInterval.Duration)
+ 	assert.Equal(t, 0, conf.ProbePort)
+ 	assert.Equal(t, 0, conf.PprofPort)
+ 	assert.Equal(t, false, conf.Debug)
+diff --git a/listener/listener_medium_test.go b/listener/listener_medium_test.go
+index 51ef692..5e5acaf 100644
+--- a/listener/listener_medium_test.go
++++ b/listener/listener_medium_test.go
+@@ -12,6 +12,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++//go:build medium
+ // +build medium
+ 
+ package listener
+@@ -31,8 +32,10 @@ import (
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/jumptrading/influx-spout/config"
++	"github.com/jumptrading/influx-spout/filter"
+ 	"github.com/jumptrading/influx-spout/spouttest"
+ 	"github.com/jumptrading/influx-spout/stats"
++	"github.com/jumptrading/influx-spout/writer"
+ )
+ 
+ const (
+@@ -56,12 +59,6 @@ var (
+ 	numLines = len(poetry)
+ )
+ 
+-func init() {
+-	// Make the statistician report more often during tests (default
+-	// is 3s). This makes the tests run faster.
+-	statsInterval = 500 * time.Millisecond
+-}
+-
+ func testConfig() *config.Config {
+ 	return &config.Config{
+ 		Mode:               "listener",
+@@ -76,6 +73,10 @@ func testConfig() *config.Config {
+ 
+ 		Port:      listenPort,
+ 		ProbePort: probePort,
++
++		// Make the statistician report more often during tests. This
++		// makes the tests run faster.
++		StatsInterval: config.Duration{250 * time.Millisecond},
+ 	}
+ }
+ 
+@@ -484,6 +485,138 @@ func BenchmarkHTTPListenerWithPrecision(b *testing.B) {
+ 	b.StopTimer()
+ }
+ 
++// The filter and writer components also run a statistician whose
++// publish interval must come from the StatsInterval configuration
++// option. These tests verify that the configured interval is actually
++// honoured: an implementation that ignores the configuration and uses
++// the old hard-coded 3s interval would only produce a single publish
++// within the observation window.
++
++const (
++	filterStatsNATSPort = 44300
++	writerStatsNATSPort = 44400
++)
++
++func TestListenerStatsInterval(t *testing.T) {
++	stats.SetHostname("h")
++
++	s := spouttest.RunGnatsd(natsPort)
++	defer s.Shutdown()
++
++	conf := testConfig()
++	conf.StatsInterval = config.Duration{100 * time.Millisecond}
++	monitorCh, unsub := subscribeAddr(t, conf.NATSAddress, conf.NATSSubjectMonitor)
++	defer unsub()
++
++	l := startListener(t, conf)
++	defer l.Stop()
++
++	assertFrequentStats(t, monitorCh)
++}
++
++func TestFilterStatsInterval(t *testing.T) {
++	stats.SetHostname("h")
++
++	s := spouttest.RunGnatsd(filterStatsNATSPort)
++	defer s.Shutdown()
++
++	conf := &config.Config{
++		Mode:                "filter",
++		Name:                "filterstats",
++		NATSAddress:         fmt.Sprintf("nats://127.0.0.1:%d", filterStatsNATSPort),
++		NATSSubject:         []string{"filter-stats-in"},
++		NATSSubjectMonitor:  "filter-stats-monitor",
++		NATSSubjectJunkyard: "filter-stats-junk",
++		NATSMaxPendingSize:  32 * datasize.MB,
++		Workers:             1,
++		MaxTimeDelta:        config.Duration{10 * time.Minute},
++		Rule: []config.Rule{{
++			Rtype:   "basic",
++			Match:   "hello",
++			Subject: "hello-subject",
++		}},
++		StatsInterval: config.Duration{100 * time.Millisecond},
++	}
++
++	monitorCh, unsub := subscribeAddr(t, conf.NATSAddress, conf.NATSSubjectMonitor)
++	defer unsub()
++
++	f, err := filter.StartFilter(conf)
++	require.NoError(t, err)
++	defer f.Stop()
++
++	assertFrequentStats(t, monitorCh)
++}
++
++func TestWriterStatsInterval(t *testing.T) {
++	stats.SetHostname("h")
++
++	s := spouttest.RunGnatsd(writerStatsNATSPort)
++	defer s.Shutdown()
++
++	conf := &config.Config{
++		Mode:               "writer",
++		Name:               "writerstats",
++		NATSAddress:        fmt.Sprintf("nats://127.0.0.1:%d", writerStatsNATSPort),
++		NATSSubject:        []string{"writer-stats-in"},
++		NATSSubjectMonitor: "writer-stats-monitor",
++		InfluxDBAddress:    "localhost",
++		InfluxDBPort:       8086,
++		DBName:             "metrics",
++		BatchMaxCount:      1,
++		BatchMaxSize:       10 * datasize.MB,
++		BatchMaxAge:        config.Duration{5 * time.Minute},
++		Workers:            1,
++		NATSMaxPendingSize: 32 * datasize.MB,
++		StatsInterval:      config.Duration{100 * time.Millisecond},
++	}
++
++	monitorCh, unsub := subscribeAddr(t, conf.NATSAddress, conf.NATSSubjectMonitor)
++	defer unsub()
++
++	w, err := writer.StartWriter(conf)
++	require.NoError(t, err)
++	defer w.Stop()
++
++	assertFrequentStats(t, monitorCh)
++}
++
++func subscribeAddr(t require.TestingT, address, subject string) (chan string, func()) {
++	nc, err := nats.Connect(address)
++	require.NoError(t, err)
++
++	msgCh := make(chan string, 100)
++	sub, err := nc.Subscribe(subject, func(msg *nats.Msg) {
++		msgCh <- string(msg.Data)
++	})
++	require.NoError(t, err)
++	require.NoError(t, nc.Flush())
++
++	return msgCh, func() {
++		sub.Unsubscribe()
++		nc.Close()
++	}
++}
++
++// assertFrequentStats checks that the statistician publishes several
++// times within a short window. With the configured 100ms interval many
++// publishes are expected; an implementation that ignores the
++// configuration and uses the old hard-coded 3s interval would only
++// produce a single publish in this window.
++func assertFrequentStats(t *testing.T, ch chan string) {
++	const want = 4
++	deadline := time.After(2 * time.Second)
++	seen := 0
++	for seen < want {
++		select {
++		case <-ch:
++			seen++
++		case <-deadline:
++			t.Fatalf("expected at least %d stats publishes within 2s, saw %d", want, seen)
++		}
++	}
++}
++
+ func startListener(t require.TestingT, conf *config.Config) *Listener {
+ 	listener, err := StartListener(conf)
+ 	require.NoError(t, err)

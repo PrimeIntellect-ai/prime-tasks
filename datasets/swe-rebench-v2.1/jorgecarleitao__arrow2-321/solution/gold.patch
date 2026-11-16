@@ -1,0 +1,791 @@
+diff --git a/.github/workflows/integration-ffi.yml b/.github/workflows/integration-ffi.yml
+index 8f0797eea1..3fce8f24fd 100644
+--- a/.github/workflows/integration-ffi.yml
++++ b/.github/workflows/integration-ffi.yml
+@@ -38,6 +38,6 @@ jobs:
+           python -m venv venv
+           source venv/bin/activate
+ 
+-          pip install maturin==0.10.2 toml==0.10.1 pyarrow==4.0.0
++          pip install maturin==0.10.2 toml==0.10.1 pyarrow==5.0.0
+           maturin develop
+           python -m unittest discover tests
+diff --git a/examples/ffi.rs b/examples/ffi.rs
+new file mode 100644
+index 0000000000..172c3159b4
+--- /dev/null
++++ b/examples/ffi.rs
+@@ -0,0 +1,55 @@
++use arrow2::array::{Array, PrimitiveArray};
++use arrow2::datatypes::Field;
++use arrow2::error::Result;
++use arrow2::ffi;
++use std::sync::Arc;
++
++unsafe fn export(
++    array: Arc<dyn Array>,
++    array_ptr: *mut ffi::Ffi_ArrowArray,
++    schema_ptr: *mut ffi::Ffi_ArrowSchema,
++) {
++    let field = Field::new("a", array.data_type().clone(), true);
++    ffi::export_array_to_c(array, array_ptr);
++    ffi::export_field_to_c(&field, schema_ptr);
++}
++
++fn import(
++    array: Box<ffi::Ffi_ArrowArray>,
++    schema: &ffi::Ffi_ArrowSchema,
++) -> Result<Box<dyn Array>> {
++    let field = ffi::import_field_from_c(schema)?;
++    ffi::import_array_from_c(array, &field)
++}
++
++fn main() -> Result<()> {
++    // let's assume that we have an array:
++    let array = Arc::new(PrimitiveArray::<i32>::from([Some(1), None, Some(123)])) as Arc<dyn Array>;
++
++    // the goal is to export this array and import it back via FFI.
++    // to import, we initialize the structs that will receive the data
++    let array_ptr = Box::new(ffi::Ffi_ArrowArray::empty());
++    let schema_ptr = Box::new(ffi::Ffi_ArrowSchema::empty());
++
++    // since FFIs work in raw pointers, let's temporarily relinquish ownership so that producers
++    // can write into it in a thread-safe manner
++    let array_ptr = Box::into_raw(array_ptr);
++    let schema_ptr = Box::into_raw(schema_ptr);
++
++    // this is where a producer (in this case also us ^_^) writes to the pointers' location.
++    // `array` here could be anything or not even be available, if this was e.g. from Python.
++    // Safety: we just allocated the pointers correctly.
++    unsafe { export(array.clone(), array_ptr, schema_ptr) };
++
++    // we can now take ownership back, since we are responsible for deallocating this memory.
++    // Safety: we just into_raw them.
++    let array_ptr = unsafe { Box::from_raw(array_ptr) };
++    let schema_ptr = unsafe { Box::from_raw(schema_ptr) };
++
++    // and finally interpret the written memory into a new array.
++    let new_array = import(array_ptr, schema_ptr.as_ref())?;
++
++    // which is equal to the exported array
++    assert_eq!(array.as_ref(), new_array.as_ref());
++    Ok(())
++}
+diff --git a/guide/src/ffi.md b/guide/src/ffi.md
+index 2cf87b0b9c..40d01984c3 100644
+--- a/guide/src/ffi.md
++++ b/guide/src/ffi.md
+@@ -5,58 +5,9 @@ has a specification, which allows languages to share data
+ structures via foreign interfaces at zero cost (i.e. via pointers).
+ This is known as the [C Data interface](https://arrow.apache.org/docs/format/CDataInterface.html).
+ 
+-This crate supports importing from and exporting to most of `DataType`s.
+-Types currently not supported:
+-
+-* `FixedSizeBinary`
+-* `Union`
+-* `Dictionary`
+-* `FixedSizeList`
+-* `Null`
+-
+-## Export
+-
+-The API to export an `Array` is as follows:
+-
+-```rust
+-use std::sync::Arc;
+-use arrow2::array::{Array, PrimitiveArray};
+-use arrow2::datatypes::DataType;
+-use arrow2::ffi::ArrowArray;
+-
+-# fn main() {
+-// Example of an array:
+-let array = [Some(1), None, Some(123)]
+-    .iter()
+-    .collect::<PrimitiveArray<i32>>();
+-
+-// export the array.
+-let ffi_array = ffi::export_to_c(Arc::new(array))?;
+-
+-// these are mutable pointers to `ArrowArray` and `ArrowSchema` of the C data interface
+-let (array_ptr, schema_ptr) = ffi_array.references();
+-# }
+-```
+-
+-## Import
+-
+-The API to import works similarly:
++This crate supports importing from and exporting to all `DataType`s. Follow the
++example below to learn how to import and export:
+ 
+ ```rust
+-use arrow2::array::Array;
+-use arrow2::ffi;
+-
+-let array = Arc::new(ffi::create_empty());
+-
+-// non-owned mutable pointers.
+-let (array_ptr, schema_ptr) = array.references();
+-
+-// write to the pointers using any C data interface exporter
+-
+-// consume it to a `Box<dyn Array>`
+-let array = ffi::try_from(array)?;
++{{#include ../../examples/ffi.rs}}
+ ```
+-
+-This assumes that the exporter writes to `array_ptr` and `schema_ptr` 
+-according to the c data interface. This is an intrinsically `unsafe` operation.
+-Failing to do so results in UB.
+diff --git a/src/array/binary/ffi.rs b/src/array/binary/ffi.rs
+index a216be7b42..63d0ea66f3 100644
+--- a/src/array/binary/ffi.rs
++++ b/src/array/binary/ffi.rs
+@@ -25,7 +25,7 @@ unsafe impl<O: Offset> ToFfi for BinaryArray<O> {
+ 
+ unsafe impl<O: Offset, A: ffi::ArrowArrayRef> FromFfi<A> for BinaryArray<O> {
+     fn try_from_ffi(array: A) -> Result<Self> {
+-        let data_type = array.field()?.data_type().clone();
++        let data_type = array.field().data_type().clone();
+         let expected = if O::is_large() {
+             DataType::LargeBinary
+         } else {
+diff --git a/src/array/boolean/ffi.rs b/src/array/boolean/ffi.rs
+index b141c3a3a6..9dedfbc41d 100644
+--- a/src/array/boolean/ffi.rs
++++ b/src/array/boolean/ffi.rs
+@@ -23,7 +23,7 @@ unsafe impl ToFfi for BooleanArray {
+ 
+ unsafe impl<A: ffi::ArrowArrayRef> FromFfi<A> for BooleanArray {
+     fn try_from_ffi(array: A) -> Result<Self> {
+-        let data_type = array.field()?.data_type().clone();
++        let data_type = array.field().data_type().clone();
+         assert_eq!(data_type, DataType::Boolean);
+         let length = array.array().len();
+         let offset = array.array().offset();
+diff --git a/src/array/list/ffi.rs b/src/array/list/ffi.rs
+index 63d6e8f586..97bea8cbc3 100644
+--- a/src/array/list/ffi.rs
++++ b/src/array/list/ffi.rs
+@@ -24,7 +24,7 @@ unsafe impl<O: Offset> ToFfi for ListArray<O> {
+ 
+ unsafe impl<O: Offset, A: ffi::ArrowArrayRef> FromFfi<A> for ListArray<O> {
+     fn try_from_ffi(array: A) -> Result<Self> {
+-        let data_type = array.field()?.data_type().clone();
++        let data_type = array.field().data_type().clone();
+         let length = array.array().len();
+         let offset = array.array().offset();
+         let mut validity = unsafe { array.validity() }?;
+diff --git a/src/array/primitive/ffi.rs b/src/array/primitive/ffi.rs
+index 5168f322b7..1c3f534970 100644
+--- a/src/array/primitive/ffi.rs
++++ b/src/array/primitive/ffi.rs
+@@ -24,7 +24,7 @@ unsafe impl<T: NativeType> ToFfi for PrimitiveArray<T> {
+ 
+ unsafe impl<T: NativeType, A: ffi::ArrowArrayRef> FromFfi<A> for PrimitiveArray<T> {
+     fn try_from_ffi(array: A) -> Result<Self> {
+-        let data_type = array.field()?.data_type().clone();
++        let data_type = array.field().data_type().clone();
+         let length = array.array().len();
+         let offset = array.array().offset();
+         let mut validity = unsafe { array.validity() }?;
+diff --git a/src/array/struct_.rs b/src/array/struct_.rs
+index 9a6191a5d4..41763c464e 100644
+--- a/src/array/struct_.rs
++++ b/src/array/struct_.rs
+@@ -153,7 +153,7 @@ unsafe impl ToFfi for StructArray {
+ 
+ unsafe impl<A: ffi::ArrowArrayRef> FromFfi<A> for StructArray {
+     fn try_from_ffi(array: A) -> Result<Self> {
+-        let field = array.field()?;
++        let field = array.field();
+         let fields = Self::get_fields(field.data_type()).to_vec();
+ 
+         let length = array.array().len();
+diff --git a/src/array/union/ffi.rs b/src/array/union/ffi.rs
+index 7028480e04..f07b7092ea 100644
+--- a/src/array/union/ffi.rs
++++ b/src/array/union/ffi.rs
+@@ -29,7 +29,7 @@ unsafe impl ToFfi for UnionArray {
+ 
+ unsafe impl<A: ffi::ArrowArrayRef> FromFfi<A> for UnionArray {
+     fn try_from_ffi(array: A) -> Result<Self> {
+-        let field = array.field()?;
++        let field = array.field();
+         let data_type = field.data_type().clone();
+         let fields = Self::get_fields(field.data_type());
+ 
+diff --git a/src/ffi/array.rs b/src/ffi/array.rs
+index 8f947d1b1c..833657bc27 100644
+--- a/src/ffi/array.rs
++++ b/src/ffi/array.rs
+@@ -32,8 +32,7 @@ use crate::{
+ /// * the data type is not supported
+ /// * the interface is not valid (e.g. a null pointer)
+ pub fn try_from<A: ArrowArrayRef>(array: A) -> Result<Box<dyn Array>> {
+-    let field = array.field()?;
+-    let array: Box<dyn Array> = match field.data_type() {
++    let array: Box<dyn Array> = match array.field().data_type() {
+         DataType::Boolean => Box::new(BooleanArray::try_from_ffi(array)?),
+         DataType::Int8 => Box::new(PrimitiveArray::<i8>::try_from_ffi(array)?),
+         DataType::Int16 => Box::new(PrimitiveArray::<i16>::try_from_ffi(array)?),
+diff --git a/src/ffi/ffi.rs b/src/ffi/ffi.rs
+index 756b0b04da..cbb08f2fa6 100644
+--- a/src/ffi/ffi.rs
++++ b/src/ffi/ffi.rs
+@@ -17,7 +17,6 @@
+ 
+ use std::{ptr::NonNull, sync::Arc};
+ 
+-use super::schema::{to_field, Ffi_ArrowSchema};
+ use crate::{
+     array::{buffers_children_dictionary, Array},
+     bitmap::{utils::bytes_for, Bitmap},
+@@ -27,6 +26,7 @@ use crate::{
+     },
+     datatypes::{DataType, Field},
+     error::{ArrowError, Result},
++    ffi::schema::get_field_child,
+     types::NativeType,
+ };
+ 
+@@ -95,7 +95,7 @@ impl Ffi_ArrowArray {
+     /// # Safety
+     /// This method releases `buffers`. Consumers of this struct *must* call `release` before
+     /// releasing this struct, or contents in `buffers` leak.
+-    fn new(array: Arc<dyn Array>) -> Self {
++    pub(crate) fn new(array: Arc<dyn Array>) -> Self {
+         let (buffers, children, dictionary) = buffers_children_dictionary(array.as_ref());
+ 
+         let buffers_ptr = buffers
+@@ -142,7 +142,7 @@ impl Ffi_ArrowArray {
+     }
+ 
+     // create an empty `Ffi_ArrowArray`, which can be used to import data into
+-    fn empty() -> Self {
++    pub fn empty() -> Self {
+         Self {
+             length: 0,
+             null_count: 0,
+@@ -158,22 +158,17 @@ impl Ffi_ArrowArray {
+     }
+ 
+     /// the length of the array
+-    pub fn len(&self) -> usize {
++    pub(crate) fn len(&self) -> usize {
+         self.length as usize
+     }
+ 
+-    /// whether the array is empty
+-    pub fn is_empty(&self) -> bool {
+-        self.length == 0
+-    }
+-
+     /// the offset of the array
+-    pub fn offset(&self) -> usize {
++    pub(crate) fn offset(&self) -> usize {
+         self.offset as usize
+     }
+ 
+     /// the null count of the array
+-    pub fn null_count(&self) -> usize {
++    pub(crate) fn null_count(&self) -> usize {
+         self.null_count as usize
+     }
+ }
+@@ -283,31 +278,32 @@ fn buffer_len(array: &Ffi_ArrowArray, data_type: &DataType, i: usize) -> Result<
+ 
+ fn create_child(
+     array: &Ffi_ArrowArray,
+-    schema: &Ffi_ArrowSchema,
++    field: &Field,
+     parent: Arc<ArrowArray>,
+     index: usize,
+ ) -> Result<ArrowArrayChild<'static>> {
++    let field = get_field_child(field, index)?;
+     assert!(index < array.n_children as usize);
+     assert!(!array.children.is_null());
+     unsafe {
+         let arr_ptr = *array.children.add(index);
+-        let schema_ptr = schema.child(index);
+         assert!(!arr_ptr.is_null());
+         let arr_ptr = &*arr_ptr;
+-        Ok(ArrowArrayChild::from_raw(arr_ptr, schema_ptr, parent))
++
++        Ok(ArrowArrayChild::from_raw(arr_ptr, field, parent))
+     }
+ }
+ 
+ fn create_dictionary(
+     array: &Ffi_ArrowArray,
+-    schema: &Ffi_ArrowSchema,
++    field: &Field,
+     parent: Arc<ArrowArray>,
+ ) -> Result<Option<ArrowArrayChild<'static>>> {
+-    let schema = schema.dictionary();
+-    if let Some(schema) = schema {
++    if let DataType::Dictionary(_, values) = field.data_type() {
++        let field = Field::new("", values.as_ref().clone(), true);
+         assert!(!array.dictionary.is_null());
+         let array = unsafe { &*array.dictionary };
+-        Ok(Some(ArrowArrayChild::from_raw(array, schema, parent)))
++        Ok(Some(ArrowArrayChild::from_raw(array, field, parent)))
+     } else {
+         Ok(None)
+     }
+@@ -339,7 +335,7 @@ pub trait ArrowArrayRef {
+         // +1 to ignore null bitmap
+         create_buffer::<T>(
+             self.array(),
+-            self.field()?.data_type(),
++            self.field().data_type(),
+             self.deallocation(),
+             index + 1,
+         )
+@@ -354,17 +350,16 @@ pub trait ArrowArrayRef {
+     }
+ 
+     fn child(&self, index: usize) -> Result<ArrowArrayChild> {
+-        create_child(self.array(), self.schema(), self.parent().clone(), index)
++        create_child(self.array(), self.field(), self.parent().clone(), index)
+     }
+ 
+     fn dictionary(&self) -> Result<Option<ArrowArrayChild>> {
+-        create_dictionary(self.array(), self.schema(), self.parent().clone())
++        create_dictionary(self.array(), self.field(), self.parent().clone())
+     }
+ 
+     fn parent(&self) -> &Arc<ArrowArray>;
+     fn array(&self) -> &Ffi_ArrowArray;
+-    fn schema(&self) -> &Ffi_ArrowSchema;
+-    fn field(&self) -> Result<Field>;
++    fn field(&self) -> &Field;
+ }
+ 
+ /// Struct used to move an Array from and to the C Data Interface.
+@@ -388,14 +383,20 @@ pub trait ArrowArrayRef {
+ /// Furthermore, this struct assumes that the incoming data agrees with the C data interface.
+ #[derive(Debug)]
+ pub struct ArrowArray {
+-    array: Arc<Ffi_ArrowArray>,
+-    schema: Arc<Ffi_ArrowSchema>,
++    array: Box<Ffi_ArrowArray>,
++    field: Field,
++}
++
++impl ArrowArray {
++    pub fn new(array: Box<Ffi_ArrowArray>, field: Field) -> Self {
++        Self { array, field }
++    }
+ }
+ 
+ impl ArrowArrayRef for Arc<ArrowArray> {
+     /// the data_type as declared in the schema
+-    fn field(&self) -> Result<Field> {
+-        to_field(&self.schema)
++    fn field(&self) -> &Field {
++        &self.field
+     }
+ 
+     fn parent(&self) -> &Arc<ArrowArray> {
+@@ -405,23 +406,19 @@ impl ArrowArrayRef for Arc<ArrowArray> {
+     fn array(&self) -> &Ffi_ArrowArray {
+         self.array.as_ref()
+     }
+-
+-    fn schema(&self) -> &Ffi_ArrowSchema {
+-        self.schema.as_ref()
+-    }
+ }
+ 
+ #[derive(Debug)]
+ pub struct ArrowArrayChild<'a> {
+     array: &'a Ffi_ArrowArray,
+-    schema: &'a Ffi_ArrowSchema,
++    field: Field,
+     parent: Arc<ArrowArray>,
+ }
+ 
+ impl<'a> ArrowArrayRef for ArrowArrayChild<'a> {
+     /// the data_type as declared in the schema
+-    fn field(&self) -> Result<Field> {
+-        to_field(self.schema)
++    fn field(&self) -> &Field {
++        &self.field
+     }
+ 
+     fn parent(&self) -> &Arc<ArrowArray> {
+@@ -431,48 +428,14 @@ impl<'a> ArrowArrayRef for ArrowArrayChild<'a> {
+     fn array(&self) -> &Ffi_ArrowArray {
+         self.array
+     }
+-
+-    fn schema(&self) -> &Ffi_ArrowSchema {
+-        self.schema
+-    }
+ }
+ 
+ impl<'a> ArrowArrayChild<'a> {
+-    fn from_raw(
+-        array: &'a Ffi_ArrowArray,
+-        schema: &'a Ffi_ArrowSchema,
+-        parent: Arc<ArrowArray>,
+-    ) -> Self {
++    fn from_raw(array: &'a Ffi_ArrowArray, field: Field, parent: Arc<ArrowArray>) -> Self {
+         Self {
+             array,
+-            schema,
++            field,
+             parent,
+         }
+     }
+ }
+-
+-/// Exports an `Array` to the C data interface.
+-pub fn export_to_c(array: Arc<dyn Array>) -> Result<ArrowArray> {
+-    let field = Field::new("", array.data_type().clone(), array.null_count() != 0);
+-
+-    Ok(ArrowArray {
+-        array: Arc::new(Ffi_ArrowArray::new(array)),
+-        schema: Arc::new(Ffi_ArrowSchema::try_new(field)?),
+-    })
+-}
+-
+-pub fn create_empty() -> ArrowArray {
+-    ArrowArray {
+-        array: Arc::new(Ffi_ArrowArray::empty()),
+-        schema: Arc::new(Ffi_ArrowSchema::empty()),
+-    }
+-}
+-
+-impl ArrowArray {
+-    pub fn references(&self) -> (*mut Ffi_ArrowArray, *mut Ffi_ArrowSchema) {
+-        (
+-            self.array.as_ref() as *const Ffi_ArrowArray as *mut Ffi_ArrowArray,
+-            self.schema.as_ref() as *const Ffi_ArrowSchema as *mut Ffi_ArrowSchema,
+-        )
+-    }
+-}
+diff --git a/src/ffi/mod.rs b/src/ffi/mod.rs
+index 19fa83a8fb..15504487c9 100644
+--- a/src/ffi/mod.rs
++++ b/src/ffi/mod.rs
+@@ -5,5 +5,40 @@ mod array;
+ mod ffi;
+ mod schema;
+ 
+-pub use array::try_from;
+-pub use ffi::{create_empty, export_to_c, ArrowArray, ArrowArrayRef};
++pub(crate) use array::try_from;
++pub(crate) use ffi::{ArrowArray, ArrowArrayRef};
++
++use std::sync::Arc;
++
++use crate::array::Array;
++use crate::datatypes::Field;
++use crate::error::Result;
++
++pub use ffi::Ffi_ArrowArray;
++pub use schema::Ffi_ArrowSchema;
++
++use self::schema::to_field;
++
++/// Exports an `Array` to the C data interface.
++/// # Safety
++/// The pointer must be allocated and valid
++pub unsafe fn export_array_to_c(array: Arc<dyn Array>, ptr: *mut Ffi_ArrowArray) {
++    *ptr = Ffi_ArrowArray::new(array);
++}
++
++/// Exports a [`Field`] to the C data interface.
++/// # Safety
++/// The pointer must be allocated and valid
++pub unsafe fn export_field_to_c(field: &Field, ptr: *mut Ffi_ArrowSchema) {
++    *ptr = Ffi_ArrowSchema::new(field)
++}
++
++/// Imports a [`Field`] from the C data interface.
++pub fn import_field_from_c(field: &Ffi_ArrowSchema) -> Result<Field> {
++    to_field(field)
++}
++
++/// Imports a [`Field`] from the C data interface.
++pub fn import_array_from_c(array: Box<Ffi_ArrowArray>, field: &Field) -> Result<Box<dyn Array>> {
++    try_from(Arc::new(ArrowArray::new(array, field.clone())))
++}
+diff --git a/src/ffi/schema.rs b/src/ffi/schema.rs
+index 926871af11..75a0665000 100644
+--- a/src/ffi/schema.rs
++++ b/src/ffi/schema.rs
+@@ -7,14 +7,13 @@ use crate::{
+ 
+ #[allow(dead_code)]
+ struct SchemaPrivateData {
+-    field: Field,
+     children_ptr: Box<[*mut Ffi_ArrowSchema]>,
+     dictionary: Option<*mut Ffi_ArrowSchema>,
+ }
+ 
+ /// ABI-compatible struct for `ArrowSchema` from C Data Interface
+ /// See <https://arrow.apache.org/docs/format/CDataInterface.html#structure-definitions>
+-/// This was created by bindgen
++// This was created by bindgen
+ #[repr(C)]
+ #[derive(Debug)]
+ pub struct Ffi_ArrowSchema {
+@@ -52,27 +51,27 @@ unsafe extern "C" fn c_release_schema(schema: *mut Ffi_ArrowSchema) {
+ }
+ 
+ impl Ffi_ArrowSchema {
+-    /// create a new [`Ffi_ArrowSchema`]. This fails if the fields' [`DataType`] is not supported.
+-    pub fn try_new(field: Field) -> Result<Ffi_ArrowSchema> {
+-        let format = to_format(field.data_type())?;
++    /// creates a new [Ffi_ArrowSchema]
++    pub(crate) fn new(field: &Field) -> Self {
++        let format = to_format(field.data_type());
+         let name = field.name().clone();
+ 
+         // allocate (and hold) the children
+         let children_vec = match field.data_type() {
+             DataType::List(field) => {
+-                vec![Box::new(Ffi_ArrowSchema::try_new(field.as_ref().clone())?)]
++                vec![Box::new(Ffi_ArrowSchema::new(field.as_ref()))]
+             }
+             DataType::LargeList(field) => {
+-                vec![Box::new(Ffi_ArrowSchema::try_new(field.as_ref().clone())?)]
++                vec![Box::new(Ffi_ArrowSchema::new(field.as_ref()))]
+             }
+             DataType::Struct(fields) => fields
+                 .iter()
+-                .map(|field| Ok(Box::new(Ffi_ArrowSchema::try_new(field.clone())?)))
+-                .collect::<Result<Vec<_>>>()?,
++                .map(|field| Box::new(Ffi_ArrowSchema::new(field)))
++                .collect::<Vec<_>>(),
+             DataType::Union(fields, _, _) => fields
+                 .iter()
+-                .map(|field| Ok(Box::new(Ffi_ArrowSchema::try_new(field.clone())?)))
+-                .collect::<Result<Vec<_>>>()?,
++                .map(|field| Box::new(Ffi_ArrowSchema::new(field)))
++                .collect::<Vec<_>>(),
+             _ => vec![],
+         };
+         // note: this cannot be done along with the above because the above is fallible and this op leaks.
+@@ -86,20 +85,19 @@ impl Ffi_ArrowSchema {
+ 
+         let dictionary = if let DataType::Dictionary(_, values) = field.data_type() {
+             // we do not store field info in the dict values, so can't recover it all :(
+-            let field = Field::new("item", values.as_ref().clone(), true);
+-            Some(Box::new(Ffi_ArrowSchema::try_new(field)?))
++            let field = Field::new("", values.as_ref().clone(), true);
++            Some(Box::new(Ffi_ArrowSchema::new(&field)))
+         } else {
+             None
+         };
+ 
+         let mut private = Box::new(SchemaPrivateData {
+-            field,
+             children_ptr,
+             dictionary: dictionary.map(Box::into_raw),
+         });
+ 
+         // <https://arrow.apache.org/docs/format/CDataInterface.html#c.ArrowSchema>
+-        Ok(Ffi_ArrowSchema {
++        Self {
+             format: CString::new(format).unwrap().into_raw(),
+             name: CString::new(name).unwrap().into_raw(),
+             metadata: std::ptr::null_mut(),
+@@ -109,7 +107,7 @@ impl Ffi_ArrowSchema {
+             dictionary: private.dictionary.unwrap_or(std::ptr::null_mut()),
+             release: Some(c_release_schema),
+             private_data: Box::into_raw(private) as *mut ::std::os::raw::c_void,
+-        })
++        }
+     }
+ 
+     /// create an empty [Ffi_ArrowSchema]
+@@ -128,7 +126,7 @@ impl Ffi_ArrowSchema {
+     }
+ 
+     /// returns the format of this schema.
+-    pub fn format(&self) -> &str {
++    pub(crate) fn format(&self) -> &str {
+         assert!(!self.format.is_null());
+         // safe because the lifetime of `self.format` equals `self`
+         unsafe { CStr::from_ptr(self.format) }
+@@ -137,26 +135,26 @@ impl Ffi_ArrowSchema {
+     }
+ 
+     /// returns the name of this schema.
+-    pub fn name(&self) -> &str {
++    pub(crate) fn name(&self) -> &str {
+         assert!(!self.name.is_null());
+         // safe because the lifetime of `self.name` equals `self`
+         unsafe { CStr::from_ptr(self.name) }.to_str().unwrap()
+     }
+ 
+-    pub fn child(&self, index: usize) -> &'static Self {
++    pub(crate) fn child(&self, index: usize) -> &'static Self {
+         assert!(index < self.n_children as usize);
+         assert!(!self.name.is_null());
+         unsafe { self.children.add(index).as_ref().unwrap().as_ref().unwrap() }
+     }
+ 
+-    pub fn dictionary(&self) -> Option<&'static Self> {
++    pub(crate) fn dictionary(&self) -> Option<&'static Self> {
+         if self.dictionary.is_null() {
+             return None;
+         };
+         Some(unsafe { self.dictionary.as_ref().unwrap() })
+     }
+ 
+-    pub fn nullable(&self) -> bool {
++    pub(crate) fn nullable(&self) -> bool {
+         (self.flags / 2) & 1 == 1
+     }
+ }
+@@ -174,8 +172,11 @@ pub fn to_field(schema: &Ffi_ArrowSchema) -> Result<Field> {
+     let dictionary = schema.dictionary();
+     let data_type = if let Some(dictionary) = dictionary {
+         let indices_data_type = to_data_type(schema)?;
+-        let values_data_type = to_data_type(dictionary)?;
+-        DataType::Dictionary(Box::new(indices_data_type), Box::new(values_data_type))
++        let values = to_field(dictionary)?;
++        DataType::Dictionary(
++            Box::new(indices_data_type),
++            Box::new(values.data_type().clone()),
++        )
+     } else {
+         to_data_type(schema)?
+     };
+@@ -285,56 +286,62 @@ fn to_data_type(schema: &Ffi_ArrowSchema) -> Result<DataType> {
+ }
+ 
+ /// the inverse of [to_field]
+-fn to_format(data_type: &DataType) -> Result<String> {
+-    Ok(match data_type {
+-        DataType::Null => "n",
+-        DataType::Boolean => "b",
+-        DataType::Int8 => "c",
+-        DataType::UInt8 => "C",
+-        DataType::Int16 => "s",
+-        DataType::UInt16 => "S",
+-        DataType::Int32 => "i",
+-        DataType::UInt32 => "I",
+-        DataType::Int64 => "l",
+-        DataType::UInt64 => "L",
+-        DataType::Float16 => "e",
+-        DataType::Float32 => "f",
+-        DataType::Float64 => "g",
+-        DataType::Binary => "z",
+-        DataType::LargeBinary => "Z",
+-        DataType::Utf8 => "u",
+-        DataType::LargeUtf8 => "U",
+-        DataType::Date32 => "tdD",
+-        DataType::Date64 => "tdm",
+-        DataType::Time32(TimeUnit::Second) => "tts",
+-        DataType::Time32(TimeUnit::Millisecond) => "ttm",
+-        DataType::Time64(TimeUnit::Microsecond) => "ttu",
+-        DataType::Time64(TimeUnit::Nanosecond) => "ttn",
+-        DataType::Duration(TimeUnit::Second) => "tDs",
+-        DataType::Duration(TimeUnit::Millisecond) => "tDm",
+-        DataType::Duration(TimeUnit::Microsecond) => "tDu",
+-        DataType::Duration(TimeUnit::Nanosecond) => "tDn",
+-        DataType::Interval(IntervalUnit::YearMonth) => "tiM",
+-        DataType::Interval(IntervalUnit::DayTime) => "tiD",
++fn to_format(data_type: &DataType) -> String {
++    match data_type {
++        DataType::Null => "n".to_string(),
++        DataType::Boolean => "b".to_string(),
++        DataType::Int8 => "c".to_string(),
++        DataType::UInt8 => "C".to_string(),
++        DataType::Int16 => "s".to_string(),
++        DataType::UInt16 => "S".to_string(),
++        DataType::Int32 => "i".to_string(),
++        DataType::UInt32 => "I".to_string(),
++        DataType::Int64 => "l".to_string(),
++        DataType::UInt64 => "L".to_string(),
++        DataType::Float16 => "e".to_string(),
++        DataType::Float32 => "f".to_string(),
++        DataType::Float64 => "g".to_string(),
++        DataType::Binary => "z".to_string(),
++        DataType::LargeBinary => "Z".to_string(),
++        DataType::Utf8 => "u".to_string(),
++        DataType::LargeUtf8 => "U".to_string(),
++        DataType::Date32 => "tdD".to_string(),
++        DataType::Date64 => "tdm".to_string(),
++        DataType::Time32(TimeUnit::Second) => "tts".to_string(),
++        DataType::Time32(TimeUnit::Millisecond) => "ttm".to_string(),
++        DataType::Time32(_) => {
++            unreachable!("Time32 is only supported for seconds and milliseconds")
++        }
++        DataType::Time64(TimeUnit::Microsecond) => "ttu".to_string(),
++        DataType::Time64(TimeUnit::Nanosecond) => "ttn".to_string(),
++        DataType::Time64(_) => {
++            unreachable!("Time64 is only supported for micro and nanoseconds")
++        }
++        DataType::Duration(TimeUnit::Second) => "tDs".to_string(),
++        DataType::Duration(TimeUnit::Millisecond) => "tDm".to_string(),
++        DataType::Duration(TimeUnit::Microsecond) => "tDu".to_string(),
++        DataType::Duration(TimeUnit::Nanosecond) => "tDn".to_string(),
++        DataType::Interval(IntervalUnit::YearMonth) => "tiM".to_string(),
++        DataType::Interval(IntervalUnit::DayTime) => "tiD".to_string(),
+         DataType::Timestamp(unit, tz) => {
+             let unit = match unit {
+-                TimeUnit::Second => "s",
+-                TimeUnit::Millisecond => "m",
+-                TimeUnit::Microsecond => "u",
+-                TimeUnit::Nanosecond => "n",
++                TimeUnit::Second => "s".to_string(),
++                TimeUnit::Millisecond => "m".to_string(),
++                TimeUnit::Microsecond => "u".to_string(),
++                TimeUnit::Nanosecond => "n".to_string(),
+             };
+-            return Ok(format!(
++            format!(
+                 "ts{}:{}",
+                 unit,
+                 tz.as_ref().map(|x| x.as_ref()).unwrap_or("")
+-            ));
++            )
+         }
+-        DataType::Decimal(precision, scale) => return Ok(format!("d:{},{}", precision, scale)),
+-        DataType::List(_) => "+l",
+-        DataType::LargeList(_) => "+L",
+-        DataType::Struct(_) => "+s",
+-        DataType::FixedSizeBinary(size) => return Ok(format!("w{}", size)),
+-        DataType::FixedSizeList(_, size) => return Ok(format!("+w:{}", size)),
++        DataType::Decimal(precision, scale) => format!("d:{},{}", precision, scale),
++        DataType::List(_) => "+l".to_string(),
++        DataType::LargeList(_) => "+L".to_string(),
++        DataType::Struct(_) => "+s".to_string(),
++        DataType::FixedSizeBinary(size) => format!("w{}", size),
++        DataType::FixedSizeList(_, size) => format!("+w:{}", size),
+         DataType::Union(f, ids, is_sparse) => {
+             let sparsness = if *is_sparse { 's' } else { 'd' };
+             let mut r = format!("+u{}:", sparsness);
+@@ -346,10 +353,21 @@ fn to_format(data_type: &DataType) -> Result<String> {
+             };
+             let ids = &ids[..ids.len() - 1]; // take away last ","
+             r.push_str(ids);
+-            return Ok(r);
++            r
+         }
+-        DataType::Dictionary(index, _) => return to_format(index.as_ref()),
+-        _ => todo!(),
++        DataType::Dictionary(index, _) => to_format(index.as_ref()),
++    }
++}
++
++pub(super) fn get_field_child(field: &Field, index: usize) -> Result<Field> {
++    match (index, field.data_type()) {
++        (0, DataType::List(field)) => Ok(field.as_ref().clone()),
++        (0, DataType::LargeList(field)) => Ok(field.as_ref().clone()),
++        (index, DataType::Struct(fields)) => Ok(fields[index].clone()),
++        (index, DataType::Union(fields, _, _)) => Ok(fields[index].clone()),
++        (child, data_type) => Err(ArrowError::Ffi(format!(
++            "Requested child {} to type {:?} that has no such child",
++            child, data_type
++        ))),
+     }
+-    .to_string())
+ }

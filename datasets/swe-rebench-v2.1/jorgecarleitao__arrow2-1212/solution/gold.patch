@@ -1,0 +1,301 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7df2c14d4d..7b620163ac 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -47,7 +47,7 @@ regex-syntax = { version = "^0.6", optional = true }
+ streaming-iterator = { version = "0.1", optional = true }
+ fallible-streaming-iterator = { version = "0.1", optional = true }
+ 
+-json-deserializer = { version = "0.3", optional = true }
++json-deserializer = { version = "0.4", optional = true, features = ["preserve_order"] }
+ indexmap = { version = "^1.6", optional = true }
+ 
+ # used to print columns in a nice columnar format
+diff --git a/src/array/mod.rs b/src/array/mod.rs
+index 2a2f4d0e9b..951e14d71a 100644
+--- a/src/array/mod.rs
++++ b/src/array/mod.rs
+@@ -391,7 +391,7 @@ pub use list::{ListArray, ListValuesIter, MutableListArray};
+ pub use map::MapArray;
+ pub use null::NullArray;
+ pub use primitive::*;
+-pub use struct_::StructArray;
++pub use struct_::{MutableStructArray, StructArray};
+ pub use union::UnionArray;
+ pub use utf8::{MutableUtf8Array, Utf8Array, Utf8ValuesIter};
+ 
+diff --git a/src/array/struct_/mod.rs b/src/array/struct_/mod.rs
+index a7c88b6fb1..3d25d8c188 100644
+--- a/src/array/struct_/mod.rs
++++ b/src/array/struct_/mod.rs
+@@ -9,6 +9,8 @@ use super::{new_empty_array, new_null_array, Array};
+ mod ffi;
+ pub(super) mod fmt;
+ mod iterator;
++mod mutable;
++pub use mutable::*;
+ 
+ /// A [`StructArray`] is a nested [`Array`] with an optional validity representing
+ /// multiple [`Array`] with the same number of rows.
+diff --git a/src/array/struct_/mutable.rs b/src/array/struct_/mutable.rs
+new file mode 100644
+index 0000000000..cc02146a77
+--- /dev/null
++++ b/src/array/struct_/mutable.rs
+@@ -0,0 +1,216 @@
++use std::sync::Arc;
++
++use crate::{
++    array::{Array, MutableArray},
++    bitmap::MutableBitmap,
++    datatypes::DataType,
++};
++
++use super::StructArray;
++
++/// Converting a [`MutableStructArray`] into a [`StructArray`] is `O(1)`.
++#[derive(Debug)]
++pub struct MutableStructArray {
++    data_type: DataType,
++    values: Vec<Box<dyn MutableArray>>,
++    validity: Option<MutableBitmap>,
++}
++
++impl From<MutableStructArray> for StructArray {
++    fn from(other: MutableStructArray) -> Self {
++        let validity = if other.validity.as_ref().map(|x| x.unset_bits()).unwrap_or(0) > 0 {
++            other.validity.map(|x| x.into())
++        } else {
++            None
++        };
++
++        StructArray::from_data(
++            other.data_type,
++            other.values.into_iter().map(|mut v| v.as_box()).collect(),
++            validity,
++        )
++    }
++}
++
++impl MutableStructArray {
++    /// Creates a new [`MutableStructArray`].
++    pub fn new(data_type: DataType, values: Vec<Box<dyn MutableArray>>) -> Self {
++        Self::from_data(data_type, values, None)
++    }
++
++    /// Create a [`MutableStructArray`] out of low-end APIs.
++    /// # Panics
++    /// This function panics iff:
++    /// * `data_type` is not [`DataType::Struct`]
++    /// * The inner types of `data_type` are not equal to those of `values`
++    /// * `validity` is not `None` and its length is different from the `values`'s length
++    pub fn from_data(
++        data_type: DataType,
++        values: Vec<Box<dyn MutableArray>>,
++        validity: Option<MutableBitmap>,
++    ) -> Self {
++        match data_type.to_logical_type() {
++            DataType::Struct(ref fields) => assert!(fields
++                .iter()
++                .map(|f| f.data_type())
++                .eq(values.iter().map(|f| f.data_type()))),
++            _ => panic!("StructArray must be initialized with DataType::Struct"),
++        };
++        let self_ = Self {
++            data_type,
++            values,
++            validity,
++        };
++        self_.assert_lengths();
++        self_
++    }
++
++    fn assert_lengths(&self) {
++        let first_len = self.values.first().map(|v| v.len());
++        if let Some(len) = first_len {
++            if !self.values.iter().all(|x| x.len() == len) {
++                let lengths: Vec<_> = self.values.iter().map(|v| v.len()).collect();
++                panic!("StructArray child lengths differ: {:?}", lengths);
++            }
++        }
++        if let Some(validity) = &self.validity {
++            assert_eq!(first_len.unwrap_or(0), validity.len());
++        }
++    }
++
++    /// Extract the low-end APIs from the [`MutableStructArray`].
++    pub fn into_data(self) -> (DataType, Vec<Box<dyn MutableArray>>, Option<MutableBitmap>) {
++        (self.data_type, self.values, self.validity)
++    }
++
++    /// The mutable values
++    pub fn mut_values(&mut self) -> &mut Vec<Box<dyn MutableArray>> {
++        &mut self.values
++    }
++
++    /// The values
++    pub fn values(&self) -> &Vec<Box<dyn MutableArray>> {
++        &self.values
++    }
++
++    /// Return the `i`th child array.
++    pub fn value<A: MutableArray + 'static>(&mut self, i: usize) -> Option<&mut A> {
++        self.values[i].as_mut_any().downcast_mut::<A>()
++    }
++}
++
++impl MutableStructArray {
++    /// Reserves `additional` entries.
++    pub fn reserve(&mut self, additional: usize) {
++        for v in &mut self.values {
++            v.reserve(additional);
++        }
++        if let Some(x) = self.validity.as_mut() {
++            x.reserve(additional)
++        }
++    }
++
++    /// Call this after pushing into each child array.
++    /// # Panics
++    /// This function panics if any of the children does not have exactly one more
++    /// element than before the last call of `push`.
++    pub fn push(&mut self, valid: bool) {
++        match &mut self.validity {
++            Some(validity) => validity.push(valid),
++            None => match valid {
++                true => (),
++                false => self.init_validity(),
++            },
++        };
++        self.assert_lengths();
++    }
++
++    fn push_null(&mut self) {
++        for v in &mut self.values {
++            v.push_null();
++        }
++        self.push(false);
++    }
++
++    fn init_validity(&mut self) {
++        let mut validity = MutableBitmap::with_capacity(self.values.capacity());
++        let len = self.len();
++        if len > 0 {
++            validity.extend_constant(len, true);
++            validity.set(len - 1, false);
++        }
++        self.validity = Some(validity)
++    }
++
++    /// Converts itself into an [`Array`].
++    pub fn into_arc(self) -> Arc<dyn Array> {
++        let a: StructArray = self.into();
++        Arc::new(a)
++    }
++
++    /// Shrinks the capacity of the [`MutableStructArray`] to fit its current length.
++    pub fn shrink_to_fit(&mut self) {
++        for v in &mut self.values {
++            v.shrink_to_fit();
++        }
++        if let Some(validity) = self.validity.as_mut() {
++            validity.shrink_to_fit()
++        }
++    }
++}
++
++impl MutableArray for MutableStructArray {
++    fn len(&self) -> usize {
++        self.values.first().map(|v| v.len()).unwrap_or(0)
++    }
++
++    fn validity(&self) -> Option<&MutableBitmap> {
++        self.validity.as_ref()
++    }
++
++    fn as_box(&mut self) -> Box<dyn Array> {
++        Box::new(StructArray::from_data(
++            self.data_type.clone(),
++            std::mem::take(&mut self.values)
++                .into_iter()
++                .map(|mut v| v.as_box())
++                .collect(),
++            std::mem::take(&mut self.validity).map(|x| x.into()),
++        ))
++    }
++
++    fn as_arc(&mut self) -> Arc<dyn Array> {
++        Arc::new(StructArray::from_data(
++            self.data_type.clone(),
++            std::mem::take(&mut self.values)
++                .into_iter()
++                .map(|mut v| v.as_box())
++                .collect(),
++            std::mem::take(&mut self.validity).map(|x| x.into()),
++        ))
++    }
++
++    fn data_type(&self) -> &DataType {
++        &self.data_type
++    }
++
++    fn as_any(&self) -> &dyn std::any::Any {
++        self
++    }
++
++    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
++        self
++    }
++
++    fn push_null(&mut self) {
++        self.push_null()
++    }
++
++    fn shrink_to_fit(&mut self) {
++        self.shrink_to_fit()
++    }
++
++    fn reserve(&mut self, additional: usize) {
++        self.reserve(additional)
++    }
++}
+diff --git a/src/io/json/read/infer_schema.rs b/src/io/json/read/infer_schema.rs
+index 2ea4f84058..38c147728a 100644
+--- a/src/io/json/read/infer_schema.rs
++++ b/src/io/json/read/infer_schema.rs
+@@ -1,5 +1,4 @@
+ use std::borrow::Borrow;
+-use std::collections::BTreeMap;
+ 
+ use indexmap::map::IndexMap as HashMap;
+ use indexmap::set::IndexSet as HashSet;
+@@ -30,7 +29,7 @@ fn filter_map_nulls(dt: DataType) -> Option<DataType> {
+     }
+ }
+ 
+-fn infer_object(inner: &BTreeMap<String, Value>) -> Result<DataType> {
++fn infer_object(inner: &HashMap<String, Value>) -> Result<DataType> {
+     let fields = inner
+         .iter()
+         .filter_map(|(key, value)| {
+diff --git a/src/io/parquet/write/sink.rs b/src/io/parquet/write/sink.rs
+index 9ba2d4aea9..5086b8e09e 100644
+--- a/src/io/parquet/write/sink.rs
++++ b/src/io/parquet/write/sink.rs
+@@ -1,7 +1,7 @@
+ use ahash::AHashMap;
+ use std::{pin::Pin, task::Poll};
+ 
+-use futures::{future::BoxFuture, AsyncWrite, FutureExt, Sink, TryFutureExt};
++use futures::{future::BoxFuture, AsyncWrite, AsyncWriteExt, FutureExt, Sink, TryFutureExt};
+ use parquet2::metadata::KeyValue;
+ use parquet2::write::FileStreamer;
+ use parquet2::write::WriteOptions as ParquetWriteOptions;
+@@ -218,6 +218,7 @@ where
+ 
+                     this.task = Some(Box::pin(async move {
+                         writer.end(kv_meta).map_err(Error::from).await?;
++                        writer.into_inner().close().map_err(Error::from).await?;
+                         Ok(None)
+                     }));
+                     this.poll_complete(cx)

@@ -1,0 +1,345 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 1def6d319..298a7bb58 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -22,7 +22,7 @@ repos:
+       - id: sort-simple-yaml
+       - id: trailing-whitespace
+   - repo: https://github.com/astral-sh/ruff-pre-commit
+-    rev: 'v0.1.7'
++    rev: 'v0.1.8'
+     hooks:
+       - id: ruff
+         args: [--fix, --exit-non-zero-on-fix]
+diff --git a/dvc/commands/gc.py b/dvc/commands/gc.py
+index 55984fe56..9bb0f8ded 100644
+--- a/dvc/commands/gc.py
++++ b/dvc/commands/gc.py
+@@ -86,6 +86,7 @@ class CmdGC(CmdBase):
+             num=self.args.num,
+             not_in_remote=self.args.not_in_remote,
+             dry=self.args.dry,
++            skip_failed=self.args.skip_failed,
+         )
+         return 0
+ 
+@@ -188,6 +189,12 @@ def add_parser(subparsers, parent_parser):
+         help="Remote storage to collect garbage in",
+         metavar="<name>",
+     )
++    gc_parser.add_argument(
++        "--skip-failed",
++        action="store_true",
++        default=False,
++        help="Skip revisions that fail when collected.",
++    )
+     gc_parser.add_argument(
+         "-f",
+         "--force",
+diff --git a/dvc/dependency/param.py b/dvc/dependency/param.py
+index e30439018..311998ff6 100644
+--- a/dvc/dependency/param.py
++++ b/dvc/dependency/param.py
+@@ -54,12 +54,15 @@ def read_param_file(
+                 continue
+         return ret
+ 
++    from copy import deepcopy
++
+     from dpath import merge
++    from funcy import distinct
+ 
+-    for key_path in key_paths:
++    for key_path in distinct(key_paths):
+         merge(
+             ret,
+-            dpath.search(config, key_path, separator="."),
++            deepcopy(dpath.search(config, key_path, separator=".")),
+             separator=".",
+         )
+     return ret
+diff --git a/dvc/exceptions.py b/dvc/exceptions.py
+index cc74310eb..c79ee09b4 100644
+--- a/dvc/exceptions.py
++++ b/dvc/exceptions.py
+@@ -357,3 +357,15 @@ class ArtifactNotFoundError(DvcException):
+ 
+         desc = f" @ {stage or version}" if (stage or version) else ""
+         super().__init__(f"Unable to find artifact '{name}{desc}'")
++
++
++class RevCollectionError(DvcException):
++    """Thrown if a revision failed to be collected.
++
++    Args:
++        rev (str): revision that failed (or "workspace").
++    """
++
++    def __init__(self, rev):
++        self.rev = rev
++        super().__init__(f"Failed to collect '{rev}'")
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+index 66559a52f..e0e6c0666 100644
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -12,7 +12,12 @@ from typing import (
+     Union,
+ )
+ 
+-from dvc.exceptions import NotDvcRepoError, OutputNotFoundError
++from dvc.exceptions import (
++    DvcException,
++    NotDvcRepoError,
++    OutputNotFoundError,
++    RevCollectionError,
++)
+ from dvc.ignore import DvcIgnoreFilter
+ from dvc.log import logger
+ from dvc.utils.objects import cached_property
+@@ -380,6 +385,7 @@ class Repo:
+             except KeyError:
+                 pass
+         self.data_index.commit()
++        self.data_index.close()
+         self._reset()
+ 
+     def get_data_index_entry(
+@@ -492,6 +498,7 @@ class Repo:
+         revs=None,
+         num=1,
+         push: bool = False,
++        skip_failed: bool = False,
+     ):
+         """Get the stages related to the given target and collect
+         the `info` of its outputs.
+@@ -510,7 +517,7 @@ class Repo:
+         """
+         used = defaultdict(set)
+ 
+-        for _ in self.brancher(
++        for rev in self.brancher(
+             revs=revs,
+             all_branches=all_branches,
+             all_tags=all_tags,
+@@ -519,17 +526,23 @@ class Repo:
+             commit_date=commit_date,
+             num=num,
+         ):
+-            for odb, objs in self.index.used_objs(
+-                targets,
+-                remote=remote,
+-                force=force,
+-                jobs=jobs,
+-                recursive=recursive,
+-                with_deps=with_deps,
+-                push=push,
+-            ).items():
+-                used[odb].update(objs)
+-
++            try:
++                for odb, objs in self.index.used_objs(
++                    targets,
++                    remote=remote,
++                    force=force,
++                    jobs=jobs,
++                    recursive=recursive,
++                    with_deps=with_deps,
++                    push=push,
++                ).items():
++                    used[odb].update(objs)
++            except DvcException as exc:
++                rev = rev or "workspace"
++                if skip_failed:
++                    logger.warning("Failed to collect '%s', skipping", rev)
++                else:
++                    raise RevCollectionError(rev) from exc
+         if used_run_cache:
+             for odb, objs in self.stage_cache.get_used_objs(
+                 used_run_cache, remote=remote, force=force, jobs=jobs
+diff --git a/dvc/repo/gc.py b/dvc/repo/gc.py
+index 5b1f9fc4f..682d05a3f 100644
+--- a/dvc/repo/gc.py
++++ b/dvc/repo/gc.py
+@@ -68,6 +68,7 @@ def gc(  # noqa: PLR0913, C901
+     num: Optional[int] = None,
+     not_in_remote: bool = False,
+     dry: bool = False,
++    skip_failed: bool = False,
+ ):
+     # require `workspace` to be true to come into effect.
+     # assume `workspace` to be enabled if any of `all_tags`, `all_commits`,
+@@ -113,6 +114,7 @@ def gc(  # noqa: PLR0913, C901
+                 jobs=jobs,
+                 revs=[rev] if rev else None,
+                 num=num or 1,
++                skip_failed=skip_failed,
+             ).items():
+                 if odb not in odb_to_obj_ids:
+                     odb_to_obj_ids[odb] = set()
+diff --git a/dvc/repo/index.py b/dvc/repo/index.py
+index 76e2ce3a4..b3dfb47ee 100644
+--- a/dvc/repo/index.py
++++ b/dvc/repo/index.py
+@@ -129,10 +129,25 @@ def _load_data_from_outs(index, prefix, outs):
+         for key_len in range(1, len(key)):
+             parents.add((ws, key[:key_len]))
+ 
++        loaded = None
++        if out.files:
++            loaded = True
++            for okey, ometa, ohi in out.get_obj():
++                for key_len in range(1, len(okey)):
++                    parents.add((ws, (*key, *okey[:key_len])))
++
++                fkey = (*key, *okey)
++                index[(*prefix, ws, *fkey)] = DataIndexEntry(
++                    key=fkey,
++                    meta=ometa,
++                    hash_info=ohi,
++                )
++
+         entry = DataIndexEntry(
+             key=key,
+             meta=out.meta,
+             hash_info=out.hash_info,
++            loaded=loaded,
+         )
+ 
+         if (
+diff --git a/dvc/repo/metrics/show.py b/dvc/repo/metrics/show.py
+index a2f7229b5..3f2ff7f37 100644
+--- a/dvc/repo/metrics/show.py
++++ b/dvc/repo/metrics/show.py
+@@ -17,7 +17,6 @@ from funcy import ldistinct
+ from scmrepo.exceptions import SCMError
+ 
+ from dvc.log import logger
+-from dvc.repo import locked
+ from dvc.scm import NoSCMError
+ from dvc.utils import as_posix, expand_paths
+ from dvc.utils.collections import ensure_list
+@@ -185,7 +184,6 @@ def _hide_workspace(
+     return res
+ 
+ 
+-@locked
+ def show(
+     repo: "Repo",
+     targets: Optional[List[str]] = None,
+diff --git a/dvc/repo/params/show.py b/dvc/repo/params/show.py
+index ea5ceb013..5105a52cc 100644
+--- a/dvc/repo/params/show.py
++++ b/dvc/repo/params/show.py
+@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Un
+ 
+ from dvc.dependency.param import ParamsDependency, read_param_file
+ from dvc.log import logger
+-from dvc.repo import locked
+ from dvc.repo.metrics.show import FileResult, Result
+ from dvc.stage import PipelineStage
+ from dvc.utils import as_posix, expand_paths
+@@ -158,7 +157,6 @@ def _gather_params(
+     return data
+ 
+ 
+-@locked
+ def show(
+     repo: "Repo",
+     targets: Optional[List[str]] = None,
+diff --git a/dvc/repo/push.py b/dvc/repo/push.py
+index ae42610d4..0124af791 100644
+--- a/dvc/repo/push.py
++++ b/dvc/repo/push.py
+@@ -6,21 +6,44 @@ from dvc.ui import ui
+ from . import locked
+ 
+ 
++def _rebuild(idx, path, fs, cb):
++    from dvc_data.index import DataIndex, DataIndexEntry, Meta
++
++    new = DataIndex()
++    items = list(idx.items())
++
++    cb.set_size(len(items))
++    for key, entry in items:
++        if entry.meta and entry.meta.isdir:
++            meta = Meta(isdir=True)
++        else:
++            try:
++                meta = Meta.from_info(fs.info(fs.join(path, *key)), fs.protocol)
++            except FileNotFoundError:
++                meta = None
++
++        if meta:
++            new.add(DataIndexEntry(key=key, meta=meta))
++
++        cb.relative_update(1)
++
++    return new
++
++
+ def _update_meta(index, **kwargs):
+-    from dvc.repo.index import build_data_index
+     from dvc.repo.worktree import _merge_push_meta, worktree_view_by_remotes
+ 
+     stages = set()
+     for remote_name, idx in worktree_view_by_remotes(index, push=True, **kwargs):
+         remote = index.repo.cloud.get_remote(remote_name)
+ 
+-        with ui.progress("Collecting", unit="entry") as pb:
+-            new = build_data_index(
+-                idx,
+-                remote.path,
+-                remote.fs,
+-                callback=pb.as_callback(),
+-            )
++        with ui.progress(
++            desc=f"Collecting {remote.path} on {remote.fs.protocol}",
++            unit="entry",
++            leave=True,
++        ) as pb:
++            cb = pb.as_callback()
++            new = _rebuild(idx.data["repo"], remote.path, remote.fs, cb)
+ 
+         for out in idx.outs:
+             if not remote.fs.version_aware:
+@@ -100,6 +123,7 @@ def push(  # noqa: PLR0913
+     with ui.progress(
+         desc="Collecting",
+         unit="entry",
++        leave=True,
+     ) as pb:
+         data = collect(
+             [idx.data["repo"] for idx in indexes.values()],
+@@ -114,7 +138,8 @@ def push(  # noqa: PLR0913
+     try:
+         with ui.progress(
+             desc="Pushing",
+-            unit="file",
++            bar_format="{desc}",
++            leave=True,
+         ) as pb:
+             push_transferred, push_failed = ipush(
+                 data,
+diff --git a/pyproject.toml b/pyproject.toml
+index 41b28d8c0..ab97301ad 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -35,7 +35,7 @@ dependencies = [
+     "configobj>=5.0.6",
+     "distro>=1.3",
+     "dpath<3,>=2.1.0",
+-    "dvc-data>=3,<3.1",
++    "dvc-data>=3.3,<3.4",
+     "dvc-http>=2.29.0",
+     "dvc-render>=1.0.0,<2",
+     "dvc-studio-client>=0.17.1,<1",
+@@ -77,7 +77,7 @@ gdrive = ["dvc-gdrive>=3,<4"]
+ gs = ["dvc-gs>=3,<4"]
+ hdfs = ["dvc-hdfs>=3,<4"]
+ lint = [
+-    "mypy==1.7.1",
++    "mypy==1.8.0",
+     "pandas-stubs",
+     "types-colorama",
+     "types-psutil",

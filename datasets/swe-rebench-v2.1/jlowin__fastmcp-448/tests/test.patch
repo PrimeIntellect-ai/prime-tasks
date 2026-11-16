@@ -1,0 +1,496 @@
+diff --git a/tests/server/test_openapi.py b/tests/server/test_openapi.py
+index ee2c0f7..d0f016a 100644
+--- a/tests/server/test_openapi.py
++++ b/tests/server/test_openapi.py
+@@ -1,6 +1,7 @@
+ import base64
+ import json
+ import re
++from enum import Enum
+ 
+ import httpx
+ import pytest
+@@ -184,6 +185,13 @@ async def test_create_openapi_server_with_timeout(
+         assert template._timeout == 1.0
+ 
+ 
++def _tool_dump(tool):
++    """Return the tool fields that are stable across MCP versions."""
++    dump = tool.model_dump()
++    keys = ("name", "annotations", "description", "inputSchema")
++    return {key: dump[key] for key in keys}
++
++
+ class TestTools:
+     async def test_list_tools(self, fastmcp_openapi_server: FastMCPOpenAPI):
+         """
+@@ -193,7 +201,7 @@ class TestTools:
+             tools = await client.list_tools()
+         assert len(tools) == 2
+ 
+-        assert tools[0].model_dump() == dict(
++        assert _tool_dump(tools[0]) == dict(
+             name="create_user_users_post",
+             annotations=None,
+             description=IsStr(regex=r"^Create a new user\..*$", regex_flags=re.DOTALL),
+@@ -206,7 +214,7 @@ class TestTools:
+                 "required": ["name", "active"],
+             },
+         )
+-        assert tools[1].model_dump() == dict(
++        assert _tool_dump(tools[1]) == dict(
+             name="update_user_name_users__user_id__name_patch",
+             annotations=None,
+             description=IsStr(
+@@ -1028,7 +1036,10 @@ async def test_none_path_parameters_rejected(
+     # Create a client and try to call a tool with a None path parameter
+     async with Client(mcp_server) as client:
+         # get_user has a required path parameter user_id
+-        with pytest.raises(ClientError, match="Missing required path parameters"):
++        with pytest.raises(
++            ClientError,
++            match="Missing required path parameters|Input validation error",
++        ):
+             await client.call_tool(
+                 "update_user_name_users__user_id__name_patch",
+                 {
+@@ -1817,3 +1828,97 @@ class TestReprMethods:
+         assert f"name={template.name!r}" in template_repr
+         assert "uri_template=" in template_repr
+         assert "path=" in template_repr
++
++
++def _resolve_local_refs(node, root):
++    """Resolve local ``#/...`` JSON references within *node* using *root*."""
++    if isinstance(node, dict):
++        ref = node.get("$ref")
++        if isinstance(ref, str) and ref.startswith("#/"):
++            target = root
++            try:
++                for part in ref[2:].split("/"):
++                    target = target[part]
++            except (KeyError, TypeError):
++                return node
++            return _resolve_local_refs(target, root)
++        return {key: _resolve_local_refs(value, root) for key, value in node.items()}
++    if isinstance(node, list):
++        return [_resolve_local_refs(item, root) for item in node]
++    return node
++
++
++def _collect_enum_values(node):
++    """Collect every ``enum`` list found anywhere within *node*."""
++    found = []
++    if isinstance(node, dict):
++        enum = node.get("enum")
++        if isinstance(enum, list):
++            found.append(enum)
++        for value in node.values():
++            found.extend(_collect_enum_values(value))
++    elif isinstance(node, list):
++        for item in node:
++            found.extend(_collect_enum_values(item))
++    return found
++
++
++class TestEnumHandling:
++    """Tests for handling enum parameters in OpenAPI schemas."""
++
++    async def test_enum_parameter_schema(self):
++        """Test that enum parameters are properly handled in tool parameter schemas."""
++
++        # Define an enum just like in example.py
++        class QueryEnum(str, Enum):
++            foo = "foo"
++            bar = "bar"
++            baz = "baz"
++
++        # Create a minimal FastAPI app with an endpoint using the enum
++        app = FastAPI()
++
++        @app.post("/items/{item_id}")
++        def read_item(
++            item_id: int,
++            query: QueryEnum | None = None,
++        ):
++            return {"item_id": item_id, "query": query}
++
++        # Create a client for the app
++        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
++
++        # Create the FastMCPOpenAPI server from the app
++        openapi_spec = app.openapi()
++        server = FastMCPOpenAPI(
++            openapi_spec=openapi_spec,
++            client=client,
++            name="Enum Test",
++        )
++
++        # Read the tool through the client-facing protocol.
++        async with Client(server) as mcp_client:
++            tools = await mcp_client.list_tools()
++
++        read_item_tool = next(
++            (t for t in tools if t.name == "read_item_items__item_id__post"), None
++        )
++        assert read_item_tool is not None, "read_item tool wasn't created"
++
++        # The schema exposed to clients must include the enum parameter and
++        # make its referenced definition available.
++        parameters = read_item_tool.model_dump()["inputSchema"]
++        assert "properties" in parameters
++        assert "query" in parameters["properties"]
++
++        # The enum definition must be available to the client. It may be
++        # inlined directly in the parameter schema or included via $defs and
++        # referenced; either way, resolving the parameter schema must expose
++        # the enum values.
++        resolved_query = _resolve_local_refs(
++            parameters["properties"]["query"], parameters
++        )
++        assert any(
++            set(values) == {"foo", "bar", "baz"}
++            for values in _collect_enum_values(resolved_query)
++        )
+diff --git a/tests/utilities/test_json_schema.py b/tests/utilities/test_json_schema.py
+index 7ae6845..b3af905 100644
+--- a/tests/utilities/test_json_schema.py
++++ b/tests/utilities/test_json_schema.py
+@@ -1,110 +1,206 @@
+-from fastmcp.utilities.json_schema import _prune_param, prune_params
+-
+-
+-def test_prune_param_nonexistent():
+-    """Test pruning a parameter that doesn't exist."""
+-    schema = {"properties": {"foo": {"type": "string"}}}
+-    result = _prune_param(schema, "bar")
+-    assert result == schema  # Schema should be unchanged
+-
+-
+-def test_prune_param_exists():
+-    """Test pruning a parameter that exists."""
+-    schema = {"properties": {"foo": {"type": "string"}, "bar": {"type": "integer"}}}
+-    result = _prune_param(schema, "bar")
+-    assert result["properties"] == {"foo": {"type": "string"}}
+-
+-
+-def test_prune_param_last_property():
+-    """Test pruning the only/last parameter, should leave empty properties object."""
+-    schema = {"properties": {"foo": {"type": "string"}}}
+-    result = _prune_param(schema, "foo")
+-    assert "properties" in result
+-    assert result["properties"] == {}
+-
+-
+-def test_prune_param_from_required():
+-    """Test pruning a parameter that's in the required list."""
+-    schema = {
+-        "properties": {"foo": {"type": "string"}, "bar": {"type": "integer"}},
+-        "required": ["foo", "bar"],
+-    }
+-    result = _prune_param(schema, "bar")
+-    assert result["required"] == ["foo"]
+-
+-
+-def test_prune_param_last_required():
+-    """Test pruning the last required parameter, should remove required field."""
+-    schema = {
+-        "properties": {"foo": {"type": "string"}, "bar": {"type": "integer"}},
+-        "required": ["foo"],
+-    }
+-    result = _prune_param(schema, "foo")
+-    assert "required" not in result
+-
+-
+-def test_prune_param_with_refs():
+-    """Test pruning a parameter that has references in $defs."""
+-    schema = {
+-        "properties": {
+-            "foo": {"$ref": "#/$defs/foo_def"},
+-            "bar": {"$ref": "#/$defs/bar_def"},
+-        },
+-        "$defs": {
+-            "foo_def": {"type": "string"},
+-            "bar_def": {"type": "integer"},
+-        },
+-    }
+-    result = _prune_param(schema, "bar")
+-    assert "bar_def" not in result["$defs"]
+-    assert "foo_def" in result["$defs"]
+-
+-
+-def test_prune_param_all_refs():
+-    """Test pruning all parameters with refs, should remove $defs."""
+-    schema = {
+-        "properties": {
+-            "foo": {"$ref": "#/$defs/foo_def"},
+-        },
+-        "$defs": {
+-            "foo_def": {"type": "string"},
+-        },
+-    }
+-    result = _prune_param(schema, "foo")
+-    assert "$defs" not in result
+-
+-
+-def test_prune_params_multiple():
+-    """Test pruning multiple parameters at once."""
+-    schema = {
+-        "properties": {
+-            "foo": {"type": "string"},
+-            "bar": {"type": "integer"},
+-            "baz": {"type": "boolean"},
+-        },
+-        "required": ["foo", "bar"],
+-    }
+-    result = prune_params(schema, ["foo", "baz"])
+-    assert result["properties"] == {"bar": {"type": "integer"}}
+-    assert result["required"] == ["bar"]
+-
+-
+-def test_prune_params_nested_refs():
+-    """Test pruning with nested references."""
+-    schema = {
+-        "properties": {
+-            "foo": {
+-                "type": "object",
+-                "properties": {"nested": {"$ref": "#/$defs/nested_def"}},
++import copy
++
++from fastmcp.utilities.json_schema import compress_schema
++
++
++class TestCompressSchema:
++    """Tests for the compress_schema function."""
++
++    def test_prune_params(self):
++        """Test pruning parameters with compress_schema."""
++        schema = {
++            "properties": {
++                "foo": {"type": "string"},
++                "bar": {"type": "integer"},
++                "baz": {"type": "boolean"},
++            },
++            "required": ["foo", "bar"],
++        }
++        result = compress_schema(schema, prune_params=["foo", "baz"])
++        assert result["properties"] == {"bar": {"type": "integer"}}
++        assert result["required"] == ["bar"]
++
++    def test_prune_nonexistent_param(self):
++        """Pruning a parameter that doesn't exist leaves the schema unchanged."""
++        schema = {"properties": {"foo": {"type": "string"}}}
++        result = compress_schema(schema, prune_params=["bar"])
++        assert result["properties"] == {"foo": {"type": "string"}}
++
++    def test_prune_last_property(self):
++        """Pruning the only property removes it from properties."""
++        schema = {"properties": {"foo": {"type": "string"}}}
++        result = compress_schema(schema, prune_params=["foo"])
++        assert "foo" not in result.get("properties", {})
++
++    def test_prune_param_from_required(self):
++        """Pruning a required parameter removes it from the required list."""
++        schema = {
++            "properties": {"foo": {"type": "string"}, "bar": {"type": "integer"}},
++            "required": ["foo", "bar"],
++        }
++        result = compress_schema(schema, prune_params=["bar"])
++        assert result["required"] == ["foo"]
++
++    def test_prune_last_required(self):
++        """Pruning the last required parameter removes it from required."""
++        schema = {
++            "properties": {"foo": {"type": "string"}, "bar": {"type": "integer"}},
++            "required": ["foo"],
++        }
++        result = compress_schema(schema, prune_params=["foo"])
++        assert "foo" not in result.get("required", [])
++
++    def test_prune_defs(self):
++        """Unused definitions are removed by default."""
++        schema = {
++            "properties": {
++                "foo": {"$ref": "#/$defs/foo_def"},
++                "bar": {"type": "integer"},
++            },
++            "$defs": {
++                "foo_def": {"type": "string"},
++                "unused_def": {"type": "number"},
++            },
++        }
++        result = compress_schema(schema)
++        assert "foo_def" in result["$defs"]
++        assert "unused_def" not in result["$defs"]
++
++    def test_disable_prune_defs(self):
++        """Disabling pruning keeps all definitions."""
++        schema = {
++            "properties": {
++                "foo": {"$ref": "#/$defs/foo_def"},
++                "bar": {"type": "integer"},
++            },
++            "$defs": {
++                "foo_def": {"type": "string"},
++                "unused_def": {"type": "number"},
++            },
++        }
++        result = compress_schema(schema, prune_defs=False)
++        assert "foo_def" in result["$defs"]
++        assert "unused_def" in result["$defs"]
++
++    def test_nested_references_kept(self):
++        """Definitions referenced through other definitions are kept."""
++        schema = {
++            "properties": {"foo": {"$ref": "#/$defs/foo_def"}},
++            "$defs": {
++                "foo_def": {
++                    "type": "object",
++                    "properties": {"nested": {"$ref": "#/$defs/nested_def"}},
++                },
++                "nested_def": {"type": "string"},
++                "unused_def": {"type": "integer"},
++            },
++        }
++        result = compress_schema(schema)
++        assert "foo_def" in result["$defs"]
++        assert "nested_def" in result["$defs"]
++        assert "unused_def" not in result["$defs"]
++
++    def test_array_references_kept(self):
++        """Definitions referenced from array items are kept."""
++        schema = {
++            "properties": {
++                "items": {"type": "array", "items": {"$ref": "#/$defs/item_def"}},
++            },
++            "$defs": {
++                "item_def": {"type": "string"},
++                "unused_def": {"type": "integer"},
++            },
++        }
++        result = compress_schema(schema)
++        assert "item_def" in result["$defs"]
++        assert "unused_def" not in result["$defs"]
++
++    def test_removes_unused_defs(self):
++        """Unused definitions are dropped."""
++        schema = {
++            "properties": {"foo": {"type": "string"}},
++            "$defs": {"unused_def": {"type": "integer"}},
++        }
++        result = compress_schema(schema)
++        assert "unused_def" not in result.get("$defs", {})
++
++    def test_pruning_additional_properties(self):
++        """additionalProperties: False is removed by default."""
++        schema = {
++            "type": "object",
++            "properties": {"foo": {"type": "string"}},
++            "additionalProperties": False,
++        }
++        result = compress_schema(schema)
++        assert "additionalProperties" not in result
++
++    def test_disable_pruning_additional_properties(self):
++        """Disabling pruning retains additionalProperties: False."""
++        schema = {
++            "type": "object",
++            "properties": {"foo": {"type": "string"}},
++            "additionalProperties": False,
++        }
++        result = compress_schema(schema, prune_additional_properties=False)
++        assert result["additionalProperties"] is False
++
++    def test_keeps_additional_properties_true(self):
++        """additionalProperties: True is not removed."""
++        schema = {
++            "type": "object",
++            "properties": {"foo": {"type": "string"}},
++            "additionalProperties": True,
++        }
++        result = compress_schema(schema)
++        assert result["additionalProperties"] is True
++
++    def test_keeps_additional_properties_schema(self):
++        """An additionalProperties schema is not removed."""
++        schema = {
++            "type": "object",
++            "properties": {"foo": {"type": "string"}},
++            "additionalProperties": {"type": "string"},
++        }
++        result = compress_schema(schema)
++        assert result["additionalProperties"] == {"type": "string"}
++
++    def test_combined_operations(self):
++        """All pruning operations can be applied together."""
++        schema = {
++            "type": "object",
++            "properties": {
++                "keep": {"type": "string"},
++                "remove": {"$ref": "#/$defs/remove_def"},
++            },
++            "required": ["keep", "remove"],
++            "additionalProperties": False,
++            "$defs": {
++                "remove_def": {"type": "string"},
++                "unused_def": {"type": "number"},
++            },
++        }
++        result = compress_schema(schema, prune_params=["remove"])
++        assert "remove" not in result["properties"]
++        assert result["required"] == ["keep"]
++        assert "remove_def" not in result.get("$defs", {})
++        assert "unused_def" not in result.get("$defs", {})
++        assert "additionalProperties" not in result
++
++    def test_does_not_mutate_input(self):
++        """The input schema is not modified."""
++        schema = {
++            "type": "object",
++            "properties": {
++                "keep": {"type": "string"},
++                "remove": {"$ref": "#/$defs/remove_def"},
++            },
++            "required": ["keep", "remove"],
++            "additionalProperties": False,
++            "$defs": {
++                "remove_def": {"type": "string"},
++                "unused_def": {"type": "number"},
+             },
+-            "bar": {"$ref": "#/$defs/bar_def"},
+-        },
+-        "$defs": {
+-            "nested_def": {"type": "string"},
+-            "bar_def": {"type": "integer"},
+-        },
+-    }
+-    # Removing foo should keep nested_def as it's not referenced anymore
+-    result = _prune_param(schema, "foo")
+-    assert "nested_def" not in result["$defs"]
+-    assert "bar_def" in result["$defs"]
++        }
++        original = copy.deepcopy(schema)
++        compress_schema(schema, prune_params=["remove"])
++        assert schema == original
+diff --git a/tests/utilities/test_typeadapter.py b/tests/utilities/test_typeadapter.py
+index 9218586..68f11b9 100644
+--- a/tests/utilities/test_typeadapter.py
++++ b/tests/utilities/test_typeadapter.py
+@@ -13,7 +13,7 @@ import annotated_types
+ import pytest
+ from pydantic import BaseModel, Field
+ 
+-from fastmcp.utilities.json_schema import prune_params
++from fastmcp.utilities.json_schema import compress_schema
+ from fastmcp.utilities.types import get_cached_typeadapter
+ 
+ 
+@@ -175,7 +175,7 @@ def test_skip_names():
+     # Get schema and prune parameters
+     type_adapter = get_cached_typeadapter(func_with_many_params)
+     schema = type_adapter.json_schema()
+-    pruned_schema = prune_params(schema, params=["skip_this", "also_skip"])
++    pruned_schema = compress_schema(schema, prune_params=["skip_this", "also_skip"])
+ 
+     # Check that only the desired parameters remain
+     assert "keep_this" in pruned_schema["properties"]

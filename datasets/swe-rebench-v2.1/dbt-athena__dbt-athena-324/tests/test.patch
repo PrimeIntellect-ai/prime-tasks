@@ -1,0 +1,189 @@
+diff --git a/tests/unit/constants.py b/tests/unit/constants.py
+index 0513ab6..8fe9aa8 100644
+--- a/tests/unit/constants.py
++++ b/tests/unit/constants.py
+@@ -1,6 +1,7 @@
+ CATALOG_ID = "12345678910"
+ DATA_CATALOG_NAME = "awsdatacatalog"
+ SHARED_DATA_CATALOG_NAME = "9876543210"
++FEDERATED_QUERY_CATALOG_NAME = "federated_query_data_source"
+ DATABASE_NAME = "test_dbt_athena"
+ BUCKET = "test-dbt-athena"
+ AWS_REGION = "eu-west-1"
+diff --git a/tests/unit/test_adapter.py b/tests/unit/test_adapter.py
+index 30d39e4..95ce59d 100644
+--- a/tests/unit/test_adapter.py
++++ b/tests/unit/test_adapter.py
+@@ -4,7 +4,10 @@ from unittest.mock import patch
+ 
+ import agate
+ import boto3
++import botocore
+ import pytest
++
++# from botocore.client.BaseClient import _make_api_call
+ from moto import mock_athena, mock_glue, mock_s3, mock_sts
+ from moto.core import DEFAULT_ACCOUNT_ID
+ 
+@@ -28,6 +31,7 @@ from .constants import (
+     BUCKET,
+     DATA_CATALOG_NAME,
+     DATABASE_NAME,
++    FEDERATED_QUERY_CATALOG_NAME,
+     S3_STAGING_DIR,
+     SHARED_DATA_CATALOG_NAME,
+ )
+@@ -66,6 +70,7 @@ class TestAthenaAdapter:
+             ("awsdatacatalog", "quux"),
+             ("awsdatacatalog", "baz"),
+             (SHARED_DATA_CATALOG_NAME, "foo"),
++            (FEDERATED_QUERY_CATALOG_NAME, "foo"),
+         }
+         self.mock_manifest.nodes = {
+             "model.root.model1": CompiledNode(
+@@ -212,6 +217,42 @@ class TestAthenaAdapter:
+                 raw_code="select * from source_table",
+                 language="",
+             ),
++            "model.root.model5": CompiledNode(
++                name="model5",
++                database=FEDERATED_QUERY_CATALOG_NAME,
++                schema="foo",
++                resource_type=NodeType.Model,
++                unique_id="model.root.model5",
++                alias="bar",
++                fqn=["root", "model5"],
++                package_name="root",
++                refs=[],
++                sources=[],
++                depends_on=DependsOn(),
++                config=NodeConfig.from_dict(
++                    {
++                        "enabled": True,
++                        "materialized": "table",
++                        "persist_docs": {},
++                        "post-hook": [],
++                        "pre-hook": [],
++                        "vars": {},
++                        "meta": {"owner": "data-engineers"},
++                        "quoting": {},
++                        "column_types": {},
++                        "tags": [],
++                    }
++                ),
++                tags=[],
++                path="model5.sql",
++                original_file_path="model5.sql",
++                compiled=True,
++                extra_ctes_injected=False,
++                extra_ctes=[],
++                checksum=FileHash.from_contents(""),
++                raw_code="select * from source_table",
++                language="",
++            ),
+         }
+ 
+     @property
+@@ -612,25 +653,58 @@ class TestAthenaAdapter:
+         for row in actual.rows.values():
+             assert row.values() in expected_rows
+ 
+-    def test__get_catalog_schemas(self):
+-        res = self.adapter._get_catalog_schemas(self.mock_manifest)
+-        assert len(res.keys()) == 2
+-
+-        information_schema_0 = list(res.keys())[0]
+-        assert information_schema_0.name == "INFORMATION_SCHEMA"
+-        assert information_schema_0.schema is None
+-        assert information_schema_0.database == "awsdatacatalog"
+-        relations = list(res.values())[0]
+-        assert set(relations.keys()) == {"foo", "quux", "baz"}
+-        assert list(relations.values()) == [{"bar"}, {"bar"}, {"qux"}]
+-
+-        information_schema_1 = list(res.keys())[1]
+-        assert information_schema_1.name == "INFORMATION_SCHEMA"
+-        assert information_schema_1.schema is None
+-        assert information_schema_1.database == SHARED_DATA_CATALOG_NAME
+-        relations = list(res.values())[1]
+-        assert set(relations.keys()) == {"foo"}
+-        assert list(relations.values()) == [{"bar"}]
++    @mock_athena
++    def test_catalog_generation_for_federated_query_catalog(self, mock_aws_service):
++        mock_aws_service.create_data_catalog(
++            catalog_name=FEDERATED_QUERY_CATALOG_NAME, catalog_type="LAMBDA"
++        )
++
++        # Moto does not support Athena metadata APIs for federated catalogs, so the
++        # table metadata is served by a patched API call. Both Athena metadata
++        # operations return the same table description.
++        orig = botocore.client.BaseClient._make_api_call
++        table_metadata = {
++            "Name": "bar",
++            "TableType": "EXTERNAL_TABLE",
++            "Columns": [
++                {"Name": "id", "Type": "string"},
++                {"Name": "country", "Type": "string"},
++            ],
++            "PartitionKeys": [{"Name": "dt", "Type": "date"}],
++        }
++
++        def mock_athena_list_table_metadata(client, operation_name, kwargs):
++            if operation_name == "ListTableMetadata":
++                return {"TableMetadataList": [table_metadata]}
++            if operation_name == "GetTableMetadata":
++                return {"TableMetadata": table_metadata}
++            return orig(client, operation_name, kwargs)
++
++        manifest = mock.MagicMock()
++        manifest.nodes = {"model.root.model5": self.mock_manifest.nodes["model.root.model5"]}
++        manifest.sources = {}
++        manifest.get_used_schemas.return_value = {(FEDERATED_QUERY_CATALOG_NAME, "foo")}
++
++        with patch("botocore.client.BaseClient._make_api_call", new=mock_athena_list_table_metadata):
++            actual, errors = self.adapter.get_catalog(manifest)
++
++        assert not errors
++        rows = [dict(zip(actual.column_names, row.values())) for row in actual.rows.values()]
++        discovered_metadata = {
++            (
++                row["table_database"],
++                row["table_schema"],
++                row["table_name"],
++                row["column_name"],
++                row["column_type"],
++            )
++            for row in rows
++        }
++        assert discovered_metadata == {
++            (FEDERATED_QUERY_CATALOG_NAME, "foo", "bar", "id", "string"),
++            (FEDERATED_QUERY_CATALOG_NAME, "foo", "bar", "country", "string"),
++            (FEDERATED_QUERY_CATALOG_NAME, "foo", "bar", "dt", "date"),
++        }
+ 
+     @mock_athena
+     @mock_sts
+diff --git a/tests/unit/utils.py b/tests/unit/utils.py
+index 60ec02e..3fd47ec 100644
+--- a/tests/unit/utils.py
++++ b/tests/unit/utils.py
+@@ -146,10 +146,18 @@ class TestAdapterConversions:
+ 
+ class MockAWSService:
+     def create_data_catalog(
+-        self, catalog_name: str = DATA_CATALOG_NAME, catalog_type: str = "GLUE", catalog_id: str = CATALOG_ID
++        self,
++        catalog_name: str = DATA_CATALOG_NAME,
++        catalog_type: str = "GLUE",
++        catalog_id: str = CATALOG_ID,
+     ):
+         athena = boto3.client("athena", region_name=AWS_REGION)
+-        athena.create_data_catalog(Name=catalog_name, Type=catalog_type, Parameters={"catalog-id": catalog_id})
++        catalog_type_value = getattr(catalog_type, "value", catalog_type)
++        if catalog_type_value == "GLUE":
++            parameters = {"catalog-id": catalog_id}
++        else:
++            parameters = {"catalog": catalog_name}
++        athena.create_data_catalog(Name=catalog_name, Type=catalog_type_value, Parameters=parameters)
+ 
+     def create_database(self, name: str = DATABASE_NAME, catalog_id: str = CATALOG_ID):
+         glue = boto3.client("glue", region_name=AWS_REGION)

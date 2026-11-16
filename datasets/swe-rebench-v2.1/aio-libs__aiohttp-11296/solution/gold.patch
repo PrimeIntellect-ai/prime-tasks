@@ -1,0 +1,78 @@
+diff --git a/CHANGES/11270.bugfix.rst b/CHANGES/11270.bugfix.rst
+new file mode 100644
+index 000000000..d1e0992b9
+--- /dev/null
++++ b/CHANGES/11270.bugfix.rst
+@@ -0,0 +1,1 @@
++Fixed file uploads failing with HTTP 422 errors when encountering 307/308 redirects, and 301/302 redirects for non-POST methods, by preserving the request body when appropriate per :rfc:`9110#section-15.4.3-3.1` -- by :user:`bdraco`.
+diff --git a/aiohttp/client.py b/aiohttp/client.py
+index 26492cd15..0c72d5948 100644
+--- a/aiohttp/client.py
++++ b/aiohttp/client.py
+@@ -821,6 +821,12 @@ class ClientSession:
+                             data = None
+                             if headers.get(hdrs.CONTENT_LENGTH):
+                                 headers.pop(hdrs.CONTENT_LENGTH)
++                        else:
++                            # For 307/308, always preserve the request body
++                            # For 301/302 with non-POST methods, preserve the request body
++                            # https://www.rfc-editor.org/rfc/rfc9110#section-15.4.3-3.1
++                            # Use the existing payload to avoid recreating it from a potentially consumed file
++                            data = req._body
+ 
+                         r_url = resp.headers.get(hdrs.LOCATION) or resp.headers.get(
+                             hdrs.URI
+diff --git a/aiohttp/payload.py b/aiohttp/payload.py
+index d119d9bee..3affa710b 100644
+--- a/aiohttp/payload.py
++++ b/aiohttp/payload.py
+@@ -486,10 +486,14 @@ class IOBasePayload(Payload):
+         if self._start_position is None:
+             try:
+                 self._start_position = self._value.tell()
+-            except OSError:
++            except (OSError, AttributeError):
+                 self._consumed = True  # Cannot seek, mark as consumed
+             return
+-        self._value.seek(self._start_position)
++        try:
++            self._value.seek(self._start_position)
++        except (OSError, AttributeError):
++            # Failed to seek back - mark as consumed since we've already read
++            self._consumed = True
+ 
+     def _read_and_available_len(
+         self, remaining_content_len: Optional[int]
+@@ -540,11 +544,30 @@ class IOBasePayload(Payload):
+         """
+         Size of the payload in bytes.
+ 
+-        Returns the number of bytes remaining to be read from the file.
++        Returns the total size of the payload content from the initial position.
++        This ensures consistent Content-Length for requests, including 307/308 redirects
++        where the same payload instance is reused.
++
+         Returns None if the size cannot be determined (e.g., for unseekable streams).
+         """
+         try:
+-            return os.fstat(self._value.fileno()).st_size - self._value.tell()
++            # Store the start position on first access.
++            # This is critical when the same payload instance is reused (e.g., 307/308
++            # redirects). Without storing the initial position, after the payload is
++            # read once, the file position would be at EOF, which would cause the
++            # size calculation to return 0 (file_size - EOF position).
++            # By storing the start position, we ensure the size calculation always
++            # returns the correct total size for any subsequent use.
++            if self._start_position is None:
++                try:
++                    self._start_position = self._value.tell()
++                except (OSError, AttributeError):
++                    # Can't get position, can't determine size
++                    return None
++
++            # Return the total size from the start position
++            # This ensures Content-Length is correct even after reading
++            return os.fstat(self._value.fileno()).st_size - self._start_position
+         except (AttributeError, OSError):
+             return None
+ 

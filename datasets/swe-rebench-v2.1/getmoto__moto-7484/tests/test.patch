@@ -1,0 +1,178 @@
+diff --git a/tests/test_dynamodb/__init__.py b/tests/test_dynamodb/__init__.py
+index fb3729acd..3c8492eba 100644
+--- a/tests/test_dynamodb/__init__.py
++++ b/tests/test_dynamodb/__init__.py
+@@ -7,7 +7,7 @@ import boto3
+ from moto import mock_aws
+ 
+ 
+-def dynamodb_aws_verified(create_table: bool = True):
++def dynamodb_aws_verified(create_table: bool = True, add_range: bool = False):
+     """
+     Function that is verified to work against AWS.
+     Can be run against AWS at any time by setting:
+@@ -46,10 +46,15 @@ def dynamodb_aws_verified(create_table: bool = True):
+         def create_table_and_test(table_name):
+             client = boto3.client("dynamodb", region_name="us-east-1")
+ 
++            schema = [{"AttributeName": "pk", "KeyType": "HASH"}]
++            defs = [{"AttributeName": "pk", "AttributeType": "S"}]
++            if add_range:
++                schema.append({"AttributeName": "sk", "KeyType": "RANGE"})
++                defs.append({"AttributeName": "sk", "AttributeType": "S"})
+             client.create_table(
+                 TableName=table_name,
+-                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+-                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
++                KeySchema=schema,
++                AttributeDefinitions=defs,
+                 ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 5},
+                 Tags=[{"Key": "environment", "Value": "moto_tests"}],
+             )
+diff --git a/tests/test_dynamodb/test_dynamodb.py b/tests/test_dynamodb/test_dynamodb.py
+index 8feeb8fa2..3cfcfd071 100644
+--- a/tests/test_dynamodb/test_dynamodb.py
++++ b/tests/test_dynamodb/test_dynamodb.py
+@@ -1,3 +1,4 @@
++import copy
+ import re
+ import uuid
+ from datetime import datetime
+@@ -5957,3 +5958,86 @@ def test_update_item_with_global_secondary_index():
+                 "One or more parameter values were invalid: Type mismatch"
+                 in err["Message"]
+             )
++
++
++@pytest.mark.aws_verified
++@dynamodb_aws_verified(add_range=True)
++def test_query_with_unknown_last_evaluated_key(table_name=None):
++    client = boto3.client("dynamodb", region_name="us-east-1")
++
++    for i in range(10):
++        client.put_item(
++            TableName=table_name,
++            Item={
++                "pk": {"S": "hash_value"},
++                "sk": {"S": f"range_value{i}"},
++            },
++        )
++
++    p1 = client.query(
++        TableName=table_name,
++        KeyConditionExpression="#h = :h",
++        ExpressionAttributeNames={"#h": "pk"},
++        ExpressionAttributeValues={":h": {"S": "hash_value"}},
++        Limit=1,
++    )
++    assert p1["Items"] == [{"pk": {"S": "hash_value"}, "sk": {"S": "range_value0"}}]
++
++    # Using the Exact ExclusiveStartKey provided
++    p2 = client.query(
++        TableName=table_name,
++        KeyConditionExpression="#h = :h",
++        ExpressionAttributeNames={"#h": "pk"},
++        ExpressionAttributeValues={":h": {"S": "hash_value"}},
++        Limit=1,
++        ExclusiveStartKey=p1["LastEvaluatedKey"],
++    )
++    assert p2["Items"] == [{"pk": {"S": "hash_value"}, "sk": {"S": "range_value1"}}]
++
++    # We can change ExclusiveStartKey
++    # It doesn't need to match - it just needs to be >= page1, but < page1
++    different_key = copy.copy(p1["LastEvaluatedKey"])
++    different_key["sk"]["S"] = different_key["sk"]["S"] + "0"
++    p3 = client.query(
++        TableName=table_name,
++        KeyConditionExpression="#h = :h",
++        ExpressionAttributeNames={"#h": "pk"},
++        ExpressionAttributeValues={":h": {"S": "hash_value"}},
++        Limit=1,
++        ExclusiveStartKey=different_key,
++    )
++    assert p3["Items"] == [{"pk": {"S": "hash_value"}, "sk": {"S": "range_value1"}}]
++
++    # Sanity check - increasing the sk to something much greater will result in a different outcome
++    different_key["sk"]["S"] = "range_value500"
++    p4 = client.query(
++        TableName=table_name,
++        KeyConditionExpression="#h = :h",
++        ExpressionAttributeNames={"#h": "pk"},
++        ExpressionAttributeValues={":h": {"S": "hash_value"}},
++        Limit=1,
++        ExclusiveStartKey=different_key,
++    )
++    assert p4["Items"] == [{"pk": {"S": "hash_value"}, "sk": {"S": "range_value6"}}]
++
++
++@mock_aws
++def test_dynamodb_aws_verified_creates_and_deletes_table():
++    captured = {}
++
++    @dynamodb_aws_verified()
++    def inner(table_name=None):
++        captured["table_name"] = table_name
++        client = boto3.client("dynamodb", region_name="us-east-1")
++        # The decorator passes the created table name to the test
++        assert table_name
++        client.describe_table(TableName=table_name)
++        return "done"
++
++    assert inner() == "done"
++
++    # The decorator tears the table down after the test finishes
++    client = boto3.client("dynamodb", region_name="us-east-1")
++    with pytest.raises(ClientError) as exc:
++        client.describe_table(TableName=captured["table_name"])
++    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+diff --git a/tests/test_dynamodb/test_dynamodb_table_without_range_key.py b/tests/test_dynamodb/test_dynamodb_table_without_range_key.py
+index ac8afc9dc..bff168cc8 100644
+--- a/tests/test_dynamodb/test_dynamodb_table_without_range_key.py
++++ b/tests/test_dynamodb/test_dynamodb_table_without_range_key.py
+@@ -8,6 +8,8 @@ from botocore.exceptions import ClientError
+ from moto import mock_aws
+ from moto.core import DEFAULT_ACCOUNT_ID as ACCOUNT_ID
+ 
++from . import dynamodb_aws_verified
++
+ 
+ @mock_aws
+ def test_create_table():
+@@ -512,29 +514,26 @@ def test_update_settype_item_with_conditions():
+     assert returned_item["Item"]["foo"] == set(["baz"])
+ 
+ 
+-@mock_aws
+-def test_scan_pagination():
+-    table = _create_user_table()
+-
++@pytest.mark.aws_verified
++@dynamodb_aws_verified()
++def test_scan_pagination(table_name=None):
++    table = boto3.resource("dynamodb", "us-east-1").Table(table_name)
+     expected_usernames = [f"user{i}" for i in range(10)]
+     for u in expected_usernames:
+-        table.put_item(Item={"username": u})
++        table.put_item(Item={"pk": u})
+ 
+     page1 = table.scan(Limit=6)
+     assert page1["Count"] == 6
+     assert len(page1["Items"]) == 6
+-    page1_results = set([r["username"] for r in page1["Items"]])
+-    assert page1_results == {"user0", "user3", "user1", "user2", "user5", "user4"}
++    page1_results = [r["pk"] for r in page1["Items"]]
+ 
+     page2 = table.scan(Limit=6, ExclusiveStartKey=page1["LastEvaluatedKey"])
+     assert page2["Count"] == 4
+     assert len(page2["Items"]) == 4
+     assert "LastEvaluatedKey" not in page2
+-    page2_results = set([r["username"] for r in page2["Items"]])
+-    assert page2_results == {"user6", "user7", "user8", "user9"}
++    page2_results = [r["pk"] for r in page2["Items"]]
+ 
+-    results = page1["Items"] + page2["Items"]
+-    usernames = set([r["username"] for r in results])
++    usernames = set(page1_results + page2_results)
+     assert usernames == set(expected_usernames)
+ 
+ 

@@ -1,0 +1,103 @@
+diff --git a/pkg/utils/metrics/http_metrics_test.go b/pkg/utils/metrics/http_metrics_test.go
+new file mode 100644
+index 00000000..049853ca
+--- /dev/null
++++ b/pkg/utils/metrics/http_metrics_test.go
+@@ -0,0 +1,97 @@
++package metrics
++
++import (
++	"bufio"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/gorilla/mux"
++)
++
++func TestResponseChunksAreStreamed(t *testing.T) {
++	allowSecondChunk := make(chan struct{}, 1)
++	finishHandler := make(chan struct{}, 1)
++
++	mr := mux.NewRouter()
++	mr.Use(HTTPMetricMiddleware)
++	mr.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		_, _ = io.WriteString(w, "first\n")
++		if flusher, ok := w.(http.Flusher); ok {
++			flusher.Flush()
++		}
++		<-allowSecondChunk
++		_, _ = io.WriteString(w, "second\n")
++		if flusher, ok := w.(http.Flusher); ok {
++			flusher.Flush()
++		}
++		<-finishHandler
++	})
++	server := httptest.NewServer(mr)
++	defer func() {
++		select {
++		case allowSecondChunk <- struct{}{}:
++		default:
++		}
++		select {
++		case finishHandler <- struct{}{}:
++		default:
++		}
++		server.Close()
++	}()
++
++	type responseResult struct {
++		resp *http.Response
++		err  error
++	}
++	responseCh := make(chan responseResult, 1)
++	go func() {
++		resp, err := http.Get(server.URL)
++		responseCh <- responseResult{resp: resp, err: err}
++	}()
++
++	var resp *http.Response
++	select {
++	case result := <-responseCh:
++		if result.err != nil {
++			t.Fatalf("request failed: %v", result.err)
++		}
++		resp = result.resp
++	case <-time.After(5 * time.Second):
++		allowSecondChunk <- struct{}{}
++		finishHandler <- struct{}{}
++		result := <-responseCh
++		if result.resp != nil {
++			_ = result.resp.Body.Close()
++		}
++		t.Fatal("response headers were not sent while the handler was still running")
++	}
++	defer resp.Body.Close()
++
++	reader := bufio.NewReader(resp.Body)
++	for i, expected := range []string{"first\n", "second\n"} {
++		if i == 1 {
++			allowSecondChunk <- struct{}{}
++		}
++		lineCh := make(chan string, 1)
++		go func() {
++			line, err := reader.ReadString('\n')
++			if err != nil {
++				lineCh <- "read error: " + err.Error()
++				return
++			}
++			lineCh <- line
++		}()
++
++		select {
++		case line := <-lineCh:
++			if line != expected {
++				t.Fatalf("response chunk %d = %q, want %q", i+1, line, expected)
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatalf("response chunk %d was not relayed while the handler was still running", i+1)
++		}
++	}
++}

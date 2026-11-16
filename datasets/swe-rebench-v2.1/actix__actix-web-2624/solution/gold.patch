@@ -1,0 +1,209 @@
+diff --git a/actix-http/CHANGES.md b/actix-http/CHANGES.md
+index 7f7af23a..afc988d4 100644
+--- a/actix-http/CHANGES.md
++++ b/actix-http/CHANGES.md
+@@ -1,6 +1,14 @@
+ # Changes
+ 
+ ## Unreleased - 2021-xx-xx
++### Changed
++- `error::DispatcherError` enum is now marked `#[non_exhaustive]`. [#2624]
++
++
++### Fixed
++- Issue where handlers that took payload but then dropped without reading it to EOF it would cause keep-alive connections to become stuck. [#2624]
++
++[#2624]: https://github.com/actix/actix-web/pull/2624
+ 
+ 
+ ## 3.0.0-rc.1 - 2022-01-31
+diff --git a/actix-http/src/error.rs b/actix-http/src/error.rs
+index 84132286..52b95342 100644
+--- a/actix-http/src/error.rs
++++ b/actix-http/src/error.rs
+@@ -340,6 +340,7 @@ impl From<PayloadError> for Error {
+ 
+ /// A set of errors that can occur during dispatching HTTP requests.
+ #[derive(Debug, Display, From)]
++#[non_exhaustive]
+ pub enum DispatchError {
+     /// Service error.
+     #[display(fmt = "Service Error")]
+@@ -373,6 +374,10 @@ pub enum DispatchError {
+     #[display(fmt = "Connection shutdown timeout")]
+     DisconnectTimeout,
+ 
++    /// Handler dropped payload before reading EOF.
++    #[display(fmt = "Handler dropped payload before reading EOF")]
++    HandlerDroppedPayload,
++
+     /// Internal error.
+     #[display(fmt = "Internal error")]
+     InternalError,
+diff --git a/actix-http/src/h1/codec.rs b/actix-http/src/h1/codec.rs
+index df74bcc4..80afd745 100644
+--- a/actix-http/src/h1/codec.rs
++++ b/actix-http/src/h1/codec.rs
+@@ -125,11 +125,13 @@ impl Decoder for Codec {
+             self.flags.set(Flags::HEAD, head.method == Method::HEAD);
+             self.version = head.version;
+             self.conn_type = head.connection_type();
++
+             if self.conn_type == ConnectionType::KeepAlive
+                 && !self.flags.contains(Flags::KEEP_ALIVE_ENABLED)
+             {
+                 self.conn_type = ConnectionType::Close
+             }
++
+             match payload {
+                 PayloadType::None => self.payload = None,
+                 PayloadType::Payload(pl) => self.payload = Some(pl),
+diff --git a/actix-http/src/h1/decoder.rs b/actix-http/src/h1/decoder.rs
+index fa924f92..17b9b695 100644
+--- a/actix-http/src/h1/decoder.rs
++++ b/actix-http/src/h1/decoder.rs
+@@ -209,15 +209,16 @@ impl MessageType for Request {
+ 
+         let (len, method, uri, ver, h_len) = {
+             // SAFETY:
+-            // Create an uninitialized array of `MaybeUninit`. The `assume_init` is
+-            // safe because the type we are claiming to have initialized here is a
+-            // bunch of `MaybeUninit`s, which do not require initialization.
++            // Create an uninitialized array of `MaybeUninit`. The `assume_init` is safe because the
++            // type we are claiming to have initialized here is a bunch of `MaybeUninit`s, which
++            // do not require initialization.
+             let mut parsed = unsafe {
+                 MaybeUninit::<[MaybeUninit<httparse::Header<'_>>; MAX_HEADERS]>::uninit()
+                     .assume_init()
+             };
+ 
+             let mut req = httparse::Request::new(&mut []);
++
+             match req.parse_with_uninit_headers(src, &mut parsed)? {
+                 httparse::Status::Complete(len) => {
+                     let method = Method::from_bytes(req.method.unwrap().as_bytes())
+@@ -232,6 +233,7 @@ impl MessageType for Request {
+ 
+                     (len, method, uri, version, req.headers.len())
+                 }
++
+                 httparse::Status::Partial => {
+                     return if src.len() >= MAX_BUFFER_SIZE {
+                         trace!("MAX_BUFFER_SIZE unprocessed data reached, closing");
+diff --git a/actix-http/src/h1/dispatcher.rs b/actix-http/src/h1/dispatcher.rs
+index 3f327171..fbc7e5b9 100644
+--- a/actix-http/src/h1/dispatcher.rs
++++ b/actix-http/src/h1/dispatcher.rs
+@@ -21,7 +21,7 @@ use crate::{
+     config::ServiceConfig,
+     error::{DispatchError, ParseError, PayloadError},
+     service::HttpFlow,
+-    Error, Extensions, OnConnectData, Request, Response, StatusCode,
++    ConnectionType, Error, Extensions, OnConnectData, Request, Response, StatusCode,
+ };
+ 
+ use super::{
+@@ -151,7 +151,8 @@ pin_project! {
+         error: Option<DispatchError>,
+ 
+         #[pin]
+-        state: State<S, B, X>,
++        pub(super) state: State<S, B, X>,
++        // when Some(_) dispatcher is in state of receiving request payload
+         payload: Option<PayloadSender>,
+         messages: VecDeque<DispatcherMessage>,
+ 
+@@ -174,7 +175,7 @@ enum DispatcherMessage {
+ 
+ pin_project! {
+     #[project = StateProj]
+-    enum State<S, B, X>
++    pub(super) enum State<S, B, X>
+     where
+         S: Service<Request>,
+         X: Service<Request, Response = Request>,
+@@ -194,7 +195,7 @@ where
+     X: Service<Request, Response = Request>,
+     B: MessageBody,
+ {
+-    fn is_none(&self) -> bool {
++    pub(super) fn is_none(&self) -> bool {
+         matches!(self, State::None)
+     }
+ }
+@@ -686,12 +687,74 @@ where
+         let can_not_read = !self.can_read(cx);
+ 
+         // limit amount of non-processed requests
+-        if pipeline_queue_full || can_not_read {
++        if pipeline_queue_full {
+             return Ok(false);
+         }
+ 
+         let mut this = self.as_mut().project();
+ 
++        if can_not_read {
++            log::debug!("cannot read request payload");
++
++            if let Some(sender) = &this.payload {
++                // ...maybe handler does not want to read any more payload...
++                if let PayloadStatus::Dropped = sender.need_read(cx) {
++                    log::debug!("handler dropped payload early; attempt to clean connection");
++                    // ...in which case poll request payload a few times
++                    loop {
++                        match this.codec.decode(this.read_buf)? {
++                            Some(msg) => {
++                                match msg {
++                                    // payload decoded did not yield EOF yet
++                                    Message::Chunk(Some(_)) => {
++                                        // if non-clean connection, next loop iter will detect empty
++                                        // read buffer and close connection
++                                    }
++
++                                    // connection is in clean state for next request
++                                    Message::Chunk(None) => {
++                                        log::debug!("connection successfully cleaned");
++
++                                        // reset dispatcher state
++                                        let _ = this.payload.take();
++                                        this.state.set(State::None);
++
++                                        // break out of payload decode loop
++                                        break;
++                                    }
++
++                                    // Either whole payload is read and loop is broken or more data
++                                    // was expected in which case connection is closed. In both
++                                    // situations dispatcher cannot get here.
++                                    Message::Item(_) => {
++                                        unreachable!("dispatcher is in payload receive state")
++                                    }
++                                }
++                            }
++
++                            // not enough info to decide if connection is going to be clean or not
++                            None => {
++                                log::error!(
++                                    "handler did not read whole payload and dispatcher could not \
++                                    drain read buf; return 500 and close connection"
++                                );
++
++                                this.flags.insert(Flags::SHUTDOWN);
++                                let mut res = Response::internal_server_error().drop_body();
++                                res.head_mut().set_connection_type(ConnectionType::Close);
++                                this.messages.push_back(DispatcherMessage::Error(res));
++                                *this.error = Some(DispatchError::HandlerDroppedPayload);
++                                return Ok(true);
++                            }
++                        }
++                    }
++                }
++            } else {
++                // can_not_read and no request payload
++                return Ok(false);
++            }
++        }
++
+         let mut updated = false;
+ 
+         loop {

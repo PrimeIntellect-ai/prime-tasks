@@ -1,0 +1,108 @@
+diff --git a/nats-streaming-server.go b/nats-streaming-server.go
+index 8dde3b5..7920b79 100644
+--- a/nats-streaming-server.go
++++ b/nats-streaming-server.go
+@@ -52,6 +52,7 @@ Streaming Server Options:
+           --encrypt <bool>               Specify if server should use encryption at rest
+           --encryption_cipher <string>   Cipher to use for encryption. Currently support AES and CHAHA (ChaChaPoly). Defaults to AES
+           --encryption_key <string>      Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
++          --replace_durable <bool>       Replace the existing durable subscription instead of reporting a duplicate durable error
+ 
+ Streaming Server Clustering Options:
+     --clustered <bool>                     Run the server in a clustered configuration (default: false)
+diff --git a/server/conf.go b/server/conf.go
+index 16c58aa..9925a06 100644
+--- a/server/conf.go
++++ b/server/conf.go
+@@ -199,6 +199,11 @@ func ProcessConfigFile(configFile string, opts *Options) error {
+ 				return err
+ 			}
+ 			opts.NKeySeedFile = v.(string)
++		case "replace_durable", "replace_durables", "replace_duplicate_durable", "replace_duplicate_durables":
++			if err := checkType(k, reflect.Bool, v); err != nil {
++				return err
++			}
++			opts.ReplaceDurable = v.(bool)
+ 		}
+ 	}
+ 	return nil
+@@ -687,6 +692,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp,
+ 	fs.BoolVar(&sopts.Encrypt, "encrypt", false, "Specify if server should use encryption at rest")
+ 	fs.StringVar(&sopts.EncryptionCipher, "encryption_cipher", stores.CryptoCipherAutoSelect, "Encryption cipher. Supported are AES and CHACHA (default is AES)")
+ 	fs.StringVar(&encryptionKey, "encryption_key", "", "Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead")
++	fs.BoolVar(&sopts.ReplaceDurable, "replace_durable", false, "Replace the existing durable subscription instead of reporting a duplicate durable error")
+ 
+ 	// First, we need to call NATS's ConfigureOptions() with above flag set.
+ 	// It will be augmented with NATS specific flags and call fs.Parse(args) for us.
+diff --git a/server/server.go b/server/server.go
+index 8758a6a..d75e8a4 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -1337,6 +1337,7 @@ type Options struct {
+ 	EncryptionKey      []byte        // Encryption key. The environment NATS_STREAMING_ENCRYPTION_KEY takes precedence and is the preferred way to provide the key.
+ 	Clustering         ClusteringOptions
+ 	NATSClientOpts     []nats.Option
++	ReplaceDurable     bool // If true, the subscription request for a durable subscription will replace the current durable instead of failing with duplicate durable error.
+ }
+ 
+ // Clone returns a deep copy of the Options object.
+@@ -5109,6 +5110,11 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
+ 	// until we are done with this subscription. This will also stop
+ 	// the delete timer if one was set.
+ 	c, preventDelete, err := s.lookupOrCreateChannelPreventDelete(sr.Subject)
++	// For durable subscriptions, and if allowed, if this is going to be a
++	// duplicate, close the current durable and accept the new one.
++	if err == nil && sr.DurableName != "" && sr.QGroup == "" && s.opts.ReplaceDurable {
++		err = s.closeDurableIfDuplicate(c, sr)
++	}
+ 	if err == nil {
+ 		// If clustered, thread operations through Raft.
+ 		if s.isClustered {
+@@ -5173,6 +5179,47 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
+ 	s.subStartCh <- &subStartInfo{c: c, sub: sub, qs: qs, isDurable: sub.IsDurable}
+ }
+ 
++// This will close (and replicate the close operation if running in cluster mode)
++// the current durable subscription matching this subscription request information.
++// This should be invoked only if ReplaceDurable option is enabled.
++// It is used in case users want to be able to "resend" a subscription request
++// if the original request failed, due to timeout for instance. It could be that
++// the server accepted the original, sent the response back but the client library
++// gave up on it due to its own timeout. In that case, trying to issue the same
++// subscription request would lead to a "duplicate durable" error and the only choice
++// would be to close the connection.
++func (s *StanServer) closeDurableIfDuplicate(c *channel, sr *pb.SubscriptionRequest) error {
++	var duplicate bool
++	var ackInbox string
++	ss := c.ss
++	ss.RLock()
++	sub := ss.durables[durableKey(sr)]
++	if sub != nil {
++		sub.RLock()
++		duplicate = sub.ClientID != ""
++		ackInbox = sub.AckInbox
++		sub.RUnlock()
++	}
++	ss.RUnlock()
++	if !duplicate {
++		return nil
++	}
++	creq := &pb.UnsubscribeRequest{
++		ClientID: sr.ClientID,
++		Subject:  sr.Subject,
++		Inbox:    ackInbox,
++	}
++	var err error
++	if s.isClustered {
++		err = s.replicateCloseSubscription(creq)
++	} else {
++		s.closeMu.Lock()
++		err = s.unsubscribe(creq, true)
++		s.closeMu.Unlock()
++	}
++	return err
++}
++
+ type subStateTraceCtx struct {
+ 	clientID      string
+ 	isRemove      bool

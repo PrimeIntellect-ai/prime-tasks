@@ -1,0 +1,329 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 8055cfe..c0d0b12 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -1,4 +1,5 @@
+ dev
++- pipx now parses package specification before install.   It removes (with warning) the `--editable` install option for any package specification that is not a local path.   It also removes (with warning) any environment markers.
+ - Disabled animation when we cannot determine terminal size or if the number of columns is too small. (Fixes #444)
+ - Version of each injected package is now listed after name for `pipx list --include-injected`
+ - Change metadata recorded from version-specified install to allow upgrades in future.  Adds pipx dependency on `packaging` package.
+diff --git a/src/pipx/commands/common.py b/src/pipx/commands/common.py
+index b881944..b5c5d2a 100644
+--- a/src/pipx/commands/common.py
++++ b/src/pipx/commands/common.py
+@@ -14,10 +14,10 @@ import userpath  # type: ignore
+ from pipx import constants
+ from pipx.colors import bold, red
+ from pipx.emojies import hazard, stars
+-from pipx.package_specifier import valid_pypi_name
++from pipx.package_specifier import parse_specifier_for_install, valid_pypi_name
++from pipx.pipx_metadata_file import PackageInfo
+ from pipx.util import WINDOWS, PipxError, mkdir, rmdir
+ from pipx.venv import Venv
+-from pipx.pipx_metadata_file import PackageInfo
+ 
+ 
+ def expose_apps_globally(
+@@ -244,9 +244,9 @@ def package_name_from_spec(
+ ) -> str:
+     start_time = time.time()
+ 
+-    # shortcut if valid PyPI name and not a local path
++    # shortcut if valid PyPI name
+     pypi_name = valid_pypi_name(package_spec)
+-    if pypi_name is not None and not Path(package_spec).exists():
++    if pypi_name is not None:
+         # NOTE: if pypi name and installed package name differ, this means pipx
+         #       will use the pypi name
+         package_name = pypi_name
+@@ -254,6 +254,9 @@ def package_name_from_spec(
+         logging.info(f"Package name determined in {time.time()-start_time:.1f}s")
+         return package_name
+ 
++    # check syntax and clean up spec and pip_args
++    (package_spec, pip_args) = parse_specifier_for_install(package_spec, pip_args)
++
+     with tempfile.TemporaryDirectory() as temp_venv_dir:
+         venv = Venv(Path(temp_venv_dir), python=python, verbose=verbose)
+         venv.create_venv(venv_args=[], pip_args=[])
+diff --git a/src/pipx/commands/run.py b/src/pipx/commands/run.py
+index 8aacbc2..a9b812e 100644
+--- a/src/pipx/commands/run.py
++++ b/src/pipx/commands/run.py
+@@ -10,6 +10,7 @@ from shutil import which
+ from typing import List
+ 
+ from pipx import constants
++from pipx.commands.common import package_name_from_spec
+ from pipx.constants import TEMP_VENV_EXPIRATION_THRESHOLD_DAYS
+ from pipx.emojies import hazard
+ from pipx.util import (
+@@ -115,12 +116,15 @@ def _download_and_run(
+     venv = Venv(venv_dir, python=python, verbose=verbose)
+     venv.create_venv(venv_args, pip_args)
+ 
+-    # venv.pipx_metadata.main_package.package contains package name if it is
+-    #   pre-existing, otherwise is None to instruct venv.install_package to
+-    #   determine package name.
++    if venv.pipx_metadata.main_package.package is not None:
++        package = venv.pipx_metadata.main_package.package
++    else:
++        package = package_name_from_spec(
++            package_or_url, python, pip_args=pip_args, verbose=verbose
++        )
+ 
+     venv.install_package(
+-        package=venv.pipx_metadata.main_package.package,
++        package=package,
+         package_or_url=package_or_url,
+         pip_args=pip_args,
+         include_dependencies=False,
+diff --git a/src/pipx/package_specifier.py b/src/pipx/package_specifier.py
+index 500a1e4..1329830 100644
+--- a/src/pipx/package_specifier.py
++++ b/src/pipx/package_specifier.py
+@@ -6,52 +6,44 @@
+ #   <pypi_package_name><version_specifier>
+ 
+ import logging
++import textwrap
+ from pathlib import Path
+-from typing import Optional
++from typing import List, NamedTuple, Optional, Set, Tuple
+ 
+ from packaging.requirements import InvalidRequirement, Requirement
+ from packaging.utils import canonicalize_name
+ 
++from pipx.emojies import hazard
+ from pipx.util import PipxError
+ 
+ 
+-def parse_specifier_for_metadata(package_spec: str) -> str:
+-    """Return package_or_url suitable for pipx metadata
++class ParsedPackage(NamedTuple):
++    valid_pep508: Optional[Requirement]
++    valid_url: Optional[str]
++    valid_local_path: Optional[str]
+ 
+-    Specifically:
+-    * Strip any version specifiers (e.g. package == 1.5.4)
+-    * Strip any markers (e.g. python_version > 3.4)
+-    * Convert local paths to absolute paths
++
++def _parse_specifier(package_spec: str) -> ParsedPackage:
++    """Parse package_spec as would be given to pipx
+     """
+     # NOTE: If package_spec is valid pypi name, pip will always treat it as a
+     #       pypi package, not checking for local path.
+     #       We replicate pypi precedence here (only non-valid-pypi names
+     #       initiate check for local path, e.g. './package-name')
+-
+-    valid_pep508 = False
+-    valid_url = False
+-    valid_local_path = False
+-    package_or_url = ""
++    valid_pep508 = None
++    valid_url = None
++    valid_local_path = None
+ 
+     try:
+         package_req = Requirement(package_spec)
+     except InvalidRequirement:
+         # not a valid PEP508 package specification
+-        valid_pep508 = False
++        pass
+     else:
+         # valid PEP508 package specification
+-        valid_pep508 = True
+-        if package_req.url:
+-            package_or_url = package_req.url
+-        else:
+-            if package_req.extras:
+-                package_or_url = canonicalize_name(
+-                    package_req.name + "[" + ",".join(sorted(package_req.extras)) + "]"
+-                )
+-            else:
+-                package_or_url = canonicalize_name(package_req.name)
++        valid_pep508 = package_req
+ 
+-    # NOTE: packaging currently (2020-07-19) does basic syntax checks on the URL.
++    # NOTE: packaging currently (2020-07-19) only does basic syntax checks on URL.
+     #   Some examples of what it will not catch:
+     #       - invalid RCS string (e.g. "gat+https://...")
+     #       - non-existent scheme (e.g. "zzzzz://...")
+@@ -59,10 +51,10 @@ def parse_specifier_for_metadata(package_spec: str) -> str:
+         try:
+             package_req = Requirement("notapackagename @ " + package_spec)
+         except InvalidRequirement:
+-            valid_url = False
++            # not a valid url
++            pass
+         else:
+-            valid_url = True
+-            package_or_url = package_spec
++            valid_url = package_spec
+ 
+     if not valid_pep508 and not valid_url:
+         package_path = Path(package_spec)
+@@ -72,12 +64,101 @@ def parse_specifier_for_metadata(package_spec: str) -> str:
+             package_path_exists = False
+ 
+         if package_path_exists:
+-            valid_local_path = True
+-            package_or_url = str(package_path.resolve())
++            valid_local_path = str(package_path.resolve())
+ 
+     if not valid_pep508 and not valid_url and not valid_local_path:
+         raise PipxError(f"Unable to parse package spec: {package_spec}")
+ 
++    return ParsedPackage(
++        valid_pep508=valid_pep508,
++        valid_url=valid_url,
++        valid_local_path=valid_local_path,
++    )
++
++
++def _extras_to_str(extras: Set):
++    if extras:
++        return "[" + ",".join(sorted(extras)) + "]"
++    else:
++        return ""
++
++
++def package_is_local_path(package_spec: str) -> bool:
++    return _parse_specifier(package_spec).valid_local_path is not None
++
++
++def parse_specifier_for_install(
++    package_spec: str, pip_args: List[str]
++) -> Tuple[str, List[str]]:
++    """Return package_or_url and pip_args suitable for pip install
++
++    Specifically:
++    * Strip any markers (e.g. python_version > 3.4)
++    * Ensure --editable is removed for any package_spec not a local path
++    * Convert local paths to absolute paths
++    """
++    parsed_package = _parse_specifier(package_spec)
++    if parsed_package.valid_pep508 is not None:
++        if parsed_package.valid_pep508.url:
++            package_or_url = parsed_package.valid_pep508.url
++        else:
++            package_or_url = canonicalize_name(parsed_package.valid_pep508.name)
++            package_or_url += _extras_to_str(parsed_package.valid_pep508.extras)
++            if parsed_package.valid_pep508.specifier:
++                package_or_url = package_or_url + str(
++                    parsed_package.valid_pep508.specifier
++                )
++            if parsed_package.valid_pep508.marker:
++                logging.warning(
++                    textwrap.fill(
++                        f"{hazard}  Ignoring environment markers "
++                        f"({parsed_package.valid_pep508.marker}) in package "
++                        "specification. Use pipx options to specify this type of "
++                        "information.",
++                        subsequent_indent="    ",
++                    )
++                )
++    elif parsed_package.valid_url is not None:
++        package_or_url = parsed_package.valid_url
++    elif parsed_package.valid_local_path is not None:
++        package_or_url = parsed_package.valid_local_path
++
++    logging.info(f"cleaned package spec: {package_or_url}")
++
++    if "--editable" in pip_args and not parsed_package.valid_local_path:
++        logging.warning(
++            textwrap.fill(
++                f"{hazard}  Ignoring --editable install option. pipx disallows it "
++                "for anything but a local path, to avoid having to create a new "
++                "src/ directory.",
++                subsequent_indent="    ",
++            )
++        )
++        pip_args.remove("--editable")
++
++    return (package_or_url, pip_args)
++
++
++def parse_specifier_for_metadata(package_spec: str) -> str:
++    """Return package_or_url suitable for pipx metadata
++
++    Specifically:
++    * Strip any version specifiers (e.g. package == 1.5.4)
++    * Strip any markers (e.g. python_version > 3.4)
++    * Convert local paths to absolute paths
++    """
++    parsed_package = _parse_specifier(package_spec)
++    if parsed_package.valid_pep508 is not None:
++        if parsed_package.valid_pep508.url:
++            package_or_url = parsed_package.valid_pep508.url
++        else:
++            package_or_url = canonicalize_name(parsed_package.valid_pep508.name)
++            package_or_url += _extras_to_str(parsed_package.valid_pep508.extras)
++    elif parsed_package.valid_url is not None:
++        package_or_url = parsed_package.valid_url
++    elif parsed_package.valid_local_path is not None:
++        package_or_url = parsed_package.valid_local_path
++
+     logging.info(f"cleaned package spec: {package_or_url}")
+ 
+     return package_or_url
+diff --git a/src/pipx/venv.py b/src/pipx/venv.py
+index d0c67e9..92d8821 100644
+--- a/src/pipx/venv.py
++++ b/src/pipx/venv.py
+@@ -2,11 +2,14 @@ import json
+ import logging
+ import pkgutil
+ from pathlib import Path
+-from typing import Dict, Generator, List, NamedTuple, Optional, Set
++from typing import Dict, Generator, List, NamedTuple, Set
+ 
+ from pipx.animate import animate
+ from pipx.constants import DEFAULT_PYTHON, PIPX_SHARED_PTH
+-from pipx.package_specifier import parse_specifier_for_metadata
++from pipx.package_specifier import (
++    parse_specifier_for_install,
++    parse_specifier_for_metadata,
++)
+ from pipx.pipx_metadata_file import PackageInfo, PipxMetadata
+ from pipx.shared_libs import shared_libs
+ from pipx.util import (
+@@ -159,20 +162,20 @@ class Venv:
+ 
+     def install_package(
+         self,
+-        package: Optional[str],  # if None, will be determined in this function
++        package: str,
+         package_or_url: str,
+         pip_args: List[str],
+         include_dependencies: bool,
+         include_apps: bool,
+         is_main_package: bool,
+     ) -> None:
+-
+         if pip_args is None:
+             pip_args = []
+-        if package is None:
+-            # If no package name is supplied, install only main package
+-            #   first in order to see what its name is
+-            package = self.install_package_no_deps(package_or_url, pip_args)
++
++        # check syntax and clean up spec and pip_args
++        (package_or_url, pip_args) = parse_specifier_for_install(
++            package_or_url, pip_args
++        )
+ 
+         try:
+             with animate(
+@@ -224,7 +227,7 @@ class Venv:
+         installed_packages = self.list_installed_packages() - old_package_set
+         if len(installed_packages) == 1:
+             package = installed_packages.pop()
+-            logging.info(f"Determined package name: '{package}'")
++            logging.info(f"Determined package name: {package}")
+         else:
+             logging.info(f"old_package_set = {old_package_set}")
+             logging.info(f"install_packages = {installed_packages}")

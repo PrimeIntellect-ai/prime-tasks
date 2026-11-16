@@ -1,0 +1,461 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f753b94..5dfe2dc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,16 @@
+ 
+ This document describes the changes to Minimq between releases.
+ 
++# [Unreleased]
++
++## Added
++* Support for subscribing at `QoS::ExactlyOnce`
++
++## Fixed
++* Fixed an issue where PubComp was serialized with an incorrect control code
++* Fixed an issue where some response control packets would be improperly serialized
++
++
+ # [0.7.0] - 2023-06-22
+ 
+ ## Fixed
+@@ -118,7 +128,8 @@ keep-alive interval
+ 
+ * Initial library release and publish to crates.io
+ 
+-[Unreleased]: https://github.com/quartiq/minimq/compare/0.6.2...HEAD
++[Unreleased]: https://github.com/quartiq/minimq/compare/0.7.0...HEAD
++[0.7.0]: https://github.com/quartiq/minimq/releases/tag/0.7.0
+ [0.6.2]: https://github.com/quartiq/minimq/releases/tag/0.6.2
+ [0.6.1]: https://github.com/quartiq/minimq/releases/tag/0.6.1
+ [0.6.0]: https://github.com/quartiq/minimq/releases/tag/0.6.0
+diff --git a/README.md b/README.md
+index e30ac64..abad14a 100644
+--- a/README.md
++++ b/README.md
+@@ -19,8 +19,7 @@ publication. Below is a detailed list of features, indicating what aspects are s
+ * Retained messages
+ * Connection will messages
+ * Session state reconnection and republication
+-* Topic subscriptions at quality-of-service at-most-once and at-least-once
+-    * exactly-once subscription support is not yet implemented
++* Topic subscriptions at all quality-of-service levels
+ * Subscription option flags
+ * Zero-copy message deserialization
+ * Serde-compatible MQTT message serialization and deserialization
+diff --git a/src/de/received_packet.rs b/src/de/received_packet.rs
+index e068405..b7fa9ae 100644
+--- a/src/de/received_packet.rs
++++ b/src/de/received_packet.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     message_types::MessageType,
+-    packets::{ConnAck, Disconnect, Pub, PubAck, PubComp, PubRec, SubAck},
++    packets::{ConnAck, Disconnect, Pub, PubAck, PubComp, PubRec, PubRel, SubAck},
+     varint::Varint,
+     ProtocolError, QoS, Retain,
+ };
+@@ -17,6 +17,7 @@ pub enum ReceivedPacket<'a> {
+     Publish(Pub<'a>),
+     PubAck(PubAck<'a>),
+     SubAck(SubAck<'a>),
++    PubRel(PubRel<'a>),
+     PubRec(PubRec<'a>),
+     PubComp(PubComp<'a>),
+     Disconnect(Disconnect<'a>),
+@@ -102,6 +103,7 @@ impl<'de> serde::de::Visitor<'de> for ControlPacketVisitor {
+             MessageType::SubAck => ReceivedPacket::SubAck(seq.next_element()?.unwrap()),
+             MessageType::PingResp => ReceivedPacket::PingResp,
+             MessageType::PubRec => ReceivedPacket::PubRec(seq.next_element()?.unwrap()),
++            MessageType::PubRel => ReceivedPacket::PubRel(seq.next_element()?.unwrap()),
+             MessageType::PubComp => ReceivedPacket::PubComp(seq.next_element()?.unwrap()),
+             MessageType::Disconnect => ReceivedPacket::Disconnect(seq.next_element()?.unwrap()),
+             _ => return Err(A::Error::custom("Unsupported message type")),
+@@ -331,4 +333,42 @@ mod test {
+             _ => panic!("Invalid message"),
+         }
+     }
++
++    #[test]
++    fn deserialize_good_pubrel() {
++        let serialized_pubrel: [u8; 6] = [
++            6 << 4 | 0b10, // PubRec
++            0x04,          // Remaining length
++            0x00,
++            0x05, // Identifier
++            0x10, // Response Code
++            0x00, // Properties length
++        ];
++        let packet = ReceivedPacket::from_buffer(&serialized_pubrel).unwrap();
++        match packet {
++            ReceivedPacket::PubRel(rec) => {
++                assert_eq!(rec.packet_id, 5);
++                assert_eq!(rec.reason.code(), ReasonCode::NoMatchingSubscribers);
++            }
++            _ => panic!("Invalid message"),
++        }
++    }
++
++    #[test]
++    fn deserialize_short_pubrel() {
++        let serialized_pubrel: [u8; 4] = [
++            6 << 4 | 0b10, // PubRec
++            0x02,          // Remaining length
++            0x00,
++            0x05, // Identifier
++        ];
++        let packet = ReceivedPacket::from_buffer(&serialized_pubrel).unwrap();
++        match packet {
++            ReceivedPacket::PubRel(rec) => {
++                assert_eq!(rec.packet_id, 5);
++                assert_eq!(rec.reason.code(), ReasonCode::Success);
++            }
++            _ => panic!("Invalid message"),
++        }
++    }
+ }
+diff --git a/src/message_types.rs b/src/message_types.rs
+index a55a0e8..465df34 100644
+--- a/src/message_types.rs
++++ b/src/message_types.rs
+@@ -67,7 +67,7 @@ impl<'a> ControlPacket for PubRel<'a> {
+ }
+ 
+ impl<'a> ControlPacket for PubComp<'a> {
+-    const MESSAGE_TYPE: MessageType = MessageType::PubRec;
++    const MESSAGE_TYPE: MessageType = MessageType::PubComp;
+ }
+ 
+ impl<'a> ControlPacket for Subscribe<'a> {
+diff --git a/src/mqtt_client.rs b/src/mqtt_client.rs
+index 5fc53d2..941f6cf 100644
+--- a/src/mqtt_client.rs
++++ b/src/mqtt_client.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     de::{received_packet::ReceivedPacket, PacketReader},
+     network_manager::InterfaceHolder,
+-    packets::{ConnAck, Connect, PingReq, Pub, PubAck, PubRel, SubAck, Subscribe},
++    packets::{ConnAck, Connect, PingReq, Pub, PubAck, PubComp, PubRec, PubRel, SubAck, Subscribe},
+     reason_codes::ReasonCode,
+     session_state::SessionState,
+     types::{Properties, TopicFilter, Utf8String},
+@@ -313,7 +313,18 @@ impl<
+     /// # Returns
+     /// Number of pending messages with the specified QoS.
+     pub fn pending_messages(&self, qos: QoS) -> usize {
+-        self.sm.context().session_state.pending_messages(qos)
++        self.sm
++            .context()
++            .session_state
++            .pending_client_publications(qos)
++    }
++
++    /// Get the number of total message transactions that are in-progress.
++    pub fn inflight_messages(&self) -> usize {
++        let session_state = &self.sm.context().session_state;
++        session_state.server_packet_ids().len()
++            + session_state.pending_client_publications(QoS::AtLeastOnce)
++            + session_state.pending_client_publications(QoS::ExactlyOnce)
+     }
+ 
+     /// Determine if the client is able to process publish requests.
+@@ -494,13 +505,13 @@ impl<
+ 
+                 let pubrel = PubRel {
+                     packet_id: rec.packet_id,
+-                    code: self
+-                        .sm
+-                        .context_mut()
+-                        .session_state
+-                        .find_packet(rec.packet_id, QoS::ExactlyOnce)
+-                        .into(),
+-                    properties: Properties::Slice(&[]),
++                    reason: Into::<ReasonCode>::into(
++                        self.sm
++                            .context_mut()
++                            .session_state
++                            .find_packet(rec.packet_id, QoS::ExactlyOnce),
++                    )
++                    .into(),
+                 };
+ 
+                 crate::info!("Sending: {:?}", pubrel);
+@@ -514,6 +525,23 @@ impl<
+                     .handle_pubrec(rec.packet_id, packet)?;
+             }
+ 
++            ReceivedPacket::PubRel(rel) => {
++                let session_state = &mut self.sm.context_mut().session_state;
++
++                let reason = session_state.remove_server_packet_id(rel.packet_id);
++
++                // Send a PubComp
++                let pubcomp = PubComp {
++                    packet_id: rel.packet_id,
++
++                    // Note: Because we do not support ExactlyOnce, it's not possible for
++                    // us to receive two packets with the same ID.
++                    reason: reason.into(),
++                };
++
++                self.network.send_packet(&pubcomp)?;
++            }
++
+             ReceivedPacket::Publish(info) => {
+                 if &States::Active != self.sm.state() {
+                     return Err(Error::NotReady);
+@@ -523,21 +551,52 @@ impl<
+                 match info.qos {
+                     QoS::AtMostOnce => {}
+                     QoS::AtLeastOnce => {
++                        // Note(uwnrap): There should always be a packet ID for QoS > AtMostOnce.
++                        let packet_id = info.packet_id.unwrap();
++
++                        // Reject the packet ID if it's currently in use for another publication.
++                        let reason = if self
++                            .sm
++                            .context_mut()
++                            .session_state
++                            .server_packet_id_in_use(packet_id)
++                        {
++                            ReasonCode::PacketIdInUse
++                        } else {
++                            ReasonCode::Success
++                        };
++
+                         let puback = PubAck {
+-                            // Note(uwnrap): There should always be a packet ID for QoS >
+-                            // AtMostOnce.
+                             packet_identifier: info.packet_id.unwrap(),
+-
+-                            // Note: Because we do not support ExactlyOnce, it's not possible for
+-                            // us to receive two packets with the same ID.
+-                            reason: ReasonCode::Success.into(),
++                            reason: reason.into(),
+                         };
+ 
+                         self.network.send_packet(&puback)?;
+                     }
+ 
+-                    // TODO: Add support.
+-                    QoS::ExactlyOnce => unimplemented!(),
++                    QoS::ExactlyOnce => {
++                        let session_state = &mut self.sm.context_mut().session_state;
++                        // Note(uwnrap): There should always be a packet ID for QoS >
++                        // AtMostOnce.
++                        let packet_id = info.packet_id.unwrap();
++
++                        // Check if the packet ID already exists before forwarding to app
++                        // This procedure follows the MQTTv5 spec section 4.3.3 and 4.4
++                        let duplicate = session_state.server_packet_id_in_use(packet_id);
++
++                        let reason = session_state.push_server_packet_id(packet_id);
++
++                        let pubrec = PubRec {
++                            packet_id,
++                            reason: reason.into(),
++                        };
++
++                        self.network.send_packet(&pubrec)?;
++
++                        if duplicate || !pubrec.reason.code().success() {
++                            return Ok(None);
++                        }
++                    }
+                 }
+ 
+                 // Provide the packet to the application for further processing.
+diff --git a/src/packets.rs b/src/packets.rs
+index 4f3309f..0931774 100644
+--- a/src/packets.rs
++++ b/src/packets.rs
+@@ -145,7 +145,7 @@ pub struct SubAck<'a> {
+ }
+ 
+ /// An MQTT PUBREC control packet
+-#[derive(Debug, Deserialize)]
++#[derive(Debug, Serialize, Deserialize)]
+ pub struct PubRec<'a> {
+     /// The ID of the packet that publication reception occurred on.
+     pub packet_id: u16,
+@@ -156,20 +156,18 @@ pub struct PubRec<'a> {
+ }
+ 
+ /// An MQTT PUBREL control packet
+-#[derive(Debug, Serialize)]
++#[derive(Debug, Deserialize, Serialize)]
+ pub struct PubRel<'a> {
+     /// The ID of the publication that this packet is associated with.
+     pub packet_id: u16,
+ 
+-    /// The response code of the publish release message.
+-    pub code: ReasonCode,
+-
+-    /// Properties associated wtih the packet
+-    pub properties: Properties<'a>,
++    /// The properties and success status of associated with the publication.
++    #[serde(borrow)]
++    pub reason: Reason<'a>,
+ }
+ 
+ /// An MQTT PUBCOMP control packet
+-#[derive(Debug, Deserialize)]
++#[derive(Debug, Serialize, Deserialize)]
+ pub struct PubComp<'a> {
+     /// Packet identifier of the publication that this packet is associated with.
+     pub packet_id: u16,
+@@ -202,7 +200,7 @@ impl<'a> From<ReasonCode> for Reason<'a> {
+         Self {
+             reason: Some(ReasonData {
+                 code,
+-                _properties: None,
++                _properties: Some(Properties::Slice(&[])),
+             }),
+         }
+     }
+@@ -457,7 +455,7 @@ mod tests {
+     #[test]
+     fn serialize_pubrel() {
+         let good_pubrel: [u8; 6] = [
+-            6 << 4 | 0b10, // PubRec
++            6 << 4 | 0b10, // PubRel
+             0x04,          // Remaining length
+             0x00,
+             0x05, // Identifier
+@@ -467,8 +465,7 @@ mod tests {
+ 
+         let pubrel = crate::packets::PubRel {
+             packet_id: 5,
+-            code: ReasonCode::NoMatchingSubscribers,
+-            properties: crate::types::Properties::Slice(&[]),
++            reason: ReasonCode::NoMatchingSubscribers.into(),
+         };
+ 
+         let mut buffer: [u8; 1024] = [0; 1024];
+@@ -504,4 +501,31 @@ mod tests {
+             good_puback
+         );
+     }
++
++    #[test]
++    fn serialize_pubcomp() {
++        let good_pubcomp: [u8; 5] = [
++            7 << 4, // PubComp
++            0x03,   // Remaining length
++            0x00,
++            0x15, // Identifier
++            0x00, // Response Code
++        ];
++
++        let pubrel = crate::packets::PubComp {
++            packet_id: 0x15,
++            reason: crate::packets::Reason {
++                reason: Some(crate::packets::ReasonData {
++                    code: ReasonCode::Success,
++                    _properties: None,
++                }),
++            },
++        };
++
++        let mut buffer: [u8; 1024] = [0; 1024];
++        assert_eq!(
++            MqttSerializer::to_buffer(&mut buffer, &pubrel).unwrap(),
++            good_pubcomp
++        );
++    }
+ }
+diff --git a/src/session_state.rs b/src/session_state.rs
+index 5495202..633a0a6 100644
+--- a/src/session_state.rs
++++ b/src/session_state.rs
+@@ -31,6 +31,11 @@ pub struct SessionState<
+     pub maximum_packet_size: Option<u32>,
+     pub client_id: String<64>,
+     pub pending_subscriptions: Vec<u16, 32>,
++
++    /// Represents a list of packet_ids current in use by the server for Publish packets with
++    /// QoS::ExactlyOnce
++    pending_pubrel: Vec<u16, MSG_COUNT>,
++
+     pending_publish: LinearMap<u16, MessageRecord<MSG_SIZE>, MSG_COUNT>,
+     pending_publish_ordering: Vec<u16, MSG_COUNT>,
+     clock: Clock,
+@@ -59,6 +64,7 @@ impl<
+             pending_subscriptions: Vec::new(),
+             pending_publish: LinearMap::new(),
+             pending_publish_ordering: Vec::new(),
++            pending_pubrel: Vec::new(),
+             maximum_packet_size: None,
+             was_reset: false,
+             _stack: PhantomData::default(),
+@@ -74,6 +80,7 @@ impl<
+         self.pending_subscriptions.clear();
+         self.pending_publish.clear();
+         self.pending_publish_ordering.clear();
++        self.pending_pubrel.clear();
+     }
+ 
+     /// Check if the session state has been reset.
+@@ -222,7 +229,7 @@ impl<
+         }
+     }
+ 
+-    pub fn pending_messages(&self, qos: QoS) -> usize {
++    pub fn pending_client_publications(&self, qos: QoS) -> usize {
+         match qos {
+             QoS::AtMostOnce => 0,
+             _ => self
+@@ -338,4 +345,39 @@ impl<
+             None
+         }
+     }
++
++    /// Check if a server packet ID is in use.
++    pub fn server_packet_id_in_use(&self, id: u16) -> bool {
++        self.pending_pubrel
++            .iter()
++            .any(|&inflight_id| inflight_id == id)
++    }
++
++    /// Register a server packet ID as being in use.
++    pub fn push_server_packet_id(&mut self, id: u16) -> ReasonCode {
++        if self.pending_pubrel.push(id).is_err() {
++            ReasonCode::ReceiveMaxExceeded
++        } else {
++            ReasonCode::Success
++        }
++    }
++
++    /// Mark a server packet ID as no longer in use.
++    pub fn remove_server_packet_id(&mut self, id: u16) -> ReasonCode {
++        if let Some(position) = self
++            .pending_pubrel
++            .iter()
++            .position(|&inflight_id| inflight_id == id)
++        {
++            self.pending_pubrel.swap_remove(position);
++            ReasonCode::Success
++        } else {
++            ReasonCode::PacketIdNotFound
++        }
++    }
++
++    /// Get a list of all inflight server packet IDs.
++    pub fn server_packet_ids(&self) -> &[u16] {
++        &self.pending_pubrel
++    }
+ }
+diff --git a/src/types.rs b/src/types.rs
+index a4e6fce..78d1ffc 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -257,8 +257,6 @@ impl Default for SubscriptionOptions {
+ impl SubscriptionOptions {
+     /// Specify the maximum QoS supported on this subscription.
+     pub fn maximum_qos(mut self, qos: QoS) -> Self {
+-        // TODO: Support for higher QoS levels.
+-        assert!(qos != QoS::ExactlyOnce);
+         self.maximum_qos = qos;
+         self
+     }

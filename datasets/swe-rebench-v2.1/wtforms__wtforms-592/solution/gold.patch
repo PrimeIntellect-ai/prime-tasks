@@ -1,0 +1,181 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 4c28ec3..5a16f31 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -27,6 +27,8 @@ Unreleased
+     :issue:`603` :pr:`605`
+ -   Forms can have form-level errors. :issue:`55` :pr:`595`
+ -   Implemented :class:`~wtforms.fields.core.MonthField`. :pr:`530` :pr:`593`
++-   Filters can be inline. :meth:`form.BaseForm.process` takes a
++    *extra_filters* parameter. :issue:`128` :pr:`592`
+ 
+ 
+ Version 2.3.1
+diff --git a/docs/forms.rst b/docs/forms.rst
+index 7de7d65..64c305a 100644
+--- a/docs/forms.rst
++++ b/docs/forms.rst
+@@ -132,8 +132,8 @@ name re-used on a subclass causes the new definition to obscure the original.
+ 
+ .. _inline-validators:
+ 
+-In-line Validators
+-~~~~~~~~~~~~~~~~~~
++In-line Validators and Filters
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+ In order to provide custom validation for a single field without needing to
+ write a one-time-use validator, validation can be defined inline by defining a
+@@ -146,6 +146,16 @@ method with the convention `validate_fieldname`::
+             if field.data < 13:
+                 raise ValidationError("We're sorry, you must be 13 or older to register")
+ 
++The same principle applies for filters with the convention `filter_fieldname`::
++
++    class SignupForm(Form):
++        name = StringField('name')
++
++        def filter_name(form, field):
++            return field.strip()
++
++Note that filters are applied after processing the default and incoming data,
++but before validation.
+ 
+ .. _using-forms:
+ 
+diff --git a/src/wtforms/csrf/core.py b/src/wtforms/csrf/core.py
+index df4895d..c0d3c54 100644
+--- a/src/wtforms/csrf/core.py
++++ b/src/wtforms/csrf/core.py
+@@ -39,8 +39,8 @@ class CSRFTokenField(HiddenField):
+         """
+         self.csrf_impl.validate_csrf_token(form, self)
+ 
+-    def process(self, *args):
+-        super().process(*args)
++    def process(self, *args, **kwargs):
++        super().process(*args, **kwargs)
+         self.current_token = self.csrf_impl.generate_csrf_token(self)
+ 
+ 
+diff --git a/src/wtforms/fields/core.py b/src/wtforms/fields/core.py
+index 96bc5d6..2b19ea6 100644
+--- a/src/wtforms/fields/core.py
++++ b/src/wtforms/fields/core.py
+@@ -295,7 +295,7 @@ class Field:
+         """
+         pass
+ 
+-    def process(self, formdata, data=unset_value):
++    def process(self, formdata, data=unset_value, extra_filters=None):
+         """
+         Process incoming data, calling process_data, process_formdata as needed,
+         and run filters.
+@@ -307,6 +307,8 @@ class Field:
+         process_formdata and process_data methods. Only override this for
+         special advanced processing, such as when a field encapsulates many
+         inputs.
++
++        :param extra_filters: A sequence of extra filters to run.
+         """
+         self.process_errors = []
+         if data is unset_value:
+@@ -334,7 +336,7 @@ class Field:
+                 self.process_errors.append(e.args[0])
+ 
+         try:
+-            for filter in self.filters:
++            for filter in itertools.chain(self.filters, extra_filters or []):
+                 self.data = filter(self.data)
+         except ValueError as e:
+             self.process_errors.append(e.args[0])
+@@ -940,7 +942,13 @@ class FormField(Field):
+                 " define them on the enclosed form."
+             )
+ 
+-    def process(self, formdata, data=unset_value):
++    def process(self, formdata, data=unset_value, extra_filters=None):
++        if extra_filters:
++            raise TypeError(
++                "FormField cannot take filters, as the encapsulated"
++                "data is not mutable."
++            )
++
+         if data is unset_value:
+             try:
+                 data = self.default()
+@@ -1041,7 +1049,13 @@ class FieldList(Field):
+         self.last_index = -1
+         self._prefix = kwargs.get("_prefix", "")
+ 
+-    def process(self, formdata, data=unset_value):
++    def process(self, formdata, data=unset_value, extra_filters=None):
++        if extra_filters:
++            raise TypeError(
++                "FieldList does not accept any filters. Instead, define"
++                " them on the enclosed field."
++            )
++
+         self.entries = []
+         if data is unset_value or not data:
+             try:
+diff --git a/src/wtforms/form.py b/src/wtforms/form.py
+index 26e8331..b9fe171 100644
+--- a/src/wtforms/form.py
++++ b/src/wtforms/form.py
+@@ -79,7 +79,7 @@ class BaseForm:
+         for name, field in self._fields.items():
+             field.populate_obj(obj, name)
+ 
+-    def process(self, formdata=None, obj=None, data=None, **kwargs):
++    def process(self, formdata=None, obj=None, data=None, extra_filters=None, **kwargs):
+         """
+         Take form, object data, and keyword arg input and have the fields
+         process them.
+@@ -95,6 +95,10 @@ class BaseForm:
+             If provided, must be a dictionary of data. This is only used if
+             `formdata` is empty or not provided and `obj` does not contain
+             an attribute named the same as the field.
++        :param extra_filters: A dict mapping field names to lists of
++            extra filters functions to run. Extra filters run after
++            filters passed when creating the field. If the form has
++            ``filter_<fieldname>``, it is the last extra filter.
+         :param `**kwargs`:
+             If `formdata` is empty or not provided and `obj` does not contain
+             an attribute named the same as a field, form will assign the value
+@@ -107,13 +111,23 @@ class BaseForm:
+             #     Temporarily, this can simply be merged with kwargs.
+             kwargs = dict(data, **kwargs)
+ 
++        filters = extra_filters.copy() if extra_filters is not None else {}
++
+         for name, field in self._fields.items():
++            field_extra_filters = filters.get(name, [])
++
++            inline_filter = getattr(self, "filter_%s" % name, None)
++            if inline_filter is not None:
++                field_extra_filters.append(inline_filter)
++
+             if obj is not None and hasattr(obj, name):
+-                field.process(formdata, getattr(obj, name))
++                field.process(
++                    formdata, getattr(obj, name), extra_filters=field_extra_filters
++                )
+             elif name in kwargs:
+-                field.process(formdata, kwargs[name])
++                field.process(formdata, kwargs[name], extra_filters=field_extra_filters)
+             else:
+-                field.process(formdata)
++                field.process(formdata, extra_filters=field_extra_filters)
+ 
+     def validate(self, extra_validators=None):
+         """
+@@ -228,7 +242,7 @@ class Form(BaseForm, metaclass=FormMeta):
+     Meta = DefaultMeta
+ 
+     def __init__(
+-        self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs
++        self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs,
+     ):
+         """
+         :param formdata:

@@ -1,0 +1,189 @@
+diff --git a/examples/app-vitest-full/components/WrapperTests.vue b/examples/app-vitest-full/components/WrapperTests.vue
+index d648481..c06f5c1 100644
+--- a/examples/app-vitest-full/components/WrapperTests.vue
++++ b/examples/app-vitest-full/components/WrapperTests.vue
+@@ -10,7 +10,7 @@ function testExpose() {
+ 
+ const someRef = ref('thing')
+ 
+-const modelValue = defineModel({ default: false })
++const modelValue = defineModel({ type: Boolean, default: false })
+ 
+ defineExpose({
+   testExpose,
+diff --git a/test/unit/mock-transform.spec.ts b/test/unit/mock-transform.spec.ts
+index 2439ca4..3bf036b 100644
+--- a/test/unit/mock-transform.spec.ts
++++ b/test/unit/mock-transform.spec.ts
+@@ -1,7 +1,51 @@
+ import { beforeEach, describe, expect, it } from 'vitest'
+ import { rollup } from 'rollup'
++import { parseAst } from 'rollup/parseAst'
+ import { type MockPluginContext, createMockPlugin } from '../../src/module/plugins/mock'
+ 
++// The transform must always emit a syntactically valid ES module. This is the
++// behavioural property that broke when `vi` was imported explicitly: the mock
++// setup was spliced into the middle of the existing `vi` import statement.
++const parseModule = (code: string) => parseAst(code)
++
++// number of `import ... from 'vitest'` statements in the generated module
++const vitestImports = (code: string) => code.match(/from\s*['"]vitest['"]/g) ?? []
++
++// local `vi` bindings imported from Vitest, independent of formatting/order
++const vitestViBindings = (code: string) => {
++  const ast = parseModule(code) as { body: Array<{ type: string, source?: { value: string }, specifiers?: Array<{ type: string, imported?: { name?: string }, local?: { name?: string } }> }> }
++  return ast.body
++    .filter(node => node.type === 'ImportDeclaration' && node.source?.value === 'vitest')
++    .flatMap(node => node.specifiers ?? [])
++    .filter(specifier => specifier.type === 'ImportSpecifier' && specifier.imported?.name === 'vi' && specifier.local?.name === 'vi')
++}
++
++// the generated module registers a mock for `name`
++const mocksModule = (code: string, name: string) =>
++  new RegExp(`vi\\.mock\\(\\s*['"]${name}['"]`).test(code)
++
++// Run emitted registrations with an explicit vi binding, then invoke the
++// registered factory as Vitest does when importing the mocked module.
++const runMockFactory = async (code: string) => {
++  const ast = parseModule(code) as { body: Array<{ type: string, start: number, end: number }> }
++  let executable = code
++  for (const declaration of ast.body.filter(node => node.type === 'ImportDeclaration').sort((a, b) => b.start - a.start)) {
++    executable = executable.slice(0, declaration.start) + executable.slice(declaration.end)
++  }
++
++  const globals: Record<string, unknown> = {}
++  const registrations: Array<{ id: string, factory: (importOriginal: (id: string) => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>> }> = []
++  const vi = {
++    hoisted: (factory: () => unknown) => factory(),
++    stubGlobal: (name: string, value: unknown) => { globals[name] = value },
++    mock: (id: string, factory: (importOriginal: (id: string) => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>) => registrations.push({ id, factory }),
++  }
++  new Function('vi', 'globalThis', executable)(vi, globals)
++  const registration = registrations.find(mock => mock.id === 'bob')
++  if (!registration) throw new Error('The transformed module did not register the expected mock')
++  return await registration.factory(async () => ({ useSomeExport: 'original' }))
++}
++
+ describe('mocking', () => {
+   const pluginContext: MockPluginContext = { imports: [], components: [] }
+   const plugin = createMockPlugin(pluginContext)
+@@ -42,45 +86,60 @@ describe('mocking', () => {
+         name: 'useSomeExport',
+         from: 'bob',
+       }]
+-      expect(await getResult(`
++
++      // without an existing `vi` import the plugin adds one
++      const withoutVi = await getResult(`
+         import { mockNuxtImport } from '@nuxt/test-utils/runtime'
+         mockNuxtImport('useSomeExport', () => {
+           return () => 'mocked'
+         })
+-      `)).toMatchInlineSnapshot(`
+-        "import {vi} from "vitest";
+-        vi.hoisted(() => { 
+-                if(!globalThis.__NUXT_VITEST_MOCKS){
+-                  vi.stubGlobal("__NUXT_VITEST_MOCKS", {})
+-                }
+-              });
+-        vi.mock("bob", async (importOriginal) => {
+-          const mocks = globalThis.__NUXT_VITEST_MOCKS
+-          if (!mocks["bob"]) {
+-            mocks["bob"] = { ...await importOriginal("bob") }
+-          }
+-          mocks["bob"]["useSomeExport"] = await (() => {
+-                  return () => 'mocked'
+-                })();
+-          return mocks["bob"] 
+-        });
++      `)
++      expect(() => parseModule(withoutVi)).not.toThrow()
++      expect(vitestImports(withoutVi)).toHaveLength(1)
++      // without an existing binding, the transform imports `vi` from Vitest
++      expect(vitestViBindings(withoutVi)).toHaveLength(1)
++      expect(mocksModule(withoutVi, 'bob')).toBe(true)
++      expect(withoutVi).toContain('useSomeExport')
++      expect(withoutVi).not.toContain('mockNuxtImport(')
+ 
+-                import { mockNuxtImport } from '@nuxt/test-utils/runtime'
+-                
+-              
+-         import "bob";"
++      // with an existing `vi` import the generated module must still be valid ESM
++      const withVi = await getResult(`
++        import { vi } from 'vitest'
++        import { mockNuxtImport } from '@nuxt/test-utils/runtime'
++        mockNuxtImport('useSomeExport', () => {
++          return () => 'mocked'
++        })
+       `)
++      expect(() => parseModule(withVi)).not.toThrow()
++      expect(vitestImports(withVi)).toHaveLength(1)
++      expect(mocksModule(withVi, 'bob')).toBe(true)
++      expect(withVi).toContain('useSomeExport')
++      const mockedModule = await runMockFactory(withVi)
++      expect((mockedModule.useSomeExport as () => string)()).toBe('mocked')
+     })
++
+     it('should not add `vi` import if it already exists', async () => {
+       pluginContext.imports = [{
+         name: 'useSomeExport',
+         from: 'bob',
+       }]
+       const code = await getResult(`
+-        import { expect, vi } from 'vitest'
++        import { expect, vi, it } from 'vitest'
+         mockNuxtImport('useSomeExport', () => 'bob')
++
++        it('test', () => {
++          const a = vi.fn()
++        })
+       `)
+-      expect(code).not.toContain('import {vi} from "vitest";')
++      // the generated module must be valid ESM: the mock setup must not be
++      // spliced into the middle of the existing `vi` import statement
++      expect(() => parseModule(code)).not.toThrow()
++      // the existing `vi` import is preserved and not duplicated
++      expect(vitestImports(code)).toHaveLength(1)
++      expect(vitestViBindings(code)).toHaveLength(1)
++      // the module is mocked and the requested export is replaced
++      expect(mocksModule(code, 'bob')).toBe(true)
++      expect(code).toContain('useSomeExport')
+     })
+   })
+ 
+@@ -96,26 +155,17 @@ describe('mocking', () => {
+         shortPath: 'thing.vue',
+         filePath: '/test/thing.vue',
+       }]
+-      expect(await getResult(`
++
++      // without an existing `vi` import the plugin adds one
++      const withoutVi = await getResult(`
+         import { mockComponent } from '@nuxt/test-utils/runtime'
+         mockComponent('MyComponent', () => import('./MockComponent.vue'))
+-      `)).toMatchInlineSnapshot(`
+-        "import {vi} from "vitest";
+-        vi.hoisted(() => { 
+-                if(!globalThis.__NUXT_VITEST_MOCKS){
+-                  vi.stubGlobal("__NUXT_VITEST_MOCKS", {})
+-                }
+-              });
+-        vi.mock("MyComponent", async () => {
+-          const factory = (() => import('./MockComponent.vue'));
+-          const result = typeof factory === 'function' ? await factory() : await factory
+-          return 'default' in result ? result : { default: result }
+-        });
+-
+-                import { mockComponent } from '@nuxt/test-utils/runtime'
+-                
+-              "
+       `)
++      expect(() => parseModule(withoutVi)).not.toThrow()
++      expect(vitestImports(withoutVi)).toHaveLength(1)
++      expect(mocksModule(withoutVi, 'MyComponent')).toBe(true)
++      expect(withoutVi).toContain("import('./MockComponent.vue')")
++      expect(withoutVi).not.toContain('mockComponent(')
+     })
+   })
+ })

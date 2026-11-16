@@ -1,0 +1,392 @@
+diff --git a/api/v1alpha1/instancegroup_types.go b/api/v1alpha1/instancegroup_types.go
+index 9c07cb0..bf03559 100644
+--- a/api/v1alpha1/instancegroup_types.go
++++ b/api/v1alpha1/instancegroup_types.go
+@@ -425,6 +425,12 @@ func (c *EKSConfiguration) GetVolumes() []NodeVolume {
+ func (c *EKSConfiguration) GetBootstrapArguments() string {
+ 	return c.BootstrapArguments
+ }
++func (c *EKSConfiguration) GetSecurityGroups() []string {
++	if c.NodeSecurityGroups == nil {
++		return []string{}
++	}
++	return c.NodeSecurityGroups
++}
+ func (c *EKSConfiguration) GetTags() []map[string]string {
+ 	if c.Tags == nil {
+ 		return []map[string]string{}
+diff --git a/controllers/providers/aws/aws.go b/controllers/providers/aws/aws.go
+index 19ea461..acdb281 100644
+--- a/controllers/providers/aws/aws.go
++++ b/controllers/providers/aws/aws.go
+@@ -30,6 +30,8 @@ import (
+ 	"github.com/aws/aws-sdk-go/aws/session"
+ 	"github.com/aws/aws-sdk-go/service/autoscaling"
+ 	"github.com/aws/aws-sdk-go/service/autoscaling/autoscalingiface"
++	"github.com/aws/aws-sdk-go/service/ec2"
++	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
+ 	"github.com/aws/aws-sdk-go/service/eks"
+ 	"github.com/aws/aws-sdk-go/service/eks/eksiface"
+ 	"github.com/aws/aws-sdk-go/service/iam"
+@@ -45,7 +47,7 @@ var (
+ )
+ 
+ const (
+-	CacheDefaultTTL                 time.Duration = time.Second * 0
++	CacheDefaultTTL                 time.Duration = 0 * time.Second
+ 	DescribeAutoScalingGroupsTTL    time.Duration = 60 * time.Second
+ 	DescribeLaunchConfigurationsTTL time.Duration = 60 * time.Second
+ 	ListAttachedRolePoliciesTTL     time.Duration = 60 * time.Second
+@@ -53,6 +55,8 @@ const (
+ 	GetInstanceProfileTTL           time.Duration = 60 * time.Second
+ 	DescribeNodegroupTTL            time.Duration = 60 * time.Second
+ 	DescribeClusterTTL              time.Duration = 180 * time.Second
++	DescribeSecurityGroupsTTL       time.Duration = 180 * time.Second
++	DescribeSubnetsTTL              time.Duration = 180 * time.Second
+ 	CacheMaxItems                   int64         = 5000
+ 	CacheItemsToPrune               uint32        = 500
+ )
+@@ -61,6 +65,7 @@ type AwsWorker struct {
+ 	AsgClient  autoscalingiface.AutoScalingAPI
+ 	EksClient  eksiface.EKSAPI
+ 	IamClient  iamiface.IAMAPI
++	Ec2Client  ec2iface.EC2API
+ 	Parameters map[string]interface{}
+ }
+ 
+@@ -617,6 +622,84 @@ func (w *AwsWorker) compactTags(tags []map[string]string) map[string]string {
+ 	return compacted
+ }
+ 
++func (w *AwsWorker) SubnetByName(name, vpc string) (*ec2.Subnet, error) {
++	subnets := []*ec2.Subnet{}
++	filteredSubnets := []*ec2.Subnet{}
++
++	err := w.Ec2Client.DescribeSubnetsPages(
++		&ec2.DescribeSubnetsInput{
++			Filters: []*ec2.Filter{
++				{
++					Name:   aws.String("vpc-id"),
++					Values: []*string{aws.String(vpc)},
++				},
++			},
++		},
++		func(page *ec2.DescribeSubnetsOutput, lastPage bool) bool {
++			for _, p := range page.Subnets {
++				subnets = append(subnets, p)
++			}
++			return page.NextToken != nil
++		},
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	for _, s := range subnets {
++		for _, tag := range s.Tags {
++			k := aws.StringValue(tag.Key)
++			v := aws.StringValue(tag.Value)
++			if strings.EqualFold(k, "Name") && strings.EqualFold(v, name) {
++				filteredSubnets = append(filteredSubnets, s)
++			}
++		}
++	}
++
++	if len(filteredSubnets) == 0 {
++		return nil, nil
++	}
++	return filteredSubnets[0], nil
++}
++
++func (w *AwsWorker) SecurityGroupByName(name, vpc string) (*ec2.SecurityGroup, error) {
++	groups := []*ec2.SecurityGroup{}
++	filteredGroups := []*ec2.SecurityGroup{}
++	err := w.Ec2Client.DescribeSecurityGroupsPages(
++		&ec2.DescribeSecurityGroupsInput{
++			Filters: []*ec2.Filter{
++				{
++					Name:   aws.String("vpc-id"),
++					Values: []*string{aws.String(vpc)},
++				},
++			},
++		},
++		func(page *ec2.DescribeSecurityGroupsOutput, lastPage bool) bool {
++			for _, p := range page.SecurityGroups {
++				groups = append(groups, p)
++			}
++			return page.NextToken != nil
++		},
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	for _, g := range groups {
++		for _, tag := range g.Tags {
++			k := aws.StringValue(tag.Key)
++			v := aws.StringValue(tag.Value)
++			if strings.EqualFold(k, "Name") && strings.EqualFold(v, name) {
++				filteredGroups = append(filteredGroups, g)
++			}
++		}
++	}
++	if len(filteredGroups) == 0 {
++		return nil, nil
++	}
++	return filteredGroups[0], nil
++}
++
+ func (w *AwsWorker) DescribeAutoscalingGroups() ([]*autoscaling.Group, error) {
+ 	scalingGroups := []*autoscaling.Group{}
+ 	err := w.AsgClient.DescribeAutoScalingGroupsPages(&autoscaling.DescribeAutoScalingGroupsInput{}, func(page *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
+@@ -738,6 +821,29 @@ func GetAwsAsgClient(region string, cacheCfg *cache.Config, maxRetries int) auto
+ 	return autoscaling.New(sess)
+ }
+ 
++// GetAwsEc2Client returns an EC2 client
++func GetAwsEc2Client(region string, cacheCfg *cache.Config, maxRetries int) ec2iface.EC2API {
++	config := aws.NewConfig().WithRegion(region).WithCredentialsChainVerboseErrors(true)
++	config = request.WithRetryer(config, NewRetryLogger(maxRetries))
++	sess, err := session.NewSession(config)
++	if err != nil {
++		panic(err)
++	}
++
++	cache.AddCaching(sess, cacheCfg)
++	cacheCfg.SetCacheTTL("ec2", "DescribeSecurityGroups", DescribeSecurityGroupsTTL)
++	cacheCfg.SetCacheTTL("ec2", "DescribeSubnets", DescribeSubnetsTTL)
++	sess.Handlers.Complete.PushFront(func(r *request.Request) {
++		ctx := r.HTTPRequest.Context()
++		log.V(1).Info("AWS API call",
++			"cacheHit", cache.IsCacheHit(ctx),
++			"service", r.ClientInfo.ServiceName,
++			"operation", r.Operation.Name,
++		)
++	})
++	return ec2.New(sess)
++}
++
+ // GetAwsEksClient returns an EKS client
+ func GetAwsEksClient(region string, cacheCfg *cache.Config, maxRetries int) eksiface.EKSAPI {
+ 	config := aws.NewConfig().WithRegion(region).WithCredentialsChainVerboseErrors(true)
+diff --git a/controllers/provisioners/eks/cloud.go b/controllers/provisioners/eks/cloud.go
+index 44c978d..03515d3 100644
+--- a/controllers/provisioners/eks/cloud.go
++++ b/controllers/provisioners/eks/cloud.go
+@@ -45,6 +45,7 @@ type DiscoveredState struct {
+ 	InstanceProfile               *iam.InstanceProfile
+ 	Publisher                     kubeprovider.EventPublisher
+ 	Cluster                       *eks.Cluster
++	VPCId                         string
+ }
+ 
+ func (ctx *EksInstanceGroupContext) CloudDiscovery() error {
+@@ -108,6 +109,9 @@ func (ctx *EksInstanceGroupContext) CloudDiscovery() error {
+ 	}
+ 	state.SetCluster(cluster)
+ 
++	vpcId := aws.StringValue(cluster.ResourcesVpcConfig.VpcId)
++	state.SetVPCId(vpcId)
++
+ 	// find all owned scaling groups
+ 	ownedScalingGroups := ctx.findOwnedScalingGroups(scalingGroups)
+ 	state.SetOwnedScalingGroups(ownedScalingGroups)
+@@ -201,6 +205,14 @@ func (d *DiscoveredState) SetCluster(cluster *eks.Cluster) {
+ 	d.Cluster = cluster
+ }
+ 
++func (d *DiscoveredState) SetVPCId(id string) {
++	d.VPCId = id
++}
++
++func (d *DiscoveredState) GetVPCId() string {
++	return d.VPCId
++}
++
+ func (d *DiscoveredState) GetClusterVersion() string {
+ 	if d.Cluster == nil {
+ 		return ""
+diff --git a/controllers/provisioners/eks/create.go b/controllers/provisioners/eks/create.go
+index cccec81..c111993 100644
+--- a/controllers/provisioners/eks/create.go
++++ b/controllers/provisioners/eks/create.go
+@@ -65,7 +65,6 @@ func (ctx *EksInstanceGroupContext) CreateScalingGroup(lcName string) error {
+ 	var (
+ 		instanceGroup = ctx.GetInstanceGroup()
+ 		spec          = instanceGroup.GetEKSSpec()
+-		configuration = instanceGroup.GetEKSConfiguration()
+ 		state         = ctx.GetDiscoveredState()
+ 		asgName       = ctx.ResourcePrefix
+ 		tags          = ctx.GetAddedTags(asgName)
+@@ -81,7 +80,7 @@ func (ctx *EksInstanceGroupContext) CreateScalingGroup(lcName string) error {
+ 		LaunchConfigurationName: aws.String(lcName),
+ 		MinSize:                 aws.Int64(spec.GetMinSize()),
+ 		MaxSize:                 aws.Int64(spec.GetMaxSize()),
+-		VPCZoneIdentifier:       aws.String(common.ConcatenateList(configuration.GetSubnets(), ",")),
++		VPCZoneIdentifier:       aws.String(common.ConcatenateList(ctx.ResolveSubnets(), ",")),
+ 		Tags:                    tags,
+ 	})
+ 	if err != nil {
+diff --git a/controllers/provisioners/eks/helpers.go b/controllers/provisioners/eks/helpers.go
+index de751f8..34a7150 100644
+--- a/controllers/provisioners/eks/helpers.go
++++ b/controllers/provisioners/eks/helpers.go
+@@ -46,6 +46,7 @@ func (ctx *EksInstanceGroupContext) GetLaunchConfigurationInput(name string) *au
+ 		args                  = ctx.GetBootstrapArgs()
+ 		preScript, postScript = ctx.GetUserDataStages()
+ 		userData              = ctx.AwsWorker.GetBasicUserData(clusterName, args, preScript, postScript)
++		sgs                   = ctx.ResolveSecurityGroups()
+ 	)
+ 
+ 	input := &autoscaling.CreateLaunchConfigurationInput{
+@@ -54,7 +55,7 @@ func (ctx *EksInstanceGroupContext) GetLaunchConfigurationInput(name string) *au
+ 		ImageId:                 aws.String(configuration.Image),
+ 		InstanceType:            aws.String(configuration.InstanceType),
+ 		KeyName:                 aws.String(configuration.KeyPairName),
+-		SecurityGroups:          aws.StringSlice(configuration.NodeSecurityGroups),
++		SecurityGroups:          aws.StringSlice(sgs),
+ 		BlockDeviceMappings:     devices,
+ 		UserData:                aws.String(userData),
+ 	}
+@@ -66,7 +67,66 @@ func (ctx *EksInstanceGroupContext) GetLaunchConfigurationInput(name string) *au
+ 	return input
+ }
+ 
++func (ctx *EksInstanceGroupContext) ResolveSubnets() []string {
++	var (
++		instanceGroup = ctx.GetInstanceGroup()
++		configuration = instanceGroup.GetEKSConfiguration()
++		state         = ctx.GetDiscoveredState()
++		resolved      = make([]string, 0)
++	)
++
++	for _, s := range configuration.GetSubnets() {
++		if strings.HasPrefix(s, "subnet-") {
++			resolved = append(resolved, s)
++			continue
++		}
++
++		sn, err := ctx.AwsWorker.SubnetByName(s, state.GetVPCId())
++		if err != nil {
++			ctx.Log.Error(err, "failed to resolve subnet id by name", "subnet", s)
++			continue
++		}
++		if sn == nil {
++			ctx.Log.Error(errors.New("subnet not found"), "failed to resolve subnet by name", "subnet", s)
++			continue
++		}
++		resolved = append(resolved, aws.StringValue(sn.SubnetId))
++	}
++
++	return resolved
++}
++
++func (ctx *EksInstanceGroupContext) ResolveSecurityGroups() []string {
++	var (
++		instanceGroup = ctx.GetInstanceGroup()
++		configuration = instanceGroup.GetEKSConfiguration()
++		state         = ctx.GetDiscoveredState()
++		resolved      = make([]string, 0)
++	)
++
++	for _, g := range configuration.GetSecurityGroups() {
++		if strings.HasPrefix(g, "sg-") {
++			resolved = append(resolved, g)
++			continue
++		}
++
++		sg, err := ctx.AwsWorker.SecurityGroupByName(g, state.GetVPCId())
++		if err != nil {
++			ctx.Log.Error(err, "failed to resolve security group by name", "security-group", g)
++			continue
++		}
++		if sg == nil {
++			ctx.Log.Error(errors.New("security group not found"), "failed to resolve security group by name", "security-group", g)
++			continue
++		}
++		resolved = append(resolved, aws.StringValue(sg.GroupId))
++	}
++
++	return resolved
++}
++
+ func (ctx *EksInstanceGroupContext) GetUserDataStages() ([]string, []string) {
++
+ 	var (
+ 		instanceGroup = ctx.GetInstanceGroup()
+ 		configuration = instanceGroup.GetEKSConfiguration()
+diff --git a/controllers/provisioners/eks/update.go b/controllers/provisioners/eks/update.go
+index 753f6e9..c9e0aca 100644
+--- a/controllers/provisioners/eks/update.go
++++ b/controllers/provisioners/eks/update.go
+@@ -84,7 +84,6 @@ func (ctx *EksInstanceGroupContext) UpdateScalingGroup() error {
+ 	var (
+ 		instanceGroup = ctx.GetInstanceGroup()
+ 		spec          = instanceGroup.GetEKSSpec()
+-		configuration = instanceGroup.GetEKSConfiguration()
+ 		status        = instanceGroup.GetStatus()
+ 		state         = ctx.GetDiscoveredState()
+ 		scalingGroup  = state.GetScalingGroup()
+@@ -99,7 +98,7 @@ func (ctx *EksInstanceGroupContext) UpdateScalingGroup() error {
+ 			LaunchConfigurationName: aws.String(state.GetActiveLaunchConfigurationName()),
+ 			MinSize:                 aws.Int64(spec.GetMinSize()),
+ 			MaxSize:                 aws.Int64(spec.GetMaxSize()),
+-			VPCZoneIdentifier:       aws.String(common.ConcatenateList(configuration.GetSubnets(), ",")),
++			VPCZoneIdentifier:       aws.String(common.ConcatenateList(ctx.ResolveSubnets(), ",")),
+ 		})
+ 		if err != nil {
+ 			return err
+@@ -186,12 +185,11 @@ func (ctx *EksInstanceGroupContext) ScalingGroupUpdateNeeded() bool {
+ 	var (
+ 		instanceGroup  = ctx.GetInstanceGroup()
+ 		spec           = instanceGroup.GetEKSSpec()
+-		configuration  = instanceGroup.GetEKSConfiguration()
+ 		state          = ctx.GetDiscoveredState()
+ 		scalingGroup   = state.GetScalingGroup()
+ 		zoneIdentifier = aws.StringValue(scalingGroup.VPCZoneIdentifier)
+ 		groupSubnets   = strings.Split(zoneIdentifier, ",")
+-		specSubnets    = configuration.GetSubnets()
++		specSubnets    = ctx.ResolveSubnets()
+ 	)
+ 
+ 	if state.GetActiveLaunchConfigurationName() != aws.StringValue(scalingGroup.LaunchConfigurationName) {
+diff --git a/docs/EKS.md b/docs/EKS.md
+index 970ba8c..4ff20a2 100644
+--- a/docs/EKS.md
++++ b/docs/EKS.md
+@@ -25,8 +25,8 @@ spec:
+       keyPairName: <string> : must match the name of an EC2 Key Pair (required)
+       image: <string> : must match the ID of an EKS AMI (required)
+       instanceType: <string> : must match the type of an EC2 instance (required)
+-      securityGroups: <[]string> : must match existing security group IDs (required)
+-      subnets: <[]string> : must match existing subnet IDs (required)
++      securityGroups: <[]string> : must match existing security group IDs or Name (by value of tag "Name") (required)
++      subnets: <[]string> : must match existing subnet IDs or Name (by value of tag "Name") (required)
+ 
+       # customize EBS volumes
+       volumes: <[]NodeVolume> : list of NodeVolume objects
+diff --git a/docs/INSTALL.md b/docs/INSTALL.md
+index 3bc5ef9..55702fb 100644
+--- a/docs/INSTALL.md
++++ b/docs/INSTALL.md
+@@ -51,6 +51,8 @@ The below are the minimum required policies needed to run the basic operations o
+ iam:GetRole
+ iam:GetInstanceProfile
+ iam:PassRole
++ec2:DescribeSecurityGroups
++ec2:DescribeSubnets
+ autoscaling:DescribeAutoScalingGroups
+ autoscaling:UpdateAutoScalingGroup
+ autoscaling:TerminateInstanceInAutoScalingGroup
+diff --git a/main.go b/main.go
+index 80d3e04..66cdcbd 100644
+--- a/main.go
++++ b/main.go
+@@ -113,6 +113,7 @@ func main() {
+ 	cacheCfg := cache.NewConfig(aws.CacheDefaultTTL, aws.CacheMaxItems, aws.CacheItemsToPrune)
+ 
+ 	awsWorker := aws.AwsWorker{
++		Ec2Client: aws.GetAwsEc2Client(awsRegion, cacheCfg, maxAPIRetries),
+ 		IamClient: aws.GetAwsIamClient(awsRegion, cacheCfg, maxAPIRetries),
+ 		AsgClient: aws.GetAwsAsgClient(awsRegion, cacheCfg, maxAPIRetries),
+ 		EksClient: aws.GetAwsEksClient(awsRegion, cacheCfg, maxAPIRetries),

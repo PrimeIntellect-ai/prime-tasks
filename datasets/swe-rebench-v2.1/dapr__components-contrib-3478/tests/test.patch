@@ -1,0 +1,151 @@
+diff --git a/pubsub/aws/snssqs/snssqs_test.go b/pubsub/aws/snssqs/snssqs_test.go
+index f396ddef..920f3802 100644
+--- a/pubsub/aws/snssqs/snssqs_test.go
++++ b/pubsub/aws/snssqs/snssqs_test.go
+@@ -14,8 +14,17 @@ limitations under the License.
+ package snssqs
+ 
+ import (
++	"context"
++	"crypto/md5"
++	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/stretchr/testify/require"
+ 
+@@ -491,3 +500,128 @@ func Test_buildARN_NonStandardPartition(t *testing.T) {
+ 	arn := ps.buildARN("sns", "myTopic")
+ 	r.Equal("arn:aws-cn:sns:cn-northwest-1:123456789012:myTopic", arn)
+ }
++
++// snsSqsFakeAWS answers the SQS and SNS calls made during component initialization and
++// consumption. The first two ReceiveMessage calls return one SNS notification each (ids
++// "a" and "b"); later calls return no messages.
++type snsSqsFakeAWS struct {
++	receives atomic.Int32
++}
++
++const (
++	fakeAWSAccount = "000000000000"
++	fakeTopicArn   = "arn:aws:sns:us-east-1:" + fakeAWSAccount + ":my-topic"
++	fakeQueueArn   = "arn:aws:sqs:us-east-1:" + fakeAWSAccount + ":my-queue"
++	fakeSubArn     = fakeTopicArn + ":sub-1"
++)
++
++func (f *snsSqsFakeAWS) ServeHTTP(w http.ResponseWriter, req *http.Request) {
++	if target := req.Header.Get("X-Amz-Target"); target != "" {
++		// SQS JSON protocol.
++		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
++		switch target {
++		case "AmazonSQS.GetQueueUrl":
++			_, _ = fmt.Fprintf(w, `{"QueueUrl":"http://%s/%s/my-queue"}`, req.Host, fakeAWSAccount)
++		case "AmazonSQS.GetQueueAttributes":
++			_, _ = fmt.Fprintf(w, `{"Attributes":{"QueueArn":%q}}`, fakeQueueArn)
++		case "AmazonSQS.ReceiveMessage":
++			n := f.receives.Add(1)
++			if n > 2 {
++				_, _ = w.Write([]byte(`{}`))
++				return
++			}
++			id := map[int32]string{1: "a", 2: "b"}[n]
++			snsBody, _ := json.Marshal(map[string]string{"Message": id, "TopicArn": fakeTopicArn})
++			sum := md5.Sum(snsBody)
++			msg, _ := json.Marshal(map[string]any{
++				"MessageId":     id,
++				"ReceiptHandle": "rh-" + id,
++				"Body":          string(snsBody),
++				"MD5OfBody":     hex.EncodeToString(sum[:]),
++				"Attributes":    map[string]string{"ApproximateReceiveCount": "1"},
++			})
++			_, _ = fmt.Fprintf(w, `{"Messages":[%s]}`, msg)
++		default:
++			_, _ = w.Write([]byte(`{}`))
++		}
++		return
++	}
++
++	// SNS query protocol.
++	_ = req.ParseForm()
++	w.Header().Set("Content-Type", "text/xml")
++	switch req.FormValue("Action") {
++	case "GetTopicAttributes":
++		_, _ = fmt.Fprintf(w, `<GetTopicAttributesResponse><GetTopicAttributesResult><Attributes><entry><key>TopicArn</key><value>%s</value></entry></Attributes></GetTopicAttributesResult></GetTopicAttributesResponse>`, fakeTopicArn)
++	case "ListSubscriptionsByTopic":
++		_, _ = fmt.Fprintf(w, `<ListSubscriptionsByTopicResponse><ListSubscriptionsByTopicResult><Subscriptions><member><TopicArn>%s</TopicArn><SubscriptionArn>%s</SubscriptionArn><Protocol>sqs</Protocol><Endpoint>%s</Endpoint><Owner>%s</Owner></member></Subscriptions></ListSubscriptionsByTopicResult></ListSubscriptionsByTopicResponse>`, fakeTopicArn, fakeSubArn, fakeQueueArn, fakeAWSAccount)
++	default:
++		_, _ = w.Write([]byte(`<UnknownResponse/>`))
++	}
++}
++
++// Test_subscribe_parallel_does_not_starve_new_messages verifies the central behavioral
++// requirement of the consumer-starvation fix, exercised through the component lifecycle
++// (Init, Subscribe) against a fake AWS endpoint: while a handler for a message from one
++// batch is still running, a message received in a later batch must still be dispatched
++// to its handler. The handler for "a" blocks until the test releases it; the handler for
++// "b" signals completion. If consumption waits for the whole first batch to finish before
++// polling again, "b" is never handled and the test fails.
++func Test_subscribe_parallel_does_not_starve_new_messages(t *testing.T) {
++	r := require.New(t)
++
++	server := httptest.NewServer(&snsSqsFakeAWS{})
++	defer server.Close()
++
++	aStarted := make(chan struct{})
++	bHandled := make(chan struct{})
++	releaseA := make(chan struct{})
++	var aOnce, bOnce sync.Once
++
++	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
++		switch string(msg.Data) {
++		case "a":
++			aOnce.Do(func() { close(aStarted) })
++			<-releaseA
++		case "b":
++			bOnce.Do(func() { close(bHandled) })
++		}
++		return nil
++	}
++
++	ps := NewSnsSqs(logger.NewLogger("SnsSqs unit test"))
++	defer ps.Close()
++	// Unblock the first handler before the component is closed.
++	defer close(releaseA)
++
++	err := ps.Init(context.Background(), pubsub.Metadata{Base: metadata.Base{Properties: map[string]string{
++		"consumerID":              "my-consumer",
++		"accountId":               fakeAWSAccount,
++		"region":                  "us-east-1",
++		"endpoint":                server.URL,
++		"accessKey":               "a",
++		"secretKey":               "s",
++		"concurrencyMode":         string(pubsub.Parallel),
++		"disableEntityManagement": "true",
++	}}})
++	r.NoError(err)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	err = ps.Subscribe(ctx, pubsub.SubscribeRequest{Topic: "my-topic"}, handler)
++	r.NoError(err)
++
++	select {
++	case <-aStarted:
++	case <-time.After(10 * time.Second):
++		r.FailNow("first message was never handled")
++	}
++
++	select {
++	case <-bHandled:
++	// A message from a later batch was handled while the first handler was still blocked.
++	case <-time.After(10 * time.Second):
++		r.FailNow("second message was not handled while the first message handler was still running (consumer starvation)")
++	}
++}

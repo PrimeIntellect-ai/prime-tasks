@@ -1,0 +1,234 @@
+diff --git a/pkg/sidecar/config/config_test.go b/pkg/sidecar/config/config_test.go
+index 5fd112b27..52ef1cee5 100644
+--- a/pkg/sidecar/config/config_test.go
++++ b/pkg/sidecar/config/config_test.go
+@@ -1,15 +1,22 @@
+ package config
+ 
+ import (
++	"context"
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/magiconair/properties"
++	"github.com/scylladb/scylla-operator/pkg/naming"
++	"github.com/scylladb/scylla-operator/pkg/sidecar/identity"
++	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/equality"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes/fake"
+ )
+ 
+ func TestMergeSnitchConfigs(t *testing.T) {
+@@ -273,108 +280,107 @@ func TestAllowedCPUs(t *testing.T) {
+ 	t.Log(cpusAllowed)
+ }
+ 
+-func TestScyllaArguments(t *testing.T) {
+-	ts := []struct {
+-		Name         string
+-		Args         string
+-		ExpectedArgs map[string]string
+-	}{
+-		{
+-			Name: "all combinations in one",
+-			Args: `--arg1 --arg2=val2 --arg3 "val3" --arg4="val4" --arg5=-1.23 --arg6 -123 --arg7 123`,
+-			ExpectedArgs: map[string]string{
+-				"arg1": "",
+-				"arg2": "val2",
+-				"arg3": `"val3"`,
+-				"arg4": `"val4"`,
+-				"arg5": "-1.23",
+-				"arg6": "-123",
+-				"arg7": "123",
+-			},
+-		},
+-		{
+-			Name:         "single empty flag",
+-			Args:         "--arg",
+-			ExpectedArgs: map[string]string{"arg": ""},
+-		},
+-		{
+-			Name:         "single flag",
+-			Args:         "--arg val",
+-			ExpectedArgs: map[string]string{"arg": "val"},
+-		},
+-		{
+-			Name:         "integer value",
+-			Args:         "--arg 123",
+-			ExpectedArgs: map[string]string{"arg": "123"},
+-		},
+-		{
+-			Name:         "negative integer value",
+-			Args:         "--arg -123",
+-			ExpectedArgs: map[string]string{"arg": "-123"},
+-		},
+-		{
+-			Name:         "float value",
+-			Args:         "--arg 1.23",
+-			ExpectedArgs: map[string]string{"arg": "1.23"},
+-		},
+-		{
+-			Name:         "negative float value",
+-			Args:         "--arg -1.23",
+-			ExpectedArgs: map[string]string{"arg": "-1.23"},
+-		},
+-		{
+-			Name:         "negative float value and string parameter",
+-			Args:         "--arg1 -1.23 --arg2 val",
+-			ExpectedArgs: map[string]string{"arg1": "-1.23", "arg2": "val"},
+-		},
+-		{
+-			Name:         "bool value",
+-			Args:         "--arg true",
+-			ExpectedArgs: map[string]string{"arg": "true"},
+-		},
+-		{
+-			Name:         "flag quoted",
+-			Args:         `--arg "val"`,
+-			ExpectedArgs: map[string]string{"arg": `"val"`},
+-		},
+-		{
+-			Name:         "flag quoted with equal sign",
+-			Args:         `--arg="val"`,
+-			ExpectedArgs: map[string]string{"arg": `"val"`},
+-		},
+-		{
+-			Name:         "empty",
+-			Args:         "",
+-			ExpectedArgs: map[string]string{},
+-		},
+-		{
+-			Name: "garbage inside",
+-			Args: "--arg1 val asdasdasdas --arg2=val",
+-			ExpectedArgs: map[string]string{
+-				"arg1": "val",
+-				"arg2": "val",
+-			},
+-		},
+-		{
+-			Name: "mixed types",
+-			Args: "--skip-wait-for-gossip-to-settle 0 --ring-delay-ms 5000 --compaction-enforce-min-threshold true --shadow-round-ms 1",
+-			ExpectedArgs: map[string]string{
+-				"skip-wait-for-gossip-to-settle":   "0",
+-				"ring-delay-ms":                    "5000",
+-				"compaction-enforce-min-threshold": "true",
+-				"shadow-round-ms":                  "1",
+-			},
+-		},
++func TestSetupScyllaArgumentsPreservesPresenceOnlyFlags(t *testing.T) {
++	type savedFile struct {
++		path    string
++		data    []byte
++		mode    os.FileMode
++		link    string
++		existed bool
+ 	}
+ 
+-	for _, test := range ts {
+-		t.Run(test.Name, func(t *testing.T) {
+-			t.Parallel()
++	var saved []savedFile
++	createdDirs := map[string]struct{}{}
++	writeFixture := func(path, content string) {
++		for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
++			if _, err := os.Stat(dir); err == nil {
++				break
++			}
++			createdDirs[dir] = struct{}{}
++		}
++		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++			t.Fatalf("create fixture directory for %q: %v", path, err)
++		}
++		old := savedFile{path: path}
++		if info, err := os.Lstat(path); err == nil {
++			old.existed = true
++			old.mode = info.Mode()
++			if info.Mode()&os.ModeSymlink != 0 {
++				old.link, err = os.Readlink(path)
++			} else {
++				old.data, err = os.ReadFile(path)
++			}
++			if err != nil {
++				t.Fatalf("save fixture target %q: %v", path, err)
++			}
++		} else if !os.IsNotExist(err) {
++			t.Fatalf("inspect fixture target %q: %v", path, err)
++		}
++		saved = append(saved, old)
++		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
++			t.Fatalf("prepare fixture target %q: %v", path, err)
++		}
++		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
++			t.Fatalf("write fixture %q: %v", path, err)
++		}
++	}
+ 
+-			argumentsMap := convertScyllaArguments(test.Args)
+-			if !reflect.DeepEqual(test.ExpectedArgs, argumentsMap) {
+-				t.Errorf("expected %+v, got %+v", test.ExpectedArgs, argumentsMap)
++	t.Cleanup(func() {
++		for i := len(saved) - 1; i >= 0; i-- {
++			file := saved[i]
++			_ = os.Remove(file.path)
++			if file.existed {
++				if file.mode&os.ModeSymlink != 0 {
++					_ = os.Symlink(file.link, file.path)
++				} else {
++					_ = os.WriteFile(file.path, file.data, file.mode.Perm())
++				}
+ 			}
+-		})
++		}
++		// Remove deepest directories first, and only remove paths this test created.
++		var dirs []string
++		for dir := range createdDirs {
++			dirs = append(dirs, dir)
++		}
++		slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
++		for _, dir := range dirs {
++			_ = os.Remove(dir)
++		}
++	})
++
++	writeFixture(scyllaYAMLPath, "{}\n")
++	writeFixture(naming.ScyllaManagedConfigPath, "{}\n")
++	writeFixture(filepath.Join(naming.ScyllaDBSnitchConfigDir, naming.ScyllaRackDCPropertiesName), "dc: dc\nrack: rack\n")
++	writeFixture(scyllaRackDCPropertiesPath, "")
++	writeFixture(scyllaIOPropertiesPath, "{}\n")
++
++	m := &identity.Member{
++		Name:                        "cluster-0",
++		Namespace:                   "ns",
++		Cluster:                     "cluster",
++		RackOrdinal:                 0,
++		BroadcastAddress:            "1.1.1.1",
++		BroadcastRPCAddress:         "1.1.1.1",
++		AdditionalScyllaDBArguments: []string{"--poll-mode", "--test-switch"},
++	}
++	labels := naming.ScyllaLabels()
++	labels[naming.ClusterNameLabel] = m.Cluster
++	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: m.Name, Namespace: m.Namespace, Labels: labels}}
++	s := NewScyllaConfig(m, fake.NewSimpleClientset(pod), 1, nil)
++
++	cmd, err := s.Setup(context.Background())
++	if err != nil {
++		t.Fatalf("unexpected setup error: %v", err)
++	}
++
++	for _, flag := range []string{"--poll-mode", "--test-switch"} {
++		if !slices.Contains(cmd.Args, flag) {
++			t.Errorf("final ScyllaDB command %v does not contain standalone %q", cmd.Args, flag)
++		}
++		for _, arg := range cmd.Args {
++			if strings.HasPrefix(arg, flag+"=") {
++				t.Errorf("final ScyllaDB command contains value-bearing form %q for presence-only flag %q", arg, flag)
++			}
++		}
+ 	}
+ }

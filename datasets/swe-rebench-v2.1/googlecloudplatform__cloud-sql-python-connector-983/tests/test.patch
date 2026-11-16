@@ -1,0 +1,416 @@
+diff --git a/tests/unit/mocks.py b/tests/unit/mocks.py
+index d56e63f..57d4642 100644
+--- a/tests/unit/mocks.py
++++ b/tests/unit/mocks.py
+@@ -50,7 +50,9 @@ class FakeCredentials:
+     def refresh(self, request: Callable) -> None:
+         """Refreshes the access token."""
+         self.token = "12345"
+-        self.expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=60)
++        self.expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
++            minutes=60
++        )
+ 
+     @property
+     def expired(self) -> bool:
+@@ -62,7 +64,9 @@ class FakeCredentials:
+         """
+         if self.expiry is None:
+             return False
+-        return False if self.expiry > datetime.datetime.utcnow() else True
++        if self.expiry > datetime.datetime.now(datetime.timezone.utc):
++            return False
++        return True
+ 
+     @property
+     def valid(self) -> bool:
+@@ -108,11 +112,15 @@ class MockMetadata(ConnectionInfo):
+ 
+ 
+ async def instance_metadata_success(*args: Any, **kwargs: Any) -> MockMetadata:
+-    return MockMetadata(datetime.datetime.utcnow() + datetime.timedelta(minutes=10))
++    return MockMetadata(
++        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)
++    )
+ 
+ 
+ async def instance_metadata_expired(*args: Any, **kwargs: Any) -> MockMetadata:
+-    return MockMetadata(datetime.datetime.utcnow() - datetime.timedelta(minutes=10))
++    return MockMetadata(
++        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)
++    )
+ 
+ 
+ async def instance_metadata_error(*args: Any, **kwargs: Any) -> None:
+@@ -145,10 +153,10 @@ def generate_cert(
+         .issuer_name(issuer)
+         .public_key(key.public_key())
+         .serial_number(x509.random_serial_number())
+-        .not_valid_before(datetime.datetime.utcnow())
++        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+         .not_valid_after(
+             # cert valid for 10 mins
+-            datetime.datetime.utcnow()
++            datetime.datetime.now(datetime.timezone.utc)
+             + datetime.timedelta(minutes=60)
+         )
+     )
+@@ -189,7 +197,7 @@ def client_key_signed_cert(
+         .issuer_name(issuer)
+         .public_key(client_key)
+         .serial_number(x509.random_serial_number())
+-        .not_valid_before(datetime.datetime.utcnow())
++        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+         .not_valid_after(cert._not_valid_after)  # type: ignore
+     )
+     return (
+@@ -258,7 +266,8 @@ class FakeCSQLInstance:
+                     "cert": server_ca_cert,
+                     "instance": self.name,
+                     "expirationTime": str(
+-                        datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
++                        datetime.datetime.now(datetime.timezone.utc)
++                        + datetime.timedelta(minutes=10)
+                     ),
+                 },
+                 "dnsName": "abcde.12345.us-central1.sql.goog",
+@@ -284,7 +293,8 @@ class FakeCSQLInstance:
+                     "kind": "sql#sslCert",
+                     "cert": ephemeral_cert,
+                     "expirationTime": str(
+-                        datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
++                        datetime.datetime.now(datetime.timezone.utc)
++                        + datetime.timedelta(minutes=10)
+                     ),
+                 }
+             }
+diff --git a/tests/unit/test_instance.py b/tests/unit/test_instance.py
+index b8948aa..fe3c663 100644
+--- a/tests/unit/test_instance.py
++++ b/tests/unit/test_instance.py
+@@ -15,11 +15,13 @@ limitations under the License.
+ """
+ import asyncio
+ import datetime
++import warnings
+ from typing import Tuple
+ 
+ from aiohttp import ClientResponseError
+ from aiohttp import RequestInfo
+ from aioresponses import aioresponses
++from cryptography.utils import CryptographyDeprecationWarning
+ from google.auth.credentials import Credentials
+ from mock import patch
+ import mocks
+@@ -162,6 +164,40 @@ async def test_schedule_refresh_wont_replace_valid_result_with_invalid(
+     assert isinstance(await instance._current, ConnectionInfo)
+ 
+ 
++@pytest.mark.asyncio
++async def test_schedule_refresh_replaces_expired_result_with_failed_refresh(
++    instance: Instance, test_rate_limiter: AsyncRateLimiter
++) -> None:
++    """
++    Test to check that a failed refresh replaces a current result whose
++    certificate has already expired, so connections never reuse expired metadata.
++    """
++    # allow more frequent refreshes for tests
++    setattr(instance, "_refresh_rate_limiter", test_rate_limiter)
++
++    # wait for the initial refresh so it cannot overwrite the value set below
++    await instance._current
++
++    # set current to metadata that expired 10 minutes ago
++    expired_task = asyncio.create_task(mocks.instance_metadata_expired())
++    await expired_task
++    instance._current = expired_task
++
++    # stub _perform_refresh to throw an error
++    setattr(instance, "_perform_refresh", mocks.instance_metadata_error)
++
++    # schedule refresh immediately and wait for it to fail
++    refresh_task = instance._schedule_refresh(0)
++    with pytest.raises(mocks.BadRefresh):
++        assert await refresh_task
++
++    # check that the expired result was replaced by the failed refresh
++    assert instance._current is not expired_task
++    with pytest.raises(mocks.BadRefresh):
++        assert await instance._current
++    await instance.close()
++
++
+ @pytest.mark.asyncio
+ async def test_schedule_refresh_replaces_invalid_result(
+     instance: Instance, test_rate_limiter: AsyncRateLimiter
+@@ -257,7 +293,9 @@ async def test_perform_refresh(
+     assert isinstance(instance_metadata, ConnectionInfo)
+     # verify instance metadata expiration
+     assert (
+-        mock_instance.cert._not_valid_after.replace(microsecond=0)  # type: ignore
++        mock_instance.cert._not_valid_after.replace(
++            tzinfo=datetime.timezone.utc, microsecond=0  # type: ignore
++        )
+         == instance_metadata.expiration
+     )
+ 
+@@ -273,7 +311,9 @@ async def test_perform_refresh_expiration(
+     credentials expiration should be used.
+     """
+     # set credentials expiration to 1 minute from now
+-    expiration = datetime.datetime.utcnow() + datetime.timedelta(minutes=1)
++    expiration = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
++        minutes=1
++    )
+     credentials = mocks.FakeCredentials(token="my-token", expiry=expiration)
+     setattr(instance, "_enable_iam_auth", True)
+     # set downscoped credential to mock
+@@ -288,6 +328,100 @@ async def test_perform_refresh_expiration(
+     assert expiration == instance_metadata.expiration
+ 
+ 
++@pytest.mark.asyncio
++async def test_connect_info_reads_certificate_expiry_without_deprecation_warning(
++    mock_instance: mocks.FakeCSQLInstance,
++    fake_credentials: Credentials,
++) -> None:
++    loop = asyncio.get_running_loop()
++    keys = asyncio.create_task(generate_keys())
++    _, client_key = await keys
++
++    with aioresponses() as mocked:
++        mocked.get(
++            f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{mock_instance.project}/instances/{mock_instance.name}/connectSettings",
++            status=200,
++            body=mock_instance.connect_settings(),
++            repeat=True,
++        )
++        mocked.post(
++            f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{mock_instance.project}/instances/{mock_instance.name}:generateEphemeralCert",
++            status=200,
++            body=mock_instance.generate_ephemeral(client_key),
++            repeat=True,
++        )
++        refreshed_instance = Instance(
++            f"{mock_instance.project}:{mock_instance.region}:{mock_instance.name}",
++            "pg8000",
++            keys,
++            loop,
++            fake_credentials,
++        )
++        try:
++            with warnings.catch_warnings(record=True) as caught:
++                warnings.simplefilter("always", CryptographyDeprecationWarning)
++                metadata, _ = await refreshed_instance.connect_info(IPTypes.PUBLIC)
++            assert metadata.expiration.utcoffset() == datetime.timedelta(0)
++            assert not any(
++                issubclass(warning.category, CryptographyDeprecationWarning)
++                for warning in caught
++            )
++        finally:
++            await refreshed_instance.close()
++
++
++@pytest.mark.asyncio
++async def test_connect_info_interprets_naive_credential_expiry_as_utc(
++    mock_instance: mocks.FakeCSQLInstance,
++) -> None:
++    loop = asyncio.get_running_loop()
++    keys = asyncio.create_task(generate_keys())
++    _, client_key = await keys
++    expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
++        minutes=1
++    )
++    expiry = expiry.replace(tzinfo=None)
++
++    class CredentialsWithNaiveExpiry(mocks.FakeCredentials):
++        @property
++        def valid(self) -> bool:
++            return self.token is not None
++
++        def refresh(self, request: object) -> None:
++            pass
++
++    credentials = CredentialsWithNaiveExpiry(token="my-token", expiry=expiry)
++
++    with aioresponses() as mocked:
++        mocked.get(
++            f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{mock_instance.project}/instances/{mock_instance.name}/connectSettings",
++            status=200,
++            body=mock_instance.connect_settings(),
++            repeat=True,
++        )
++        mocked.post(
++            f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{mock_instance.project}/instances/{mock_instance.name}:generateEphemeralCert",
++            status=200,
++            body=mock_instance.generate_ephemeral(client_key),
++            repeat=True,
++        )
++        refreshed_instance = Instance(
++            f"{mock_instance.project}:{mock_instance.region}:{mock_instance.name}",
++            "pg8000",
++            keys,
++            loop,
++            credentials,
++            enable_iam_auth=True,
++        )
++        try:
++            metadata, _ = await refreshed_instance.connect_info(IPTypes.PUBLIC)
++            assert metadata.expiration == expiry.replace(
++                tzinfo=datetime.timezone.utc
++            )
++        finally:
++            await refreshed_instance.close()
++
++
+ @pytest.mark.asyncio
+ async def test_connect_info(
+     instance: Instance,
+diff --git a/tests/unit/test_refresh_utils.py b/tests/unit/test_refresh_utils.py
+index 18d38d7..c674b60 100644
+--- a/tests/unit/test_refresh_utils.py
++++ b/tests/unit/test_refresh_utils.py
+@@ -13,9 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
+-import asyncio
+-from datetime import datetime
+-from datetime import timedelta
+ from typing import Any, no_type_check
+ 
+ import aiohttp
+@@ -27,15 +24,11 @@ import google.oauth2.credentials
+ from mock import Mock
+ from mock import patch
+ from mocks import FakeCSQLInstance  # type: ignore
+-from mocks import instance_metadata_expired
+-from mocks import instance_metadata_success
+ import pytest  # noqa F401 Needed to run the tests
+ 
+ from google.cloud.sql.connector.refresh_utils import _downscope_credentials
+ from google.cloud.sql.connector.refresh_utils import _get_ephemeral
+ from google.cloud.sql.connector.refresh_utils import _get_metadata
+-from google.cloud.sql.connector.refresh_utils import _is_valid
+-from google.cloud.sql.connector.refresh_utils import _seconds_until_refresh
+ from google.cloud.sql.connector.utils import generate_keys
+ 
+ 
+@@ -47,44 +40,6 @@ def credentials() -> Credentials:
+     return credentials
+ 
+ 
+-@pytest.mark.asyncio
+-async def test_get_ephemeral(
+-    mock_instance: FakeCSQLInstance, credentials: Credentials
+-) -> None:
+-    """
+-    Test to check whether _get_ephemeral runs without problems given valid
+-    parameters.
+-    """
+-    project = "my-project"
+-    instance = "my-instance"
+-    _, pub_key = await generate_keys()
+-    # mock Cloud SQL Admin API call
+-    with aioresponses() as mocked:
+-        mocked.post(
+-            "https://sqladmin.googleapis.com/sql/v1beta4/projects/my-project/instances/my-instance:generateEphemeralCert",
+-            status=200,
+-            body=mock_instance.generate_ephemeral(pub_key),
+-            repeat=True,
+-        )
+-        async with aiohttp.ClientSession() as client_session:
+-            result: Any = await _get_ephemeral(
+-                client_session,
+-                "https://sqladmin.googleapis.com",
+-                credentials,
+-                project,
+-                instance,
+-                pub_key,
+-            )
+-    cert, _ = result
+-    cert = cert.strip()  # remove any trailing whitespace
+-    cert = cert.split("\n")
+-
+-    assert (
+-        cert[0] == "-----BEGIN CERTIFICATE-----"
+-        and cert[len(cert) - 1] == "-----END CERTIFICATE-----"
+-    )
+-
+-
+ @pytest.mark.asyncio
+ @no_type_check
+ async def test_get_ephemeral_TypeError(credentials: Credentials) -> None:
+@@ -177,28 +132,6 @@ async def test_get_metadata_region_mismatch(
+                 )
+ 
+ 
+-@pytest.mark.asyncio
+-@no_type_check
+-async def test_is_valid_with_valid_metadata() -> None:
+-    """
+-    Test to check that valid metadata with expiration in future returns True.
+-    """
+-    # task that returns class with expiration 10 mins in future
+-    task = asyncio.create_task(instance_metadata_success())
+-    assert await _is_valid(task)
+-
+-
+-@pytest.mark.asyncio
+-@no_type_check
+-async def test_is_valid_with_expired_metadata() -> None:
+-    """
+-    Test to check that invalid metadata with expiration in past returns False.
+-    """
+-    # task that returns class with expiration 10 mins in past
+-    task = asyncio.create_task(instance_metadata_expired())
+-    assert not await _is_valid(task)
+-
+-
+ def test_downscope_credentials_user() -> None:
+     """
+     Test _downscope_credentials with google.oauth2.credentials.Credentials
+@@ -215,43 +148,3 @@ def test_downscope_credentials_user() -> None:
+     # verify downscoped credentials have new scope
+     assert credentials.scopes == ["https://www.googleapis.com/auth/sqlservice.login"]
+     assert credentials != creds
+-
+-
+-def test_seconds_until_refresh_over_1_hour() -> None:
+-    """
+-    Test _seconds_until_refresh returns proper time in seconds.
+-
+-    If expiration is over 1 hour, should return duration/2.
+-    """
+-    # using pytest.approx since sometimes can be off by a second
+-    assert (
+-        pytest.approx(
+-            _seconds_until_refresh(datetime.utcnow() + timedelta(minutes=62)), 1
+-        )
+-        == 31 * 60
+-    )
+-
+-
+-def test_seconds_until_refresh_under_1_hour_over_4_mins() -> None:
+-    """
+-    Test _seconds_until_refresh returns proper time in seconds.
+-
+-    If expiration is under 1 hour and over 4 minutes,
+-    should return duration-refresh_buffer (refresh_buffer = 4 minutes).
+-    """
+-    # using pytest.approx since sometimes can be off by a second
+-    assert (
+-        pytest.approx(
+-            _seconds_until_refresh(datetime.utcnow() + timedelta(minutes=5)), 1
+-        )
+-        == 60
+-    )
+-
+-
+-def test_seconds_until_refresh_under_4_mins() -> None:
+-    """
+-    Test _seconds_until_refresh returns proper time in seconds.
+-
+-    If expiration is under 4 minutes, should return 0.
+-    """
+-    assert _seconds_until_refresh(datetime.utcnow() + timedelta(minutes=3)) == 0

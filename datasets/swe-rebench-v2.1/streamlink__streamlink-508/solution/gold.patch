@@ -1,0 +1,588 @@
+diff --git a/docs/plugin_matrix.rst b/docs/plugin_matrix.rst
+index 51af2a96..c5c08654 100644
+--- a/docs/plugin_matrix.rst
++++ b/docs/plugin_matrix.rst
+@@ -63,6 +63,7 @@ dogus               - startv.com.tr      Yes   No
+                     - ntvspor.net
+                     - kralmuzik.com.tr
+                     - ntv.com.tr
++                    - eurostartv.com.tr
+ dommune             dommune.com          Yes   --
+ douyutv             douyutv.com          Yes   --
+ dplay               - dplay.se           --    Yes   Streams may be geo-restricted.
+diff --git a/src/streamlink/plugins/dogus.py b/src/streamlink/plugins/dogus.py
+index 9eabfd24..4d58d33b 100644
+--- a/src/streamlink/plugins/dogus.py
++++ b/src/streamlink/plugins/dogus.py
+@@ -7,6 +7,7 @@ from streamlink.plugin.api import http
+ from streamlink.plugin.api import validate
+ from streamlink.stream import HDSStream
+ from streamlink.stream import HLSStream
++from streamlink.utils import update_scheme
+ 
+ 
+ class Dogus(Plugin):
+@@ -20,13 +21,14 @@ class Dogus(Plugin):
+             ntv.com.tr/canli-yayin/ntv|
+             ntvspor.net/canli-yayin|
+             kralmuzik.com.tr/tv/kral-tv|
+-            kralmuzik.com.tr/tv/kral-pop-tv
++            kralmuzik.com.tr/tv/kral-pop-tv|
++            eurostartv.com.tr/canli-izle
+         )/?""", re.VERBOSE)
+-    mobile_url_re = re.compile(r"""(?P<q>[\"'])(?P<url>https?://[^'"]*?/live/hls/[^'"]*?\?token=)
++    mobile_url_re = re.compile(r"""(?P<q>["'])(?P<url>(https?:)?//[^'"]*?/live/hls/[^'"]*?\?token=)
+                                    (?P<token>[^'"]*?)(?P=q)""", re.VERBOSE)
+-    desktop_url_re = re.compile(r"""(?P<q>[\"'])(?P<url>https?://[^'"]*?/live/hds/[^'"]*?\?token=)
++    desktop_url_re = re.compile(r"""(?P<q>["'])(?P<url>(https?:)?//[^'"]*?/live/hds/[^'"]*?\?token=)
+                                     (?P<token>[^'"]*?)(?P=q)""", re.VERBOSE)
+-    token_re = re.compile(r"""token=(?P<q>[\"'])(?P<token>[^'"]*?)(?P=q)""")
++    token_re = re.compile(r"""token=(?P<q>["'])(?P<token>[^'"]*?)(?P=q)""")
+ 
+     hds_schema = validate.Schema(validate.all(
+         {
+@@ -69,8 +71,8 @@ class Dogus(Plugin):
+         mobile_url_m = self.mobile_url_re.search(res.text)
+         desktop_url_m = self.desktop_url_re.search(res.text)
+ 
+-        desktop_url = desktop_url_m and desktop_url_m.group("url")
+-        mobile_url = mobile_url_m and mobile_url_m.group("url")
++        desktop_url = desktop_url_m and  update_scheme(self.url, desktop_url_m.group("url"))
++        mobile_url = mobile_url_m and  update_scheme(self.url, mobile_url_m.group("url"))
+ 
+         token = (desktop_url_m and desktop_url_m.group("token")) or (mobile_url_m and mobile_url_m.group("token"))
+         if not token:
+diff --git a/src/streamlink/plugins/filmon.py b/src/streamlink/plugins/filmon.py
+index e7edd269..faec7498 100644
+--- a/src/streamlink/plugins/filmon.py
++++ b/src/streamlink/plugins/filmon.py
+@@ -1,150 +1,137 @@
+ import re
+ 
+-from streamlink.compat import urlparse
++import time
++
++from streamlink import StreamError
+ from streamlink.plugin import Plugin
+ from streamlink.plugin.api import http, validate
+-from streamlink.stream import HLSStream, RTMPStream
+-
+-CHINFO_URL = "http://www.filmon.com/ajax/getChannelInfo"
+-SWF_URL = "http://www.filmon.com/tv/modules/FilmOnTV/files/flashapp/filmon/FilmonPlayer.swf"
+-VODINFO_URL = "http://www.filmon.com/vod/info/{0}"
+-
+-AJAX_HEADERS = {
+-    "Referer": "http://www.filmon.com",
+-    "X-Requested-With": "XMLHttpRequest",
+-    "User-Agent": "Mozilla/5.0"
+-}
+-QUALITY_WEIGHTS = {
+-    "high": 720,
+-    "low": 480
+-}
+-STREAM_TYPES = ("hls", "rtmp")
+-
+-_url_re = re.compile(r"http(s)?://(\w+\.)?filmon.com/(channel|tv|vod)/")
+-_channel_id_re = re.compile(r"/channels/(\d+)/extra_big_logo.png")
+-_vod_id_re = re.compile(r"movie_id=(\d+)")
+-
+-_channel_schema = validate.Schema({
+-    "streams": [{
+-        "name": validate.text,
++from streamlink.stream import HLSStream
++
++
++class FilmOnHLS(HLSStream):
++    __shortname__ = "hls-filmon"
++
++    def __init__(self, session_, channel=None, vod_id=None, quality="high", **args):
++        super(FilmOnHLS, self).__init__(session_, None, **args)
++        self.logger = self.session.logger.new_module("stream.hls-filmon")
++        self.channel = channel
++        self.vod_id = vod_id
++        if self.channel is None and self.vod_id is None:
++            raise ValueError("channel or vod_id must be set")
++        self.quality = quality
++        self.api = FilmOnAPI()
++        self._url = None
++        self.watch_timeout = 0
++
++    def _get_stream_data(self):
++        if self.channel:
++            self.logger.debug("Reloading FilmOn channel playlist: {0}", self.channel)
++            data = self.api.channel(self.channel)
++            for stream in data["streams"]:
++                yield stream
++        elif self.vod_id:
++            self.logger.debug("Reloading FilmOn VOD playlist: {0}", self.vod_id)
++            data = self.api.vod(self.vod_id)
++            for _, stream in data["streams"].items():
++                yield stream
++
++    @property
++    def url(self):
++        # If the watch timeout has passed then refresh the playlist from the API
++        if int(time.time()) >= self.watch_timeout:
++            for stream in self._get_stream_data():
++                if stream["quality"] == self.quality:
++                    self.watch_timeout = int(time.time()) + stream["watch-timeout"]
++                    self._url = stream["url"]
++                    return self._url
++            raise StreamError("cannot refresh FilmOn HLS Stream playlist")
++        else:
++            return self._url
++
++
++class FilmOnAPI(object):
++    channel_url = "http://www.filmon.com/api-v2/channel/{0}?protocol=hls"
++    vod_url = "http://www.filmon.com/vod/info/{0}"
++
++    stream_schema = {
+         "quality": validate.text,
+-        "url": validate.url(scheme=validate.any("http", "rtmp"))
+-    }]
+-})
+-_vod_schema = validate.Schema(
+-    {
+-        "data": {
+-            "streams": {
+-                validate.text: {
+-                    "name": validate.text,
+-                    "url": validate.url(scheme=validate.any("http", "rtmp"))
+-                }
++        "url": validate.url(),
++        "watch-timeout": int
++    }
++    api_schema = validate.Schema(
++        {
++            "data": {
++                "streams": validate.any(
++                    {validate.text: stream_schema},
++                    [stream_schema]
++                )
+             }
+-        }
+-    },
+-    validate.get("data")
+-)
++        },
++        validate.get("data")
++    )
+ 
++    def channel(self, channel):
++        res = http.get(self.channel_url.format(channel))
++        return http.json(res, schema=self.api_schema)
+ 
+-def ajax(*args, **kwargs):
+-    kwargs["headers"] = AJAX_HEADERS
+-    return http.post(*args, **kwargs)
++    def vod(self, vod_id):
++        res = http.get(self.vod_url.format(vod_id))
++        return http.json(res, schema=self.api_schema)
+ 
+ 
+ class Filmon(Plugin):
++    url_re = re.compile(r"""https?://(?:\w+\.)?filmon.(?:tv|com)/
++        (?:
++            (tv|channel)/(?P<channel>[^/]+)|
++            vod/view/(?P<vod_id>\d+)-|
++            group/
++        )
++    """, re.VERBOSE)
++
++    _channel_id_re = re.compile(r'channel_id\s*?=\s*"(\d+)"')
++    _channel_id_schema = validate.Schema(
++        validate.transform(_channel_id_re.search),
++        validate.any(None, validate.get(1))
++    )
++
++    quality_weights = {
++        "high": 720,
++        "low": 480
++    }
++
++    def __init__(self, url):
++        super(Filmon, self).__init__(url)
++        self.api = FilmOnAPI()
++
+     @classmethod
+     def can_handle_url(cls, url):
+-        return _url_re.match(url)
++        return cls.url_re.match(url) is not None
+ 
+     @classmethod
+     def stream_weight(cls, key):
+-        weight = QUALITY_WEIGHTS.get(key)
++        weight = cls.quality_weights.get(key)
+         if weight:
+             return weight, "filmon"
+ 
+         return Plugin.stream_weight(key)
+ 
+-    def _create_rtmp_stream(self, stream, live=True):
+-        rtmp = stream["url"]
+-        playpath = stream["name"]
+-        parsed = urlparse(rtmp)
+-        if parsed.query:
+-            app = "{0}?{1}".format(parsed.path[1:], parsed.query)
+-        else:
+-            app = parsed.path[1:]
+-
+-        if playpath.endswith(".mp4"):
+-            playpath = "mp4:" + playpath
+-
+-        params = {
+-            "rtmp": rtmp,
+-            "pageUrl": self.url,
+-            "swfUrl": SWF_URL,
+-            "playpath": playpath,
+-            "app": app,
+-        }
+-        if live:
+-            params["live"] = True
+-
+-        return RTMPStream(self.session, params)
+-
+-    def _get_live_streams(self, channel_id):
+-        params = {"channel_id": channel_id}
+-        for stream_type in STREAM_TYPES:
+-            cookies = {"flash-player-type": stream_type}
+-            res = ajax(CHINFO_URL, cookies=cookies, data=params)
+-            channel = http.json(res, schema=_channel_schema)
+-
+-            # TODO: Replace with "yield from" when dropping Python 2.
+-            for stream in self._parse_live_streams(channel):
+-                yield stream
+-
+-    def _parse_live_streams(self, channel):
+-        for stream in channel["streams"]:
+-            name = stream["quality"]
+-            scheme = urlparse(stream["url"]).scheme
+-
+-            if scheme == "http":
+-                try:
+-                    streams = HLSStream.parse_variant_playlist(self.session, stream["url"])
+-                    for __, stream in streams.items():
+-                        yield name, stream
+-
+-                except IOError as err:
+-                    self.logger.error("Failed to extract HLS stream '{0}': {1}", name, err)
+-
+-            elif scheme == "rtmp":
+-                yield name, self._create_rtmp_stream(stream)
+-
+-    def _get_vod_streams(self, movie_id):
+-        for stream_type in STREAM_TYPES:
+-            cookies = {"flash-player-type": stream_type}
+-            res = ajax(VODINFO_URL.format(movie_id), cookies=cookies)
+-            vod = http.json(res, schema=_vod_schema)
+-
+-            # TODO: Replace with "yield from" when dropping Python 2.
+-            for stream in self._parse_vod_streams(vod):
+-                yield stream
+-
+-    def _parse_vod_streams(self, vod):
+-        for name, stream in vod["streams"].items():
+-            scheme = urlparse(stream["url"]).scheme
+-
+-            if scheme == "http":
+-                yield name, HLSStream(self.session, stream["url"])
+-            elif scheme == "rtmp":
+-                yield name, self._create_rtmp_stream(stream, live=False)
+-
+     def _get_streams(self):
+-        res = http.get(self.url)
++        url_m = self.url_re.match(self.url)
+ 
+-        match = _vod_id_re.search(res.text)
+-        if match:
+-            return self._get_vod_streams(match.group(1))
++        channel = url_m and url_m.group("channel")
++        vod_id = url_m and url_m.group("vod_id")
+ 
+-        match = _channel_id_re.search(res.text)
+-        if match:
+-            return self._get_live_streams(match.group(1))
++        if vod_id:
++            data = self.api.vod(vod_id)
++            for _, stream in data["streams"].items():
++                yield stream["quality"], FilmOnHLS(self.session, vod_id=vod_id, quality=stream["quality"])
++
++        else:
++            if not channel:
++                channel = http.get(self.url, schema=self._channel_id_schema)
++            data = self.api.channel(channel)
++            for stream in data["streams"]:
++                yield stream["quality"], FilmOnHLS(self.session, channel=channel, quality=stream["quality"])
+ 
+ 
+ __plugin__ = Filmon
+diff --git a/src/streamlink/plugins/twitch.py b/src/streamlink/plugins/twitch.py
+index 8f916bca..e8d21f6d 100644
+--- a/src/streamlink/plugins/twitch.py
++++ b/src/streamlink/plugins/twitch.py
+@@ -1,10 +1,9 @@
+ # coding=utf-8
+ import re
+-
+-import requests
+-
++import warnings
+ from random import random
+ 
++import requests
+ from streamlink.compat import urlparse
+ from streamlink.exceptions import NoStreamsError, PluginError, StreamError
+ from streamlink.plugin import Plugin, PluginOptions
+@@ -40,9 +39,11 @@ _url_re = re.compile(r"""
+         (?P<subdomain>[\w\-]+)
+         \.
+     )?
+-    twitch.tv
+-    /
+-    (?P<channel>[^/]+)
++    twitch.tv/
++    (?:
++        videos/(?P<videos_id>\d+)|
++        (?P<channel>[^/]+)
++    )
+     (?:
+         /
+         (?P<video_type>[bcv])
+@@ -180,9 +181,10 @@ class UsherService(object):
+ 
+ 
+ class TwitchAPI(object):
+-    def __init__(self, beta=False):
++    def __init__(self, beta=False, version=3):
+         self.oauth_token = None
+         self.subdomain = beta and "betaapi" or "api"
++        self.version = version
+ 
+     def add_cookies(self, cookies):
+         http.parse_cookies(cookies, domain="twitch.tv")
+@@ -198,7 +200,7 @@ class TwitchAPI(object):
+         else:
+             url = "https://{0}.twitch.tv{1}".format(self.subdomain, path)
+ 
+-        headers = {'Accept': 'application/vnd.twitchtv.v3+json',
++        headers = {'Accept': 'application/vnd.twitchtv.v{0}+json'.format(self.version),
+                    'Client-ID': TWITCH_CLIENT_ID}
+ 
+         # The certificate used by Twitch cannot be verified on some OpenSSL versions.
+@@ -216,27 +218,28 @@ class TwitchAPI(object):
+         self.subdomain = subdomain_buffer
+         return response
+ 
+-    def access_token(self, endpoint, asset, **params):
+-        return self.call("/api/{0}/{1}/access_token".format(endpoint, asset), **params)
++    # Public API calls
++
++    def user(self, **params):
++        return self.call("/kraken/user", **params)
++
++    def users(self, **params):
++        return self.call("/kraken/users", **params)
++
++    def videos(self, video_id, **params):
++        return self.call("/kraken/videos/{0}".format(video_id), **params)
+ 
+     def channel_info(self, channel, **params):
+         return self.call("/kraken/channels/{0}".format(channel), **params)
+ 
+-    def channel_subscription(self, channel, **params):
+-        return self.call("/api/channels/{0}/subscription".format(channel), **params)
++    # Private API calls
+ 
+-    def channel_viewer_info(self, channel, **params):
+-        return self.call("/api/channels/{0}/viewer".format(channel), **params)
++    def access_token(self, endpoint, asset, **params):
++        return self.call("/api/{0}/{1}/access_token".format(endpoint, asset), **params)
+ 
+     def token(self, **params):
+         return self.call("/api/viewer/token", **params)
+ 
+-    def user(self, **params):
+-        return self.call("/kraken/user", **params)
+-
+-    def videos(self, video_id, **params):
+-        return self.call("/kraken/videos/{0}".format(video_id), **params)
+-
+     def viewer_info(self, **params):
+         return self.call("/api/viewer/info", **params)
+ 
+@@ -246,6 +249,17 @@ class TwitchAPI(object):
+     def clip_status(self, channel, clip_name, schema):
+         return http.json(self.call_subdomain("clips", "/api/v1/clips/" + channel + "/" + clip_name + "/status", format=""), schema=schema)
+ 
++    # Unsupported/Removed private API calls
++
++    def channel_viewer_info(self, channel, **params):
++        warnings.warn("The channel_viewer_info API call is unsupported and may stop working at any time")
++        return self.call("/api/channels/{0}/viewer".format(channel), **params)
++
++    def channel_subscription(self, channel, **params):
++        warnings.warn("The channel_subscription API call has been removed and no longer works",
++                      category=DeprecationWarning)
++        return self.call("/api/channels/{0}/subscription".format(channel), **params)
++
+ 
+ class Twitch(Plugin):
+     options = PluginOptions({
+@@ -269,19 +283,66 @@ class Twitch(Plugin):
+     def __init__(self, url):
+         Plugin.__init__(self, url)
+         match = _url_re.match(url).groupdict()
+-        self.channel = match.get("channel").lower()
++        self._channel = match.get("channel") and match.get("channel").lower()
++        self._channel_id = None
+         self.subdomain = match.get("subdomain")
+         self.video_type = match.get("video_type")
+-        self.video_id = match.get("video_id")
++        if match.get("videos_id"):
++            self.video_type = "v"
++        self.video_id = match.get("video_id") or match.get("videos_id")
+         self.clip_name = match.get("clip_name")
+         self._hosted_chain = []
+ 
+         parsed = urlparse(url)
+         self.params = parse_query(parsed.query)
+ 
+-        self.api = TwitchAPI(beta=self.subdomain == "beta")
++        self.api = TwitchAPI(beta=self.subdomain == "beta", version=5)
+         self.usher = UsherService()
+ 
++    @property
++    def channel(self):
++        if not self._channel:
++            if self.video_id:
++                cdata = self._channel_from_video_id(self.video_id)
++                self._channel = cdata["name"].lower()
++                self._channel_id = cdata["_id"]
++        return self._channel
++
++    @channel.setter
++    def channel(self, channel):
++        self._channel = channel
++        # channel id becomes unknown
++        self._channel_id = None
++
++    @property
++    def channel_id(self):
++        if not self._channel_id:
++            # If the channel name is set, use that to look up the ID
++            if self._channel:
++                cdata = self._channel_from_login(self._channel)
++                self._channel_id = cdata["_id"]
++
++            # If the channel name is not set but the video ID is,
++            # use that to look up both ID and name
++            elif self.video_id:
++                cdata = self._channel_from_video_id(self.video_id)
++                self._channel = cdata["name"].lower()
++                self._channel_id = cdata["_id"]
++        return self._channel_id
++
++    def _channel_from_video_id(self, video_id):
++        vdata = self.api.videos(video_id)
++        if "channel" not in vdata:
++            raise PluginError("Unable to find video: {0}".format(video_id))
++        return vdata["channel"]
++
++    def _channel_from_login(self, channel):
++        cdata = self.api.users(login=channel)
++        if len(cdata["users"]):
++            return cdata["users"][0]
++        else:
++            raise PluginError("Unable to find channel: {0}".format(channel))
++
+     def _authenticate(self):
+         if self.api.oauth_token:
+             return
+@@ -374,7 +435,7 @@ class Twitch(Plugin):
+             chunk_stop = chunk_start + chunk_length
+             chunk_stream = HTTPStream(self.session, chunk_url)
+ 
+-            if start_offset >= chunk_start and start_offset <= chunk_stop:
++            if chunk_start <= start_offset <= chunk_stop:
+                 try:
+                     headers = extract_flv_header_tags(chunk_stream)
+                 except IOError as err:
+@@ -411,7 +472,7 @@ class Twitch(Plugin):
+                 playlist_streams.append(chunk_stream)
+                 for tag in headers:
+                     playlist_tags.append(tag)
+-            elif chunk_start >= start_offset and chunk_start < stop_offset:
++            elif start_offset <= chunk_start < stop_offset:
+                 playlist_streams.append(chunk_stream)
+ 
+             playlist_offset += chunk_length
+@@ -463,33 +524,34 @@ class Twitch(Plugin):
+         return sig, token
+ 
+     def _check_for_host(self):
+-        channel_id = self.api.channel_info(self.channel)["_id"]
+-        host_info = self.api.hosted_channel(include_logins=1, host=channel_id).json()["hosts"][0]
+-        if "target_login" in host_info:
++        host_info = self.api.hosted_channel(include_logins=1, host=self.channel_id).json()["hosts"][0]
++        if "target_login" in host_info and host_info["target_login"].lower() != self.channel.lower():
+             self.logger.info("{0} is hosting {1}".format(self.channel, host_info["target_login"]))
+             return host_info["target_login"]
+ 
+     def _get_hls_streams(self, stream_type="live"):
+         self.logger.debug("Getting {} HLS streams for {}".format(stream_type, self.channel))
+         self._authenticate()
+-        sig, token = self._access_token(stream_type)
++        self._hosted_chain.append(self.channel)
++
+         if stream_type == "live":
+             hosted_channel = self._check_for_host()
+             if hosted_channel and self.options.get("disable_hosting"):
+                 self.logger.info("hosting was disabled by command line option")
+-                return {}
+             elif hosted_channel:
+                 self.logger.info("switching to {}", hosted_channel)
+                 if hosted_channel in self._hosted_chain:
+-                    self._hosted_chain.append(hosted_channel)
+                     self.logger.error(u"A loop of hosted channels has been detected, "
+-                                      "cannot find a playable stream. ({})".format(u" -> ".join(self._hosted_chain)))
++                                      "cannot find a playable stream. ({})".format(u" -> ".join(self._hosted_chain + [hosted_channel])))
+                     return {}
+-                self._hosted_chain.append(hosted_channel)
+                 self.channel = hosted_channel
+                 return self._get_hls_streams(stream_type)
++
++            # only get the token once the channel has been resolved
++            sig, token = self._access_token(stream_type)
+             url = self.usher.channel(self.channel, sig=sig, token=token)
+         elif stream_type == "video":
++            sig, token = self._access_token(stream_type)
+             url = self.usher.video(self.video_id, nauthsig=sig, nauth=token)
+         else:
+             self.logger.debug("Unknown HLS stream type: {}".format(stream_type))
+diff --git a/src/streamlink/utils/__init__.py b/src/streamlink/utils/__init__.py
+index ff6e63af..774bad79 100644
+--- a/src/streamlink/utils/__init__.py
++++ b/src/streamlink/utils/__init__.py
+@@ -134,6 +134,21 @@ def rtmpparse(url):
+     return (tcurl, playpath)
+ 
+ 
++def update_scheme(current, target):
++    """
++    Take the scheme from the current URL and applies it to the
++    target URL if the target URL startswith //
++    :param current: current URL
++    :param target: target URL
++    :return: target URL with the current URLs schema
++    """
++    scheme = urlparse(current).scheme
++    if target.startswith("//"):
++        return "{0}:{1}".format(scheme, target)
++    else:
++        return target
++
++
+ #####################################
+ # Deprecated functions, do not use. #
+ #####################################

@@ -1,0 +1,164 @@
+diff --git a/tests/__init__.py b/tests/__init__.py
+index 2bd14e8..59ce569 100644
+--- a/tests/__init__.py
++++ b/tests/__init__.py
+@@ -335,6 +335,7 @@ class EODagTestCase(unittest.TestCase):
+                     response.__zip_buffer = io.BytesIO(fh.read())
+                 cl = response.__zip_buffer.getbuffer().nbytes
+                 response.headers = {"content-length": cl}
++                response.url = "http://foo.bar"
+ 
+             def __enter__(response):
+                 return response
+diff --git a/tests/units/test_download_plugins.py b/tests/units/test_download_plugins.py
+index 832c63f..fe59418 100644
+--- a/tests/units/test_download_plugins.py
++++ b/tests/units/test_download_plugins.py
+@@ -147,6 +147,8 @@ class TestDownloadPluginBase(BaseDownloadPluginTest):
+         """Download._prepare_download must check output directory permissions"""
+         if os.name == "nt":
+             self.skipTest("windows permissions too complex to set for this test")
++        if hasattr(os, "geteuid") and os.geteuid() == 0:
++            self.skipTest("root bypasses directory permissions")
+ 
+         plugin = self.get_download_plugin(self.product)
+         self.product.location = self.product.remote_location = "somewhere"
+@@ -172,6 +174,7 @@ class TestDownloadPluginHttp(BaseDownloadPluginTest):
+                     self.__zip_buffer = io.BytesIO(fh.read())
+                 cl = self.__zip_buffer.getbuffer().nbytes
+                 self.headers = {"content-length": cl}
++                self.url = "http://foo.bar"
+ 
+             def __enter__(self):
+                 return self
+@@ -1008,12 +1011,12 @@ class TestDownloadPluginHttp(BaseDownloadPluginTest):
+         # empty product download directory should have been removed
+         self.assertFalse(Path(os.path.join(self.output_dir, "dummy_product")).exists())
+ 
+-    def test_plugins_download_http_order_download_cds(
++    def test_plugins_download_http_order_download_cop_ads(
+         self,
+     ):
+         """HTTPDownload.download must order the product if needed"""
+ 
+-        self.product.provider = "cop_cds"
++        self.product.provider = "cop_ads"
+         self.product.product_type = "CAMS_EAC4"
+         product_dataset = "cams-global-reanalysis-eac4"
+ 
+diff --git a/tests/units/test_http_server.py b/tests/units/test_http_server.py
+index 9571d73..94dc566 100644
+--- a/tests/units/test_http_server.py
++++ b/tests/units/test_http_server.py
+@@ -36,11 +36,14 @@ from eodag.config import PluginConfig
+ from eodag.plugins.authentication.base import Authentication
+ from eodag.plugins.download.base import Download
+ from eodag.utils import USER_AGENT, MockResponse, StreamResponse
+-from eodag.utils.exceptions import TimeOutError
++from eodag.utils.exceptions import NotAvailableError, TimeOutError
+ from tests import mock
+ from tests.context import (
+     DEFAULT_ITEMS_PER_PAGE,
+     HTTP_REQ_TIMEOUT,
++    NOT_AVAILABLE,
++    OFFLINE_STATUS,
++    ONLINE_STATUS,
+     TEST_RESOURCES_PATH,
+     AuthenticationError,
+     SearchResult,
+@@ -436,6 +439,10 @@ class RequestTestCase(unittest.TestCase):
+         self.assertIn("description", response_content)
+         self.assertIn("NotAvailableError", response_content["description"])
+ 
++    def _request_accepted(self, url: str):
++        response = self.app.get(url, follow_redirects=True)
++        self.assertEqual(202, response.status_code)
++
+     def test_request_params(self):
+         self._request_not_valid(f"search?collections={self.tested_product_type}&bbox=1")
+         self._request_not_valid(
+@@ -1047,6 +1054,10 @@ class RequestTestCase(unittest.TestCase):
+         response_filename = header_content_disposition.get_param("filename", None)
+         self.assertEqual(response_filename, expected_file)
+ 
++    @mock.patch(
++        "eodag.plugins.authentication.base.Authentication.authenticate",
++        autospec=True,
++    )
+     @mock.patch(
+         "eodag.plugins.download.base.Download._stream_download_dict",
+         autospec=True,
+@@ -1056,7 +1067,7 @@ class RequestTestCase(unittest.TestCase):
+         autospec=True,
+     )
+     def test_download_item_from_collection_no_stream(
+-        self, mock_download: Mock, mock_stream_download: Mock
++        self, mock_download: Mock, mock_stream_download: Mock, mock_auth: Mock
+     ):
+         """Download through eodag server catalog should return a valid response"""
+         # download should be performed locally then deleted if streaming is not available
+@@ -1073,6 +1084,64 @@ class RequestTestCase(unittest.TestCase):
+             expected_file
+         ), f"File {expected_file} should have been deleted"
+ 
++    @mock.patch(
++        "eodag.rest.core.eodag_api.search",
++        autospec=True,
++    )
++    def test_download_offline_item_from_catalog(self, mock_search):
++        """An unavailable OFFLINE product returns HTTP 202 in server mode."""
++        product = self.mock_search_result()[0][0]
++        mock_search.return_value = ([product], 1)
++        class Downloader:
++            def __getattr__(self, name):
++                def invoke(*args, **kwargs):
++                    received_minimums = (
++                        kwargs.get("wait") == -1 and kwargs.get("timeout") == -1
++                    ) or args[-2:] == (-1, -1)
++                    if received_minimums:
++                        raise NotAvailableError("Product offline. Try again later.")
++                    return StreamResponse(content=iter(()))
++
++                return invoke
++
++        product.downloader_auth = Mock()
++        product.downloader = Downloader()
++        product.properties["orderStatusLink"] = "http://example.test/order"
++        product.properties["storageStatus"] = OFFLINE_STATUS
++
++        self._request_accepted(
++            f"catalogs/{self.tested_product_type}/items/foo/download"
++        )
++
++    @mock.patch(
++        "eodag.rest.core.eodag_api.search",
++        autospec=True,
++    )
++    def test_download_offline_item_when_it_becomes_available(self, mock_search):
++        """A product that becomes available is streamed instead of returning 202."""
++        product = self.mock_search_result()[0][0]
++        mock_search.return_value = ([product], 1)
++
++        class Downloader:
++            def order_response_process(self, response, product):
++                return None
++
++            def _stream_download_dict(self, product, **kwargs):
++                product.properties["storageStatus"] = ONLINE_STATUS
++                return StreamResponse(content=iter((b"available",)))
++
++        product.downloader_auth = Mock()
++        product.downloader = Downloader()
++        product.properties["orderStatusLink"] = "http://example.test/order"
++        product.properties["storageStatus"] = OFFLINE_STATUS
++
++        response = self.app.get(
++            f"catalogs/{self.tested_product_type}/items/foo/download"
++        )
++
++        self.assertEqual(200, response.status_code)
++        self.assertEqual(b"available", response.content)
++
+     def test_conformance(self):
+         """Request to /conformance should return a valid response"""
+         self._request_valid("conformance", check_links=False)

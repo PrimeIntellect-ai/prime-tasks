@@ -1,0 +1,68 @@
+diff --git a/internal/locate/region_cache_test.go b/internal/locate/region_cache_test.go
+index 10dbac9..53fb781 100644
+--- a/internal/locate/region_cache_test.go
++++ b/internal/locate/region_cache_test.go
+@@ -53,6 +53,7 @@ import (
+ 	"github.com/pingcap/kvproto/pkg/errorpb"
+ 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+ 	"github.com/pingcap/kvproto/pkg/metapb"
++	"github.com/pingcap/kvproto/pkg/pdpb"
+ 	"github.com/stretchr/testify/require"
+ 	"github.com/stretchr/testify/suite"
+ 	"github.com/tikv/client-go/v2/config/retry"
+@@ -3086,3 +3087,55 @@ func (s *testRegionCacheSuite) TestRegionCacheValidAfterLoading() {
+ 		s.True(region.isValid())
+ 	}
+ }
++
++func (s *testRegionCacheSuite) TestBatchLoadLimitRanges() {
++	// Fragment the keyspace so a successful lookup must progress through more than
++	// one response batch; a single region covering every input would mask omissions.
++	currentRegion := s.region1
++	regionIDs := s.cluster.AllocIDs(78)
++	makeKey := func(value uint64) []byte {
++		key := make([]byte, 4096)
++		binary.BigEndian.PutUint64(key, value)
++		return key
++	}
++	for i, regionID := range regionIDs {
++		splitKey := makeKey(uint64((i + 1) * 512))
++		peerIDs := s.cluster.AllocIDs(2)
++		s.cluster.Split(currentRegion, regionID, splitKey, peerIDs, peerIDs[0])
++		currentRegion = regionID
++	}
++
++	ranges := make([]kv.KeyRange, 0, 20000)
++	for i := 0; i < 20000; i++ {
++		startKey := makeKey(uint64(i * 2))
++		endKey := makeKey(uint64(i*2 + 1))
++		ranges = append(ranges, kv.KeyRange{StartKey: startKey, EndKey: endKey})
++	}
++
++	originalBatchScanRegions := s.cache.pdClient.BatchScanRegions
++	s.cache.pdClient = &inspectedPDClient{
++		Client: s.cache.pdClient,
++		batchScanRegions: func(ctx context.Context, keyRanges []router.KeyRange, limit int, opts ...opt.GetRegionOption) ([]*router.Region, error) {
++			requestRanges := make([]*pdpb.KeyRange, 0, len(keyRanges))
++			for _, keyRange := range keyRanges {
++				requestRanges = append(requestRanges, &pdpb.KeyRange{StartKey: keyRange.StartKey, EndKey: keyRange.EndKey})
++			}
++			request := &pdpb.BatchScanRegionsRequest{Ranges: requestRanges}
++			s.Require().LessOrEqual(proto.Size(request), 150*1024*1024, "BatchScanRegions request must stay within the default 150 MiB size limit")
++			return originalBatchScanRegions(ctx, keyRanges, limit, opts...)
++		},
++	}
++	locations, err := s.cache.BatchLocateKeyRanges(s.bo, ranges)
++	s.Nil(err)
++	for rangeIdx, keyRange := range ranges {
++		covered := false
++		for _, location := range locations {
++			if bytes.Compare(location.StartKey, keyRange.StartKey) <= 0 &&
++				(len(location.EndKey) == 0 || bytes.Compare(location.EndKey, keyRange.EndKey) >= 0) {
++				covered = true
++				break
++			}
++		}
++		s.Require().True(covered, "no returned location covers input range %d", rangeIdx)
++	}
++}

@@ -1,0 +1,297 @@
+diff --git a/asv_bench/benchmarks/rolling.py b/asv_bench/benchmarks/rolling.py
+index bd4da00bfd..f9a5f38c2e 100644
+--- a/asv_bench/benchmarks/rolling.py
++++ b/asv_bench/benchmarks/rolling.py
+@@ -10,7 +10,19 @@ class Methods:
+         ["DataFrame", "Series"],
+         [("rolling", {"window": 10}), ("rolling", {"window": 1000}), ("expanding", {})],
+         ["int", "float"],
+-        ["median", "mean", "max", "min", "std", "count", "skew", "kurt", "sum", "sem"],
++        [
++            "median",
++            "mean",
++            "max",
++            "min",
++            "std",
++            "count",
++            "skew",
++            "kurt",
++            "sum",
++            "sem",
++            "nunique",
++        ],
+     )
+     param_names = ["constructor", "window_kwargs", "dtype", "method"]
+ 
+diff --git a/doc/source/reference/window.rst b/doc/source/reference/window.rst
+index 2aeb57faac..2bd63f02fa 100644
+--- a/doc/source/reference/window.rst
++++ b/doc/source/reference/window.rst
+@@ -42,6 +42,7 @@ Rolling window functions
+    Rolling.quantile
+    Rolling.sem
+    Rolling.rank
++   Rolling.nunique
+ 
+ .. _api.functions_window:
+ 
+@@ -86,6 +87,7 @@ Expanding window functions
+    Expanding.quantile
+    Expanding.sem
+    Expanding.rank
++   Expanding.nunique
+ 
+ .. _api.functions_ewm:
+ 
+diff --git a/doc/source/whatsnew/v2.3.0.rst b/doc/source/whatsnew/v2.3.0.rst
+index 0913476397..9352063ad3 100644
+--- a/doc/source/whatsnew/v2.3.0.rst
++++ b/doc/source/whatsnew/v2.3.0.rst
+@@ -118,6 +118,7 @@ Conversion
+ 
+ Strings
+ ^^^^^^^
++- Bug in :meth:`DataFrame.sum` with ``axis=1``, :meth:`.DataFrameGroupBy.sum` or :meth:`.SeriesGroupBy.sum` with ``skipna=True``, and :meth:`.Resampler.sum` on :class:`StringDtype` with all NA values resulted in ``0`` and is now the empty string ``""`` (:issue:`60229`)
+ - Bug in :meth:`Series.__pos__` and :meth:`DataFrame.__pos__` did not raise for :class:`StringDtype` with ``storage="pyarrow"`` (:issue:`60710`)
+ - Bug in :meth:`Series.rank` for :class:`StringDtype` with ``storage="pyarrow"`` incorrectly returning integer results in case of ``method="average"`` and raising an error if it would truncate results (:issue:`59768`)
+ - Bug in :meth:`Series.replace` with :class:`StringDtype` when replacing with a non-string value was not upcasting to ``object`` dtype (:issue:`60282`)
+diff --git a/doc/source/whatsnew/v3.0.0.rst b/doc/source/whatsnew/v3.0.0.rst
+index ad086c4d63..25c26253e6 100644
+--- a/doc/source/whatsnew/v3.0.0.rst
++++ b/doc/source/whatsnew/v3.0.0.rst
+@@ -62,6 +62,7 @@ Other enhancements
+ - :meth:`Series.plot` now correctly handle the ``ylabel`` parameter for pie charts, allowing for explicit control over the y-axis label (:issue:`58239`)
+ - :meth:`DataFrame.plot.scatter` argument ``c`` now accepts a column of strings, where rows with the same string are colored identically (:issue:`16827` and :issue:`16485`)
+ - :class:`DataFrameGroupBy` and :class:`SeriesGroupBy` methods ``sum``, ``mean``, ``median``, ``prod``, ``min``, ``max``, ``std``, ``var`` and ``sem`` now accept ``skipna`` parameter (:issue:`15675`)
++- :class:`Rolling` and :class:`Expanding` now support ``nunique`` (:issue:`26958`)
+ - :class:`Rolling` and :class:`Expanding` now support aggregations ``first`` and ``last`` (:issue:`33155`)
+ - :func:`read_parquet` accepts ``to_pandas_kwargs`` which are forwarded to :meth:`pyarrow.Table.to_pandas` which enables passing additional keywords to customize the conversion to pandas, such as ``maps_as_pydicts`` to read the Parquet map data type as python dictionaries (:issue:`56842`)
+ - :meth:`.DataFrameGroupBy.transform`, :meth:`.SeriesGroupBy.transform`, :meth:`.DataFrameGroupBy.agg`, :meth:`.SeriesGroupBy.agg`, :meth:`.SeriesGroupBy.apply`, :meth:`.DataFrameGroupBy.apply` now support ``kurt`` (:issue:`40139`)
+diff --git a/pandas/_libs/window/aggregations.pyi b/pandas/_libs/window/aggregations.pyi
+index ee735761e3..b4bdd7e05c 100644
+--- a/pandas/_libs/window/aggregations.pyi
++++ b/pandas/_libs/window/aggregations.pyi
+@@ -89,6 +89,12 @@ def roll_rank(
+     method: WindowingRankType,
+     ascending: bool,
+ ) -> np.ndarray: ...  # np.ndarray[float]
++def roll_nunique(
++    values: np.ndarray,  # const float64_t[:]
++    start: np.ndarray,  # np.ndarray[np.int64]
++    end: np.ndarray,  # np.ndarray[np.int64]
++    minp: int,  # int64_t
++) -> np.ndarray: ...  # np.ndarray[float]
+ def roll_apply(
+     obj: object,
+     start: np.ndarray,  # np.ndarray[np.int64]
+diff --git a/pandas/_libs/window/aggregations.pyx b/pandas/_libs/window/aggregations.pyx
+index d33c840371..2baed13cbd 100644
+--- a/pandas/_libs/window/aggregations.pyx
++++ b/pandas/_libs/window/aggregations.pyx
+@@ -6,6 +6,7 @@ from libc.math cimport (
+     sqrt,
+ )
+ from libcpp.deque cimport deque
++from libcpp.unordered_map cimport unordered_map
+ 
+ from pandas._libs.algos cimport TiebreakEnumType
+ 
+@@ -1470,6 +1471,66 @@ def roll_rank(const float64_t[:] values, ndarray[int64_t] start,
+     return np.asarray(output)
+ 
+ 
++def roll_nunique(const float64_t[:] values, ndarray[int64_t] start,
++                 ndarray[int64_t] end, int64_t minp) -> np.ndarray:
++    """
++    Rolling number of unique elements in the window
++    """
++    cdef:
++        Py_ssize_t i, j, s, e, N = len(start)
++        int64_t nobs = 0
++        float64_t val
++        float64_t[::1] output
++        unordered_map[float64_t, int64_t] value_counts
++
++    is_monotonic_increasing_bounds = is_monotonic_increasing_start_end_bounds(
++        start, end
++    )
++    output = np.empty(N, dtype=np.float64)
++    value_counts = unordered_map[float64_t, int64_t]()
++
++    with nogil:
++        for i in range(N):
++            s = start[i]
++            e = end[i]
++
++            if i == 0 or not is_monotonic_increasing_bounds or s >= end[i - 1]:
++                if i != 0:
++                    nobs = 0
++                    value_counts.clear()
++
++                # setup
++                for j in range(s, e):
++                    val = values[j]
++                    if val == val:
++                        nobs += 1
++                        value_counts[val] += 1
++
++            else:
++                # calculate deletes
++                for j in range(start[i - 1], s):
++                    val = values[j]
++                    if val == val:
++                        value_counts[val] -= 1
++                        if value_counts[val] == 0:
++                            value_counts.erase(val)
++                        nobs -= 1
++
++                # calculate adds
++                for j in range(end[i - 1], e):
++                    val = values[j]
++                    if val == val:
++                        nobs += 1
++                        value_counts[val] += 1
++
++            if nobs >= minp:
++                output[i] = value_counts.size()
++            else:
++                output[i] = NaN
++
++    return np.asarray(output)
++
++
+ def roll_apply(object obj,
+                ndarray[int64_t] start, ndarray[int64_t] end,
+                int64_t minp,
+diff --git a/pandas/core/arrays/base.py b/pandas/core/arrays/base.py
+index 33745438e2..dbf2090e53 100644
+--- a/pandas/core/arrays/base.py
++++ b/pandas/core/arrays/base.py
+@@ -2628,7 +2628,15 @@ class ExtensionArray:
+             if op.how not in ["any", "all"]:
+                 # Fail early to avoid conversion to object
+                 op._get_cython_function(op.kind, op.how, np.dtype(object), False)
+-            npvalues = self.to_numpy(object, na_value=np.nan)
++
++            arr = self
++            if op.how == "sum":
++                # https://github.com/pandas-dev/pandas/issues/60229
++                # All NA should result in the empty string.
++                assert "skipna" in kwargs
++                if kwargs["skipna"] and min_count == 0:
++                    arr = arr.fillna("")
++            npvalues = arr.to_numpy(object, na_value=np.nan)
+         else:
+             raise NotImplementedError(
+                 f"function is not implemented for this dtype: {self.dtype}"
+diff --git a/pandas/core/window/expanding.py b/pandas/core/window/expanding.py
+index 81c89e1ef5..bff3485c9c 100644
+--- a/pandas/core/window/expanding.py
++++ b/pandas/core/window/expanding.py
+@@ -927,6 +927,41 @@ class Expanding(RollingAndExpandingMixin):
+             numeric_only=numeric_only,
+         )
+ 
++    @doc(
++        template_header,
++        ".. versionadded:: 3.0.0 \n\n",
++        create_section_header("Parameters"),
++        kwargs_numeric_only,
++        create_section_header("Returns"),
++        template_returns,
++        create_section_header("See Also"),
++        template_see_also,
++        create_section_header("Examples"),
++        dedent(
++            """
++        >>> s = pd.Series([1, 4, 2, 3, 5, 3])
++        >>> s.expanding().nunique()
++        0    1.0
++        1    2.0
++        2    3.0
++        3    4.0
++        4    5.0
++        5    5.0
++        dtype: float64
++        """
++        ).replace("\n", "", 1),
++        window_method="expanding",
++        aggregation_description="nunique",
++        agg_method="nunique",
++    )
++    def nunique(
++        self,
++        numeric_only: bool = False,
++    ):
++        return super().nunique(
++            numeric_only=numeric_only,
++        )
++
+     @doc(
+         template_header,
+         create_section_header("Parameters"),
+diff --git a/pandas/core/window/rolling.py b/pandas/core/window/rolling.py
+index 69fce8cf21..03534bbee4 100644
+--- a/pandas/core/window/rolling.py
++++ b/pandas/core/window/rolling.py
+@@ -1799,6 +1799,16 @@ class RollingAndExpandingMixin(BaseWindow):
+ 
+         return self._apply(window_func, name="rank", numeric_only=numeric_only)
+ 
++    def nunique(
++        self,
++        numeric_only: bool = False,
++    ):
++        window_func = partial(
++            window_aggregations.roll_nunique,
++        )
++
++        return self._apply(window_func, name="nunique", numeric_only=numeric_only)
++
+     def cov(
+         self,
+         other: DataFrame | Series | None = None,
+@@ -2855,6 +2865,43 @@ class Rolling(RollingAndExpandingMixin):
+             numeric_only=numeric_only,
+         )
+ 
++    @doc(
++        template_header,
++        ".. versionadded:: 3.0.0 \n\n",
++        create_section_header("Parameters"),
++        kwargs_numeric_only,
++        create_section_header("Returns"),
++        template_returns,
++        create_section_header("See Also"),
++        template_see_also,
++        create_section_header("Examples"),
++        dedent(
++            """
++        >>> s = pd.Series([1, 4, 2, np.nan, 3, 3, 4, 5])
++        >>> s.rolling(3).nunique()
++        0    NaN
++        1    NaN
++        2    3.0
++        3    NaN
++        4    NaN
++        5    NaN
++        6    2.0
++        7    3.0
++        dtype: float64
++        """
++        ).replace("\n", "", 1),
++        window_method="rolling",
++        aggregation_description="nunique",
++        agg_method="nunique",
++    )
++    def nunique(
++        self,
++        numeric_only: bool = False,
++    ):
++        return super().nunique(
++            numeric_only=numeric_only,
++        )
++
+     @doc(
+         template_header,
+         create_section_header("Parameters"),

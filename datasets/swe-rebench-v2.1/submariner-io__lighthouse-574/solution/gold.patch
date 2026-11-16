@@ -1,0 +1,351 @@
+diff --git a/pkg/agent/controller/agent.go b/pkg/agent/controller/agent.go
+index c05042c..f51d32a 100644
+--- a/pkg/agent/controller/agent.go
++++ b/pkg/agent/controller/agent.go
+@@ -276,40 +276,6 @@ func (a *Controller) serviceExportToServiceImport(obj runtime.Object, numRequeue
+ 		return nil, false
+ 	}
+ 
+-	if a.globalnetEnabled && svcType == mcsv1a1.Headless {
+-		klog.Infof("Headless Services not supported with globalnet yet")
+-		a.updateExportedServiceStatus(svcExport.Name, svcExport.Namespace, mcsv1a1.ServiceExportValid,
+-			corev1.ConditionFalse, invalidServiceType, "Headless Services not supported with Globalnet IP")
+-
+-		return nil, false
+-	}
+-
+-	var ips []string
+-	var ports []mcsv1a1.ServicePort
+-	if a.globalnetEnabled {
+-		ip, reason, msg := a.getGlobalIP(svc)
+-		if ip == "" {
+-			klog.V(log.DEBUG).Infof("Service to be exported (%s/%s) doesn't have a global IP yet", svcExport.Namespace, svcExport.Name)
+-			// Globalnet enabled but service doesn't have globalIp yet, Update the status and requeue
+-			a.updateExportedServiceStatus(svcExport.Name, svcExport.Namespace, mcsv1a1.ServiceExportValid,
+-				corev1.ConditionFalse, reason, msg)
+-
+-			return nil, true
+-		}
+-
+-		ips = []string{ip}
+-		ports = a.getPortsForService(svc)
+-	} else {
+-		ips, ports, err = a.getIPsAndPortsForService(svc, svcType)
+-		if err != nil {
+-			// Failed to get ips for some reason, requeue
+-			a.updateExportedServiceStatus(svcExport.Name, svcExport.Namespace, mcsv1a1.ServiceExportValid,
+-				corev1.ConditionUnknown, "ServiceRetrievalFailed", err.Error())
+-
+-			return nil, true
+-		}
+-	}
+-
+ 	serviceImport := a.newServiceImport(svcExport.Name, svcExport.Namespace)
+ 
+ 	serviceImport.Spec = mcsv1a1.ServiceImportSpec{
+@@ -327,12 +293,27 @@ func (a *Controller) serviceExportToServiceImport(obj runtime.Object, numRequeue
+ 	}
+ 
+ 	if svcType == mcsv1a1.ClusterSetIP {
+-		serviceImport.Spec.IPs = ips
+-		serviceImport.Spec.Ports = ports
++		if a.globalnetEnabled {
++			ip, reason, msg := a.getGlobalIP(svc)
++			if ip == "" {
++				klog.V(log.DEBUG).Infof("Service to be exported (%s/%s) doesn't have a global IP yet", svcExport.Namespace, svcExport.Name)
++				// Globalnet enabled but service doesn't have globalIp yet, Update the status and requeue
++				a.updateExportedServiceStatus(svcExport.Name, svcExport.Namespace, mcsv1a1.ServiceExportValid,
++					corev1.ConditionFalse, reason, msg)
++
++				return nil, true
++			}
++
++			serviceImport.Spec.IPs = []string{ip}
++		} else {
++			serviceImport.Spec.IPs = []string{svc.Spec.ClusterIP}
++		}
++
++		serviceImport.Spec.Ports = a.getPortsForService(svc)
+ 		/* We also store the clusterIP in an annotation as an optimization to recover it in case the IPs are
+ 		cleared out when here's no backing Endpoint pods.
+ 		*/
+-		serviceImport.Annotations[clusterIP] = ips[0]
++		serviceImport.Annotations[clusterIP] = serviceImport.Spec.IPs[0]
+ 	}
+ 
+ 	a.updateExportedServiceStatus(svcExport.Name, svcExport.Namespace, mcsv1a1.ServiceExportValid,
+@@ -496,27 +477,6 @@ func (a *Controller) newServiceImport(name, namespace string) *mcsv1a1.ServiceIm
+ 	}
+ }
+ 
+-func (a *Controller) getIPsAndPortsForService(service *corev1.Service, siType mcsv1a1.ServiceImportType) (
+-	[]string, []mcsv1a1.ServicePort, error) {
+-	mcsPorts := a.getPortsForService(service)
+-
+-	if siType == mcsv1a1.ClusterSetIP {
+-		return []string{service.Spec.ClusterIP}, mcsPorts, nil
+-	}
+-
+-	endpoint, err := a.kubeClientSet.CoreV1().Endpoints(service.Namespace).Get(context.TODO(), service.Name, metav1.GetOptions{})
+-	if err != nil {
+-		if !apierrors.IsNotFound(err) {
+-			klog.Errorf("Error retrieving Endpoints for Service (%s/%s): %v", service.Namespace, service.Name, err)
+-			return nil, nil, errors.WithMessage(err, "Error retrieving the Endpoints for the Service")
+-		}
+-
+-		return make([]string, 0), nil, nil
+-	}
+-
+-	return getIPsFromEndpoint(endpoint), mcsPorts, nil
+-}
+-
+ func (a *Controller) getPortsForService(service *corev1.Service) []mcsv1a1.ServicePort {
+ 	var mcsPorts = make([]mcsv1a1.ServicePort, 0, len(service.Spec.Ports))
+ 
+@@ -535,20 +495,6 @@ func (a *Controller) getObjectNameWithClusterID(name, namespace string) string {
+ 	return name + "-" + namespace + "-" + a.clusterID
+ }
+ 
+-func getIPsFromEndpoint(endpoint *corev1.Endpoints) []string {
+-	ipList := make([]string, 0)
+-
+-	for _, eps := range endpoint.Subsets {
+-		for _, addr := range eps.Addresses {
+-			ipList = append(ipList, addr.IP)
+-		}
+-	}
+-
+-	klog.V(log.DEBUG).Infof("IPList %v for endpoint (%s/%s)", ipList, endpoint.Namespace, endpoint.Name)
+-
+-	return ipList
+-}
+-
+ func (a *Controller) remoteEndpointSliceToLocal(obj runtime.Object, numRequeues int, op syncer.Operation) (runtime.Object, bool) {
+ 	endpointSlice := obj.(*discovery.EndpointSlice)
+ 	endpointSlice.Namespace = endpointSlice.GetObjectMeta().GetLabels()[lhconstants.LabelSourceNamespace]
+diff --git a/pkg/agent/controller/endpoint.go b/pkg/agent/controller/endpoint.go
+index 32b855d..0cbb03b 100644
+--- a/pkg/agent/controller/endpoint.go
++++ b/pkg/agent/controller/endpoint.go
+@@ -29,27 +29,35 @@ import (
+ 	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/fields"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+-	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/client-go/dynamic"
+ 	"k8s.io/klog"
+ 	utilnet "k8s.io/utils/net"
++	mcsv1a1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+ )
+ 
+ func startEndpointController(localClient dynamic.Interface, restMapper meta.RESTMapper, scheme *runtime.Scheme,
+-	serviceImportUID types.UID, serviceImportName, serviceImportNameSpace, serviceName, clusterID string) (*EndpointController, error) {
++	serviceImport *mcsv1a1.ServiceImport, serviceImportNameSpace, serviceName, clusterID string,
++	globalnetEnabled bool) (*EndpointController, error) {
+ 	klog.V(log.DEBUG).Infof("Starting Endpoints controller for service %s/%s", serviceImportNameSpace, serviceName)
+ 
++	globalIngressIPGVR, _ := schema.ParseResourceArg("globalingressips.v1.submariner.io")
++
+ 	controller := &EndpointController{
+ 		clusterID:                    clusterID,
+-		serviceImportUID:             serviceImportUID,
+-		serviceImportName:            serviceImportName,
++		serviceImportUID:             serviceImport.UID,
++		serviceImportName:            serviceImport.Name,
+ 		serviceImportSourceNameSpace: serviceImportNameSpace,
+ 		serviceName:                  serviceName,
+ 		stopCh:                       make(chan struct{}),
++		isHeadless:                   serviceImport.Spec.Type == mcsv1a1.Headless,
++		globalnetEnabled:             globalnetEnabled,
++		localClient:                  localClient,
++		ingressIPClient:              localClient.Resource(*globalIngressIPGVR),
+ 	}
+ 
+ 	nameSelector := fields.OneTermEqualSelector("metadata.name", serviceName)
+@@ -74,8 +82,6 @@ func startEndpointController(localClient dynamic.Interface, restMapper meta.REST
+ 		return nil, err
+ 	}
+ 
+-	controller.localClient = localClient
+-
+ 	return controller, nil
+ }
+ 
+@@ -122,10 +128,11 @@ func (e *EndpointController) endpointsToEndpointSlice(obj runtime.Object, numReq
+ 		klog.V(log.TRACE).Infof("Endpoints %s/%s updated", endPoints.Namespace, endPoints.Name)
+ 	}
+ 
+-	return e.endpointSliceFromEndpoints(endPoints, op), false
++	return e.endpointSliceFromEndpoints(endPoints, op)
+ }
+ 
+-func (e *EndpointController) endpointSliceFromEndpoints(endpoints *corev1.Endpoints, op syncer.Operation) *discovery.EndpointSlice {
++func (e *EndpointController) endpointSliceFromEndpoints(endpoints *corev1.Endpoints, op syncer.Operation) (
++	runtime.Object, bool) {
+ 	endpointSlice := &discovery.EndpointSlice{}
+ 
+ 	endpointSlice.Name = endpoints.Name + "-" + e.clusterID
+@@ -153,9 +160,19 @@ func (e *EndpointController) endpointSliceFromEndpoints(endpoints *corev1.Endpoi
+ 			endpointSlice.AddressType = discovery.AddressTypeIPv6
+ 		}
+ 
+-		endpointSlice.Endpoints = append(endpointSlice.Endpoints, getEndpointsFromAddresses(subset.Addresses, endpointSlice.AddressType, true)...)
+-		endpointSlice.Endpoints = append(endpointSlice.Endpoints, getEndpointsFromAddresses(subset.NotReadyAddresses,
+-			endpointSlice.AddressType, false)...)
++		newEndpoints, retry := e.getEndpointsFromAddresses(subset.Addresses, endpointSlice.AddressType, true)
++		if retry {
++			return nil, true
++		}
++
++		endpointSlice.Endpoints = append(endpointSlice.Endpoints, newEndpoints...)
++		newEndpoints, retry = e.getEndpointsFromAddresses(subset.NotReadyAddresses, endpointSlice.AddressType, false)
++		if retry {
++			// TODO: We may not want unready endpoints at all
++			return nil, true
++		}
++
++		endpointSlice.Endpoints = append(endpointSlice.Endpoints, newEndpoints...)
+ 	}
+ 
+ 	if op == syncer.Create {
+@@ -164,30 +181,42 @@ func (e *EndpointController) endpointSliceFromEndpoints(endpoints *corev1.Endpoi
+ 		klog.V(log.TRACE).Infof("Returning EndpointSlice: %#v", endpointSlice)
+ 	}
+ 
+-	return endpointSlice
++	return endpointSlice, false
+ }
+ 
+-func getEndpointsFromAddresses(addresses []corev1.EndpointAddress, addressType discovery.AddressType, ready bool) []discovery.Endpoint {
++func (e *EndpointController) getEndpointsFromAddresses(addresses []corev1.EndpointAddress, addressType discovery.AddressType,
++	ready bool) ([]discovery.Endpoint, bool) {
+ 	endpoints := []discovery.Endpoint{}
+ 	isIPv6AddressType := addressType == discovery.AddressTypeIPv6
+ 
+ 	for _, address := range addresses {
+ 		if utilnet.IsIPv6String(address.IP) == isIPv6AddressType {
+-			endpoints = append(endpoints, endpointFromAddress(address, ready))
++			endpoint, retry := e.endpointFromAddress(address, ready)
++			if retry {
++				return nil, true
++			}
++
++			endpoints = append(endpoints, *endpoint)
+ 		}
+ 	}
+ 
+-	return endpoints
++	return endpoints, false
+ }
+ 
+-func endpointFromAddress(address corev1.EndpointAddress, ready bool) discovery.Endpoint {
++func (e *EndpointController) endpointFromAddress(address corev1.EndpointAddress, ready bool) (*discovery.Endpoint, bool) {
+ 	topology := map[string]string{}
+ 	if address.NodeName != nil {
+ 		topology["kubernetes.io/hostname"] = *address.NodeName
+ 	}
+ 
+-	endpoint := discovery.Endpoint{
+-		Addresses:  []string{address.IP},
++	ip := e.getIP(address)
++
++	if ip == "" {
++		return nil, true
++	}
++
++	endpoint := &discovery.Endpoint{
++		Addresses:  []string{ip},
+ 		Conditions: discovery.EndpointConditions{Ready: &ready},
+ 		Topology:   topology,
+ 	}
+@@ -206,7 +235,7 @@ func endpointFromAddress(address corev1.EndpointAddress, ready bool) discovery.E
+ 		endpoint.Hostname = &address.TargetRef.Name
+ 	}
+ 
+-	return endpoint
++	return endpoint, false
+ }
+ 
+ func allAddressesIPv6(addresses []corev1.EndpointAddress) bool {
+@@ -222,3 +251,25 @@ func allAddressesIPv6(addresses []corev1.EndpointAddress) bool {
+ 
+ 	return true
+ }
++
++func (e *EndpointController) getIP(address corev1.EndpointAddress) string {
++	if e.isHeadless && e.globalnetEnabled {
++		var ip string
++
++		name := "pod-" + address.TargetRef.Name
++
++		// TODO: Replace with a syncer.GetResource() to reduce API calls
++		obj, err := e.ingressIPClient.Namespace(e.serviceImportSourceNameSpace).Get(context.TODO(), name, metav1.GetOptions{})
++		if err == nil {
++			ip, _, _ = unstructured.NestedString(obj.Object, "status", "allocatedIP")
++		}
++
++		if ip == "" {
++			klog.Infof("GlobalIP for %s not allocated yet", name)
++		}
++
++		return ip
++	}
++
++	return address.IP
++}
+diff --git a/pkg/agent/controller/serviceimport.go b/pkg/agent/controller/serviceimport.go
+index d0e62e1..ba3ad28 100644
+--- a/pkg/agent/controller/serviceimport.go
++++ b/pkg/agent/controller/serviceimport.go
+@@ -34,11 +34,12 @@ import (
+ func newServiceImportController(spec *AgentSpecification, serviceSyncer syncer.Interface, restMapper meta.RESTMapper,
+ 	localClient dynamic.Interface, scheme *runtime.Scheme) (*ServiceImportController, error) {
+ 	controller := &ServiceImportController{
+-		serviceSyncer: serviceSyncer,
+-		localClient:   localClient,
+-		restMapper:    restMapper,
+-		clusterID:     spec.ClusterID,
+-		scheme:        scheme,
++		serviceSyncer:    serviceSyncer,
++		localClient:      localClient,
++		restMapper:       restMapper,
++		clusterID:        spec.ClusterID,
++		scheme:           scheme,
++		globalnetEnabled: spec.GlobalnetEnabled,
+ 	}
+ 
+ 	var err error
+@@ -112,7 +113,7 @@ func (c *ServiceImportController) serviceImportCreatedOrUpdated(serviceImport *m
+ 	}
+ 
+ 	endpointController, err := startEndpointController(c.localClient, c.restMapper, c.scheme,
+-		serviceImport.ObjectMeta.UID, serviceImport.ObjectMeta.Name, serviceNameSpace, serviceName, c.clusterID)
++		serviceImport, serviceNameSpace, serviceName, c.clusterID, c.globalnetEnabled)
+ 	if err != nil {
+ 		klog.Errorf(err.Error())
+ 		return true
+diff --git a/pkg/agent/controller/types.go b/pkg/agent/controller/types.go
+index 9f4c435..7030600 100644
+--- a/pkg/agent/controller/types.go
++++ b/pkg/agent/controller/types.go
+@@ -61,6 +61,7 @@ type ServiceImportController struct {
+ 	endpointControllers sync.Map
+ 	clusterID           string
+ 	scheme              *runtime.Scheme
++	globalnetEnabled    bool
+ }
+ 
+ // Each EndpointController listens for the endpoints that backs a service and have a ServiceImport
+@@ -74,4 +75,7 @@ type EndpointController struct {
+ 	serviceImportSourceNameSpace string
+ 	stopCh                       chan struct{}
+ 	localClient                  dynamic.Interface
++	ingressIPClient              dynamic.NamespaceableResourceInterface
++	isHeadless                   bool
++	globalnetEnabled             bool
+ }

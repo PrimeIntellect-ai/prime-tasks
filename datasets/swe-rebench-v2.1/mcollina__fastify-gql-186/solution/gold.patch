@@ -1,0 +1,395 @@
+diff --git a/README.md b/README.md
+index 601e2f2..c737cdc 100644
+--- a/README.md
++++ b/README.md
+@@ -12,6 +12,7 @@ Features:
+ * Subscriptions.
+ * Federation support.
+ * Gateway implementation, including Subscriptions.
++* Batched query support.
+ 
+ ## Install
+ 
+@@ -137,6 +138,47 @@ In addition to the `persistedQueries` above, which let's client request for eith
+ Note: `onlyPersisted` disables all IDEs (graphiql/playground) so typically you'd want to use it in production.
+ 
+ 
++### Batched Queries
++
++Batched queries, like those sent by `apollo-link-batch-http` are supported by enabling the `allowBatchedQueries` option.
++
++Instead a single query object, an array of queries is accepted, and the response is returned as an array of results. Errors are returned on a per query basis. Note that the response will not be returned until the slowest query has been executed.
++
++Request:
++```js
++[
++  {
++    operationName: 'AddQuery',
++    variables: { x: 1, y: 2 },
++    query: 'query AddQuery ($x: Int!, $y: Int!) { add(x: $x, y: $y) }'
++  },
++  {
++    operationName: 'DoubleQuery',
++    variables: { x: 1 },
++    query: 'query DoubleQuery ($x: Int!) { add(x: $x, y: $x) }'
++  },
++  {
++    operationName: 'BadQuery',
++    query: 'query DoubleQuery ($x: Int!) {---' // Malformed Query
++  }
++]
++```
++
++Response:
++```js
++[
++  {
++    data: { add: 3 }
++  },
++  {
++    data: { add: 2 }
++  },
++  {
++    errors: [{ message: 'Bad Request' }]
++  }
++]
++```
++
+ ### Access app context in resolver
+ 
+ ```js
+@@ -608,6 +650,7 @@ __fastify-gql__ supports the following options:
+     * `service.wsConnectionParams`: `Function` or `Object`
+ * `persistedQueries`: A hash/query map to resolve the full query text using it's unique hash.
+ * `onlyPersisted`: Boolean. Flag to control whether to allow graphql queries other than persisted. When `true`, it'll make the server reject any queries that are not present in the `persistedQueries` option above. It will also disable any ide available (playground/graphiql).
++* `allowBatchedQueries`: Boolean. Flag to control whether to allow batched queries. When `true`, the server supports recieving an array of queries and returns an array of results.
+ 
+ #### queryDepth example
+ ```
+diff --git a/index.d.ts b/index.d.ts
+index e2139e6..0050f23 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -134,6 +134,12 @@ declare namespace fastifyGQL {
+         url: string
+       }>
+     }
++    /**
++     * Enable support for batched queries (POST requests only).
++     * Batched query support allows clients to send an array of queries and
++     * receive an array of responses within a single request.
++     */
++    allowBatchedQueries?: boolean
+   }
+ 
+   /**
+diff --git a/index.js b/index.js
+index 1469273..5d05a69 100644
+--- a/index.js
++++ b/index.js
+@@ -148,6 +148,7 @@ const plugin = fp(async function (app, opts) {
+       context: opts.context,
+       onlyPersisted: onlyPersisted,
+       persistedQueries: opts.persistedQueries,
++      allowBatchedQueries: opts.allowBatchedQueries,
+       schema,
+       subscriber,
+       verifyClient,
+diff --git a/lib/routes.js b/lib/routes.js
+index 8e13a98..e422846 100644
+--- a/lib/routes.js
++++ b/lib/routes.js
+@@ -7,49 +7,93 @@ const { formatError, GraphQLError } = require('graphql')
+ const subscription = require('./subscription')
+ const { FEDERATED_ERROR, toGraphQLError } = require('./errors')
+ 
+-const responseSchema = {
+-  '2xx': {
+-    type: 'object',
+-    properties: {
+-      data: {
+-        type: ['object', 'null'],
+-        additionalProperties: true
+-      },
+-      errors: {
+-        type: 'array',
+-        items: {
+-          type: 'object',
+-          required: ['message'],
+-          properties: {
+-            message: { type: 'string' },
+-            locations: {
+-              type: 'array',
+-              items: {
+-                type: 'object',
+-                properties: {
+-                  line: { type: 'integer' },
+-                  column: { type: 'integer' }
+-                }
+-              }
+-            },
+-            path: {
+-              type: 'array',
+-              items: { type: 'string' }
+-            },
+-            extensions: {
+-              type: 'object',
+-              properties: {
+-                code: { type: 'string' }
+-              },
+-              additionalProperties: true
++const responseProperties = {
++  data: {
++    type: ['object', 'null'],
++    additionalProperties: true
++  },
++  errors: {
++    type: 'array',
++    items: {
++      type: 'object',
++      required: ['message'],
++      properties: {
++        message: { type: 'string' },
++        locations: {
++          type: 'array',
++          items: {
++            type: 'object',
++            properties: {
++              line: { type: 'integer' },
++              column: { type: 'integer' }
+             }
+           }
++        },
++        path: {
++          type: 'array',
++          items: { type: 'string' }
++        },
++        extensions: {
++          type: 'object',
++          properties: {
++            code: { type: 'string' }
++          },
++          additionalProperties: true
+         }
+       }
+     }
+   }
+ }
+ 
++const requestProperties = {
++  query: {
++    type: 'string'
++  },
++  persisted: {
++    type: 'boolean'
++  },
++  operationName: {
++    type: 'string'
++  }
++}
++
++const getSchema = {
++  querystring: {
++    type: 'object',
++    properties: {
++      ...requestProperties,
++      variables: {
++        type: 'string' // Stringified JSON
++      }
++    }
++  },
++  response: {
++    '2xx': {
++      type: 'object',
++      properties: responseProperties
++    }
++  }
++}
++
++const postSchema = (allowBatchedQueries) => ({
++  body: {
++    type: allowBatchedQueries ? ['object', 'array'] : 'object',
++    properties: {
++      ...requestProperties,
++      variables: {
++        type: ['object', 'null']
++      }
++    }
++  },
++  // JSON schema isn't allowing ['object', 'array'] on response.
++  response: allowBatchedQueries ? {} : {
++    '2xx': {
++      type: 'object',
++      properties: responseProperties
++    }
++  }
++})
++
+ async function defaultErrorHandler (err, request, reply) {
+   if (err.data) {
+     reply.code(200)
+@@ -102,68 +146,53 @@ module.exports = async function (app, opts) {
+     lruGatewayResolvers,
+     entityResolversFactory,
+     onlyPersisted,
+-    persistedQueries = {}
++    persistedQueries = {},
++    allowBatchedQueries
+   } = opts
+ 
++  async function execute (body, request, reply) {
++    let { query } = body
++    const { persisted, operationName, variables } = body
++
++    if (persisted || onlyPersisted) {
++      query = persistedQueries[query]
++    }
++
++    if (!query) {
++      return new BadRequest('Unknown query')
++    }
++
++    let context = {}
++    if (contextFn) {
++      context = await contextFn(request, reply)
++    }
++
++    return reply.graphql(query, { pubsub: subscriber, ...context, __currentQuery: query }, variables, operationName)
++  }
++
+   const getOptions = {
+     url: graphqlPath,
+     method: 'GET',
+-    schema: {
+-      querystring: {
+-        type: 'object',
+-        properties: {
+-          query: {
+-            type: 'string'
+-          },
+-          persisted: {
+-            type: 'boolean'
+-          },
+-          operationName: {
+-            type: 'string'
+-          },
+-          variables: { // this is a JSON
+-            type: 'string'
+-          }
+-        }
+-      },
+-      response: responseSchema
+-    },
++    schema: getSchema,
+     attachValidation: true,
+     handler: async function (request, reply) {
+       validationHandler(request.validationError)
+ 
+-      let {
+-        query,
+-        persisted,
+-        variables,
+-        operationName
+-      } = request.query
+-
+-      if (persisted || onlyPersisted) {
+-        query = persistedQueries[query]
+-      }
+-
+-      if (!query) {
+-        reply.send(new BadRequest('Unknown query'))
+-        return
+-      }
+-
++      // Parse variables from stringified JSON
++      let { variables } = request.query
+       if (variables) {
+         try {
+           variables = JSON.parse(variables)
+         } catch (err) {
+           request.log.info({ err: err })
+-          reply.send(new BadRequest(err.message))
+-          return
++          return reply.send(new BadRequest(err.message))
+         }
+       }
+ 
+-      let context = {}
+-      if (contextFn) {
+-        context = await contextFn(request, reply)
+-      }
+-
+-      return reply.graphql(query, { pubsub: subscriber, ...context }, variables, operationName)
++      return execute({
++        ...request.query,
++        variables
++      }, request, reply)
+     }
+   }
+ 
+@@ -190,55 +219,21 @@ module.exports = async function (app, opts) {
+   })
+ 
+   app.post(graphqlPath, {
+-    schema: {
+-      body: {
+-        type: 'object',
+-        properties: {
+-          query: {
+-            type: 'string',
+-            description: 'the GraphQL query'
+-          },
+-          persisted: {
+-            type: 'boolean',
+-            description: 'flag to indicate if requesting for a persisted query using it\'s hash'
+-          },
+-          operationName: {
+-            type: 'string'
+-          },
+-          variables: {
+-            type: ['object', 'null'],
+-            additionalProperties: true
+-          }
+-        }
+-      },
+-      response: responseSchema
+-    },
++    schema: postSchema(allowBatchedQueries),
+     attachValidation: true
+   }, async function (request, reply) {
+     validationHandler(request.validationError)
+ 
+-    let { query } = request.body
+-    const {
+-      persisted,
+-      variables,
+-      operationName
+-    } = request.body
+-
+-    if (persisted || onlyPersisted) {
+-      query = persistedQueries[query]
++    if (allowBatchedQueries && Array.isArray(request.body)) {
++      // Batched query
++      return Promise.all(request.body.map(r =>
++        execute(r, request, reply)
++          .catch(e => ({ errors: [{ message: e.message }] }))
++      ))
++    } else {
++      // Regular query
++      return execute(request.body, request, reply)
+     }
+-
+-    if (!query) {
+-      reply.send(new BadRequest('Unknown query'))
+-      return
+-    }
+-
+-    let context = {}
+-    if (contextFn) {
+-      context = await contextFn(request, reply)
+-    }
+-
+-    return reply.graphql(query, { pubsub: subscriber, ...context, __currentQuery: query }, variables, operationName)
+   })
+ 
+   if (opts.ide || opts.graphiql) {

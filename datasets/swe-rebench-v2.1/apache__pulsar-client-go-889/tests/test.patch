@@ -1,0 +1,292 @@
+diff --git a/pulsar/consumer_test.go b/pulsar/consumer_test.go
+index f574378..9a7c497 100644
+--- a/pulsar/consumer_test.go
++++ b/pulsar/consumer_test.go
+@@ -3262,3 +3262,21 @@ func TestAvailablePermitsLeak(t *testing.T) {
+ 	assert.NotEqual(t, true, errors.Is(err, context.DeadlineExceeded),
+ 		"This means the resource is exhausted. consumer.Receive() will block forever.")
+ }
++
++func TestConsumerWithBackoffPolicy(t *testing.T) {
++	c, conn, requests := newFakeClientWithConnection()
++
++	backoff := &recordingBackoffPolicy{delay: 500 * time.Millisecond, calls: make(chan time.Time, 10)}
++	opts := ConsumerOptions{
++		Topic:            "my-topic",
++		SubscriptionName: "sub-1",
++		Type:             Shared,
++	}
++	setBackoffPolicyField(t, &opts, backoff)
++	consumer, err := c.Subscribe(opts)
++	assert.NoError(t, err)
++	assert.NotNil(t, consumer)
++	defer consumer.Close()
++
++	assertPublicReconnectDelay(t, conn, requests, backoff)
++}
+diff --git a/pulsar/producer_test.go b/pulsar/producer_test.go
+index f193ffd..6a2e682 100644
+--- a/pulsar/producer_test.go
++++ b/pulsar/producer_test.go
+@@ -1072,6 +1072,23 @@ func TestSendTimeout(t *testing.T) {
+ 	makeHTTPCall(t, http.MethodDelete, quotaURL, "")
+ }
+ 
++func TestProducerWithBackoffPolicy(t *testing.T) {
++	c, conn, requests := newFakeClientWithConnection()
++
++	backoff := &recordingBackoffPolicy{delay: 500 * time.Millisecond, calls: make(chan time.Time, 10)}
++	opts := ProducerOptions{
++		Topic:       "my-topic",
++		SendTimeout: 2 * time.Second,
++	}
++	setBackoffPolicyField(t, &opts, backoff)
++	producer, err := c.CreateProducer(opts)
++	assert.NoError(t, err)
++	assert.NotNil(t, producer)
++	defer producer.Close()
++
++	assertPublicReconnectDelay(t, conn, requests, backoff)
++}
++
+ func TestSendContextExpired(t *testing.T) {
+ 	quotaURL := adminURL + "/admin/v2/namespaces/public/default/backlogQuota"
+ 	quotaFmt := `{"limit": "%d", "policy": "producer_request_hold"}`
+diff --git a/pulsar/reader_test.go b/pulsar/reader_test.go
+index 3c85871..dc9f624 100644
+--- a/pulsar/reader_test.go
++++ b/pulsar/reader_test.go
+@@ -20,11 +20,19 @@ package pulsar
+ import (
+ 	"context"
+ 	"fmt"
++	"net/url"
++	"reflect"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/apache/pulsar-client-go/pulsar/crypto"
++	"github.com/apache/pulsar-client-go/pulsar/internal"
++	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
++	plog "github.com/apache/pulsar-client-go/pulsar/log"
++	"github.com/gogo/protobuf/proto"
+ 	"github.com/google/uuid"
++	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+@@ -775,3 +783,213 @@ func TestReaderWithSchema(t *testing.T) {
+ 	assert.Nil(t, err)
+ 	assert.Equal(t, *res, value)
+ }
++
++// recordingBackoffPolicy records when a reconnection delay is requested.
++type recordingBackoffPolicy struct {
++	delay time.Duration
++	calls chan time.Time
++}
++
++func (b *recordingBackoffPolicy) Next() time.Duration {
++	b.calls <- time.Now()
++	return b.delay
++}
++
++// fakeLookupService resolves every topic to a fixed address without contacting
++// a real broker.
++type fakeLookupService struct{}
++
++func (f *fakeLookupService) Lookup(topic string) (*internal.LookupResult, error) {
++	u, _ := url.Parse("pulsar://localhost:6650")
++	return &internal.LookupResult{LogicalAddr: u, PhysicalAddr: u}, nil
++}
++
++func (f *fakeLookupService) GetPartitionedTopicMetadata(topic string) (*internal.PartitionedTopicMetadata, error) {
++	return &internal.PartitionedTopicMetadata{Partitions: 0}, nil
++}
++
++func (f *fakeLookupService) GetTopicsOfNamespace(namespace string, mode internal.GetTopicsOfNamespaceMode) ([]string, error) {
++	return nil, nil
++}
++
++func (f *fakeLookupService) GetSchema(topic string, schemaVersion []byte) (*pb.Schema, error) {
++	return nil, nil
++}
++
++func (f *fakeLookupService) Close() {}
++
++// fakeConnection is a no-op Connection that lets the reconnection logic run
++// without a real broker.
++type fakeConnection struct {
++	mu        sync.Mutex
++	listeners map[uint64]internal.ConnectionListener
++	handlers  map[uint64]internal.ConsumerHandler
++}
++
++func (c *fakeConnection) SendRequest(requestID uint64, req *pb.BaseCommand, callback func(*pb.BaseCommand, error)) {
++}
++func (c *fakeConnection) SendRequestNoWait(req *pb.BaseCommand) error { return nil }
++func (c *fakeConnection) WriteData(data internal.Buffer)              {}
++func (c *fakeConnection) RegisterListener(id uint64, listener internal.ConnectionListener) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.listeners == nil {
++		c.listeners = make(map[uint64]internal.ConnectionListener)
++	}
++	c.listeners[id] = listener
++	return nil
++}
++func (c *fakeConnection) UnregisterListener(id uint64) {
++	c.mu.Lock()
++	delete(c.listeners, id)
++	c.mu.Unlock()
++}
++func (c *fakeConnection) AddConsumeHandler(id uint64, handler internal.ConsumerHandler) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.handlers == nil {
++		c.handlers = make(map[uint64]internal.ConsumerHandler)
++	}
++	c.handlers[id] = handler
++	return nil
++}
++func (c *fakeConnection) DeleteConsumeHandler(id uint64) {
++	c.mu.Lock()
++	delete(c.handlers, id)
++	c.mu.Unlock()
++}
++
++// disconnect simulates the broker connection closing and notifies its users.
++func (c *fakeConnection) disconnect() {
++	c.mu.Lock()
++	listeners := make([]internal.ConnectionListener, 0, len(c.listeners))
++	for _, listener := range c.listeners {
++		listeners = append(listeners, listener)
++	}
++	handlers := make([]internal.ConsumerHandler, 0, len(c.handlers))
++	for _, handler := range c.handlers {
++		handlers = append(handlers, handler)
++	}
++	c.mu.Unlock()
++	for _, listener := range listeners {
++		listener.ConnectionClosed()
++	}
++	for _, handler := range handlers {
++		handler.ConnectionClosed()
++	}
++}
++func (c *fakeConnection) ID() string               { return "fake" }
++func (c *fakeConnection) GetMaxMessageSize() int32 { return 5 * 1024 * 1024 }
++func (c *fakeConnection) Close()                   {}
++
++// fakeRPCClient answers every request with a successful response so that
++// consumers, producers and readers can be created without a broker.
++type fakeRPCClient struct {
++	conn     *fakeConnection
++	id       uint64
++	requests chan time.Time
++}
++
++func (r *fakeRPCClient) NewRequestID() uint64  { r.id++; return r.id }
++func (r *fakeRPCClient) NewProducerID() uint64 { r.id++; return r.id }
++func (r *fakeRPCClient) NewConsumerID() uint64 { r.id++; return r.id }
++func (r *fakeRPCClient) RequestToAnyBroker(requestID uint64, cmdType pb.BaseCommand_Type, message proto.Message) (*internal.RPCResult, error) {
++	return nil, nil
++}
++func (r *fakeRPCClient) Request(logicalAddr *url.URL, physicalAddr *url.URL, requestID uint64, cmdType pb.BaseCommand_Type, message proto.Message) (*internal.RPCResult, error) {
++	r.requests <- time.Now()
++	return &internal.RPCResult{
++		Cnx:      r.conn,
++		Response: &pb.BaseCommand{Type: pb.BaseCommand_SUCCESS.Enum()},
++	}, nil
++}
++func (r *fakeRPCClient) RequestOnCnxNoWait(cnx internal.Connection, cmdType pb.BaseCommand_Type, message proto.Message) error {
++	return nil
++}
++func (r *fakeRPCClient) RequestOnCnx(cnx internal.Connection, requestID uint64, cmdType pb.BaseCommand_Type, message proto.Message) (*internal.RPCResult, error) {
++	return &internal.RPCResult{Cnx: cnx, Response: &pb.BaseCommand{Type: pb.BaseCommand_SUCCESS.Enum()}}, nil
++}
++
++// newFakeClient returns a client backed by in-memory fakes so that client
++// operations can be exercised without a running broker.
++func newFakeClient() *client {
++	c, _, _ := newFakeClientWithConnection()
++	return c
++}
++
++func newFakeClientWithConnection() (*client, *fakeConnection, chan time.Time) {
++	conn := &fakeConnection{}
++	requests := make(chan time.Time, 100)
++	c := &client{
++		rpcClient:     &fakeRPCClient{conn: conn, requests: requests},
++		lookupService: &fakeLookupService{},
++		handlers:      internal.NewClientHandlers(),
++		metrics:       internal.NewMetricsProvider(4, map[string]string{}, prometheus.DefaultRegisterer),
++		log:           plog.DefaultNopLogger(),
++	}
++	return c, conn, requests
++}
++
++// assertPublicReconnectDelay triggers a connection loss and checks that the
++// next broker request follows the delay returned by the supplied policy.
++func assertPublicReconnectDelay(t *testing.T, conn *fakeConnection, requests chan time.Time, policy *recordingBackoffPolicy) {
++	t.Helper()
++	for len(requests) > 0 {
++		<-requests
++	}
++	conn.disconnect()
++	var policyCalled time.Time
++	select {
++	case policyCalled = <-policy.calls:
++	case <-time.After(10 * time.Second):
++		t.Fatal("reconnection did not request a backoff delay")
++	}
++	select {
++	case attempt := <-requests:
++		assert.GreaterOrEqual(t, attempt.Sub(policyCalled), policy.delay-20*time.Millisecond,
++			"broker reconnection was attempted before the policy delay elapsed")
++	case <-time.After(10 * time.Second):
++		t.Fatal("no broker reconnection request followed the connection loss")
++	}
++}
++
++func setBackoffPolicyField(t *testing.T, opts interface{}, policy internal.BackoffPolicy) {
++	t.Helper()
++	field := reflect.ValueOf(opts).Elem().FieldByName("BackoffPolicy")
++	if !field.IsValid() || !field.CanSet() {
++		t.Fatalf("%T does not expose a writable BackoffPolicy field", opts)
++	}
++	field.Set(reflect.ValueOf(policy))
++}
++
++func TestReaderReconnectHonorsConfiguredBackoffPolicy(t *testing.T) {
++	c, conn, requests := newFakeClientWithConnection()
++
++	backoff := &recordingBackoffPolicy{delay: 500 * time.Millisecond, calls: make(chan time.Time, 10)}
++	opts := ReaderOptions{
++		Topic:          "my-topic",
++		StartMessageID: LatestMessageID(),
++	}
++	setBackoffPolicyField(t, &opts, backoff)
++	reader, err := c.CreateReader(opts)
++	assert.NoError(t, err)
++	assert.NotNil(t, reader)
++	defer reader.Close()
++
++	assertPublicReconnectDelay(t, conn, requests, backoff)
++}
++
++// minimalBackoffPolicy implements only the Next method of the public
++// BackoffPolicy contract.
++type minimalBackoffPolicy struct {
++delay time.Duration
++}
++
++func (m minimalBackoffPolicy) Next() time.Duration {
++return m.delay
++}
++
++func TestBackoffPolicyContractIsNextDelay(t *testing.T) {
++var policy internal.BackoffPolicy = minimalBackoffPolicy{delay: 250 * time.Millisecond}
++assert.Equal(t, 250*time.Millisecond, policy.Next())
++}

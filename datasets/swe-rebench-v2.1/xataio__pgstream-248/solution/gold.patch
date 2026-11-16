@@ -1,0 +1,253 @@
+diff --git a/pkg/wal/processor/batch/mocks/mock_batch_sender.go b/pkg/wal/processor/batch/mocks/mock_batch_sender.go
+index efbc999..3c09304 100644
+--- a/pkg/wal/processor/batch/mocks/mock_batch_sender.go
++++ b/pkg/wal/processor/batch/mocks/mock_batch_sender.go
+@@ -9,9 +9,9 @@ import (
+ )
+ 
+ type BatchSender[T batch.Message] struct {
+-	AddToBatchFn func(context.Context, *batch.WALMessage[T]) error
+-	SendFn       func(context.Context) error
+-	msgChan      chan *batch.WALMessage[T]
++	SendMessageFn func(context.Context, *batch.WALMessage[T]) error
++	CloseFn       func()
++	msgChan       chan *batch.WALMessage[T]
+ }
+ 
+ func NewBatchSender[T batch.Message]() *BatchSender[T] {
+@@ -20,9 +20,9 @@ func NewBatchSender[T batch.Message]() *BatchSender[T] {
+ 	}
+ }
+ 
+-func (m *BatchSender[T]) AddToBatch(ctx context.Context, msg *batch.WALMessage[T]) error {
+-	if m.AddToBatchFn != nil {
+-		return m.AddToBatchFn(ctx, msg)
++func (m *BatchSender[T]) SendMessage(ctx context.Context, msg *batch.WALMessage[T]) error {
++	if m.SendMessageFn != nil {
++		return m.SendMessageFn(ctx, msg)
+ 	}
+ 
+ 	m.msgChan <- msg
+@@ -31,15 +31,9 @@ func (m *BatchSender[T]) AddToBatch(ctx context.Context, msg *batch.WALMessage[T
+ 
+ func (m *BatchSender[T]) Close() {
+ 	close(m.msgChan)
+-}
+-
+-func (m *BatchSender[T]) Send(ctx context.Context) error {
+-	if m.SendFn != nil {
+-		return m.SendFn(ctx)
++	if m.CloseFn != nil {
++		m.CloseFn()
+ 	}
+-
+-	_ = m.GetWALMessages()
+-	return nil
+ }
+ 
+ func (m *BatchSender[T]) GetWALMessages() []*batch.WALMessage[T] {
+diff --git a/pkg/wal/processor/batch/wal_batch_sender.go b/pkg/wal/processor/batch/wal_batch_sender.go
+index d1c888b..92d1180 100644
+--- a/pkg/wal/processor/batch/wal_batch_sender.go
++++ b/pkg/wal/processor/batch/wal_batch_sender.go
+@@ -29,7 +29,8 @@ type Sender[T Message] struct {
+ 	maxBatchSize      int64
+ 	batchSendInterval time.Duration
+ 
+-	wg *sync.WaitGroup
++	wg       *sync.WaitGroup
++	cancelFn context.CancelFunc
+ 
+ 	sendBatchFn sendBatchFn[T]
+ }
+@@ -38,7 +39,7 @@ type sendBatchFn[T Message] func(context.Context, *Batch[T]) error
+ 
+ var errSendStopped = errors.New("stop processing, sending has stopped")
+ 
+-func NewSender[T Message](config *Config, sendfn sendBatchFn[T], logger loglib.Logger) (*Sender[T], error) {
++func NewSender[T Message](ctx context.Context, config *Config, sendfn sendBatchFn[T], logger loglib.Logger) (*Sender[T], error) {
+ 	s := &Sender[T]{
+ 		batchSendInterval: config.GetBatchTimeout(),
+ 		maxBatchBytes:     config.GetMaxBatchBytes(),
+@@ -49,6 +50,7 @@ func NewSender[T Message](config *Config, sendfn sendBatchFn[T], logger loglib.L
+ 		logger:            logger,
+ 		sendBatchFn:       sendfn,
+ 		wg:                &sync.WaitGroup{},
++		cancelFn:          func() {},
+ 	}
+ 
+ 	maxQueueBytes, err := config.GetMaxQueueBytes()
+@@ -57,10 +59,22 @@ func NewSender[T Message](config *Config, sendfn sendBatchFn[T], logger loglib.L
+ 	}
+ 	s.queueBytesSema = synclib.NewWeightedSemaphore(int64(maxQueueBytes))
+ 
++	// start the send process in the background
++	go func() {
++		ctx, s.cancelFn = context.WithCancel(ctx)
++		defer s.cancelFn()
++
++		if err := s.send(ctx); err != nil && !errors.Is(err, context.Canceled) {
++			s.logger.Error(err, "sending stopped")
++		}
++	}()
++
+ 	return s, nil
+ }
+ 
+-func (s *Sender[T]) AddToBatch(ctx context.Context, msg *WALMessage[T]) error {
++// SendMessage adds the message to the batch, which will be sent when the interval or the
++// max number of messages is reached by a background process.
++func (s *Sender[T]) SendMessage(ctx context.Context, msg *WALMessage[T]) error {
+ 	if msg == nil {
+ 		return nil
+ 	}
+@@ -94,7 +108,7 @@ func (s *Sender[T]) AddToBatch(ctx context.Context, msg *WALMessage[T]) error {
+ 	return nil
+ }
+ 
+-func (s *Sender[T]) Send(ctx context.Context) error {
++func (s *Sender[T]) send(ctx context.Context) error {
+ 	// make sure we send on a separate go routine to isolate the IO operations,
+ 	// ensuring the goroutine is always sending, and minimise the wait time
+ 	// between batch sending
+@@ -187,6 +201,8 @@ func (s *Sender[T]) Send(ctx context.Context) error {
+ }
+ 
+ func (s *Sender[T]) Close() {
++	s.cancelFn()
++	// wait for the send loop to finish
+ 	s.wg.Wait()
+ 	s.closeMsgChan()
+ }
+diff --git a/pkg/wal/processor/kafka/wal_kafka_batch_writer.go b/pkg/wal/processor/kafka/wal_kafka_batch_writer.go
+index cc0c415..24229de 100644
+--- a/pkg/wal/processor/kafka/wal_kafka_batch_writer.go
++++ b/pkg/wal/processor/kafka/wal_kafka_batch_writer.go
+@@ -37,9 +37,8 @@ type BatchWriter struct {
+ type Option func(*BatchWriter)
+ 
+ type batchSender interface {
+-	AddToBatch(context.Context, *batch.WALMessage[kafka.Message]) error
++	SendMessage(context.Context, *batch.WALMessage[kafka.Message]) error
+ 	Close()
+-	Send(context.Context) error
+ }
+ 
+ var errRecordTooLarge = errors.New("record too large")
+@@ -77,18 +76,11 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...Option) (*Batch
+ 		opt(w)
+ 	}
+ 
+-	w.batchSender, err = batch.NewSender(&config.Batch, w.sendBatch, w.logger)
++	w.batchSender, err = batch.NewSender(ctx, &config.Batch, w.sendBatch, w.logger)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// start the send process in the background
+-	go func() {
+-		if err := w.batchSender.Send(ctx); err != nil {
+-			w.logger.Error(err, "sending stopped")
+-		}
+-	}()
+-
+ 	return w, nil
+ }
+ 
+@@ -159,7 +151,7 @@ func (w *BatchWriter) ProcessWALEvent(ctx context.Context, walEvent *wal.Event)
+ 	}
+ 
+ 	msg := batch.NewWALMessage(kafkaMsg, walEvent.CommitPosition)
+-	return w.batchSender.AddToBatch(ctx, msg)
++	return w.batchSender.SendMessage(ctx, msg)
+ }
+ 
+ func (w *BatchWriter) Name() string {
+diff --git a/pkg/wal/processor/postgres/postgres_batch_writer.go b/pkg/wal/processor/postgres/postgres_batch_writer.go
+index 2a6a56f..2e4742c 100644
+--- a/pkg/wal/processor/postgres/postgres_batch_writer.go
++++ b/pkg/wal/processor/postgres/postgres_batch_writer.go
+@@ -35,9 +35,8 @@ type BatchWriter struct {
+ type Option func(*BatchWriter)
+ 
+ type queryBatchSender interface {
+-	AddToBatch(context.Context, *batch.WALMessage[*query]) error
++	SendMessage(context.Context, *batch.WALMessage[*query]) error
+ 	Close()
+-	Send(context.Context) error
+ }
+ 
+ // NewBatchWriter returns a postgres processor that batches and writes data to
+@@ -80,18 +79,11 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...Option) (*Batch
+ 		}
+ 	}
+ 
+-	w.batchSender, err = batch.NewSender(&config.BatchConfig, w.sendBatch, w.logger)
++	w.batchSender, err = batch.NewSender(ctx, &config.BatchConfig, w.sendBatch, w.logger)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// start the send process in the background
+-	go func() {
+-		if err := w.batchSender.Send(ctx); err != nil && !errors.Is(err, context.Canceled) {
+-			w.logger.Error(err, "sending stopped")
+-		}
+-	}()
+-
+ 	return w, nil
+ }
+ 
+@@ -132,7 +124,7 @@ func (w *BatchWriter) ProcessWALEvent(ctx context.Context, walEvent *wal.Event)
+ 	for _, q := range queries {
+ 		w.logger.Debug("batching query", loglib.Fields{"sql": q.getSQL(), "args": q.getArgs(), "commit_position": walEvent.CommitPosition})
+ 		msg := batch.NewWALMessage(q, walEvent.CommitPosition)
+-		if err := w.batchSender.AddToBatch(ctx, msg); err != nil {
++		if err := w.batchSender.SendMessage(ctx, msg); err != nil {
+ 			return err
+ 		}
+ 	}
+diff --git a/pkg/wal/processor/search/search_batch_indexer.go b/pkg/wal/processor/search/search_batch_indexer.go
+index 871cd8d..3fad47e 100644
+--- a/pkg/wal/processor/search/search_batch_indexer.go
++++ b/pkg/wal/processor/search/search_batch_indexer.go
+@@ -34,9 +34,8 @@ type BatchIndexer struct {
+ type Option func(*BatchIndexer)
+ 
+ type batchSender interface {
+-	AddToBatch(context.Context, *batch.WALMessage[*msg]) error
++	SendMessage(context.Context, *batch.WALMessage[*msg]) error
+ 	Close()
+-	Send(context.Context) error
+ }
+ 
+ // NewBatchIndexer returns a processor of wal events that indexes data into the
+@@ -55,18 +54,11 @@ func NewBatchIndexer(ctx context.Context, config IndexerConfig, store Store, lsn
+ 	}
+ 
+ 	var err error
+-	indexer.batchSender, err = batch.NewSender(&config.Batch, indexer.sendBatch, indexer.logger)
++	indexer.batchSender, err = batch.NewSender(ctx, &config.Batch, indexer.sendBatch, indexer.logger)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// start the send process in the background
+-	go func() {
+-		if err := indexer.batchSender.Send(ctx); err != nil {
+-			indexer.logger.Error(err, "sending stopped")
+-		}
+-	}()
+-
+ 	return indexer, nil
+ }
+ 
+@@ -116,7 +108,7 @@ func (i *BatchIndexer) ProcessWALEvent(ctx context.Context, event *wal.Event) (e
+ 		return nil
+ 	}
+ 
+-	return i.batchSender.AddToBatch(ctx, batch.NewWALMessage(msg, event.CommitPosition))
++	return i.batchSender.SendMessage(ctx, batch.NewWALMessage(msg, event.CommitPosition))
+ }
+ 
+ func (i *BatchIndexer) Name() string {

@@ -1,0 +1,123 @@
+diff --git a/workflow/controller/operator_test.go b/workflow/controller/operator_test.go
+index 133a72f7..940320e0 100644
+--- a/workflow/controller/operator_test.go
++++ b/workflow/controller/operator_test.go
+@@ -3,6 +3,8 @@ package controller
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"regexp"
++	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -10,6 +12,7 @@ import (
+ 	"github.com/prometheus/client_golang/prometheus"
+ 	dto "github.com/prometheus/client_model/go"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	apiv1 "k8s.io/api/core/v1"
+ 	apierr "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+@@ -361,6 +364,92 @@ func TestProcessNodesWithRetriesWithBackoff(t *testing.T) {
+ 	assert.Equal(t, n.Phase, wfv1.NodeSucceeded)
+ }
+ 
++func TestProcessNodesWithRetriesWithExponentialBackoff(t *testing.T) {
++	require := require.New(t)
++
++	cancel, controller := newController()
++	defer cancel()
++
++	wf := unmarshalWF(retriesVariableTemplate)
++	wf.Spec.Templates[0].RetryStrategy.RetryPolicy = wfv1.RetryPolicyAlways
++	wf.Spec.Templates[0].RetryStrategy.Backoff = &wfv1.Backoff{
++		Duration: "5m",
++		Factor:   2,
++	}
++	wfClient := controller.wfclientset.ArgoprojV1alpha1().Workflows(wf.Namespace)
++	wf, err := wfClient.Create(wf)
++	require.NoError(err)
++
++	// Start the workflow, fail its first attempt, and let normal workflow processing
++	// schedule the retry.
++	newWorkflowOperationCtx(wf, controller).operate()
++	makePodsPhase(t, apiv1.PodFailed, controller.kubeclientset, wf.Namespace)
++	wf, err = wfClient.Get(wf.Name, metav1.GetOptions{})
++	require.NoError(err)
++	newWorkflowOperationCtx(wf, controller).operate()
++	wf, err = wfClient.Get(wf.Name, metav1.GetOptions{})
++	require.NoError(err)
++
++	var retryNode wfv1.NodeStatus
++	foundRetryNode := false
++	for _, node := range wf.Status.Nodes {
++		if node.Type == wfv1.NodeTypeRetry {
++			retryNode = node
++			foundRetryNode = true
++			break
++		}
++	}
++	require.True(foundRetryNode)
++	backoff, err := parseRetryMessage(retryNode.Message)
++	require.NoError(err)
++	require.InDelta(5*time.Minute.Seconds(), float64(backoff), 5)
++
++	// Model a second failed attempt in the persisted workflow state so normal
++	// processing can expose the delay that applies to the next retry.
++	parent := wf.Status.Nodes[retryNode.ID]
++	lastChildID := parent.Children[len(parent.Children)-1]
++	secondAttempt := wf.Status.Nodes[lastChildID]
++	secondAttempt.Name = wf.Name + "(1)"
++	secondAttempt.ID = wf.NodeID(secondAttempt.Name)
++	secondAttempt.StartedAt = metav1.NewTime(time.Now().UTC().Add(-time.Second))
++	secondAttempt.FinishedAt = metav1.NewTime(time.Now().UTC().Add(-time.Second))
++	secondAttempt.Phase = wfv1.NodeFailed
++	parent.Children = append(parent.Children, secondAttempt.ID)
++	wf.Status.Nodes[parent.ID] = parent
++	wf.Status.Nodes[secondAttempt.ID] = secondAttempt
++	wf, err = wfClient.Update(wf)
++	require.NoError(err)
++
++	newWorkflowOperationCtx(wf, controller).operate()
++	wf, err = wfClient.Get(wf.Name, metav1.GetOptions{})
++	require.NoError(err)
++	retryNode = wf.Status.Nodes[retryNode.ID]
++	backoff, err = parseRetryMessage(retryNode.Message)
++	require.NoError(err)
++	require.InDelta(10*time.Minute.Seconds(), float64(backoff), 5)
++}
++
++func parseRetryMessage(message string) (int, error) {
++	pattern := regexp.MustCompile(`Backoff for (\d+) minutes (\d+) seconds`)
++	matches := pattern.FindStringSubmatch(message)
++	if len(matches) != 3 {
++		return 0, fmt.Errorf("unexpected message: %v", message)
++	}
++
++	minutes, err := strconv.Atoi(matches[1])
++	if err != nil {
++		return 0, err
++	}
++
++	seconds, err := strconv.Atoi(matches[2])
++	if err != nil {
++		return 0, err
++	}
++
++	totalSeconds := minutes*60 + seconds
++	return totalSeconds, nil
++}
++
+ // TestProcessNodesWithRetries tests retrying when RetryOn.Error is disabled
+ func TestProcessNodesNoRetryWithError(t *testing.T) {
+ 	cancel, controller := newController()
+@@ -460,7 +549,7 @@ spec:
+     outputs: {}
+     retryStrategy:
+       backoff:
+-        duration: "1"
++        duration: "2"
+         factor: 2
+         maxDuration: 1m
+       limit: 10

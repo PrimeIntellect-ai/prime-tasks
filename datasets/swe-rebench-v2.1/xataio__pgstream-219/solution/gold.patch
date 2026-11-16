@@ -1,0 +1,470 @@
+diff --git a/cmd/config.go b/cmd/config.go
+index 0781f33..88b33a6 100644
+--- a/cmd/config.go
++++ b/cmd/config.go
+@@ -287,7 +287,8 @@ func parsePostgresProcessorConfig() *stream.PostgresProcessorConfig {
+ 			SchemaLogStore: pgschemalog.Config{
+ 				URL: viper.GetString("PGSTREAM_POSTGRES_WRITER_SCHEMALOG_STORE_URL"),
+ 			},
+-			DisableTriggers: viper.GetBool("PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS"),
++			DisableTriggers:  viper.GetBool("PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS"),
++			OnConflictAction: viper.GetString("PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION"),
+ 		},
+ 	}
+ }
+diff --git a/docs/README.md b/docs/README.md
+index ede3df0..93d156c 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -213,6 +213,7 @@ One of exponential/constant backoff policies can be provided for the search stor
+ | PGSTREAM_POSTGRES_WRITER_BATCH_BYTES         | 1572864 | No       | Max size in bytes for a given batch. When this size is reached, the batch is sent to PostgreSQL.                 |
+ | PGSTREAM_POSTGRES_WRITER_SCHEMALOG_STORE_URL | N/A     | No       | URL of the store where the pgstream schemalog table which keeps track of schema changes is.                      |
+ | PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS    | False   | No       | Option to disable triggers on the target PostgreSQL database while performing the snaphot/replication streaming. |
++| PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION  | error   | No       | Action to apply to inserts on conflict. Options are `nothing`, `update` or `error`.                              |
+ 
+ </details>
+ 
+@@ -271,6 +272,7 @@ For details on how to use and configure the snapshot mode, check the [snapshot t
+ ### Supported transformers
+ 
+ #### go-masker
++
+  <details>
+   <summary>masking</summary>
+ 
+@@ -282,10 +284,9 @@ For details on how to use and configure the snapshot mode, check the [snapshot t
+ 
+ **Parameter Details:**
+ 
+-| Parameter | Type   | Default  | Required | Values                                                                     |
+-| --------- | ------ | -------- | -------- | -------------------------------------------------------------------------- |
+-| type      | string | default  | No       | password, name, address, email, mobile, tel, id, credit_card, url, default |
+-
++| Parameter | Type   | Default | Required | Values                                                                     |
++| --------- | ------ | ------- | -------- | -------------------------------------------------------------------------- |
++| type      | string | default | No       | password, name, address, email, mobile, tel, id, credit_card, url, default |
+ 
+ **Example Configuration:**
+ 
+diff --git a/docs/tutorials/postgres_snapshot.md b/docs/tutorials/postgres_snapshot.md
+index 7541572..02171bc 100644
+--- a/docs/tutorials/postgres_snapshot.md
++++ b/docs/tutorials/postgres_snapshot.md
+@@ -92,10 +92,18 @@ PGSTREAM_POSTGRES_WRITER_TARGET_URL="postgres://postgres:postgres@localhost:7654
+ ```
+ 
+ If we need to disable triggers on the target database during the snapshot process(ie., to avoid foreign key constraint violations), we can do so by setting the following variable:
++
+ ```sh
+ PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS=true
+ ```
+ 
++For further granularity, we can also configure the action that should be taken when an insert has a conflict.
++
++```sh
++# Insert on conflict action. Options are update, nothing or error (error is the default behaviour)
++PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION=update
++```
++
+ The PostgreSQL writer uses batching under the hood to reduce the number of IO calls to the target database and improve performance. The batch size and send timeout can both be configured to be able to better fit the different traffic patterns. The writer will send a batch when the timeout or the batch size is reached, whichever happens first.
+ 
+ ```sh
+diff --git a/docs/tutorials/postgres_to_postgres.md b/docs/tutorials/postgres_to_postgres.md
+index 3d32639..0237449 100644
+--- a/docs/tutorials/postgres_to_postgres.md
++++ b/docs/tutorials/postgres_to_postgres.md
+@@ -146,10 +146,18 @@ PGSTREAM_POSTGRES_WRITER_TARGET_URL="postgres://postgres:postgres@localhost:7654
+ ```
+ 
+ If we need to disable triggers on the target database during the replication process(ie., to avoid foreign key constraint violations), we can do so by setting the following variable:
++
+ ```sh
+ PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS=true
+ ```
+ 
++For further granularity, we can also configure the action that should be taken when there's a conflict on an insert.
++
++```sh
++# Insert on conflict action. Options are update, nothing or error (error is the default behaviour)
++PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION=update
++```
++
+ The PostgreSQL writer uses batching under the hood to reduce the number of IO calls to the target database and improve performance. The batch size and send timeout can both be configured to be able to better fit the different traffic patterns. The writer will send a batch when the timeout or the batch size is reached, whichever happens first.
+ 
+ ```sh
+diff --git a/internal/postgres/errors.go b/internal/postgres/errors.go
+index 3332356..23f8d07 100644
+--- a/internal/postgres/errors.go
++++ b/internal/postgres/errors.go
+@@ -48,6 +48,14 @@ func (e *ErrDataException) Error() string {
+ 	return fmt.Sprintf("data exception: %s", e.Details)
+ }
+ 
++type ErrRelationAlreadyExists struct {
++	Details string
++}
++
++func (e *ErrRelationAlreadyExists) Error() string {
++	return fmt.Sprintf("relation already exists: %v", e.Details)
++}
++
+ func mapError(err error) error {
+ 	if pgconn.Timeout(err) {
+ 		return ErrConnTimeout
+diff --git a/internal/postgres/pg_restore.go b/internal/postgres/pg_restore.go
+index efc6bea..43a1dd1 100644
+--- a/internal/postgres/pg_restore.go
++++ b/internal/postgres/pg_restore.go
+@@ -3,13 +3,18 @@
+ package postgres
+ 
+ import (
++	"bufio"
+ 	"bytes"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"os/exec"
++	"strings"
+ )
+ 
+-var pgRestoreCmd = "pg_restore"
++const (
++	pgRestoreCmd = "pg_restore"
++)
+ 
+ type PGRestoreOptions struct {
+ 	// ConnectionString
+@@ -22,7 +27,7 @@ type PGRestoreOptions struct {
+ 	Options []string
+ }
+ 
+-func (opts PGRestoreOptions) ToArgs() []string {
++func (opts PGRestoreOptions) toArgs() []string {
+ 	var options []string
+ 
+ 	options = append(options, "-d", opts.ConnectionString)
+@@ -40,12 +45,10 @@ func (opts PGRestoreOptions) ToArgs() []string {
+ 	return options
+ }
+ 
+-// Func RunPGRestore runs pg_restore command with the given options and returns the result.
++// Func RunPGRestore runs pg_restore command with the given options and returns
++// the result.
+ func RunPGRestore(opts PGRestoreOptions, dump []byte) (string, error) {
+-	cmd := exec.Command(pgRestoreCmd, opts.ToArgs()...) //nolint:gosec
+-
+-	var stderr bytes.Buffer
+-	cmd.Stderr = &stderr
++	cmd := exec.Command(pgRestoreCmd, opts.toArgs()...) //nolint:gosec
+ 
+ 	stdin, err := cmd.StdinPipe()
+ 	if err != nil {
+@@ -58,10 +61,71 @@ func RunPGRestore(opts PGRestoreOptions, dump []byte) (string, error) {
+ 	}()
+ 
+ 	// TODO: add streaming support when large data output is required
+-	out, err := cmd.Output()
+-	if err != nil {
+-		return "", fmt.Errorf("error running pg_restore: %w: (%s)", err, stderr.String())
++	out, err := cmd.CombinedOutput()
++	if err != nil || strings.Contains(string(out), "ERROR") {
++		return "", fmt.Errorf("error running pg_restore: %w", parsePgRestoreOutputErrs(out))
+ 	}
+ 
+ 	return string(out), nil
+ }
++
++func parsePgRestoreOutputErrs(out []byte) error {
++	errs := &PGRestoreErrors{}
++	scanner := bufio.NewScanner(bytes.NewReader(out))
++	for scanner.Scan() {
++		line := scanner.Text()
++		if strings.Contains(line, "pg_restore: error:") {
++			switch {
++			case strings.Contains(line, "already exists"),
++				strings.Contains(line, "multiple primary keys for table"):
++				errs.addError(&ErrRelationAlreadyExists{Details: line})
++			default:
++				errs.addError(errors.New(line))
++			}
++		}
++	}
++	return errs
++}
++
++type PGRestoreErrors struct {
++	ignoredErrs  []error
++	criticalErrs []error
++}
++
++func NewPGRestoreErrors(errs ...error) *PGRestoreErrors {
++	pgrestoreErrs := &PGRestoreErrors{}
++	for _, err := range errs {
++		pgrestoreErrs.addError(err)
++	}
++	return pgrestoreErrs
++}
++
++func (e PGRestoreErrors) Error() string {
++	if len(e.criticalErrs) == 0 && len(e.ignoredErrs) == 0 {
++		return ""
++	}
++
++	return errors.Join(append(e.criticalErrs, e.ignoredErrs...)...).Error()
++}
++
++func (e *PGRestoreErrors) HasCriticalErrors() bool {
++	return len(e.criticalErrs) > 0
++}
++
++func (e *PGRestoreErrors) GetIgnoredErrors() []error {
++	return e.ignoredErrs
++}
++
++func (e *PGRestoreErrors) addError(err error) {
++	if err == nil {
++		return
++	}
++
++	var errAlreadyExists *ErrRelationAlreadyExists
++	switch {
++	case errors.As(err, &errAlreadyExists):
++		e.ignoredErrs = append(e.ignoredErrs, err)
++	default:
++		e.criticalErrs = append(e.criticalErrs, err)
++	}
++}
+diff --git a/pkg/snapshot/generator/postgres/schema/pgdumprestore/snapshot_pg_dump_restore_generator.go b/pkg/snapshot/generator/postgres/schema/pgdumprestore/snapshot_pg_dump_restore_generator.go
+index 7dc92a6..817be67 100644
+--- a/pkg/snapshot/generator/postgres/schema/pgdumprestore/snapshot_pg_dump_restore_generator.go
++++ b/pkg/snapshot/generator/postgres/schema/pgdumprestore/snapshot_pg_dump_restore_generator.go
+@@ -4,6 +4,7 @@ package pgdumprestore
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 
+ 	pglib "github.com/xataio/pgstream/internal/postgres"
+@@ -96,8 +97,17 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
+ 	}
+ 
+ 	_, err = s.pgRestoreFn(s.pgrestoreOptions(), dump)
++	pgrestoreErr := &pglib.PGRestoreErrors{}
+ 	if err != nil {
+-		return err
++		switch {
++		case errors.As(err, &pgrestoreErr):
++			if pgrestoreErr.HasCriticalErrors() {
++				return err
++			}
++			s.logger.Warn(nil, "pg_restore errors ignored", loglib.Fields{"errors_ignored": len(pgrestoreErr.GetIgnoredErrors())})
++		default:
++			return err
++		}
+ 	}
+ 
+ 	// if we perform a schema snapshot using pg_dump/pg_restore, we need to make
+diff --git a/pkg/wal/processor/postgres/config.go b/pkg/wal/processor/postgres/config.go
+index b569f3b..e002427 100644
+--- a/pkg/wal/processor/postgres/config.go
++++ b/pkg/wal/processor/postgres/config.go
+@@ -8,8 +8,9 @@ import (
+ )
+ 
+ type Config struct {
+-	URL             string
+-	BatchConfig     batch.Config
+-	SchemaLogStore  schemalogpg.Config
+-	DisableTriggers bool
++	URL              string
++	BatchConfig      batch.Config
++	SchemaLogStore   schemalogpg.Config
++	DisableTriggers  bool
++	OnConflictAction string
+ }
+diff --git a/pkg/wal/processor/postgres/postgres_batch_writer.go b/pkg/wal/processor/postgres/postgres_batch_writer.go
+index 0d1b95d..2a6a56f 100644
+--- a/pkg/wal/processor/postgres/postgres_batch_writer.go
++++ b/pkg/wal/processor/postgres/postgres_batch_writer.go
+@@ -57,10 +57,15 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...Option) (*Batch
+ 		schemaLogStore = schemalog.NewStoreCache(schemaLogStore)
+ 	}
+ 
++	adapter, err := newAdapter(schemaLogStore, config.OnConflictAction)
++	if err != nil {
++		return nil, err
++	}
++
+ 	w := &BatchWriter{
+ 		logger:          loglib.NewNoopLogger(),
+ 		pgConn:          pgConn,
+-		adapter:         newAdapter(schemaLogStore),
++		adapter:         adapter,
+ 		disableTriggers: config.DisableTriggers,
+ 	}
+ 
+diff --git a/pkg/wal/processor/postgres/postgres_wal_adapter.go b/pkg/wal/processor/postgres/postgres_wal_adapter.go
+index 9ab1e48..c731533 100644
+--- a/pkg/wal/processor/postgres/postgres_wal_adapter.go
++++ b/pkg/wal/processor/postgres/postgres_wal_adapter.go
+@@ -18,15 +18,20 @@ type adapter struct {
+ 	ddlAdapter *ddlAdapter
+ }
+ 
+-func newAdapter(schemaQuerier schemalogQuerier) *adapter {
++func newAdapter(schemaQuerier schemalogQuerier, onConflictAction string) (*adapter, error) {
++	dmlAdapter, err := newDMLAdapter(onConflictAction)
++	if err != nil {
++		return nil, err
++	}
++
+ 	var ddl *ddlAdapter
+ 	if schemaQuerier != nil {
+ 		ddl = newDDLAdapter(schemaQuerier)
+ 	}
+ 	return &adapter{
+-		dmlAdapter: &dmlAdapter{},
++		dmlAdapter: dmlAdapter,
+ 		ddlAdapter: ddl,
+-	}
++	}, nil
+ }
+ 
+ func (a *adapter) walEventToQueries(ctx context.Context, e *wal.Event) ([]*query, error) {
+diff --git a/pkg/wal/processor/postgres/postgres_wal_dml_adapter.go b/pkg/wal/processor/postgres/postgres_wal_dml_adapter.go
+index 41dbf74..92197d1 100644
+--- a/pkg/wal/processor/postgres/postgres_wal_dml_adapter.go
++++ b/pkg/wal/processor/postgres/postgres_wal_dml_adapter.go
+@@ -3,6 +3,7 @@
+ package postgres
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"slices"
+ 	"strings"
+@@ -11,7 +12,29 @@ import (
+ 	"github.com/xataio/pgstream/pkg/wal"
+ )
+ 
+-type dmlAdapter struct{}
++type onConflictAction uint
++
++const (
++	onConflictError onConflictAction = iota
++	onConflictUpdate
++	onConflictDoNothing
++)
++
++var errUnsupportedOnConflictAction = errors.New("unsupported on conflict action")
++
++type dmlAdapter struct {
++	onConflictAction onConflictAction
++}
++
++func newDMLAdapter(action string) (*dmlAdapter, error) {
++	oca, err := parseOnConflictAction(action)
++	if err != nil {
++		return nil, err
++	}
++	return &dmlAdapter{
++		onConflictAction: oca,
++	}, nil
++}
+ 
+ func (a *dmlAdapter) walDataToQuery(d *wal.Data) *query {
+ 	switch d.Action {
+@@ -54,7 +77,7 @@ func (a *dmlAdapter) buildInsertQuery(d *wal.Data) *query {
+ 	}
+ 
+ 	return &query{
+-		sql: fmt.Sprintf("INSERT INTO %s(%s) VALUES(%s) %s",
++		sql: fmt.Sprintf("INSERT INTO %s(%s) VALUES(%s)%s",
+ 			quotedTableName(d.Schema, d.Table), strings.Join(names, ", "),
+ 			strings.Join(placeholders, ", "),
+ 			a.buildOnConflictQuery(d)),
+@@ -99,15 +122,26 @@ func (a *dmlAdapter) buildSetQuery(cols []wal.Column) (string, []any) {
+ }
+ 
+ func (a *dmlAdapter) buildOnConflictQuery(d *wal.Data) string {
+-	primaryKeyCols := a.extractPrimaryKeyColumns(d.Metadata.InternalColIDs, d.Columns)
+-	conflictCols := []string{}
+-	for _, col := range primaryKeyCols {
+-		conflictCols = append(conflictCols, col.Name)
+-	}
+-	if len(conflictCols) == 0 {
++	switch a.onConflictAction {
++	case onConflictUpdate:
++		// on conflict do update requires a conflict target. If there are no
++		// primary keys to use for the conflict target, default to error
++		// behaviour
++		primaryKeyCols := a.extractPrimaryKeyColumnNames(d.Metadata.InternalColIDs, d.Columns)
++		if len(primaryKeyCols) == 0 {
++			return ""
++		}
++
++		cols := make([]string, 0, len(d.Columns))
++		for _, col := range d.Columns {
++			cols = append(cols, fmt.Sprintf("%[1]s = EXCLUDED.%[1]s", pq.QuoteIdentifier(col.Name)))
++		}
++		return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", strings.Join(primaryKeyCols, ","), strings.Join(cols, ", "))
++	case onConflictDoNothing:
++		return " ON CONFLICT DO NOTHING"
++	default:
+ 		return ""
+ 	}
+-	return fmt.Sprintf("ON CONFLICT (%s) DO NOTHING", strings.Join(conflictCols, ", "))
+ }
+ 
+ func (a *dmlAdapter) extractPrimaryKeyColumns(colIDs []string, cols []wal.Column) []wal.Column {
+@@ -122,6 +156,31 @@ func (a *dmlAdapter) extractPrimaryKeyColumns(colIDs []string, cols []wal.Column
+ 	return primaryKeyColumns
+ }
+ 
++func (a *dmlAdapter) extractPrimaryKeyColumnNames(colIDs []string, cols []wal.Column) []string {
++	primaryKeyCols := a.extractPrimaryKeyColumns(colIDs, cols)
++	if len(primaryKeyCols) == 0 {
++		return []string{}
++	}
++	colNames := []string{}
++	for _, col := range primaryKeyCols {
++		colNames = append(colNames, col.Name)
++	}
++	return colNames
++}
++
+ func quotedTableName(schemaName, tableName string) string {
+ 	return fmt.Sprintf("%s.%s", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(tableName))
+ }
++
++func parseOnConflictAction(action string) (onConflictAction, error) {
++	switch action {
++	case "", "error":
++		return onConflictError, nil
++	case "update":
++		return onConflictUpdate, nil
++	case "nothing":
++		return onConflictDoNothing, nil
++	default:
++		return 0, errUnsupportedOnConflictAction
++	}
++}
+diff --git a/snapshot2pg.env b/snapshot2pg.env
+index 5a88bec..d4b7219 100644
+--- a/snapshot2pg.env
++++ b/snapshot2pg.env
+@@ -5,7 +5,6 @@ PGSTREAM_POSTGRES_SNAPSHOT_SCHEMA_WORKERS=4
+ PGSTREAM_POSTGRES_SNAPSHOT_TABLE_WORKERS=4
+ PGSTREAM_POSTGRES_SNAPSHOT_BATCH_PAGE_SIZE=1000
+ PGSTREAM_POSTGRES_SNAPSHOT_WORKERS=1
+-PGSTREAM_POSTGRES_SNAPSHOT_CLEAN_TARGET_DB=true
+ 
+ # Processor config
+ PGSTREAM_TRANSFORMER_RULES_FILE="transformer_rules.yaml"
+@@ -14,3 +13,4 @@ PGSTREAM_POSTGRES_WRITER_BATCH_SIZE=100
+ PGSTREAM_POSTGRES_WRITER_BATCH_TIMEOUT=5s
+ PGSTREAM_POSTGRES_WRITER_SCHEMALOG_STORE_URL="postgres://postgres:postgres@localhost?sslmode=disable"
+ PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS=true
++PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION="nothing"

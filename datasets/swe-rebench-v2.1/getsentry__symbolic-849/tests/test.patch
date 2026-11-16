@@ -1,0 +1,264 @@
+diff --git a/symbolic-debuginfo/tests/test_objects.rs b/symbolic-debuginfo/tests/test_objects.rs
+index 6372f0a1..29c871a5 100644
+--- a/symbolic-debuginfo/tests/test_objects.rs
++++ b/symbolic-debuginfo/tests/test_objects.rs
+@@ -2,7 +2,7 @@ use std::{env, ffi::CString, fmt, io::BufWriter};
+ 
+ use symbolic_common::ByteView;
+ use symbolic_debuginfo::{
+-    elf::ElfObject, pe::PeObject, FileEntry, Function, LineInfo, Object, SymbolMap,
++    elf::ElfObject, pe::PeObject, DebugSession, FileEntry, Function, LineInfo, Object, SymbolMap,
+ };
+ use symbolic_testutils::fixture;
+ 
+@@ -871,6 +871,8 @@ fn test_wasm_symbols() -> Result<(), Error> {
+         Some("bda18fd85d4a4eb893022d6bfad846b1".into())
+     );
+ 
++    assert!(!object.has_sources());
++
+     let symbols = object.symbol_map();
+     insta::assert_debug_snapshot!("wasm_symbols", SymbolsDebug(&symbols));
+ 
+@@ -893,3 +895,241 @@ fn test_wasm_line_program() -> Result<(), Error> {
+ 
+     Ok(())
+ }
++
++const EMBEDDED_SOURCE: &str = "int main(void) { return 42; }\n";
++
++fn uleb(mut value: u64) -> Vec<u8> {
++    let mut out = Vec::new();
++    loop {
++        let byte = (value & 0x7f) as u8;
++        value >>= 7;
++        if value == 0 {
++            out.push(byte);
++            return out;
++        }
++        out.push(byte | 0x80);
++    }
++}
++
++/// Builds the DWARF 5 debug sections of a single compile unit whose line table lists
++/// `/tmp/foo.c`, optionally with the source code embedded in the file entry.
++fn dwarf_debug_sections(embedded_source: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
++    const DW_LNCT_PATH: u64 = 0x1;
++    const DW_LNCT_DIRECTORY_INDEX: u64 = 0x2;
++    const DW_LNCT_LLVM_SOURCE: u64 = 0x2001;
++    const DW_FORM_STRING: u64 = 0x08;
++    const DW_FORM_DATA1: u64 = 0x0b;
++    const DW_FORM_ADDR: u64 = 0x01;
++    const DW_FORM_SEC_OFFSET: u64 = 0x17;
++    const DW_AT_LOW_PC: u8 = 0x11;
++    const DW_AT_STMT_LIST: u8 = 0x10;
++    const DW_TAG_COMPILE_UNIT: u8 = 0x11;
++
++    // DWARF 5 line number program header with one directory and one file entry.
++    let mut header = vec![
++        1,    // minimum_instruction_length
++        1,    // maximum_operations_per_instruction
++        1,    // default_is_stmt
++        0xfb, // line_base
++        14,   // line_range
++        13,   // opcode_base
++        0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, // standard_opcode_lengths
++    ];
++    header.push(1); // directory_entry_format_count
++    header.extend(uleb(DW_LNCT_PATH));
++    header.extend(uleb(DW_FORM_STRING));
++    header.extend(uleb(1)); // directories_count
++    header.extend(b"/tmp\0");
++
++    let mut file_formats = vec![
++        (DW_LNCT_PATH, DW_FORM_STRING),
++        (DW_LNCT_DIRECTORY_INDEX, DW_FORM_DATA1),
++    ];
++    if embedded_source.is_some() {
++        file_formats.push((DW_LNCT_LLVM_SOURCE, DW_FORM_STRING));
++    }
++    header.push(file_formats.len() as u8);
++    for (content_type, form) in file_formats {
++        header.extend(uleb(content_type));
++        header.extend(uleb(form));
++    }
++    header.extend(uleb(1)); // file_names_count
++    header.extend(b"foo.c\0");
++    header.push(0); // directory index
++    if let Some(source) = embedded_source {
++        header.extend(source.as_bytes());
++        header.push(0);
++    }
++
++    let mut line = vec![5, 0, 8, 0]; // version 5, address_size 8, segment_selector_size 0
++    line.extend((header.len() as u32).to_le_bytes());
++    line.extend(header);
++    // The line program itself is empty.
++    let mut line_section = (line.len() as u32).to_le_bytes().to_vec();
++    line_section.extend(line);
++
++    let abbrev = vec![
++        1,                        // abbreviation code
++        DW_TAG_COMPILE_UNIT,      // tag
++        0,                        // no children
++        DW_AT_LOW_PC,             // DW_AT_low_pc
++        DW_FORM_ADDR as u8,       // as addr
++        DW_AT_STMT_LIST,          // DW_AT_stmt_list
++        DW_FORM_SEC_OFFSET as u8, // as sec_offset
++        0,                        // end of attributes
++        0,                        // end of attributes
++        0,                        // end of abbreviations
++    ];
++
++    let mut info = vec![5, 0, 1, 8]; // version 5, DW_UT_compile, address_size 8
++    info.extend(0u32.to_le_bytes()); // debug_abbrev_offset
++    info.push(1); // abbreviation code
++    // A non-zero low_pc keeps the unit even in non-relocatable objects such as WASM.
++    info.extend(0x1000u64.to_le_bytes()); // DW_AT_low_pc
++    info.extend(0u32.to_le_bytes()); // DW_AT_stmt_list
++    let mut info_section = (info.len() as u32).to_le_bytes().to_vec();
++    info_section.extend(info);
++
++    vec![
++        (".debug_abbrev", abbrev),
++        (".debug_info", info_section),
++        (".debug_line", line_section),
++    ]
++}
++
++fn push_elf_section_header(out: &mut Vec<u8>, name: u32, kind: u32, offset: u64, size: u64) {
++    out.extend(name.to_le_bytes());
++    out.extend(kind.to_le_bytes());
++    out.extend(0u64.to_le_bytes()); // sh_flags
++    out.extend(0u64.to_le_bytes()); // sh_addr
++    out.extend(offset.to_le_bytes());
++    out.extend(size.to_le_bytes());
++    out.extend(0u32.to_le_bytes()); // sh_link
++    out.extend(0u32.to_le_bytes()); // sh_info
++    out.extend(1u64.to_le_bytes()); // sh_addralign
++    out.extend(0u64.to_le_bytes()); // sh_entsize
++}
++
++/// Wraps the given sections into a minimal little-endian ELF64 file.
++fn elf_with_sections(sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
++    let mut shstrtab = vec![0u8];
++    let mut name_offsets = Vec::new();
++    for (name, _) in sections {
++        name_offsets.push(shstrtab.len() as u32);
++        shstrtab.extend(name.as_bytes());
++        shstrtab.push(0);
++    }
++    let shstrtab_name = shstrtab.len() as u32;
++    shstrtab.extend(b".shstrtab\0");
++
++    let mut contents = Vec::new();
++    let mut offsets = Vec::new();
++    for (_, data) in sections {
++        offsets.push(64 + contents.len() as u64);
++        contents.extend(data);
++    }
++    let shstrtab_offset = 64 + contents.len() as u64;
++    contents.extend(&shstrtab);
++    while (64 + contents.len()) % 8 != 0 {
++        contents.push(0);
++    }
++    let shoff = 64 + contents.len() as u64;
++
++    let mut out = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
++    out.extend(1u16.to_le_bytes()); // e_type: ET_REL
++    out.extend(62u16.to_le_bytes()); // e_machine: x86-64
++    out.extend(1u32.to_le_bytes()); // e_version
++    out.extend(0u64.to_le_bytes()); // e_entry
++    out.extend(0u64.to_le_bytes()); // e_phoff
++    out.extend(shoff.to_le_bytes()); // e_shoff
++    out.extend(0u32.to_le_bytes()); // e_flags
++    out.extend(64u16.to_le_bytes()); // e_ehsize
++    out.extend(0u16.to_le_bytes()); // e_phentsize
++    out.extend(0u16.to_le_bytes()); // e_phnum
++    out.extend(64u16.to_le_bytes()); // e_shentsize
++    out.extend(((sections.len() + 2) as u16).to_le_bytes()); // e_shnum
++    out.extend(((sections.len() + 1) as u16).to_le_bytes()); // e_shstrndx
++    out.extend(contents);
++
++    push_elf_section_header(&mut out, 0, 0, 0, 0);
++    for (i, (_, data)) in sections.iter().enumerate() {
++        push_elf_section_header(&mut out, name_offsets[i], 1, offsets[i], data.len() as u64);
++    }
++    push_elf_section_header(&mut out, shstrtab_name, 3, shstrtab_offset, shstrtab.len() as u64);
++    out
++}
++
++/// Wraps the given sections into a minimal WebAssembly module made of custom sections.
++fn wasm_with_sections(sections: &[(&str, Vec<u8>)]) -> Vec<u8> {
++    let mut out = b"\0asm".to_vec();
++    out.extend(1u32.to_le_bytes());
++    for (name, data) in sections {
++        let mut payload = uleb(name.len() as u64);
++        payload.extend(name.as_bytes());
++        payload.extend(data);
++        out.push(0); // custom section
++        out.extend(uleb(payload.len() as u64));
++        out.extend(payload);
++    }
++    out
++}
++
++/// Checks that the embedded source of `/tmp/foo.c` can be retrieved from the session by its
++/// absolute path, and that unknown paths are not reported.
++fn assert_embedded_source<'s, S>(session: &'s S) -> Result<(), Error>
++where
++    S: DebugSession<'s>,
++    S::Error: std::error::Error + 'static,
++{
++    let descriptor = session
++        .source_by_path("/tmp/foo.c")?
++        .expect("embedded source is found by absolute path");
++    assert_eq!(descriptor.contents(), Some(EMBEDDED_SOURCE));
++
++    assert!(session.source_by_path("/tmp/other.c")?.is_none());
++
++    Ok(())
++}
++
++#[test]
++fn test_elf_has_embedded_source() -> Result<(), Error> {
++    let view = ByteView::from_vec(elf_with_sections(&dwarf_debug_sections(Some(
++        EMBEDDED_SOURCE,
++    ))));
++    let object = ElfObject::parse(&view)?;
++
++    assert!(object.has_sources());
++
++    let session = object.debug_session()?;
++    assert_embedded_source(&session)?;
++
++    Ok(())
++}
++
++#[test]
++fn test_elf_without_embedded_source() -> Result<(), Error> {
++    let view = ByteView::from_vec(elf_with_sections(&dwarf_debug_sections(None)));
++    let object = ElfObject::parse(&view)?;
++
++    assert!(!object.has_sources());
++
++    let session = object.debug_session()?;
++    assert!(session.source_by_path("/tmp/foo.c")?.is_none());
++
++    Ok(())
++}
++
++#[test]
++fn test_wasm_has_sources() -> Result<(), Error> {
++    let view = ByteView::from_vec(wasm_with_sections(&dwarf_debug_sections(Some(
++        EMBEDDED_SOURCE,
++    ))));
++    let object = Object::parse(&view)?;
++
++    assert!(object.has_sources());
++
++    let session = object.debug_session()?;
++    assert_embedded_source(&session)?;
++
++    Ok(())
++}

@@ -1,0 +1,121 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 761ab8c7..abace433 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -156,6 +156,7 @@ All notable changes to this project will be documented in this file.
+ -   #2285 : Reduce number of warnings in unit tests.
+ -   #2295 : Fix wrapper handling of constant array arguments.
+ -   #2097 : Fix printing of an empty list.
++-   #2235 : Fix negative numbers in slice indices when translating to C.
+ 
+ ### Changed
+ 
+diff --git a/pyccel/ast/utilities.py b/pyccel/ast/utilities.py
+index 4013d617..5a7c15a0 100644
+--- a/pyccel/ast/utilities.py
++++ b/pyccel/ast/utilities.py
+@@ -353,7 +353,11 @@ def insert_index(expr, pos, index_var):
+             if indices[pos].step is not None:
+                 index_var = PyccelMul(index_var, indices[pos].step, simplify=True)
+             if indices[pos].start is not None:
+-                index_var = PyccelAdd(index_var, indices[pos].start, simplify=True)
++                if is_literal_integer(indices[pos].start) and int(indices[pos].start) < 0:
++                    index_var = PyccelAdd(PyccelAdd(base.shape[pos], indices[pos].start, simplify=True),
++                                          index_var, simplify=True)
++                else:
++                    index_var = PyccelAdd(index_var, indices[pos].start, simplify=True)
+ 
+         # Update index
+         indices[pos] = index_var
+diff --git a/pyccel/codegen/printing/ccode.py b/pyccel/codegen/printing/ccode.py
+index 8a2f073f..4751a789 100644
+--- a/pyccel/codegen/printing/ccode.py
++++ b/pyccel/codegen/printing/ccode.py
+@@ -1930,41 +1930,43 @@ class CCodePrinter(CodePrinter):
+         Slice
+             The new slice with processed arguments (start, stop, step).
+         """
+-        start = LiteralInteger(0) if _slice.start is None else _slice.start
+-        stop = array_size if _slice.stop is None else _slice.stop
++        explicit_start = LiteralInteger(0) if _slice.start is None else _slice.start
++        explicit_stop = array_size if _slice.stop is None else _slice.stop
+ 
+         # negative start and end in slice
+-        if isinstance(start, PyccelUnarySub) and isinstance(start.args[0], LiteralInteger):
+-            start = PyccelMinus(array_size, start.args[0], simplify = True)
+-        elif allow_negative_index and not isinstance(start, (LiteralInteger, PyccelArrayShapeElement)):
+-            start = IfTernaryOperator(PyccelLt(start, LiteralInteger(0)),
+-                            PyccelMinus(array_size, start, simplify = True), start)
++        if isinstance(explicit_start, PyccelUnarySub) and isinstance(explicit_start.args[0], LiteralInteger):
++            start = PyccelMinus(array_size, explicit_start.args[0], simplify = True)
++        elif allow_negative_index and not isinstance(explicit_start, (LiteralInteger, PyccelArrayShapeElement)):
++            start = IfTernaryOperator(PyccelLt(explicit_start, LiteralInteger(0)),
++                            PyccelAdd(array_size, explicit_start, simplify = True), explicit_start)
+         else:
+             start = _slice.start
+ 
+-        if isinstance(stop, PyccelUnarySub) and isinstance(stop.args[0], LiteralInteger):
+-            stop = PyccelMinus(array_size, stop.args[0], simplify = True)
+-        elif allow_negative_index and not isinstance(stop, (LiteralInteger, PyccelArrayShapeElement)):
+-            stop = IfTernaryOperator(PyccelLt(stop, LiteralInteger(0)),
+-                            PyccelMinus(array_size, stop, simplify = True), stop)
++        if isinstance(explicit_stop, PyccelUnarySub) and isinstance(explicit_stop.args[0], LiteralInteger):
++            stop = PyccelMinus(array_size, explicit_stop.args[0], simplify = True)
++        elif allow_negative_index and not isinstance(explicit_stop, (LiteralInteger, PyccelArrayShapeElement)):
++            stop = IfTernaryOperator(PyccelLt(explicit_stop, LiteralInteger(0)),
++                            PyccelAdd(array_size, explicit_stop, simplify = True), explicit_stop)
+         else:
+             stop = _slice.stop
+ 
+         # steps in slices
+-        step = _slice.step
++        explicit_step = _slice.step or LiteralInteger(1)
+ 
+         # negative step in slice
+-        if step and isinstance(step, PyccelUnarySub) and isinstance(step.args[0], LiteralInteger):
++        if isinstance(explicit_step, PyccelUnarySub) and isinstance(explicit_step.args[0], LiteralInteger):
+             start = PyccelMinus(array_size, LiteralInteger(1), simplify = True) if _slice.start is None else start
+             stop = LiteralInteger(0) if _slice.stop is None else stop
+             raise NotImplementedError("Negative step not yet handled")
+ 
+         # variable step in slice
+-        elif step and allow_negative_index and step and not isinstance(step, LiteralInteger):
+-            og_start = start
+-            start = IfTernaryOperator(PyccelGt(step, LiteralInteger(0)), start, PyccelMinus(stop, LiteralInteger(1), simplify = True))
+-            stop = IfTernaryOperator(PyccelGt(step, LiteralInteger(0)), stop, og_start)
++        elif allow_negative_index and not isinstance(explicit_step, LiteralInteger):
++            start = IfTernaryOperator(PyccelGt(explicit_step, LiteralInteger(0)), explicit_start,
++                                      PyccelMinus(explicit_stop, LiteralInteger(1), simplify = True))
++            stop = IfTernaryOperator(PyccelGt(explicit_step, LiteralInteger(0)), explicit_stop, explicit_start)
+             raise NotImplementedError("Negative step not yet handled")
++        else:
++            step = _slice.step
+ 
+         return Slice(start, stop, step)
+ 
+diff --git a/pyccel/codegen/wrapper/c_to_python_wrapper.py b/pyccel/codegen/wrapper/c_to_python_wrapper.py
+index dd8a07af..d0413a9b 100644
+--- a/pyccel/codegen/wrapper/c_to_python_wrapper.py
++++ b/pyccel/codegen/wrapper/c_to_python_wrapper.py
+@@ -2343,17 +2343,18 @@ class CToPythonWrapper(Wrapper):
+             return {'body': body, 'args': [arg_var], 'default_init': default_body}
+ 
+         arg_var = orig_var.clone(self.scope.get_new_name(orig_var.name), is_argument = False, is_optional=False,
+-                                memory_handling='alias', new_class = Variable, is_const = False)
++                                memory_handling='alias', new_class = Variable, allows_negative_indexes = False,
++                                is_const = False)
+         self.scope.insert_variable(arg_var)
+         if orig_var.is_optional:
+             sliced_arg_var = orig_var.clone(self.scope.get_new_name(orig_var.name), is_argument = False,
+                                     is_optional=False, memory_handling='alias', new_class = Variable,
+-                                    is_const = False)
++                                    allows_negative_indexes = False, is_const = False)
+             self.scope.insert_variable(sliced_arg_var)
+         else:
+             sliced_arg_var = orig_var.clone(self.scope.get_expected_name(orig_var.name), is_argument = False,
+                                     is_optional=False, memory_handling='alias', new_class = Variable,
+-                                    is_const = False)
++                                    allows_negative_indexes = False, is_const = False)
+             self.scope.insert_variable(sliced_arg_var, orig_var.name)
+ 
+         original_size = tuple(PyccelMul(sh, st) for sh, st in zip(shape_elems, stride_elems))

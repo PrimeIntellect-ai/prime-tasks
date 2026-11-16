@@ -1,0 +1,240 @@
+diff --git a/soroban-env-host/src/test/complex.rs b/soroban-env-host/src/test/complex.rs
+index c9f3279..163ef7e 100644
+--- a/soroban-env-host/src/test/complex.rs
++++ b/soroban-env-host/src/test/complex.rs
+@@ -12,7 +12,7 @@ use super::util::{generate_account_id, generate_bytes_array};
+ #[test]
+ fn run_complex() -> Result<(), HostError> {
+     let info = crate::LedgerInfo {
+-        protocol_version: 21,
++        protocol_version: crate::meta::get_ledger_protocol_version(crate::meta::INTERFACE_VERSION),
+         sequence_number: 1234,
+         timestamp: 1234,
+         network_id: [7; 32],
+diff --git a/soroban-env-host/src/test/hostile.rs b/soroban-env-host/src/test/hostile.rs
+index d28af48..44f1b9f 100644
+--- a/soroban-env-host/src/test/hostile.rs
++++ b/soroban-env-host/src/test/hostile.rs
+@@ -222,10 +222,11 @@ fn wasm_module_with_mem_grow(n_pages: usize) -> Vec<u8> {
+ fn excessive_memory_growth() -> Result<(), HostError> {
+     // not sure why calling `memory_grow(32)`, wasmi requests 33 pages of memory
+     let wasm = wasm_module_with_mem_grow(32);
+-    let host = Host::test_host_with_recording_footprint()
++    let host = Host::test_host_with_recording_footprint();
++    let contract_id_obj = host.register_test_contract_wasm(wasm.as_slice());
++    let host = host
+         .test_budget(0, 0)
+         .enable_model(ContractCostType::WasmMemAlloc, 0, 0, 1, 0);
+-    let contract_id_obj = host.register_test_contract_wasm(wasm.as_slice());
+     host.set_diagnostic_level(crate::DiagnosticLevel::Debug)?;
+ 
+     // This one should just run out of memory
+diff --git a/soroban-env-host/src/test/invocation.rs b/soroban-env-host/src/test/invocation.rs
+index 448ec22..b0d09d4 100644
+--- a/soroban-env-host/src/test/invocation.rs
++++ b/soroban-env-host/src/test/invocation.rs
+@@ -57,10 +57,11 @@ fn invoke_alloc() -> Result<(), HostError> {
+     // So we wind up with a growth-sequence that's a bit irregular: +0x10000,
+     // +0x20000, +0x30000, +0x50000, +0x90000. Total is 1 + 2 + 3 + 5 + 9 = 20
+     // pages or about 1.3 MiB, plus the initial 17 pages (1.1MiB) plus some more
+-    // slop from general host machinery allocations, we get around 2.5MiB. Call
+-    // is "less than 3MiB".
++    // slop from general host machinery allocations, plus allocating a VM once
++    // during upload and once during execution we get around 2.5MiB. Call
++    // is "less than 4MiB".
+     assert!(used_bytes > (128 * 4096));
+-    assert!(used_bytes < 0x30_0000);
++    assert!(used_bytes < 0x40_0000);
+     Ok(())
+ }
+ 
+diff --git a/soroban-env-host/src/test/ledger.rs b/soroban-env-host/src/test/ledger.rs
+index e98b02b..9b961c2 100644
+--- a/soroban-env-host/src/test/ledger.rs
++++ b/soroban-env-host/src/test/ledger.rs
+@@ -14,7 +14,7 @@ fn ledger_network_id() -> Result<(), HostError> {
+ 
+     let host = Host::with_storage_and_budget(storage, budget);
+     host.set_ledger_info(LedgerInfo {
+-        protocol_version: 0,
++        protocol_version: crate::meta::get_ledger_protocol_version(crate::meta::INTERFACE_VERSION),
+         sequence_number: 0,
+         timestamp: 0,
+         network_id: [7; 32],
+diff --git a/soroban-env-host/src/test/lifecycle.rs b/soroban-env-host/src/test/lifecycle.rs
+index 8c3e223..38c9aec 100644
+--- a/soroban-env-host/src/test/lifecycle.rs
++++ b/soroban-env-host/src/test/lifecycle.rs
+@@ -68,6 +68,7 @@ fn test_host() -> Host {
+         Storage::with_enforcing_footprint_and_map(Footprint::default(), StorageMap::new());
+     let host = Host::with_storage_and_budget(storage, budget);
+     host.set_ledger_info(LedgerInfo {
++        protocol_version: crate::meta::get_ledger_protocol_version(crate::meta::INTERFACE_VERSION),
+         network_id: generate_bytes_array(),
+         ..Default::default()
+     })
+@@ -167,7 +168,7 @@ fn create_contract_using_parent_id_test() {
+     });
+ 
+     let child_id = sha256_hash_id_preimage(child_pre_image);
+-    let child_wasm: &[u8] = b"70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4";
++    let child_wasm: &[u8] = &[];
+ 
+     // Install the code for the child contract.
+     let wasm_hash = xdr::Hash(Sha256::digest(&child_wasm).try_into().unwrap());
+@@ -235,8 +236,54 @@ fn create_contract_using_parent_id_test() {
+ 
+ #[test]
+ fn create_contract_from_source_account() {
+-    let code: &[u8] = b"70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4";
+-    test_create_contract_from_source_account(&test_host(), code);
++    test_create_contract_from_source_account(&test_host(), &[]);
++}
++
++// Returns a copy of `wasm` with the interface version in its environment
++// metadata section replaced by `interface_version`.
++fn wasm_with_interface_version(wasm: &[u8], interface_version: u64) -> Vec<u8> {
++    let name = crate::meta::ENV_META_V0_SECTION_NAME.as_bytes();
++    let name_pos = wasm
++        .windows(name.len())
++        .position(|w| w == name)
++        .expect("wasm is missing the environment metadata section");
++    // The section payload is the XDR encoding of `ScEnvMetaEntry`: a 4-byte
++    // union discriminant followed by the 8-byte interface version.
++    let version_pos = name_pos + name.len() + 4;
++    let mut patched = wasm.to_vec();
++    patched[version_pos..version_pos + 8].copy_from_slice(&interface_version.to_be_bytes());
++    patched
++}
++
++#[test]
++fn upload_contract_wasm_rejects_mismatched_pre_release() {
++    let host = Host::test_host_with_recording_footprint();
++    let proto = crate::meta::get_ledger_protocol_version(crate::meta::INTERFACE_VERSION) as u64;
++    let pre = crate::meta::get_pre_release_version(crate::meta::INTERFACE_VERSION) as u64;
++
++    // A contract built for the current protocol but a different pre-release
++    // number must be rejected at upload time, before it is ever invoked.
++    let mismatched = wasm_with_interface_version(ADD_I32, (proto << 32) | (pre + 1));
++    let res = host.invoke_function(HostFunction::UploadContractWasm(
++        mismatched.as_slice().try_into().unwrap(),
++    ));
++    assert!(res.is_err());
++
++    // A contract with the matching pre-release number still uploads fine.
++    let matching = wasm_with_interface_version(ADD_I32, (proto << 32) | pre);
++    let res = host.invoke_function(HostFunction::UploadContractWasm(
++        matching.as_slice().try_into().unwrap(),
++    ));
++    assert!(res.is_ok());
++}
++
++#[test]
++fn get_ledger_protocol_version_extracts_high_bits() {
++    // The ledger protocol version is the high 32 bits of the interface version.
++    assert_eq!(
++        crate::meta::get_ledger_protocol_version((5u64 << 32) | 3),
++        5
++    );
+ }
+ 
+ pub(crate) fn sha256_hash_id_preimage<T: xdr::WriteXdr>(pre_image: T) -> xdr::Hash {
+diff --git a/soroban-env-host/src/test/metering_benchmark.rs b/soroban-env-host/src/test/metering_benchmark.rs
+index d09340b..419ad79 100644
+--- a/soroban-env-host/src/test/metering_benchmark.rs
++++ b/soroban-env-host/src/test/metering_benchmark.rs
+@@ -20,16 +20,18 @@ use super::util::{generate_account_id, generate_bytes_array};
+ // Run with the following command:
+ // RUST_TEST_THREADS=1  cargo test --release --package soroban-env-host --lib -- test::metering_benchmark  --nocapture --ignored
+ 
+-const LEDGER_INFO: LedgerInfo = LedgerInfo {
+-    protocol_version: 21,
+-    sequence_number: 1234,
+-    timestamp: 1234,
+-    network_id: [7; 32],
+-    base_reserve: 1,
+-    min_persistent_entry_expiration: 4096,
+-    min_temp_entry_expiration: 16,
+-    max_entry_expiration: 6312000,
+-};
++fn ledger_info() -> LedgerInfo {
++    LedgerInfo {
++        protocol_version: crate::meta::get_ledger_protocol_version(crate::meta::INTERFACE_VERSION),
++        sequence_number: 1234,
++        timestamp: 1234,
++        network_id: [7; 32],
++        base_reserve: 1,
++        min_persistent_entry_expiration: 4096,
++        min_temp_entry_expiration: 16,
++        max_entry_expiration: 6312000,
++    }
++}
+ 
+ #[ignore]
+ #[test]
+@@ -42,7 +44,7 @@ fn run_add_i32() -> Result<(), HostError> {
+     // Run 1: record footprint, emulating "preflight".
+     let foot = {
+         let host = Host::test_host_with_recording_footprint();
+-        host.set_ledger_info(LEDGER_INFO.clone())?;
++        host.set_ledger_info(ledger_info())?;
+         let contract_id_obj =
+             host.register_test_contract_wasm_from_source_account(ADD_I32, account_id.clone(), salt);
+         host.call(
+@@ -60,7 +62,7 @@ fn run_add_i32() -> Result<(), HostError> {
+             MeteredOrdMap::default(),
+         );
+         let host = Host::with_storage_and_budget(store, Budget::default());
+-        host.set_ledger_info(LEDGER_INFO)?;
++        host.set_ledger_info(ledger_info())?;
+         host.setup_storage_footprint(foot)?;
+         let contract_id_obj =
+             host.register_test_contract_wasm_from_source_account(ADD_I32, account_id, salt);
+@@ -82,7 +84,7 @@ fn run_complex() -> Result<(), HostError> {
+     // Run 1: record footprint, emulating "preflight".
+     let foot = {
+         let host = Host::test_host_with_recording_footprint();
+-        host.set_ledger_info(LEDGER_INFO.clone())?;
++        host.set_ledger_info(ledger_info())?;
+         let contract_id_obj =
+             host.register_test_contract_wasm_from_source_account(COMPLEX, account_id.clone(), salt);
+         host.call(
+@@ -101,7 +103,7 @@ fn run_complex() -> Result<(), HostError> {
+             MeteredOrdMap::default(),
+         );
+         let host = Host::with_storage_and_budget(store, Budget::default());
+-        host.set_ledger_info(LEDGER_INFO)?;
++        host.set_ledger_info(ledger_info())?;
+         host.setup_storage_footprint(foot)?;
+         let contract_id_obj =
+             host.register_test_contract_wasm_from_source_account(COMPLEX, account_id, salt);
+diff --git a/soroban-env-host/src/test/token.rs b/soroban-env-host/src/test/token.rs
+index 7a51ea6..50a7602 100644
+--- a/soroban-env-host/src/test/token.rs
++++ b/soroban-env-host/src/test/token.rs
+@@ -50,7 +50,9 @@ impl TokenTest {
+     fn setup() -> Self {
+         let host = Host::test_host_with_recording_footprint();
+         host.set_ledger_info(LedgerInfo {
+-            protocol_version: 20,
++            protocol_version: crate::meta::get_ledger_protocol_version(
++                crate::meta::INTERFACE_VERSION,
++            ),
+             sequence_number: 123,
+             timestamp: 123456,
+             network_id: [5; 32],
+diff --git a/soroban-env-host/src/test/util.rs b/soroban-env-host/src/test/util.rs
+index a517775..af7f409 100644
+--- a/soroban-env-host/src/test/util.rs
++++ b/soroban-env-host/src/test/util.rs
+@@ -100,7 +100,9 @@ impl Host {
+         let storage = Storage::with_recording_footprint(snapshot_source);
+         let host = Host::with_storage_and_budget(storage, Budget::default());
+         host.set_ledger_info(LedgerInfo {
+-            protocol_version: 20,
++            protocol_version: crate::meta::get_ledger_protocol_version(
++                crate::meta::INTERFACE_VERSION,
++            ),
+             sequence_number: 0,
+             timestamp: 0,
+             network_id: [0; 32],

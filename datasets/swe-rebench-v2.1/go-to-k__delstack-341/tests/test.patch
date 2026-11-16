@@ -1,0 +1,201 @@
+diff --git a/internal/operation/cloudformation_stack_test.go b/internal/operation/cloudformation_stack_test.go
+index 97a60ff..585dd31 100644
+--- a/internal/operation/cloudformation_stack_test.go
++++ b/internal/operation/cloudformation_stack_test.go
+@@ -3,7 +3,12 @@ package operation
+ import (
+ 	"context"
+ 	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	osexec "os/exec"
+ 	"reflect"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/aws"
+@@ -1444,6 +1449,68 @@ func TestCloudFormationStackOperator_deleteStackNormally(t *testing.T) {
+ 	}
+ }
+ 
++func TestAppDeletesMultipleSelectedStacks(t *testing.T) {
++	deleted := map[string]bool{}
++	postDeleteDescribeCalls := map[string]int{}
++	var mu sync.Mutex
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if err := r.ParseForm(); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		switch r.Form.Get("Action") {
++		case "DescribeStacks":
++			name := r.Form.Get("StackName")
++			mu.Lock()
++			isDeleted := deleted[name]
++			if isDeleted {
++				postDeleteDescribeCalls[name]++
++			}
++			postDeleteCall := postDeleteDescribeCalls[name]
++			mu.Unlock()
++
++			stackXML := ""
++			if name != "" && !isDeleted {
++				stackXML = fmt.Sprintf(`<member><StackName>%s</StackName><StackStatus>CREATE_COMPLETE</StackStatus><CreationTime>2024-01-01T00:00:00Z</CreationTime><EnableTerminationProtection>false</EnableTerminationProtection></member>`, name)
++			} else if name != "" && postDeleteCall == 1 {
++				stackXML = fmt.Sprintf(`<member><StackName>%s</StackName><StackStatus>DELETE_COMPLETE</StackStatus></member>`, name)
++			}
++			_, _ = fmt.Fprintf(w, `<?xml version="1.0"?><DescribeStacksResponse xmlns="http://cloudformation.amazonaws.com/doc/2010-05-15/"><DescribeStacksResult><Stacks>%s</Stacks></DescribeStacksResult><ResponseMetadata><RequestId>test</RequestId></ResponseMetadata></DescribeStacksResponse>`, stackXML)
++		case "DeleteStack":
++			name := r.Form.Get("StackName")
++			mu.Lock()
++			deleted[name] = true
++			mu.Unlock()
++			_, _ = fmt.Fprint(w, `<?xml version="1.0"?><DeleteStackResponse xmlns="http://cloudformation.amazonaws.com/doc/2010-05-15/"><DeleteStackResult/><ResponseMetadata><RequestId>test</RequestId></ResponseMetadata></DeleteStackResponse>`)
++		default:
++			http.Error(w, "unexpected CloudFormation action: "+r.Form.Get("Action"), http.StatusBadRequest)
++		}
++	}))
++	defer server.Close()
++
++	cmd := osexec.Command("go", "run", "../../cmd/delstack", "--region", "us-east-1", "--stackName", "StackOne", "--stackName", "StackTwo")
++	cmd.Env = append(os.Environ(),
++		"AWS_ACCESS_KEY_ID=test-access-key",
++		"AWS_SECRET_ACCESS_KEY=test-secret-key",
++		"AWS_EC2_METADATA_DISABLED=true",
++		"AWS_ENDPOINT_URL_CLOUDFORMATION="+server.URL,
++		"AWS_ENDPOINT_URL="+server.URL,
++	)
++	output, err := cmd.CombinedOutput()
++	if err != nil {
++		t.Fatalf("CLI failed: %v\n%s", err, output)
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	for _, name := range []string{"StackOne", "StackTwo"} {
++		if !deleted[name] {
++			t.Errorf("expected a deletion request for %s; CLI output: %s", name, output)
++		}
++	}
++}
++
+ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 	io.NewLogger(false)
+ 	ctx := context.Background()
+@@ -1464,6 +1531,7 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 		prepareMockCloudFormationFn func(m *client.MockICloudFormation)
+ 		want                        want
+ 		wantErr                     bool
++		allowErrorForEmptyResult    bool
+ 	}{
+ 		{
+ 			name: "list stacks filtered by keyword successfully",
+@@ -1526,7 +1594,8 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 			wantErr: false,
+ 		},
+ 		{
+-			name: "list stacks with RootId filtered by keyword and no stacks do not have RootId found successfully",
++			name:                     "empty result when all matching stacks are nested",
++			allowErrorForEmptyResult: true,
+ 			args: args{
+ 				ctx:     ctx,
+ 				keyword: "TestStack",
+@@ -1645,7 +1714,8 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 			wantErr: false,
+ 		},
+ 		{
+-			name: "list stacks filtered by keyword but no stacks found successfully",
++			name:                     "empty result when no stack names match",
++			allowErrorForEmptyResult: true,
+ 			args: args{
+ 				ctx:     ctx,
+ 				keyword: "TestStack",
+@@ -1660,7 +1730,8 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 			wantErr: false,
+ 		},
+ 		{
+-			name: "list stacks filtered by keyword but empty keyword and no stacks found successfully",
++			name:                     "empty result for an empty inventory",
++			allowErrorForEmptyResult: true,
+ 			args: args{
+ 				ctx:     ctx,
+ 				keyword: "",
+@@ -1705,7 +1776,8 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 			wantErr: true,
+ 		},
+ 		{
+-			name: "list stacks filtered by keyword with XxxInProgress stacks successfully",
++			name:                     "empty result when all matching stacks are in progress",
++			allowErrorForEmptyResult: true,
+ 			args: args{
+ 				ctx:     ctx,
+ 				keyword: "TestStack",
+@@ -1762,6 +1834,36 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 			},
+ 			wantErr: false,
+ 		},
++		{
++			name:                     "empty result when all matching stacks are protected",
++			allowErrorForEmptyResult: true,
++			args: args{
++				ctx:     ctx,
++				keyword: "TestStack",
++			},
++			prepareMockCloudFormationFn: func(m *client.MockICloudFormation) {
++				m.EXPECT().DescribeStacks(gomock.Any(), nil).Return(
++					[]types.Stack{
++						{
++							StackName:                   aws.String("TestStack1"),
++							StackStatus:                 types.StackStatusCreateComplete,
++							EnableTerminationProtection: aws.Bool(true),
++						},
++						{
++							StackName:                   aws.String("TestStack2"),
++							StackStatus:                 types.StackStatusCreateComplete,
++							EnableTerminationProtection: aws.Bool(true),
++						},
++					},
++					nil,
++				)
++			},
++			want: want{
++				filteredStacks: []string{},
++				err:            nil,
++			},
++			wantErr: false,
++		},
+ 	}
+ 
+ 	for _, tt := range cases {
+@@ -1783,15 +1885,21 @@ func TestCloudFormationStackOperator_ListStacksFilteredByKeyword(t *testing.T) {
+ 			cloudformationStackOperator := NewCloudFormationStackOperator(aws.Config{}, cloudformationMock, targetResourceTypes)
+ 
+ 			output, err := cloudformationStackOperator.ListStacksFilteredByKeyword(tt.args.ctx, &tt.args.keyword)
+-			if (err != nil) != tt.wantErr {
+-				t.Errorf("error = %#v, wantErr %#v", err.Error(), tt.wantErr)
+-				return
+-			}
+-			if tt.wantErr && err.Error() != tt.want.err.Error() {
+-				t.Errorf("err = %#v, want %#v", err.Error(), tt.want.err.Error())
+-				return
++			if !tt.allowErrorForEmptyResult {
++				if (err != nil) != tt.wantErr {
++					t.Errorf("error = %#v, wantErr %#v", err, tt.wantErr)
++					return
++				}
++				if tt.wantErr && err.Error() != tt.want.err.Error() {
++					t.Errorf("err = %#v, want %#v", err.Error(), tt.want.err.Error())
++					return
++				}
+ 			}
+-			if !reflect.DeepEqual(output, tt.want.filteredStacks) {
++			if len(tt.want.filteredStacks) == 0 {
++				if len(output) != 0 {
++					t.Errorf("output = %#v, want no matching stacks", output)
++				}
++			} else if !reflect.DeepEqual(output, tt.want.filteredStacks) {
+ 				t.Errorf("output = %#v, want %#v", output, tt.want.filteredStacks)
+ 			}
+ 		})

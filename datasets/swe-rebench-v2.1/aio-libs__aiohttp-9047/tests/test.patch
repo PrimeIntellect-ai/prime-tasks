@@ -1,0 +1,256 @@
+diff --git a/tests/test_connector.py b/tests/test_connector.py
+index 0129f0cc..6144da25 100644
+--- a/tests/test_connector.py
++++ b/tests/test_connector.py
+@@ -10,7 +10,7 @@ import sys
+ import uuid
+ from collections import deque
+ from contextlib import closing, suppress
+-from typing import Any, List, Optional, Type
++from typing import Any, List, Optional
+ from unittest import mock
+ 
+ import pytest
+@@ -23,6 +23,7 @@ from aiohttp.client import ClientRequest, ClientTimeout
+ from aiohttp.client_reqrep import ConnectionKey
+ from aiohttp.connector import Connection, TCPConnector, _DNSCacheTable
+ from aiohttp.locks import EventResultOrError
++from aiohttp.resolver import ThreadedResolver
+ from aiohttp.test_utils import make_mocked_coro, unused_port
+ from aiohttp.tracing import Trace
+ 
+@@ -1540,109 +1541,6 @@ async def test_tcp_connector_clear_dns_cache_bad_args(loop) -> None:
+         conn.clear_dns_cache("localhost")
+ 
+ 
+-async def test_dont_recreate_ssl_context() -> None:
+-    conn = aiohttp.TCPConnector()
+-    ctx = await conn._make_or_get_ssl_context(True)
+-    assert ctx is await conn._make_or_get_ssl_context(True)
+-
+-
+-async def test_dont_recreate_ssl_context2() -> None:
+-    conn = aiohttp.TCPConnector()
+-    ctx = await conn._make_or_get_ssl_context(False)
+-    assert ctx is await conn._make_or_get_ssl_context(False)
+-
+-
+-async def test___get_ssl_context1() -> None:
+-    conn = aiohttp.TCPConnector()
+-    req = mock.Mock()
+-    req.is_ssl.return_value = False
+-    assert await conn._get_ssl_context(req) is None
+-
+-
+-async def test___get_ssl_context2(loop) -> None:
+-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+-    conn = aiohttp.TCPConnector(loop=loop)
+-    req = mock.Mock()
+-    req.is_ssl.return_value = True
+-    req.ssl = ctx
+-    assert await conn._get_ssl_context(req) is ctx
+-
+-
+-async def test___get_ssl_context3(loop) -> None:
+-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+-    conn = aiohttp.TCPConnector(loop=loop, ssl=ctx)
+-    req = mock.Mock()
+-    req.is_ssl.return_value = True
+-    req.ssl = True
+-    assert await conn._get_ssl_context(req) is ctx
+-
+-
+-async def test___get_ssl_context4(loop) -> None:
+-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+-    conn = aiohttp.TCPConnector(loop=loop, ssl=ctx)
+-    req = mock.Mock()
+-    req.is_ssl.return_value = True
+-    req.ssl = False
+-    assert await conn._get_ssl_context(req) is await conn._make_or_get_ssl_context(
+-        False
+-    )
+-
+-
+-async def test___get_ssl_context5(loop) -> None:
+-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+-    conn = aiohttp.TCPConnector(loop=loop, ssl=ctx)
+-    req = mock.Mock()
+-    req.is_ssl.return_value = True
+-    req.ssl = aiohttp.Fingerprint(hashlib.sha256(b"1").digest())
+-    assert await conn._get_ssl_context(req) is await conn._make_or_get_ssl_context(
+-        False
+-    )
+-
+-
+-async def test___get_ssl_context6() -> None:
+-    conn = aiohttp.TCPConnector()
+-    req = mock.Mock()
+-    req.is_ssl.return_value = True
+-    req.ssl = True
+-    assert await conn._get_ssl_context(req) is await conn._make_or_get_ssl_context(True)
+-
+-
+-async def test_ssl_context_once() -> None:
+-    """Test the ssl context is created only once and shared between connectors."""
+-    conn1 = aiohttp.TCPConnector()
+-    conn2 = aiohttp.TCPConnector()
+-    conn3 = aiohttp.TCPConnector()
+-
+-    req = mock.Mock()
+-    req.is_ssl.return_value = True
+-    req.ssl = True
+-    assert await conn1._get_ssl_context(req) is await conn1._make_or_get_ssl_context(
+-        True
+-    )
+-    assert await conn2._get_ssl_context(req) is await conn1._make_or_get_ssl_context(
+-        True
+-    )
+-    assert await conn3._get_ssl_context(req) is await conn1._make_or_get_ssl_context(
+-        True
+-    )
+-    assert conn1._made_ssl_context is conn2._made_ssl_context is conn3._made_ssl_context
+-    assert True in conn1._made_ssl_context
+-
+-
+-@pytest.mark.parametrize("exception", [OSError, ssl.SSLError, asyncio.CancelledError])
+-async def test_ssl_context_creation_raises(exception: Type[BaseException]) -> None:
+-    """Test that we try again if SSLContext creation fails the first time."""
+-    conn = aiohttp.TCPConnector()
+-    conn._made_ssl_context.clear()
+-
+-    with mock.patch.object(
+-        conn, "_make_ssl_context", side_effect=exception
+-    ), pytest.raises(exception):
+-        await conn._make_or_get_ssl_context(True)
+-
+-    assert isinstance(await conn._make_or_get_ssl_context(True), ssl.SSLContext)
+-
+-
+ async def test_close_twice(loop) -> None:
+     proto = mock.Mock()
+ 
+@@ -2477,6 +2375,54 @@ async def test_tcp_connector_do_not_raise_connector_ssl_error(
+     await conn.close()
+ 
+ 
++async def test_client_session_get_with_link_local_resolution(
++    aiohttp_server, loop, monkeypatch
++) -> None:
++    async def handler(request):
++        return web.Response(text="connected")
++
++    app = web.Application()
++    app.router.add_get("/", handler)
++    server = await aiohttp_server(app)
++    port = server.port
++
++    async def getaddrinfo(host, requested_port, **kwargs):
++        assert host == "link-local.example"
++        return [
++            (
++                socket.AF_INET6,
++                socket.SOCK_STREAM,
++                socket.IPPROTO_TCP,
++                "",
++                ("fe80::1", requested_port, 0, 3),
++            ),
++            (
++                socket.AF_INET,
++                socket.SOCK_STREAM,
++                socket.IPPROTO_TCP,
++                "",
++                ("127.0.0.1", requested_port),
++            ),
++        ]
++
++    async def getnameinfo(address, flags):
++        if flags == socket.AI_NUMERICHOST | socket.AI_NUMERICSERV:
++            raise socket.gaierror("invalid flags for getnameinfo")
++        # Route the simulated device to the local test server after the lookup.
++        return "127.0.0.1", str(port)
++
++    monkeypatch.setattr(loop, "getaddrinfo", getaddrinfo)
++    monkeypatch.setattr(loop, "getnameinfo", getnameinfo)
++    connector = aiohttp.TCPConnector(
++        resolver=ThreadedResolver(loop=loop),
++        use_dns_cache=False,
++    )
++    async with aiohttp.ClientSession(connector=connector) as session:
++        async with session.get(f"http://link-local.example:{port}/") as response:
++            assert response.status == 200
++            assert await response.text() == "connected"
++
++
+ async def test_tcp_connector_uses_provided_local_addr(aiohttp_server) -> None:
+     async def handler(request):
+         return web.Response()
+diff --git a/tests/test_proxy.py b/tests/test_proxy.py
+index c5e98deb..5335751a 100644
+--- a/tests/test_proxy.py
++++ b/tests/test_proxy.py
+@@ -817,7 +817,7 @@ class TestProxy(unittest.TestCase):
+         self.loop.start_tls.assert_called_with(
+             mock.ANY,
+             mock.ANY,
+-            self.loop.run_until_complete(connector._make_or_get_ssl_context(True)),
++            mock.ANY,
+             server_hostname="www.python.org",
+             ssl_handshake_timeout=mock.ANY,
+         )
+diff --git a/tests/test_resolver.py b/tests/test_resolver.py
+index 825db81e..0ca4f3d9 100644
+--- a/tests/test_resolver.py
++++ b/tests/test_resolver.py
+@@ -8,7 +8,6 @@ from unittest.mock import Mock, patch
+ import pytest
+ 
+ from aiohttp.resolver import (
+-    _NUMERIC_SOCKET_FLAGS,
+     AsyncResolver,
+     DefaultResolver,
+     ThreadedResolver,
+@@ -110,7 +109,9 @@ def fake_ipv6_addrinfo(hosts: Collection[str]) -> Callable[..., Awaitable[Any]]:
+ 
+ 
+ def fake_ipv6_nameinfo(host: str) -> Callable[..., Awaitable[Any]]:
+-    async def fake(*args: Any, **kwargs: Any) -> Tuple[str, int]:
++    async def fake(address: Any, flags: int) -> Tuple[str, int]:
++        if flags == socket.AI_NUMERICHOST | socket.AI_NUMERICSERV:
++            raise socket.gaierror("invalid flags for getnameinfo")
+         return host, 0
+ 
+     return fake
+@@ -140,9 +141,12 @@ async def test_async_resolver_positive_link_local_ipv6_lookup(loop: Any) -> None
+         mock().getaddrinfo.return_value = fake_aiodns_getaddrinfo_ipv6_result(
+             ["fe80::1"]
+         )
+-        mock().getnameinfo.return_value = fake_aiodns_getnameinfo_ipv6_result(
+-            "fe80::1%eth0"
+-        )
++        async def getnameinfo(address, flags):
++            if flags == socket.AI_NUMERICHOST | socket.AI_NUMERICSERV:
++                raise socket.gaierror("invalid flags for getnameinfo")
++            return await fake_aiodns_getnameinfo_ipv6_result("fe80::1%eth0")
++
++        mock().getnameinfo.side_effect = getnameinfo
+         resolver = AsyncResolver()
+         real = await resolver.resolve("www.python.org")
+         ipaddress.ip_address(real[0]["host"])
+@@ -153,9 +157,6 @@ async def test_async_resolver_positive_link_local_ipv6_lookup(loop: Any) -> None
+             port=0,
+             type=socket.SOCK_STREAM,
+         )
+-        mock().getnameinfo.assert_called_with(
+-            ("fe80::1", 0, 0, 3), _NUMERIC_SOCKET_FLAGS
+-        )
+ 
+ 
+ @pytest.mark.skipif(not getaddrinfo, reason="aiodns >=3.2.0 required")
+@@ -211,6 +212,7 @@ async def test_threaded_resolver_positive_ipv6_link_local_lookup() -> None:
+     loop = Mock()
+     loop.getaddrinfo = fake_ipv6_addrinfo(["fe80::1"])
+     loop.getnameinfo = fake_ipv6_nameinfo("fe80::1%eth0")
++
+     resolver = ThreadedResolver()
+     resolver._loop = loop
+     real = await resolver.resolve("www.python.org")

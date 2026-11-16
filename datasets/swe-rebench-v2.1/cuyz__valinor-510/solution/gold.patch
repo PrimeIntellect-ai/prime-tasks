@@ -1,0 +1,570 @@
+diff --git a/docs/pages/usage/type-reference.md b/docs/pages/usage/type-reference.md
+index 5a6752e..2fb54fe 100644
+--- a/docs/pages/usage/type-reference.md
++++ b/docs/pages/usage/type-reference.md
+@@ -134,6 +134,15 @@ final class SomeClass
+ 
+         /** @var array{string, bar: int} */
+         private array $shapedArrayWithUndefinedKey,
++
++        /** @var array{foo: string, ...} */
++        private array $unsealedShapedArray,
++        
++        /** @var array{foo: string, ...array<string>} */
++        private array $unsealedShapedArrayWithExplicitType,
++        
++        /** @var array{foo: string, ...array<int, string>} */
++        private array $unsealedShapedArrayWithExplicitKeyAndType,
+     ) {}
+ }
+ ```
+diff --git a/qa/PHPStan/Extension/TreeMapperPHPStanExtension.php b/qa/PHPStan/Extension/TreeMapperPHPStanExtension.php
+index ac447d9..2b2f734 100644
+--- a/qa/PHPStan/Extension/TreeMapperPHPStanExtension.php
++++ b/qa/PHPStan/Extension/TreeMapperPHPStanExtension.php
+@@ -8,6 +8,7 @@ use CuyZ\Valinor\Mapper\TreeMapper;
+ use PhpParser\Node\Expr\MethodCall;
+ use PHPStan\Analyser\Scope;
+ use PHPStan\PhpDoc\TypeStringResolver;
++use PHPStan\PhpDocParser\Parser\ParserException;
+ use PHPStan\Reflection\MethodReflection;
+ use PHPStan\Type\ClassStringType;
+ use PHPStan\Type\Constant\ConstantStringType;
+@@ -46,7 +47,15 @@ final class TreeMapperPHPStanExtension implements DynamicMethodReturnTypeExtensi
+             return $type->traverse(fn (Type $type) => $this->type($type));
+         }
+ 
+-        return $this->type($type);
++        try {
++            return $this->type($type);
++        } catch (ParserException) {
++            // Fallback to `mixed` type if the type cannot be resolved. This can
++            // occur with a type that is not understood/supported by PHPStan. If
++            // that happens, returning a mixed type is the safest option, as it
++            // will not make the analysis fail.
++            return new MixedType();
++        }
+     }
+ 
+     private function type(Type $type): Type
+diff --git a/src/Definition/Repository/Cache/Compiler/TypeCompiler.php b/src/Definition/Repository/Cache/Compiler/TypeCompiler.php
+index b633a30..adebebd 100644
+--- a/src/Definition/Repository/Cache/Compiler/TypeCompiler.php
++++ b/src/Definition/Repository/Cache/Compiler/TypeCompiler.php
+@@ -97,13 +97,20 @@ final class TypeCompiler
+                     default => "$class::default()",
+                 };
+             case $type instanceof ShapedArrayType:
+-                $shapes = array_map(
++                $elements = implode(', ', array_map(
+                     fn (ShapedArrayElement $element) => $this->compileArrayShapeElement($element),
+                     $type->elements()
+-                );
+-                $shapes = implode(', ', $shapes);
++                ));
++
++                if ($type->hasUnsealedType()) {
++                    $unsealedType = $this->compile($type->unsealedType());
++
++                    return "$class::unsealed($unsealedType, $elements)";
++                } elseif ($type->isUnsealed()) {
++                    return "$class::unsealedWithoutType($elements)";
++                }
+ 
+-                return "new $class(...[$shapes])";
++                return "new $class($elements)";
+             case $type instanceof ArrayType:
+             case $type instanceof NonEmptyArrayType:
+                 if ($type->toString() === 'array' || $type->toString() === 'non-empty-array') {
+diff --git a/src/Mapper/Tree/Builder/ShapedArrayNodeBuilder.php b/src/Mapper/Tree/Builder/ShapedArrayNodeBuilder.php
+index 492d74a..6dc633f 100644
+--- a/src/Mapper/Tree/Builder/ShapedArrayNodeBuilder.php
++++ b/src/Mapper/Tree/Builder/ShapedArrayNodeBuilder.php
+@@ -69,6 +69,15 @@ final class ShapedArrayNodeBuilder implements NodeBuilder
+             unset($value[$key]);
+         }
+ 
++        if ($type->isUnsealed()) {
++            $unsealedShell = $shell->withType($type->unsealedType())->withValue($value);
++            $unsealedChildren = $rootBuilder->build($unsealedShell)->children();
++
++            foreach ($unsealedChildren as $unsealedChild) {
++                $children[$unsealedChild->name()] = $unsealedChild;
++            }
++        }
++
+         return $children;
+     }
+ 
+diff --git a/src/Type/Parser/Exception/Iterable/ShapedArrayClosingBracketMissing.php b/src/Type/Parser/Exception/Iterable/ShapedArrayClosingBracketMissing.php
+index b6bf3bc..9ee0385 100644
+--- a/src/Type/Parser/Exception/Iterable/ShapedArrayClosingBracketMissing.php
++++ b/src/Type/Parser/Exception/Iterable/ShapedArrayClosingBracketMissing.php
+@@ -5,6 +5,7 @@ declare(strict_types=1);
+ namespace CuyZ\Valinor\Type\Parser\Exception\Iterable;
+ 
+ use CuyZ\Valinor\Type\Parser\Exception\InvalidType;
++use CuyZ\Valinor\Type\Type;
+ use CuyZ\Valinor\Type\Types\ShapedArrayElement;
+ use RuntimeException;
+ 
+@@ -16,10 +17,16 @@ final class ShapedArrayClosingBracketMissing extends RuntimeException implements
+     /**
+      * @param ShapedArrayElement[] $elements
+      */
+-    public function __construct(array $elements)
++    public function __construct(array $elements, Type|null|false $unsealedType = null)
+     {
+         $signature = 'array{' . implode(', ', array_map(fn (ShapedArrayElement $element) => $element->toString(), $elements));
+ 
++        if ($unsealedType === false) {
++            $signature .= ', ...';
++        } elseif ($unsealedType instanceof Type) {
++            $signature .= ', ...' . $unsealedType->toString();
++        }
++
+         parent::__construct(
+             "Missing closing curly bracket in shaped array signature `$signature`.",
+             1631283658
+diff --git a/src/Type/Parser/Exception/Iterable/ShapedArrayInvalidUnsealedType.php b/src/Type/Parser/Exception/Iterable/ShapedArrayInvalidUnsealedType.php
+new file mode 100644
+index 0000000..cef92e2
+--- /dev/null
++++ b/src/Type/Parser/Exception/Iterable/ShapedArrayInvalidUnsealedType.php
+@@ -0,0 +1,32 @@
++<?php
++
++declare(strict_types=1);
++
++namespace CuyZ\Valinor\Type\Parser\Exception\Iterable;
++
++use CuyZ\Valinor\Type\Parser\Exception\InvalidType;
++use CuyZ\Valinor\Type\Type;
++use CuyZ\Valinor\Type\Types\ShapedArrayElement;
++use RuntimeException;
++
++use function implode;
++
++/** @internal */
++final class ShapedArrayInvalidUnsealedType extends RuntimeException implements InvalidType
++{
++    /**
++     * @param ShapedArrayElement[] $elements
++     */
++    public function __construct(array $elements, Type $unsealedType)
++    {
++        $signature = 'array{';
++        $signature .= implode(', ', array_map(fn (ShapedArrayElement $element) => $element->toString(), $elements));
++        $signature .= ', ...' . $unsealedType->toString();
++        $signature .= '}';
++
++        parent::__construct(
++            "Invalid unsealed type `{$unsealedType->toString()}` in shaped array signature `$signature`, it should be a valid array.",
++            1711618899,
++        );
++    }
++}
+diff --git a/src/Type/Parser/Exception/Iterable/ShapedArrayUnexpectedTokenAfterSealedType.php b/src/Type/Parser/Exception/Iterable/ShapedArrayUnexpectedTokenAfterSealedType.php
+new file mode 100644
+index 0000000..15be028
+--- /dev/null
++++ b/src/Type/Parser/Exception/Iterable/ShapedArrayUnexpectedTokenAfterSealedType.php
+@@ -0,0 +1,36 @@
++<?php
++
++declare(strict_types=1);
++
++namespace CuyZ\Valinor\Type\Parser\Exception\Iterable;
++
++use CuyZ\Valinor\Type\Parser\Exception\InvalidType;
++use CuyZ\Valinor\Type\Parser\Lexer\Token\Token;
++use CuyZ\Valinor\Type\Type;
++use CuyZ\Valinor\Type\Types\ShapedArrayElement;
++use RuntimeException;
++
++use function implode;
++
++/** @internal */
++final class ShapedArrayUnexpectedTokenAfterSealedType extends RuntimeException implements InvalidType
++{
++    /**
++     * @param array<ShapedArrayElement> $elements
++     * @param list<Token> $unexpectedTokens
++     */
++    public function __construct(array $elements, Type $unsealedType, array $unexpectedTokens)
++    {
++        $unexpected = implode('', array_map(fn (Token $token) => $token->symbol(), $unexpectedTokens));
++
++        $signature = 'array{';
++        $signature .= implode(', ', array_map(fn (ShapedArrayElement $element) => $element->toString(), $elements));
++        $signature .= ', ...' . $unsealedType->toString();
++        $signature .= $unexpected;
++
++        parent::__construct(
++            "Unexpected `$unexpected` after sealed type in shaped array signature `$signature`, expected a `}`.",
++            1711618958,
++        );
++    }
++}
+diff --git a/src/Type/Parser/Exception/Iterable/ShapedArrayWithoutElementsWithSealedType.php b/src/Type/Parser/Exception/Iterable/ShapedArrayWithoutElementsWithSealedType.php
+new file mode 100644
+index 0000000..578f00c
+--- /dev/null
++++ b/src/Type/Parser/Exception/Iterable/ShapedArrayWithoutElementsWithSealedType.php
+@@ -0,0 +1,23 @@
++<?php
++
++declare(strict_types=1);
++
++namespace CuyZ\Valinor\Type\Parser\Exception\Iterable;
++
++use CuyZ\Valinor\Type\Parser\Exception\InvalidType;
++use CuyZ\Valinor\Type\Type;
++use RuntimeException;
++
++/** @internal */
++final class ShapedArrayWithoutElementsWithSealedType extends RuntimeException implements InvalidType
++{
++    public function __construct(Type $unsealedType)
++    {
++        $signature = "array{...{$unsealedType->toString()}}";
++
++        parent::__construct(
++            "Missing elements in shaped array signature `$signature`.",
++            1711629845,
++        );
++    }
++}
+diff --git a/src/Type/Parser/Lexer/NativeLexer.php b/src/Type/Parser/Lexer/NativeLexer.php
+index 3f8340a..5040df1 100644
+--- a/src/Type/Parser/Lexer/NativeLexer.php
++++ b/src/Type/Parser/Lexer/NativeLexer.php
+@@ -26,6 +26,7 @@ use CuyZ\Valinor\Type\Parser\Lexer\Token\OpeningCurlyBracketToken;
+ use CuyZ\Valinor\Type\Parser\Lexer\Token\OpeningSquareBracketToken;
+ use CuyZ\Valinor\Type\Parser\Lexer\Token\QuoteToken;
+ use CuyZ\Valinor\Type\Parser\Lexer\Token\Token;
++use CuyZ\Valinor\Type\Parser\Lexer\Token\TripleDotsToken;
+ use CuyZ\Valinor\Type\Parser\Lexer\Token\UnionToken;
+ 
+ use function filter_var;
+@@ -56,6 +57,7 @@ final class NativeLexer implements TypeLexer
+             ':' => ColonToken::get(),
+             '?' => NullableToken::get(),
+             ',' => CommaToken::get(),
++            '...' => TripleDotsToken::get(),
+             '"', "'" => new QuoteToken($symbol),
+             'int', 'integer' => IntegerToken::get(),
+             'array' => ArrayToken::array(),
+diff --git a/src/Type/Parser/Lexer/Token/ArrayToken.php b/src/Type/Parser/Lexer/Token/ArrayToken.php
+index 8d1563f..4bd8846 100644
+--- a/src/Type/Parser/Lexer/Token/ArrayToken.php
++++ b/src/Type/Parser/Lexer/Token/ArrayToken.php
+@@ -12,6 +12,9 @@ use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayColonTokenMissing;
+ use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayCommaMissing;
+ use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayElementTypeMissing;
+ use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayEmptyElements;
++use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayInvalidUnsealedType;
++use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayUnexpectedTokenAfterSealedType;
++use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayWithoutElementsWithSealedType;
+ use CuyZ\Valinor\Type\Parser\Lexer\TokenStream;
+ use CuyZ\Valinor\Type\Type;
+ use CuyZ\Valinor\Type\Types\ArrayKeyType;
+@@ -99,6 +102,8 @@ final class ArrayToken implements TraversingToken
+ 
+         $elements = [];
+         $index = 0;
++        $isUnsealed = false;
++        $unsealedType = null;
+ 
+         while (! $stream->done()) {
+             if ($stream->next() instanceof ClosingCurlyBracketToken) {
+@@ -121,12 +126,50 @@ final class ArrayToken implements TraversingToken
+ 
+             $optional = false;
+ 
++            if ($stream->next() instanceof TripleDotsToken) {
++                $isUnsealed = true;
++                $stream->forward();
++            }
++
++            if ($stream->done()) {
++                throw new ShapedArrayClosingBracketMissing($elements, unsealedType: false);
++            }
++
+             if ($stream->next() instanceof UnknownSymbolToken) {
+                 $type = new StringValueType($stream->forward()->symbol());
++            } elseif ($isUnsealed && $stream->next() instanceof ClosingCurlyBracketToken) {
++                $stream->forward();
++                break;
+             } else {
+                 $type = $stream->read();
+             }
+ 
++            if ($isUnsealed) {
++                $unsealedType = $type;
++
++                if ($elements === []) {
++                    throw new ShapedArrayWithoutElementsWithSealedType($unsealedType);
++                }
++
++                if (! $unsealedType instanceof ArrayType) {
++                    throw new ShapedArrayInvalidUnsealedType($elements, $unsealedType);
++                }
++
++                if ($stream->done()) {
++                    throw new ShapedArrayClosingBracketMissing($elements, $unsealedType);
++                } elseif (! $stream->next() instanceof ClosingCurlyBracketToken) {
++                    $unexpected = [];
++
++                    while (! $stream->done() && ! $stream->next() instanceof ClosingCurlyBracketToken) {
++                        $unexpected[] = $stream->forward();
++                    }
++
++                    throw new ShapedArrayUnexpectedTokenAfterSealedType($elements, $unsealedType, $unexpected);
++                }
++
++                continue;
++            }
++
+             if ($stream->done()) {
+                 $elements[] = new ShapedArrayElement(new IntegerValueType($index), $type);
+ 
+@@ -178,10 +221,16 @@ final class ArrayToken implements TraversingToken
+             }
+         }
+ 
+-        if (empty($elements)) {
++        if ($elements === []) {
+             throw new ShapedArrayEmptyElements();
+         }
+ 
++        if ($unsealedType) {
++            return ShapedArrayType::unsealed($unsealedType, ...$elements);
++        } elseif ($isUnsealed) {
++            return ShapedArrayType::unsealedWithoutType(...$elements);
++        }
++
+         return new ShapedArrayType(...$elements);
+     }
+ }
+diff --git a/src/Type/Parser/Lexer/Token/TripleDotsToken.php b/src/Type/Parser/Lexer/Token/TripleDotsToken.php
+new file mode 100644
+index 0000000..a800bba
+--- /dev/null
++++ b/src/Type/Parser/Lexer/Token/TripleDotsToken.php
+@@ -0,0 +1,18 @@
++<?php
++
++declare(strict_types=1);
++
++namespace CuyZ\Valinor\Type\Parser\Lexer\Token;
++
++use CuyZ\Valinor\Utility\IsSingleton;
++
++/** @internal */
++final class TripleDotsToken implements Token
++{
++    use IsSingleton;
++
++    public function symbol(): string
++    {
++        return '...';
++    }
++}
+diff --git a/src/Type/Types/ArrayKeyType.php b/src/Type/Types/ArrayKeyType.php
+index 3adc944..931f062 100644
+--- a/src/Type/Types/ArrayKeyType.php
++++ b/src/Type/Types/ArrayKeyType.php
+@@ -66,7 +66,7 @@ final class ArrayKeyType implements ScalarType
+         return self::$string ??= new self(NativeStringType::get());
+     }
+ 
+-    public static function from(Type $type): ?self
++    public static function from(Type $type): self
+     {
+         return match (true) {
+             $type instanceof self => $type,
+diff --git a/src/Type/Types/ShapedArrayType.php b/src/Type/Types/ShapedArrayType.php
+index 4238cdb..e94cd09 100644
+--- a/src/Type/Types/ShapedArrayType.php
++++ b/src/Type/Types/ShapedArrayType.php
+@@ -9,10 +9,9 @@ use CuyZ\Valinor\Type\CompositeType;
+ use CuyZ\Valinor\Type\Parser\Exception\Iterable\ShapedArrayElementDuplicatedKey;
+ use CuyZ\Valinor\Type\Type;
+ 
+-use function array_diff;
+ use function array_key_exists;
+-use function array_keys;
+ use function array_map;
++use function assert;
+ use function count;
+ use function implode;
+ use function in_array;
+@@ -24,15 +23,13 @@ final class ShapedArrayType implements CompositeType
+     /** @var ShapedArrayElement[] */
+     private array $elements;
+ 
+-    private string $signature;
++    private bool $isUnsealed = false;
++
++    private ?ArrayType $unsealedType = null;
+ 
+     public function __construct(ShapedArrayElement ...$elements)
+     {
+         $this->elements = $elements;
+-        $this->signature =
+-            'array{' .
+-            implode(', ', array_map(fn (ShapedArrayElement $element) => $element->toString(), $elements))
+-            . '}';
+ 
+         $keys = [];
+ 
+@@ -40,24 +37,56 @@ final class ShapedArrayType implements CompositeType
+             $key = $element->key()->value();
+ 
+             if (in_array($key, $keys, true)) {
+-                throw new ShapedArrayElementDuplicatedKey((string)$key, $this->signature);
++                throw new ShapedArrayElementDuplicatedKey((string)$key, $this->toString());
+             }
+ 
+             $keys[] = $key;
+         }
+     }
+ 
++    public static function unsealed(ArrayType $unsealedType, ShapedArrayElement ...$elements): self
++    {
++        $self = new self(...$elements);
++        $self->isUnsealed = true;
++        $self->unsealedType = $unsealedType;
++
++        return $self;
++    }
++
++    public static function unsealedWithoutType(ShapedArrayElement ...$elements): self
++    {
++        $self = new self(...$elements);
++        $self->isUnsealed = true;
++
++        return $self;
++    }
++
++    public function isUnsealed(): bool
++    {
++        return $this->isUnsealed;
++    }
++
++    public function hasUnsealedType(): bool
++    {
++        return $this->unsealedType !== null;
++    }
++
++    public function unsealedType(): ArrayType
++    {
++        assert($this->isUnsealed);
++
++        return $this->unsealedType ?? ArrayType::native();
++    }
++
+     public function accepts(mixed $value): bool
+     {
+         if (! is_array($value)) {
+             return false;
+         }
+ 
+-        $keys = [];
+-
+         foreach ($this->elements as $shape) {
+             $type = $shape->type();
+-            $keys[] = $key = $shape->key()->value();
++            $key = $shape->key()->value();
+             $valueExists = array_key_exists($key, $value);
+ 
+             if (! $valueExists && ! $shape->isOptional()) {
+@@ -67,11 +96,15 @@ final class ShapedArrayType implements CompositeType
+             if ($valueExists && ! $type->accepts($value[$key])) {
+                 return false;
+             }
++
++            unset($value[$key]);
+         }
+ 
+-        $excess = array_diff(array_keys($value), $keys);
++        if ($this->isUnsealed) {
++            return $this->unsealedType()->accepts($value);
++        }
+ 
+-        return count($excess) === 0;
++        return count($value) === 0;
+     }
+ 
+     public function matches(Type $other): bool
+@@ -98,6 +131,10 @@ final class ShapedArrayType implements CompositeType
+                 }
+             }
+ 
++            if ($this->isUnsealed && ! $this->unsealedType()->matches($other)) {
++                return false;
++            }
++
+             return true;
+         }
+ 
+@@ -107,11 +144,9 @@ final class ShapedArrayType implements CompositeType
+ 
+         foreach ($this->elements as $element) {
+             foreach ($other->elements as $otherElement) {
+-                if ($element->key()->matches($otherElement->key())) {
+-                    if (! $element->type()->matches($otherElement->type())) {
+-                        return false;
+-                    }
+-
++                if ($element->key()->matches($otherElement->key())
++                    && $element->type()->matches($otherElement->type())
++                ) {
+                     continue 2;
+                 }
+             }
+@@ -121,6 +156,11 @@ final class ShapedArrayType implements CompositeType
+             }
+         }
+ 
++        if ($other->isUnsealed) {
++            return $this->isUnsealed
++                && $this->unsealedType()->matches($other->unsealedType());
++        }
++
+         return true;
+     }
+ 
+@@ -136,6 +176,10 @@ final class ShapedArrayType implements CompositeType
+             }
+         }
+ 
++        if ($this->isUnsealed) {
++            $types = [...$types, $this->unsealedType(), ...$this->unsealedType()->traverse()];
++        }
++
+         return $types;
+     }
+ 
+@@ -149,6 +193,19 @@ final class ShapedArrayType implements CompositeType
+ 
+     public function toString(): string
+     {
+-        return $this->signature;
++        $signature = 'array{';
++        $signature .= implode(', ', array_map(fn (ShapedArrayElement $element) => $element->toString(), $this->elements));
++
++        if ($this->isUnsealed) {
++            $signature .= ', ...';
++
++            if ($this->unsealedType) {
++                $signature .= $this->unsealedType->toString();
++            }
++        }
++
++        $signature .= '}';
++
++        return $signature;
+     }
+ }

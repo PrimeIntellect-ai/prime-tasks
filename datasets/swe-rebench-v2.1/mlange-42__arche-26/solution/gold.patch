@@ -1,0 +1,235 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 30d0d39..55cbc06 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ ### Other
+ 
+ * Use aligned item size in component storage, for approx. 20% faster query iteration (#25)
++* Queries lock the World, and automatically unlock it after iteration (#26)
+ 
+ ## [[v0.1.1]](https://github.com/mlange-42/arche/compare/v0.1.0...v0.1.1)
+ 
+diff --git a/ecs/bit_pool.go b/ecs/bit_pool.go
+new file mode 100644
+index 0000000..5152ace
+--- /dev/null
++++ b/ecs/bit_pool.go
+@@ -0,0 +1,43 @@
++package ecs
++
++// newEntityPool creates a new, initialized bit pool
++func newBitPool() bitPool {
++	return bitPool{
++		bits:      [MaskTotalBits]uint8{},
++		next:      0,
++		length:    0,
++		available: 0,
++	}
++}
++
++// bitPool is an entityPool implementation using implicit linked lists.
++// Implements https://skypjack.github.io/2019-05-06-ecs-baf-part-3/
++type bitPool struct {
++	bits      [MaskTotalBits]uint8
++	next      uint8
++	length    uint8
++	available uint8
++}
++
++// Get returns a fresh or recycled bit
++func (p *bitPool) Get() uint8 {
++	if p.available == 0 {
++		if p.length >= MaskTotalBits {
++			panic("run out of the maximum of 64 bits")
++		}
++		b := p.length
++		p.bits[p.length] = b
++		p.length++
++		return b
++	}
++	curr := p.next
++	p.next, p.bits[p.next] = p.bits[p.next], p.next
++	p.available--
++	return p.bits[curr]
++}
++
++// Recycle hands a bit back for recycling
++func (p *bitPool) Recycle(b uint8) {
++	p.next, p.bits[b] = b, p.next
++	p.available++
++}
+diff --git a/ecs/entity_pool.go b/ecs/entity_pool.go
+index 1bd3f51..03b33a0 100644
+--- a/ecs/entity_pool.go
++++ b/ecs/entity_pool.go
+@@ -2,7 +2,7 @@ package ecs
+ 
+ import "math"
+ 
+-// newEntityPool creates a new, initialized EntityPool
++// newEntityPool creates a new, initialized Entity pool
+ func newEntityPool() entityPool {
+ 	return entityPool{
+ 		entities:  []Entity{{0, math.MaxUint16}},
+@@ -11,7 +11,7 @@ func newEntityPool() entityPool {
+ 	}
+ }
+ 
+-// entityPool is an entityPool implementation using implicit linked lists.
++// entityPool is an implementation using implicit linked lists.
+ // Implements https://skypjack.github.io/2019-05-06-ecs-baf-part-3/
+ type entityPool struct {
+ 	entities  []Entity
+diff --git a/ecs/query.go b/ecs/query.go
+index bb31a37..b7972d9 100644
+--- a/ecs/query.go
++++ b/ecs/query.go
+@@ -6,17 +6,21 @@ import (
+ 
+ // Query is an iterator to iterate entities
+ type Query struct {
++	world      *World
+ 	archetypes []archetypeIter
+ 	index      int
+ 	done       bool
++	lockBit    uint8
+ }
+ 
+ // newQuery creates a new QueryIter
+-func newQuery(arches []archetypeIter) Query {
++func newQuery(world *World, arches []archetypeIter, lockBit uint8) Query {
+ 	return Query{
++		world:      world,
+ 		archetypes: arches,
+ 		index:      0,
+ 		done:       false,
++		lockBit:    lockBit,
+ 	}
+ }
+ 
+@@ -32,6 +36,7 @@ func (q *Query) Next() bool {
+ 		q.index++
+ 		if q.index >= len(q.archetypes) {
+ 			q.done = true
++			q.world.closeQuery(q)
+ 			return false
+ 		}
+ 	}
+@@ -61,6 +66,15 @@ func (q *Query) Entity() Entity {
+ 	return q.archetypes[q.index].Entity()
+ }
+ 
++// Close closes the query and unlocks the world.
++//
++// Automatically called when iteration finishes.
++// Needs to be called only if breaking out of the query iteration.
++func (q *Query) Close() {
++	q.done = true
++	q.world.closeQuery(q)
++}
++
+ type archetypeIter struct {
+ 	Archetype *archetype
+ 	Length    int
+diff --git a/ecs/world.go b/ecs/world.go
+index bfcd214..1007fa2 100644
+--- a/ecs/world.go
++++ b/ecs/world.go
+@@ -11,8 +11,10 @@ func NewWorld() World {
+ 	return World{
+ 		entities:   []entityIndex{{-1, 0}},
+ 		entityPool: newEntityPool(),
++		bitPool:    newBitPool(),
+ 		registry:   newComponentRegistry(),
+ 		archetypes: []archetype{newArchetype()},
++		locks:      Mask(0),
+ 	}
+ }
+ 
+@@ -21,13 +23,17 @@ type World struct {
+ 	entities   []entityIndex
+ 	archetypes []archetype
+ 	entityPool entityPool
++	bitPool    bitPool
+ 	registry   componentRegistry
++	locks      Mask
+ }
+ 
+ // NewEntity creates a new or recycled entity.
+ //
+ // Do not use during Query iteration!
+ func (w *World) NewEntity() Entity {
++	w.checkLocked()
++
+ 	entity := w.entityPool.Get()
+ 	idx := w.archetypes[0].Add(entity)
+ 	if int(entity.id) == len(w.entities) {
+@@ -42,6 +48,8 @@ func (w *World) NewEntity() Entity {
+ //
+ // Do not use during Query iteration!
+ func (w *World) RemEntity(entity Entity) {
++	w.checkLocked()
++
+ 	index := w.entities[entity.id]
+ 	oldArch := &w.archetypes[index.arch]
+ 	swapped := oldArch.Remove(int(index.index))
+@@ -79,6 +87,8 @@ func (w *World) Has(entity Entity, comp ID) bool {
+ //
+ // Do not use during Query iteration!
+ func (w *World) Add(entity Entity, comps ...ID) {
++	w.checkLocked()
++
+ 	if len(comps) == 0 {
+ 		return
+ 	}
+@@ -123,6 +133,8 @@ func (w *World) Add(entity Entity, comps ...ID) {
+ //
+ // Do not use during Query iteration!
+ func (w *World) Remove(entity Entity, comps ...ID) {
++	w.checkLocked()
++
+ 	if len(comps) == 0 {
+ 		return
+ 	}
+@@ -196,6 +208,8 @@ func (w *World) ComponentID(tp reflect.Type) ID {
+ }
+ 
+ // Query creates a query iterator for the given components
++//
++// Locks the world to prevent changes to component compositions
+ func (w *World) Query(comps ...ID) Query {
+ 	mask := NewMask(comps...)
+ 	arches := []archetypeIter{}
+@@ -206,7 +220,30 @@ func (w *World) Query(comps ...ID) Query {
+ 			arches = append(arches, newArchetypeIter(arch))
+ 		}
+ 	}
+-	return newQuery(arches)
++	lock := w.bitPool.Get()
++	w.locks.Set(ID(lock), true)
++	return newQuery(w, arches, lock)
++}
++
++// closeQuery closes a query and unlocks the world
++func (w *World) closeQuery(query *Query) {
++	l := query.lockBit
++	if !w.locks.Get(ID(l)) {
++		panic("unbalanced query unlock")
++	}
++	w.locks.Set(ID(l), false)
++	w.bitPool.Recycle(l)
++}
++
++// IsLocked returns whether the world is locked by any queries
++func (w *World) IsLocked() bool {
++	return w.locks != 0
++}
++
++func (w *World) checkLocked() {
++	if w.locks != 0 {
++		panic("attempt to modify a locked world")
++	}
+ }
+ 
+ // ComponentID provides a way to get a component's ID via generics

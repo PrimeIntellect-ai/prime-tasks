@@ -1,0 +1,358 @@
+diff --git a/pkg/compute/kube/client_test.go b/pkg/compute/kube/client_test.go
+index f6674ed5..8edc96e1 100644
+--- a/pkg/compute/kube/client_test.go
++++ b/pkg/compute/kube/client_test.go
+@@ -1,9 +1,13 @@
+ package kube
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"fmt"
++	"io"
+ 	"net"
++	"os"
++	"syscall"
+ 	"testing"
+ 	"time"
+ 
+@@ -23,6 +27,8 @@ import (
+ 	. "github.com/onsi/ginkgo"
+ 	. "github.com/onsi/gomega"
+ 
++	xds_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++
+ 	configv1alpha2 "github.com/openservicemesh/osm/pkg/apis/config/v1alpha2"
+ 	policyv1alpha1 "github.com/openservicemesh/osm/pkg/apis/policy/v1alpha1"
+ 
+@@ -30,11 +36,13 @@ import (
+ 
+ 	"github.com/openservicemesh/osm/pkg/constants"
+ 	"github.com/openservicemesh/osm/pkg/endpoint"
++	"github.com/openservicemesh/osm/pkg/envoy/generator/lds"
+ 	"github.com/openservicemesh/osm/pkg/identity"
+ 	"github.com/openservicemesh/osm/pkg/k8s"
+ 	"github.com/openservicemesh/osm/pkg/messaging"
+ 	"github.com/openservicemesh/osm/pkg/service"
+ 	"github.com/openservicemesh/osm/pkg/tests"
++	"github.com/openservicemesh/osm/pkg/trafficpolicy"
+ )
+ 
+ var (
+@@ -438,7 +446,11 @@ func TestGetServicesForServiceIdentity(t *testing.T) {
+ 						Selector: map[string]string{
+ 							"k1": "v1", // matches labels on pod ns1/p1
+ 						},
+-						Ports: []corev1.ServicePort{{}},
++						Ports: []corev1.ServicePort{
++							{
++								Protocol: corev1.ProtocolTCP,
++							},
++						},
+ 					},
+ 				},
+ 				{
+@@ -960,7 +972,11 @@ func TestListServicesForProxy(t *testing.T) {
+ 						Selector: map[string]string{
+ 							"k1": "v1",
+ 						},
+-						Ports: []corev1.ServicePort{{}},
++						Ports: []corev1.ServicePort{
++							{
++								Protocol: corev1.ProtocolTCP,
++							},
++						},
+ 					},
+ 				},
+ 				{
+@@ -972,7 +988,11 @@ func TestListServicesForProxy(t *testing.T) {
+ 						Selector: map[string]string{
+ 							"k2": "v2", // does not match labels on pod ns1/p1
+ 						},
+-						Ports: []corev1.ServicePort{{}},
++						Ports: []corev1.ServicePort{
++							{
++								Protocol: corev1.ProtocolTCP,
++							},
++						},
+ 					},
+ 				},
+ 			},
+@@ -2197,7 +2217,7 @@ func TestListServiceIdentitiesForService(t *testing.T) {
+ 	}
+ }
+ 
+-func TestK8sServicesToMeshServices(t *testing.T) {
++func TestServiceToMeshServices(t *testing.T) {
+ 	testCases := []struct {
+ 		name         string
+ 		svc          corev1.Service
+@@ -2208,7 +2228,7 @@ func TestK8sServicesToMeshServices(t *testing.T) {
+ 			name: "k8s service with single port and endpoint, no appProtocol set",
+ 			// Single port on the service maps to a single MeshService.
+ 			// Since no appProtocol is specified, MeshService.Protocol should default
+-			// to http.
++			// to http since Port.Protocol=TCP.
+ 			svc: corev1.Service{
+ 				ObjectMeta: metav1.ObjectMeta{
+ 					Namespace: "ns1",
+@@ -2217,8 +2237,9 @@ func TestK8sServicesToMeshServices(t *testing.T) {
+ 				Spec: corev1.ServiceSpec{
+ 					Ports: []corev1.ServicePort{
+ 						{
+-							Name: "p1",
+-							Port: 80,
++							Name:     "p1",
++							Port:     80,
++							Protocol: corev1.ProtocolTCP,
+ 						},
+ 					},
+ 					ClusterIP: "10.0.0.1",
+@@ -2306,7 +2327,7 @@ func TestK8sServicesToMeshServices(t *testing.T) {
+ 			name: "k8s headless service with single port and endpoint, no appProtocol set",
+ 			// Single port on the service maps to a single MeshService.
+ 			// Since no appProtocol is specified, MeshService.Protocol should default
+-			// to http.
++			// to http because Port.Protocol=TCP
+ 			svc: corev1.Service{
+ 				ObjectMeta: metav1.ObjectMeta{
+ 					Namespace: "ns1",
+@@ -2315,8 +2336,9 @@ func TestK8sServicesToMeshServices(t *testing.T) {
+ 				Spec: corev1.ServiceSpec{
+ 					Ports: []corev1.ServicePort{
+ 						{
+-							Name: "p1",
+-							Port: 80,
++							Name:     "p1",
++							Port:     80,
++							Protocol: corev1.ProtocolTCP,
+ 						},
+ 					},
+ 					ClusterIP: corev1.ClusterIPNone,
+@@ -2500,6 +2522,71 @@ func TestK8sServicesToMeshServices(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name: "duplicate ports on k8s service with different protocols",
++			svc: corev1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Namespace: "ns1",
++					Name:      "s1",
++				},
++				Spec: corev1.ServiceSpec{
++					ClusterIP: "10.0.0.1",
++					Ports: []corev1.ServicePort{
++						{
++							Name:     "p1",
++							Port:     80,
++							Protocol: corev1.ProtocolTCP,
++						},
++						{
++							Name:     "p2",
++							Port:     80,
++							Protocol: corev1.ProtocolUDP,
++						},
++					},
++				},
++			},
++			svcEndpoints: []runtime.Object{
++				&corev1.Endpoints{
++					ObjectMeta: metav1.ObjectMeta{
++						// Should match svc.Name and svc.Namespace
++						Namespace: "ns1",
++						Name:      "s1",
++					},
++					Subsets: []corev1.EndpointSubset{
++						{
++							Ports: []corev1.EndpointPort{
++								{
++									// Must match the port of 'svc.Spec.Ports[0]'
++									Name: "p1",
++									Port: 8080, // TargetPort
++								},
++								{
++									// Must match the port of 'svc.Spec.Ports[1]'
++									Name: "p2",
++									Port: 8080, // TargetPort
++								},
++							},
++						},
++					},
++				},
++			},
++			expected: []service.MeshService{
++				{
++					Namespace:  "ns1",
++					Name:       "s1",
++					Port:       80,
++					TargetPort: 8080,
++					Protocol:   "http",
++				},
++				{
++					Namespace:  "ns1",
++					Name:       "s1",
++					Port:       80,
++					TargetPort: 8080,
++					Protocol:   "",
++				},
++			},
++		},
+ 	}
+ 
+ 	for _, tc := range testCases {
+@@ -2520,6 +2607,154 @@ func TestK8sServicesToMeshServices(t *testing.T) {
+ 	}
+ }
+ 
++func TestServiceToMeshServicesWarnsOnImplicitHTTP(t *testing.T) {
++	assert := tassert.New(t)
++
++	stop := make(chan struct{})
++	defer close(stop)
++
++	// Provide matching endpoints so that the only warning emitted is the one
++	// about the implicitly selected app protocol.
++	endpoints := &corev1.Endpoints{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: "ns1",
++			Name:      "s1",
++		},
++		Subsets: []corev1.EndpointSubset{
++			{
++				Ports: []corev1.EndpointPort{
++					{
++						Name: "p1",
++						Port: 8080,
++					},
++				},
++			},
++		},
++	}
++	fakeClient := testclient.NewSimpleClientset(endpoints)
++	k8sClient, err := k8s.NewClient(tests.OsmNamespace, tests.OsmMeshConfigName, messaging.NewBroker(stop),
++		k8s.WithKubeClient(fakeClient, "test-mesh"),
++	)
++	assert.NoError(err)
++	c := NewClient(k8sClient)
++
++	svc := corev1.Service{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: "ns1",
++			Name:      "s1",
++		},
++		Spec: corev1.ServiceSpec{
++			ClusterIP: "10.0.0.1",
++			Ports: []corev1.ServicePort{
++				{
++					Name:     "p1",
++					Port:     80,
++					Protocol: corev1.ProtocolTCP,
++				},
++			},
++		},
++	}
++
++	var actual []service.MeshService
++	output := captureStderr(t, func() {
++		actual = c.serviceToMeshServices(svc)
++	})
++	assert.Len(actual, 1)
++	assert.Equal("http", actual[0].Protocol)
++
++	// The app protocol was not explicitly specified, so a warning must be
++	// logged to indicate that http was selected implicitly.
++	assert.Contains(output, `"level":"warn"`)
++}
++
++// captureStderr runs fn while capturing everything written to the process's
++// standard error stream, and returns the captured output.
++func captureStderr(t *testing.T, fn func()) string {
++	t.Helper()
++
++	r, w, err := os.Pipe()
++	if err != nil {
++		t.Fatalf("failed to create pipe: %v", err)
++	}
++
++	// Duplicate the current stderr file descriptor so it can be restored later.
++	origFd, err := syscall.Dup(int(os.Stderr.Fd()))
++	if err != nil {
++		t.Fatalf("failed to duplicate stderr: %v", err)
++	}
++
++	if err := syscall.Dup2(int(w.Fd()), int(os.Stderr.Fd())); err != nil {
++		t.Fatalf("failed to redirect stderr: %v", err)
++	}
++
++	done := make(chan string, 1)
++	go func() {
++		var buf bytes.Buffer
++		_, _ = io.Copy(&buf, r)
++		done <- buf.String()
++	}()
++
++	fn()
++
++	// Restore stderr and close the write end so the reader can finish.
++	_ = syscall.Dup2(origFd, int(os.Stderr.Fd()))
++	_ = syscall.Close(origFd)
++	_ = w.Close()
++
++	return <-done
++}
++
++func TestServiceToMeshServicesUDPPortResultsInConfigError(t *testing.T) {
++	assert := tassert.New(t)
++
++	stop := make(chan struct{})
++	defer close(stop)
++	fakeClient := testclient.NewSimpleClientset()
++	k8sClient, err := k8s.NewClient(tests.OsmNamespace, tests.OsmMeshConfigName, messaging.NewBroker(stop),
++		k8s.WithKubeClient(fakeClient, "test-mesh"),
++	)
++	assert.NoError(err)
++	c := NewClient(k8sClient)
++
++	svc := corev1.Service{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: "ns1",
++			Name:      "s1",
++		},
++		Spec: corev1.ServiceSpec{
++			ClusterIP: "10.0.0.1",
++			Ports: []corev1.ServicePort{
++				{
++					Name:     "p1",
++					Port:     80,
++					Protocol: corev1.ProtocolUDP,
++				},
++			},
++		},
++	}
++
++	meshServices := c.serviceToMeshServices(svc)
++	assert.Len(meshServices, 1)
++	// A UDP port whose app protocol cannot be detected must be left unset.
++	assert.Empty(meshServices[0].Protocol)
++
++	// Building the Envoy config for the unset protocol must log an error.
++	output := captureStderr(t, func() {
++		lb := lds.ListenerBuilder().
++			ProxyIdentity(tests.BookstoreServiceIdentity).
++			TrafficDirection(xds_core.TrafficDirection_INBOUND).
++			InboundMeshTrafficMatches([]*trafficpolicy.TrafficMatch{
++				{
++					Name:                "udp-port",
++					DestinationPort:     int(meshServices[0].Port),
++					DestinationProtocol: meshServices[0].Protocol,
++				},
++			})
++		_, _ = lb.Build()
++	})
++	assert.Contains(output, `"level":"error"`)
++}
++
+ func TestGetMeshService(t *testing.T) {
+ 	osmNamespace := "osm"
+ 	testCases := []struct {

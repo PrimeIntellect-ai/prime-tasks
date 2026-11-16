@@ -1,0 +1,6 @@
+should not print handlerDidEnd in ConsoleBot fallback mode
+```
+You > ...
+Bot > ...
+Bot > handlerDidEnd: []
+```

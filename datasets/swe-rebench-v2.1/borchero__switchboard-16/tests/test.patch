@@ -1,0 +1,268 @@
+diff --git a/internal/integrations/externaldns_test.go b/internal/integrations/externaldns_test.go
+index bbb7191..5aed9cb 100644
+--- a/internal/integrations/externaldns_test.go
++++ b/internal/integrations/externaldns_test.go
+@@ -8,7 +8,9 @@ import (
+ 	"github.com/borchero/switchboard/internal/switchboard"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ 	"sigs.k8s.io/external-dns/endpoint"
+ )
+ 
+@@ -23,36 +25,43 @@ func TestExternalDNSUpdateResource(t *testing.T) {
+ 	// Setup
+ 	ctx := context.Background()
+ 	scheme := k8tests.NewScheme()
+-	client := k8tests.NewClient(t, scheme)
+-	namespace, shutdown := k8tests.NewNamespace(ctx, t, client)
+-	defer shutdown()
+ 
+-	// Create a dummy service as owner and target
+-	owner := k8tests.DummyService("my-service", namespace, 80)
+-	err := client.Create(ctx, &owner)
+-	require.Nil(t, err)
+-	integration := NewExternalDNS(client, switchboard.NewServiceTarget(owner.Name, namespace))
++	// Create a dummy service as owner and target which only exposes a load balancer hostname
++	owner := k8tests.DummyService("my-service", "my-namespace", 80)
++	owner.Spec.Type = v1.ServiceTypeLoadBalancer
++	owner.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{
++		{Hostname: "example.lb.identifier.amazonaws.com"},
++	}
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&owner).Build()
++	integration := NewExternalDNS(ctrlClient, switchboard.NewServiceTarget(owner.Name, owner.Namespace))
+ 
+ 	// No resource should be created if no hosts are provided
+ 	info := IngressInfo{}
+-	err = integration.UpdateResource(ctx, &owner, info)
++	err := integration.UpdateResource(ctx, &owner, info)
+ 	require.Nil(t, err)
+-	assert.Len(t, getDNSEndpoints(ctx, t, client, namespace), 0)
++	assert.Len(t, getDNSEndpoints(ctx, t, ctrlClient, owner.Namespace), 0)
+ 
+ 	// A resource with the name of the service should be created for at least one host
+ 	info.Hosts = []string{"example.com"}
+ 	err = integration.UpdateResource(ctx, &owner, info)
+ 	require.Nil(t, err)
+-	endpoints := getDNSEndpoints(ctx, t, client, namespace)
++	endpoints := getDNSEndpoints(ctx, t, ctrlClient, owner.Namespace)
+ 	assert.Len(t, endpoints, 1)
+ 	assert.Contains(t, endpoints, owner.Name)
+ 	assert.ElementsMatch(t, endpoints[owner.Name], info.Hosts)
+ 
++	// The created DNS endpoint must use a CNAME record pointing at the load balancer hostname
++	records := getDNSRecords(ctx, t, ctrlClient, owner.Namespace)
++	require.Len(t, records, 1)
++	assert.Equal(t, "example.com", records[0].DNSName)
++	assert.Equal(t, "CNAME", records[0].RecordType)
++	assert.ElementsMatch(t, []string{"example.lb.identifier.amazonaws.com"}, records[0].Targets)
++
+ 	// When the hosts are changed, more endpoints should be added
+ 	info.Hosts = []string{"example.com", "www.example.com"}
+ 	err = integration.UpdateResource(ctx, &owner, info)
+ 	require.Nil(t, err)
+-	endpoints = getDNSEndpoints(ctx, t, client, namespace)
++	endpoints = getDNSEndpoints(ctx, t, ctrlClient, owner.Namespace)
+ 	assert.Len(t, endpoints, 1)
+ 	assert.Contains(t, endpoints, owner.Name)
+ 	assert.ElementsMatch(t, endpoints[owner.Name], info.Hosts)
+@@ -61,52 +70,53 @@ func TestExternalDNSUpdateResource(t *testing.T) {
+ 	info.Hosts = nil
+ 	err = integration.UpdateResource(ctx, &owner, info)
+ 	require.Nil(t, err)
+-	assert.Len(t, getDNSEndpoints(ctx, t, client, namespace), 0)
++	assert.Len(t, getDNSEndpoints(ctx, t, ctrlClient, owner.Namespace), 0)
+ }
+ 
+ func TestExternalDNSEndpoints(t *testing.T) {
+-	integration := externalDNS{ttl: 250}
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	owner := k8tests.DummyService("my-service", "my-namespace", 80)
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&owner).Build()
++	integration := NewExternalDNS(ctrlClient, switchboard.NewStaticTarget(
++		"192.0.2.10", "192.0.2.11", "2001:db8::10", "2001:db8::11",
++		"example.lb.identifier.amazonaws.com",
++	))
+ 	hosts := []string{"example.com", "www.example.com"}
+-
+-	endpoints := integration.endpoints(hosts, []string{"127.0.0.1"})
+-	assert.Len(t, endpoints, 2)
+-	for _, ep := range endpoints {
+-		assert.ElementsMatch(t, ep.Targets, []string{"127.0.0.1"})
+-		assert.Equal(t, ep.RecordTTL, endpoint.TTL(250))
+-		assert.Equal(t, ep.RecordType, "A")
+-		assert.Contains(t, hosts, ep.DNSName)
+-	}
+-
+-	endpoints = integration.endpoints(hosts, []string{"2001:db8::1"})
+-	assert.Len(t, endpoints, 2)
+-	for _, ep := range endpoints {
+-		assert.ElementsMatch(t, ep.Targets, []string{"2001:db8::1"})
+-		assert.Equal(t, ep.RecordTTL, endpoint.TTL(250))
+-		assert.Equal(t, ep.RecordType, "AAAA")
+-		assert.Contains(t, hosts, ep.DNSName)
++	err := integration.UpdateResource(ctx, &owner, IngressInfo{Hosts: hosts})
++	require.NoError(t, err)
++	records := getDNSRecords(ctx, t, ctrlClient, owner.Namespace)
++	require.Len(t, records, 6)
++
++	wantTargets := map[string][]string{
++		"A":     {"192.0.2.10", "192.0.2.11"},
++		"AAAA":  {"2001:db8::10", "2001:db8::11"},
++		"CNAME": {"example.lb.identifier.amazonaws.com"},
+ 	}
+-
+-	endpoints = integration.endpoints(hosts, []string{"127.0.0.1", "2001:db8::1"})
+-	assert.Len(t, endpoints, 4)
+-	for _, ep := range endpoints {
+-		if ep.RecordType == "A" {
+-			assert.ElementsMatch(t, ep.Targets, []string{"127.0.0.1"})
+-			assert.Equal(t, ep.RecordTTL, endpoint.TTL(250))
+-			assert.Contains(t, hosts, ep.DNSName)
+-		} else {
+-			assert.ElementsMatch(t, ep.Targets, []string{"2001:db8::1"})
+-			assert.Equal(t, ep.RecordTTL, endpoint.TTL(250))
+-			assert.Equal(t, ep.RecordType, "AAAA")
+-			assert.Contains(t, hosts, ep.DNSName)
+-		}
++	seenRecords := make(map[string]bool)
++	for _, record := range records {
++		assert.Contains(t, hosts, record.DNSName)
++		assert.ElementsMatch(t, wantTargets[record.RecordType], record.Targets)
++		seenRecords[record.DNSName+"/"+record.RecordType] = true
+ 	}
++	assert.Equal(t, map[string]bool{
++		"example.com/A": true, "example.com/AAAA": true, "example.com/CNAME": true,
++		"www.example.com/A": true, "www.example.com/AAAA": true, "www.example.com/CNAME": true,
++	}, seenRecords)
+ }
+ 
+ func TestExternalDNSRecordType(t *testing.T) {
+-	integration := externalDNS{ttl: 250}
+-	assert.Equal(t, "A", integration.recordType("127.0.0.1"))
+-	assert.Equal(t, "AAAA", integration.recordType("::FFFF:C0A8:1"))
+-	assert.Equal(t, "AAAA", integration.recordType("2001:db8::1"))
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	owner := k8tests.DummyService("my-service", "my-namespace", 80)
++	owner.Spec.ClusterIP = ""
++	owner.Spec.ClusterIPs = nil
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&owner).Build()
++	integration := NewExternalDNS(ctrlClient, switchboard.NewServiceTarget(owner.Name, owner.Namespace))
++
++	err := integration.UpdateResource(ctx, &owner, IngressInfo{Hosts: []string{"example.com"}})
++	require.NoError(t, err)
++	assert.Empty(t, getDNSRecords(ctx, t, ctrlClient, owner.Namespace))
+ }
+ 
+ //-------------------------------------------------------------------------------------------------
+@@ -132,3 +142,19 @@ func getDNSEndpoints(
+ 	}
+ 	return result
+ }
++
++func getDNSRecords(
++	ctx context.Context, t *testing.T, ctrlClient client.Client, namespace string,
++) []*endpoint.Endpoint {
++	var list endpoint.DNSEndpointList
++	err := ctrlClient.List(ctx, &list, &client.ListOptions{
++		Namespace: namespace,
++	})
++	require.Nil(t, err)
++
++	records := make([]*endpoint.Endpoint, 0)
++	for _, item := range list.Items {
++		records = append(records, item.Spec.Endpoints...)
++	}
++	return records
++}
+diff --git a/internal/switchboard/targets_test.go b/internal/switchboard/targets_test.go
+index 8df348e..1e129f4 100644
+--- a/internal/switchboard/targets_test.go
++++ b/internal/switchboard/targets_test.go
+@@ -3,46 +3,49 @@ package switchboard
+ import (
+ 	"context"
+ 	"testing"
+-	"time"
+ 
+ 	"github.com/borchero/switchboard/internal/k8tests"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+-	"sigs.k8s.io/controller-runtime/pkg/client"
++	v1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+ 
+-func TestServiceTargetIP(t *testing.T) {
+-	// Setup
++func TestServiceTargetTargetsFromService(t *testing.T) {
+ 	ctx := context.Background()
+ 	scheme := k8tests.NewScheme()
+-	ctrlClient := k8tests.NewClient(t, scheme)
+-	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
+-	defer shutdown()
+ 
+-	// Create a new service
+-	service := k8tests.DummyService("my-service", namespace, 80)
+-	err := ctrlClient.Create(ctx, &service)
+-	require.Nil(t, err)
++	// A service without a load balancer falls back to its cluster IPs.
++	service := k8tests.DummyService("my-service", "my-namespace", 80)
++	service.Spec.ClusterIPs = []string{"10.0.0.1", "2001:db8::1"}
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&service).Build()
+ 
+-	// Check whether we find the cluster IP
+ 	target := NewServiceTarget(service.Name, service.Namespace)
+-	ips, err := target.IPs(ctx, ctrlClient)
++	targets, err := target.Targets(ctx, ctrlClient)
+ 	require.Nil(t, err)
+-	assert.ElementsMatch(t, service.Spec.ClusterIPs, ips)
++	assert.ElementsMatch(t, service.Spec.ClusterIPs, targets)
+ 
+-	// Update the service to provide a load balancer
+-	service.Spec.Type = "LoadBalancer"
+-	err = ctrlClient.Update(ctx, &service)
++	// A load balancer IP is used as target.
++	service.Spec.Type = v1.ServiceTypeLoadBalancer
++	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "1.2.3.4"}}
++	ctrlClient = fake.NewClientBuilder().WithScheme(scheme).WithObjects(&service).Build()
++	targets, err = target.Targets(ctx, ctrlClient)
+ 	require.Nil(t, err)
++	assert.ElementsMatch(t, []string{"1.2.3.4"}, targets)
+ 
+-	// Check whether we find the load balancer IP
+-	time.Sleep(time.Second)
+-	name := client.ObjectKeyFromObject(&service)
+-	err = ctrlClient.Get(ctx, name, &service)
+-	require.Nil(t, err)
+-	ips, err = target.IPs(ctx, ctrlClient)
++	// A load balancer hostname is used as target when no IP is present.
++	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{
++		{Hostname: "example.lb.identifier.amazonaws.com"},
++	}
++	ctrlClient = fake.NewClientBuilder().WithScheme(scheme).WithObjects(&service).Build()
++	targets, err = target.Targets(ctx, ctrlClient)
+ 	require.Nil(t, err)
+-	assert.ElementsMatch(t, []string{service.Status.LoadBalancer.Ingress[0].IP}, ips)
++	assert.ElementsMatch(t, []string{"example.lb.identifier.amazonaws.com"}, targets)
++
++	// A failed service lookup is reported to the caller.
++	ctrlClient = fake.NewClientBuilder().WithScheme(scheme).Build()
++	_, err = target.Targets(ctx, ctrlClient)
++	require.Error(t, err)
+ }
+ 
+ func TestServiceTargetNamespacedName(t *testing.T) {
+@@ -56,7 +59,7 @@ func TestStaticTargetIPs(t *testing.T) {
+ 	ctx := context.Background()
+ 	expectedIPs := []string{"127.0.0.1", "2001:db8::1"}
+ 	target := NewStaticTarget(expectedIPs...)
+-	ips, err := target.IPs(ctx, nil)
++	ips, err := target.Targets(ctx, nil)
+ 	require.Nil(t, err)
+ 	assert.ElementsMatch(t, expectedIPs, ips)
+ }

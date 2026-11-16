@@ -1,0 +1,2 @@
+ItemCollection constructor should clone items in iterator by default
+Currently, if an ItemCollection is constructed with an iterator of Item objects, those objects may be mangled and become unusable by operation in ItemCollection. This can be avoided by setting the clone parameter to True. This change would make the clone parameter default to True to have correct behavior by default, and allow a client to set clone to False if they desired the higher performance of not cloning the Items.

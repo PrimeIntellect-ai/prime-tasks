@@ -1,0 +1,126 @@
+diff --git a/controllers/provisioners/eks/cloud_test.go b/controllers/provisioners/eks/cloud_test.go
+index 635bee4..da418fa 100644
+--- a/controllers/provisioners/eks/cloud_test.go
++++ b/controllers/provisioners/eks/cloud_test.go
+@@ -17,17 +17,22 @@ package eks
+ 
+ import (
+ 	"fmt"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+-	corev1 "k8s.io/api/core/v1"
+-
+ 	"github.com/aws/aws-sdk-go/aws"
+ 	"github.com/aws/aws-sdk-go/service/autoscaling"
+ 	"github.com/aws/aws-sdk-go/service/iam"
++	"github.com/ghodss/yaml"
+ 	"github.com/keikoproj/instance-manager/api/v1alpha1"
++	kubeprovider "github.com/keikoproj/instance-manager/controllers/providers/kubernetes"
+ 	"github.com/keikoproj/instance-manager/controllers/provisioners"
+ 	"github.com/onsi/gomega"
++	corev1 "k8s.io/api/core/v1"
++	kerr "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ )
+ 
+ func TestCloudDiscoveryPositive(t *testing.T) {
+@@ -191,12 +196,11 @@ func TestCloudDiscoverySpotPrice(t *testing.T) {
+ 	_, err = k.Kubernetes.CoreV1().Events("").Create(MockSpotEvent("1", ownedScalingGroupName, "0.80", true, time.Now()))
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+ 
+-	// recommendation should not be used if nodes are not ready
++	// A changed recommendation is actionable while a rolling upgrade is still in progress.
+ 	err = ctx.CloudDiscovery()
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+-	g.Expect(configuration.GetSpotPrice()).To(gomega.Equal("0.67"))
++	g.Expect(configuration.GetSpotPrice()).To(gomega.Equal("0.80"))
+ 
+-	// recommendation should be accepted if nodes are ready
+ 	status.Conditions = append(status.Conditions, v1alpha1.InstanceGroupCondition{
+ 		Type:   v1alpha1.NodesReady,
+ 		Status: corev1.ConditionTrue,
+@@ -278,3 +282,81 @@ func TestLaunchConfigDeletion(t *testing.T) {
+ 	g.Expect(err).NotTo(gomega.HaveOccurred())
+ 	g.Expect(asgMock.DeleteLaunchConfigurationCallCount).To(gomega.Equal(2))
+ }
++
++func TestUpgradeCRDStrategyReplaceValidation(t *testing.T) {
++	var (
++		g  = gomega.NewGomegaWithT(t)
++		ig = MockInstanceGroup()
++		cr = MockCustomResourceSpec()
++	)
++
++	config := ig.GetEKSConfiguration()
++	config.Subnets = []string{"subnet-1"}
++	config.Image = "ami-1234"
++	config.NodeSecurityGroups = []string{"sg-12323"}
++	config.InstanceType = "m5.large"
++	config.KeyPairName = "myKey"
++
++	crYAML, err := yaml.Marshal(cr.Object)
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	strategy := MockAwsCRDStrategy(string(crYAML))
++	strategy.CRDType.ConcurrencyPolicy = "replace"
++	ig.SetUpgradeStrategy(strategy)
++
++	err = ig.Spec.Validate()
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++	g.Expect(strings.ToLower(ig.GetUpgradeStrategy().GetCRDType().GetConcurrencyPolicy())).To(gomega.Equal("replace"))
++}
++
++func TestUpgradeCRDStrategyReplace(t *testing.T) {
++	var (
++		g   = gomega.NewGomegaWithT(t)
++		k   = MockKubernetesClientSet()
++		ig  = MockInstanceGroup()
++		cr  = MockCustomResourceSpec()
++		crd = MockCustomResourceDefinition()
++	)
++
++	crYAML, err := yaml.Marshal(cr.Object)
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	definitionsGvr := kubeprovider.GetGVR(crd, "customresourcedefinitions")
++	crGvr := kubeprovider.GetGVR(cr, "dogs")
++	_, err = k.KubeDynamic.Resource(definitionsGvr).Create(crd, metav1.CreateOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	strategy := MockAwsCRDStrategy(string(crYAML))
++	strategy.CRDType.ConcurrencyPolicy = "replace"
++	ig.SetUpgradeStrategy(strategy)
++
++	status := ig.GetStatus()
++	status.SetActiveScalingGroupName("scaling-group-1")
++	status.SetActiveLaunchConfigurationName("some-launch-configuration-2")
++
++	// an active custom resource submitted for a previous launch configuration
++	existing := MockCustomResourceSpec()
++	existing.SetName("captain-1")
++	existing.SetNamespace("default")
++	kubeprovider.AddAnnotation(existing, kubeprovider.OwnershipAnnotationKey, kubeprovider.OwnershipAnnotationValue)
++	kubeprovider.AddAnnotation(existing, kubeprovider.ScopeAnnotationKey, "scaling-group-1")
++	err = unstructured.SetNestedField(existing.Object, "bla", "status", "dogStatus")
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++	_, err = k.KubeDynamic.Resource(crGvr).Namespace("default").Create(existing, metav1.CreateOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	_, err = kubeprovider.ProcessCRDStrategy(k.KubeDynamic, ig)
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++	// process again so that implementations which delete and requeue before
++	// submitting the replacement are also covered
++	_, err = kubeprovider.ProcessCRDStrategy(k.KubeDynamic, ig)
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	// the custom resource for the previous launch configuration should be deleted
++	_, err = k.KubeDynamic.Resource(crGvr).Namespace("default").Get("captain-1", metav1.GetOptions{})
++	g.Expect(kerr.IsNotFound(err)).To(gomega.BeTrue())
++
++	// a new custom resource for the new launch configuration should be submitted
++	_, err = k.KubeDynamic.Resource(crGvr).Namespace("default").Get("captain-2", metav1.GetOptions{})
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++}

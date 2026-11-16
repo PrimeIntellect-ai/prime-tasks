@@ -1,0 +1,179 @@
+diff --git a/docs/concepts/models/python_models.md b/docs/concepts/models/python_models.md
+index 5928f57b..5d22ad44 100644
+--- a/docs/concepts/models/python_models.md
++++ b/docs/concepts/models/python_models.md
+@@ -200,6 +200,7 @@ def execute(
+     Table resolution for these statements occurs at the virtual layer. This means that table names, including `@this_model` macro, are resolved to their qualified view names. For instance, when running the plan in an environment named `dev`, `db.test_model` and `@this_model` would resolve to `db__dev.test_model` and not to the physical table name.
+ 
+ ## Dependencies
++
+ In order to fetch data from an upstream model, you first get the table name using `context`'s `resolve_table` method. This returns the appropriate table name for the current runtime [environment](../environments.md):
+ 
+ ```python linenums="1"
+@@ -230,6 +231,21 @@ def execute(
+     context.resolve_table("docs_example.another_dependency")
+ ```
+ 
++User-defined [global variables](global-variables) can also be used in `resolve_table` calls, as long as the `depends_on` keyword argument is present and contains the required dependencies. This is shown in the following example:
++
++```python linenums="1"
++@model(
++    "@schema_name.test_model2",
++    kind="FULL",
++    columns={"id": "INT"},
++    depends_on=["@schema_name.test_model1"],
++)
++def execute(context, **kwargs):
++    schema_name = context.var("schema_name")
++    table = context.resolve_table(f"{schema_name}.test_model1")
++    select_query = exp.select("*").from_(table)
++    return context.fetchdf(select_query)
++```
+ 
+ ## Returning empty dataframes
+ 
+diff --git a/sqlmesh/core/model/common.py b/sqlmesh/core/model/common.py
+index 577ab27c..73b06557 100644
+--- a/sqlmesh/core/model/common.py
++++ b/sqlmesh/core/model/common.py
+@@ -29,6 +29,7 @@ def make_python_env(
+     used_variables: t.Optional[t.Set[str]] = None,
+     path: t.Optional[str | Path] = None,
+     python_env: t.Optional[t.Dict[str, Executable]] = None,
++    strict_resolution: bool = True,
+ ) -> t.Dict[str, Executable]:
+     python_env = {} if python_env is None else python_env
+     variables = variables or {}
+@@ -81,15 +82,25 @@ def make_python_env(
+             build_env(used_macro.func, env=env, name=name, path=module_path)
+ 
+     python_env.update(serialize_env(env, path=module_path))
+-    return _add_variables_to_python_env(python_env, used_variables, variables)
++    return _add_variables_to_python_env(
++        python_env,
++        used_variables,
++        variables,
++        strict_resolution=strict_resolution,
++    )
+ 
+ 
+ def _add_variables_to_python_env(
+     python_env: t.Dict[str, Executable],
+     used_variables: t.Optional[t.Set[str]],
+     variables: t.Optional[t.Dict[str, t.Any]],
++    strict_resolution: bool = True,
+ ) -> t.Dict[str, Executable]:
+-    _, python_used_variables = parse_dependencies(python_env, None)
++    _, python_used_variables = parse_dependencies(
++        python_env,
++        None,
++        strict_resolution=strict_resolution,
++    )
+     used_variables = (used_variables or set()) | python_used_variables
+ 
+     variables = {k: v for k, v in (variables or {}).items() if k in used_variables}
+@@ -100,12 +111,17 @@ def _add_variables_to_python_env(
+ 
+ 
+ def parse_dependencies(
+-    python_env: t.Dict[str, Executable], entrypoint: t.Optional[str]
++    python_env: t.Dict[str, Executable], entrypoint: t.Optional[str], strict_resolution: bool = True
+ ) -> t.Tuple[t.Set[str], t.Set[str]]:
+-    """Parses the source of a model function and finds upstream table dependencies and referenced variables based on calls to context / evaluator.
++    """
++    Parses the source of a model function and finds upstream table dependencies
++    and referenced variables based on calls to context / evaluator.
+ 
+     Args:
+         python_env: A dictionary of Python definitions.
++        entrypoint: The name of the function.
++        strict_resolution: If true, the arguments of `table` and `resolve_table` calls must
++            be resolvable at parse time, otherwise an exception will be raised.
+ 
+     Returns:
+         A tuple containing the set of upstream table dependencies and the set of referenced variables.
+@@ -140,9 +156,11 @@ def parse_dependencies(
+                         expression = to_source(first_arg)
+                         return eval(expression, env)
+                     except Exception:
+-                        raise ConfigError(
+-                            f"Error resolving dependencies for '{executable.path}'. Argument '{expression.strip()}' must be resolvable at parse time."
+-                        )
++                        if strict_resolution:
++                            raise ConfigError(
++                                f"Error resolving dependencies for '{executable.path}'. "
++                                f"Argument '{expression.strip()}' must be resolvable at parse time."
++                            )
+ 
+                 if func.value.id == "context" and func.attr in ("table", "resolve_table"):
+                     depends_on.add(get_first_arg("model_name"))
+diff --git a/sqlmesh/core/model/definition.py b/sqlmesh/core/model/definition.py
+index 761accca..5014d803 100644
+--- a/sqlmesh/core/model/definition.py
++++ b/sqlmesh/core/model/definition.py
+@@ -1971,28 +1971,48 @@ def create_python_model(
+         python_env: The Python environment of all objects referenced by the model implementation.
+         path: An optional path to the model definition file.
+         depends_on: The custom set of model's upstream dependencies.
++        variables: The variables to pass to the model.
+     """
+     # Find dependencies for python models by parsing code if they are not explicitly defined
+     # Also remove self-references that are found
+ 
+     dialect = kwargs.get("dialect")
++    renderer_kwargs = {
++        "module_path": module_path,
++        "macros": macros,
++        "jinja_macros": jinja_macros,
++        "variables": variables,
++        "path": path,
++        "dialect": dialect,
++        "default_catalog": kwargs.get("default_catalog"),
++    }
++
+     name_renderer = _meta_renderer(
+         expression=d.parse_one(name, dialect=dialect),
+-        module_path=module_path,
+-        macros=macros,
+-        jinja_macros=jinja_macros,
+-        variables=variables,
+-        path=path,
+-        dialect=dialect,
+-        default_catalog=kwargs.get("default_catalog"),
++        **renderer_kwargs,  # type: ignore
+     )
+     name = t.cast(t.List[exp.Expression], name_renderer.render())[0].sql(dialect=dialect)
+ 
++    dependencies_unspecified = depends_on is None
++
+     parsed_depends_on, referenced_variables = (
+-        parse_dependencies(python_env, entrypoint) if python_env is not None else (set(), set())
++        parse_dependencies(python_env, entrypoint, strict_resolution=dependencies_unspecified)
++        if python_env is not None
++        else (set(), set())
+     )
+-    if depends_on is None:
++    if dependencies_unspecified:
+         depends_on = parsed_depends_on - {name}
++    else:
++        depends_on_renderer = _meta_renderer(
++            expression=exp.Array(
++                expressions=[d.parse_one(dep, dialect=dialect) for dep in depends_on or []]
++            ),
++            **renderer_kwargs,  # type: ignore
++        )
++        depends_on = {
++            dep.sql(dialect=dialect)
++            for dep in t.cast(t.List[exp.Expression], depends_on_renderer.render())[0].expressions
++        }
+ 
+     variables = {k: v for k, v in (variables or {}).items() if k in referenced_variables}
+     if variables:
+@@ -2161,6 +2181,7 @@ def _create_model(
+         used_variables=used_variables,
+         path=path,
+         python_env=python_env,
++        strict_resolution=depends_on is None,
+     )
+ 
+     env: t.Dict[str, t.Any] = {}

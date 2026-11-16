@@ -1,0 +1,108 @@
+diff --git a/fs/sync/sync_test.go b/fs/sync/sync_test.go
+index 019b171c..c3733e40 100644
+--- a/fs/sync/sync_test.go
++++ b/fs/sync/sync_test.go
+@@ -3,13 +3,18 @@
+ package sync
+ 
+ import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
+ 	"runtime"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	_ "github.com/ncw/rclone/backend/all" // import all backends
+ 	"github.com/ncw/rclone/fs"
+ 	"github.com/ncw/rclone/fs/accounting"
++	"github.com/ncw/rclone/fs/config"
+ 	"github.com/ncw/rclone/fs/filter"
+ 	"github.com/ncw/rclone/fs/hash"
+ 	"github.com/ncw/rclone/fs/operations"
+@@ -1245,3 +1250,84 @@ func TestAbort(t *testing.T) {
+ 	err := Sync(r.Fremote, r.Flocal)
+ 	assert.Equal(t, accounting.ErrorMaxTransferLimitReached, err)
+ }
++
++// Cleanup on Backblaze B2 removes unfinished large file uploads that
++// were started more than a day ago, and leaves recent ones alone.
++func TestCleanUpB2UnfinishedLargeFiles(t *testing.T) {
++	now := time.Now()
++	stamp := func(tm time.Time) int64 { return tm.UnixNano() / int64(time.Millisecond) }
++	files := []map[string]interface{}{
++		{"fileId": "id-stale", "fileName": "stale-large.bin", "action": "start", "size": 0, "uploadTimestamp": stamp(now.Add(-48 * time.Hour))},
++		{"fileId": "id-fresh", "fileName": "fresh-large.bin", "action": "start", "size": 0, "uploadTimestamp": stamp(now.Add(-time.Hour))},
++		{"fileId": "id-current", "fileName": "normal.txt", "action": "upload", "size": 5, "uploadTimestamp": stamp(now.Add(-48 * time.Hour))},
++	}
++
++	// Ids of the files removed by cleanup, whichever API call removed them
++	var mu sync.Mutex
++	var deleted []string
++	var server *httptest.Server
++	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/b2api/v1/b2_authorize_account":
++			_ = json.NewEncoder(w).Encode(map[string]interface{}{
++				"accountId":               "acc",
++				"apiUrl":                  server.URL,
++				"authorizationToken":      "token",
++				"downloadUrl":             server.URL,
++				"recommendedPartSize":     100000000,
++				"absoluteMinimumPartSize": 5000000,
++			})
++		case "/b2api/v1/b2_list_buckets":
++			_ = json.NewEncoder(w).Encode(map[string]interface{}{
++				"buckets": []map[string]string{{"bucketId": "bucket-id", "accountId": "acc", "bucketName": "bucket", "bucketType": "allPrivate"}},
++			})
++		case "/b2api/v1/b2_list_file_versions":
++			_ = json.NewEncoder(w).Encode(map[string]interface{}{
++				"files":        files,
++				"nextFileName": nil,
++				"nextFileId":   nil,
++			})
++		case "/b2api/v1/b2_list_unfinished_large_files":
++			var unfinished []map[string]interface{}
++			for _, file := range files {
++				if file["action"] == "start" {
++					unfinished = append(unfinished, file)
++				}
++			}
++			_ = json.NewEncoder(w).Encode(map[string]interface{}{
++				"files":      unfinished,
++				"nextFileId": nil,
++			})
++		case "/b2api/v1/b2_delete_file_version", "/b2api/v1/b2_cancel_large_file":
++			var req struct {
++				ID   string `json:"fileId"`
++				Name string `json:"fileName"`
++			}
++			_ = json.NewDecoder(r.Body).Decode(&req)
++			mu.Lock()
++			deleted = append(deleted, req.ID)
++			mu.Unlock()
++			_ = json.NewEncoder(w).Encode(map[string]interface{}{"fileId": req.ID, "fileName": req.Name})
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer server.Close()
++
++	const remoteName = "fake-b2-cleanup"
++	config.FileSet(remoteName, "type", "b2")
++	config.FileSet(remoteName, "account", "acc")
++	config.FileSet(remoteName, "key", "key")
++	config.FileSet(remoteName, "endpoint", server.URL)
++
++	f, err := fs.NewFs(remoteName + ":bucket")
++	require.NoError(t, err)
++	cleaner, ok := f.(fs.CleanUpper)
++	require.True(t, ok, "b2 backend should support cleanup")
++	require.NoError(t, cleaner.CleanUp())
++
++	mu.Lock()
++	defer mu.Unlock()
++	assert.Equal(t, []string{"id-stale"}, deleted)
++}

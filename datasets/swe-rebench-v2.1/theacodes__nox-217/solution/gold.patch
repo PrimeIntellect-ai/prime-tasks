@@ -1,0 +1,371 @@
+diff --git a/.travis.yml b/.travis.yml
+index 76ad1b3..cfdbc1f 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -14,6 +14,13 @@ matrix:
+   - python: '3.7'
+     env: NOXSESSION="docs"
+     dist: xenial    # required for Python 3.7 (travis-ci/travis-ci#9069)
++before_install:
++  - wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
++  - chmod +x miniconda.sh
++  - ./miniconda.sh -b
++  # Prefer the built-in python binary.
++  - export PATH="$PATH:/home/travis/miniconda3/bin"
++  - conda update --yes conda
+ install:
+   - pip install --upgrade pip setuptools
+   - pip install .
+diff --git a/appveyor.yml b/appveyor.yml
+index 3ba586a..53cd227 100644
+--- a/appveyor.yml
++++ b/appveyor.yml
+@@ -11,24 +11,43 @@ environment:
+     # See: http://www.appveyor.com/docs/installed-software#python
+ 
+     - PYTHON: "C:\\Python35"
++      CONDA: "C:\\Miniconda35"
+       NOX_SESSION: "tests-3.5"
+ 
+     - PYTHON: "C:\\Python35-x64"
++      CONDA: "C:\\Miniconda35-x64"
+       NOX_SESSION: "tests-3.5"
+ 
+     - PYTHON: "C:\\Python36"
++      CONDA: "C:\\Miniconda36"
+       NOX_SESSION: "tests-3.6"
+ 
+     - PYTHON: "C:\\Python36-x64"
++      CONDA: "C:\\Miniconda36-x64"
+       NOX_SESSION: "tests-3.6"
+ 
+     - PYTHON: "C:\\Python37"
++      # Python 3.7 conda installation appears to be broken on Appveyor:
++      # TypeError: LoadLibrary() argument 1 must be str, not None
++      CONDA: "C:\\Miniconda36"
+       NOX_SESSION: "tests-3.7"
+ 
+     - PYTHON: "C:\\Python37-x64"
++      # Python 3.7 conda installation appears to be broken on Appveyor:
++      # TypeError: LoadLibrary() argument 1 must be str, not None
++      CONDA: "C:\\Miniconda36-x64"
+       NOX_SESSION: "tests-3.7"
+ 
+ install:
++  # Add conda command to path.
++  # https://www.tjelvarolsson.com/blog/how-to-continuously-test-your-python-code-on-windows-using-appveyor/
++  - "SET PATH=%CONDA%;%CONDA%\\Scripts;%PATH%"
++  - conda config --set changeps1 no
++  - conda update -q --yes conda
++  # Get Python from conda-forge.
++  - conda config --add channels conda-forge
++  - conda info -a
++
+   # Prepend newly installed Python to the PATH of this build (this cannot be
+   # done from inside the powershell script as it would require to restart
+   # the parent CMD process).
+diff --git a/nox/registry.py b/nox/registry.py
+index 315b61a..b9fd223 100644
+--- a/nox/registry.py
++++ b/nox/registry.py
+@@ -19,7 +19,9 @@ import functools
+ _REGISTRY = collections.OrderedDict()
+ 
+ 
+-def session_decorator(func=None, python=None, py=None, reuse_venv=None, name=None):
++def session_decorator(
++    func=None, python=None, py=None, reuse_venv=None, name=None, venv_backend=None
++):
+     """Designate the decorated function as a session."""
+     # If `func` is provided, then this is the decorator call with the function
+     # being sent as part of the Python syntax (`@nox.session`).
+@@ -30,7 +32,12 @@ def session_decorator(func=None, python=None, py=None, reuse_venv=None, name=Non
+     # This is what makes the syntax with and without parentheses both work.
+     if func is None:
+         return functools.partial(
+-            session_decorator, python=python, py=py, reuse_venv=reuse_venv, name=name
++            session_decorator,
++            python=python,
++            py=py,
++            reuse_venv=reuse_venv,
++            name=name,
++            venv_backend=venv_backend,
+         )
+ 
+     if py is not None and python is not None:
+@@ -44,6 +51,7 @@ def session_decorator(func=None, python=None, py=None, reuse_venv=None, name=Non
+ 
+     func.python = python
+     func.reuse_venv = reuse_venv
++    func.venv_backend = venv_backend
+     _REGISTRY[name or func.__name__] = func
+ 
+     return func
+diff --git a/nox/sessions.py b/nox/sessions.py
+index e7aa8c2..38cd20d 100644
+--- a/nox/sessions.py
++++ b/nox/sessions.py
+@@ -23,7 +23,7 @@ import py
+ 
+ import nox.command
+ from nox.logger import logger
+-from nox.virtualenv import ProcessEnv, VirtualEnv
++from nox.virtualenv import CondaEnv, ProcessEnv, VirtualEnv
+ 
+ 
+ def _normalize_path(envdir, path):
+@@ -212,13 +212,63 @@ class Session:
+         if self._runner.global_config.error_on_external_run:
+             kwargs.setdefault("external", "error")
+ 
+-        # If we aren't using a virtualenv allow all external programs.
+-        if not isinstance(self.virtualenv, VirtualEnv):
++        # Allow all external programs when running outside a sandbox.
++        if not self.virtualenv.is_sandboxed:
++            kwargs["external"] = True
++
++        if args[0] in self.virtualenv.allowed_globals:
+             kwargs["external"] = True
+ 
+         # Run a shell command.
+         return nox.command.run(args, env=env, path=self.bin, **kwargs)
+ 
++    def conda_install(self, *args, **kwargs):
++        """Install invokes `conda install`_ to install packages inside of the
++        session's environment.
++
++        To install packages directly::
++
++            session.conda_install('pandas')
++            session.conda_install('numpy', 'scipy')
++            session.conda_install('--channel=conda-forge', 'dask==2.1.0')
++
++        To install packages from a `requirements.txt` file::
++
++            session.conda_install('--file', 'requirements.txt')
++            session.conda_install('--file', 'requirements-dev.txt')
++
++        To install the current package without clobbering conda-installed
++        dependencies::
++
++            session.install('.', '--no-deps')
++            # Install in editable mode.
++            session.install('-e', '.', '--no-deps')
++
++        Additional keyword args are the same as for :meth:`run`.
++
++        .. _conda install:
++        """
++        if not isinstance(self.virtualenv, CondaEnv):
++            raise ValueError(
++                "A session without a conda environment can not install dependencies from conda."
++            )
++        if not args:
++            raise ValueError("At least one argument required to install().")
++
++        if "silent" not in kwargs:
++            kwargs["silent"] = True
++
++        self._run(
++            "conda",
++            "install",
++            "--yes",
++            "--prefix",
++            self.virtualenv.location,
++            *args,
++            external="error",
++            **kwargs
++        )
++
+     def install(self, *args, **kwargs):
+         """Install invokes `pip`_ to install packages inside of the session's
+         virtualenv.
+@@ -244,7 +294,7 @@ class Session:
+ 
+         .. _pip: https://pip.readthedocs.org
+         """
+-        if not isinstance(self.virtualenv, VirtualEnv):
++        if not isinstance(self.virtualenv, (CondaEnv, VirtualEnv)):
+             raise ValueError(
+                 "A session without a virtualenv can not install dependencies."
+             )
+@@ -316,9 +366,22 @@ class SessionRunner:
+         reuse_existing = (
+             self.func.reuse_venv or self.global_config.reuse_existing_virtualenvs
+         )
+-        self.venv = VirtualEnv(
+-            path, interpreter=self.func.python, reuse_existing=reuse_existing
+-        )
++
++        if not self.func.venv_backend or self.func.venv_backend == "virtualenv":
++            self.venv = VirtualEnv(
++                path, interpreter=self.func.python, reuse_existing=reuse_existing
++            )
++        elif self.func.venv_backend == "conda":
++            self.venv = CondaEnv(
++                path, interpreter=self.func.python, reuse_existing=reuse_existing
++            )
++        else:
++            raise ValueError(
++                "Expected venv_backend one of ('virtualenv', 'conda'), but got '{}'.".format(
++                    self.func.venv_backend
++                )
++            )
++
+         self.venv.create()
+ 
+     def execute(self):
+diff --git a/nox/virtualenv.py b/nox/virtualenv.py
+index 0f00604..ef65914 100644
+--- a/nox/virtualenv.py
++++ b/nox/virtualenv.py
+@@ -40,6 +40,12 @@ class InterpreterNotFound(OSError):
+ class ProcessEnv:
+     """A environment with a 'bin' directory and a set of 'env' vars."""
+ 
++    # Does this environment provide any process isolation?
++    is_sandboxed = False
++
++    # Special programs that aren't included in the environment.
++    allowed_globals = ()
++
+     def __init__(self, bin=None, env=None):
+         self._bin = bin
+         self.env = os.environ.copy()
+@@ -85,6 +91,89 @@ def locate_via_py(version):
+             return None
+ 
+ 
++def _clean_location(self):
++    """Deletes any existing path-based environment"""
++    if os.path.exists(self.location):
++        if self.reuse_existing:
++            return False
++        else:
++            shutil.rmtree(self.location)
++
++    return True
++
++
++class CondaEnv(ProcessEnv):
++    """Conda environemnt management class.
++
++    Args:
++        location (str): The location on the filesystem where the conda environment
++            should be created.
++        interpreter (Optional[str]): The desired Python version. Of the form
++
++            * ``X.Y``, e.g. ``3.5``
++            * ``X.Y-32``. For example, a usage of the Windows Launcher might
++              be ``py -3.6-32``
++            * ``X.Y.Z``, e.g. ``3.4.9``
++            * ``pythonX.Y``, e.g. ``python2.7``
++            * A path in the filesystem to a Python executable
++
++            If not specified, this will use the currently running Python.
++        reuse_existing (Optional[bool]): Flag indicating if the conda environment
++            should be reused if it already exists at ``location``.
++    """
++
++    is_sandboxed = True
++    allowed_globals = ("conda",)
++
++    def __init__(self, location, interpreter=None, reuse_existing=False):
++        self.location_name = location
++        self.location = os.path.abspath(location)
++        self.interpreter = interpreter
++        self.reuse_existing = reuse_existing
++        super(CondaEnv, self).__init__()
++
++    _clean_location = _clean_location
++
++    @property
++    def bin(self):
++        """Returns the location of the conda env's bin folder."""
++        if _SYSTEM == "Windows":
++            return os.path.join(self.location, "Scripts")
++        else:
++            return os.path.join(self.location, "bin")
++
++    def create(self):
++        """Create the conda env."""
++        if not self._clean_location():
++            logger.debug(
++                "Re-using existing conda env at {}.".format(self.location_name)
++            )
++            return False
++
++        cmd = [
++            "conda",
++            "create",
++            "--yes",
++            "--prefix",
++            self.location,
++            # Ensure the pip package is installed.
++            "pip",
++        ]
++
++        if self.interpreter:
++            python_dep = "python={}".format(self.interpreter)
++        else:
++            python_dep = "python"
++        cmd.append(python_dep)
++
++        logger.info(
++            "Creating conda env in {} with {}".format(self.location_name, python_dep)
++        )
++        nox.command.run(cmd, silent=True, log=False)
++
++        return True
++
++
+ class VirtualEnv(ProcessEnv):
+     """Virtualenv management class.
+ 
+@@ -105,6 +194,8 @@ class VirtualEnv(ProcessEnv):
+             should be reused if it already exists at ``location``.
+     """
+ 
++    is_sandboxed = True
++
+     def __init__(self, location, interpreter=None, reuse_existing=False):
+         self.location_name = location
+         self.location = os.path.abspath(location)
+@@ -113,15 +204,7 @@ class VirtualEnv(ProcessEnv):
+         self.reuse_existing = reuse_existing
+         super(VirtualEnv, self).__init__()
+ 
+-    def _clean_location(self):
+-        """Deletes any existing virtualenv"""
+-        if os.path.exists(self.location):
+-            if self.reuse_existing:
+-                return False
+-            else:
+-                shutil.rmtree(self.location)
+-
+-        return True
++    _clean_location = _clean_location
+ 
+     @property
+     def _resolved_interpreter(self):
+diff --git a/noxfile.py b/noxfile.py
+index a6ced84..004a365 100644
+--- a/noxfile.py
++++ b/noxfile.py
+@@ -32,6 +32,16 @@ def tests(session):
+     session.notify("cover")
+ 
+ 
++@nox.session(python=["3.5", "3.6", "3.7"], venv_backend="conda")
++def conda_tests(session):
++    """Run test suite with pytest."""
++    session.conda_install("--file", "requirements-conda-test.txt")
++    session.install("contexter", "--no-deps")
++    session.install("-e", ".", "--no-deps")
++    tests = session.posargs or ["tests/"]
++    session.run("pytest", *tests)
++
++
+ @nox.session
+ def cover(session):
+     """Coverage analysis."""

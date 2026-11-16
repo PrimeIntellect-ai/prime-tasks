@@ -1,0 +1,172 @@
+diff --git a/controllers/kubevirtmachine_controller_test.go b/controllers/kubevirtmachine_controller_test.go
+index bdbe3a3..3f68e69 100644
+--- a/controllers/kubevirtmachine_controller_test.go
++++ b/controllers/kubevirtmachine_controller_test.go
+@@ -20,6 +20,8 @@ import (
+ 	gocontext "context"
+ 	"time"
+ 
++	"gopkg.in/yaml.v3"
++
+ 	"github.com/golang/mock/gomock"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+@@ -135,16 +137,6 @@ var _ = Describe("KubevirtClusterToKubevirtMachines", func() {
+ 	})
+ })
+ 
+-var _ = Describe("utility functions", func() {
+-	DescribeTable("should detect userdata is cloud-config", func(userData []byte, expected bool) {
+-		Expect(isCloudConfigUserData(userData)).To(Equal(expected))
+-	},
+-		Entry("should detect cloud-config", []byte("#something\n\n#something else\n#cloud-config\nthe end"), true),
+-		Entry("should not detect cloud-config", []byte("#something\n\n#something else\n#not-cloud-config\nthe end"), false),
+-		Entry("should not detect cloud-config", []byte("#something\n\n#something else\n   #cloud-config\nthe end"), false),
+-	)
+-})
+-
+ var _ = Describe("reconcile a kubevirt machine", func() {
+ 	var (
+ 		mockCtrl            *gomock.Controller
+@@ -256,8 +248,141 @@ var _ = Describe("reconcile a kubevirt machine", func() {
+ 		}
+ 
+ 	}
++
++	generateBootstrapUserData := func(userData string) []byte {
++		bootstrapSecret.Data["value"] = []byte(userData)
++		cluster.Status.InfrastructureReady = true
++		objects := []client.Object{
++			cluster,
++			kubevirtCluster,
++			machine,
++			kubevirtMachine,
++			sshKeySecret,
++			bootstrapSecret,
++		}
++		setupClient(kubevirt.DefaultMachineFactory{}, objects)
++		infraClusterMock.EXPECT().GenerateInfraClusterClient(kubevirtMachine.Spec.InfraClusterSecretRef, kubevirtMachine.Namespace, gomock.Any()).Return(fakeClient, kubevirtMachine.Namespace, nil).Times(1)
++
++		request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}}
++		_, err := kubevirtMachineReconciler.Reconcile(gocontext.Background(), request)
++		Expect(err).NotTo(HaveOccurred())
++
++		generated := &corev1.Secret{}
++		generatedKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: bootstrapSecretName + "-userdata"}
++		Expect(fakeClient.Get(gocontext.Background(), generatedKey, generated)).To(Succeed())
++		return generated.Data["userdata"]
++	}
++
+ 	AfterEach(func() {})
+ 
++	usersFrom := func(generated []byte) *yaml.Node {
++		var document yaml.Node
++		Expect(yaml.Unmarshal(generated, &document)).To(Succeed())
++		root := document.Content[0]
++		var users *yaml.Node
++		usersFields := 0
++		for i := 0; i < len(root.Content); i += 2 {
++			if root.Content[i].Value == "users" {
++				usersFields++
++				users = root.Content[i+1]
++			}
++		}
++		Expect(usersFields).To(Equal(1))
++		Expect(users.Kind).To(Equal(yaml.SequenceNode))
++		return users
++	}
++	userField := func(user *yaml.Node, name string) *yaml.Node {
++		for i := 0; i < len(user.Content); i += 2 {
++			if user.Content[i].Value == name {
++				return user.Content[i+1]
++			}
++		}
++		return nil
++	}
++	userNamed := func(users *yaml.Node, name string) *yaml.Node {
++		for _, user := range users.Content {
++			if value := userField(user, "name"); value != nil && value.Value == name {
++				return user
++			}
++		}
++		return nil
++	}
++
++	It("generates one users field containing custom users and the CAPK account", func() {
++		generated := generateBootstrapUserData(`#cloud-config
++users:
++  - name: johndoe
++    group: users
++`)
++
++		users := usersFrom(generated)
++		Expect(users.Content).To(HaveLen(2))
++		Expect([]string{userField(users.Content[0], "name").Value, userField(users.Content[1], "name").Value}).To(ConsistOf("johndoe", "capk"))
++		capk := userNamed(users, "capk")
++		Expect(userField(capk, "gecos").Value).To(Equal("CAPK User"))
++		Expect(userField(capk, "sudo").Value).To(Equal("ALL=(ALL) NOPASSWD:ALL"))
++		Expect(userField(capk, "groups").Value).To(Equal("users, admin"))
++		keys := userField(capk, "ssh_authorized_keys")
++		Expect(keys.Kind).To(Equal(yaml.SequenceNode))
++		authorizedKeys := make([]string, 0, len(keys.Content))
++		for _, key := range keys.Content {
++			authorizedKeys = append(authorizedKeys, key.Value)
++		}
++		Expect(authorizedKeys).To(ContainElement("sha-rsa 1234"))
++	})
++
++	It("adds the CAPK account when Cloud-Init data has no users field", func() {
++		generated := generateBootstrapUserData(`#cloud-config
++package_update: true
++`)
++
++		users := usersFrom(generated)
++		Expect(users.Content).To(HaveLen(1))
++		capk := userNamed(users, "capk")
++		Expect(capk).NotTo(BeNil())
++		Expect(userField(capk, "gecos").Value).To(Equal("CAPK User"))
++		Expect(userField(capk, "sudo").Value).To(Equal("ALL=(ALL) NOPASSWD:ALL"))
++		Expect(userField(capk, "groups").Value).To(Equal("users, admin"))
++		keys := userField(capk, "ssh_authorized_keys")
++		Expect(keys.Kind).To(Equal(yaml.SequenceNode))
++		authorizedKeys := make([]string, 0, len(keys.Content))
++		for _, key := range keys.Content {
++			authorizedKeys = append(authorizedKeys, key.Value)
++		}
++		Expect(authorizedKeys).To(ContainElement("sha-rsa 1234"))
++	})
++
++	It("replaces an existing CAPK account with the CAPK settings and SSH key", func() {
++		generated := generateBootstrapUserData(`#cloud-config
++users:
++  - name: johndoe
++    group: users
++  - name: capk
++    group: users
++`)
++
++		users := usersFrom(generated)
++		Expect(users.Content).To(HaveLen(2))
++		Expect([]string{userField(users.Content[0], "name").Value, userField(users.Content[1], "name").Value}).To(ConsistOf("johndoe", "capk"))
++		capk := userNamed(users, "capk")
++		Expect(userField(capk, "gecos").Value).To(Equal("CAPK User"))
++		Expect(userField(capk, "sudo").Value).To(Equal("ALL=(ALL) NOPASSWD:ALL"))
++		Expect(userField(capk, "groups").Value).To(Equal("users, admin"))
++		keys := userField(capk, "ssh_authorized_keys")
++		Expect(keys.Kind).To(Equal(yaml.SequenceNode))
++		authorizedKeys := make([]string, 0, len(keys.Content))
++		for _, key := range keys.Content {
++			authorizedKeys = append(authorizedKeys, key.Value)
++		}
++		Expect(authorizedKeys).To(ContainElement("sha-rsa 1234"))
++	})
++
++	It("preserves bootstrap data that is not a Cloud-Init configuration", func() {
++		input := "hello: world"
++		generated := generateBootstrapUserData(input)
++		Expect(generated).To(Equal([]byte(input)))
++	})
++
+ 	It("should create KubeVirt VM", func() {
+ 		objects := []client.Object{
+ 			cluster,

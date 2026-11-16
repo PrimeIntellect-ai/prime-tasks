@@ -1,0 +1,157 @@
+diff --git a/src/conversion.jl b/src/conversion.jl
+index a1a8bddf..8a32ac63 100644
+--- a/src/conversion.jl
++++ b/src/conversion.jl
+@@ -1,38 +1,26 @@
+ """
+     convfact(s::Units, t::Units)
+-Find the conversion factor from unit `t` to unit `s`, e.g., `convfact(m,cm) == 1//100`.
++Find the conversion factor from unit `t` to unit `s`, e.g., `convfact(m, cm) == 1//100`.
+ """
+ @generated function convfact(s::Units, t::Units)
+-    sunits = s.parameters[1]
+-    tunits = t.parameters[1]
+-
+     # Check if conversion is possible in principle
+-    sdim = dimension(s())
+-    tdim = dimension(t())
+-    sdim != tdim && throw(DimensionError(s(),t()))
+-
+-    # first convert to base SI units.
+-    # fact1 is what would need to be multiplied to get to base SI units
+-    # fact2 is what would be multiplied to get from the result to base SI units
+-
+-    inex1, ex1 = basefactor(t())
+-    inex2, ex2 = basefactor(s())
+-
+-    a = inex1 / inex2
+-    ex = ex1 // ex2     # do overflow checking?
++    dimension(s()) != dimension(t()) && throw(DimensionError(s(), t()))
+ 
+-    tens1 = mapreduce(tensfactor, +, tunits; init=0)
+-    tens2 = mapreduce(tensfactor, +, sunits; init=0)
+-
+-    pow = tens1-tens2
++    # use absoluteunit because division is invalid for AffineUnits;
++    # convert to FreeUnits first because absolute ContextUnits might still
++    # promote to AffineUnits
++    conv_units = absoluteunit(FreeUnits(t())) / absoluteunit(FreeUnits(s()))
++    inex, ex = basefactor(conv_units)
++    pow = tensfactor(conv_units)
++    inex_orig = inex
+ 
+     fpow = 10.0^pow
+-    if fpow > typemax(Int) || 1/(fpow) > typemax(Int)
+-        a *= fpow
++    if fpow > typemax(Int) || 1/fpow > typemax(Int)
++        inex *= fpow
+     else
+         comp = (pow > 0 ? fpow * numerator(ex) : 1/fpow * denominator(ex))
+         if comp > typemax(Int)
+-            a *= fpow
++            inex *= fpow
+         else
+             ex *= (10//1)^pow
+         end
+@@ -41,9 +29,15 @@ Find the conversion factor from unit `t` to unit `s`, e.g., `convfact(m,cm) == 1
+     if ex isa Rational && denominator(ex) == 1
+         ex = numerator(ex)
+     end
+-    a ≈ 1.0 ? (inex = 1) : (inex = a)
+-    y = inex * ex
+-    :($y)
++
++    result = (inex ≈ 1.0 ? 1 : inex) * ex
++    if fp_overflow_underflow(inex_orig, result)
++        throw(ArgumentError(
++            "Floating point overflow/underflow, probably due to large " *
++            "exponents and/or SI prefixes in units"
++        ))
++    end
++    return :($result)
+ end
+ 
+ """
+diff --git a/src/units.jl b/src/units.jl
+index f6a3f89a..89df1bf4 100644
+--- a/src/units.jl
++++ b/src/units.jl
+@@ -194,7 +194,7 @@ end
+ function basefactor(inex, ex, eq, tens, p)
+     # Sometimes (x::Rational)^1 can fail for large rationals because the result
+     # is of type x*x so we do a hack here
+-    function dpow(x,p)
++    function dpow(x, p)
+         if p == 0
+             1
+         elseif p == 1
+@@ -232,19 +232,23 @@ function basefactor(inex, ex, eq, tens, p)
+             # Note that sometimes x^1 can cause an overflow error if x is large because
+             # of how power_by_squaring is implemented for Rationals, so we use dpow.
+             x = dpow(eq*ex*(10//1)^tens, p)
+-            return (inex^p, isinteger(x) ? Int(x) : x)
++            result = (inex^p, isinteger(x) ? Int(x) : x)
+         else
+             x = dpow(ex*(10//1)^tens, p)
+-            return ((inex*eq)^p, isinteger(x) ? Int(x) : x)
++            result = ((inex * eq)^p, isinteger(x) ? Int(x) : x)
+         end
+     else
+         if eq_is_exact && can_exact2
+-            x = dpow(eq,p)
+-            return ((inex * ex * 10.0^tens)^p, isinteger(x) ? Int(x) : x)
++            x = dpow(eq, p)
++            result = ((inex * ex * 10.0^tens)^p, isinteger(x) ? Int(x) : x)
+         else
+-            return ((inex * ex * 10.0^tens * eq)^p, 1)
++            result = ((inex * ex * 10.0^tens * eq)^p, 1)
+         end
+     end
++    if fp_overflow_underflow(inex, first(result))
++        throw(ArgumentError("Floating point overflow/underflow, probably due to large exponent ($p)"))
++    end
++    return result
+ end
+ 
+ """
+@@ -257,18 +261,21 @@ reference units.
+ """
+ @inline basefactor(x::Unit{U}) where {U} = basefactor(basefactors[U]..., 1, 0, power(x))
+ 
+-function basefactor(x::Units{U}) where {U}
++function basefactor(::Units{U}) where {U}
+     fact1 = map(basefactor, U)
+-    inex1 = mapreduce(x->getfield(x,1), *, fact1, init=1.0)
+-    float_num = mapreduce(x->float(numerator(getfield(x,2))), *, fact1, init=1.0)
+-    float_den = mapreduce(x->float(denominator(getfield(x,2))), *, fact1, init=1.0)
+-    can_exact = (float_num < typemax(Int))
+-    can_exact &= (float_den < typemax(Int))
++    inex1 = mapreduce(first, *, fact1, init=1.0)
++    float_num = mapreduce(x -> float(numerator(last(x))), *, fact1, init=1.0)
++    float_den = mapreduce(x -> float(denominator(last(x))), *, fact1, init=1.0)
++    can_exact = float_num < typemax(Int) && float_den < typemax(Int)
+     if can_exact
+-        return inex1, mapreduce(x->getfield(x,2), *, fact1, init=1)
++        result = (inex1, mapreduce(last, *, fact1, init=1))
+     else
+-        return inex1*float_num/float_den, 1
++        result = (inex1 * (float_num / float_den), 1)
++    end
++    if any(fp_overflow_underflow(first(x), first(result)) for x in fact1)
++        throw(ArgumentError("Floating point overflow/underflow, probably due to a large exponent in some of the units"))
+     end
++    return result
+ end
+ 
+ Base.broadcastable(x::Units) = Ref(x)
+diff --git a/src/utils.jl b/src/utils.jl
+index c0975ce5..28a61d16 100644
+--- a/src/utils.jl
++++ b/src/utils.jl
+@@ -246,3 +246,6 @@ struct AffineError <: Exception
+ end
+ 
+ Base.showerror(io::IO, e::AffineError) = print(io, "AffineError: $(e.x)")
++
++fp_overflow_underflow(input, result) =
++    isfinite(input) && !isfinite(result) || !iszero(input) && iszero(result)

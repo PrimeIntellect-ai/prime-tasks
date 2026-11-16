@@ -1,0 +1,239 @@
+diff --git a/pkg/downloader/chart_downloader_test.go b/pkg/downloader/chart_downloader_test.go
+index 80249e24..12c60612 100644
+--- a/pkg/downloader/chart_downloader_test.go
++++ b/pkg/downloader/chart_downloader_test.go
+@@ -16,12 +16,24 @@ limitations under the License.
+ package downloader
+ 
+ import (
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"io/ioutil"
++	"math/big"
+ 	"net/http"
++	"net/http/httptest"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	"helm.sh/helm/v3/internal/test/ensure"
++	"helm.sh/helm/v3/pkg/chart"
+ 	"helm.sh/helm/v3/pkg/cli"
+ 	"helm.sh/helm/v3/pkg/getter"
+ 	"helm.sh/helm/v3/pkg/repo"
+@@ -80,6 +92,209 @@ func TestResolveChartRef(t *testing.T) {
+ 	}
+ }
+ 
++func newTLSGetterTestServer(t *testing.T) (*httptest.Server, <-chan bool) {
++	t.Helper()
++	clientCertificateSeen := make(chan bool, 10)
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		clientCertificateSeen <- r.TLS != nil && len(r.TLS.PeerCertificates) > 0
++		_, _ = w.Write([]byte("chart archive"))
++	}))
++	server.TLS = &tls.Config{ClientAuth: tls.RequestClientCert}
++	server.StartTLS()
++	return server, clientCertificateSeen
++}
++
++func writeTLSGetterTestFiles(t *testing.T, server *httptest.Server, tlsDir string) (string, string, string) {
++	t.Helper()
++	if err := os.MkdirAll(tlsDir, 0700); err != nil {
++		t.Fatal(err)
++	}
++	caFile := filepath.Join(tlsDir, "server-ca.pem")
++	serverCertificate := server.TLS.Certificates[0].Certificate[0]
++	if err := ioutil.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertificate}), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	clientTemplate := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "helm-test-client"},
++		NotBefore:    time.Now().Add(-time.Minute),
++		NotAfter:     time.Now().Add(time.Hour),
++		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
++	}
++	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, clientTemplate, &clientKey.PublicKey, clientKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	certFile := filepath.Join(tlsDir, "client.pem")
++	keyFile := filepath.Join(tlsDir, "client-key.pem")
++	if err := ioutil.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER}), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := ioutil.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)}), 0600); err != nil {
++		t.Fatal(err)
++	}
++	return certFile, keyFile, caFile
++}
++
++func TestHTTPGetterTLSClientConfig(t *testing.T) {
++	root := ensure.TempDir(t)
++	defer os.RemoveAll(root)
++	server, clientCertificateSeen := newTLSGetterTestServer(t)
++	defer server.Close()
++	certFile, keyFile, caFile := writeTLSGetterTestFiles(t, server, filepath.Join(root, "tls"))
++
++	fullTLSGetter, err := getter.NewHTTPGetter(
++		getter.WithURL(server.URL),
++		getter.WithTLSClientConfig(certFile, keyFile, caFile),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := fullTLSGetter.Get(server.URL); err != nil {
++		t.Fatalf("request with client credentials and custom server CA failed: %v", err)
++	}
++	if !<-clientCertificateSeen {
++		t.Fatal("server did not receive the configured client certificate")
++	}
++
++	caOnlyGetter, err := getter.NewHTTPGetter(
++		getter.WithURL(server.URL),
++		getter.WithTLSClientConfig("", "", caFile),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := caOnlyGetter.Get(server.URL); err != nil {
++		t.Fatalf("request with empty client-certificate paths and a custom server CA failed: %v", err)
++	}
++	if <-clientCertificateSeen {
++		t.Fatal("server received a client certificate when the client-certificate paths were empty")
++	}
++}
++
++func TestChartDownloaderUsesRepositoryTLSConfig(t *testing.T) {
++	root := ensure.TempDir(t)
++	defer os.RemoveAll(root)
++	server, clientCertificateSeen := newTLSGetterTestServer(t)
++	defer server.Close()
++	certFile, keyFile, caFile := writeTLSGetterTestFiles(t, server, filepath.Join(root, "tls"))
++	configPath := filepath.Join(root, "repositories.yaml")
++	config := repo.NewFile()
++	config.Add(&repo.Entry{
++		Name:     "tls-repository",
++		URL:      server.URL,
++		CertFile: certFile,
++		KeyFile:  keyFile,
++		CAFile:   caFile,
++	})
++	if err := config.WriteFile(configPath, 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	cacheDir := filepath.Join(root, "cache")
++	if err := os.MkdirAll(cacheDir, 0700); err != nil {
++		t.Fatal(err)
++	}
++	index := repo.NewIndexFile()
++	index.Add(&chart.Metadata{Name: "foo", Version: "1.2.3"}, "foo-1.2.3.tgz", server.URL, "")
++	if err := index.WriteFile(filepath.Join(cacheDir, "tls-repository-index.yaml"), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	dest := filepath.Join(root, "download")
++	if err := os.MkdirAll(dest, 0700); err != nil {
++		t.Fatal(err)
++	}
++	d := ChartDownloader{
++		Out:              os.Stderr,
++		Getters:          getter.All(&cli.EnvSettings{}),
++		RepositoryConfig: configPath,
++		RepositoryCache:  cacheDir,
++	}
++	if _, _, err := d.DownloadTo("tls-repository/foo", "1.2.3", dest); err != nil {
++		t.Fatalf("failed to download chart using repository TLS settings: %v", err)
++	}
++	if !<-clientCertificateSeen {
++		t.Fatal("chart repository request did not present its configured client certificate")
++	}
++}
++
++func TestChartDownloaderUsesRepositoryCAFileOnly(t *testing.T) {
++root := ensure.TempDir(t)
++defer os.RemoveAll(root)
++server, _ := newTLSGetterTestServer(t)
++defer server.Close()
++_, _, caFile := writeTLSGetterTestFiles(t, server, filepath.Join(root, "tls"))
++configPath := filepath.Join(root, "repositories.yaml")
++config := repo.NewFile()
++config.Add(&repo.Entry{
++Name:   "ca-repository",
++URL:    server.URL,
++CAFile: caFile,
++})
++if err := config.WriteFile(configPath, 0600); err != nil {
++t.Fatal(err)
++}
++
++cacheDir := filepath.Join(root, "cache")
++if err := os.MkdirAll(cacheDir, 0700); err != nil {
++t.Fatal(err)
++}
++index := repo.NewIndexFile()
++index.Add(&chart.Metadata{Name: "foo", Version: "1.2.3"}, "foo-1.2.3.tgz", server.URL, "")
++if err := index.WriteFile(filepath.Join(cacheDir, "ca-repository-index.yaml"), 0600); err != nil {
++t.Fatal(err)
++}
++
++dest := filepath.Join(root, "download")
++if err := os.MkdirAll(dest, 0700); err != nil {
++t.Fatal(err)
++}
++d := ChartDownloader{
++Out:              os.Stderr,
++Getters:          getter.All(&cli.EnvSettings{}),
++RepositoryConfig: configPath,
++RepositoryCache:  cacheDir,
++}
++if _, _, err := d.DownloadTo("ca-repository/foo", "1.2.3", dest); err != nil {
++t.Fatalf("failed to download chart using only the repository CA file: %v", err)
++}
++if _, err := os.Stat(filepath.Join(dest, "foo-1.2.3.tgz")); err != nil {
++t.Fatalf("chart was not saved: %v", err)
++}
++}
++
++func TestHelmPullUsesCommandLineTLSConfig(t *testing.T) {
++	root := ensure.TempDir(t)
++	defer os.RemoveAll(root)
++	server, clientCertificateSeen := newTLSGetterTestServer(t)
++	defer server.Close()
++	certFile, keyFile, caFile := writeTLSGetterTestFiles(t, server, filepath.Join(root, "tls"))
++	dest := filepath.Join(root, "download")
++	if err := os.MkdirAll(dest, 0700); err != nil {
++		t.Fatal(err)
++	}
++
++	cmd := exec.Command("go", "run", "../../cmd/helm", "pull", server.URL+"/chart-1.2.3.tgz",
++		"--cert-file", certFile, "--key-file", keyFile, "--ca-file", caFile,
++		"--destination", dest)
++	if output, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("helm pull with command-line TLS settings failed: %v\n%s", err, output)
++	}
++	if !<-clientCertificateSeen {
++		t.Fatal("chart download did not present the command-line client certificate")
++	}
++	if _, err := os.Stat(filepath.Join(dest, "chart-1.2.3.tgz")); err != nil {
++		t.Fatalf("helm pull did not save the downloaded chart: %v", err)
++	}
++}
++
+ func TestVerifyChart(t *testing.T) {
+ 	v, err := VerifyChart("testdata/signtest-0.1.0.tgz", "testdata/helm-test-key.pub")
+ 	if err != nil {

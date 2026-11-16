@@ -1,0 +1,254 @@
+diff --git a/src/ComposerIntegration/ComposerIntegrationHandler.php b/src/ComposerIntegration/ComposerIntegrationHandler.php
+index 05d9c8b..d246a49 100644
+--- a/src/ComposerIntegration/ComposerIntegrationHandler.php
++++ b/src/ComposerIntegration/ComposerIntegrationHandler.php
+@@ -25,6 +25,7 @@ class ComposerIntegrationHandler
+     public function __construct(
+         private readonly ContainerInterface $container,
+         private readonly QuieterConsoleIO $arrayCollectionIo,
++        private readonly VendorCleanup $vendorCleanup,
+     ) {
+     }
+ 
+@@ -86,5 +87,7 @@ class ComposerIntegrationHandler
+ 
+             throw ComposerRunFailed::fromExitCode($resultCode);
+         }
++
++        ($this->vendorCleanup)($composer);
+     }
+ }
+diff --git a/src/ComposerIntegration/PieComposerFactory.php b/src/ComposerIntegration/PieComposerFactory.php
+index 97063ab..d135e61 100644
+--- a/src/ComposerIntegration/PieComposerFactory.php
++++ b/src/ComposerIntegration/PieComposerFactory.php
+@@ -75,6 +75,7 @@ class PieComposerFactory extends Factory
+         );
+ 
+         OverrideWindowsUrlInstallListener::selfRegister($composer, $io, $container, $composerRequest);
++        RemoveUnrelatedInstallOperations::selfRegister($composer, $composerRequest);
+ 
+         $composer->getConfig()->merge(['config' => ['__PIE_REQUEST__' => $composerRequest]]);
+         $io->loadConfiguration($composer->getConfig());
+diff --git a/src/ComposerIntegration/PiePackageInstaller.php b/src/ComposerIntegration/PiePackageInstaller.php
+index 3604907..d2185cc 100644
+--- a/src/ComposerIntegration/PiePackageInstaller.php
++++ b/src/ComposerIntegration/PiePackageInstaller.php
+@@ -12,6 +12,7 @@ use Composer\PartialComposer;
+ use Composer\Repository\InstalledRepositoryInterface;
+ use Composer\Util\Filesystem;
+ use Php\Pie\ExtensionType;
++use Symfony\Component\Console\Output\OutputInterface;
+ 
+ use function sprintf;
+ 
+@@ -39,11 +40,14 @@ class PiePackageInstaller extends LibraryInstaller
+                 $output = $this->composerRequest->pieOutput;
+ 
+                 if ($this->composerRequest->requestedPackage->package !== $composerPackage->getName()) {
+-                    $output->writeln(sprintf(
+-                        '<error>Not using PIE to install %s as it was not the expected package %s</error>',
+-                        $composerPackage->getName(),
+-                        $this->composerRequest->requestedPackage->package,
+-                    ));
++                    $output->writeln(
++                        sprintf(
++                            '<comment>Skipping %s install request from Composer as it was not the expected PIE package %s</comment>',
++                            $composerPackage->getName(),
++                            $this->composerRequest->requestedPackage->package,
++                        ),
++                        OutputInterface::VERBOSITY_VERY_VERBOSE,
++                    );
+ 
+                     return null;
+                 }
+diff --git a/src/ComposerIntegration/RemoveUnrelatedInstallOperations.php b/src/ComposerIntegration/RemoveUnrelatedInstallOperations.php
+new file mode 100644
+index 0000000..874ce7e
+--- /dev/null
++++ b/src/ComposerIntegration/RemoveUnrelatedInstallOperations.php
+@@ -0,0 +1,90 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Php\Pie\ComposerIntegration;
++
++use Closure;
++use Composer\Composer;
++use Composer\DependencyResolver\Operation\InstallOperation;
++use Composer\DependencyResolver\Operation\OperationInterface;
++use Composer\DependencyResolver\Transaction;
++use Composer\Installer\InstallerEvent;
++use Composer\Installer\InstallerEvents;
++use Symfony\Component\Console\Output\OutputInterface;
++
++use function array_filter;
++use function assert;
++use function sprintf;
++
++/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
++class RemoveUnrelatedInstallOperations
++{
++    public function __construct(
++        private readonly PieComposerRequest $composerRequest,
++    ) {
++    }
++
++    public static function selfRegister(
++        Composer $composer,
++        PieComposerRequest $composerRequest,
++    ): void {
++        $composer
++            ->getEventDispatcher()
++            ->addListener(
++                InstallerEvents::PRE_OPERATIONS_EXEC,
++                new self($composerRequest),
++            );
++    }
++
++    /**
++     * @psalm-suppress InternalProperty
++     * @psalm-suppress InternalMethod
++     */
++    public function __invoke(InstallerEvent $installerEvent): void
++    {
++        $pieOutput = $this->composerRequest->pieOutput;
++
++        $newOperations = array_filter(
++            $installerEvent->getTransaction()?->getOperations() ?? [],
++            function (OperationInterface $operation) use ($pieOutput): bool {
++                if (! $operation instanceof InstallOperation) {
++                    $pieOutput->writeln(
++                        sprintf(
++                            'Unexpected operation during installer: %s',
++                            $operation::class,
++                        ),
++                        OutputInterface::VERBOSITY_VERY_VERBOSE,
++                    );
++
++                    return false;
++                }
++
++                $isRequestedPiePackage = $this->composerRequest->requestedPackage->package === $operation->getPackage()->getName();
++
++                if (! $isRequestedPiePackage) {
++                    $pieOutput->writeln(
++                        sprintf(
++                            'Filtering package %s from install operations, as it was not the requested package',
++                            $operation->getPackage()->getName(),
++                        ),
++                        OutputInterface::VERBOSITY_VERY_VERBOSE,
++                    );
++                }
++
++                return $isRequestedPiePackage;
++            },
++        );
++
++        $overrideOperations = Closure::Bind(
++            static function (Transaction $transaction) use ($newOperations): void {
++                /** @psalm-suppress InaccessibleProperty */
++                $transaction->operations = $newOperations;
++            },
++            null,
++            Transaction::class,
++        );
++        assert($overrideOperations !== null);
++        $overrideOperations($installerEvent->getTransaction());
++    }
++}
+diff --git a/src/ComposerIntegration/VendorCleanup.php b/src/ComposerIntegration/VendorCleanup.php
+new file mode 100644
+index 0000000..035c2d8
+--- /dev/null
++++ b/src/ComposerIntegration/VendorCleanup.php
+@@ -0,0 +1,88 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Php\Pie\ComposerIntegration;
++
++use Composer\Composer;
++use Composer\Util\Filesystem;
++use Symfony\Component\Console\Output\OutputInterface;
++
++use function array_filter;
++use function array_walk;
++use function in_array;
++use function is_array;
++use function scandir;
++use function sprintf;
++
++use const DIRECTORY_SEPARATOR;
++
++/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
++class VendorCleanup
++{
++    public function __construct(
++        private readonly OutputInterface $output,
++        private readonly Filesystem $filesystem,
++    ) {
++    }
++
++    public function __invoke(Composer $composer): void
++    {
++        $vendorDir      = (string) $composer->getConfig()->get('vendor-dir');
++        $vendorContents = scandir($vendorDir);
++
++        if (! is_array($vendorContents)) {
++            $this->output->writeln(
++                sprintf(
++                    '<comment>Vendor directory (vendor-dir config) %s seemed invalid?/comment>',
++                    $vendorDir,
++                ),
++                OutputInterface::VERBOSITY_VERY_VERBOSE,
++            );
++
++            return;
++        }
++
++        $toRemove = array_filter(
++            $vendorContents,
++            static function (string $path): bool {
++                return ! in_array(
++                    $path,
++                    [
++                        '.',
++                        '..',
++                        'autoload.php',
++                        'composer',
++                    ],
++                );
++            },
++        );
++
++        array_walk(
++            $toRemove,
++            function (string $pathToRemove) use ($vendorDir): void {
++                $fullPathToRemove = $vendorDir . DIRECTORY_SEPARATOR . $pathToRemove;
++
++                $this->output->writeln(
++                    sprintf(
++                        '<comment>Removing: %s</comment>',
++                        $fullPathToRemove,
++                    ),
++                    OutputInterface::VERBOSITY_VERY_VERBOSE,
++                );
++
++                if ($this->filesystem->remove($fullPathToRemove)) {
++                    return;
++                }
++
++                $this->output->writeln(
++                    sprintf(
++                        '<comment>Warning: failed to remove %s</comment>',
++                        $fullPathToRemove,
++                    ),
++                    OutputInterface::VERBOSITY_VERBOSE,
++                );
++            },
++        );
++    }
++}

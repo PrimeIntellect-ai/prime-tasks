@@ -1,0 +1,261 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9465c8862..b9545389f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -88,6 +88,10 @@
+ 
+   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+ 
++- Improved the error message for unknown record fields, displaying an additional
++  note on how to have a field accessor only if it makes sense.
++  ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
++
+ ### Formatter
+ 
+ ### Language Server
+diff --git a/compiler-core/src/error.rs b/compiler-core/src/error.rs
+index 4a5340dd8..5ae8042d4 100644
+--- a/compiler-core/src/error.rs
++++ b/compiler-core/src/error.rs
+@@ -3,7 +3,7 @@ use crate::build::{Outcome, Runtime, Target};
+ use crate::diagnostic::{Diagnostic, ExtraLabel, Label, Location};
+ use crate::type_::collapse_links;
+ use crate::type_::error::{MissingAnnotation, UnknownTypeHint};
+-use crate::type_::error::{Named, RecordVariants};
++use crate::type_::error::{Named, UnknownField};
+ use crate::type_::printer::{Names, Printer};
+ use crate::type_::{error::PatternMatchKind, FieldAccessUsage};
+ use crate::{ast::BinOp, parse::error::ParseErrorType, type_::Type};
+@@ -1580,7 +1580,7 @@ Hint: Add some type annotations and try again.")
+                     type_,
+                     label,
+                     fields,
+-                    variants,
++                    unknown_field: variants,
+                 } => {
+                     let mut printer = Printer::new(names);
+ 
+@@ -1601,8 +1601,9 @@ Hint: Add some type annotations and try again.")
+                         text.push_str(field);
+                     }
+ 
++
+                     match variants {
+-                        RecordVariants::HasVariants => {
++                        UnknownField::AppearsInAVariant => {
+                             let msg = wrap(
+                                 "Note: The field you are trying to \
+ access might not be consistently present or positioned across the custom \
+@@ -1612,7 +1613,7 @@ same position and has the same type in all variants to enable direct accessor sy
+                             text.push_str("\n\n");
+                             text.push_str(&msg);
+                         }
+-                        RecordVariants::NoVariants => (),
++                        UnknownField::TrulyUnknown => (),
+                     }
+ 
+                     // Give a hint about Gleam not having OOP methods if it
+diff --git a/compiler-core/src/type_.rs b/compiler-core/src/type_.rs
+index 38b3369e0..c3c062202 100644
+--- a/compiler-core/src/type_.rs
++++ b/compiler-core/src/type_.rs
+@@ -547,6 +547,16 @@ impl ValueConstructorVariant {
+             } => *implementations,
+         }
+     }
++
++    fn record_field_map(&self) -> Option<&FieldMap> {
++        match self {
++            ValueConstructorVariant::LocalVariable { .. }
++            | ValueConstructorVariant::ModuleConstant { .. }
++            | ValueConstructorVariant::LocalConstant { .. }
++            | ValueConstructorVariant::ModuleFn { .. } => None,
++            ValueConstructorVariant::Record { field_map, .. } => field_map.as_ref(),
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+diff --git a/compiler-core/src/type_/environment.rs b/compiler-core/src/type_/environment.rs
+index 9129bb1d8..2320cfeb3 100644
+--- a/compiler-core/src/type_/environment.rs
++++ b/compiler-core/src/type_/environment.rs
+@@ -468,6 +468,36 @@ impl<'a> Environment<'a> {
+         }
+     }
+ 
++    pub fn get_type_variants_fields(
++        &self,
++        module: &EcoString,
++        name: &EcoString,
++    ) -> Vec<&EcoString> {
++        self.get_constructors_for_type(module, name)
++            .iter()
++            .flat_map(|c| &c.variants)
++            .filter_map(|variant| {
++                self.type_value_constructor_to_constructor(module, variant)?
++                    .variant
++                    .record_field_map()
++            })
++            .flat_map(|field_map| field_map.fields.keys())
++            .collect_vec()
++    }
++
++    fn type_value_constructor_to_constructor(
++        &self,
++        module: &EcoString,
++        variant: &TypeValueConstructor,
++    ) -> Option<&ValueConstructor> {
++        if *module == self.current_module {
++            self.scope.get(&variant.name)
++        } else {
++            let (_, module) = self.imported_modules.get(module)?;
++            module.get_public_value(&variant.name)
++        }
++    }
++
+     pub fn insert_accessors(&mut self, type_name: EcoString, accessors: AccessorsMap) {
+         let _ = self.accessors.insert(type_name, accessors);
+     }
+diff --git a/compiler-core/src/type_/error.rs b/compiler-core/src/type_/error.rs
+index 7df7412ce..d860fc17d 100644
+--- a/compiler-core/src/type_/error.rs
++++ b/compiler-core/src/type_/error.rs
+@@ -66,10 +66,36 @@ pub struct UnknownType {
+     pub name: EcoString,
+ }
+ 
++/// This is used by the unknown record field error to tell if an unknown field
++/// is a field appearing in another variant of the same type to provide a better
++/// error message explaining why it can't be accessed:
++///
++/// ```gleam
++/// pub type Wibble {
++///   Wibble(field: Int)
++///   Wobble(thing: String)
++/// }
++///
++/// Wobble("hello").field
++/// //             ^^^^^^
++/// ```
++///
++/// Here the error can be extra useful and explain that to access `field` all
++/// variants should have that field at the same position and with the same type.
++///
+ #[derive(Debug, Eq, PartialEq, Clone, Copy)]
+-pub enum RecordVariants {
+-    HasVariants,
+-    NoVariants,
++pub enum UnknownField {
++    /// The field we're trying to access appears in at least a variant, so it
++    /// can be useulf to explain why it cannot be accessed and how to fix it
++    /// (adding it to all variants/making sure it has the same type/making sure
++    /// it's in the same position).
++    ///
++    AppearsInAVariant,
++
++    /// The field is not in any of the variants, this might truly be a typo and
++    /// there's no need to add further explanations.
++    ///
++    TrulyUnknown,
+ }
+ 
+ /// A suggestion for an unknown module
+@@ -183,7 +209,7 @@ pub enum Error {
+         label: EcoString,
+         fields: Vec<EcoString>,
+         usage: FieldAccessUsage,
+-        variants: RecordVariants,
++        unknown_field: UnknownField,
+     },
+ 
+     IncorrectArity {
+@@ -1300,12 +1326,6 @@ pub enum UnifyErrorSituation {
+     /// The operands of a binary operator were incorrect.
+     Operator(BinOp),
+ 
+-    /// A try expression returned a different error type to the previous try.
+-    TryErrorMismatch,
+-
+-    /// The final value of a try expression was not a Result.
+-    TryReturnResult,
+-
+     /// One of the elements of a list was not the same type as the others.
+     ListElementMismatch,
+ 
+@@ -1351,17 +1371,6 @@ annotation of this function.",
+             }
+             Self::Operator(_op) => None,
+ 
+-            Self::TryErrorMismatch => Some(
+-                "This returned value has a type incompatible with the previous try expression.
+-All the try expressions in a block and the final result value must have
+-the same error type.",
+-            ),
+-
+-            Self::TryReturnResult => Some(
+-                "This returned value has a type incompatible with the previous try expression.
+-The returned value after a try must be of type Result.",
+-            ),
+-
+             Self::ListElementMismatch => Some(
+                 "All elements of a list must be the same type, but this one doesn't
+ match the one before it.",
+@@ -1434,14 +1443,6 @@ impl UnifyError {
+         self.with_unify_error_situation(UnifyErrorSituation::Operator(binop))
+     }
+ 
+-    pub fn inconsistent_try(self, return_value_is_result: bool) -> Self {
+-        self.with_unify_error_situation(if return_value_is_result {
+-            UnifyErrorSituation::TryErrorMismatch
+-        } else {
+-            UnifyErrorSituation::TryReturnResult
+-        })
+-    }
+-
+     pub fn into_error(self, location: SrcSpan) -> Error {
+         match self {
+             Self::CouldNotUnify {
+diff --git a/compiler-core/src/type_/expression.rs b/compiler-core/src/type_/expression.rs
+index 0785f7271..834796bba 100644
+--- a/compiler-core/src/type_/expression.rs
++++ b/compiler-core/src/type_/expression.rs
+@@ -2232,19 +2232,13 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
+             });
+         }
+ 
+-        let has_variants = match &*record_type {
+-            Type::Named { name, .. } => self
++        let appears_in_a_variant = match &*record_type {
++            Type::Named { module, name, .. } => self
+                 .environment
+-                .module_types_constructors
+-                .get(name)
+-                .map_or(RecordVariants::NoVariants, |type_variant_constructors| {
+-                    if type_variant_constructors.variants.len() > 1 {
+-                        RecordVariants::HasVariants
+-                    } else {
+-                        RecordVariants::NoVariants
+-                    }
+-                }),
+-            _ => RecordVariants::NoVariants,
++                .get_type_variants_fields(module, name)
++                .iter()
++                .contains(&&label),
++            _ => false,
+         };
+ 
+         let unknown_field = |fields| Error::UnknownRecordField {
+@@ -2253,7 +2247,11 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
+             location,
+             label: label.clone(),
+             fields,
+-            variants: has_variants,
++            unknown_field: if appears_in_a_variant {
++                UnknownField::AppearsInAVariant
++            } else {
++                UnknownField::TrulyUnknown
++            },
+         };
+         let accessors = match collapse_links(record_type.clone()).as_ref() {
+             // A type in the current module which may have fields

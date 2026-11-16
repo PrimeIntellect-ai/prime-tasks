@@ -1,0 +1,440 @@
+diff --git a/.eslintrc.yml b/.eslintrc.yml
+index 1c765b1..e4ece69 100644
+--- a/.eslintrc.yml
++++ b/.eslintrc.yml
+@@ -22,6 +22,9 @@ rules:
+     - allowExpressions: true
+       allowTypedFunctionExpressions: true
+       allowHigherOrderFunctions: true
++  '@typescript-eslint/no-empty-interface':
++    - error
++    - allowSingleExtends: true
+   'prettier/prettier':
+     - error
+     - singleQuote: true
+diff --git a/.gitignore b/.gitignore
+index 63c4469..759b56f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -94,4 +94,4 @@ typings/
+ /extractedTranslations/
+ 
+ # Test files
+-.extracted/
+\ No newline at end of file
++/tests/**/*.extracted/
+diff --git a/README.md b/README.md
+index 4c1f284..21d14f1 100644
+--- a/README.md
++++ b/README.md
+@@ -92,7 +92,8 @@ https://babeljs.io/docs/en/configuration) documentation to get started.
+ | defaultValue | `string` or `null` | Default value for extracted keys. | `''` (empty string) |
+ | keyAsDefaultValue | `boolean` or `string[]` | If true, use the extracted key as defaultValue (ignoring `defaultValue` option). You can also specify an array of locales to apply this behavior only to a specific set locales (e.g. if you keys are in plain english, you may want to set this option to `['en']`). | `false` |
+ | keyAsDefaultValueForDerivedKeys | `boolean` | If false and `keyAsDefaultValue` is enabled, don't use derived keys (plural forms or contexts) as default value. `defaultValue` will be used instead. | `true` |
+-| exporterJsonSpace | `number` | Number of indentation space to use in extracted JSON files. | 2 |
++| discardOldKeys | `boolean` | When set to `true`, keys that no longer exist are removed from the JSON files. By default, new keys will be added to the JSON files and never removed. | `false` |
++| jsonSpace | `number` | Number of indentation space to use in extracted JSON files. | `2` |
+ 
+ ## Comment hints
+ 
+diff --git a/src/config.ts b/src/config.ts
+index b7aac33..6feb35c 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -14,7 +14,8 @@ export interface Config {
+   defaultValue: string | null;
+   keyAsDefaultValue: boolean | string[];
+   keyAsDefaultValueForDerivedKeys: boolean;
+-  exporterJsonSpace: string | number;
++  discardOldKeys: boolean;
++  jsonSpace: string | number;
+ }
+ 
+ function coalesce<T>(v: T | undefined, defaultVal: T): T {
+@@ -50,6 +51,7 @@ export function parseConfig(opts: Partial<Config>): Config {
+       opts.keyAsDefaultValueForDerivedKeys,
+       true,
+     ),
+-    exporterJsonSpace: coalesce(opts.exporterJsonSpace, 2),
++    discardOldKeys: coalesce(opts.discardOldKeys, false),
++    jsonSpace: coalesce(opts.jsonSpace, 2),
+   };
+ }
+diff --git a/src/exporter.ts b/src/exporter.ts
+index ee62c6b..01ce9eb 100644
+--- a/src/exporter.ts
++++ b/src/exporter.ts
+@@ -4,20 +4,124 @@ import { TranslationKey } from './keys';
+ import { Config } from './config';
+ import { PLUGIN_NAME } from './constants';
+ 
++/**
++ * Thrown when an error happens during the translations export.
++ */
+ export class ExportError extends Error {}
+ 
++/**
++ * A deep, recursive object which leaves must be of generic type V.
++ */
+ interface DeepObject<V = string> {
+   [k: string]: DeepObject<V> | V;
+ }
+ 
++/**
++ * Content of a translation file. Just a deep JSON with only objects.
++ */
++interface TranslationFile extends DeepObject<string | null> {}
++
++/**
++ * Flat version of TranslationFile. This is mainly used to simplify merging
++ * translations.
++ */
++interface FlatTranslationFile {
++  [keyPathAsJSON: string]: string | null;
++}
++
++/**
++ * An instance of exporter cache.
++ *
++ * See createExporterCache for details.
++ */
++export interface ExporterCache {
++  originalTranslationFiles: { [path: string]: FlatTranslationFile };
++  currentTranslationFiles: { [path: string]: FlatTranslationFile };
++}
++
++/**
++ * This creates a new empty cache for the exporter.
++ *
++ * The cache is required by the exporter and is used to merge the translations
++ * from the original translation file. It will be  mutated by the exporter
++ * and the same instance must be given untouched across export calls.
++ */
++export function createExporterCache(): ExporterCache {
++  return {
++    originalTranslationFiles: {},
++    currentTranslationFiles: {},
++  };
++}
++
++/**
++ * Take a deep translation file and flatten it.
++ * This is to simplify merging keys later on.
++ *
++ * @param deep Deep translation file.
++ */
++function flattenTranslationFile(deep: TranslationFile): FlatTranslationFile {
++  const result: FlatTranslationFile = {};
++
++  for (const [k, v] of Object.entries(deep)) {
++    if (typeof v === 'object' && v !== null) {
++      // Nested case, we must recurse
++      const flat = flattenTranslationFile(v);
++      for (const [flatK, flatV] of Object.entries(flat)) {
++        result[JSON.stringify([k, ...JSON.parse(flatK)])] = flatV;
++      }
++    } else {
++      // Leaf, just set the value.
++      result[JSON.stringify([k])] = v;
++    }
++  }
++
++  return result;
++}
++
++/**
++ * Take a flat translation file and make it deep.
++ *
++ * This is to make a flat translation file ready to be exported to a file.
++ *
++ * @param flat Flat translation file as returned by flattenTranslationFile
++ */
++function unflattenTranslationFile(flat: FlatTranslationFile): TranslationFile {
++  const result: TranslationFile = {};
++
++  for (const [k, v] of Object.entries(flat)) {
++    const keyPath = JSON.parse(k);
++    const cleanKey = keyPath.pop();
++    const error = new ExportError(
++      `${PLUGIN_NAME}: Couldn't export translations. Key "${keyPath}" ` +
++        `has a conflict.`,
++    );
++
++    let obj = result;
++    for (const p of keyPath) {
++      const currentValue = obj[p];
++      if (typeof currentValue === 'string' || currentValue === null) {
++        throw error;
++      }
++      obj = obj[p] = currentValue || {};
++    }
++
++    const currentValue = obj[cleanKey];
++    if (typeof currentValue === 'object' && currentValue !== null) {
++      throw error;
++    }
++    obj[cleanKey] = v;
++  }
++
++  return result;
++}
++
+ /**
+  * Load translation given a file. If the file is not found, default to empty
+- * object
++ * object.
+  * @param filePath Path of the JSON translation file to load.
+  */
+-function loadTranslationFile(filePath: string): DeepObject<string | null> {
++function loadTranslationFile(filePath: string): FlatTranslationFile {
+   let content: string;
+-
+   try {
+     content = fs.readFileSync(filePath, { encoding: 'utf8' });
+   } catch (err) {
+@@ -25,25 +129,63 @@ function loadTranslationFile(filePath: string): DeepObject<string | null> {
+     throw err;
+   }
+ 
+-  const obj = JSON.parse(content);
+-  return obj;
++  return flattenTranslationFile(JSON.parse(content));
+ }
+ 
+ /**
+- * Exports all given translation keyr as JSON.
++ * Create a new translationFile with a key added to it.
++ *
++ * @param translationFile The translation file to add the key to.
++ * @param key The translation key to add.
++ * @param locale Current locale being exported
++ * @param config Configuration (that will help setting the proper default
++ *   value)
++ */
++function addKeyToTranslationFile(
++  translationFile: FlatTranslationFile,
++  key: TranslationKey,
++  locale: string,
++  config: Config,
++): FlatTranslationFile {
++  // compute the default value
++  let defaultValue = config.defaultValue;
++  const keyAsDefaultValueEnabled =
++    config.keyAsDefaultValue === true ||
++    (Array.isArray(config.keyAsDefaultValue) &&
++      config.keyAsDefaultValue.includes(locale));
++  const keyAsDefaultValueForDerivedKeys =
++    config.keyAsDefaultValueForDerivedKeys;
++  if (
++    keyAsDefaultValueEnabled &&
++    (keyAsDefaultValueForDerivedKeys || !key.isDerivedKey)
++  ) {
++    defaultValue = key.cleanKey;
++  }
++
++  return {
++    [JSON.stringify([...key.keyPath, key.cleanKey])]: defaultValue,
++    ...translationFile,
++  };
++}
++
++/**
++ * Exports all given translation keys as JSON.
+  *
+  * @param keys: translation keys to export
+  * @param locale: the locale to export
+  * @param config: plugin configuration
++ * @param cache: cache instance to use (see createExporterCache)
+  */
+ export default function exportTranslationKeys(
+   keys: TranslationKey[],
+   locale: string,
+   config: Config,
++  cache: ExporterCache,
+ ): void {
+-  const keysPerFilepath: { [filename: string]: TranslationKey[] } = {};
++  const keysPerFilepath: { [path: string]: TranslationKey[] } = {};
+ 
+   for (const key of keys) {
++    // Figure out in which path each key should go.
+     const filePath = config.outputPath
+       .replace('{{locale}}', locale)
+       .replace('{{ns}}', key.ns);
+@@ -51,46 +193,46 @@ export default function exportTranslationKeys(
+   }
+ 
+   for (const [filePath, keysForFilepath] of Object.entries(keysPerFilepath)) {
+-    let obj: DeepObject<string | null> = {};
+-    obj = loadTranslationFile(filePath);
+-    const originalObject = obj;
++    if (!(filePath in cache.originalTranslationFiles)) {
++      // Cache original translation file so that we don't loose it across babel
++      // passes.
++      cache.originalTranslationFiles[filePath] = loadTranslationFile(filePath);
++    }
++
++    let translationFile = cache.currentTranslationFiles[filePath] || {};
+ 
+     for (const k of keysForFilepath) {
+-      // resolve key path
+-      for (const p of k.keyPath) {
+-        let value = obj[p];
+-        if (value === undefined) {
+-          value = obj[p] = {};
+-        }
+-        if (typeof value === 'string' || value === null) {
+-          throw new ExportError(
+-            `${PLUGIN_NAME}: Couldn't export translations. Key "${k.key}" ` +
+-              `has conflict.`,
+-          );
+-        }
+-        obj = value;
+-      }
++      translationFile = addKeyToTranslationFile(
++        translationFile,
++        k,
++        locale,
++        config,
++      );
++    }
+ 
+-      // The key was already exported.
+-      if (obj[k.cleanKey] !== undefined) {
+-        continue;
+-      }
++    cache.currentTranslationFiles[filePath] = translationFile;
+ 
+-      // Set the default values for the path
+-      let defaultValue = config.defaultValue;
+-      const keyAsDefaultValueEnabled =
+-        config.keyAsDefaultValue === true ||
+-        (Array.isArray(config.keyAsDefaultValue) &&
+-          config.keyAsDefaultValue.includes(locale));
+-      const keyAsDefaultValueForDerivedKeys =
+-        config.keyAsDefaultValueForDerivedKeys;
+-      if (
+-        keyAsDefaultValueEnabled &&
+-        (keyAsDefaultValueForDerivedKeys || !k.isDerivedKey)
+-      ) {
+-        defaultValue = k.cleanKey;
+-      }
+-      obj[k.cleanKey] = defaultValue;
++    let deepTranslationFile: TranslationFile;
++    if (config.discardOldKeys) {
++      const originalTranslationFile = cache.originalTranslationFiles[filePath];
++      const alreadyTranslated = Object.keys(originalTranslationFile)
++        .filter(k => k in translationFile)
++        .reduce<FlatTranslationFile>(
++          (accumulator, k) => ({
++            ...accumulator,
++            [k]: originalTranslationFile[k],
++          }),
++          {},
++        );
++      deepTranslationFile = unflattenTranslationFile({
++        ...translationFile,
++        ...alreadyTranslated,
++      });
++    } else {
++      deepTranslationFile = unflattenTranslationFile({
++        ...translationFile,
++        ...cache.originalTranslationFiles[filePath],
++      });
+     }
+ 
+     // Finally do the export
+@@ -98,7 +240,7 @@ export default function exportTranslationKeys(
+     fs.mkdirSync(directoryPath, { recursive: true });
+     fs.writeFileSync(
+       filePath,
+-      JSON.stringify(originalObject, null, config.exporterJsonSpace),
++      JSON.stringify(deepTranslationFile, null, config.jsonSpace),
+       {
+         encoding: 'utf8',
+       },
+diff --git a/src/plugin.ts b/src/plugin.ts
+index 4222954..fdcd377 100644
+--- a/src/plugin.ts
++++ b/src/plugin.ts
+@@ -9,7 +9,10 @@ import extractTranslationRenderProp from './extractors/translationRenderProp';
+ import extractTransComponent from './extractors/transComponent';
+ import { computeDerivedKeys, ExtractedKey, TranslationKey } from './keys';
+ import { Config, parseConfig } from './config';
+-import exportTranslationKeys from './exporter';
++import exportTranslationKeys, {
++  ExporterCache,
++  createExporterCache,
++} from './exporter';
+ import { PLUGIN_NAME } from './constants';
+ import extractWithTranslationHOC from './extractors/withTranslationHOC';
+ 
+@@ -26,12 +29,10 @@ interface I18NextExtractState {
+   extractedKeys: ExtractedKey[];
+   commentHints: CommentHint[];
+   config: Config;
++  extractedNodes: WeakSet<BabelTypes.Node>;
++  exporterCache: ExporterCache;
+ }
+ 
+-// We have to store which nodes were extracted because the plugin might be called multiple times
+-// by Babel and the state would be lost across calls.
+-const extractedNodes = new WeakSet<BabelTypes.Node>();
+-
+ /**
+  * Handle the extraction.
+  *
+@@ -49,14 +50,15 @@ function handleExtraction<T>(
+ ): T | undefined {
+   const filename = (state.file && state.file.opts.filename) || '???';
+   const lineNumber = (path.node.loc && path.node.loc.start.line) || '???';
++  const extractState = state.I18NextExtract;
+ 
+   const collect = (keys: ExtractedKey[]): void => {
+     for (const key of keys) {
+-      if (extractedNodes.has(key.nodePath.node)) {
++      if (extractState.extractedNodes.has(key.nodePath.node)) {
+         // The node was already extracted. Skip it.
+         continue;
+       }
+-      extractedNodes.add(key.nodePath.node);
++      extractState.extractedNodes.add(key.nodePath.node);
+       state.I18NextExtract.extractedKeys.push(key);
+     }
+   };
+@@ -149,12 +151,22 @@ export default function(
+ ): BabelCore.PluginObj<VisitorState> {
+   api.assertVersion(7);
+ 
++  // We have to store which nodes were extracted because the visitor might be
++  // called multiple times by Babel and the state would be lost across calls.
++  const extractedNodes = new WeakSet<BabelTypes.Node>();
++
++  // This is a cache for the exporter to keep track of the translation files.
++  // It must remain global and persist across transpiled files.
++  const exporterCache = createExporterCache();
++
+   return {
+     pre() {
+       this.I18NextExtract = {
+         config: parseConfig(this.opts),
+         extractedKeys: [],
+         commentHints: [],
++        extractedNodes,
++        exporterCache,
+       };
+     },
+ 
+@@ -171,7 +183,12 @@ export default function(
+           ],
+           Array<TranslationKey>(),
+         );
+-        exportTranslationKeys(derivedKeys, locale, extractState.config);
++        exportTranslationKeys(
++          derivedKeys,
++          locale,
++          extractState.config,
++          extractState.exporterCache,
++        );
+       }
+     },
+ 

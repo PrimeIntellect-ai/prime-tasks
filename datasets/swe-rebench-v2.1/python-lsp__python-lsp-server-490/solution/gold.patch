@@ -1,0 +1,240 @@
+diff --git a/pylsp/plugins/flake8_lint.py b/pylsp/plugins/flake8_lint.py
+index 8d8d4c5..77aa22b 100644
+--- a/pylsp/plugins/flake8_lint.py
++++ b/pylsp/plugins/flake8_lint.py
+@@ -9,9 +9,13 @@ import sys
+ from pathlib import PurePath
+ from subprocess import PIPE, Popen
+ 
++from flake8.plugins.pyflakes import FLAKE8_PYFLAKES_CODES
++
+ from pylsp import hookimpl, lsp
++from pylsp.plugins.pyflakes_lint import PYFLAKES_ERROR_MESSAGES
+ 
+ log = logging.getLogger(__name__)
++
+ FIX_IGNORES_RE = re.compile(r"([^a-zA-Z0-9_,]*;.*(\W+||$))")
+ UNNECESSITY_CODES = {
+     "F401",  # `module` imported but unused
+@@ -20,6 +24,14 @@ UNNECESSITY_CODES = {
+     "F523",  # .format(...) unused positional arguments
+     "F841",  # local variable `name` is assigned to but never used
+ }
++# NOTE: If the user sets the flake8 executable with workspace configuration, the
++# error codes in this set may be inaccurate.
++ERROR_CODES = (
++    # Errors from the pyflakes plugin of flake8
++    {FLAKE8_PYFLAKES_CODES.get(m.__name__, "E999") for m in PYFLAKES_ERROR_MESSAGES}
++    # Syntax error from flake8 itself
++    | {"E999"}
++)
+ 
+ 
+ @hookimpl
+@@ -208,7 +220,7 @@ def parse_stdout(source, stdout):
+         # show also the code in message
+         msg = code + " " + msg
+         severity = lsp.DiagnosticSeverity.Warning
+-        if code == "E999" or code[0] == "F":
++        if code in ERROR_CODES:
+             severity = lsp.DiagnosticSeverity.Error
+         diagnostic = {
+             "source": "flake8",
+diff --git a/pylsp/plugins/jedi_completion.py b/pylsp/plugins/jedi_completion.py
+index 2ecf0be..65f7523 100644
+--- a/pylsp/plugins/jedi_completion.py
++++ b/pylsp/plugins/jedi_completion.py
+@@ -88,6 +88,7 @@ def pylsp_completions(config, document, position):
+             include_params=include_params if c.type in ["class", "function"] else False,
+             resolve=resolve_eagerly,
+             resolve_label_or_snippet=(i < max_to_resolve),
++            snippet_support=snippet_support,
+         )
+         for i, c in enumerate(completions)
+     ]
+@@ -102,6 +103,7 @@ def pylsp_completions(config, document, position):
+                     include_params=False,
+                     resolve=resolve_eagerly,
+                     resolve_label_or_snippet=(i < max_to_resolve),
++                    snippet_support=snippet_support,
+                 )
+                 completion_dict["kind"] = lsp.CompletionItemKind.TypeParameter
+                 completion_dict["label"] += " object"
+@@ -116,6 +118,7 @@ def pylsp_completions(config, document, position):
+                     include_params=False,
+                     resolve=resolve_eagerly,
+                     resolve_label_or_snippet=(i < max_to_resolve),
++                    snippet_support=snippet_support,
+                 )
+                 completion_dict["kind"] = lsp.CompletionItemKind.TypeParameter
+                 completion_dict["label"] += " object"
+@@ -226,6 +229,7 @@ def _format_completion(
+     include_params=True,
+     resolve=False,
+     resolve_label_or_snippet=False,
++    snippet_support=False,
+ ):
+     completion = {
+         "label": _label(d, resolve_label_or_snippet),
+@@ -240,16 +244,20 @@ def _format_completion(
+     # Adjustments for file completions
+     if d.type == "path":
+         path = os.path.normpath(d.name)
+-        path = path.replace("\\", "\\\\")
+-        path = path.replace("/", "\\/")
+ 
+-        # If the completion ends with os.sep, it means it's a directory. So we add an escaped os.sep
+-        # at the end to ease additional file completions.
++        # If the completion ends with os.sep, it means it's a directory. So we add os.sep at the end
++        # to ease additional file completions.
+         if d.name.endswith(os.sep):
+             if os.name == "nt":
+-                path = path + "\\\\"
++                path = path + "\\"
+             else:
+-                path = path + "\\/"
++                path = path + "/"
++
++        # Escape to prevent conflicts with the code snippets grammer
++        # See also https://github.com/python-lsp/python-lsp-server/issues/373
++        if snippet_support:
++            path = path.replace("\\", "\\\\")
++            path = path.replace("/", "\\/")
+ 
+         completion["insertText"] = path
+ 
+diff --git a/pylsp/plugins/rope_autoimport.py b/pylsp/plugins/rope_autoimport.py
+index ca3db1c..ebcc707 100644
+--- a/pylsp/plugins/rope_autoimport.py
++++ b/pylsp/plugins/rope_autoimport.py
+@@ -295,7 +295,7 @@ def pylsp_code_actions(
+         word = get_name_or_module(document, diagnostic)
+         log.debug(f"autoimport: searching for word: {word}")
+         rope_config = config.settings(document_path=document.path).get("rope", {})
+-        autoimport = workspace._rope_autoimport(rope_config, feature="code_actions")
++        autoimport = workspace._rope_autoimport(rope_config)
+         suggestions = list(autoimport.search_full(word))
+         log.debug("autoimport: suggestions: %s", suggestions)
+         results = list(
+diff --git a/pylsp/python_lsp.py b/pylsp/python_lsp.py
+index 52a22a3..a31e761 100644
+--- a/pylsp/python_lsp.py
++++ b/pylsp/python_lsp.py
+@@ -687,7 +687,36 @@ class PythonLSPServer(MethodDispatcher):
+     def m_text_document__code_lens(self, textDocument=None, **_kwargs):
+         return self.code_lens(textDocument["uri"])
+ 
++    def _cell_document__completion(self, cellDocument, position=None, **_kwargs):
++        workspace = self._match_uri_to_workspace(cellDocument.notebook_uri)
++        notebookDocument = workspace.get_maybe_document(cellDocument.notebook_uri)
++        if notebookDocument is None:
++            raise ValueError("Invalid notebook document")
++
++        cell_data = notebookDocument.cell_data()
++
++        # Concatenate all cells to be a single temporary document
++        total_source = "\n".join(data["source"] for data in cell_data.values())
++        with workspace.temp_document(total_source) as temp_uri:
++            # update position to be the position in the temp document
++            if position is not None:
++                position["line"] += cell_data[cellDocument.uri]["line_start"]
++
++            completions = self.completions(temp_uri, position)
++
++            # Translate temp_uri locations to cell document locations
++            for item in completions.get("items", []):
++                if item.get("data", {}).get("doc_uri") == temp_uri:
++                    item["data"]["doc_uri"] = cellDocument.uri
++
++            return completions
++
+     def m_text_document__completion(self, textDocument=None, position=None, **_kwargs):
++        # textDocument here is just a dict with a uri
++        workspace = self._match_uri_to_workspace(textDocument["uri"])
++        document = workspace.get_document(textDocument["uri"])
++        if isinstance(document, Cell):
++            return self._cell_document__completion(document, position, **_kwargs)
+         return self.completions(textDocument["uri"], position)
+ 
+     def _cell_document__definition(self, cellDocument, position=None, **_kwargs):
+diff --git a/pylsp/workspace.py b/pylsp/workspace.py
+index 5c6880c..5e8e548 100644
+--- a/pylsp/workspace.py
++++ b/pylsp/workspace.py
+@@ -8,7 +8,7 @@ import os
+ import re
+ import uuid
+ import functools
+-from typing import Literal, Optional, Generator, Callable, List
++from typing import Optional, Generator, Callable, List
+ from threading import RLock
+ 
+ import jedi
+@@ -58,30 +58,20 @@ class Workspace:
+         # Whilst incubating, keep rope private
+         self.__rope = None
+         self.__rope_config = None
+-
+-        # We have a sperate AutoImport object for each feature to avoid sqlite errors
+-        # from accessing the same database from multiple threads.
+-        # An upstream fix discussion is here: https://github.com/python-rope/rope/issues/713
+-        self.__rope_autoimport = (
+-            {}
+-        )  # Type: Dict[Literal["completions", "code_actions"], rope.contrib.autoimport.sqlite.AutoImport]
++        self.__rope_autoimport = None
+ 
+     def _rope_autoimport(
+         self,
+         rope_config: Optional,
+         memory: bool = False,
+-        feature: Literal["completions", "code_actions"] = "completions",
+     ):
+         # pylint: disable=import-outside-toplevel
+         from rope.contrib.autoimport.sqlite import AutoImport
+ 
+-        if feature not in ["completions", "code_actions"]:
+-            raise ValueError(f"Unknown feature {feature}")
+-
+-        if self.__rope_autoimport.get(feature, None) is None:
++        if self.__rope_autoimport is None:
+             project = self._rope_project_builder(rope_config)
+-            self.__rope_autoimport[feature] = AutoImport(project, memory=memory)
+-        return self.__rope_autoimport[feature]
++            self.__rope_autoimport = AutoImport(project, memory=memory)
++        return self.__rope_autoimport
+ 
+     def _rope_project_builder(self, rope_config):
+         # pylint: disable=import-outside-toplevel
+@@ -388,8 +378,8 @@ class Workspace:
+         )
+ 
+     def close(self):
+-        for _, autoimport in self.__rope_autoimport.items():
+-            autoimport.close()
++        if self.__rope_autoimport:
++            self.__rope_autoimport.close()
+ 
+ 
+ class Document:
+diff --git a/pyproject.toml b/pyproject.toml
+index 1756952..be764e4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -34,7 +34,7 @@ all = [
+     "pydocstyle>=6.3.0,<6.4.0",
+     "pyflakes>=3.1.0,<3.2.0",
+     "pylint>=2.5.0,<3.1",
+-    "rope>1.2.0",
++    "rope>=1.11.0",
+     "yapf>=0.33.0",
+     "whatthepatch>=1.0.2,<2.0.0"
+ ]
+@@ -45,7 +45,7 @@ pycodestyle = ["pycodestyle>=2.11.0,<2.12.0"]
+ pydocstyle = ["pydocstyle>=6.3.0,<6.4.0"]
+ pyflakes = ["pyflakes>=3.1.0,<3.2.0"]
+ pylint = ["pylint>=2.5.0,<3.1"]
+-rope = ["rope>1.2.0"]
++rope = ["rope>=1.11.0"]
+ yapf = ["yapf>=0.33.0", "whatthepatch>=1.0.2,<2.0.0"]
+ websockets = ["websockets>=10.3"]
+ test = [

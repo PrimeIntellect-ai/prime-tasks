@@ -1,0 +1,213 @@
+diff --git a/.gitignore b/.gitignore
+index f4a3fee..4e432cc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -21,6 +21,7 @@ develop-eggs
+ 
+ # Installer logs
+ pip-log.txt
++get-pip.py
+ 
+ # Unit test / coverage reports
+ coverage
+diff --git a/gpiozero/devices.py b/gpiozero/devices.py
+index 67a6248..62eaac4 100644
+--- a/gpiozero/devices.py
++++ b/gpiozero/devices.py
+@@ -11,13 +11,11 @@ import os
+ import atexit
+ import weakref
+ import warnings
+-from collections import namedtuple
++from collections import namedtuple, OrderedDict
+ from itertools import chain
+ from types import FunctionType
+ from threading import Lock
+ 
+-import pkg_resources
+-
+ from .pins import Pin
+ from .threads import _threads_shutdown
+ from .mixins import (
+@@ -199,6 +197,8 @@ class Device(ValuesMixin, GPIOBase):
+         # Force pin_factory to be keyword-only, even in Python 2
+         pin_factory = kwargs.pop('pin_factory', None)
+         if pin_factory is None:
++            if Device.pin_factory is None:
++                Device.pin_factory = Device._default_pin_factory()
+             self.pin_factory = Device.pin_factory
+         else:
+             self.pin_factory = pin_factory
+@@ -207,6 +207,54 @@ class Device(ValuesMixin, GPIOBase):
+                             "argument '%s'" % kwargs.popitem()[0])
+         super(Device, self).__init__()
+ 
++    @staticmethod
++    def _default_pin_factory(name=os.getenv('GPIOZERO_PIN_FACTORY', None)):
++        # We prefer RPi.GPIO here as it supports PWM, and all Pi revisions.  If
++        # no third-party libraries are available, however, we fall back to a
++        # pure Python implementation which supports platforms like PyPy
++        #
++        # NOTE: If the built-in pin factories are expanded, this dict must be
++        # updated along with the entry-points in setup.py.
++        default_factories = OrderedDict({
++            'rpigpio': 'gpiozero.pins.rpigpio:RPiGPIOFactory',
++            'rpio':    'gpiozero.pins.rpio:RPIOFactory',
++            'pigpio':  'gpiozero.pins.pigpio:PiGPIOFactory',
++            'native':  'gpiozero.pins.native:NativeFactory',
++        })
++        if name is None:
++            # If no factory is explicitly specified, try various names in
++            # "preferred" order. For speed, we select from the dictionary above
++            # rather than importing pkg_resources and using load_entry_point
++            for name, entry_point in default_factories.items():
++                try:
++                    mod_name, cls_name = entry_point.split(':', 1)
++                    module = __import__(mod_name, fromlist=(cls_name,))
++                    return getattr(module, cls_name)()
++                except Exception as e:
++                    warnings.warn(
++                        PinFactoryFallback(
++                            'Falling back from %s: %s' % (name, str(e))))
++            raise BadPinFactory('Unable to load any default pin factory!')
++        elif name in default_factories:
++            # As above, this is a fast-path optimization to avoid loading
++            # pkg_resources (which it turns out was 80% of gpiozero's import
++            # time!)
++            mod_name, cls_name = default_factories[name].split(':', 1)
++            module = __import__(mod_name, fromlist=(cls_name,))
++            return getattr(module, cls_name)()
++        else:
++            # Slow path: load pkg_resources and try and find the specified
++            # entry-point. Try with the name verbatim first. If that fails,
++            # attempt with the lower-cased name (this ensures compatibility
++            # names work but we're still case insensitive for all factories)
++            import pkg_resources
++            group = 'gpiozero_pin_factories'
++            for factory in pkg_resources.iter_entry_points(group, name):
++                return factory.load()()
++            for factory in pkg_resources.iter_entry_points(group, name.lower()):
++                return factory.load()()
++            raise BadPinFactory('Unable to find pin factory "%s"' % name)
++
+     def __repr__(self):
+         return "<gpiozero.%s object>" % (self.__class__.__name__)
+ 
+@@ -427,43 +475,8 @@ class GPIODevice(Device):
+             return "<gpiozero.%s object closed>" % self.__class__.__name__
+ 
+ 
+-# Defined last to ensure Device is defined before attempting to load any pin
+-# factory; pin factories want to load spi which in turn relies on devices (for
+-# the soft-SPI implementation)
+-def _default_pin_factory(name=os.getenv('GPIOZERO_PIN_FACTORY', None)):
+-    group = 'gpiozero_pin_factories'
+-    if name is None:
+-        # If no factory is explicitly specified, try various names in
+-        # "preferred" order. Note that in this case we only select from
+-        # gpiozero distribution so without explicitly specifying a name (via
+-        # the environment) it's impossible to auto-select a factory from
+-        # outside the base distribution
+-        #
+-        # We prefer RPi.GPIO here as it supports PWM, and all Pi revisions. If
+-        # no third-party libraries are available, however, we fall back to a
+-        # pure Python implementation which supports platforms like PyPy
+-        dist = pkg_resources.get_distribution('gpiozero')
+-        for name in ('rpigpio', 'rpio', 'pigpio', 'native'):
+-            try:
+-                return pkg_resources.load_entry_point(dist, group, name)()
+-            except Exception as e:
+-                warnings.warn(
+-                    PinFactoryFallback(
+-                        'Falling back from %s: %s' % (name, str(e))))
+-        raise BadPinFactory('Unable to load any default pin factory!')
+-    else:
+-        # Try with the name verbatim first. If that fails, attempt with the
+-        # lower-cased name (this ensures compatibility names work but we're
+-        # still case insensitive for all factories)
+-        for factory in pkg_resources.iter_entry_points(group, name):
+-            return factory.load()()
+-        for factory in pkg_resources.iter_entry_points(group, name.lower()):
+-            return factory.load()()
+-        raise BadPinFactory('Unable to find pin factory "%s"' % name)
+-
+-
+ def _devices_shutdown():
+-    if Device.pin_factory:
++    if Device.pin_factory is not None:
+         with Device.pin_factory._res_lock:
+             reserved_devices = {
+                 dev
+@@ -482,6 +495,4 @@ def _shutdown():
+     _threads_shutdown()
+     _devices_shutdown()
+ 
+-
+-Device.pin_factory = _default_pin_factory()
+ atexit.register(_shutdown)
+diff --git a/gpiozero/exc.py b/gpiozero/exc.py
+index d88dbc9..da87973 100644
+--- a/gpiozero/exc.py
++++ b/gpiozero/exc.py
+@@ -25,6 +25,9 @@ class BadQueueLen(GPIOZeroError, ValueError):
+ class BadPinFactory(GPIOZeroError, ImportError):
+     "Error raised when an unknown pin factory name is specified"
+ 
++class ZombieThread(GPIOZeroError, RuntimeError):
++    "Error raised when a thread fails to die within a given timeout"
++
+ class CompositeDeviceError(GPIOZeroError):
+     "Base class for errors specific to the CompositeDevice hierarchy"
+ 
+diff --git a/gpiozero/threads.py b/gpiozero/threads.py
+index f54ce4e..63312ee 100644
+--- a/gpiozero/threads.py
++++ b/gpiozero/threads.py
+@@ -8,12 +8,20 @@ str = type('')
+ 
+ from threading import Thread, Event
+ 
++from .exc import ZombieThread
++
+ 
+ _THREADS = set()
+ def _threads_shutdown():
+     while _THREADS:
+-        for t in _THREADS.copy():
+-            t.stop()
++        threads = _THREADS.copy()
++        # Optimization: instead of calling stop() which implicitly calls
++        # join(), set all the stopping events simultaneously, *then* join
++        # threads with a reasonable timeout
++        for t in threads:
++            t.stopping.set()
++        for t in threads:
++            t.join(10)
+ 
+ 
+ class GPIOThread(Thread):
+@@ -29,11 +37,17 @@ class GPIOThread(Thread):
+         _THREADS.add(self)
+         super(GPIOThread, self).start()
+ 
+-    def stop(self):
++    def stop(self, timeout=10):
+         self.stopping.set()
+-        self.join()
+-
+-    def join(self):
+-        super(GPIOThread, self).join()
+-        _THREADS.discard(self)
+-
++        self.join(timeout)
++
++    def join(self, timeout=None):
++        super(GPIOThread, self).join(timeout)
++        if self.is_alive():
++            assert timeout is not None
++            # timeout can't be None here because if it was, then join()
++            # wouldn't return until the thread was dead
++            raise ZombieThread(
++                "Thread failed to die within %d seconds" % timeout)
++        else:
++            _THREADS.discard(self)

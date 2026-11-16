@@ -1,0 +1,317 @@
+diff --git a/pkg/kor/volumeattachments_test.go b/pkg/kor/volumeattachments_test.go
+new file mode 100644
+index 0000000..d31e986
+--- /dev/null
++++ b/pkg/kor/volumeattachments_test.go
+@@ -0,0 +1,311 @@
++package kor
++
++import (
++	"encoding/json"
++	"fmt"
++	corev1 "k8s.io/api/core/v1"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	storagev1 "k8s.io/api/storage/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++)
++
++type vaFixtureServer struct {
++	mu          sync.Mutex
++	attachments map[string]*storagev1.VolumeAttachment
++	pvs         map[string]bool
++	nodes       map[string]bool
++	drivers     map[string]bool
++}
++
++func newVAFixtureServer() *vaFixtureServer {
++	server := &vaFixtureServer{
++		attachments: make(map[string]*storagev1.VolumeAttachment),
++		pvs:         map[string]bool{"pv-1": true},
++		nodes:       map[string]bool{"node-1": true},
++		drivers:     map[string]bool{"csi-driver-1": true},
++	}
++	server.add("va-1", "csi-driver-1", "node-1", "pv-1", nil)
++	server.add("va-2", "csi-driver-1", "node-1", "pv-unknown", nil)
++	server.add("va-3", "csi-driver-1", "node-unknown", "pv-1", nil)
++	server.add("va-4", "csi-driver-unknown", "node-1", "pv-1", nil)
++	return server
++}
++
++func (s *vaFixtureServer) add(name, driver, node, pv string, resourceLabels map[string]string) {
++	pvName := pv
++	s.attachments[name] = &storagev1.VolumeAttachment{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: resourceLabels},
++		Spec: storagev1.VolumeAttachmentSpec{
++			Attacher: driver,
++			NodeName: node,
++			Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
++		},
++	}
++}
++
++func vaFixtureWriteJSON(w http.ResponseWriter, code int, value interface{}) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(code)
++	_ = json.NewEncoder(w).Encode(value)
++}
++
++func (s *vaFixtureServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if r.URL.Path == "/api/v1/namespaces" && r.Method == http.MethodGet {
++		vaFixtureWriteJSON(w, http.StatusOK, &corev1.NamespaceList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "NamespaceList"}})
++		return
++	}
++
++	if r.Method == http.MethodGet {
++		switch r.URL.Path {
++		case "/api/v1/persistentvolumes":
++			list := &corev1.PersistentVolumeList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeList"}}
++			for name := range s.pvs {
++				list.Items = append(list.Items, corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: name}})
++			}
++			vaFixtureWriteJSON(w, http.StatusOK, list)
++			return
++		case "/api/v1/nodes":
++			list := &corev1.NodeList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "NodeList"}}
++			for name := range s.nodes {
++				list.Items = append(list.Items, corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
++			}
++			vaFixtureWriteJSON(w, http.StatusOK, list)
++			return
++		case "/apis/storage.k8s.io/v1/csidrivers":
++			list := &storagev1.CSIDriverList{TypeMeta: metav1.TypeMeta{APIVersion: "storage.k8s.io/v1", Kind: "CSIDriverList"}}
++			for name := range s.drivers {
++				list.Items = append(list.Items, storagev1.CSIDriver{ObjectMeta: metav1.ObjectMeta{Name: name}})
++			}
++			vaFixtureWriteJSON(w, http.StatusOK, list)
++			return
++		}
++	}
++
++	const attachmentsPath = "/apis/storage.k8s.io/v1/volumeattachments"
++	if r.URL.Path == attachmentsPath {
++		switch r.Method {
++		case http.MethodGet:
++			selector, err := labels.Parse(r.URL.Query().Get("labelSelector"))
++			if err != nil {
++				http.Error(w, err.Error(), http.StatusBadRequest)
++				return
++			}
++			list := &storagev1.VolumeAttachmentList{TypeMeta: metav1.TypeMeta{APIVersion: "storage.k8s.io/v1", Kind: "VolumeAttachmentList"}}
++			for _, attachment := range s.attachments {
++				if selector.Matches(labels.Set(attachment.Labels)) {
++					list.Items = append(list.Items, *attachment)
++				}
++			}
++			vaFixtureWriteJSON(w, http.StatusOK, list)
++			return
++		}
++	}
++	if strings.HasPrefix(r.URL.Path, attachmentsPath+"/") && r.Method == http.MethodDelete {
++		name, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, attachmentsPath+"/"))
++		if _, found := s.attachments[name]; !found {
++			vaFixtureWriteJSON(w, http.StatusNotFound, &metav1.Status{Status: metav1.StatusFailure, Code: http.StatusNotFound, Reason: metav1.StatusReasonNotFound})
++			return
++		}
++		delete(s.attachments, name)
++		vaFixtureWriteJSON(w, http.StatusOK, &metav1.Status{Status: metav1.StatusSuccess, Code: http.StatusOK})
++		return
++	}
++
++	for _, resource := range []struct {
++		prefix string
++		items  map[string]bool
++	}{
++		{prefix: "/api/v1/persistentvolumes/", items: s.pvs},
++		{prefix: "/api/v1/nodes/", items: s.nodes},
++		{prefix: "/apis/storage.k8s.io/v1/csidrivers/", items: s.drivers},
++	} {
++		if strings.HasPrefix(r.URL.Path, resource.prefix) && r.Method == http.MethodGet {
++			name, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, resource.prefix))
++			if resource.items[name] {
++				kind := "PersistentVolume"
++				apiVersion := "v1"
++				if resource.prefix == "/api/v1/nodes/" {
++					kind = "Node"
++				}
++				if resource.prefix == "/apis/storage.k8s.io/v1/csidrivers/" {
++					kind = "CSIDriver"
++					apiVersion = "storage.k8s.io/v1"
++				}
++				vaFixtureWriteJSON(w, http.StatusOK, map[string]interface{}{
++					"apiVersion": apiVersion,
++					"kind":       kind,
++					"metadata":   map[string]string{"name": name},
++				})
++			} else {
++				vaFixtureWriteJSON(w, http.StatusNotFound, &metav1.Status{Status: metav1.StatusFailure, Code: http.StatusNotFound, Reason: metav1.StatusReasonNotFound})
++			}
++			return
++		}
++	}
++	vaFixtureWriteJSON(w, http.StatusNotFound, &metav1.Status{Status: metav1.StatusFailure, Code: http.StatusNotFound, Reason: metav1.StatusReasonNotFound})
++}
++
++func (s *vaFixtureServer) count() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return len(s.attachments)
++}
++
++func (s *vaFixtureServer) has(name string) bool {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	_, found := s.attachments[name]
++	return found
++}
++
++func runVAFixtureCLI(t *testing.T, api *vaFixtureServer, args ...string) string {
++	t.Helper()
++	server := httptest.NewServer(api)
++	t.Cleanup(server.Close)
++
++	config := fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- name: test
++  cluster:
++    server: %s
++    insecure-skip-tls-verify: true
++contexts:
++- name: test
++  context:
++    cluster: test
++    user: test
++current-context: test
++users:
++- name: test
++  user:
++    token: test
++`, server.URL)
++	configPath := filepath.Join(t.TempDir(), "kubeconfig")
++	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
++		t.Fatalf("write kubeconfig: %v", err)
++	}
++
++	commandArgs := []string{"run", "../../main.go", "volumeattachment", "--kubeconfig", configPath}
++	commandArgs = append(commandArgs, args...)
++	command := exec.Command("go", commandArgs...)
++	output, err := command.CombinedOutput()
++	if err != nil {
++		t.Fatalf("CLI command failed: %v\n%s", err, output)
++	}
++	return string(output)
++}
++
++func TestVAFixtureDiscovery(t *testing.T) {
++	api := newVAFixtureServer()
++	output := runVAFixtureCLI(t, api, "--output", "json")
++
++	var result map[string]map[string][]string
++	if err := json.Unmarshal([]byte(output), &result); err != nil {
++		t.Fatalf("parse JSON output: %v\n%s", err, output)
++	}
++	names := result[""]["VolumeAttachment"]
++	for _, expected := range []string{"va-2", "va-3", "va-4"} {
++		if !vaFixtureContains(names, expected) {
++			t.Errorf("expected missing-reference attachment %q in output; got %v", expected, names)
++		}
++	}
++	if vaFixtureContains(names, "va-1") {
++		t.Errorf("valid attachment va-1 should not be reported; got %v", names)
++	}
++}
++
++func TestVAFixtureMarkedUnused(t *testing.T) {
++	api := newVAFixtureServer()
++	api.add("va-labeled", "csi-driver-1", "node-1", "pv-1", map[string]string{"kor/used": "false"})
++	output := runVAFixtureCLI(t, api, "--output", "json")
++
++	var result map[string]map[string][]string
++	if err := json.Unmarshal([]byte(output), &result); err != nil {
++		t.Fatalf("parse JSON output: %v\n%s", err, output)
++	}
++	if !vaFixtureContains(result[""]["VolumeAttachment"], "va-labeled") {
++		t.Errorf("expected label-marked attachment to be reported; got %v", result[""]["VolumeAttachment"])
++	}
++}
++
++func TestVAFixtureDeleteIncludesLabelMarkedUnused(t *testing.T) {
++	api := newVAFixtureServer()
++	api.add("va-labeled", "csi-driver-1", "node-1", "pv-1", map[string]string{"kor/used": "false"})
++	_ = runVAFixtureCLI(t, api, "--output", "json", "--delete", "--no-interactive")
++
++	if api.has("va-labeled") {
++		t.Error("label-marked unused attachment should be deleted")
++	}
++	if api.count() != 1 {
++		t.Errorf("expected only the valid attachment to remain, got %d attachments", api.count())
++	}
++}
++
++func TestVAFixtureOutputFormats(t *testing.T) {
++	for _, format := range []string{"table", "json", "yaml"} {
++		t.Run(format, func(t *testing.T) {
++			output := runVAFixtureCLI(t, newVAFixtureServer(), "--output", format)
++			for _, name := range []string{"va-2", "va-3", "va-4"} {
++				if !strings.Contains(output, name) {
++					t.Errorf("%s output should include unused attachment %q; got %q", format, name, output)
++				}
++			}
++			if strings.Contains(output, "va-1") {
++				t.Errorf("%s output should omit valid attachment va-1; got %q", format, output)
++			}
++		})
++	}
++}
++
++func TestVAFixtureLabelFiltering(t *testing.T) {
++	t.Run("exclude labels", func(t *testing.T) {
++		api := newVAFixtureServer()
++		api.add("va-skipped", "csi-driver-1", "node-1", "pv-unknown", map[string]string{"skip": "true"})
++		output := runVAFixtureCLI(t, api, "--output", "json", "--exclude-labels", "skip=true")
++		var result map[string]map[string][]string
++		if err := json.Unmarshal([]byte(output), &result); err != nil {
++			t.Fatalf("parse JSON output: %v\n%s", err, output)
++		}
++		names := result[""]["VolumeAttachment"]
++		if vaFixtureContains(names, "va-skipped") || !vaFixtureContains(names, "va-2") {
++			t.Errorf("expected matching excluded attachment omitted and other unused attachments retained; got %v", names)
++		}
++	})
++
++	t.Run("include labels", func(t *testing.T) {
++		api := newVAFixtureServer()
++		api.add("va-included", "csi-driver-1", "node-1", "pv-unknown", map[string]string{"included": "true"})
++		output := runVAFixtureCLI(t, api, "--output", "json", "--include-labels", "included=true")
++		var result map[string]map[string][]string
++		if err := json.Unmarshal([]byte(output), &result); err != nil {
++			t.Fatalf("parse JSON output: %v\n%s", err, output)
++		}
++		names := result[""]["VolumeAttachment"]
++		if !vaFixtureContains(names, "va-included") || len(names) != 1 {
++			t.Errorf("expected only the matching unused attachment; got %v", names)
++		}
++	})
++}
++
++func vaFixtureContains(values []string, wanted string) bool {
++	for _, value := range values {
++		if value == wanted {
++			return true
++		}
++	}
++	return false
++}

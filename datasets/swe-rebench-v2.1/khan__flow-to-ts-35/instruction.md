@@ -1,0 +1,1 @@
+Convert TypeofTypeAnnotation to TSTypeQuery

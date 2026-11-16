@@ -1,0 +1,225 @@
+diff --git a/controllers/k8ssandra/auth_test.go b/controllers/k8ssandra/auth_test.go
+index 55b02e3..578827b 100644
+--- a/controllers/k8ssandra/auth_test.go
++++ b/controllers/k8ssandra/auth_test.go
+@@ -10,6 +10,8 @@ import (
+ 	reaperapi "github.com/k8ssandra/k8ssandra-operator/apis/reaper/v1alpha1"
+ 	stargateapi "github.com/k8ssandra/k8ssandra-operator/apis/stargate/v1alpha1"
+ 	"github.com/k8ssandra/k8ssandra-operator/pkg/reaper"
++	"github.com/k8ssandra/k8ssandra-operator/pkg/unstructured"
++	"github.com/k8ssandra/k8ssandra-operator/pkg/utils"
+ 	"github.com/k8ssandra/k8ssandra-operator/test/framework"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -371,3 +373,78 @@ func createSingleDcClusterAuthExternalSecrets(t *testing.T, ctx context.Context,
+ 	f.AssertObjectDoesNotExist(ctx, t, stargateKey, &stargateapi.Stargate{}, timeout, interval)
+ 	f.AssertObjectDoesNotExist(ctx, t, reaperKey, &reaperapi.Reaper{}, timeout, interval)
+ }
++
++func createSingleDcClusterExternalInternode(t *testing.T, ctx context.Context, f *framework.Framework, namespace string) {
++	require := require.New(t)
++
++	kc := &api.K8ssandraCluster{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: namespace,
++			Name:      "cluster1",
++		},
++		Spec: api.K8ssandraClusterSpec{
++			Auth: pointer.BoolPtr(true),
++			Cassandra: &api.CassandraClusterTemplate{
++				Datacenters: []api.CassandraDatacenterTemplate{{
++					Meta:       api.EmbeddedObjectMeta{Name: "dc1"},
++					K8sContext: f.DataPlaneContexts[1],
++					Size:       1,
++					DatacenterOptions: api.DatacenterOptions{
++						ServerVersion: "4.1.2",
++						StorageConfig: &cassdcapi.StorageConfig{
++							CassandraDataVolumeClaimSpec: &corev1.PersistentVolumeClaimSpec{
++								StorageClassName: &defaultStorageClass,
++							},
++						},
++						CassandraConfig: &api.CassandraConfig{
++							CassandraYaml: unstructured.Unstructured{
++								"server_encryption_options": map[string]interface{}{
++									"internode_encryption": "all",
++									"keystore":             "/etc/encryption/internode/keystore.jks",
++									"keystore_password":    "changeit",
++									"truststore":           "/etc/encryption/internode/truststore.jks",
++									"truststore_password":  "changeit",
++								},
++							},
++						},
++					},
++				}},
++			},
++		},
++	}
++
++	err := f.Client.Create(ctx, kc)
++	require.NoError(err, "failed to create K8ssandraCluster")
++
++	kcKey := framework.ClusterKey{K8sContext: f.ControlPlaneContext, NamespacedName: types.NamespacedName{Namespace: namespace, Name: kc.Name}}
++	dcKey := framework.ClusterKey{K8sContext: f.DataPlaneContexts[1], NamespacedName: types.NamespacedName{Namespace: namespace, Name: "dc1"}}
++
++	verifyFinalizerAdded(ctx, t, f, kcKey.NamespacedName)
++	verifySuperuserSecretCreated(ctx, t, f, kc)
++	verifyReplicatedSecretReconciled(ctx, t, f, kc)
++
++	t.Log("check that the datacenter was created")
++	require.Eventually(f.DatacenterExists(ctx, dcKey), timeout, interval)
++
++	t.Log("update dc status to ready")
++	err = f.SetDatacenterStatusReady(ctx, dcKey)
++	require.NoError(err, "failed to set dc status ready")
++
++	t.Log("check the cassandra-yaml properties were set in the CassandraDatacenter")
++	dc := &cassdcapi.CassandraDatacenter{}
++	err = f.Get(ctx, dcKey, dc)
++	require.NoError(err, "failed to get CassandraDatacenter")
++
++	dcConfig, err := utils.UnmarshalToMap(dc.Spec.Config)
++	require.NoError(err, "failed to unmarshall CassandraDatacenter config")
++	dcConfigYaml, _ := dcConfig["cassandra-yaml"].(map[string]interface{})
++
++	require.Equal("all", dcConfigYaml["server_encryption_options"].(map[string]interface{})["internode_encryption"].(string))
++	require.Equal("changeit", dcConfigYaml["server_encryption_options"].(map[string]interface{})["keystore_password"].(string))
++	require.Equal("/etc/encryption/internode/keystore.jks", dcConfigYaml["server_encryption_options"].(map[string]interface{})["keystore"].(string))
++
++	t.Log("deleting K8ssandraCluster")
++	err = f.DeleteK8ssandraCluster(ctx, client.ObjectKey{Namespace: kc.Namespace, Name: kc.Name}, timeout, interval)
++	require.NoError(err, "failed to delete K8ssandraCluster")
++	f.AssertObjectDoesNotExist(ctx, t, dcKey, &cassdcapi.CassandraDatacenter{}, timeout, interval)
++}
+diff --git a/controllers/k8ssandra/k8ssandracluster_controller_test.go b/controllers/k8ssandra/k8ssandracluster_controller_test.go
+index 7184763..5684788 100644
+--- a/controllers/k8ssandra/k8ssandracluster_controller_test.go
++++ b/controllers/k8ssandra/k8ssandracluster_controller_test.go
+@@ -102,6 +102,7 @@ func TestK8ssandraCluster(t *testing.T) {
+ 	t.Run("CreateSingleDcClusterNoAuth", testEnv.ControllerTest(ctx, createSingleDcClusterNoAuth))
+ 	t.Run("CreateSingleDcClusterAuth", testEnv.ControllerTest(ctx, createSingleDcClusterAuth))
+ 	t.Run("CreateSingleDcClusterAuthExternalSecrets", testEnv.ControllerTest(ctx, createSingleDcClusterAuthExternalSecrets))
++	t.Run("CreateSingleDcClusterExternalInternode", testEnv.ControllerTest(ctx, createSingleDcClusterExternalInternode))
+ 
+ 	// If webhooks are installed, this testcase is handled by the webhook test
+ 	// t.Run("ChangeNumTokensValue", testEnv.ControllerTest(ctx, changeNumTokensValue))
+diff --git a/pkg/cassandra/encryption_test.go b/pkg/cassandra/encryption_test.go
+index f769f8a..a665b0c 100644
+--- a/pkg/cassandra/encryption_test.go
++++ b/pkg/cassandra/encryption_test.go
+@@ -3,9 +3,10 @@ package cassandra
+ import (
+ 	"context"
+ 	"fmt"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"testing"
+ 
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
+ 	api "github.com/k8ssandra/k8ssandra-operator/apis/k8ssandra/v1alpha1"
+ 	"github.com/k8ssandra/k8ssandra-operator/pkg/encryption"
+ 	"github.com/k8ssandra/k8ssandra-operator/pkg/unstructured"
+@@ -16,7 +17,7 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+ 
+-func TestCheckMandatoryEncryptionFields(t *testing.T) {
++func TestEncryptionEnabledWithPasswords(t *testing.T) {
+ 	dcConfig := &DatacenterConfig{
+ 		CassandraConfig: api.CassandraConfig{
+ 			CassandraYaml: unstructured.Unstructured{
+@@ -28,25 +29,81 @@ func TestCheckMandatoryEncryptionFields(t *testing.T) {
+ 				},
+ 			},
+ 		},
+-		ClientEncryptionStores: &encryption.Stores{
+-			KeystoreSecretRef: &encryption.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{
+-				Name: "client-keystore-secret",
+-			}},
+-			TruststoreSecretRef: &encryption.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{
+-				Name: "client-truststore-secret",
+-			}},
++		ServerKeystorePassword: "flintstones",
++		ClientKeystorePassword: "flightstones",
++	}
++
++	assert.True(t, ServerEncryptionEnabled(dcConfig))
++	assert.True(t, ClientEncryptionEnabled(dcConfig))
++}
++
++func TestOverrideOfMandatoryEncryptionCheck(t *testing.T) {
++	dcConfig := &DatacenterConfig{
++		CassandraConfig: api.CassandraConfig{
++			CassandraYaml: unstructured.Unstructured{
++				"client_encryption_options": map[string]interface{}{
++					"enabled": true,
++				},
++				"server_encryption_options": map[string]interface{}{
++					"internode_encryption": "all",
++				},
++			},
+ 		},
+-		ServerEncryptionStores: &encryption.Stores{
+-			TruststoreSecretRef: &encryption.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{
+-				Name: "server-truststore-secret",
+-			}},
++	}
++
++	assert.False(t, ServerEncryptionEnabled(dcConfig))
++	assert.False(t, ClientEncryptionEnabled(dcConfig))
++}
++
++func TestHandleEncryptionOptionsWithManualSettings(t *testing.T) {
++	// When no encryption stores and no keystore/truststore passwords are configured, the operator
++	// must leave manually supplied server/client encryption settings in the cassandra-yaml alone.
++	dcConfig := &DatacenterConfig{
++		CassandraConfig: api.CassandraConfig{
++			CassandraYaml: unstructured.Unstructured{
++				"client_encryption_options": map[string]interface{}{
++					"enabled":           true,
++					"keystore":          "/manual/client/keystore.jks",
++					"keystore_password": "manual-client-password",
++				},
++				"server_encryption_options": map[string]interface{}{
++					"internode_encryption": "all",
++					"keystore":             "/manual/server/keystore.jks",
++					"keystore_password":    "manual-server-password",
++				},
++			},
+ 		},
+ 	}
+ 
+-	noErr := checkMandatoryEncryptionFields(dcConfig.ClientEncryptionStores)
+-	assert.NoError(t, noErr)
++	err := HandleEncryptionOptions(dcConfig)
++	require.NoError(t, err)
++
++	expectedCassandraYaml := unstructured.Unstructured{
++		"client_encryption_options": map[string]interface{}{
++			"enabled":           true,
++			"keystore":          "/manual/client/keystore.jks",
++			"keystore_password": "manual-client-password",
++		},
++		"server_encryption_options": map[string]interface{}{
++			"internode_encryption": "all",
++			"keystore":             "/manual/server/keystore.jks",
++			"keystore_password":    "manual-server-password",
++		},
++	}
++	assert.Equal(t, expectedCassandraYaml["server_encryption_options"], dcConfig.CassandraConfig.CassandraYaml["server_encryption_options"])
++	assert.Equal(t, expectedCassandraYaml["client_encryption_options"], dcConfig.CassandraConfig.CassandraYaml["client_encryption_options"])
++}
++
++func TestUnmarshalToMap(t *testing.T) {
++	result, err := utils.UnmarshalToMap([]byte(`{"cassandra-yaml": {"server_encryption_options": {"internode_encryption": "all"}}}`))
++	require.NoError(t, err)
++	cassandraYaml, ok := result["cassandra-yaml"].(map[string]interface{})
++	require.True(t, ok)
++	serverOptions, ok := cassandraYaml["server_encryption_options"].(map[string]interface{})
++	require.True(t, ok)
++	assert.Equal(t, "all", serverOptions["internode_encryption"])
+ 
+-	err := checkMandatoryEncryptionFields(dcConfig.ServerEncryptionStores)
++	_, err = utils.UnmarshalToMap([]byte(`{"cassandra-yaml": `))
+ 	assert.Error(t, err)
+ }
+ 

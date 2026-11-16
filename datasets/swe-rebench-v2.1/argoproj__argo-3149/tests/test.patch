@@ -1,0 +1,200 @@
+diff --git a/test/test.go b/test/test.go
+index df263407..836c6174 100644
+--- a/test/test.go
++++ b/test/test.go
+@@ -51,6 +51,25 @@ func LoadWorkflowFromBytes(yamlBytes []byte) *wfv1.Workflow {
+ 	return &wf
+ }
+ 
++// LoadTestWorkflow returns a workflow relative to the test file
++func LoadTestWorkflowTemplate(path string) *wfv1.WorkflowTemplate {
++	yamlBytes, err := ioutil.ReadFile(path)
++	if err != nil {
++		panic(err)
++	}
++	return LoadWorkflowTemplateFromBytes(yamlBytes)
++}
++
++// LoadWorkflowFromBytes returns a workflow unmarshalled from an yaml byte array
++func LoadWorkflowTemplateFromBytes(yamlBytes []byte) *wfv1.WorkflowTemplate {
++	var wf wfv1.WorkflowTemplate
++	err := yaml.Unmarshal(yamlBytes, &wf)
++	if err != nil {
++		panic(err)
++	}
++	return &wf
++}
++
+ // LoadUnstructuredFromBytes returns an Unstructured unmarshalled from an yaml byte array
+ func LoadUnstructuredFromBytes(yamlBytes []byte) *unstructured.Unstructured {
+ 	var un unstructured.Unstructured
+diff --git a/workflow/controller/controller_test.go b/workflow/controller/controller_test.go
+index bdb6f737..802e7648 100644
+--- a/workflow/controller/controller_test.go
++++ b/workflow/controller/controller_test.go
+@@ -370,20 +370,14 @@ spec:
+ `
+ 
+ func TestCheckAndInitWorkflowTmplRef(t *testing.T) {
+-	//_, controller := newController()
+ 	wf := unmarshalWF(wfWithTmplRef)
+ 	wftmpl := unmarshalWFTmpl(wfTmpl)
+ 	_, controller := newController(wf, wftmpl)
+-	//_, err := controller.wfclientset.ArgoprojV1alpha1().WorkflowTemplates("default").Create(wftmpl)
+-	//assert.NoError(t, err)
+-	woc := wfOperationCtx{controller: controller,
+-		wf: wf}
+-	t.Run("WithWorkflowTmplRef", func(t *testing.T) {
+-		_, _, err := woc.loadExecutionSpec()
+-		assert.NoError(t, err)
+-		assert.Equal(t, &wftmpl.Spec.WorkflowSpec, woc.wfSpec)
++	woc := newWorkflowOperationCtx(wf, controller)
+ 
+-	})
++	woc.operate()
++
++	assert.Equal(t, wfv1.NodeRunning, woc.wf.Status.Phase)
+ }
+ 
+ func TestIsArchivable(t *testing.T) {
+diff --git a/workflow/controller/operator_test.go b/workflow/controller/operator_test.go
+index f6a61771..2b10ff94 100644
+--- a/workflow/controller/operator_test.go
++++ b/workflow/controller/operator_test.go
+@@ -13,6 +13,7 @@ import (
+ 	apiv1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/wait"
+ 	"k8s.io/client-go/tools/record"
+ 	"sigs.k8s.io/yaml"
+ 
+@@ -3687,3 +3688,95 @@ func TestPanicMetric(t *testing.T) {
+ 	}
+ 	assert.True(t, seen)
+ }
++
++// Assert Workflows cannot be run without using workflowTemplateRef in reference mode
++func TestControllerReferenceMode(t *testing.T) {
++	wf := unmarshalWF(globalVariablePlaceholders)
++	cancel, controller := newController()
++	defer cancel()
++	controller.Config.WorkflowRestrictions = &config.WorkflowRestrictions{}
++	controller.Config.WorkflowRestrictions.TemplateReferencing = config.TemplateReferencingStrict
++	woc := newWorkflowOperationCtx(wf, controller)
++	woc.operate()
++	assert.Equal(t, wfv1.NodeError, woc.wf.Status.Phase)
++	assert.Equal(t, "workflows must use workflowTemplateRef to be executed when the controller is in reference mode", woc.wf.Status.Message)
++
++	controller.Config.WorkflowRestrictions.TemplateReferencing = config.TemplateReferencingSecure
++	woc = newWorkflowOperationCtx(wf, controller)
++	woc.operate()
++	assert.Equal(t, wfv1.NodeError, woc.wf.Status.Phase)
++	assert.Equal(t, "workflows must use workflowTemplateRef to be executed when the controller is in reference mode", woc.wf.Status.Message)
++
++	controller.Config.WorkflowRestrictions = nil
++	woc = newWorkflowOperationCtx(wf, controller)
++	woc.operate()
++	assert.Equal(t, wfv1.NodeRunning, woc.wf.Status.Phase)
++}
++
++func TestValidReferenceMode(t *testing.T) {
++	wf := test.LoadTestWorkflow("testdata/workflow-template-ref.yaml")
++	wfTmpl := test.LoadTestWorkflowTemplate("testdata/workflow-template-submittable.yaml")
++	cancel, controller := newController(wf, wfTmpl)
++	defer cancel()
++	controller.Config.WorkflowRestrictions = &config.WorkflowRestrictions{}
++	controller.Config.WorkflowRestrictions.TemplateReferencing = config.TemplateReferencingSecure
++	woc := newWorkflowOperationCtx(wf, controller)
++	woc.operate()
++	assert.Equal(t, wfv1.NodeRunning, woc.wf.Status.Phase)
++
++	// Change the referenced WorkflowTemplate spec
++	wfTmpl.Spec.Templates[0].Container.Image = "docker/whalesay:different"
++	updateWorkflowTemplate(t, controller, wfTmpl)
++
++	woc.operate()
++	assert.Equal(t, wfv1.NodeError, woc.wf.Status.Phase)
++	assert.Equal(t, "workflowTemplateRef reference may not change during execution when the controller is in reference mode", woc.wf.Status.Message)
++}
++
++func TestStrictReferenceMode(t *testing.T) {
++	wf := test.LoadTestWorkflow("testdata/workflow-template-ref.yaml")
++	wfTmpl := test.LoadTestWorkflowTemplate("testdata/workflow-template-submittable.yaml")
++	cancel, controller := newController(wf, wfTmpl)
++	defer cancel()
++	controller.Config.WorkflowRestrictions = &config.WorkflowRestrictions{}
++	controller.Config.WorkflowRestrictions.TemplateReferencing = config.TemplateReferencingStrict
++
++	// A change to the referenced WorkflowTemplate is not rejected in Strict mode
++	wfTmpl.Spec.Templates[0].Container.Image = "docker/whalesay:different"
++	updateWorkflowTemplate(t, controller, wfTmpl)
++
++	woc := newWorkflowOperationCtx(wf, controller)
++	woc.operate()
++	assert.Equal(t, wfv1.NodeRunning, woc.wf.Status.Phase)
++}
++
++func updateWorkflowTemplate(t *testing.T, controller *WorkflowController, wfTmpl *wfv1.WorkflowTemplate) {
++	_, err := controller.wfclientset.ArgoprojV1alpha1().WorkflowTemplates(wfTmpl.Namespace).Update(wfTmpl)
++	assert.NoError(t, err)
++	err = wait.Poll(10*time.Millisecond, 10*time.Second, func() (bool, error) {
++		tmpl, err := controller.wftmplInformer.Lister().WorkflowTemplates(wfTmpl.Namespace).Get(wfTmpl.Name)
++		if err != nil {
++			return false, nil
++		}
++		return tmpl.Spec.Templates[0].Container.Image == wfTmpl.Spec.Templates[0].Container.Image, nil
++	})
++	assert.NoError(t, err)
++}
++
++func TestWorkflowRestrictions(t *testing.T) {
++	var nilRestrictions *config.WorkflowRestrictions
++	assert.False(t, nilRestrictions.MustUseReference())
++	assert.False(t, nilRestrictions.MustNotChangeSpec())
++
++	unrestricted := &config.WorkflowRestrictions{}
++	assert.False(t, unrestricted.MustUseReference())
++	assert.False(t, unrestricted.MustNotChangeSpec())
++
++	strict := &config.WorkflowRestrictions{TemplateReferencing: config.TemplateReferencingStrict}
++	assert.True(t, strict.MustUseReference())
++	assert.False(t, strict.MustNotChangeSpec())
++
++	secure := &config.WorkflowRestrictions{TemplateReferencing: config.TemplateReferencingSecure}
++	assert.True(t, secure.MustUseReference())
++	assert.True(t, secure.MustNotChangeSpec())
++}
+diff --git a/workflow/controller/testdata/workflow-template-ref.yaml b/workflow/controller/testdata/workflow-template-ref.yaml
+new file mode 100644
+index 00000000..c0810971
+--- /dev/null
++++ b/workflow/controller/testdata/workflow-template-ref.yaml
+@@ -0,0 +1,8 @@
++apiVersion: argoproj.io/v1alpha1
++kind: Workflow
++metadata:
++  generateName: workflow-template-hello-world-
++  namespace: test
++spec:
++  workflowTemplateRef:
++    name: workflow-template-submittable
+diff --git a/workflow/controller/testdata/workflow-template-submittable.yaml b/workflow/controller/testdata/workflow-template-submittable.yaml
+new file mode 100644
+index 00000000..a6b78686
+--- /dev/null
++++ b/workflow/controller/testdata/workflow-template-submittable.yaml
+@@ -0,0 +1,13 @@
++apiVersion: argoproj.io/v1alpha1
++kind: WorkflowTemplate
++metadata:
++  name: workflow-template-submittable
++  namespace: test
++spec:
++  entrypoint: whalesay-template
++  templates:
++    - name: whalesay-template
++      container:
++        image: docker/whalesay
++        command: [cowsay]
++        args: ['hello']

@@ -1,0 +1,203 @@
+diff --git a/core/src/main/scala/org/elasticmq/actor/queue/QueueActorMessageOps.scala b/core/src/main/scala/org/elasticmq/actor/queue/QueueActorMessageOps.scala
+index 259409f6e..1e2ea80eb 100644
+--- a/core/src/main/scala/org/elasticmq/actor/queue/QueueActorMessageOps.scala
++++ b/core/src/main/scala/org/elasticmq/actor/queue/QueueActorMessageOps.scala
+@@ -27,8 +27,8 @@ trait QueueActorMessageOps
+     msg match {
+       case SendMessage(message) =>
+         handleOrRedirectMessage(message, context).send()
+-      case UpdateVisibilityTimeout(messageId, visibilityTimeout) =>
+-        updateVisibilityTimeout(messageId, visibilityTimeout).send()
++      case UpdateVisibilityTimeout(deliveryReceipt, visibilityTimeout) =>
++        updateVisibilityTimeout(deliveryReceipt, visibilityTimeout).send()
+       case ReceiveMessages(visibilityTimeout, count, _, receiveRequestAttemptId) =>
+         receiveMessages(visibilityTimeout, count, receiveRequestAttemptId).send()
+       case DeleteMessage(deliveryReceipt) =>
+diff --git a/core/src/main/scala/org/elasticmq/actor/queue/operations/UpdateVisibilityTimeoutOps.scala b/core/src/main/scala/org/elasticmq/actor/queue/operations/UpdateVisibilityTimeoutOps.scala
+index 11c63e516..569a7f8cf 100644
+--- a/core/src/main/scala/org/elasticmq/actor/queue/operations/UpdateVisibilityTimeoutOps.scala
++++ b/core/src/main/scala/org/elasticmq/actor/queue/operations/UpdateVisibilityTimeoutOps.scala
+@@ -8,42 +8,43 @@ trait UpdateVisibilityTimeoutOps extends Logging {
+   this: QueueActorStorage =>
+ 
+   def updateVisibilityTimeout(
+-      messageId: MessageId,
++      deliveryReceipt: DeliveryReceipt,
+       visibilityTimeout: VisibilityTimeout
+-  ): ResultWithEvents[Either[MessageDoesNotExist, Unit]] = {
+-    updateNextDelivery(messageId, CommonOperations.computeNextDelivery(visibilityTimeout, queueData, nowProvider))
++  ): ResultWithEvents[Either[InvalidReceiptHandle, Unit]] = {
++    updateNextDelivery(deliveryReceipt, CommonOperations.computeNextDelivery(visibilityTimeout, queueData, nowProvider))
+   }
+ 
+   private def updateNextDelivery(
+-      messageId: MessageId,
++      deliveryReceipt: DeliveryReceipt,
+       newNextDelivery: MillisNextDelivery
+-  ): ResultWithEvents[Either[MessageDoesNotExist, Unit]] = {
+-    messageQueue.byId.get(messageId.id) match {
+-      case Some(internalMessage) =>
++  ): ResultWithEvents[Either[InvalidReceiptHandle, Unit]] = {
++    val msgId = deliveryReceipt.extractId.toString
++
++    messageQueue.byId.get(msgId) match {
++      case Some(msg) if msg.deliveryReceipts.lastOption.contains(deliveryReceipt.receipt) =>
+         // Updating
+-        val oldNextDelivery = internalMessage.nextDelivery
+-        internalMessage.nextDelivery = newNextDelivery.millis
++        val oldNextDelivery = msg.nextDelivery
++        msg.nextDelivery = newNextDelivery.millis
+ 
+         if (newNextDelivery.millis < oldNextDelivery) {
+           // We have to re-insert the msg, as another msg with a bigger next delivery may be now before it,
+           // so the msg wouldn't be correctly received.
+           // (!) This may be slow (!)
+-          messageQueue = messageQueue.filterNot(_.id == internalMessage.id)
+-          messageQueue += internalMessage
++          messageQueue = messageQueue.filterNot(_.id == msg.id)
++          messageQueue += msg
+         }
+         // Else:
+         // Just increasing the next delivery. Common case. It is enough to increase the value in the object. No need to
+         // re-insert the msg into the queue, as it will be reinserted if needed during receiving.
+ 
+-        logger.debug(s"${queueData.name}: Updated next delivery of $messageId to $newNextDelivery")
++        logger.debug(s"${queueData.name}: Updated next delivery of $msgId to $newNextDelivery")
+ 
+         ResultWithEvents.valueWithEvents(
+           Right(()),
+-          List(QueueEvent.MessageUpdated(queueData.name, internalMessage))
++          List(QueueEvent.MessageUpdated(queueData.name, msg))
+         )
+-
+-      case None =>
+-        ResultWithEvents.onlyValue(Left(new MessageDoesNotExist(queueData.name, messageId)))
++      case _ =>
++        ResultWithEvents.onlyValue(Left(new InvalidReceiptHandle(queueData.name, deliveryReceipt.receipt)))
+     }
+   }
+ 
+diff --git a/core/src/main/scala/org/elasticmq/msg/QueueMsg.scala b/core/src/main/scala/org/elasticmq/msg/QueueMsg.scala
+index 23c085c15..532c32879 100644
+--- a/core/src/main/scala/org/elasticmq/msg/QueueMsg.scala
++++ b/core/src/main/scala/org/elasticmq/msg/QueueMsg.scala
+@@ -41,8 +41,8 @@ case class ClearQueue() extends QueueQueueMsg[Unit]
+ 
+ case class SendMessage(message: NewMessageData) extends QueueMessageMsg[MessageData]
+ case class MoveMessage(message: InternalMessage, moveDestination: MoveDestination) extends QueueMessageMsg[Unit]
+-case class UpdateVisibilityTimeout(messageId: MessageId, visibilityTimeout: VisibilityTimeout)
+-    extends QueueMessageMsg[Either[MessageDoesNotExist, Unit]]
++case class UpdateVisibilityTimeout(deliveryReceipt: DeliveryReceipt, visibilityTimeout: VisibilityTimeout)
++    extends QueueMessageMsg[Either[InvalidReceiptHandle, Unit]]
+ case class ReceiveMessages(
+     visibilityTimeout: VisibilityTimeout,
+     count: Int,
+diff --git a/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityBatchDirectives.scala b/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityBatchDirectives.scala
+index 48b4abe18..4f7df9f1a 100644
+--- a/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityBatchDirectives.scala
++++ b/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityBatchDirectives.scala
+@@ -1,20 +1,34 @@
+ package org.elasticmq.rest.sqs
+ 
+ import Constants._
++import org.elasticmq.{DeliveryReceipt, MillisVisibilityTimeout}
++import org.elasticmq.msg.UpdateVisibilityTimeout
++import org.elasticmq.actor.reply._
+ import org.elasticmq.rest.sqs.Action.ChangeMessageVisibilityBatch
+ import org.elasticmq.rest.sqs.directives.ElasticMQDirectives
+ 
+ trait ChangeMessageVisibilityBatchDirectives {
+-  this: ElasticMQDirectives with ChangeMessageVisibilityDirectives with BatchRequestsModule =>
++  this: ElasticMQDirectives with BatchRequestsModule =>
+   def changeMessageVisibilityBatch(p: AnyParams) = {
+     p.action(ChangeMessageVisibilityBatch) {
+       queueActorFromRequest(p) { queueActor =>
+         val resultsFuture =
+           batchRequest("ChangeMessageVisibilityBatchRequestEntry", p) { (messageData, id, _) =>
+-            doChangeMessageVisibility(queueActor, messageData).map { _ =>
+-              <ChangeMessageVisibilityBatchResultEntry>
+-              <Id>{id}</Id>
+-            </ChangeMessageVisibilityBatchResultEntry>
++            val receiptHandle = messageData(ReceiptHandleParameter)
++            val visibilityTimeout = MillisVisibilityTimeout.fromSeconds(messageData(VisibilityTimeoutParameter).toLong)
++            val result = queueActor ? UpdateVisibilityTimeout(DeliveryReceipt(receiptHandle), visibilityTimeout)
++
++            result.map {
++              case Left(error) =>
++                <BatchResultErrorEntry>
++                  <Id>{id}</Id>
++                  <Code>{error.code}</Code>
++                  <Message>{error.message}</Message>
++                </BatchResultErrorEntry>
++              case Right(_) =>
++                <ChangeMessageVisibilityBatchResultEntry>
++                  <Id>{id}</Id>
++                </ChangeMessageVisibilityBatchResultEntry>
+             }
+           }
+ 
+diff --git a/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityDirectives.scala b/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityDirectives.scala
+index 46d01da35..2fe178631 100644
+--- a/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityDirectives.scala
++++ b/rest/rest-sqs/src/main/scala/org/elasticmq/rest/sqs/ChangeMessageVisibilityDirectives.scala
+@@ -1,41 +1,35 @@
+ package org.elasticmq.rest.sqs
+ 
+-import Constants._
+-import org.elasticmq.{DeliveryReceipt, MillisVisibilityTimeout}
+-import akka.actor.ActorRef
+ import org.elasticmq.actor.reply._
+ import org.elasticmq.msg.UpdateVisibilityTimeout
+ import org.elasticmq.rest.sqs.Action.ChangeMessageVisibility
++import org.elasticmq.rest.sqs.Constants._
+ import org.elasticmq.rest.sqs.directives.ElasticMQDirectives
++import org.elasticmq.{DeliveryReceipt, MillisVisibilityTimeout}
+ 
+ trait ChangeMessageVisibilityDirectives { this: ElasticMQDirectives =>
+   def changeMessageVisibility(p: AnyParams) = {
+     p.action(ChangeMessageVisibility) {
+       queueActorFromRequest(p) { queueActor =>
+-        doChangeMessageVisibility(queueActor, p).map { _ =>
+-          respondWith {
+-            <ChangeMessageVisibilityResponse>
+-              <ResponseMetadata>
+-                <RequestId>{EmptyRequestId}</RequestId>
+-              </ResponseMetadata>
+-            </ChangeMessageVisibilityResponse>
+-          }
++        (p.requiredParam(ReceiptHandleParameter) and p.requiredParam(VisibilityTimeoutParameter)) {
++          (receipt, visibilityTimeout) =>
++            val result = queueActor ? UpdateVisibilityTimeout(
++              DeliveryReceipt(receipt),
++              MillisVisibilityTimeout.fromSeconds(visibilityTimeout.toLong)
++            )
++            result.map {
++              case Left(error) => throw new SQSException(error.code, errorMessage = Some(error.message))
++              case Right(_) =>
++                respondWith {
++                  <ChangeMessageVisibilityResponse>
++                  <ResponseMetadata>
++                    <RequestId>{EmptyRequestId}</RequestId>
++                  </ResponseMetadata>
++                </ChangeMessageVisibilityResponse>
++                }
++            }
+         }
+       }
+     }
+   }
+-
+-  def doChangeMessageVisibility(queueActor: ActorRef, parameters: AnyParams) = {
+-    val visibilityTimeout = MillisVisibilityTimeout.fromSeconds(parameters(VisibilityTimeoutParameter).toLong)
+-    val msgId = DeliveryReceipt(parameters(ReceiptHandleParameter)).extractId
+-
+-    for {
+-      updateResult <- queueActor ? UpdateVisibilityTimeout(msgId, visibilityTimeout)
+-    } yield {
+-      updateResult match {
+-        case Left(_)  => throw SQSException.invalidParameterValue
+-        case Right(_) => // ok
+-      }
+-    }
+-  }
+ }

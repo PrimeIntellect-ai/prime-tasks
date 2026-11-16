@@ -1,0 +1,239 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b8d8ca471..980fa9541 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,7 +7,11 @@
+ - Function captures are now formatted like regular function calls.
+   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+ 
+-### Bug Fixes
++### Bug fixes
++
++- Fixed a bug where the "convert from use" code action would generate invalid
++  code with labelled arguments.
++  ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+ 
+ - Fixed a bug where private types would be allowed to be used in other modules.
+   ([Surya Rose](https://github.com/GearsDatapacks))
+diff --git a/compiler-core/src/ast.rs b/compiler-core/src/ast.rs
+index 58321380f..554e8edb5 100644
+--- a/compiler-core/src/ast.rs
++++ b/compiler-core/src/ast.rs
+@@ -1231,6 +1231,14 @@ impl<A> CallArg<A> {
+     pub fn is_implicit(&self) -> bool {
+         self.implicit.is_some()
+     }
++
++    #[must_use]
++    pub fn is_use_implicit_callback(&self) -> bool {
++        match self.implicit {
++            Some(ImplicitCallArgOrigin::Use | ImplicitCallArgOrigin::IncorrectArityUse) => true,
++            Some(_) | None => false,
++        }
++    }
+ }
+ 
+ impl CallArg<TypedExpr> {
+diff --git a/compiler-core/src/ast/typed.rs b/compiler-core/src/ast/typed.rs
+index 11a231ff4..5737c0f8b 100644
+--- a/compiler-core/src/ast/typed.rs
++++ b/compiler-core/src/ast/typed.rs
+@@ -1,6 +1,6 @@
+ use std::sync::OnceLock;
+ 
+-use type_::TypedCallArg;
++use type_::{FieldMap, TypedCallArg};
+ 
+ use super::*;
+ use crate::type_::{bool, HasType, Type, ValueConstructorVariant};
+@@ -690,6 +690,38 @@ impl TypedExpr {
+             TypedExpr::Fn { body, .. } => body.last().last_location(),
+         }
+     }
++
++    pub fn field_map(&self) -> Option<&FieldMap> {
++        match self {
++            TypedExpr::Int { .. }
++            | TypedExpr::Float { .. }
++            | TypedExpr::String { .. }
++            | TypedExpr::Block { .. }
++            | TypedExpr::Pipeline { .. }
++            | TypedExpr::Fn { .. }
++            | TypedExpr::List { .. }
++            | TypedExpr::Call { .. }
++            | TypedExpr::BinOp { .. }
++            | TypedExpr::Case { .. }
++            | TypedExpr::RecordAccess { .. }
++            | TypedExpr::Tuple { .. }
++            | TypedExpr::TupleIndex { .. }
++            | TypedExpr::Todo { .. }
++            | TypedExpr::Panic { .. }
++            | TypedExpr::BitArray { .. }
++            | TypedExpr::RecordUpdate { .. }
++            | TypedExpr::NegateBool { .. }
++            | TypedExpr::NegateInt { .. }
++            | TypedExpr::Invalid { .. } => None,
++
++            TypedExpr::Var { constructor, .. } => constructor.field_map(),
++            TypedExpr::ModuleSelect { constructor, .. } => match constructor {
++                ModuleValueConstructor::Record { field_map, .. }
++                | ModuleValueConstructor::Fn { field_map, .. } => field_map.as_ref(),
++                ModuleValueConstructor::Constant { .. } => None,
++            },
++        }
++    }
+ }
+ 
+ impl<'a> From<&'a TypedExpr> for Located<'a> {
+diff --git a/compiler-core/src/language_server/code_action.rs b/compiler-core/src/language_server/code_action.rs
+index 6a03d7926..c09f5e58a 100644
+--- a/compiler-core/src/language_server/code_action.rs
++++ b/compiler-core/src/language_server/code_action.rs
+@@ -788,17 +788,7 @@ impl<'ast> ast::visit::Visit<'ast> for FillInMissingLabelledArgs<'ast> {
+             return;
+         }
+ 
+-        let field_map = match fun {
+-            TypedExpr::Var { constructor, .. } => constructor.field_map(),
+-            TypedExpr::ModuleSelect { constructor, .. } => match constructor {
+-                ModuleValueConstructor::Record { field_map, .. }
+-                | ModuleValueConstructor::Fn { field_map, .. } => field_map.as_ref(),
+-                ModuleValueConstructor::Constant { .. } => None,
+-            },
+-            _ => None,
+-        };
+-
+-        if let Some(field_map) = field_map {
++        if let Some(field_map) = fun.field_map() {
+             self.selected_call = Some((*location, field_map, args))
+         }
+ 
+@@ -2224,15 +2214,40 @@ impl<'a> DesugarUse<'a> {
+             return vec![];
+         };
+ 
+-        let TypedExpr::Call { args, .. } = use_.call.as_ref() else {
++        let TypedExpr::Call { args, fun, .. } = use_.call.as_ref() else {
+             return vec![];
+         };
+ 
++        // If the use callback we're desugaring is using labels, that means we
++        // have to add the last argument's label when writing the callback;
++        // otherwise, it would result in invalid code.
++        //
++        //     use acc, item <- list.fold(over: list, from: 1)
++        //     todo
++        //
++        // Needs to be rewritten as:
++        //
++        //     list.fold(over: list, from: 1, with: fn(acc, item) { ... })
++        //                                    ^^^^^ We cannot forget to add this label back!
++        //
++        let callback_label = if args.iter().any(|arg| arg.label.is_some()) {
++            fun.field_map()
++                .and_then(|field_map| field_map.missing_labels(args).last().cloned())
++                .map(|label| eco_format!("{label}: "))
++                .unwrap_or(EcoString::from(""))
++        } else {
++            EcoString::from("")
++        };
++
++        // The use callback is not necessarily the last argumen. If you have the
++        // following function: `wibble(a a, b b) { todo }`
++        // And use it like this: `use <- wibble(b: 1)`, the first argument `a`
++        // is going to be the use callback, not the last one!
+         let Some(CallArg {
+             implicit: Some(ImplicitCallArgOrigin::Use),
+             value: TypedExpr::Fn { body, type_, .. },
+             ..
+-        }) = args.last()
++        }) = args.iter().find(|arg| arg.is_use_implicit_callback())
+         else {
+             return vec![];
+         };
+@@ -2283,9 +2298,9 @@ impl<'a> DesugarUse<'a> {
+                 // the implicit fn expression then we need to put a comma after
+                 // the last argument.
+                 if use_rhs_function_has_some_explicit_args {
+-                    format!(", fn({}) {{", assignments)
++                    format!(", {callback_label}fn({assignments}) {{")
+                 } else {
+-                    format!("fn({}) {{", assignments)
++                    format!("{callback_label}fn({assignments}) {{")
+                 },
+             )
+         } else {
+@@ -2374,6 +2389,7 @@ pub struct TurnIntoUse<'a> {
+ 
+ /// All the locations we'll need to transform a function call into a use
+ /// expression.
++///
+ struct CallLocations {
+     call_span: SrcSpan,
+     called_function_span: SrcSpan,
+diff --git a/compiler-core/src/type_/fields.rs b/compiler-core/src/type_/fields.rs
+index 748493e74..d6ef4bf12 100644
+--- a/compiler-core/src/type_/fields.rs
++++ b/compiler-core/src/type_/fields.rs
+@@ -146,6 +146,61 @@ impl FieldMap {
+             .sorted()
+             .collect()
+     }
++
++    /// This returns an array of the labels that are unused given an argument
++    /// list.
++    /// The unused labels are in the order they are expected to be passed in
++    /// to a call using those.
++    ///
++    /// ## Examples
++    ///
++    /// ```gleam
++    /// pub fn wibble(label1 a, label2 b, label3 c) { todo }
++    ///
++    /// wibble(1, label3: 2) // -> unused labels: [label2]
++    /// ```
++    ///
++    pub fn missing_labels<A: std::fmt::Debug>(&self, args: &[CallArg<A>]) -> Vec<EcoString> {
++        let mut arg_position_to_label = self
++            .fields
++            .iter()
++            .map(|(label, position)| (position, label.clone()))
++            .collect::<HashMap<_, _>>();
++
++        // We first get rid of all the labels taken by the positional arguments
++        // that have been supplied.
++        let mut position = 0;
++        for arg in args {
++            if arg.label.is_none() && !arg.is_use_implicit_callback() {
++                let _ = arg_position_to_label.remove(&position);
++                position += 1;
++            } else {
++                // As soon as we find an unlabelled argument we break out of the
++                // loop, we know that now there's only going to be labelled
++                // arguments
++                break;
++            }
++        }
++
++        let mut arg_label_to_position = arg_position_to_label
++            .iter()
++            .map(|(position, label)| (label.clone(), position))
++            .collect::<HashMap<_, _>>();
++
++        // Now we're just left with labelled args, we remove those from the
++        // remaining labels.
++        for arg in args.iter().skip(position as usize) {
++            if let Some(label) = &arg.label {
++                let _ = arg_label_to_position.remove(label);
++            }
++        }
++
++        arg_label_to_position
++            .iter()
++            .sorted_by_key(|(_, position)| *position)
++            .map(|(label, _position)| label.clone())
++            .collect_vec()
++    }
+ }
+ 
+ #[derive(Debug)]

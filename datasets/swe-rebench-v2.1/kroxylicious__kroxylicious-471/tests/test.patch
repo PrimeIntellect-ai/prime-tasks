@@ -1,0 +1,168 @@
+diff --git a/kroxylicious/src/test/java/io/kroxylicious/proxy/internal/filter/EagerMetadataLearnerTest.java b/kroxylicious/src/test/java/io/kroxylicious/proxy/internal/filter/EagerMetadataLearnerTest.java
+index e30278c..1822f34 100644
+--- a/kroxylicious/src/test/java/io/kroxylicious/proxy/internal/filter/EagerMetadataLearnerTest.java
++++ b/kroxylicious/src/test/java/io/kroxylicious/proxy/internal/filter/EagerMetadataLearnerTest.java
+@@ -6,11 +6,13 @@
+ 
+ package io.kroxylicious.proxy.internal.filter;
+ 
++import java.util.List;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.stream.Stream;
+ 
+ import org.apache.kafka.common.message.ApiVersionsRequestData;
+ import org.apache.kafka.common.message.MetadataRequestData;
++import org.apache.kafka.common.message.MetadataRequestData.MetadataRequestTopic;
+ import org.apache.kafka.common.message.MetadataResponseData;
+ import org.apache.kafka.common.message.ProduceRequestData;
+ import org.apache.kafka.common.message.RequestHeaderData;
+@@ -25,19 +27,23 @@ import org.apache.kafka.common.requests.ProduceRequest;
+ import org.apache.kafka.common.requests.SaslAuthenticateRequest;
+ import org.apache.kafka.common.requests.SaslHandshakeRequest;
+ import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.Arguments;
+ import org.junit.jupiter.params.provider.MethodSource;
++import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
+ 
+ import io.kroxylicious.proxy.filter.KrpcFilterContext;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyShort;
+ import static org.mockito.ArgumentMatchers.isA;
++import static org.mockito.Mockito.atLeast;
+ import static org.mockito.Mockito.never;
+-import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+@@ -55,43 +61,108 @@ class EagerMetadataLearnerTest {
+ 
+     public static Stream<Arguments> preludeRequests() {
+         return Stream.of(
+-                toArgs(new ApiVersionsRequest(new ApiVersionsRequestData(), ApiVersionsRequestData.HIGHEST_SUPPORTED_VERSION)),
+-                toArgs(new SaslHandshakeRequest(new SaslHandshakeRequestData(), SaslHandshakeRequestData.HIGHEST_SUPPORTED_VERSION)),
+-                toArgs(new SaslAuthenticateRequest(new SaslAuthenticateRequestData(), SaslHandshakeRequestData.HIGHEST_SUPPORTED_VERSION)));
++                toArgs("ApiVersionsRequest", new ApiVersionsRequest(new ApiVersionsRequestData(), ApiVersionsRequestData.HIGHEST_SUPPORTED_VERSION)),
++                toArgs("SaslHandshakeRequest", new SaslHandshakeRequest(new SaslHandshakeRequestData(), SaslHandshakeRequestData.HIGHEST_SUPPORTED_VERSION)),
++                toArgs("SaslAuthenticateRequest", new SaslAuthenticateRequest(new SaslAuthenticateRequestData(), SaslHandshakeRequestData.HIGHEST_SUPPORTED_VERSION)));
+     }
+ 
+-    @ParameterizedTest
++    @ParameterizedTest(name = "{0}")
+     @MethodSource("preludeRequests")
+-    public void forwardsRequestsOfKafkaPrelude(ApiKeys apiKey, RequestHeaderData header, ApiMessage request) {
++    public void forwardsRequestsOfKafkaPrelude(String name, ApiKeys apiKey, RequestHeaderData header, ApiMessage request) {
+         learner.onRequest(apiKey, header, request, context);
+         verify(context).forwardRequest(header, request);
+     }
+ 
+     public static Stream<Arguments> postPreludeRequests() {
+         return Stream.of(
+-                toArgs(new ProduceRequest(new ProduceRequestData(), ProduceRequestData.HIGHEST_SUPPORTED_VERSION)),
+-                toArgs(new MetadataRequest(new MetadataRequestData(), MetadataRequestData.HIGHEST_SUPPORTED_VERSION)),
+-                toArgs(new MetadataRequest(new MetadataRequestData(), MetadataRequestData.LOWEST_SUPPORTED_VERSION)));
++                toArgs("ProduceRequest replaced by MetadataRequest", new ProduceRequest(new ProduceRequestData(), ProduceRequestData.HIGHEST_SUPPORTED_VERSION)),
++                toArgs("MetadataRequest (highest supported)", new MetadataRequest(new MetadataRequestData(), MetadataRequestData.HIGHEST_SUPPORTED_VERSION)),
++                toArgs("MetadataRequest (lowest supported)", new MetadataRequest(new MetadataRequestData(), MetadataRequestData.LOWEST_SUPPORTED_VERSION)),
++                toArgs("MetadataRequest (payload fidelity)", new MetadataRequest(new MetadataRequestData().setTopics(List.of(new MetadataRequestTopic().setName("foo"))),
++                        MetadataRequestData.LOWEST_SUPPORTED_VERSION)));
+     }
+ 
+-    @ParameterizedTest
++    @ParameterizedTest(name = "{0}")
+     @MethodSource("postPreludeRequests")
+-    public void spontaneouslyEmitsMetadataRequest(ApiKeys apiKey, RequestHeaderData header, ApiMessage request) {
++    public void spontaneouslyEmitsMetadataRequest(String name, ApiKeys apiKey, RequestHeaderData header, ApiMessage request) {
+         var metadataResponse = new MetadataResponseData();
+         metadataResponse.brokers().add(new MetadataResponseData.MetadataResponseBroker().setNodeId(1).setHost("localhost").setPort(1234));
+ 
+         when(context.sendRequest(anyShort(), isA(MetadataRequestData.class))).thenReturn(CompletableFuture.completedStage(metadataResponse));
+         learner.onRequest(apiKey, header, request, context);
+ 
+-        verify(context, apiKey.equals(ApiKeys.METADATA) ? times(1) : never()).forwardResponse(metadataResponse);
+-        verify(context).closeConnection();
++        if (apiKey == ApiKeys.METADATA) {
++            // The client's metadata request must be passed on with fidelity (preserving the requested topics).
++            // A compliant implementation may forward the client's request directly or reuse it as the
++            // out-of-band request, so either route is accepted.
++            assertThat(metadataRequestPassedOnWithFidelity(request))
++                    .as("client's metadata request passed on with fidelity")
++                    .isTrue();
++        }
++        else {
++            verify(context).sendRequest(anyShort(), isA(MetadataRequestData.class));
++            verify(context, never()).forwardResponse(metadataResponse);
++        }
+     }
+ 
+-    private static Arguments toArgs(AbstractRequest request) {
++    @Test
++    public void clientReconnectingAfterProxyRestartHasItsMetadataRequestPassedOnWithFidelity() {
++        // A client such as kcat -C -E reconnects after the proxy restarts and sends a Metadata request
++        // naming the topics it is interested in. Preserving the requested topic allows the client to continue
++        // on the correct broker.
++        var request = new MetadataRequestData().setTopics(List.of(new MetadataRequestTopic().setName("my-topic")));
++        var header = new RequestHeaderData()
++                .setRequestApiKey(ApiKeys.METADATA.id)
++                .setRequestApiVersion(MetadataRequestData.LOWEST_SUPPORTED_VERSION);
++        var metadataResponse = new MetadataResponseData();
++        metadataResponse.brokers().add(new MetadataResponseData.MetadataResponseBroker().setNodeId(1).setHost("localhost").setPort(1234));
++        when(context.sendRequest(anyShort(), isA(MetadataRequestData.class))).thenReturn(CompletableFuture.completedStage(metadataResponse));
++
++        learner.onRequest(ApiKeys.METADATA, header, request, context);
++
++        assertThat(metadataRequestPassedOnWithFidelity(request))
++                .as("client's metadata request passed on with fidelity")
++                .isTrue();
++    }
++
++    @Test
++    public void producerReconnectingAfterProxyRestartCanContinueProducingToItsRequestedTopic() {
++        var request = new MetadataRequestData().setTopics(List.of(new MetadataRequestTopic().setName("producer-topic")));
++        var header = new RequestHeaderData()
++                .setRequestApiKey(ApiKeys.METADATA.id)
++                .setRequestApiVersion(MetadataRequestData.LOWEST_SUPPORTED_VERSION);
++        var metadataResponse = new MetadataResponseData();
++        metadataResponse.brokers().add(new MetadataResponseData.MetadataResponseBroker().setNodeId(1).setHost("localhost").setPort(1234));
++        when(context.sendRequest(anyShort(), isA(MetadataRequestData.class))).thenReturn(CompletableFuture.completedStage(metadataResponse));
++
++        learner.onRequest(ApiKeys.METADATA, header, request, context);
++
++        assertThat(metadataRequestPassedOnWithFidelity(request))
++                .as("producer's requested topic is preserved during reconnection")
++                .isTrue();
++    }
++
++    /**
++     * @return true if the given metadata request was passed on (either forwarded directly or sent as the
++     *         out-of-band request) with its topics preserved.
++     */
++    private boolean metadataRequestPassedOnWithFidelity(ApiMessage request) {
++        var expectedTopics = ((MetadataRequestData) request).topics();
++        ArgumentCaptor<ApiMessage> forwarded = ArgumentCaptor.forClass(ApiMessage.class);
++        ArgumentCaptor<ApiMessage> sent = ArgumentCaptor.forClass(ApiMessage.class);
++        verify(context, atLeast(0)).forwardRequest(any(), forwarded.capture());
++        verify(context, atLeast(0)).sendRequest(anyShort(), sent.capture());
++        return Stream.concat(forwarded.getAllValues().stream(), sent.getAllValues().stream())
++                .filter(MetadataRequestData.class::isInstance)
++                .map(MetadataRequestData.class::cast)
++                .anyMatch(m -> m.topics().equals(expectedTopics));
++    }
++
++    private static Arguments toArgs(String name, AbstractRequest request) {
+         var header = new RequestHeaderData().setRequestApiKey(request.apiKey().id).setRequestApiVersion(request.version());
+         var apiKey = request.apiKey();
+         var request1 = request.data();
+-        return Arguments.of(apiKey, header, request1);
++        return Arguments.of(name, apiKey, header, request1);
+     }
+ 
+-}
+\ No newline at end of file
++}

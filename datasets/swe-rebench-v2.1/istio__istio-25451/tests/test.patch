@@ -1,0 +1,148 @@
+diff --git a/operator/cmd/mesh/manifest-generate_test.go b/operator/cmd/mesh/manifest-generate_test.go
+index 86e20c435..b04a10055 100644
+--- a/operator/cmd/mesh/manifest-generate_test.go
++++ b/operator/cmd/mesh/manifest-generate_test.go
+@@ -17,6 +17,8 @@ package mesh
+ import (
+ 	"fmt"
+ 	"io/ioutil"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
+@@ -34,6 +36,7 @@ import (
+ 	"istio.io/istio/operator/pkg/util/httpserver"
+ 	"istio.io/istio/operator/pkg/util/tgz"
+ 	"istio.io/istio/pkg/test/env"
++	"istio.io/pkg/log"
+ 	"istio.io/pkg/version"
+ )
+ 
+@@ -488,6 +491,62 @@ func TestBogusControlPlaneSec(t *testing.T) {
+ 	}
+ }
+ 
++func TestInstallManifestsFlagDoesNotBecomeInputFile(t *testing.T) {
++	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/api":
++			_, _ = w.Write([]byte(`{"kind":"APIVersions","apiVersion":"v1","versions":["v1"],"serverAddressByClientCIDRs":[]}`))
++		case "/apis":
++			_, _ = w.Write([]byte(`{"kind":"APIGroupList","apiVersion":"v1","groups":[]}`))
++		case "/api/v1/namespaces":
++			w.WriteHeader(http.StatusCreated)
++			_, _ = w.Write([]byte(`{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"istio-system"}}`))
++		default:
++			w.WriteHeader(http.StatusNotFound)
++			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
++		}
++	}))
++	defer apiServer.Close()
++
++	kubeconfigDir, err := ioutil.TempDir("", "istio-install-kubeconfig-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(kubeconfigDir)
++	kubeconfig := filepath.Join(kubeconfigDir, "config")
++	contents := `apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: ` + apiServer.URL + `
++  name: test
++contexts:
++- context:
++    cluster: test
++    user: test
++  name: test
++current-context: test
++users:
++- name: test
++  user: {}`
++	if err := ioutil.WriteFile(kubeconfig, []byte(contents), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	cmd := InstallCmd(log.DefaultOptions())
++	cmd.SilenceErrors = true
++	cmd.SilenceUsage = true
++	cmd.SetArgs([]string{
++		"--manifests", string(snapshotCharts),
++		"--skip-confirmation", "--force", "--dry-run",
++		"--kubeconfig", kubeconfig,
++	})
++	if err := cmd.Execute(); err != nil {
++		t.Fatalf("install with the supplied manifests directory failed: %v", err)
++	}
++}
++
+ func TestInstallPackagePath(t *testing.T) {
+ 	serverDir, err := ioutil.TempDir(os.TempDir(), "istio-test-server-*")
+ 	if err != nil {
+@@ -650,7 +709,7 @@ func TestLDFlags(t *testing.T) {
+ 	version.DockerInfo.Hub = "testHub"
+ 	version.DockerInfo.Tag = "testTag"
+ 	l := clog.NewConsoleLogger(os.Stdout, os.Stderr, installerScope)
+-	_, iops, err := GenerateConfig(nil, []string{"installPackagePath=" + string(liveCharts)}, true, nil, l)
++	_, iops, err := GenManifests(nil, []string{"installPackagePath=" + string(liveCharts)}, true, nil, l)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/pkg/test/framework/components/istio/operator.go b/pkg/test/framework/components/istio/operator.go
+index 44c4d3a64..abfdefecc 100644
+--- a/pkg/test/framework/components/istio/operator.go
++++ b/pkg/test/framework/components/istio/operator.go
+@@ -23,6 +23,7 @@ import (
+ 	"os"
+ 	"path"
+ 	"path/filepath"
++	"reflect"
+ 	"regexp"
+ 	"sync"
+ 	"time"
+@@ -480,6 +481,33 @@ func isCentralIstio(env *kube.Environment, cfg Config) bool {
+ 	return false
+ }
+ 
++func applyManifests(cluster resource.Cluster, inFiles, setOverlay []string, l clog.Logger) error {
++	apply := reflect.ValueOf(mesh.ApplyManifests)
++	t := apply.Type()
++	var args []reflect.Value
++	switch t.NumIn() {
++	case 2:
++		options := reflect.New(t.In(0)).Elem()
++		options.FieldByName("Client").Set(reflect.ValueOf(cluster))
++		options.FieldByName("InFilenames").Set(reflect.ValueOf(inFiles))
++		options.FieldByName("SetOverlay").Set(reflect.ValueOf(setOverlay))
++		options.FieldByName("WaitTimeout").Set(reflect.ValueOf(300 * time.Second))
++		args = []reflect.Value{options, reflect.ValueOf(l)}
++	case 7:
++		args = []reflect.Value{
++			reflect.ValueOf(inFiles), reflect.ValueOf(setOverlay), reflect.ValueOf(false),
++			reflect.ValueOf(false), reflect.ValueOf(cluster), reflect.ValueOf(300 * time.Second), reflect.ValueOf(l),
++		}
++	default:
++		return fmt.Errorf("unsupported manifest apply interface")
++	}
++	result := apply.Call(args)[0]
++	if result.IsNil() {
++		return nil
++	}
++	return result.Interface().(error)
++}
++
+ func applyManifest(ctx resource.Context, inFiles, setOverlay []string, cluster resource.Cluster) error {
+ 	// Generate the manifest.
+ 	l := clog.NewConsoleLogger(os.Stdout, os.Stderr, scopes.Framework)
+@@ -498,7 +526,7 @@ func applyManifest(ctx resource.Context, inFiles, setOverlay []string, cluster r
+ 	}
+ 
+ 	scopes.Framework.Infof("Running istio control plane on cluster %s", cluster.Name())
+-	err = mesh.ApplyManifests(inFiles, setOverlay, false, false, cluster, 300*time.Second, l)
++	err = applyManifests(cluster, inFiles, setOverlay, l)
+ 	if err != nil {
+ 		return fmt.Errorf("manifest apply failed: %v", err)
+ 	}

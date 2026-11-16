@@ -1,0 +1,202 @@
+diff --git a/policy/predicate/file.go b/policy/predicate/file.go
+index 918ab6d..e832692 100644
+--- a/policy/predicate/file.go
++++ b/policy/predicate/file.go
+@@ -15,9 +15,9 @@
+ package predicate
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"fmt"
+-	"regexp"
+ 	"strconv"
+ 
+ 	"github.com/palantir/policy-bot/policy/common"
+@@ -96,35 +96,80 @@ type ModifiedLines struct {
+ 	Total     ComparisonExpr `yaml:"total"`
+ }
+ 
+-type ComparisonExpr string
++type CompareOp uint8
+ 
+-var (
+-	numCompRegexp = regexp.MustCompile(`^(<|>) ?(\d+)$`)
++const (
++	OpNone CompareOp = iota
++	OpLessThan
++	OpGreaterThan
+ )
+ 
++type ComparisonExpr struct {
++	Op    CompareOp
++	Value int64
++}
++
+ func (exp ComparisonExpr) IsEmpty() bool {
+-	return exp == ""
++	return exp.Op == OpNone && exp.Value == 0
+ }
+ 
+-func (exp ComparisonExpr) Evaluate(n int64) (bool, error) {
+-	match := numCompRegexp.FindStringSubmatch(string(exp))
+-	if match == nil {
+-		return false, errors.Errorf("invalid comparison expression: %q", exp)
++func (exp ComparisonExpr) Evaluate(n int64) bool {
++	switch exp.Op {
++	case OpLessThan:
++		return n < exp.Value
++	case OpGreaterThan:
++		return n > exp.Value
+ 	}
++	return false
++}
+ 
+-	op := match[1]
+-	v, err := strconv.ParseInt(match[2], 10, 64)
+-	if err != nil {
+-		return false, errors.Wrapf(err, "invalid commparison expression: %q", exp)
++func (exp ComparisonExpr) MarshalText() ([]byte, error) {
++	if exp.Op == OpNone {
++		return nil, nil
+ 	}
+ 
+-	switch op {
+-	case "<":
+-		return n < v, nil
+-	case ">":
+-		return n > v, nil
++	var op string
++	switch exp.Op {
++	case OpLessThan:
++		op = "<"
++	case OpGreaterThan:
++		op = ">"
++	default:
++		return nil, errors.Errorf("unknown operation: %d", exp.Op)
+ 	}
+-	return false, errors.Errorf("invalid comparison expression: %q", exp)
++	return []byte(fmt.Sprintf("%s %d", op, exp.Value)), nil
++}
++
++func (exp *ComparisonExpr) UnmarshalText(text []byte) error {
++	text = bytes.TrimSpace(text)
++	if len(text) == 0 {
++		*exp = ComparisonExpr{}
++		return nil
++	}
++
++	i := 0
++	var op CompareOp
++	switch text[i] {
++	case '<':
++		op = OpLessThan
++	case '>':
++		op = OpGreaterThan
++	default:
++		return errors.Errorf("invalid comparison operator: %c", text[i])
++	}
++
++	i++
++	for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
++		i++
++	}
++
++	v, err := strconv.ParseInt(string(text[i:]), 10, 64)
++	if err != nil {
++		return errors.Wrapf(err, "invalid comparison value")
++	}
++
++	*exp = ComparisonExpr{Op: op, Value: v}
++	return nil
+ }
+ 
+ func (pred *ModifiedLines) Evaluate(ctx context.Context, prctx pull.Context) (bool, string, error) {
+@@ -144,14 +189,8 @@ func (pred *ModifiedLines) Evaluate(ctx context.Context, prctx pull.Context) (bo
+ 		pred.Deletions: deletions,
+ 		pred.Total:     additions + deletions,
+ 	} {
+-		if !expr.IsEmpty() {
+-			ok, err := expr.Evaluate(v)
+-			if err != nil {
+-				return false, "", err
+-			}
+-			if ok {
+-				return true, "", nil
+-			}
++		if !expr.IsEmpty() && expr.Evaluate(v) {
++			return true, "", nil
+ 		}
+ 	}
+ 	return false, fmt.Sprintf("modification of (+%d, -%d) does not match any conditions", additions, deletions), nil
+diff --git a/server/handler/details.go b/server/handler/details.go
+index cf1f561..9c69353 100644
+--- a/server/handler/details.go
++++ b/server/handler/details.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/alexedwards/scs"
+ 	"github.com/bluekeyes/templatetree"
+ 	"github.com/google/go-github/v32/github"
++	"github.com/palantir/go-githubapp/githubapp"
+ 	"github.com/palantir/policy-bot/policy/common"
+ 	"github.com/palantir/policy-bot/pull"
+ 	"github.com/pkg/errors"
+@@ -44,12 +45,16 @@ func (h *Details) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
+ 
+ 	number, err := strconv.Atoi(pat.Param(r, "number"))
+ 	if err != nil {
+-		http.Error(w, fmt.Sprintf("invalid pull request number: %v", err), http.StatusBadRequest)
++		http.Error(w, fmt.Sprintf("Invalid pull request number: %v", err), http.StatusBadRequest)
+ 		return nil
+ 	}
+ 
+ 	installation, err := h.Installations.GetByOwner(ctx, owner)
+ 	if err != nil {
++		if _, notFound := err.(githubapp.InstallationNotFound); notFound {
++			h.render404(w, owner, repo, number)
++			return nil
++		}
+ 		return err
+ 	}
+ 
+@@ -72,7 +77,7 @@ func (h *Details) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
+ 	level, _, err := client.Repositories.GetPermissionLevel(ctx, owner, repo, user)
+ 	if err != nil {
+ 		if isNotFound(err) {
+-			http.Error(w, fmt.Sprintf("not found: %s/%s#%d", owner, repo, number), http.StatusNotFound)
++			h.render404(w, owner, repo, number)
+ 			return nil
+ 		}
+ 		return errors.Wrap(err, "failed to get user permission level")
+@@ -80,14 +85,14 @@ func (h *Details) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
+ 
+ 	// if the user does not have permission, pretend the repo/PR doesn't exist
+ 	if level.GetPermission() == "none" {
+-		http.Error(w, fmt.Sprintf("not found: %s/%s#%d", owner, repo, number), http.StatusNotFound)
++		h.render404(w, owner, repo, number)
+ 		return nil
+ 	}
+ 
+ 	pr, _, err := client.PullRequests.Get(ctx, owner, repo, number)
+ 	if err != nil {
+ 		if isNotFound(err) {
+-			http.Error(w, fmt.Sprintf("not found: %s/%s#%d", owner, repo, number), http.StatusNotFound)
++			h.render404(w, owner, repo, number)
+ 			return nil
+ 		}
+ 		return errors.Wrap(err, "failed to get pull request")
+@@ -156,6 +161,14 @@ func (h *Details) render(w http.ResponseWriter, data interface{}) error {
+ 	return h.Templates.ExecuteTemplate(w, "details.html.tmpl", data)
+ }
+ 
++func (h *Details) render404(w http.ResponseWriter, owner, repo string, number int) {
++	msg := fmt.Sprintf(
++		"Not Found: %s/%s#%d\n\nThe repository or pull request does not exist, you do not have permission, or policy-bot is not installed.",
++		owner, repo, number,
++	)
++	http.Error(w, msg, http.StatusNotFound)
++}
++
+ func getPolicyURL(pr *github.PullRequest, config FetchedConfig) string {
+ 	base := pr.GetBase().GetRepo().GetHTMLURL()
+ 	if u, _ := url.Parse(base); u != nil {

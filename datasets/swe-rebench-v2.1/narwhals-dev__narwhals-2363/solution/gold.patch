@@ -1,0 +1,409 @@
+diff --git a/docs/api-reference/expr.md b/docs/api-reference/expr.md
+index e0f7b657..02e4e02a 100644
+--- a/docs/api-reference/expr.md
++++ b/docs/api-reference/expr.md
+@@ -36,6 +36,7 @@
+         - is_null
+         - is_unique
+         - len
++        - log
+         - map_batches
+         - max
+         - mean
+diff --git a/docs/api-reference/series.md b/docs/api-reference/series.md
+index 95a6539a..3a49856e 100644
+--- a/docs/api-reference/series.md
++++ b/docs/api-reference/series.md
+@@ -45,6 +45,7 @@
+         - is_unique
+         - item
+         - len
++        - log
+         - max
+         - mean
+         - median
+diff --git a/docs/ecosystem.md b/docs/ecosystem.md
+index 0bc7d0df..45a667b9 100644
+--- a/docs/ecosystem.md
++++ b/docs/ecosystem.md
+@@ -55,7 +55,7 @@ to various SQL (as well as Polars LazyFrame) engines. Some differences with Narw
+ 
+ * Narwhals allows you to write "Dataframe X in, Dataframe X out" functions.
+   Ibis allows materialising to pandas, Polars (eager), and PyArrow, but has
+-  no way to get back to the input type exactly (e.g. `Enum` don't round-trip in Ibis)
++  no way to get back to the input type exactly (e.g. `Enum`s don't round-trip in Ibis)
+ * Narwhals respects input data types as much as possible, Ibis doesn't
+   support Categorical / Enum.
+ * Narwhals separates between lazy and eager APIs, with the eager API
+@@ -70,8 +70,6 @@ to various SQL (as well as Polars LazyFrame) engines. Some differences with Narw
+ * Narwhals supports pandas and Dask, which Ibis has deprecated support for.
+ 
+ Although people often ask about the two tools, we consider them to be
+-very different and not in competition. Further efforts to clarify the
+-distinction are welcome 🙏!
+-
+-Furthermore, [there is work is in progress](https://github.com/narwhals-dev/narwhals/pull/2536)
+-to support `ibis.Table` in Narwhals!
++very different and not in competition. In particular,
++**Narwhals supports ibis Tables**, meaning that dataframe-agnostic code
++written using Narwhals' lazy API also supports Ibis.
+diff --git a/narwhals/_arrow/expr.py b/narwhals/_arrow/expr.py
+index 2f0134ea..0f494d10 100644
+--- a/narwhals/_arrow/expr.py
++++ b/narwhals/_arrow/expr.py
+@@ -210,4 +210,7 @@ class ArrowExpr(EagerExpr["ArrowDataFrame", ArrowSeries]):
+     def rank(self, method: RankMethod, *, descending: bool) -> Self:
+         return self._reuse_series("rank", method=method, descending=descending)
+ 
++    def log(self, base: float) -> Self:
++        return self._reuse_series("log", base=base)
++
+     ewm_mean = not_implemented()
+diff --git a/narwhals/_arrow/series.py b/narwhals/_arrow/series.py
+index 83a478b5..44d5d13e 100644
+--- a/narwhals/_arrow/series.py
++++ b/narwhals/_arrow/series.py
+@@ -1148,6 +1148,9 @@ class ArrowSeries(EagerSeries["ChunkedArrayAny"]):
+             msg = f"Unable to compare other of type {type(other)} with series of type {self.dtype}."
+             raise InvalidOperationError(msg) from exc
+ 
++    def log(self, base: float) -> Self:
++        return self._with_native(pc.logb(self.native, lit(base)))
++
+     @property
+     def dt(self) -> ArrowSeriesDateTimeNamespace:
+         return ArrowSeriesDateTimeNamespace(self)
+diff --git a/narwhals/_compliant/expr.py b/narwhals/_compliant/expr.py
+index 922a69c1..afe91d08 100644
+--- a/narwhals/_compliant/expr.py
++++ b/narwhals/_compliant/expr.py
+@@ -143,6 +143,7 @@ class CompliantExpr(Protocol38[CompliantFrameT, CompliantSeriesOrNativeExprT_co]
+     def diff(self) -> Self: ...
+     def unique(self) -> Self: ...
+     def len(self) -> Self: ...
++    def log(self, base: float) -> Self: ...
+     def round(self, decimals: int) -> Self: ...
+     def mode(self) -> Self: ...
+     def head(self, n: int) -> Self: ...
+diff --git a/narwhals/_compliant/series.py b/narwhals/_compliant/series.py
+index f1c94513..aebcfae8 100644
+--- a/narwhals/_compliant/series.py
++++ b/narwhals/_compliant/series.py
+@@ -200,6 +200,7 @@ class CompliantSeries(
+     def is_unique(self) -> Self: ...
+     def item(self, index: int | None) -> Any: ...
+     def len(self) -> int: ...
++    def log(self, base: float) -> Self: ...
+     def max(self) -> Any: ...
+     def mean(self) -> float: ...
+     def median(self) -> float: ...
+diff --git a/narwhals/_dask/expr.py b/narwhals/_dask/expr.py
+index 5b5cc1e2..8af4a1b5 100644
+--- a/narwhals/_dask/expr.py
++++ b/narwhals/_dask/expr.py
+@@ -663,6 +663,14 @@ class DaskExpr(
+ 
+         return self._with_callable(da.isfinite, "is_finite")
+ 
++    def log(self, base: float) -> Self:
++        import dask.array as da
++
++        def _log(_input: dx.Series) -> dx.Series:
++            return da.log(_input) / da.log(base)
++
++        return self._with_callable(_log, "log")
++
+     @property
+     def str(self) -> DaskExprStringNamespace:
+         return DaskExprStringNamespace(self)
+diff --git a/narwhals/_duckdb/expr.py b/narwhals/_duckdb/expr.py
+index ed0dabaa..40e40857 100644
+--- a/narwhals/_duckdb/expr.py
++++ b/narwhals/_duckdb/expr.py
+@@ -753,6 +753,17 @@ class DuckDBExpr(LazyExpr["DuckDBLazyFrame", "duckdb.Expression"]):
+ 
+         return self._with_callable(_rank)
+ 
++    def log(self, base: float) -> Self:
++        def _log(_input: duckdb.Expression) -> duckdb.Expression:
++            log = FunctionExpression("log", _input)
++            return (
++                when(_input < lit(0), lit(float("nan")))
++                .when(_input == lit(0), lit(float("-inf")))
++                .otherwise(log / FunctionExpression("log", lit(base)))
++            )
++
++        return self._with_callable(_log)
++
+     @property
+     def str(self) -> DuckDBExprStringNamespace:
+         return DuckDBExprStringNamespace(self)
+diff --git a/narwhals/_ibis/expr.py b/narwhals/_ibis/expr.py
+index 146ae68d..cfa45328 100644
+--- a/narwhals/_ibis/expr.py
++++ b/narwhals/_ibis/expr.py
+@@ -648,6 +648,17 @@ class IbisExpr(LazyExpr["IbisLazyFrame", "ir.Column"]):
+ 
+         return self._with_callable(_rank)
+ 
++    def log(self, base: float) -> Self:
++        def _log(_input: ir.NumericColumn) -> ir.Value:
++            otherwise = _input.log(cast("ir.NumericValue", lit(base)))
++            return ibis.cases(
++                (_input < lit(0), lit(float("nan"))),
++                (_input == lit(0), lit(float("-inf"))),
++                else_=otherwise,
++            )
++
++        return self._with_callable(_log)
++
+     @property
+     def str(self) -> IbisExprStringNamespace:
+         return IbisExprStringNamespace(self)
+diff --git a/narwhals/_pandas_like/dataframe.py b/narwhals/_pandas_like/dataframe.py
+index 37298d5d..3dd662ba 100644
+--- a/narwhals/_pandas_like/dataframe.py
++++ b/narwhals/_pandas_like/dataframe.py
+@@ -422,6 +422,8 @@ class PandasLikeDataFrame(
+         new_series = align_series_full_broadcast(*new_series)
+         namespace = self.__narwhals_namespace__()
+         df = namespace._concat_horizontal([s.native for s in new_series])
++        # `concat` creates a new object, so fine to modify `.columns.name` inplace.
++        df.columns.name = self.native.columns.name
+         return self._with_native(df, validate_column_names=True)
+ 
+     def drop_nulls(
+@@ -480,6 +482,8 @@ class PandasLikeDataFrame(
+         to_concat.extend(self._extract_comparand(s) for s in name_columns.values())
+         namespace = self.__narwhals_namespace__()
+         df = namespace._concat_horizontal(to_concat)
++        # `concat` creates a new object, so fine to modify `.columns.name` inplace.
++        df.columns.name = self.native.columns.name
+         return self._with_native(df, validate_column_names=False)
+ 
+     def rename(self, mapping: Mapping[str, str]) -> Self:
+diff --git a/narwhals/_pandas_like/expr.py b/narwhals/_pandas_like/expr.py
+index 73bf1f2d..d862ffec 100644
+--- a/narwhals/_pandas_like/expr.py
++++ b/narwhals/_pandas_like/expr.py
+@@ -393,3 +393,6 @@ class PandasLikeExpr(EagerExpr["PandasLikeDataFrame", PandasLikeSeries]):
+         return self._reuse_series(
+             "rank", call_kwargs={"method": method, "descending": descending}
+         )
++
++    def log(self, base: float) -> Self:
++        return self._reuse_series("log", call_kwargs={"base": base})
+diff --git a/narwhals/_pandas_like/series.py b/narwhals/_pandas_like/series.py
+index 005c1cfb..ea6b60a9 100644
+--- a/narwhals/_pandas_like/series.py
++++ b/narwhals/_pandas_like/series.py
+@@ -42,6 +42,7 @@ if TYPE_CHECKING:
+     from typing_extensions import Self
+     from typing_extensions import TypeIs
+ 
++    from narwhals._arrow.typing import ChunkedArrayAny
+     from narwhals._pandas_like.dataframe import PandasLikeDataFrame
+     from narwhals._pandas_like.namespace import PandasLikeNamespace
+     from narwhals.dtypes import DType
+@@ -1015,6 +1016,39 @@ class PandasLikeSeries(EagerSeries[Any]):
+         data["count"] = result.reset_index(drop=True)
+         return PandasLikeDataFrame.from_native(ns.DataFrame(data), context=self)
+ 
++    def log(self, base: float) -> Self:
++        native = self.native
++        implementation = self._implementation
++
++        dtype_backend = get_dtype_backend(native.dtype, implementation=implementation)
++
++        if implementation.is_cudf():
++            import cupy as cp
++
++            return self._with_native(cp.log(native) / cp.log(base))
++
++        if dtype_backend == "pyarrow":
++            import pyarrow.compute as pc
++
++            from narwhals._arrow.utils import native_to_narwhals_dtype
++
++            ca = native.array._pa_array
++            result_arr = cast("ChunkedArrayAny", pc.logb(ca, base))
++            nw_dtype = native_to_narwhals_dtype(result_arr.type, self._version)
++            out_dtype = narwhals_to_native_dtype(
++                nw_dtype,
++                "pyarrow",
++                self._implementation,
++                self._backend_version,
++                self._version,
++            )
++            result_native = native.__class__(
++                result_arr, dtype=out_dtype, index=native.index, name=native.name
++            )
++        else:
++            result_native = np.log(native) / np.log(base)
++        return self._with_native(result_native)
++
+     @property
+     def str(self) -> PandasLikeSeriesStringNamespace:
+         return PandasLikeSeriesStringNamespace(self)
+diff --git a/narwhals/_polars/expr.py b/narwhals/_polars/expr.py
+index c46aede6..52a563de 100644
+--- a/narwhals/_polars/expr.py
++++ b/narwhals/_polars/expr.py
+@@ -290,6 +290,7 @@ class PolarsExpr:
+     is_null: Method[Self]
+     is_unique: Method[Self]
+     len: Method[Self]
++    log: Method[Self]
+     max: Method[Self]
+     mean: Method[Self]
+     median: Method[Self]
+diff --git a/narwhals/_polars/series.py b/narwhals/_polars/series.py
+index b75b2381..fd891240 100644
+--- a/narwhals/_polars/series.py
++++ b/narwhals/_polars/series.py
+@@ -95,6 +95,7 @@ INHERITED_METHODS = frozenset(
+         "is_unique",
+         "item",
+         "len",
++        "log",
+         "max",
+         "mean",
+         "min",
+@@ -674,6 +675,7 @@ class PolarsSeries:
+     is_unique: Method[Self]
+     item: Method[Any]
+     len: Method[int]
++    log: Method[Self]
+     max: Method[Any]
+     mean: Method[float]
+     min: Method[Any]
+diff --git a/narwhals/_spark_like/expr.py b/narwhals/_spark_like/expr.py
+index c52bdd12..6d2d4a39 100644
+--- a/narwhals/_spark_like/expr.py
++++ b/narwhals/_spark_like/expr.py
+@@ -811,6 +811,16 @@ class SparkLikeExpr(LazyExpr["SparkLikeLazyFrame", "Column"]):
+ 
+         return self._with_callable(_rank)
+ 
++    def log(self, base: float) -> Self:
++        def _log(_input: Column) -> Column:
++            return (
++                self._F.when(_input < 0, self._F.lit(float("nan")))
++                .when(_input == 0, self._F.lit(float("-inf")))
++                .otherwise(self._F.log(base, _input))
++            )
++
++        return self._with_callable(_log)
++
+     @property
+     def str(self) -> SparkLikeExprStringNamespace:
+         return SparkLikeExprStringNamespace(self)
+diff --git a/narwhals/expr.py b/narwhals/expr.py
+index faee62dc..3db1d65e 100644
+--- a/narwhals/expr.py
++++ b/narwhals/expr.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import math
+ from typing import TYPE_CHECKING
+ from typing import Any
+ from typing import Callable
+@@ -2482,6 +2483,41 @@ class Expr:
+             )
+         )
+ 
++    def log(self, base: float = math.e) -> Self:
++        r"""Compute the logarithm to a given base.
++
++        Arguments:
++            base: Given base, defaults to `e`
++
++        Returns:
++            A new expression log values data.
++
++        Examples:
++            >>> import pyarrow as pa
++            >>> import narwhals as nw
++            >>> df_native = pa.table({"values": [1, 2, 4]})
++            >>> df = nw.from_native(df_native)
++            >>> result = df.with_columns(
++            ...     log=nw.col("values").log(), log_2=nw.col("values").log(base=2)
++            ... )
++            >>> result
++            ┌────────────────────────────────────────────────┐
++            |               Narwhals DataFrame               |
++            |------------------------------------------------|
++            |pyarrow.Table                                   |
++            |values: int64                                   |
++            |log: double                                     |
++            |log_2: double                                   |
++            |----                                            |
++            |values: [[1,2,4]]                               |
++            |log: [[0,0.6931471805599453,1.3862943611198906]]|
++            |log_2: [[0,1,2]]                                |
++            └────────────────────────────────────────────────┘
++        """
++        return self._with_elementwise_op(
++            lambda plx: self._to_compliant_expr(plx).log(base=base)
++        )
++
+     @property
+     def str(self) -> ExprStringNamespace[Self]:
+         return ExprStringNamespace(self)
+diff --git a/narwhals/series.py b/narwhals/series.py
+index ca85f2ba..a83afbb7 100644
+--- a/narwhals/series.py
++++ b/narwhals/series.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import math
+ from typing import TYPE_CHECKING
+ from typing import Any
+ from typing import Callable
+@@ -2601,6 +2602,32 @@ class Series(Generic[IntoSeriesT]):
+             level=self._level,
+         )
+ 
++    def log(self, base: float = math.e) -> Self:
++        r"""Compute the logarithm to a given base.
++
++        Arguments:
++            base: Given base, defaults to `e`
++
++        Returns:
++            A new expression log values data.
++
++        Examples:
++            >>> import pandas as pd
++            >>> import narwhals as nw
++            >>> s_native = pd.Series([1, 2, 4], name="a")
++            >>> s = nw.from_native(s_native, series_only=True)
++            >>> s.log(base=2)
++            ┌───────────────────────┐
++            |    Narwhals Series    |
++            |-----------------------|
++            |0    0.0               |
++            |1    1.0               |
++            |2    2.0               |
++            |Name: a, dtype: float64|
++            └───────────────────────┘
++        """
++        return self._with_compliant(self._compliant_series.log(base=base))
++
+     @property
+     def str(self) -> SeriesStringNamespace[Self]:
+         return SeriesStringNamespace(self)
+diff --git a/pyproject.toml b/pyproject.toml
+index 40d1e22a..c18f9c03 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -290,6 +290,7 @@ strict = true
+ [[tool.mypy.overrides]]
+ module = [
+   "cudf.*",
++  "cupy.*",
+   "dask.*",
+   "dask_expr.*",
+   "duckdb.*",

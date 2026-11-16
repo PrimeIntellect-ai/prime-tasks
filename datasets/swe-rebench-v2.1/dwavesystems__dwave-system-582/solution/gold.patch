@@ -1,0 +1,260 @@
+diff --git a/dwave/embedding/chain_strength.py b/dwave/embedding/chain_strength.py
+index 39af669..778375f 100644
+--- a/dwave/embedding/chain_strength.py
++++ b/dwave/embedding/chain_strength.py
+@@ -15,20 +15,21 @@
+ """Utility functions for calculating chain strength.
+ 
+ Examples:
+-    This example uses :func:`uniform_torque_compensation`, given a prefactor of 2,
++    This example uses :func:`uniform_torque_compensation`, given a prefactor of 3,
+     to calculate a chain strength that :class:`EmbeddingComposite` then uses.
+ 
++    >>> import numpy as np
+     >>> from functools import partial
+     >>> from dwave.system import EmbeddingComposite, DWaveSampler
+     >>> from dwave.embedding.chain_strength import uniform_torque_compensation
+     ...
+-    >>> Q = {(0,0): 1, (1,1): 1, (2,3): 2, (1,2): -2, (0,3): -2}
++    >>> Q = np.triu(np.ones((5, 5)))        # K5 with all biases set to 1.0
+     >>> sampler = EmbeddingComposite(DWaveSampler())
+     >>> # partial() can be used when the BQM or embedding is not accessible
+-    >>> chain_strength = partial(uniform_torque_compensation, prefactor=2)
++    >>> chain_strength = partial(uniform_torque_compensation, prefactor=3)
+     >>> sampleset = sampler.sample_qubo(Q, chain_strength=chain_strength, return_embedding=True)
+     >>> sampleset.info['embedding_context']['chain_strength']
+-    1.224744871391589
++    1.5
+ 
+ """
+ import math
+diff --git a/dwave/embedding/transforms.py b/dwave/embedding/transforms.py
+index 3f31b0e..7c5d51b 100644
+--- a/dwave/embedding/transforms.py
++++ b/dwave/embedding/transforms.py
+@@ -14,14 +14,14 @@
+ 
+ import collections.abc as abc
+ import itertools
++import typing
+ import warnings
++from collections import defaultdict
++from functools import cached_property
+ 
+ import numpy as np
+ import dimod
+ 
+-from collections import defaultdict
+-from copy import deepcopy
+-
+ from dwave.embedding.chain_breaks import majority_vote, broken_chains
+ from dwave.embedding.exceptions import MissingEdgeError, MissingChainError, InvalidNodeError, DisconnectedChainError
+ from dwave.embedding.utils import adjacency_to_edges, intlabel_disjointsets
+@@ -120,6 +120,12 @@ class EmbeddedStructure(dict):
+         """callable: Return the chain strength selected for embedding."""
+         return self._chain_strength
+ 
++    @cached_property
++    def max_chain_length(self):
++        """Maximum chain length in the embedding."""
++        # we can cache the max chain length since we're immutable
++        return len(max(self.values(), default=[], key=len))
++
+     def chain_edges(self, u):
+         """Iterate over edges contained in the chain for u.
+ 
+@@ -135,7 +141,6 @@ class EmbeddedStructure(dict):
+         for i, j in self._chain_edges[u]:
+             yield emb_u[i], emb_u[j]
+ 
+-
+     def interaction_edges(self, u, *args):
+         """Iterate over edges between in the chains for u and v.
+ 
+@@ -176,6 +181,16 @@ class EmbeddedStructure(dict):
+         raise NotImplementedError("EmbeddedStructure does not support the"
+                                   " fromkeys method")
+ 
++    def _relabel_bqm(self, source_bqm: dimod.BQM) -> dimod.BQM:
++        if self.max_chain_length != 1:
++            raise TypeError("Embedding without chains required for relabeling")
++
++        # TODO: drop var filtering after https://github.com/dwavesystems/dimod/issues/1408 is fixed
++        mapping = {n: next(iter(c)) for n, c in self.items() if n in source_bqm.variables}
++        target_bqm = source_bqm.relabel_variables(mapping, inplace=False)
++
++        return target_bqm
++
+     def embed_bqm(self, source_bqm, chain_strength=None, smear_vartype=None):
+         """Embed a binary quadratic model onto a target graph.
+ 
+@@ -226,6 +241,10 @@ class EmbeddedStructure(dict):
+             :func:`.embed_ising`, :func:`.embed_qubo`
+ 
+         """
++        # short-circuit the expensive embedding in case of a simple 1-1 mapping
++        if self.max_chain_length == 1:
++            return self._relabel_bqm(source_bqm)
++
+         return_vartype = source_bqm.vartype
+         if smear_vartype is None:
+             smear_vartype = return_vartype
+@@ -510,6 +529,35 @@ def embed_qubo(source_Q, embedding, target_adjacency, chain_strength=None):
+     return target_Q
+ 
+ 
++def _relabel_sampleset(target_sampleset: dimod.SampleSet,
++                       embedding: EmbeddedStructure,
++                       source_bqm: dimod.BQM,
++                       chain_break_method: typing.Optional[typing.Any] = None,
++                       chain_break_fraction: bool = False,
++                       return_embedding: bool = False
++                       ) -> dimod.SampleSet:
++    """Unembed a sample set in the special case of 1-to-1 variable embedding."""
++
++    if embedding.max_chain_length != 1:
++        raise TypeError("Embedding without chains required for relabeling")
++
++    mapping = {next(iter(c)): n for n, c in embedding.items()}
++    source_sampleset = target_sampleset.relabel_variables(mapping, inplace=True)
++
++    # to make the unembedding interface backwards-compatible
++    if chain_break_fraction:
++        source_sampleset = dimod.append_data_vectors(
++            source_sampleset, chain_break_fraction=np.zeros(len(source_sampleset)))
++
++    if return_embedding:
++        # we explicitly mark no chain break resolution was needed during unembedding
++        embedding_context = dict(
++            embedding=embedding, chain_break_method=None)
++        source_sampleset.info.update(embedding_context=embedding_context)
++
++    return source_sampleset
++
++
+ def unembed_sampleset(target_sampleset, embedding, source_bqm,
+                       chain_break_method=None, chain_break_fraction=False,
+                       return_embedding=False):
+@@ -571,6 +619,15 @@ def unembed_sampleset(target_sampleset, embedding, source_bqm,
+ 
+     """
+ 
++    # short-circuit the expensive unembedding in case of a simple 1-1 mapping
++    if hasattr(embedding, 'max_chain_length') and embedding.max_chain_length == 1:
++        return _relabel_sampleset(target_sampleset=target_sampleset,
++                                  embedding=embedding,
++                                  source_bqm=source_bqm,
++                                  chain_break_method=chain_break_method,
++                                  chain_break_fraction=chain_break_fraction,
++                                  return_embedding=return_embedding)
++
+     if chain_break_method is None:
+         chain_break_method = majority_vote
+     elif isinstance(chain_break_method, abc.Sequence):
+diff --git a/dwave/system/composites/embedding.py b/dwave/system/composites/embedding.py
+index a7a1f48..2f56559 100644
+--- a/dwave/system/composites/embedding.py
++++ b/dwave/system/composites/embedding.py
+@@ -25,13 +25,14 @@ For example:
+ """
+ 
+ import itertools
++from time import perf_counter
+ 
+ from warnings import warn
+ 
+ import dimod
+ import minorminer
+ 
+-from dwave.embedding import (target_to_source, unembed_sampleset, embed_bqm,
++from dwave.embedding import (target_to_source, unembed_sampleset,
+                              chain_to_quadratic, EmbeddedStructure)
+ from dwave.system.warnings import WarningHandler, WarningAction
+ 
+@@ -50,6 +51,10 @@ class EmbeddingComposite(dimod.ComposedSampler):
+     D-Wave quantum computer. A new minor-embedding is calculated each time one 
+     of its sampling methods is called.
+ 
++    In case a native embedding is found (one to one mapping between source and
++    target variables), embedding and unembedding steps are simplified as they
++    are reduced to variable relabeling.
++
+     Args:
+         child_sampler (:class:`dimod.Sampler`):
+             A dimod sampler, such as a :obj:`DWaveSampler`, that accepts
+@@ -77,6 +82,12 @@ class EmbeddingComposite(dimod.ComposedSampler):
+         Support for context manager protocol with :meth:`dimod.Scoped`
+         implemented.
+ 
++    .. versionchanged:: 1.33.0
++        For native embeddings, chain strength is not calculated anymore, and
++        chain break resolution method is ignored (both ``chain_strength`` and
++        ``chain_break_method`` are set to ``None`` in the returned
++        ``embedding_context``).
++
+     Examples:
+ 
+        >>> from dwave.system import DWaveSampler, EmbeddingComposite
+@@ -209,6 +220,15 @@ class EmbeddingComposite(dimod.ComposedSampler):
+                 Parameters for the sampling method, specified by the child
+                 sampler.
+ 
++        .. versionchanged:: 1.33.0
++            For native embeddings, ``chain_strength``, ``chain_break_method``
++            and ``embedding_parameters`` parameters are ignored.
++            ``chain_break_fraction`` are set to zero for all samples.
++
++        .. versionadded:: 1.33.0
++            Embedding/unembedding duration included under ``timing`` key of the
++            ``embedding_context`` when embedding is returned.
++
+         Returns:
+             :obj:`~dimod.SampleSet`
+ 
+@@ -249,8 +269,10 @@ class EmbeddingComposite(dimod.ComposedSampler):
+         if not hasattr(embedding, 'embed_bqm'):
+             embedding = EmbeddedStructure(target_edgelist, embedding)
+ 
++        t0 = perf_counter()
+         bqm_embedded = embedding.embed_bqm(bqm, chain_strength=chain_strength,
+                                            smear_vartype=dimod.SPIN)
++        embedding_time = perf_counter() - t0
+ 
+         if warnings is None:
+             warnings = self.warnings_default
+@@ -289,15 +311,21 @@ class EmbeddingComposite(dimod.ComposedSampler):
+ 
+             warninghandler.chain_break(response, embedding)
+ 
++            response.resolve()
++
++            t0 = perf_counter()
+             sampleset = unembed_sampleset(response, embedding, source_bqm=bqm,
+                                           chain_break_method=chain_break_method,
+                                           chain_break_fraction=chain_break_fraction,
+                                           return_embedding=return_embedding)
++            unembedding_time = perf_counter() - t0
+ 
+             if return_embedding:
++                timing = dict(embedding=embedding_time, unembedding=unembedding_time)
+                 sampleset.info['embedding_context'].update(
+                     embedding_parameters=embedding_parameters,
+-                    chain_strength=embedding.chain_strength)
++                    chain_strength=embedding.chain_strength,
++                    timing=timing)
+ 
+             if chain_break_fraction and len(sampleset):
+                 warninghandler.issue("All samples have broken chains",
+diff --git a/releasenotes/notes/speed-up-embedding-composites-for-subgraphs-f246b8d1336cb898.yaml b/releasenotes/notes/speed-up-embedding-composites-for-subgraphs-f246b8d1336cb898.yaml
+new file mode 100644
+index 0000000..7798f15
+--- /dev/null
++++ b/releasenotes/notes/speed-up-embedding-composites-for-subgraphs-f246b8d1336cb898.yaml
+@@ -0,0 +1,7 @@
++---
++features:
++  - |
++    Speed-up embedding/unembedding in all embedding composites for the special
++    case of one-to-one embeddings, i.e. subgraphs.
++
++    See `#579 <https://github.com/dwavesystems/dwave-system/issues/579>`_.

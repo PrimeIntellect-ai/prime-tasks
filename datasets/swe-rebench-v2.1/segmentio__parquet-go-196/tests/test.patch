@@ -1,0 +1,181 @@
+diff --git a/schema_test.go b/schema_test.go
+index 50cb976..bf11ff6 100644
+--- a/schema_test.go
++++ b/schema_test.go
+@@ -8,8 +8,9 @@ import (
+ 
+ func TestSchemaOf(t *testing.T) {
+ 	tests := []struct {
+-		value interface{}
+-		print string
++		value   interface{}
++		print   string
++		columns [][]string
+ 	}{
+ 		{
+ 			value: new(struct{ Name string }),
+@@ -54,14 +55,64 @@ func TestSchemaOf(t *testing.T) {
+ 	}
+ }`,
+ 		},
++
++		{
++			value: new(struct {
++				Inner struct {
++					FirstName          string `parquet:"first_name"`
++					ShouldNotBePresent string `parquet:"-"`
++				} `parquet:"inner,optional"`
++			}),
++			columns: [][]string{{"inner", "first_name"}},
++		},
++
++		{
++			value: new(struct {
++				Inner struct {
++					FirstName    string `parquet:"first_name"`
++					MyNameIsDash string `parquet:"-,"`
++				} `parquet:"inner,optional"`
++			}),
++			columns: [][]string{{"inner", "first_name"}, {"inner", "-"}},
++		},
+ 	}
+ 
+ 	for _, test := range tests {
+ 		t.Run("", func(t *testing.T) {
+ 			schema := parquet.SchemaOf(test.value)
+ 
+-			if s := schema.String(); s != test.print {
+-				t.Errorf("\nexpected:\n\n%s\n\nfound:\n\n%s\n", test.print, s)
++			if test.print != "" {
++				if s := schema.String(); s != test.print {
++					t.Errorf("\nexpected:\n\n%s\n\nfound:\n\n%s\n", test.print, s)
++				}
++			}
++			if test.columns != nil {
++				gotColumns := schema.Columns()
++				if len(gotColumns) != len(test.columns) {
++					t.Fatalf("schema columns = %v, want %v", gotColumns, test.columns)
++				}
++				for _, want := range test.columns {
++					found := false
++					for _, got := range gotColumns {
++						if len(got) != len(want) {
++							continue
++						}
++						match := true
++						for j := range got {
++							if got[j] != want[j] {
++								match = false
++								break
++							}
++						}
++						if match {
++							found = true
++							break
++						}
++					}
++					if !found {
++						t.Errorf("schema columns %v do not contain path %v", gotColumns, want)
++					}
++				}
+ 			}
+ 		})
+ 	}
+diff --git a/writer_test.go b/writer_test.go
+index 2fc53b0..1f21afc 100644
+--- a/writer_test.go
++++ b/writer_test.go
+@@ -78,6 +78,13 @@ type timeseries struct {
+ 	Value     float64 `parquet:"value"`
+ }
+ 
++type event struct {
++	Name     string  `parquet:"name,dict"`
++	Type     string  `parquet:"-"`
++	Value    float64 `parquet:"value"`
++	Category string  `parquet:"-"`
++}
++
+ var writerTests = []struct {
+ 	scenario string
+ 	version  int
+@@ -413,6 +420,79 @@ value 3: R:0 D:0 V:<null>
+ 	},
+ }
+ 
++func TestWriterOmitsTaggedFields(t *testing.T) {
++	input := []*event{
++		{Name: "customer1", Type: "request", Value: 42.0},
++		{Name: "customer2", Type: "access", Value: 1.0},
++	}
++
++	buffer := new(bytes.Buffer)
++	if err := writeParquetFile(buffer, makeRows(input)); err != nil {
++		t.Fatal(err)
++	}
++	file, err := parquet.OpenFile(bytes.NewReader(buffer.Bytes()), int64(buffer.Len()))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	columns := file.Schema().Columns()
++	wantColumns := []string{"name", "value"}
++	if len(columns) != len(wantColumns) {
++		t.Fatalf("schema has columns %v, want %v", columns, wantColumns)
++	}
++	seenColumns := make(map[string]bool, len(columns))
++	for _, column := range columns {
++		if len(column) == 1 {
++			seenColumns[column[0]] = true
++		}
++	}
++	for _, want := range wantColumns {
++		if !seenColumns[want] {
++			t.Errorf("schema columns %v do not contain %q", columns, want)
++		}
++	}
++
++	rows := file.RowGroups()[0].Rows()
++	defer rows.Close()
++	rowBuffer := make([]parquet.Row, len(input))
++	n, err := rows.ReadRows(rowBuffer)
++	if err != nil && n != len(input) {
++		t.Fatalf("reading rows: read %d of %d: %v", n, len(input), err)
++	}
++	if n != len(input) {
++		t.Fatalf("read %d rows, want %d", n, len(input))
++	}
++	structSchema := parquet.SchemaOf(&event{})
++	seenRows := make(map[string]bool, len(input))
++	for i, row := range rowBuffer {
++		var got event
++		if err := structSchema.Reconstruct(&got, row); err != nil {
++			t.Fatalf("reconstructing row %d: %v", i, err)
++		}
++		switch got.Name {
++		case "customer1":
++			if got.Value != 42.0 {
++				t.Errorf("row %d value = %v, want 42", i, got.Value)
++			}
++		case "customer2":
++			if got.Value != 1.0 {
++				t.Errorf("row %d value = %v, want 1", i, got.Value)
++			}
++		default:
++			t.Errorf("row %d has unexpected retained name %q", i, got.Name)
++		}
++		seenRows[got.Name] = true
++		if got.Type != "" || got.Category != "" {
++			t.Errorf("row %d reconstructed omitted fields with values (%q, %q)", i, got.Type, got.Category)
++		}
++	}
++	for _, name := range []string{"customer1", "customer2"} {
++		if !seenRows[name] {
++			t.Errorf("Parquet rows do not contain retained value %q", name)
++		}
++	}
++}
++
+ func TestWriter(t *testing.T) {
+ 	if !hasParquetTools() {
+ 		t.Skip("parquet-tools are not installed")

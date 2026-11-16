@@ -1,0 +1,165 @@
+diff --git a/tests/system/test_connector_object.py b/tests/system/test_connector_object.py
+index 532c160..70b509b 100644
+--- a/tests/system/test_connector_object.py
++++ b/tests/system/test_connector_object.py
+@@ -21,7 +21,9 @@ import sqlalchemy
+ import logging
+ import google.auth
+ from google.cloud.sql.connector import Connector
+-from google.cloud.sql.connector.instance import AutoIAMAuthNotSupported
++from google.cloud.sql.connector.exceptions import (
++    AutoIAMAuthNotSupported,
++)
+ import datetime
+ import concurrent.futures
+ from threading import Thread
+diff --git a/tests/unit/test_utils.py b/tests/unit/test_utils.py
+index ffaf189..520b96d 100644
+--- a/tests/unit/test_utils.py
++++ b/tests/unit/test_utils.py
+@@ -14,7 +14,16 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
+ 
+-from google.cloud.sql.connector import utils
++import datetime
++
++from aioresponses import aioresponses
++from aioresponses.core import CallbackResult
++from google.auth.credentials import Credentials
++from mock import patch
++from typing import Any
++
++from google.cloud.sql.connector import Connector, utils
++from unit.mocks import FakeCSQLInstance
+ 
+ import pytest  # noqa F401 Needed to run the tests
+ 
+@@ -39,3 +48,127 @@ async def test_generate_keys_returns_bytes_and_str() -> None:
+ 
+     res1, res2 = await utils.generate_keys()
+     assert isinstance(res1, bytes) and (isinstance(res2, str))
++
++
++def test_format_database_user_postgres() -> None:
++    """
++    Test that format_database_user properly formats Postgres IAM database users.
++    """
++    service_account = utils.format_database_user(
++        "POSTGRES_14", "service-account@test.iam"
++    )
++    service_account2 = utils.format_database_user(
++        "POSTGRES_14", "service-account@test.iam.gserviceaccount.com"
++    )
++    assert service_account == "service-account@test.iam"
++    assert service_account2 == "service-account@test.iam"
++    user = utils.format_database_user("POSTGRES_14", "test@test.com")
++    assert user == "test@test.com"
++
++
++def test_format_database_user_mysql() -> None:
++    """
++    Test that format_database _user properly formats MySQL IAM database users.
++    """
++    service_account = utils.format_database_user(
++        "MYSQL_8_0", "service-account@test.iam"
++    )
++    service_account2 = utils.format_database_user(
++        "MYSQL_8_0", "service-account@test.iam.gserviceaccount.com"
++    )
++    service_account3 = utils.format_database_user("MYSQL_8_0", "service-account")
++    assert service_account == "service-account"
++    assert service_account2 == "service-account"
++    assert service_account3 == "service-account"
++    user = utils.format_database_user("MYSQL_8_0", "test@test.com")
++    user2 = utils.format_database_user("MYSQL_8_0", "test")
++    assert user == "test"
++    assert user2 == "test"
++
++
++def test_format_database_user_other_engines() -> None:
++    """
++    Test that format_database_user returns the original user unchanged for
++    database versions that are neither Postgres nor MySQL.
++    """
++    user = utils.format_database_user("SQLSERVER_2019_STANDARD", "test@test.com")
++    assert user == "test@test.com"
++    user2 = utils.format_database_user(
++        "SQLSERVER_2019_STANDARD", "service-account@test.iam.gserviceaccount.com"
++    )
++    assert user2 == "service-account@test.iam.gserviceaccount.com"
++
++
++
++@pytest.mark.parametrize(
++    ("db_version", "user", "expected_user"),
++    [
++        ("MYSQL_8_0", "iam-user@example.com", "iam-user"),
++        (
++            "POSTGRES_14",
++            "iam-user@example.com.gserviceaccount.com",
++            "iam-user@example.com",
++        ),
++    ],
++)
++def test_connector_formats_automatic_iam_username(
++    fake_credentials: Credentials,
++    db_version: str,
++    user: str,
++    expected_user: str,
++) -> None:
++    """Automatic IAM connections format usernames for the reported engine."""
++    connection_name = "my-project:my-region:my-instance"
++    project, _, instance_name = connection_name.split(":")
++    mock_instance = FakeCSQLInstance(
++        project=project,
++        name=instance_name,
++        db_version=db_version,
++    )
++    connector = Connector(enable_iam_auth=True, credentials=fake_credentials)
++    fake_credentials.token = "test-token"
++    fake_credentials.expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
++
++    def ephemeral_certificate(url: Any, **kwargs: Any) -> CallbackResult:
++        request = kwargs["json"]
++        return CallbackResult(
++            method="POST",
++            status=200,
++            body=mock_instance.generate_ephemeral(request["public_key"]),
++        )
++
++    try:
++        with (
++            patch.object(Credentials, "valid", True),
++            aioresponses() as mocked,
++            patch("pg8000.dbapi.connect", return_value=True) as driver_connect,
++        ):
++            mocked.get(
++                f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{project}/instances/{instance_name}/connectSettings",
++                status=200,
++                body=mock_instance.connect_settings(),
++                repeat=True,
++            )
++            mocked.post(
++                f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{project}/instances/{instance_name}:generateEphemeralCert",
++                callback=ephemeral_certificate,
++                repeat=True,
++            )
++
++            connector.connect(
++                connection_name,
++                "pg8000",
++                user=user,
++                password="password",
++                db="database",
++            )
++
++        driver_call = driver_connect.call_args
++        driver_user = (
++            driver_call.args[0]
++            if driver_call.args
++            else driver_call.kwargs.get("user")
++        )
++        assert driver_user == expected_user
++    finally:
++        connector.close()

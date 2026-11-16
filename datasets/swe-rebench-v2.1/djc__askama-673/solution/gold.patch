@@ -1,0 +1,315 @@
+diff --git a/askama_shared/src/generator.rs b/askama_shared/src/generator.rs
+index a8636fa..9174a77 100644
+--- a/askama_shared/src/generator.rs
++++ b/askama_shared/src/generator.rs
+@@ -246,7 +246,7 @@ struct Generator<'a, S: std::hash::BuildHasher> {
+     next_ws: Option<&'a str>,
+     // Whitespace suppression from the previous non-literal. Will be used to
+     // determine whether to flush prefix whitespace from the next literal.
+-    skip_ws: bool,
++    skip_ws: WhitespaceHandling,
+     // If currently in a block, this will contain the name of a potential parent block
+     super_block: Option<(&'a str, usize)>,
+     // buffer for writable
+@@ -272,7 +272,7 @@ impl<'a, S: std::hash::BuildHasher> Generator<'a, S> {
+             heritage,
+             locals,
+             next_ws: None,
+-            skip_ws: false,
++            skip_ws: WhitespaceHandling::Preserve,
+             super_block: None,
+             buf_writable: vec![],
+             named: 0,
+@@ -1230,13 +1230,22 @@ impl<'a, S: std::hash::BuildHasher> Generator<'a, S> {
+     fn visit_lit(&mut self, lws: &'a str, val: &'a str, rws: &'a str) {
+         assert!(self.next_ws.is_none());
+         if !lws.is_empty() {
+-            if self.skip_ws {
+-                self.skip_ws = false;
+-            } else if val.is_empty() {
+-                assert!(rws.is_empty());
+-                self.next_ws = Some(lws);
+-            } else {
+-                self.buf_writable.push(Writable::Lit(lws));
++            match self.skip_ws {
++                WhitespaceHandling::Suppress => {
++                    self.skip_ws = WhitespaceHandling::Preserve;
++                }
++                _ if val.is_empty() => {
++                    assert!(rws.is_empty());
++                    self.next_ws = Some(lws);
++                }
++                WhitespaceHandling::Preserve => self.buf_writable.push(Writable::Lit(lws)),
++                WhitespaceHandling::Minimize => {
++                    self.buf_writable
++                        .push(Writable::Lit(match lws.contains('\n') {
++                            true => "\n",
++                            false => " ",
++                        }))
++                }
+             }
+         }
+ 
+@@ -1819,11 +1828,12 @@ impl<'a, S: std::hash::BuildHasher> Generator<'a, S> {
+         self.prepare_ws(ws);
+     }
+ 
+-    fn should_trim_ws(&self, ws: Option<Whitespace>) -> bool {
++    fn should_trim_ws(&self, ws: Option<Whitespace>) -> WhitespaceHandling {
+         match ws {
+-            Some(Whitespace::Trim) => true,
+-            Some(Whitespace::Preserve) => false,
+-            None => self.whitespace == WhitespaceHandling::Suppress,
++            Some(Whitespace::Suppress) => WhitespaceHandling::Suppress,
++            Some(Whitespace::Preserve) => WhitespaceHandling::Preserve,
++            Some(Whitespace::Minimize) => WhitespaceHandling::Minimize,
++            None => self.whitespace,
+         }
+     }
+ 
+@@ -1837,11 +1847,24 @@ impl<'a, S: std::hash::BuildHasher> Generator<'a, S> {
+ 
+         // If `whitespace` is set to `suppress`, we keep the whitespace characters only if there is
+         // a `+` character.
+-        if !self.should_trim_ws(ws.0) {
+-            let val = self.next_ws.unwrap();
+-            if !val.is_empty() {
+-                self.buf_writable.push(Writable::Lit(val));
++        match self.should_trim_ws(ws.0) {
++            WhitespaceHandling::Preserve => {
++                let val = self.next_ws.unwrap();
++                if !val.is_empty() {
++                    self.buf_writable.push(Writable::Lit(val));
++                }
++            }
++            WhitespaceHandling::Minimize => {
++                let val = self.next_ws.unwrap();
++                if !val.is_empty() {
++                    self.buf_writable
++                        .push(Writable::Lit(match val.contains('\n') {
++                            true => "\n",
++                            false => " ",
++                        }));
++                }
+             }
++            WhitespaceHandling::Suppress => {}
+         }
+         self.next_ws = None;
+     }
+diff --git a/askama_shared/src/lib.rs b/askama_shared/src/lib.rs
+index 874be9d..b6b478b 100644
+--- a/askama_shared/src/lib.rs
++++ b/askama_shared/src/lib.rs
+@@ -314,6 +314,10 @@ pub(crate) enum WhitespaceHandling {
+     Preserve,
+     /// It'll remove all the whitespace characters before and after the jinja block.
+     Suppress,
++    /// It'll remove all the whitespace characters except one before and after the jinja blocks.
++    /// If there is a newline character, the preserved character in the trimmed characters, it will
++    /// the one preserved.
++    Minimize,
+ }
+ 
+ impl Default for WhitespaceHandling {
+@@ -701,5 +705,14 @@ mod tests {
+         )
+         .unwrap();
+         assert_eq!(config.whitespace, WhitespaceHandling::Preserve);
++
++        let config = Config::new(
++            r#"
++            [general]
++            whitespace = "minimize"
++            "#,
++        )
++        .unwrap();
++        assert_eq!(config.whitespace, WhitespaceHandling::Minimize);
+     }
+ }
+diff --git a/askama_shared/src/parser.rs b/askama_shared/src/parser.rs
+index 4654e82..624fbc6 100644
+--- a/askama_shared/src/parser.rs
++++ b/askama_shared/src/parser.rs
+@@ -132,14 +132,16 @@ pub(crate) enum Target<'a> {
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub(crate) enum Whitespace {
+     Preserve,
+-    Trim,
++    Suppress,
++    Minimize,
+ }
+ 
+ impl From<char> for Whitespace {
+     fn from(c: char) -> Self {
+         match c {
+             '+' => Self::Preserve,
+-            '-' => Self::Trim,
++            '-' => Self::Suppress,
++            '~' => Self::Minimize,
+             _ => panic!("unsupported `Whitespace` conversion"),
+         }
+     }
+@@ -677,7 +679,7 @@ expr_prec_layer!(expr_and, expr_compare, "&&");
+ expr_prec_layer!(expr_or, expr_and, "||");
+ 
+ fn expr_handle_ws(i: &str) -> IResult<&str, Whitespace> {
+-    alt((char('-'), char('+')))(i).map(|(s, r)| (s, Whitespace::from(r)))
++    alt((char('-'), char('+'), char('~')))(i).map(|(s, r)| (s, Whitespace::from(r)))
+ }
+ 
+ fn expr_any(i: &str) -> IResult<&str, Expr<'_>> {
+@@ -1135,9 +1137,11 @@ fn block_comment<'a>(i: &'a str, s: &State<'_>) -> IResult<&'a str, Node<'a>> {
+     ));
+     let (i, (_, (pws, tail, _))) = p(i)?;
+     let nws = if tail.ends_with('-') {
+-        Some(Whitespace::Trim)
++        Some(Whitespace::Suppress)
+     } else if tail.ends_with('+') {
+         Some(Whitespace::Preserve)
++    } else if tail.ends_with('~') {
++        Some(Whitespace::Minimize)
+     } else {
+         None
+     };
+@@ -1443,12 +1447,12 @@ mod tests {
+     #[test]
+     fn change_delimiters_parse_filter() {
+         let syntax = Syntax {
+-            expr_start: "{~",
+-            expr_end: "~}",
++            expr_start: "{=",
++            expr_end: "=}",
+             ..Syntax::default()
+         };
+ 
+-        super::parse("{~ strvar|e ~}", &syntax).unwrap();
++        super::parse("{= strvar|e =}", &syntax).unwrap();
+     }
+ 
+     #[test]
+@@ -1665,31 +1669,31 @@ mod tests {
+         );
+         assert_eq!(
+             super::parse("{#- #}", s).unwrap(),
+-            vec![Node::Comment(Ws(Some(Whitespace::Trim), None))],
++            vec![Node::Comment(Ws(Some(Whitespace::Suppress), None))],
+         );
+         assert_eq!(
+             super::parse("{# -#}", s).unwrap(),
+-            vec![Node::Comment(Ws(None, Some(Whitespace::Trim)))],
++            vec![Node::Comment(Ws(None, Some(Whitespace::Suppress)))],
+         );
+         assert_eq!(
+             super::parse("{#--#}", s).unwrap(),
+             vec![Node::Comment(Ws(
+-                Some(Whitespace::Trim),
+-                Some(Whitespace::Trim)
++                Some(Whitespace::Suppress),
++                Some(Whitespace::Suppress)
+             ))],
+         );
+         assert_eq!(
+             super::parse("{#- foo\n bar -#}", s).unwrap(),
+             vec![Node::Comment(Ws(
+-                Some(Whitespace::Trim),
+-                Some(Whitespace::Trim)
++                Some(Whitespace::Suppress),
++                Some(Whitespace::Suppress)
+             ))],
+         );
+         assert_eq!(
+             super::parse("{#- foo\n {#- bar\n -#} baz -#}", s).unwrap(),
+             vec![Node::Comment(Ws(
+-                Some(Whitespace::Trim),
+-                Some(Whitespace::Trim)
++                Some(Whitespace::Suppress),
++                Some(Whitespace::Suppress)
+             ))],
+         );
+         assert_eq!(
+@@ -1721,6 +1725,35 @@ mod tests {
+                 Some(Whitespace::Preserve)
+             ))],
+         );
++        assert_eq!(
++            super::parse("{#~ #}", s).unwrap(),
++            vec![Node::Comment(Ws(Some(Whitespace::Minimize), None))],
++        );
++        assert_eq!(
++            super::parse("{# ~#}", s).unwrap(),
++            vec![Node::Comment(Ws(None, Some(Whitespace::Minimize)))],
++        );
++        assert_eq!(
++            super::parse("{#~~#}", s).unwrap(),
++            vec![Node::Comment(Ws(
++                Some(Whitespace::Minimize),
++                Some(Whitespace::Minimize)
++            ))],
++        );
++        assert_eq!(
++            super::parse("{#~ foo\n bar ~#}", s).unwrap(),
++            vec![Node::Comment(Ws(
++                Some(Whitespace::Minimize),
++                Some(Whitespace::Minimize)
++            ))],
++        );
++        assert_eq!(
++            super::parse("{#~ foo\n {#~ bar\n ~#} baz -~#}", s).unwrap(),
++            vec![Node::Comment(Ws(
++                Some(Whitespace::Minimize),
++                Some(Whitespace::Minimize)
++            ))],
++        );
+ 
+         assert_eq!(
+             super::parse("{# foo {# bar #} {# {# baz #} qux #} #}", s).unwrap(),
+diff --git a/book/src/configuration.md b/book/src/configuration.md
+index acc9751..abf276d 100644
+--- a/book/src/configuration.md
++++ b/book/src/configuration.md
+@@ -11,7 +11,7 @@ This example file demonstrates the default configuration:
+ [general]
+ # Directories to search for templates, relative to the crate root.
+ dirs = ["templates"]
+-# Unless you add a `-` in a block, whitespace won't be trimmed.
++# Unless you add a `-` in a block, whitespace characters won't be trimmed.
+ whitespace = "preserve"
+ ```
+ 
+@@ -24,7 +24,7 @@ whitespace should be suppressed before or after a block. For example:
+ 
+ {%- if something %}
+ Hello
+-(% endif %}
++{% endif %}
+ ```
+ 
+ In the template above, only the whitespace between `<div>` and `{%-` will be
+@@ -35,11 +35,26 @@ characters, you can use the `+` operator:
+ ```jinja
+ {% if something +%}
+ Hello
+-(%+ endif %}
++{%+ endif %}
+ ```
+ 
+ In this example, `Hello` will be surrounded with newline characters.
+ 
++There is a third possibility: in case you want to suppress all whitespace
++characters except one, you can use `~`:
++
++```jinja
++{% if something ~%}
++Hello
++{%~ endif %}
++```
++
++To be noted, if one of the trimmed characters is a newline, then the only
++character remaining will be a newline.
++
++If you want this to be the default behaviour, you can set `whitespace` to
++`"minimize"`.
++
+ Here is an example that defines two custom syntaxes:
+ 
+ ```toml

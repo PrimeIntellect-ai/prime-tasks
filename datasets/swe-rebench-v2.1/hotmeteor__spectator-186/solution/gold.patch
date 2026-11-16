@@ -1,0 +1,200 @@
+diff --git a/src/Middleware.php b/src/Middleware.php
+index 44ee015..17f6435 100644
+--- a/src/Middleware.php
++++ b/src/Middleware.php
+@@ -11,6 +11,7 @@ use Closure;
+ use Illuminate\Contracts\Debug\ExceptionHandler;
+ use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
++use Illuminate\Routing\Route;
+ use Illuminate\Support\Facades\Response;
+ use Illuminate\Support\Str;
+ use Spectator\Exceptions\InvalidPathException;
+@@ -45,7 +46,7 @@ class Middleware
+         try {
+             /** @var \Illuminate\Routing\Route $route */
+             $route = $request->route();
+-            $pathItem = $this->pathItem($route->uri(), $request->method());
++            [$specPath, $pathItem] = $this->pathItem($route, $request->method());
+         } catch (InvalidPathException|MalformedSpecException|MissingSpecException|TypeErrorException|UnresolvableReferenceException $exception) {
+             $this->spectator->captureRequestValidation($exception);
+             $this->spectator->captureResponseValidation($exception);
+@@ -54,7 +55,7 @@ class Middleware
+         }
+ 
+         try {
+-            return $this->validate($request, $next, $pathItem);
++            return $this->validate($request, $next, $specPath, $pathItem);
+         } catch (Throwable $exception) {
+             if ($this->exceptionHandler->shouldReport($exception)) {
+                 return $this->formatResponse($exception, 500);
+@@ -77,13 +78,13 @@ class Middleware
+         ], $code);
+     }
+ 
+-    protected function validate(Request $request, Closure $next, PathItem $pathItem): mixed
++    protected function validate(Request $request, Closure $next, string $specPath, PathItem $pathItem): mixed
+     {
+         try {
+             RequestValidator::validate(
+                 $request,
++                $specPath,
+                 $pathItem,
+-                $request->method(),
+                 $this->version
+             );
+         } catch (RequestValidationException $exception) {
+@@ -106,6 +107,8 @@ class Middleware
+     }
+ 
+     /**
++     * @return array{0: string, 1: PathItem}
++     *
+      * @throws InvalidPathException
+      * @throws MalformedSpecException
+      * @throws MissingSpecException
+@@ -114,30 +117,44 @@ class Middleware
+      * @throws IOException
+      * @throws InvalidJsonPointerSyntaxException
+      */
+-    protected function pathItem(string $requestPath, string $requestMethod): PathItem
++    protected function pathItem(Route $route, string $requestMethod): array
+     {
+-        if (! Str::startsWith($requestPath, '/')) {
+-            $requestPath = '/'.$requestPath;
+-        }
++        $requestPath = Str::start($route->uri(), '/');
+ 
+         $openapi = $this->spectator->resolve();
+ 
+         $this->version = $openapi->openapi;
+ 
++        $pathMatches = false;
++        $partialMatch = null;
++
+         foreach ($openapi->paths as $path => $pathItem) {
+-            if ($this->resolvePath($path) === $requestPath) {
+-                $methods = array_keys($pathItem->getOperations());
++            $resolvedPath = $this->resolvePath($path);
++            $methods = array_keys($pathItem->getOperations());
+ 
++            if ($resolvedPath === $requestPath) {
++                $pathMatches = true;
+                 // Check if the method exists for this path, and if so return the full PathItem
+                 if (in_array(strtolower($requestMethod), $methods, true)) {
+-                    return $pathItem;
++                    return [$resolvedPath, $pathItem];
+                 }
++            }
+ 
+-                throw new InvalidPathException("[{$requestMethod}] not a valid method for [{$requestPath}].", 405);
++            if (Str::match($route->getCompiled()->getRegex(), $resolvedPath) !== '') {
++                $pathMatches = true;
++                if (in_array(strtolower($requestMethod), $methods, true)) {
++                    $partialMatch = [$resolvedPath, $pathItem];
++                }
+             }
+         }
+ 
+-        throw new InvalidPathException("Path [{$requestMethod} {$requestPath}] not found in spec.", 404);
++        if ($partialMatch !== null) {
++            return $partialMatch;
++        }
++
++        throw $pathMatches
++            ? throw new InvalidPathException("[{$requestMethod}] not a valid method for [{$requestPath}].", 405)
++            : new InvalidPathException("Path [{$requestMethod} {$requestPath}] not found in spec.", 404);
+     }
+ 
+     protected function resolvePath(string $path): string
+diff --git a/src/Validation/RequestValidator.php b/src/Validation/RequestValidator.php
+index 74be429..155aba1 100644
+--- a/src/Validation/RequestValidator.php
++++ b/src/Validation/RequestValidator.php
+@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Http\Request;
+ use Illuminate\Http\UploadedFile;
+ use Illuminate\Support\Arr;
++use Illuminate\Support\Collection;
+ use Opis\JsonSchema\Validator;
+ use Spectator\Exceptions\RequestValidationException;
+ use Spectator\Exceptions\SchemaValidationException;
+@@ -20,20 +21,19 @@ class RequestValidator extends AbstractValidator
+      */
+     public function __construct(
+         protected Request $request,
++        protected string $specPath,
+         protected PathItem $pathItem,
+-        protected string $method,
+         string $version = '3.0'
+     ) {
+-        $this->method = strtolower($method);
+         $this->version = $version;
+     }
+ 
+     /**
+      * @throws RequestValidationException|SchemaValidationException
+      */
+-    public static function validate(Request $request, PathItem $pathItem, string $method, string $version): void
++    public static function validate(Request $request, string $specPath, PathItem $pathItem, string $version): void
+     {
+-        $instance = new self($request, $pathItem, $method, $version);
++        $instance = new self($request, $specPath, $pathItem, $version);
+ 
+         $instance->handle();
+     }
+@@ -67,7 +67,7 @@ class RequestValidator extends AbstractValidator
+ 
+         foreach ($requiredParameters as $parameter) {
+             // Verify presence, if required.
+-            if ($parameter->in === 'path' && ! $route->hasParameter($parameter->name)) {
++            if ($parameter->in === 'path' && ! $route->hasParameter($this->translateParameterName($parameter->name))) {
+                 throw new RequestValidationException("Missing required parameter {$parameter->name} in URL path.");
+             } elseif ($parameter->in === 'query' && ! $this->hasQueryParam($parameter->name)) {
+                 throw new RequestValidationException("Missing required query parameter [?{$parameter->name}=].");
+@@ -87,12 +87,12 @@ class RequestValidator extends AbstractValidator
+                 $parameterValue = null;
+ 
+                 // Get parameter, then validate it.
+-                if ($parameter->in === 'path' && $route->hasParameter($parameter->name)) {
+-                    $parameterValue = $route->parameters()[$parameter->name];
++                if ($parameter->in === 'path' && $route->hasParameter($parameterName = $this->translateParameterName($parameter->name))) {
++                    $parameterValue = $route->parameters()[$parameterName];
+                     if ($parameterValue instanceof Model) {
+-                        $parameterValue = $route->originalParameters()[$parameter->name];
++                        $parameterValue = $route->originalParameters()[$parameterName];
+                     } elseif ($parameterValue instanceof \BackedEnum) {
+-                        $parameterValue = $route->originalParameters()[$parameter->name];
++                        $parameterValue = $route->originalParameters()[$parameterName];
+                     }
+                 } elseif ($parameter->in === 'query' && $this->hasQueryParam($parameter->name)) {
+                     $parameterValue = $this->getQueryParam($parameter->name);
+@@ -139,6 +139,19 @@ class RequestValidator extends AbstractValidator
+         }
+     }
+ 
++    protected function translateParameterName(string $parameter): string
++    {
++        /** @var \Illuminate\Routing\Route $route */
++        $route = $this->request->route();
++
++        preg_match($route->getCompiled()->getRegex(), $this->specPath, $matches);
++
++        return Collection::make($matches)
++            ->filter(fn (string $value, int|string $key) => is_string($key))
++            ->flip()
++            ->get("{{$parameter}}", $parameter);
++    }
++
+     /**
+      * @throws RequestValidationException|SchemaValidationException
+      */
+@@ -184,7 +197,7 @@ class RequestValidator extends AbstractValidator
+ 
+     protected function operation(): Operation
+     {
+-        return $this->pathItem->{$this->method};
++        return $this->pathItem->{strtolower($this->request->method())};
+     }
+ 
+     protected function parseBodySchema(): stdClass

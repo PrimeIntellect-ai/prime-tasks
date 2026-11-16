@@ -1,0 +1,211 @@
+diff --git a/server/routes_test.go b/server/routes_test.go
+index 03be733..4d539ce 100644
+--- a/server/routes_test.go
++++ b/server/routes_test.go
+@@ -14,6 +14,7 @@
+ package server
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"fmt"
+ 	"net"
+@@ -1281,3 +1282,95 @@ func TestRouteClusterNameConflictBetweenStaticAndDynamic(t *testing.T) {
+ 
+ 	checkClusterFormed(t, s1, s2)
+ }
++
++type testRouteResolver struct{}
++
++func (r *testRouteResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
++	return []string{"127.0.0.1", "127.0.0.2"}, nil
++}
++
++func TestRouteIPResolutionAndRouteToSelf(t *testing.T) {
++	// Server that is reachable through the resolved (non-self) IP.
++	ob := DefaultOptions()
++	ob.Cluster.Host = "127.0.0.2"
++	ob.Cluster.Port = 1234
++	sb, err := NewServer(ob)
++	if err != nil {
++		t.Fatalf("Error creating server: %v", err)
++	}
++	defer sb.Shutdown()
++	go sb.Start()
++	if !sb.ReadyForConnections(5 * time.Second) {
++		t.Fatalf("Failed to start server")
++	}
++
++	// Server that solicits a route to a hostname that resolves to both its own
++	// IP and the other server's IP. It must skip its own IP and use the other.
++	oa := DefaultOptions()
++	oa.Cluster.Host = "127.0.0.1"
++	oa.Cluster.Port = 1234
++	oa.Cluster.resolver = &testRouteResolver{}
++	oa.Routes = RoutesFromStr("nats://routehost:1234")
++	sa, err := NewServer(oa)
++	if err != nil {
++		t.Fatalf("Error creating server: %v", err)
++	}
++	defer sa.Shutdown()
++	go sa.Start()
++	if !sa.ReadyForConnections(5 * time.Second) {
++		t.Fatalf("Failed to start server")
++	}
++
++	checkClusterFormed(t, sa, sb)
++}
++
++type selfOnlyResolver struct{}
++
++func (r *selfOnlyResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
++	return []string{"127.0.0.1"}, nil
++}
++
++type selfRouteLogger struct {
++	DummyLogger
++	mu       sync.Mutex
++	selfSeen bool
++}
++
++func (l *selfRouteLogger) Debugf(format string, v ...interface{}) {
++	if strings.Contains(fmt.Sprintf(format, v...), "Detected route to self") {
++		l.mu.Lock()
++		l.selfSeen = true
++		l.mu.Unlock()
++	}
++}
++
++func TestRouteExcludesSelfIP(t *testing.T) {
++	o := DefaultOptions()
++	o.Cluster.Host = "127.0.0.1"
++	o.Cluster.Port = 1234
++	o.Cluster.resolver = &selfOnlyResolver{}
++	o.Routes = RoutesFromStr("nats://routehost:1234")
++	o.Debug = true
++	o.NoLog = false
++	s, err := NewServer(o)
++	if err != nil {
++		t.Fatalf("Error creating server: %v", err)
++	}
++	defer s.Shutdown()
++	l := &selfRouteLogger{}
++	s.SetLogger(l, true, true)
++	go s.Start()
++	if !s.ReadyForConnections(5 * time.Second) {
++		t.Fatalf("Failed to start server")
++	}
++
++	// The route hostname only resolves to this server's own address, so the
++	// server must not attempt to connect to itself.
++	time.Sleep(500 * time.Millisecond)
++
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.selfSeen {
++		t.Fatalf("Server attempted to connect to its own route address")
++	}
++}
+diff --git a/server/server_test.go b/server/server_test.go
+index bb8254e..ecf7825 100644
+--- a/server/server_test.go
++++ b/server/server_test.go
+@@ -1405,15 +1405,15 @@ func TestGetRandomIP(t *testing.T) {
+ 	s := &Server{}
+ 	resolver := &myDummyDNSResolver{}
+ 	// no port...
+-	if _, err := s.getRandomIP(resolver, "noport"); err == nil || !strings.Contains(err.Error(), "port") {
+-		t.Fatalf("Expected error about port missing, got %v", err)
++	if _, err := s.getRandomIP(resolver, "noport", nil); err == nil {
++		t.Fatal("Expected an error for an address without a port")
+ 	}
+ 	resolver.err = fmt.Errorf("on purpose")
+-	if _, err := s.getRandomIP(resolver, "localhost:4222"); err == nil || !strings.Contains(err.Error(), "on purpose") {
+-		t.Fatalf("Expected error about no port, got %v", err)
++	if _, err := s.getRandomIP(resolver, "localhost:4222", nil); err == nil {
++		t.Fatal("Expected an error when the host lookup fails")
+ 	}
+ 	resolver.err = nil
+-	a, err := s.getRandomIP(resolver, "localhost:4222")
++	a, err := s.getRandomIP(resolver, "localhost:4222", nil)
+ 	if err != nil {
+ 		t.Fatalf("Unexpected error: %v", err)
+ 	}
+@@ -1421,18 +1421,27 @@ func TestGetRandomIP(t *testing.T) {
+ 		t.Fatalf("Expected address to be %q, got %q", "localhost:4222", a)
+ 	}
+ 	resolver.ips = []string{"1.2.3.4"}
+-	a, err = s.getRandomIP(resolver, "localhost:4222")
++	a, err = s.getRandomIP(resolver, "localhost:4222", nil)
+ 	if err != nil {
+ 		t.Fatalf("Unexpected error: %v", err)
+ 	}
+ 	if a != "1.2.3.4:4222" {
+ 		t.Fatalf("Expected address to be %q, got %q", "1.2.3.4:4222", a)
+ 	}
++	// An IP literal is already the destination and must not be replaced by
++	// addresses returned by the resolver.
++	a, err = s.getRandomIP(resolver, "127.0.0.1:4222", nil)
++	if err != nil {
++		t.Fatalf("Unexpected error for IP literal: %v", err)
++	}
++	if a != "127.0.0.1:4222" {
++		t.Fatalf("Expected IP literal to remain %q, got %q", "127.0.0.1:4222", a)
++	}
+ 	// Check for randomness
+ 	resolver.ips = []string{"1.2.3.4", "2.2.3.4", "3.2.3.4"}
+ 	dist := [3]int{}
+ 	for i := 0; i < 100; i++ {
+-		ip, err := s.getRandomIP(resolver, "localhost:4222")
++		ip, err := s.getRandomIP(resolver, "localhost:4222", nil)
+ 		if err != nil {
+ 			t.Fatalf("Unexpected error: %v", err)
+ 		}
+@@ -1448,6 +1457,47 @@ func TestGetRandomIP(t *testing.T) {
+ 			t.Logf("Warning: out of expected range [%v,%v] for ip %v, got %v", low, high, i, d)
+ 		}
+ 	}
++
++	// Check IP exclusions
++	excludedIPs := map[string]struct{}{"1.2.3.4:4222": struct{}{}}
++	for i := 0; i < 100; i++ {
++		ip, err := s.getRandomIP(resolver, "localhost:4222", excludedIPs)
++		if err != nil {
++			t.Fatalf("Unexpected error: %v", err)
++		}
++		if ip[0] == '1' {
++			t.Fatalf("Should not have returned this ip: %q", ip)
++		}
++	}
++	excludedIPs["2.2.3.4:4222"] = struct{}{}
++	for i := 0; i < 100; i++ {
++		ip, err := s.getRandomIP(resolver, "localhost:4222", excludedIPs)
++		if err != nil {
++			t.Fatalf("Unexpected error: %v", err)
++		}
++		if ip[0] != '3' {
++			t.Fatalf("Should only have returned '3.2.3.4', got returned %q", ip)
++		}
++	}
++	excludedIPs["3.2.3.4:4222"] = struct{}{}
++	for i := 0; i < 100; i++ {
++		if _, err := s.getRandomIP(resolver, "localhost:4222", excludedIPs); err == nil {
++			t.Fatal("Expected an error when all resolved IPs are excluded")
++		}
++	}
++
++	// Now check that exclusion takes into account the port number.
++	resolver.ips = []string{"127.0.0.1"}
++	excludedIPs = map[string]struct{}{"127.0.0.1:4222": struct{}{}}
++	for i := 0; i < 100; i++ {
++		a, err := s.getRandomIP(resolver, "localhost:4223", excludedIPs)
++		if err != nil {
++			t.Fatalf("Unexpected error: %v", err)
++		}
++		if a != "127.0.0.1:4223" {
++			t.Fatalf("Expected address to be %q, got %q", "127.0.0.1:4223", a)
++		}
++	}
+ }
+ 
+ type slowWriteConn struct {

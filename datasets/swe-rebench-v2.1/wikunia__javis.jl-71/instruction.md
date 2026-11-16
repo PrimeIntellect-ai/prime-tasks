@@ -1,0 +1,2 @@
+Auto-Export of Luxor Functions
+Based on conversation with @Wikunia , the manual importing of `Luxor` is somewhat of a pain for each file written using Javis. @thofma suggested a great idea based on [Hecke.jl](https://github.com/thofma/Hecke.jl/blob/da91ba6cd304e4399a272931b022d5d94cb407b2/src/Hecke.jl#L82) to auto-export each function in Luxor automatically within Javis. Let's get this implemented for documentation and for #44 .

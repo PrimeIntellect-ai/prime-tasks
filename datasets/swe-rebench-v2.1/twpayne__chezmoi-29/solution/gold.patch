@@ -1,0 +1,554 @@
+diff --git a/README.md b/README.md
+index be16c4972..ea72d17a3 100644
+--- a/README.md
++++ b/README.md
+@@ -9,16 +9,16 @@
+ 
+ ## Features
+ 
+- * Declarative: you declare the desired state of files and directories in your
+-   home directory and `chezmoi` updates your home directory to match that
+-state.
++ * Declarative: you declare the desired state of files, directories, and
++   symbolic links in your home directory and `chezmoi` updates your home
++directory to match that state.
+ 
+  * Flexible: your dotfiles can be templates (using
+    [text/template](https://godoc.org/text/template) syntax). Predefined
+ variables allow you to change behaviour depending on operating system,
+ architecture, and hostname.
+ 
+- * Robust: `chezmoi` updates all files atomically (using
++ * Robust: `chezmoi` updates all files and symbolic links atomically (using
+    [google/renameio](https://github.com/google/renameio)) so you are never left
+ with incomplete files that could lock you out, even if the update process is
+ interrupted.
+@@ -30,8 +30,8 @@ systems.
+  * Transparent: `chezmoi` includes verbose and dry run modes so you can review
+    exactly what changes it will make to your home directory before making them.
+ 
+- * Practical: `chezmoi` manages hidden files (dot files), directories, private,
+-   and executable files.
++ * Practical: `chezmoi` manages hidden files (dot files), directories, private
++   files, executable files, and symbolic links.
+ 
+  * Fast, easy to use, and familiar: `chezmoi` runs in fractions of a second and
+    includes commands to make most operations trivial. You can use the version
+@@ -244,22 +244,32 @@ exactly what it will run without executing it.
+ 
+ ## Under the hood
+ 
+-`chezmoi` stores the desired state of files and directories in `~/.chezmoi`.
+-This location can be overridden with the `-s` flag or by giving a value for
+-`sourceDir` in `~/.chezmoi.yaml`. Some state is encoded in the source names.
+-`chezmoi` ignores all files and directories in the source directory that begin
+-with a `.`.  The following prefixes and suffixes are special.
++`chezmoi` stores the desired state of files, symbolic links, and directories in
++regular files and directories in `~/.chezmoi`. This location can be overridden
++with the `-s` flag or by giving a value for `sourceDir` in `~/.chezmoi.yaml`.
++Some state is encoded in the source names. `chezmoi` ignores all files and
++directories in the source directory that begin with a `.`. The following
++prefixes and suffixes are special.
+ 
+ | Prefix               | Effect                                                                            |
+ | -------------------- | ----------------------------------------------------------------------------------|
+ | `private_` prefix    | Remove all group and world permissions from the target file or directory.         |
+ | `empty_` prefix      | Ensure the file exists, even if is empty. By default, empty files are removed.    |
+ | `executable_` prefix | Add executable permissions to the target file.                                    |
+-| `dot_` prefix        | Rename the file or directory to use a leading dot, e.g. `dot_foo` becomes `.foo`. |
+-| `.tmpl` suffix       | Treat the source file as a template.                                              |
++| `symlink_` prefix    | Create a symlink instead of a regular file.                                       |
++| `dot_` prefix        | Rename to use a leading dot, e.g. `dot_foo` becomes `.foo`.                       |
++| `.tmpl` suffix       | Treat the contents of the source file as a template.                              |
+ 
+-Order is important, the order is `private_`, `empty_`, `executable_`, `dot_`,
+-`.tmpl`.
++Order is important, the order is `private_`, `empty_`, `executable_`,
++`symlink_`, `dot_`, `.tmpl`.
++
++Different target types allow different prefixes and suffixes.
++
++| Target type   | Allowed prefixes and suffixes                        |
++| ------------- | ---------------------------------------------------- |
++| Directory     | `private_`, `dot_`                                   |
++| Regular file  | `private_`, `empty_`, `executable_`, `dot_`, `.tmpl` |
++| Symbolic link | `symlink_`, `dot_`, `.tmpl`                          |
+ 
+ 
+ ## Using `chezmoi` outside your home directory
+diff --git a/lib/chezmoi/actuator.go b/lib/chezmoi/actuator.go
+index cae4b86fe..1e4355d9c 100644
+--- a/lib/chezmoi/actuator.go
++++ b/lib/chezmoi/actuator.go
+@@ -4,8 +4,9 @@ import "os"
+ 
+ // An Actuator makes changes.
+ type Actuator interface {
+-	Chmod(string, os.FileMode) error
+-	Mkdir(string, os.FileMode) error
+-	RemoveAll(string) error
+-	WriteFile(string, []byte, os.FileMode, []byte) error
++	Chmod(name string, mode os.FileMode) error
++	Mkdir(name string, perm os.FileMode) error
++	RemoveAll(name string) error
++	WriteFile(filename string, data []byte, perm os.FileMode, currData []byte) error
++	WriteSymlink(oldname, newname string) error
+ }
+diff --git a/lib/chezmoi/any_actuator.go b/lib/chezmoi/any_actuator.go
+index c5c84d953..45e6bd19f 100644
+--- a/lib/chezmoi/any_actuator.go
++++ b/lib/chezmoi/any_actuator.go
+@@ -41,7 +41,13 @@ func (a *AnyActuator) RemoveAll(name string) error {
+ }
+ 
+ // WriteFile implements Actuator.WriteFile.
+-func (a *AnyActuator) WriteFile(name string, contents []byte, perm os.FileMode, currentContents []byte) error {
++func (a *AnyActuator) WriteFile(name string, data []byte, perm os.FileMode, currData []byte) error {
+ 	a.actuated = true
+-	return a.a.WriteFile(name, contents, perm, currentContents)
++	return a.a.WriteFile(name, data, perm, currData)
++}
++
++// WriteSymlink implements Actuator.WriteSymlink.
++func (a *AnyActuator) WriteSymlink(oldname, newname string) error {
++	a.actuated = true
++	return a.a.WriteSymlink(oldname, newname)
+ }
+diff --git a/lib/chezmoi/chezmoi.go b/lib/chezmoi/chezmoi.go
+index d30082af6..b85baa712 100644
+--- a/lib/chezmoi/chezmoi.go
++++ b/lib/chezmoi/chezmoi.go
+@@ -20,6 +20,7 @@ import (
+ )
+ 
+ const (
++	symlinkPrefix    = "symlink_"
+ 	privatePrefix    = "private_"
+ 	emptyPrefix      = "empty_"
+ 	executablePrefix = "executable_"
+@@ -27,7 +28,7 @@ const (
+ 	templateSuffix   = ".tmpl"
+ )
+ 
+-// An Entry is either a Dir or a File.
++// An Entry is either a Dir, a File, or a Symlink.
+ type Entry interface {
+ 	SourceName() string
+ 	addAllEntries(map[string]Entry, string)
+@@ -50,6 +51,12 @@ type Dir struct {
+ 	Entries    map[string]Entry
+ }
+ 
++// A Symlink represents the target state of a symlink.
++type Symlink struct {
++	sourceName string
++	Target     string
++}
++
+ // A TargetState represents the root target state.
+ type TargetState struct {
+ 	TargetDir string
+@@ -66,7 +73,7 @@ type parsedSourceDirName struct {
+ 
+ type parsedSourceFileName struct {
+ 	fileName string
+-	perm     os.FileMode
++	mode     os.FileMode
+ 	empty    bool
+ 	template bool
+ }
+@@ -112,7 +119,7 @@ func (d *Dir) archive(w *tar.Writer, dirName string, headerTemplate *tar.Header,
+ 
+ // apply ensures that targetDir in fs matches d.
+ func (d *Dir) apply(fs vfs.FS, targetDir string, umask os.FileMode, actuator Actuator) error {
+-	info, err := fs.Stat(targetDir)
++	info, err := fs.Lstat(targetDir)
+ 	switch {
+ 	case err == nil && info.Mode().IsDir():
+ 		if info.Mode()&os.ModePerm != d.Perm&^umask {
+@@ -167,20 +174,20 @@ func (f *File) archive(w *tar.Writer, fileName string, headerTemplate *tar.Heade
+ 	return err
+ }
+ 
+-// apply ensures that state of targetPath in fs matches f.
++// apply ensures that the state of targetPath in fs matches f.
+ func (f *File) apply(fs vfs.FS, targetPath string, umask os.FileMode, actuator Actuator) error {
+-	info, err := fs.Stat(targetPath)
+-	var currentContents []byte
++	info, err := fs.Lstat(targetPath)
++	var currData []byte
+ 	switch {
+ 	case err == nil && info.Mode().IsRegular():
+ 		if len(f.Contents) == 0 && !f.Empty {
+ 			return actuator.RemoveAll(targetPath)
+ 		}
+-		currentContents, err = fs.ReadFile(targetPath)
++		currData, err = fs.ReadFile(targetPath)
+ 		if err != nil {
+ 			return err
+ 		}
+-		if !bytes.Equal(currentContents, f.Contents) {
++		if !bytes.Equal(currData, f.Contents) {
+ 			break
+ 		}
+ 		if info.Mode()&os.ModePerm != f.Perm&^umask {
+@@ -200,7 +207,7 @@ func (f *File) apply(fs vfs.FS, targetPath string, umask os.FileMode, actuator A
+ 	if len(f.Contents) == 0 && !f.Empty {
+ 		return nil
+ 	}
+-	return actuator.WriteFile(targetPath, f.Contents, f.Perm&^umask, currentContents)
++	return actuator.WriteFile(targetPath, f.Contents, f.Perm&^umask, currData)
+ }
+ 
+ // SourceName implements Entry.SourceName.
+@@ -208,6 +215,43 @@ func (f *File) SourceName() string {
+ 	return f.sourceName
+ }
+ 
++// addAllEntries adds s to result.
++func (s *Symlink) addAllEntries(result map[string]Entry, name string) {
++	result[name] = s
++}
++
++// archive writes s to w.
++func (s *Symlink) archive(w *tar.Writer, dirName string, headerTemplate *tar.Header, umask os.FileMode) error {
++	header := *headerTemplate
++	header.Typeflag = tar.TypeSymlink
++	header.Linkname = s.Target
++	return w.WriteHeader(&header)
++}
++
++// apply ensures that the state of targetPath in fs matches s.
++func (s *Symlink) apply(fs vfs.FS, targetPath string, umask os.FileMode, actuator Actuator) error {
++	info, err := fs.Lstat(targetPath)
++	switch {
++	case err == nil && info.Mode()&os.ModeType == os.ModeSymlink:
++		currentTarget, err := fs.Readlink(targetPath)
++		if err != nil {
++			return err
++		}
++		if currentTarget == s.Target {
++			return nil
++		}
++	case err == nil:
++	case os.IsNotExist(err):
++	default:
++		return err
++	}
++	return actuator.WriteSymlink(s.Target, targetPath)
++}
++
++func (s *Symlink) SourceName() string {
++	return s.sourceName
++}
++
+ // NewTargetState creates a new TargetState.
+ func NewTargetState(targetDir string, umask os.FileMode, sourceDir string, data map[string]interface{}) *TargetState {
+ 	return &TargetState{
+@@ -230,7 +274,7 @@ func (ts *TargetState) Add(fs vfs.FS, target string, info os.FileInfo, addEmpty,
+ 	}
+ 	if info == nil {
+ 		var err error
+-		info, err = fs.Stat(target)
++		info, err = fs.Lstat(target)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -274,28 +318,28 @@ func (ts *TargetState) Add(fs vfs.FS, target string, info os.FileInfo, addEmpty,
+ 		}
+ 		sourceName := parsedSourceFileName{
+ 			fileName: name,
+-			perm:     info.Mode() & os.ModePerm,
++			mode:     info.Mode() & os.ModePerm,
+ 			empty:    info.Size() == 0,
+ 			template: addTemplate,
+ 		}.SourceFileName()
+ 		if dirSourceName != "" {
+ 			sourceName = filepath.Join(dirSourceName, sourceName)
+ 		}
+-		contents, err := fs.ReadFile(target)
++		data, err := fs.ReadFile(target)
+ 		if err != nil {
+ 			return err
+ 		}
+ 		if addTemplate {
+-			contents = autoTemplate(contents, ts.Data)
++			data = autoTemplate(data, ts.Data)
+ 		}
+-		if err := actuator.WriteFile(filepath.Join(ts.SourceDir, sourceName), contents, 0666&^ts.Umask, nil); err != nil {
++		if err := actuator.WriteFile(filepath.Join(ts.SourceDir, sourceName), data, 0666&^ts.Umask, nil); err != nil {
+ 			return err
+ 		}
+ 		entries[name] = &File{
+ 			sourceName: sourceName,
+-			Empty:      len(contents) == 0,
++			Empty:      len(data) == 0,
+ 			Perm:       info.Mode() & os.ModePerm,
+-			Contents:   contents,
++			Contents:   data,
+ 		}
+ 	case info.Mode().IsDir():
+ 		if entry, ok := entries[name]; ok {
+@@ -323,6 +367,31 @@ func (ts *TargetState) Add(fs vfs.FS, target string, info os.FileInfo, addEmpty,
+ 			}
+ 		}
+ 		entries[name] = newDir(sourceName, info.Mode()&os.ModePerm)
++	case info.Mode()&os.ModeType == os.ModeSymlink:
++		if entry, ok := entries[name]; ok {
++			if _, ok := entry.(*Symlink); !ok {
++				return fmt.Errorf("%s: already added and not a symlink", targetName)
++			}
++			return nil // entry already exists
++		}
++		sourceName := parsedSourceFileName{
++			fileName: name,
++			mode:     os.ModeSymlink,
++		}.SourceFileName()
++		if dirSourceName != "" {
++			sourceName = filepath.Join(dirSourceName, sourceName)
++		}
++		data, err := fs.Readlink(target)
++		if err != nil {
++			return err
++		}
++		if err := actuator.WriteFile(filepath.Join(ts.SourceDir, sourceName), []byte(data), 0666&^ts.Umask, nil); err != nil {
++			return err
++		}
++		entries[name] = &Symlink{
++			sourceName: sourceName,
++			Target:     data,
++		}
+ 	default:
+ 		return fmt.Errorf("%s: not a regular file or directory", targetName)
+ 	}
+@@ -420,12 +489,12 @@ func (ts *TargetState) Populate(fs vfs.FS) error {
+ 			if err != nil {
+ 				return err
+ 			}
+-			contents, err := fs.ReadFile(path)
++			data, err := fs.ReadFile(path)
+ 			if err != nil {
+ 				return err
+ 			}
+ 			if psfp.template {
+-				tmpl, err := template.New(path).Parse(string(contents))
++				tmpl, err := template.New(path).Parse(string(data))
+ 				if err != nil {
+ 					return fmt.Errorf("%s: %v", path, err)
+ 				}
+@@ -433,14 +502,26 @@ func (ts *TargetState) Populate(fs vfs.FS) error {
+ 				if err := tmpl.Execute(output, ts.Data); err != nil {
+ 					return fmt.Errorf("%s: %v", path, err)
+ 				}
+-				contents = output.Bytes()
++				data = output.Bytes()
+ 			}
+-			entries[psfp.fileName] = &File{
+-				sourceName: relPath,
+-				Empty:      psfp.empty,
+-				Perm:       psfp.perm,
+-				Contents:   contents,
++			var entry Entry
++			switch psfp.mode & os.ModeType {
++			case 0:
++				entry = &File{
++					sourceName: relPath,
++					Empty:      psfp.empty,
++					Perm:       psfp.mode & os.ModePerm,
++					Contents:   data,
++				}
++			case os.ModeSymlink:
++				entry = &Symlink{
++					sourceName: relPath,
++					Target:     string(data),
++				}
++			default:
++				return fmt.Errorf("%v: unsupported mode: %d", path, psfp.mode&os.ModeType)
+ 			}
++			entries[psfp.fileName] = entry
+ 		case info.Mode().IsDir():
+ 			components := splitPathList(relPath)
+ 			dirNames, perms := parseDirNameComponents(components)
+@@ -513,21 +594,29 @@ func (psdn parsedSourceDirName) SourceDirName() string {
+ 
+ // parseSourceFileName parses a source file name.
+ func parseSourceFileName(fileName string) parsedSourceFileName {
+-	perm := os.FileMode(0666)
+-	private := false
++	mode := os.FileMode(0666)
+ 	empty := false
+ 	template := false
+-	if strings.HasPrefix(fileName, privatePrefix) {
+-		fileName = strings.TrimPrefix(fileName, privatePrefix)
+-		private = true
+-	}
+-	if strings.HasPrefix(fileName, emptyPrefix) {
+-		fileName = strings.TrimPrefix(fileName, emptyPrefix)
+-		empty = true
+-	}
+-	if strings.HasPrefix(fileName, executablePrefix) {
+-		fileName = strings.TrimPrefix(fileName, executablePrefix)
+-		perm |= 0111
++	if strings.HasPrefix(fileName, symlinkPrefix) {
++		fileName = strings.TrimPrefix(fileName, symlinkPrefix)
++		mode |= os.ModeSymlink
++	} else {
++		private := false
++		if strings.HasPrefix(fileName, privatePrefix) {
++			fileName = strings.TrimPrefix(fileName, privatePrefix)
++			private = true
++		}
++		if strings.HasPrefix(fileName, emptyPrefix) {
++			fileName = strings.TrimPrefix(fileName, emptyPrefix)
++			empty = true
++		}
++		if strings.HasPrefix(fileName, executablePrefix) {
++			fileName = strings.TrimPrefix(fileName, executablePrefix)
++			mode |= 0111
++		}
++		if private {
++			mode &= 0700
++		}
+ 	}
+ 	if strings.HasPrefix(fileName, dotPrefix) {
+ 		fileName = "." + strings.TrimPrefix(fileName, dotPrefix)
+@@ -536,12 +625,9 @@ func parseSourceFileName(fileName string) parsedSourceFileName {
+ 		fileName = strings.TrimSuffix(fileName, templateSuffix)
+ 		template = true
+ 	}
+-	if private {
+-		perm &= 0700
+-	}
+ 	return parsedSourceFileName{
+ 		fileName: fileName,
+-		perm:     perm,
++		mode:     mode,
+ 		empty:    empty,
+ 		template: template,
+ 	}
+@@ -550,14 +636,21 @@ func parseSourceFileName(fileName string) parsedSourceFileName {
+ // SourceFileName returns psfn's source file name.
+ func (psfn parsedSourceFileName) SourceFileName() string {
+ 	fileName := ""
+-	if psfn.perm&os.FileMode(077) == os.FileMode(0) {
+-		fileName = privatePrefix
+-	}
+-	if psfn.empty {
+-		fileName += emptyPrefix
+-	}
+-	if psfn.perm&os.FileMode(0111) != os.FileMode(0) {
+-		fileName += executablePrefix
++	switch psfn.mode & os.ModeType {
++	case 0:
++		if psfn.mode&os.ModePerm&os.FileMode(077) == os.FileMode(0) {
++			fileName = privatePrefix
++		}
++		if psfn.empty {
++			fileName += emptyPrefix
++		}
++		if psfn.mode&os.ModePerm&os.FileMode(0111) != os.FileMode(0) {
++			fileName += executablePrefix
++		}
++	case os.ModeSymlink:
++		fileName = symlinkPrefix
++	default:
++		panic(fmt.Sprintf("%+v: unsupported type", psfn)) // FIXME return error instead of panicing
+ 	}
+ 	if strings.HasPrefix(psfn.fileName, ".") {
+ 		fileName += dotPrefix + strings.TrimPrefix(psfn.fileName, ".")
+diff --git a/lib/chezmoi/fs_actuator.go b/lib/chezmoi/fs_actuator.go
+index b3d8e1d52..10eeb08be 100644
+--- a/lib/chezmoi/fs_actuator.go
++++ b/lib/chezmoi/fs_actuator.go
+@@ -27,7 +27,7 @@ func NewFSActuator(fs vfs.FS, targetDir string) *FSActuator {
+ }
+ 
+ // WriteFile implements Actuator.WriteFile.
+-func (a *FSActuator) WriteFile(name string, contents []byte, perm os.FileMode, currentContents []byte) error {
++func (a *FSActuator) WriteFile(name string, data []byte, perm os.FileMode, currData []byte) error {
+ 	// Special case: if writing to the real filesystem, use github.com/google/renameio
+ 	if a.FS == vfs.OSFS {
+ 		t, err := renameio.TempFile(a.dir, name)
+@@ -38,10 +38,22 @@ func (a *FSActuator) WriteFile(name string, contents []byte, perm os.FileMode, c
+ 		if err := t.Chmod(perm); err != nil {
+ 			return err
+ 		}
+-		if _, err := t.Write(contents); err != nil {
++		if _, err := t.Write(data); err != nil {
+ 			return err
+ 		}
+ 		return t.CloseAtomicallyReplace()
+ 	}
+-	return a.FS.WriteFile(name, contents, perm)
++	return a.FS.WriteFile(name, data, perm)
++}
++
++// Symlink implements Actuator.WriteSymlink.
++func (a *FSActuator) WriteSymlink(oldname, newname string) error {
++	// Special case: if writing to the real filesystem, use github.com/google/renameio
++	if a.FS == vfs.OSFS {
++		return renameio.Symlink(oldname, newname)
++	}
++	if err := a.FS.RemoveAll(newname); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return a.FS.Symlink(oldname, newname)
+ }
+diff --git a/lib/chezmoi/logging_actuator.go b/lib/chezmoi/logging_actuator.go
+index e657749db..7de3e7b7a 100644
+--- a/lib/chezmoi/logging_actuator.go
++++ b/lib/chezmoi/logging_actuator.go
+@@ -59,12 +59,12 @@ func (a *LoggingActuator) RemoveAll(name string) error {
+ }
+ 
+ // WriteFile implements Actuator.WriteFile.
+-func (a *LoggingActuator) WriteFile(name string, contents []byte, perm os.FileMode, currentContents []byte) error {
++func (a *LoggingActuator) WriteFile(name string, data []byte, perm os.FileMode, currData []byte) error {
+ 	action := fmt.Sprintf("install -m %o /dev/null %s", perm, name)
+-	err := a.a.WriteFile(name, contents, perm, currentContents)
++	err := a.a.WriteFile(name, data, perm, currData)
+ 	if err == nil {
+ 		fmt.Fprintln(a.w, action)
+-		for _, section := range diff(splitLines(currentContents), splitLines(contents)) {
++		for _, section := range diff(splitLines(currData), splitLines(data)) {
+ 			for _, s := range section.s {
+ 				fmt.Fprintf(a.w, "%c%s\n", section.ctype, s)
+ 			}
+@@ -75,9 +75,21 @@ func (a *LoggingActuator) WriteFile(name string, contents []byte, perm os.FileMo
+ 	return err
+ }
+ 
+-func splitLines(contents []byte) []string {
+-	if len(contents) == 0 {
++// WriteSymlink implements Actuator.WriteSymlink.
++func (a *LoggingActuator) WriteSymlink(oldname, newname string) error {
++	action := fmt.Sprintf("ln -sf %s %s", oldname, newname)
++	err := a.a.WriteSymlink(oldname, newname)
++	if err == nil {
++		fmt.Fprintln(a.w, action)
++	} else {
++		fmt.Fprintf(a.w, "%s: %v\n", action, err)
++	}
++	return err
++}
++
++func splitLines(data []byte) []string {
++	if len(data) == 0 {
+ 		return nil
+ 	}
+-	return strings.Split(string(contents), "\n")
++	return strings.Split(string(data), "\n")
+ }
+diff --git a/lib/chezmoi/null_actuator.go b/lib/chezmoi/null_actuator.go
+index 0392d8e8a..5c03b1e4c 100644
+--- a/lib/chezmoi/null_actuator.go
++++ b/lib/chezmoi/null_actuator.go
+@@ -29,3 +29,8 @@ func (a *NullActuator) RemoveAll(string) error {
+ func (a *NullActuator) WriteFile(string, []byte, os.FileMode, []byte) error {
+ 	return nil
+ }
++
++// WriteSymlink implements Actuator.WriteSymlink.
++func (a *NullActuator) WriteSymlink(string, string) error {
++	return nil
++}

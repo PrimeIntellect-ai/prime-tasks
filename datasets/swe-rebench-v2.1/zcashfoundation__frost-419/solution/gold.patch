@@ -1,0 +1,442 @@
+diff --git a/frost-core/src/benches.rs b/frost-core/src/benches.rs
+index 4a4da46..24bbf59 100644
+--- a/frost-core/src/benches.rs
++++ b/frost-core/src/benches.rs
+@@ -92,14 +92,24 @@ pub fn bench_sign<C: Ciphersuite, R: RngCore + CryptoRng + Clone>(
+             |b, (max_signers, min_signers)| {
+                 let mut rng = rng.clone();
+                 b.iter(|| {
+-                    frost::keys::generate_with_dealer::<C, R>(*max_signers, *min_signers, &mut rng)
+-                        .unwrap();
++                    frost::keys::generate_with_dealer::<C, R>(
++                        *max_signers,
++                        *min_signers,
++                        frost::keys::IdentifierList::Default,
++                        &mut rng,
++                    )
++                    .unwrap();
+                 })
+             },
+         );
+ 
+-        let (shares, pubkeys) =
+-            frost::keys::generate_with_dealer::<C, R>(max_signers, min_signers, rng).unwrap();
++        let (shares, pubkeys) = frost::keys::generate_with_dealer::<C, R>(
++            max_signers,
++            min_signers,
++            frost::keys::IdentifierList::Default,
++            rng,
++        )
++        .unwrap();
+ 
+         // Verifies the secret shares from the dealer
+         let mut key_packages: HashMap<frost::Identifier<C>, frost::keys::KeyPackage<C>> =
+diff --git a/frost-core/src/error.rs b/frost-core/src/error.rs
+index a377237..60adce3 100644
+--- a/frost-core/src/error.rs
++++ b/frost-core/src/error.rs
+@@ -23,6 +23,9 @@ pub enum Error<C: Ciphersuite> {
+     /// This identifier is unserializable.
+     #[error("Malformed identifier is unserializable.")]
+     MalformedIdentifier,
++    /// This identifier is duplicated.
++    #[error("Duplicated identifier.")]
++    DuplicatedIdentifier,
+     /// The encoding of a signing key was malformed.
+     #[error("Malformed signing key encoding.")]
+     MalformedSigningKey,
+@@ -122,6 +125,7 @@ where
+             | Error::DKGNotSupported
+             | Error::FieldError(_)
+             | Error::GroupError(_)
++            | Error::DuplicatedIdentifier
+             | Error::InvalidCoefficient
+             | Error::IdentifierDerivationNotSupported => None,
+         }
+diff --git a/frost-core/src/frost/keys.rs b/frost-core/src/frost/keys.rs
+index bbcedc9..43327de 100644
+--- a/frost-core/src/frost/keys.rs
++++ b/frost-core/src/frost/keys.rs
+@@ -2,7 +2,7 @@
+ #![allow(clippy::type_complexity)]
+ 
+ use std::{
+-    collections::HashMap,
++    collections::{HashMap, HashSet},
+     convert::TryFrom,
+     default::Default,
+     fmt::{self, Debug},
+@@ -36,6 +36,13 @@ pub(crate) fn generate_coefficients<C: Ciphersuite, R: RngCore + CryptoRng>(
+         .collect()
+ }
+ 
++/// Return a list of default identifiers (1 to max_signers, inclusive).
++pub(crate) fn default_identifiers<C: Ciphersuite>(max_signers: u16) -> Vec<Identifier<C>> {
++    (1..=max_signers)
++        .map(|i| Identifier::<C>::try_from(i).expect("nonzero"))
++        .collect::<Vec<_>>()
++}
++
+ /// A secret scalar value representing a signer's share of the group secret.
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+@@ -377,6 +384,14 @@ where
+     }
+ }
+ 
++/// The identifier list to use when generating key shares.
++pub enum IdentifierList<'a, C: Ciphersuite> {
++    /// Use the default values (1 to max_signers, inclusive).
++    Default,
++    /// A user-provided list of identifiers.
++    Custom(&'a [Identifier<C>]),
++}
++
+ /// Allows all participants' keys to be generated using a central, trusted
+ /// dealer.
+ ///
+@@ -392,6 +407,7 @@ where
+ pub fn generate_with_dealer<C: Ciphersuite, R: RngCore + CryptoRng>(
+     max_signers: u16,
+     min_signers: u16,
++    identifiers: IdentifierList<C>,
+     rng: &mut R,
+ ) -> Result<(HashMap<Identifier<C>, SecretShare<C>>, PublicKeyPackage<C>), Error<C>> {
+     let mut bytes = [0; 64];
+@@ -399,7 +415,7 @@ pub fn generate_with_dealer<C: Ciphersuite, R: RngCore + CryptoRng>(
+ 
+     let key = SigningKey::new(rng);
+ 
+-    split(&key, max_signers, min_signers, rng)
++    split(&key, max_signers, min_signers, identifiers, rng)
+ }
+ 
+ /// Splits an existing key into FROST shares.
+@@ -412,13 +428,21 @@ pub fn split<C: Ciphersuite, R: RngCore + CryptoRng>(
+     key: &SigningKey<C>,
+     max_signers: u16,
+     min_signers: u16,
++    identifiers: IdentifierList<C>,
+     rng: &mut R,
+ ) -> Result<(HashMap<Identifier<C>, SecretShare<C>>, PublicKeyPackage<C>), Error<C>> {
+     let group_public = VerifyingKey::from(key);
+ 
+     let coefficients = generate_coefficients::<C, R>(min_signers as usize - 1, rng);
+ 
+-    let secret_shares = generate_secret_shares(key, max_signers, min_signers, coefficients)?;
++    let default_identifiers = default_identifiers(max_signers);
++    let identifiers = match identifiers {
++        IdentifierList::Custom(identifiers) => identifiers,
++        IdentifierList::Default => &default_identifiers,
++    };
++
++    let secret_shares =
++        generate_secret_shares(key, max_signers, min_signers, coefficients, identifiers)?;
+     let mut signer_pubkeys: HashMap<Identifier<C>, VerifyingShare<C>> =
+         HashMap::with_capacity(max_signers as usize);
+ 
+@@ -671,18 +695,23 @@ pub(crate) fn generate_secret_shares<C: Ciphersuite>(
+     max_signers: u16,
+     min_signers: u16,
+     coefficients: Vec<Scalar<C>>,
++    identifiers: &[Identifier<C>],
+ ) -> Result<Vec<SecretShare<C>>, Error<C>> {
+     let mut secret_shares: Vec<SecretShare<C>> = Vec::with_capacity(max_signers as usize);
+ 
+     let (coefficients, commitment) =
+         generate_secret_polynomial(secret, max_signers, min_signers, coefficients)?;
+ 
+-    for idx in 1..=max_signers {
+-        let id = Identifier::<C>::try_from(idx)?;
+-        let value = evaluate_polynomial(id, &coefficients);
++    let identifiers_set: HashSet<_> = identifiers.iter().collect();
++    if identifiers_set.len() != identifiers.len() {
++        return Err(Error::DuplicatedIdentifier);
++    }
++
++    for id in identifiers {
++        let value = evaluate_polynomial(*id, &coefficients);
+ 
+         secret_shares.push(SecretShare {
+-            identifier: id,
++            identifier: *id,
+             value: SigningShare(value),
+             commitment: commitment.clone(),
+             ciphersuite: (),
+diff --git a/frost-ed25519/README.md b/frost-ed25519/README.md
+index e5133e8..2096a1f 100644
+--- a/frost-ed25519/README.md
++++ b/frost-ed25519/README.md
+@@ -17,7 +17,12 @@ use std::collections::HashMap;
+ let mut rng = thread_rng();
+ let max_signers = 5;
+ let min_signers = 3;
+-let (shares, pubkey_package) = frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)?;
++let (shares, pubkey_package) = frost::keys::generate_with_dealer(
++    max_signers,
++    min_signers,
++    frost::keys::IdentifierList::Default,
++    &mut rng,
++)?;
+ # // ANCHOR_END: tkg_gen
+ 
+ // Verifies the secret shares from the dealer and store them in a HashMap.
+diff --git a/frost-ed25519/src/lib.rs b/frost-ed25519/src/lib.rs
+index b9c5b11..63618f1 100644
+--- a/frost-ed25519/src/lib.rs
++++ b/frost-ed25519/src/lib.rs
+@@ -220,14 +220,18 @@ pub mod keys {
+ 
+     use super::*;
+ 
++    /// The identifier list to use when generating key shares.
++    pub type IdentifierList<'a> = frost::keys::IdentifierList<'a, E>;
++
+     /// Allows all participants' keys to be generated using a central, trusted
+     /// dealer.
+     pub fn generate_with_dealer<RNG: RngCore + CryptoRng>(
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         mut rng: RNG,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)
++        frost::keys::generate_with_dealer(max_signers, min_signers, identifiers, &mut rng)
+     }
+ 
+     /// Splits an existing key into FROST shares.
+@@ -240,9 +244,10 @@ pub mod keys {
+         secret: &SigningKey,
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         rng: &mut R,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::split(secret, max_signers, min_signers, rng)
++        frost::keys::split(secret, max_signers, min_signers, identifiers, rng)
+     }
+ 
+     /// Recompute the secret from t-of-n secret shares using Lagrange interpolation.
+diff --git a/frost-ed448/README.md b/frost-ed448/README.md
+index 2d062c3..220c8a9 100644
+--- a/frost-ed448/README.md
++++ b/frost-ed448/README.md
+@@ -17,7 +17,12 @@ use std::collections::HashMap;
+ let mut rng = thread_rng();
+ let max_signers = 5;
+ let min_signers = 3;
+-let (shares, pubkey_package) = frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)?;
++let (shares, pubkey_package) = frost::keys::generate_with_dealer(
++    max_signers,
++    min_signers,
++    frost::keys::IdentifierList::Default,
++    &mut rng,
++)?;
+ # // ANCHOR_END: tkg_gen
+ 
+ // Verifies the secret shares from the dealer and store them in a HashMap.
+diff --git a/frost-ed448/src/lib.rs b/frost-ed448/src/lib.rs
+index ab048b4..37c9a54 100644
+--- a/frost-ed448/src/lib.rs
++++ b/frost-ed448/src/lib.rs
+@@ -214,14 +214,18 @@ pub mod keys {
+     use super::*;
+     use std::collections::HashMap;
+ 
++    /// The identifier list to use when generating key shares.
++    pub type IdentifierList<'a> = frost::keys::IdentifierList<'a, E>;
++
+     /// Allows all participants' keys to be generated using a central, trusted
+     /// dealer.
+     pub fn generate_with_dealer<RNG: RngCore + CryptoRng>(
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         mut rng: RNG,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)
++        frost::keys::generate_with_dealer(max_signers, min_signers, identifiers, &mut rng)
+     }
+ 
+     /// Splits an existing key into FROST shares.
+@@ -234,9 +238,10 @@ pub mod keys {
+         secret: &SigningKey,
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         rng: &mut R,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::split(secret, max_signers, min_signers, rng)
++        frost::keys::split(secret, max_signers, min_signers, identifiers, rng)
+     }
+ 
+     /// Recompute the secret from t-of-n secret shares using Lagrange interpolation.
+diff --git a/frost-p256/README.md b/frost-p256/README.md
+index 5daff85..a561091 100644
+--- a/frost-p256/README.md
++++ b/frost-p256/README.md
+@@ -17,7 +17,12 @@ use std::collections::HashMap;
+ let mut rng = thread_rng();
+ let max_signers = 5;
+ let min_signers = 3;
+-let (shares, pubkey_package) = frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)?;
++let (shares, pubkey_package) = frost::keys::generate_with_dealer(
++    max_signers,
++    min_signers,
++    frost::keys::IdentifierList::Default,
++    &mut rng,
++)?;
+ # // ANCHOR_END: tkg_gen
+ 
+ // Verifies the secret shares from the dealer and store them in a HashMap.
+diff --git a/frost-p256/src/lib.rs b/frost-p256/src/lib.rs
+index 8a48b58..45633f1 100644
+--- a/frost-p256/src/lib.rs
++++ b/frost-p256/src/lib.rs
+@@ -240,21 +240,24 @@ type P = P256Sha256;
+ 
+ /// A FROST(P-256, SHA-256) participant identifier.
+ pub type Identifier = frost::Identifier<P>;
+-
+ /// FROST(P-256, SHA-256) keys, key generation, key shares.
+ pub mod keys {
+     use std::collections::HashMap;
+ 
+     use super::*;
+ 
++    /// The identifier list to use when generating key shares.
++    pub type IdentifierList<'a> = frost::keys::IdentifierList<'a, P>;
++
+     /// Allows all participants' keys to be generated using a central, trusted
+     /// dealer.
+     pub fn generate_with_dealer<RNG: RngCore + CryptoRng>(
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         mut rng: RNG,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)
++        frost::keys::generate_with_dealer(max_signers, min_signers, identifiers, &mut rng)
+     }
+ 
+     /// Splits an existing key into FROST shares.
+@@ -267,9 +270,10 @@ pub mod keys {
+         secret: &SigningKey,
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         rng: &mut R,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::split(secret, max_signers, min_signers, rng)
++        frost::keys::split(secret, max_signers, min_signers, identifiers, rng)
+     }
+ 
+     /// Recompute the secret from t-of-n secret shares using Lagrange interpolation.
+diff --git a/frost-ristretto255/README.md b/frost-ristretto255/README.md
+index 7bf326f..e55011d 100644
+--- a/frost-ristretto255/README.md
++++ b/frost-ristretto255/README.md
+@@ -17,7 +17,12 @@ use std::collections::HashMap;
+ let mut rng = thread_rng();
+ let max_signers = 5;
+ let min_signers = 3;
+-let (shares, pubkey_package) = frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)?;
++let (shares, pubkey_package) = frost::keys::generate_with_dealer(
++    max_signers,
++    min_signers,
++    frost::keys::IdentifierList::Default,
++    &mut rng,
++)?;
+ # // ANCHOR_END: tkg_gen
+ 
+ // Verifies the secret shares from the dealer and store them in a HashMap.
+diff --git a/frost-ristretto255/src/lib.rs b/frost-ristretto255/src/lib.rs
+index 794b01a..fcb6628 100644
+--- a/frost-ristretto255/src/lib.rs
++++ b/frost-ristretto255/src/lib.rs
+@@ -208,14 +208,18 @@ pub mod keys {
+     use super::*;
+     use std::collections::HashMap;
+ 
++    /// The identifier list to use when generating key shares.
++    pub type IdentifierList<'a> = frost::keys::IdentifierList<'a, R>;
++
+     /// Allows all participants' keys to be generated using a central, trusted
+     /// dealer.
+     pub fn generate_with_dealer<RNG: RngCore + CryptoRng>(
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         mut rng: RNG,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)
++        frost::keys::generate_with_dealer(max_signers, min_signers, identifiers, &mut rng)
+     }
+ 
+     /// Splits an existing key into FROST shares.
+@@ -228,9 +232,10 @@ pub mod keys {
+         secret: &SigningKey,
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         rng: &mut R,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::split(secret, max_signers, min_signers, rng)
++        frost::keys::split(secret, max_signers, min_signers, identifiers, rng)
+     }
+ 
+     /// Recompute the secret from t-of-n secret shares using Lagrange interpolation.
+diff --git a/frost-secp256k1/README.md b/frost-secp256k1/README.md
+index 50612c5..86c24d5 100644
+--- a/frost-secp256k1/README.md
++++ b/frost-secp256k1/README.md
+@@ -17,7 +17,12 @@ use std::collections::HashMap;
+ let mut rng = thread_rng();
+ let max_signers = 5;
+ let min_signers = 3;
+-let (shares, pubkey_package) = frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)?;
++let (shares, pubkey_package) = frost::keys::generate_with_dealer(
++    max_signers,
++    min_signers,
++    frost::keys::IdentifierList::Default,
++    &mut rng,
++)?;
+ # // ANCHOR_END: tkg_gen
+ 
+ // Verifies the secret shares from the dealer and store them in a HashMap.
+diff --git a/frost-secp256k1/src/lib.rs b/frost-secp256k1/src/lib.rs
+index 656b1a9..7051ba0 100644
+--- a/frost-secp256k1/src/lib.rs
++++ b/frost-secp256k1/src/lib.rs
+@@ -246,14 +246,18 @@ pub mod keys {
+     use super::*;
+     use std::collections::HashMap;
+ 
++    /// The identifier list to use when generating key shares.
++    pub type IdentifierList<'a> = frost::keys::IdentifierList<'a, S>;
++
+     /// Allows all participants' keys to be generated using a central, trusted
+     /// dealer.
+     pub fn generate_with_dealer<RNG: RngCore + CryptoRng>(
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         mut rng: RNG,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::generate_with_dealer(max_signers, min_signers, &mut rng)
++        frost::keys::generate_with_dealer(max_signers, min_signers, identifiers, &mut rng)
+     }
+ 
+     /// Splits an existing key into FROST shares.
+@@ -266,9 +270,10 @@ pub mod keys {
+         secret: &SigningKey,
+         max_signers: u16,
+         min_signers: u16,
++        identifiers: IdentifierList,
+         rng: &mut R,
+     ) -> Result<(HashMap<Identifier, SecretShare>, PublicKeyPackage), Error> {
+-        frost::keys::split(secret, max_signers, min_signers, rng)
++        frost::keys::split(secret, max_signers, min_signers, identifiers, rng)
+     }
+ 
+     /// Recompute the secret from t-of-n secret shares using Lagrange interpolation.

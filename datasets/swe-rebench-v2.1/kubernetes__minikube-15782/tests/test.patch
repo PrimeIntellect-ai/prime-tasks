@@ -1,0 +1,281 @@
+diff --git a/cmd/minikube/cmd/delete_test.go b/cmd/minikube/cmd/delete_test.go
+index d91f6d5b3..81dbf06f7 100644
+--- a/cmd/minikube/cmd/delete_test.go
++++ b/cmd/minikube/cmd/delete_test.go
+@@ -17,10 +17,15 @@ limitations under the License.
+ package cmd
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
++	"runtime"
++	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/docker/machine/libmachine"
+ 	"github.com/google/go-cmp/cmp"
+@@ -29,6 +34,7 @@ import (
+ 
+ 	cmdcfg "k8s.io/minikube/cmd/minikube/cmd/config"
+ 	"k8s.io/minikube/pkg/minikube/config"
++	"k8s.io/minikube/pkg/minikube/constants"
+ 	"k8s.io/minikube/pkg/minikube/localpath"
+ )
+ 
+@@ -220,3 +226,108 @@ func TestDeleteAllProfiles(t *testing.T) {
+ 
+ 	viper.Set(config.ProfileName, "")
+ }
++
++// minikubeNamedHelperSrc is a tiny program compiled to an executable named
++// "minikube" so that the mount cleanup logic recognizes the spawned process
++// as one started by minikube.
++const minikubeNamedHelperSrc = `package main
++
++import (
++"os"
++"os/signal"
++"syscall"
++)
++
++func main() {
++ch := make(chan os.Signal, 1)
++signal.Notify(ch, syscall.SIGHUP)
++<-ch
++}
++`
++
++// TestMountKillMultipleProcesses verifies that `minikube mount --kill`
++// terminates every mount process recorded for the profile, not just one.
++func TestMountKillMultipleProcesses(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping: mount --kill cleanup test is not supported on windows")
++	}
++
++	// Build the minikube binary under test.
++	binDir := t.TempDir()
++	minikubeBin := filepath.Join(binDir, "minikube")
++	build := exec.Command("go", "build", "-o", minikubeBin, "k8s.io/minikube/cmd/minikube")
++	if out, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("building minikube: %v\n%s", err, out)
++	}
++
++	// Build a helper process whose executable name is "minikube" so the
++	// cleanup logic recognizes it as a minikube-spawned process.
++	helperDir := t.TempDir()
++	helperSrc := filepath.Join(helperDir, "main.go")
++	if err := os.WriteFile(helperSrc, []byte(minikubeNamedHelperSrc), 0o600); err != nil {
++		t.Fatalf("writing helper source: %v", err)
++	}
++	helperBin := filepath.Join(helperDir, "minikube")
++	buildHelper := exec.Command("go", "build", "-o", helperBin, helperSrc)
++	if out, err := buildHelper.CombinedOutput(); err != nil {
++		t.Fatalf("building helper: %v\n%s", err, out)
++	}
++
++	home := t.TempDir()
++	profile := "mountkilltest"
++	profileDir := filepath.Join(home, ".minikube", "profiles", profile)
++	if err := os.MkdirAll(profileDir, 0o755); err != nil {
++		t.Fatalf("creating profile dir: %v", err)
++	}
++
++	const numMounts = 3
++	var procs []*exec.Cmd
++	for i := 0; i < numMounts; i++ {
++		cmd := exec.Command(helperBin, "mount", "-p", profile, fmt.Sprintf("/tmp:/mount%d", i))
++		if err := cmd.Start(); err != nil {
++			t.Fatalf("starting helper process: %v", err)
++		}
++		procs = append(procs, cmd)
++	}
++	defer func() {
++		for _, p := range procs {
++			if p.Process != nil {
++				_ = p.Process.Kill()
++			}
++		}
++	}()
++
++	var pidStrs []string
++	for _, p := range procs {
++		pidStrs = append(pidStrs, fmt.Sprintf("%d", p.Process.Pid))
++	}
++	pidFile := filepath.Join(profileDir, constants.MountProcessFileName)
++	if err := os.WriteFile(pidFile, []byte(strings.Join(pidStrs, " ")), 0o644); err != nil {
++		t.Fatalf("writing pid file: %v", err)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
++	defer cancel()
++	killCmd := exec.CommandContext(ctx, minikubeBin, "mount", "-p", profile, "--kill=true")
++	env := []string{}
++	for _, e := range os.Environ() {
++		if strings.HasPrefix(e, localpath.MinikubeHome+"=") {
++			continue
++		}
++		env = append(env, e)
++	}
++	killCmd.Env = append(env, localpath.MinikubeHome+"="+home)
++	if out, err := killCmd.CombinedOutput(); err != nil {
++		t.Fatalf("minikube mount --kill failed: %v\n%s", err, out)
++	}
++
++	for _, p := range procs {
++		done := make(chan error, 1)
++		go func(c *exec.Cmd) { done <- c.Wait() }(p)
++		select {
++		case <-done:
++		case <-time.After(10 * time.Second):
++			t.Errorf("process %d is still running after mount --kill", p.Process.Pid)
++		}
++	}
++}
+diff --git a/site/content/en/docs/contrib/tests.en.md b/site/content/en/docs/contrib/tests.en.md
+index 2c17563f3..1d3ff3407 100644
+--- a/site/content/en/docs/contrib/tests.en.md
++++ b/site/content/en/docs/contrib/tests.en.md
+@@ -399,6 +399,10 @@ Note: This test will fail on release PRs as the licenses file for the new versio
+ 
+ #### validateMountCmd
+ verifies the minikube mount command works properly
++for the platforms that support it, we're testing:
++- a generic 9p mount
++- a 9p mount on a specific port
++- cleaning-mechanism for profile-specific mounts
+ 
+ #### validatePersistentVolumeClaim
+ makes sure PVCs work properly
+diff --git a/test/integration/functional_test_mount_test.go b/test/integration/functional_test_mount_test.go
+index b09491d42..0d588a099 100644
+--- a/test/integration/functional_test_mount_test.go
++++ b/test/integration/functional_test_mount_test.go
+@@ -45,6 +45,10 @@ const (
+ )
+ 
+ // validateMountCmd verifies the minikube mount command works properly
++// for the platforms that support it, we're testing:
++// - a generic 9p mount
++// - a 9p mount on a specific port
++// - cleaning-mechanism for profile-specific mounts
+ func validateMountCmd(ctx context.Context, t *testing.T, profile string) { // nolint
+ 	if NoneDriver() {
+ 		t.Skip("skipping: none driver does not support mount")
+@@ -116,7 +120,7 @@ func validateMountCmd(ctx context.Context, t *testing.T, profile string) { // no
+ 		if err := retry.Expo(checkMount, time.Millisecond*500, Seconds(15)); err != nil {
+ 			// For local testing, allow macOS users to click prompt. If they don't, skip the test.
+ 			if runtime.GOOS == "darwin" {
+-				t.Skip("skipping: mount did not appear, likely because macOS requires prompt to allow non-codesigned binaries to listen on non-localhost port")
++				t.Skip("skipping: mount did not appear, likely because macOS requires prompt to allow non-code signed binaries to listen on non-localhost port")
+ 			}
+ 			t.Fatalf("/mount-9p did not appear within %s: %v", time.Since(start), err)
+ 		}
+@@ -244,7 +248,7 @@ func validateMountCmd(ctx context.Context, t *testing.T, profile string) { // no
+ 		if err := retry.Expo(checkMount, time.Millisecond*500, Seconds(15)); err != nil {
+ 			// For local testing, allow macOS users to click prompt. If they don't, skip the test.
+ 			if runtime.GOOS == "darwin" {
+-				t.Skip("skipping: mount did not appear, likely because macOS requires prompt to allow non-codesigned binaries to listen on non-localhost port")
++				t.Skip("skipping: mount did not appear, likely because macOS requires prompt to allow non-code signed binaries to listen on non-localhost port")
+ 			}
+ 			t.Fatalf("/mount-9p did not appear within %s: %v", time.Since(start), err)
+ 		}
+@@ -280,4 +284,95 @@ func validateMountCmd(ctx context.Context, t *testing.T, profile string) { // no
+ 			t.Fatalf("failed to find bind address with port 46464. Mount command out: \n%v", mountText)
+ 		}
+ 	})
++
++	t.Run("VerifyCleanup", func(t *testing.T) {
++		tempDir := t.TempDir()
++
++		ctx, cancel := context.WithTimeout(ctx, Minutes(10))
++
++		guestMountPaths := []string{"/mount1", "/mount2", "/mount3"}
++
++		var mntProcs []*StartSession
++		for _, guestMount := range guestMountPaths {
++			args := []string{"mount", "-p", profile, fmt.Sprintf("%s:%s", tempDir, guestMount), "--alsologtostderr", "-v=1"}
++			mntProc, err := Start(t, exec.CommandContext(ctx, Target(), args...))
++			if err != nil {
++				t.Fatalf("%v failed: %v", args, err)
++			}
++
++			mntProcs = append(mntProcs, mntProc)
++
++		}
++
++		defer func() {
++			// Still trying to stop mount processes that could otherwise
++			// (if something weird happens...) leave the test run hanging
++			// The worst thing that could happen is that we try to kill
++			// something that was aleardy killed...
++			for _, mp := range mntProcs {
++				mp.Stop(t)
++			}
++
++			cancel()
++			if *cleanup {
++				os.RemoveAll(tempDir)
++			}
++		}()
++
++		// are the mounts alive yet..?
++		checkMount := func() error {
++			for _, mnt := range guestMountPaths {
++				rr, err := Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ssh", "findmnt -T", mnt))
++				if err != nil {
++					// if something weird has happened from previous tests..
++					// this could at least spare us some waiting
++					if strings.Contains(rr.Stdout.String(), fmt.Sprintf("Profile \"%s\" not found.", profile)) {
++						t.Fatalf("profile was deleted, cancelling the test")
++					}
++					return err
++				}
++			}
++			return nil
++		}
++		if err := retry.Expo(checkMount, time.Millisecond*500, Seconds(15)); err != nil {
++			// For local testing, allow macOS users to click prompt. If they don't, skip the test.
++			if runtime.GOOS == "darwin" {
++				t.Skip("skipping: mount did not appear, likely because macOS requires prompt to allow non-code signed binaries to listen on non-localhost port")
++			}
++			t.Fatalf("mount was not ready in time: %v", err)
++		}
++
++		checkProcsAlive := func(end chan bool) {
++			for _, mntp := range mntProcs {
++				// Trying to wait for process end
++				// if the wait fail with ExitError we know that the process
++				// doesn't exist anymore..
++				go func(mntp *StartSession, end chan bool) {
++					err := mntp.cmd.Wait()
++					if _, ok := err.(*exec.ExitError); ok {
++						end <- true
++					}
++				}(mntp, end)
++
++				// Either we know that the mount process has ended
++				// or we fail after 1 second
++				// TODO: is there a better way? rather than waiting..
++				select {
++				case <-time.After(1 * time.Second):
++					t.Fatalf("1s TIMEOUT: Process %d is still running\n", mntp.cmd.Process.Pid)
++				case <-end:
++					continue
++				}
++			}
++		}
++
++		// exec the mount killer
++		_, err := Run(t, exec.Command(Target(), "mount", "-p", profile, "--kill=true"))
++		if err != nil {
++			t.Fatalf("failed while trying to kill mounts")
++		}
++
++		end := make(chan bool, 1)
++		checkProcsAlive(end)
++	})
+ }

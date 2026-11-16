@@ -1,0 +1,243 @@
+diff --git a/.changeset/chilly-laws-trade.md b/.changeset/chilly-laws-trade.md
+new file mode 100644
+index 00000000..dd2f722e
+--- /dev/null
++++ b/.changeset/chilly-laws-trade.md
+@@ -0,0 +1,5 @@
++---
++'@urql/svelte': minor
++---
++
++Improve granularity of `operationStore` updates when `query`, `variables`, and `context` are changed. This also adds an `operationStore(...).reexecute()` method, which optionally accepts a new context value and forces an update on the store, so that a query may reexecute.
+diff --git a/docs/api/svelte.md b/docs/api/svelte.md
+index 6d64b246..19906883 100644
+--- a/docs/api/svelte.md
++++ b/docs/api/svelte.md
+@@ -45,6 +45,15 @@ will automatically update the store and notify reactive subscribers.
+ In development, trying to update the _readonly_ properties directly or via the `set` or `update`
+ method will result in a `TypeError` being thrown.
+ 
++An additional non-standard method on the store is `reexecute`, which does _almost_ the same as
++assigning a new context to the operation. It is syntactic sugar to ensure that an operation may be
++reexecuted at any point in time:
++
++```js
++operationStre(...).reexecute();
++operationStre(...).reexecute({ requestPolicy: 'network-only' });
++```
++
+ [Read more about `writable` stores on the Svelte API docs.](https://svelte.dev/docs#writable)
+ 
+ ## query
+diff --git a/docs/basics/svelte.md b/docs/basics/svelte.md
+index 58c14b2a..ccd5b891 100644
+--- a/docs/basics/svelte.md
++++ b/docs/basics/svelte.md
+@@ -326,7 +326,9 @@ quite well and does so automatically. Sometimes it may be necessary though to re
+ execute a query with a different `context`. Triggering a query programmatically may be useful in a
+ couple of cases. It can for instance be used to refresh data.
+ 
+-We can trigger a new query update by changing out the `context` of our `operationStore`.
++We can trigger a new query update by changing out the `context` of our `operationStore`. While we
++can simply assign a new context value using `$todos.context = {}` we can also use the store's
++`reexecute` method as syntactic sugar for this:
+ 
+ ```jsx
+ <script>
+@@ -346,7 +348,7 @@ We can trigger a new query update by changing out the `context` of our `operatio
+   query(todos);
+ 
+   function refresh() {
+-    $todos.context = { requestPolicy: 'network-only' };
++    todos.reexecute({ requestPolicy: 'network-only' });
+   }
+ </script>
+ ```
+diff --git a/examples/with-svelte/package.json b/examples/with-svelte/package.json
+index 77bc43cb..103c647d 100644
+--- a/examples/with-svelte/package.json
++++ b/examples/with-svelte/package.json
+@@ -12,6 +12,7 @@
+     "vite": "^2.2.4"
+   },
+   "dependencies": {
++    "@urql/svelte": "^1.2.3",
+     "svelte": "^3.38.2"
+   }
+ }
+diff --git a/examples/with-svelte/vite.config.js b/examples/with-svelte/vite.config.js
+index c6602fc1..f0307a3b 100644
+--- a/examples/with-svelte/vite.config.js
++++ b/examples/with-svelte/vite.config.js
+@@ -1,7 +1,10 @@
+ import { defineConfig } from 'vite';
+-import svelte from '@sveltejs/vite-plugin-svelte';
++import { svelte } from '@sveltejs/vite-plugin-svelte';
+ 
+ // https://vitejs.dev/config/
+ export default defineConfig({
+   plugins: [svelte()],
++  optimizeDeps: {
++    exclude: ['@urql/svelte'],
++  },
+ });
+diff --git a/packages/svelte-urql/src/internal.ts b/packages/svelte-urql/src/internal.ts
+index 58ab8e1f..5ba1b6f5 100644
+--- a/packages/svelte-urql/src/internal.ts
++++ b/packages/svelte-urql/src/internal.ts
+@@ -1,5 +1,5 @@
+ export const _contextKey = '$$_urql';
+-export const _storeUpdate = new Set<object>();
++export const _storeUpdate = new WeakSet<object>();
+ export const _markStoreUpdate =
+   process.env.NODE_ENV !== 'production'
+     ? (value: object) => _storeUpdate.add(value)
+diff --git a/packages/svelte-urql/src/operationStore.ts b/packages/svelte-urql/src/operationStore.ts
+index 02666771..e40e9733 100644
+--- a/packages/svelte-urql/src/operationStore.ts
++++ b/packages/svelte-urql/src/operationStore.ts
+@@ -1,12 +1,15 @@
+ import { Readable, writable } from 'svelte/store';
+ import { DocumentNode } from 'graphql';
+ import { TypedDocumentNode } from '@graphql-typed-document-node/core';
+-import { OperationContext, CombinedError } from '@urql/core';
++import {
++  OperationContext,
++  CombinedError,
++  createRequest,
++  stringifyVariables,
++} from '@urql/core';
+ 
+ import { _storeUpdate } from './internal';
+ 
+-const emptyUpdate = Object.create(null);
+-
+ type Updater<T> = (value: T) => T;
+ 
+ /**
+@@ -28,6 +31,8 @@ export interface OperationStore<Data = any, Vars = any, Result = Data>
+   // Writable properties
+   set(value: Partial<OperationStore<Data, Vars, Result>>): void;
+   update(updater: Updater<Partial<OperationStore<Data, Vars, Result>>>): void;
++  // Imperative methods
++  reexecute(context?: Partial<OperationContext> | undefined): void;
+ }
+ 
+ export function operationStore<Data = any, Vars = object, Result = Data>(
+@@ -53,7 +58,7 @@ export function operationStore<Data = any, Vars = object, Result = Data>(
+   let _internalUpdate = false;
+ 
+   state.set = function set(value?: Partial<typeof state>) {
+-    if (!value || value === state) value = emptyUpdate;
++    if (!value || value === state) return;
+ 
+     _internalUpdate = true;
+     if (process.env.NODE_ENV !== 'production') {
+@@ -66,24 +71,48 @@ export function operationStore<Data = any, Vars = object, Result = Data>(
+           }
+         }
+       }
++    }
++
++    let hasUpdate = false;
++
++    if ('query' in value! || 'variables' in value!) {
++      const prev = createRequest(internal.query, internal.variables);
++      const next = createRequest(
++        value.query || internal.query,
++        value.variables || internal.variables
++      );
++      if (prev.key !== next.key) {
++        hasUpdate = true;
++        internal.query = value.query || internal.query;
++        internal.variables = value.variables || internal.variables || null;
++      }
++    }
+ 
+-      _storeUpdate.delete(value!);
++    if ('context' in value!) {
++      const prevKey = stringifyVariables(internal.context);
++      const nextKey = stringifyVariables(value.context);
++      if (prevKey !== nextKey) {
++        hasUpdate = true;
++        internal.context = value.context;
++      }
+     }
+ 
+     for (const key in value) {
+       if (key === 'query' || key === 'variables' || key === 'context') {
+-        (internal as any)[key] = value[key];
++        continue;
+       } else if (key === 'fetching') {
+         (state as any)[key] = !!value[key];
+       } else if (key in state) {
+         state[key] = value[key];
+       }
++
++      hasUpdate = true;
+     }
+ 
+     (state as any).stale = !!value!.stale;
+ 
+     _internalUpdate = false;
+-    svelteStore.set(state);
++    if (hasUpdate) svelteStore.set(state);
+   };
+ 
+   state.update = function update(fn: Updater<typeof state>): void {
+@@ -94,6 +123,11 @@ export function operationStore<Data = any, Vars = object, Result = Data>(
+     return svelteStore.subscribe(run, invalidate);
+   };
+ 
++  state.reexecute = function (context) {
++    internal.context = { ...(context || internal.context) };
++    svelteStore.set(state);
++  };
++
+   Object.keys(internal).forEach(prop => {
+     Object.defineProperty(state, prop, {
+       configurable: false,
+diff --git a/packages/svelte-urql/src/operations.ts b/packages/svelte-urql/src/operations.ts
+index 17c03a58..0ece6795 100644
+--- a/packages/svelte-urql/src/operations.ts
++++ b/packages/svelte-urql/src/operations.ts
+@@ -2,7 +2,6 @@ import { onDestroy } from 'svelte';
+ 
+ import {
+   createRequest,
+-  stringifyVariables,
+   OperationContext,
+   OperationResult,
+   GraphQLRequest,
+@@ -47,24 +46,20 @@ function toSource<Data, Variables, Result>(
+   store: OperationStore<Data, Variables, Result>
+ ) {
+   return make<SourceRequest<Data, Variables>>(observer => {
+-    let $request: void | GraphQLRequest<Data, Variables>;
+-    let $contextKey: void | string;
++    let _key: number | void;
++    let _context: object | void = {};
++
+     return store.subscribe(state => {
+       const request = createRequest<Data, Variables>(
+         state.query,
+         state.variables!
+       ) as SourceRequest<Data, Variables>;
+-
+-      const contextKey = stringifyVariables((request.context = state.context));
+-
+       if (
+-        $request === undefined ||
+-        request.key !== $request.key ||
+-        $contextKey === undefined ||
+-        contextKey !== $contextKey
++        (request.context = state.context) !== _context ||
++        request.key !== _key
+       ) {
+-        $contextKey = contextKey;
+-        $request = request;
++        _key = request.key;
++        _context = state.context;
+         observer.next(request);
+       }
+     });

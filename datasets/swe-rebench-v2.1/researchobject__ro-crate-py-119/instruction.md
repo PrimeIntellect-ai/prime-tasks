@@ -1,0 +1,6 @@
+Support for non-slash root data entity
+The [1.1 spec](https://www.researchobject.org/ro-crate/1.1/root-data-entity.html#direct-properties-of-the-root-data-entity) states that the root data entity SHOULD be the string `./`, but in principle it could be an arbitrary URI. This in contrast with RO-Crate 1.0, where the root data entity was always `./`. We now have a [find_root_entity_id](https://github.com/ResearchObject/ro-crate-py/blob/4ab8975b9478b7ba2f13fb0d13bd1b3b5287ac54/rocrate/rocrate.py#L105) method that looks for the root data entity without assuming it's `./`, but other parts of the code still assume that. For instance, see the [RootDataset](https://github.com/ResearchObject/ro-crate-py/blob/4ab8975b9478b7ba2f13fb0d13bd1b3b5287ac54/rocrate/model/root_dataset.py) class. We should add tests for non-slash root entities and update the code as needed.
+
+### Additional contract requirements
+
+- When reading a crate, raise `KeyError` if the metadata descriptor ID is `bad-name.json`. In `find_root_entity_id`, raise `ValueError` with a message containing `does not reference` if the metadata descriptor's `about` property is missing or does not identify an entity in the graph; if the metadata descriptor is not of type `CreativeWork` or the root entity is not of type `Dataset`, raise `ValueError` with a message containing `must be of type`.

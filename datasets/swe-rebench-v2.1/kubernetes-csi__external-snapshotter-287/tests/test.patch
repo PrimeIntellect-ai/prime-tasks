@@ -1,0 +1,236 @@
+diff --git a/pkg/sidecar-controller/content_create_test.go b/pkg/sidecar-controller/content_create_test.go
+index babc144a..7798300d 100644
+--- a/pkg/sidecar-controller/content_create_test.go
++++ b/pkg/sidecar-controller/content_create_test.go
+@@ -155,31 +155,6 @@ func TestSyncContent(t *testing.T) {
+ 			},
+ 			test: testSyncContent,
+ 		},
+-		{
+-			name:            "1-6: Basic content update ready to use bad snapshot class",
+-			initialContents: newContentArrayWithReadyToUse("content1-6", "snapuid1-6", "snap1-6", "sid1-6", "bad-class", "", "volume-handle-1-6", retainPolicy, nil, &defaultSize, &False, true),
+-			expectedContents: withContentStatus(newContentArray("content1-6", "snapuid1-6", "snap1-6", "sid1-6", "bad-class", "", "volume-handle-1-6", retainPolicy, nil, &defaultSize, true),
+-				&crdv1.VolumeSnapshotContentStatus{
+-					SnapshotHandle: toStringPointer("sid1-6"),
+-					RestoreSize:    &defaultSize,
+-					ReadyToUse:     &False,
+-					Error:          newSnapshotError("Failed to check and update snapshot content: failed to get input parameters to create snapshot for content content1-6: \"failed to retrieve snapshot class bad-class from the informer: \\\"volumesnapshotclass.snapshot.storage.k8s.io \\\\\\\"bad-class\\\\\\\" not found\\\"\""),
+-				}),
+-			expectedEvents: []string{"Warning SnapshotContentCheckandUpdateFailed"},
+-			expectedCreateCalls: []createCall{
+-				{
+-					volumeHandle: "volume-handle-1-6",
+-					snapshotName: "snapshot-snapuid1-6",
+-					driverName:   mockDriverName,
+-					snapshotId:   "snapuid1-6",
+-					creationTime: timeNow,
+-					readyToUse:   true,
+-				},
+-			},
+-			expectedListCalls: []listCall{{"sid1-6", map[string]string{}, true, time.Now(), 1, nil}},
+-			errors:            noerrors,
+-			test:              testSyncContent,
+-		},
+ 	}
+ 
+ 	runSyncContentTests(t, tests, snapshotClasses)
+diff --git a/pkg/sidecar-controller/snapshot_delete_test.go b/pkg/sidecar-controller/snapshot_delete_test.go
+index dd73ed4f..70e98499 100644
+--- a/pkg/sidecar-controller/snapshot_delete_test.go
++++ b/pkg/sidecar-controller/snapshot_delete_test.go
+@@ -17,10 +17,23 @@ limitations under the License.
+ package sidecar_controller
+ 
+ import (
++	"context"
+ 	"fmt"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
++	snapshotfake "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/clientset/versioned/fake"
++	snapshotscheme "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/clientset/versioned/scheme"
++	snapshotinformers "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/informers/externalversions"
++	commoncontroller "github.com/kubernetes-csi/external-snapshotter/v2/pkg/common-controller"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/runtime"
++	coreinformers "k8s.io/client-go/informers"
++	kubefake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/kubernetes/scheme"
++	clienttesting "k8s.io/client-go/testing"
++
+ 	"errors"
+ 
+ 	crdv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+@@ -220,18 +233,7 @@ func TestDeleteSync(t *testing.T) {
+ 			expectedListCalls:   []listCall{{"sid1-3", map[string]string{}, true, time.Now(), 1, nil}},
+ 			test:                testSyncContent,
+ 		},
+-		{
+-			name:             "1-4 - fail to delete with a snapshot class which has invalid secret parameter, bound finalizer should remain",
+-			initialContents:  newContentArrayWithDeletionTimestamp("content1-1", "snapuid1-1", "snap1-1", "sid1-1", "invalid", "", "snap1-4-volumehandle", deletionPolicy, nil, nil, true, &timeNowMetav1),
+-			expectedContents: newContentArrayWithDeletionTimestamp("content1-1", "snapuid1-1", "snap1-1", "sid1-1", "invalid", "", "snap1-4-volumehandle", deletionPolicy, nil, nil, true, &timeNowMetav1),
+-			expectedEvents:   noevents,
+-			errors: []reactorError{
+-				// Inject error to the first client.VolumesnapshotV1beta1().VolumeSnapshotContents().Delete call.
+-				// All other calls will succeed.
+-				{"get", "secrets", errors.New("mock get invalid secret error")},
+-			},
+-			test: testSyncContent,
+-		},
++
+ 		{
+ 			name:                "1-5 - csi driver delete snapshot returns error, bound finalizer should remain",
+ 			initialContents:     newContentArrayWithDeletionTimestamp("content1-5", "sid1-5", "snap1-5", "sid1-5", validSecretClass, "", "snap1-5-volumehandle", deletionPolicy, nil, &defaultSize, true, &timeNowMetav1),
+@@ -335,15 +337,142 @@ func TestDeleteSync(t *testing.T) {
+ 			expectedDeleteCalls: []deleteCall{{"sid1-14", nil, nil}},
+ 			test:                testSyncContent,
+ 		},
+-		{
+-			name:                "1-15 - (dynamic)deletion of content with no snapshotclass should produce error",
+-			initialContents:     newContentArrayWithDeletionTimestamp("content1-15", "sid1-15", "snap1-15", "sid1-15", "", "", "snap1-15-volumehandle", deletePolicy, nil, &defaultSize, true, &timeNowMetav1),
+-			expectedContents:    newContentArrayWithDeletionTimestamp("content1-15", "sid1-15", "snap1-15", "sid1-15", "", "", "snap1-15-volumehandle", deletePolicy, nil, &defaultSize, true, &timeNowMetav1),
+-			expectedEvents:      []string{"Warning SnapshotDeleteError"},
+-			errors:              noerrors,
+-			expectedDeleteCalls: []deleteCall{{"sid1-15", nil, nil}},
+-			test:                testSyncContent,
+-		},
+ 	}
+ 	runSyncContentTests(t, tests, snapshotClasses)
+ }
++
++// A deleting snapshot can outlive its class during E2E cleanup. Once the
++// controller releases its protection finalizers, the API server can remove it.
++func TestDeletingSnapshotIsRemovedWhenClassIsGone(t *testing.T) {
++	if err := snapshotscheme.AddToScheme(scheme.Scheme); err != nil {
++		t.Fatal(err)
++	}
++	className := "already-removed"
++	pvcName := "source-pvc"
++	snapshot := &crdv1.VolumeSnapshot{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: "cleanup-snapshot", Namespace: "default", ResourceVersion: "1",
++			DeletionTimestamp: &metav1.Time{Time: time.Now()},
++			Finalizers:        []string{utils.VolumeSnapshotAsSourceFinalizer, utils.VolumeSnapshotBoundFinalizer},
++		},
++		Spec: crdv1.VolumeSnapshotSpec{
++			VolumeSnapshotClassName: &className,
++			Source:                  crdv1.VolumeSnapshotSource{PersistentVolumeClaimName: &pvcName},
++		},
++	}
++	client := snapshotfake.NewSimpleClientset(snapshot)
++	client.PrependReactor("update", "volumesnapshots", func(action clienttesting.Action) (bool, runtime.Object, error) {
++		updated := action.(clienttesting.UpdateAction).GetObject().(*crdv1.VolumeSnapshot)
++		if updated.DeletionTimestamp != nil && len(updated.Finalizers) == 0 {
++			if err := client.Tracker().Delete(action.GetResource(), action.GetNamespace(), updated.Name); err != nil {
++				return true, nil, err
++			}
++			return true, updated, nil
++		}
++		return false, nil, nil
++	})
++	kubeClient := kubefake.NewSimpleClientset()
++	snapshotFactory := snapshotinformers.NewSharedInformerFactory(client, 0)
++	kubeFactory := coreinformers.NewSharedInformerFactory(kubeClient, 0)
++	controller := commoncontroller.NewCSISnapshotCommonController(
++		client, kubeClient,
++		snapshotFactory.Snapshot().V1beta1().VolumeSnapshots(),
++		snapshotFactory.Snapshot().V1beta1().VolumeSnapshotContents(),
++		snapshotFactory.Snapshot().V1beta1().VolumeSnapshotClasses(),
++		kubeFactory.Core().V1().PersistentVolumeClaims(), time.Hour,
++	)
++	stop := make(chan struct{})
++	defer close(stop)
++	snapshotFactory.Start(stop)
++	kubeFactory.Start(stop)
++	go controller.Run(1, stop)
++
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		_, err := client.SnapshotV1beta1().VolumeSnapshots("default").Get(context.Background(), snapshot.Name, metav1.GetOptions{})
++		if apierrors.IsNotFound(err) {
++			return
++		}
++		if err != nil {
++			t.Fatalf("could not check snapshot cleanup: %v", err)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("VolumeSnapshot remained after cleanup while its VolumeSnapshotClass was absent")
++}
++
++type deletionObservingSnapshotter struct {
++	mu         sync.Mutex
++	deletedIDs []string
++}
++
++func (s *deletionObservingSnapshotter) CreateSnapshot(context.Context, string, string, map[string]string, map[string]string) (string, string, time.Time, int64, bool, error) {
++	return "", "", time.Time{}, 0, false, nil
++}
++
++func (s *deletionObservingSnapshotter) DeleteSnapshot(_ context.Context, id string, _ map[string]string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.deletedIDs = append(s.deletedIDs, id)
++	return nil
++}
++
++func (s *deletionObservingSnapshotter) deletedSnapshotIDs() []string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return append([]string(nil), s.deletedIDs...)
++}
++
++func (s *deletionObservingSnapshotter) GetSnapshotStatus(context.Context, string, map[string]string) (bool, time.Time, int64, error) {
++	return false, time.Time{}, 0, nil
++}
++
++// Missing class metadata must not prevent the backend snapshot and its
++// associated content from being cleaned up. Credentials may come from any
++// available source and repeated deletion attempts are safe.
++func TestContentDeletionContinuesWhenSnapshotClassIsMissing(t *testing.T) {
++	if err := snapshotscheme.AddToScheme(scheme.Scheme); err != nil {
++		t.Fatal(err)
++	}
++	content := newContentArrayWithDeletionTimestamp("content-missing-class", "snapshot-id", "snapshot-name", "snapshot-id", "deleted-class", "", "volume-handle", deletePolicy, nil, &defaultSize, true, &timeNowMetav1)[0]
++	client := snapshotfake.NewSimpleClientset(content)
++	kubeClient := kubefake.NewSimpleClientset()
++	factory := snapshotinformers.NewSharedInformerFactory(client, 0)
++	spy := &deletionObservingSnapshotter{}
++	ctrl := NewCSISnapshotSideCarController(
++		client, kubeClient, mockDriverName,
++		factory.Snapshot().V1beta1().VolumeSnapshotContents(),
++		factory.Snapshot().V1beta1().VolumeSnapshotClasses(), spy,
++		time.Second, time.Second, "snapshot", -1,
++	)
++	stop := make(chan struct{})
++	factory.Start(stop)
++	go ctrl.Run(1, stop)
++	defer close(stop)
++
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		deletedAssociatedSnapshot := false
++		for _, id := range spy.deletedSnapshotIDs() {
++			if id == "snapshot-id" {
++				deletedAssociatedSnapshot = true
++				break
++			}
++		}
++		updated, err := client.SnapshotV1beta1().VolumeSnapshotContents().Get(context.Background(), content.Name, metav1.GetOptions{})
++		if err != nil {
++			t.Fatalf("could not inspect content cleanup: %v", err)
++		}
++		protected := false
++		for _, finalizer := range updated.Finalizers {
++			if finalizer == utils.VolumeSnapshotContentFinalizer {
++				protected = true
++			}
++		}
++		if deletedAssociatedSnapshot && !protected {
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("backend snapshot deletion and content protection release did not both complete")
++}

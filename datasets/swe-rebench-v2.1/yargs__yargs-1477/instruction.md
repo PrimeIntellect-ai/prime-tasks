@@ -1,0 +1,2 @@
+Expose yargs-parser
+Would you be willing to have yargs re-expose yargs-parser?  My hope is for nyc to be able to do something like `const {Parser} = require('yargs/yargs')`.  This would have the benefit of guaranteeing that when nyc uses the exact same version of `yargs-parser` as yargs itself.  It would also reduce the maintenance burden for packages like nyc, for example right now `yargs-parser@16.1.0` is available but latest yargs uses `yargs-parser@^15.0.0` so anyone who blindly upgrades (my CI passed so it's good) would cause two copies of yargs-parser to get installed.

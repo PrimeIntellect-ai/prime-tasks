@@ -1,0 +1,2 @@
+Hitting an inbound connection error can lead to InvalidStreamIDForPeer errors when acting as a client.
+The code that handles shutting down on inboundConnectionError tends to hit InvalidStreamIDForPeer. This is because we attempt to send a GOAWAY with lastStreamID set to `.maxID`, which is technically an invalid stream ID for the peer. We should modify the check here, as it's reasonable to want to set `.maxID` in this case, even though the server cannot technically emit such a stream ID.

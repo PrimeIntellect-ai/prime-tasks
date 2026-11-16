@@ -1,0 +1,165 @@
+diff --git a/cli/hiera.go b/cli/hiera.go
+index 226dc1c..6a3660c 100644
+--- a/cli/hiera.go
++++ b/cli/hiera.go
+@@ -4,8 +4,6 @@ import (
+ 	"context"
+ 	"fmt"
+ 
+-	"github.com/lyraproj/hiera/internal"
+-
+ 	"github.com/lyraproj/hiera/hiera"
+ 	"github.com/lyraproj/hiera/hieraapi"
+ 	"github.com/lyraproj/hiera/provider"
+@@ -118,8 +116,6 @@ func cmdLookup(cmd *cobra.Command, args []string) error {
+ 
+ 	return hiera.TryWithParent(context.Background(), provider.MuxLookupKey, configOptions, func(c px.Context) error {
+ 		c.Set(`logLevel`, px.LogLevelFromString(logLevel))
+-		defer internal.KillPlugins()
+-
+ 		hiera.LookupAndRender(c, &cmdOpts, args, cmd.OutOrStdout())
+ 		return nil
+ 	})
+diff --git a/hiera/hiera.go b/hiera/hiera.go
+index 458dda7..7a32c3c 100644
+--- a/hiera/hiera.go
++++ b/hiera/hiera.go
+@@ -100,6 +100,7 @@ func Lookup2(
+ func TryWithParent(parent context.Context, tp hieraapi.LookupKey, options map[string]px.Value, consumer func(px.Context) error) error {
+ 	return pcore.TryWithParent(parent, func(c px.Context) error {
+ 		internal.InitContext(c, tp, options)
++		defer internal.KillPlugins(c)
+ 		return consumer(c)
+ 	})
+ }
+@@ -109,6 +110,7 @@ func TryWithParent(parent context.Context, tp hieraapi.LookupKey, options map[st
+ func DoWithParent(parent context.Context, tp hieraapi.LookupKey, options map[string]px.Value, consumer func(px.Context)) {
+ 	pcore.DoWithParent(parent, func(c px.Context) {
+ 		internal.InitContext(c, tp, options)
++		defer internal.KillPlugins(c)
+ 		consumer(c)
+ 	})
+ }
+diff --git a/hieraserver/rest/rest.go b/hieraserver/rest/rest.go
+index 14824c8..55abc9c 100644
+--- a/hieraserver/rest/rest.go
++++ b/hieraserver/rest/rest.go
+@@ -12,7 +12,6 @@ import (
+ 
+ 	"github.com/lyraproj/hiera/hiera"
+ 	"github.com/lyraproj/hiera/hieraapi"
+-	"github.com/lyraproj/hiera/internal"
+ 	"github.com/lyraproj/hiera/provider"
+ 	"github.com/lyraproj/issue/issue"
+ 	"github.com/lyraproj/pcore/px"
+@@ -68,7 +67,6 @@ func startServer(cmd *cobra.Command, _ []string) {
+ 
+ 	hiera.DoWithParent(context.Background(), provider.MuxLookupKey, configOptions, func(ctx px.Context) {
+ 		ctx.Set(`logLevel`, px.LogLevelFromString(logLevel))
+-		defer internal.KillPlugins()
+ 		router := CreateRouter(ctx)
+ 		err := http.ListenAndServe(":"+strconv.Itoa(port), router)
+ 		if err != nil {
+diff --git a/internal/invocation.go b/internal/invocation.go
+index a81f2b3..b795ad4 100644
+--- a/internal/invocation.go
++++ b/internal/invocation.go
+@@ -25,6 +25,8 @@ const hieraTopProviderCacheKey = `Hiera::TopProvider::Cache`
+ const hieraConfigsPrefix = `HieraConfig:`
+ const hieraLockPrefix = `HieraLock:`
+ 
++const hieraPluginRegistry = `Hiera::Plugins`
++
+ type invocation struct {
+ 	px.Context
+ 	nameStack  []string
+@@ -35,15 +37,28 @@ type invocation struct {
+ 	config     hieraapi.ResolvedConfig
+ }
+ 
++// KillPlugins will ensure that all plugins started by this executable are gracefully terminated if possible or
++// otherwise forcefully killed.
++func KillPlugins(c px.Context) {
++	if pr, ok := c.Get(hieraPluginRegistry); ok {
++		pr.(*pluginRegistry).stopAll()
++	}
++}
++
+ // InitContext initializes the given context with the Hiera cache. The context initialized
+ // with this method determines the life-cycle of that cache.
+ func InitContext(c px.Context, topProvider hieraapi.LookupKey, options map[string]px.Value) {
++	// Add a loader to the loader chain that will act as the parent loader for all plugin loaders
++	// and be the actual cache for loaded plugins.
++	c.SetLoader(px.NewParentedLoader(c.Loader()))
++
+ 	c.Set(hieraCacheKey, &sync.Map{})
+ 	if topProvider == nil {
+ 		topProvider = provider.ConfigLookupKey
+ 	}
+ 	c.Set(hieraTopProviderKey, topProvider)
+ 	c.Set(hieraTopProviderCacheKey, &sync.Map{})
++	c.Set(hieraPluginRegistry, &pluginRegistry{})
+ 
+ 	if options == nil {
+ 		options = make(map[string]px.Value)
+diff --git a/internal/pluginloader.go b/internal/pluginloader.go
+index 7fad29c..555a231 100644
+--- a/internal/pluginloader.go
++++ b/internal/pluginloader.go
+@@ -49,15 +49,6 @@ type pluginRegistry struct {
+ 	plugins map[string]*plugin
+ }
+ 
+-// allPlugins is the global plugin registry
+-var allPlugins = &pluginRegistry{}
+-
+-// KillPlugins will ensure that all plugins started by this executable are gracefully terminated if possible or
+-// otherwise forcefully killed.
+-func KillPlugins() {
+-	allPlugins.stopAll()
+-}
+-
+ // NewPluginLoader returns a loader that is capable of discovered plugins that matches the given hierarchy entry. If
+ // such plugins are found, the will be added to the root loader. The loaded entry and the corresponding executable
+ // will be kept alive for until this executable terminates.
+@@ -329,7 +320,7 @@ func (p *plugin) callPlugin(luType, name string, params url.Values) px.Value {
+ 		ad.RawQuery = params.Encode()
+ 	}
+ 	us := ad.String()
+-	client := http.Client{Timeout: time.Duration(time.Second * 5)}
++	client := http.Client{Timeout: time.Duration(500 * time.Millisecond)}
+ 	resp, err := client.Get(us)
+ 	if err != nil {
+ 		log.Error(err.Error())
+@@ -362,11 +353,18 @@ func (l *pluginLoader) LoadEntry(c px.Context, name px.TypedName) px.LoaderEntry
+ 	if entry != nil {
+ 		return entry
+ 	}
+-
+ 	if name.Namespace() != px.NsFunction {
+ 		return nil
+ 	}
+ 
++	// Get the plugin registry for this session
++	var allPlugins *pluginRegistry
++	if pr, ok := c.Get(hieraPluginRegistry); ok {
++		allPlugins = pr.(*pluginRegistry)
++	} else {
++		return nil
++	}
++
+ 	file := l.he.PluginFile()
+ 	if file == `` {
+ 		file = name.Name()
+@@ -386,8 +384,9 @@ func (l *pluginLoader) LoadEntry(c px.Context, name px.TypedName) px.LoaderEntry
+ 		}
+ 		path = abs
+ 	}
+-	allPlugins.startPlugin(c, path, l)
+-	return l.DefiningLoader.LoadEntry(c, name)
++	pl := l.DefiningLoader.(px.ParentedLoader).Parent()
++	allPlugins.startPlugin(c, path, pl.(px.DefiningLoader))
++	return pl.LoadEntry(c, name)
+ }
+ 
+ func loadPluginFunction(c px.Context, n string, he hieraapi.Entry) (fn px.Function, ok bool) {

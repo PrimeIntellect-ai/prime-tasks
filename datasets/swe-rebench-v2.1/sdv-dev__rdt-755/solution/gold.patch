@@ -1,0 +1,305 @@
+diff --git a/rdt/transformers/categorical.py b/rdt/transformers/categorical.py
+index fef1242..13d4e03 100644
+--- a/rdt/transformers/categorical.py
++++ b/rdt/transformers/categorical.py
+@@ -9,7 +9,7 @@ from scipy.stats import norm
+ 
+ from rdt.errors import TransformerInputError
+ from rdt.transformers.base import BaseTransformer
+-from rdt.transformers.utils import fill_nan_with_none
++from rdt.transformers.utils import check_nan_in_transform, fill_nan_with_none, try_convert_to_dtype
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
+@@ -177,6 +177,7 @@ class UniformEncoder(BaseTransformer):
+         Returns:
+             pandas.Series
+         """
++        check_nan_in_transform(data, self.dtype)
+         data = data.clip(0, 1)
+         bins = [0]
+         labels = []
+@@ -192,7 +193,10 @@ class UniformEncoder(BaseTransformer):
+                 labels.append(key)
+ 
+         result = pd.cut(data, bins=bins, labels=labels, include_lowest=True)
+-        return result.replace(nan_name, np.nan).astype(self.dtype)
++        result = result.replace(nan_name, np.nan)
++        result = try_convert_to_dtype(result, self.dtype)
++
++        return result
+ 
+ 
+ class OrderedUniformEncoder(UniformEncoder):
+@@ -333,6 +337,7 @@ class FrequencyEncoder(BaseTransformer):
+         )
+         super().__init__()
+         self.add_noise = add_noise
++        self._is_integer = None
+ 
+     @staticmethod
+     def _get_intervals(data):
+@@ -516,6 +521,7 @@ class FrequencyEncoder(BaseTransformer):
+         Returns:
+             pandas.Series
+         """
++        check_nan_in_transform(data, self.dtype)
+         data = data.clip(0, 1)
+         num_rows = len(data)
+         num_categories = len(self.means)
+@@ -545,6 +551,7 @@ class OneHotEncoder(BaseTransformer):
+     _dummy_encoded = False
+     _indexer = None
+     _uniques = None
++    dtype = None
+ 
+     @staticmethod
+     def _prepare_data(data):
+@@ -582,6 +589,7 @@ class OneHotEncoder(BaseTransformer):
+             data (pandas.Series or pandas.DataFrame):
+                 Data to fit the transformer to.
+         """
++        self.dtype = data.dtype
+         data = self._prepare_data(data)
+ 
+         null = pd.isna(data).to_numpy()
+@@ -657,6 +665,7 @@ class OneHotEncoder(BaseTransformer):
+         Returns:
+             pandas.Series
+         """
++        check_nan_in_transform(data, self.dtype)
+         if not isinstance(data, np.ndarray):
+             data = data.to_numpy()
+ 
+@@ -664,8 +673,10 @@ class OneHotEncoder(BaseTransformer):
+             data = data.reshape(-1, 1)
+ 
+         indices = np.argmax(data, axis=1)
++        result = pd.Series(indices).map(self.dummies.__getitem__)
++        result = try_convert_to_dtype(result, self.dtype)
+ 
+-        return pd.Series(indices).map(self.dummies.__getitem__)
++        return result
+ 
+ 
+ class LabelEncoder(BaseTransformer):
+@@ -801,13 +812,15 @@ class LabelEncoder(BaseTransformer):
+         Returns:
+             pandas.Series
+         """
++        check_nan_in_transform(data, self.dtype)
+         if self.add_noise:
+             data = np.floor(data)
+ 
+         data = data.clip(min(self.values_to_categories), max(self.values_to_categories))
+         data = data.round().map(self.values_to_categories)
++        data = try_convert_to_dtype(data, self.dtype)
+ 
+-        return data.astype(self.dtype)
++        return data
+ 
+ 
+ class OrderedLabelEncoder(LabelEncoder):
+@@ -865,6 +878,7 @@ class OrderedLabelEncoder(LabelEncoder):
+             data (pandas.Series):
+                 Data to fit the transformer to.
+         """
++        self.dtype = data.dtype
+         data = data.fillna(np.nan)
+         missing = list(data[~data.isin(self.order)].unique())
+         if len(missing) > 0:
+diff --git a/rdt/transformers/text.py b/rdt/transformers/text.py
+index ca1887a..bb7fd9e 100644
+--- a/rdt/transformers/text.py
++++ b/rdt/transformers/text.py
+@@ -1,10 +1,10 @@
+ """Transformers for text data."""
+ import logging
++import warnings
+ 
+ import numpy as np
+ import pandas as pd
+ 
+-from rdt.errors import TransformerProcessingError
+ from rdt.transformers.base import BaseTransformer
+ from rdt.transformers.utils import strings_from_regex
+ 
+@@ -141,6 +141,37 @@ class RegexGenerator(BaseTransformer):
+         """Drop the input column by returning ``None``."""
+         return None
+ 
++    def _warn_not_enough_unique_values(self, sample_size):
++        """Warn the user that the regex cannot generate enough unique values.
++
++        Args:
++            sample_size (int):
++                Number of samples to be generated.
++        """
++        warned = False
++        if sample_size > self.generator_size:
++            if self.enforce_uniqueness:
++                warnings.warn(
++                    f"The regex for '{self.get_input_column()}' can only generate "
++                    f'{self.generator_size} unique values. Additional values may not exactly '
++                    'follow the provided regex.'
++                )
++                warned = True
++            else:
++                LOGGER.info(
++                    "The data has %s rows but the regex for '%s' can only create %s unique values."
++                    " Some values in '%s' may be repeated.",
++                    sample_size, self.get_input_column(), self.generator_size,
++                    self.get_input_column()
++                )
++
++        remaining = self.generator_size - self.generated
++        if sample_size > remaining and self.enforce_uniqueness and not warned:
++            warnings.warn(
++                f'The regex generator is not able to generate {sample_size} new unique '
++                f'values (only {max(remaining, 0)} unique values left).'
++            )
++
+     def _reverse_transform(self, data):
+         """Generate new data using the provided ``regex_format``.
+ 
+@@ -156,47 +187,39 @@ class RegexGenerator(BaseTransformer):
+         else:
+             sample_size = self.data_length
+ 
+-        if sample_size > self.generator_size:
+-            if self.enforce_uniqueness:
+-                raise TransformerProcessingError(
+-                    f'The regex is not able to generate {sample_size} unique values. '
+-                    f"Please use a different regex for column ('{self.get_input_column()}')."
+-                )
+-
+-            LOGGER.info(
+-                "The data has %s rows but the regex for '%s' can only create %s unique values."
+-                " Some values in '%s' may be repeated.",
+-                sample_size, self.get_input_column(), self.generator_size, self.get_input_column()
+-            )
++        self._warn_not_enough_unique_values(sample_size)
+ 
+         remaining = self.generator_size - self.generated
+-        if sample_size > self.generator_size - self.generated:
+-            if self.enforce_uniqueness:
+-                raise TransformerProcessingError(
+-                    f'The regex generator is not able to generate {sample_size} new unique '
+-                    f'values (only {remaining} unique value left). Please use '
+-                    "'reset_randomization' in order to restart the generator."
+-                )
+-
++        if sample_size > remaining:
+             self.reset_randomization()
+             remaining = self.generator_size
+ 
+         if remaining >= sample_size:
+-            reverse_transformed = np.array([
+-                next(self.generator)
+-                for _ in range(sample_size)
+-            ], dtype=object)
+-
++            reverse_transformed = [next(self.generator) for _ in range(sample_size)]
+             self.generated += sample_size
+ 
+         else:
+-            self.generated = self.generator_size
+             generated_values = list(self.generator)
+-            reverse_transformed = []
+-            while len(reverse_transformed) < sample_size:
+-                remaining_samples = sample_size - len(reverse_transformed)
+-                reverse_transformed.extend(generated_values[:remaining_samples])
+-
+-            reverse_transformed = np.array(reverse_transformed, dtype=object)
+-
+-        return reverse_transformed
++            reverse_transformed = generated_values[:]
++            self.generated = self.generator_size
++            if self.enforce_uniqueness:
++                try:
++                    remaining_samples = sample_size - len(reverse_transformed)
++                    start = int(generated_values[-1]) + 1
++                    reverse_transformed.extend(
++                            [str(i) for i in range(start, start + remaining_samples)])
++
++                except ValueError:
++                    counter = 0
++                    while len(reverse_transformed) < sample_size:
++                        remaining_samples = sample_size - len(reverse_transformed)
++                        reverse_transformed.extend(
++                            [f'{i}({counter})' for i in generated_values[:remaining_samples]])
++                        counter += 1
++
++            else:
++                while len(reverse_transformed) < sample_size:
++                    remaining_samples = sample_size - len(reverse_transformed)
++                    reverse_transformed.extend(generated_values[:remaining_samples])
++
++        return np.array(reverse_transformed, dtype=object)
+diff --git a/rdt/transformers/utils.py b/rdt/transformers/utils.py
+index 240b829..4e78685 100644
+--- a/rdt/transformers/utils.py
++++ b/rdt/transformers/utils.py
+@@ -2,8 +2,10 @@
+ 
+ import re
+ import string
++import warnings
+ 
+ import numpy as np
++import pandas as pd
+ 
+ import sre_parse  # isort:skip
+ 
+@@ -184,3 +186,51 @@ def flatten_column_list(column_list):
+             flattened.append(column)
+ 
+     return flattened
++
++
++def check_nan_in_transform(data, dtype):
++    """Check if there are null values in the transformed data.
++
++    Args:
++        data (pd.Series or numpy.ndarray):
++            Data that has been transformed.
++        dtype (str):
++            Data type of the transformed data.
++    """
++    if pd.isna(data).any().any():
++        message = (
++            'There are null values in the transformed data. The reversed '
++            'transformed data will contain null values'
++        )
++        is_integer = pd.api.types.is_integer_dtype(dtype)
++        if is_integer:
++            message += " of type 'float'."
++        else:
++            message += '.'
++
++        warnings.warn(message)
++
++
++def try_convert_to_dtype(data, dtype):
++    """Try to convert data to a given dtype.
++
++    Args:
++        data (pd.Series or numpy.ndarray):
++            Data to convert.
++        dtype (str):
++            Data type to convert to.
++
++    Returns:
++        data:
++            Data converted to the given dtype.
++    """
++    try:
++        data = data.astype(dtype)
++    except ValueError as error:
++        is_integer = pd.api.types.is_integer_dtype(dtype)
++        if is_integer:
++            data = data.astype(float)
++        else:
++            raise error
++
++    return data

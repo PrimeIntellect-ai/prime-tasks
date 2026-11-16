@@ -1,0 +1,4 @@
+tags._generic_abi should use only the first part of the SOABI
+In [_generic_abi()](https://github.com/pypa/packaging/blob/0031046f7fad649580bc3127d1cef9157da0dd79/packaging/tags.py#L228) (which is used on non-CPython), the abi tag is equivalent to the SOABI sysconfig value. But this is `"cpython-38-x86_64-linux-gnu"` on CPython. The equivalent code path for CPython goes to [_cpython_abis()](https://github.com/pypa/packaging/blob/0031046f7fad649580bc3127d1cef9157da0dd79/packaging/tags.py#L135) which does not use SOABI at all. Currently, PyPy must keep its SOABI to `"pypy38-pp73"` in order to allow pip to function. The EXTSUFFIX is `"".pypy38-pp73-x86_64-linux-gnu.so"`. This was fixed for wheel in pypa/wheel#372 and should be fixed here as well.
+
+It seems CMake uses the SOABI, so building projects with PyPy there requires work-arounds. Here is the PyPy issue https://foss.heptapod.net/pypy/pypy/-/issues/3816

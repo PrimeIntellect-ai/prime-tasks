@@ -1,0 +1,316 @@
+diff --git a/cmd/notary-signer/main_test.go b/cmd/notary-signer/main_test.go
+index 3b71aed..1972014 100644
+--- a/cmd/notary-signer/main_test.go
++++ b/cmd/notary-signer/main_test.go
+@@ -2,11 +2,20 @@ package main
+ 
+ import (
+ 	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
+ 	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
+ 	"fmt"
+ 	"io/ioutil"
++	"math/big"
++	"net"
+ 	"os"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/docker/notary"
+ 	"github.com/docker/notary/signer"
+@@ -123,7 +132,9 @@ func TestSetupCryptoServicesRethinkDBStoreNoDefaultAlias(t *testing.T) {
+ 				"tls_ca_file": "/tls/ca.pem",
+ 				"client_cert_file": "/tls/cert.pem",
+ 				"client_key_file": "/tls/key.pem",
+-				"database": "rethinkdbtest"
++				"database": "rethinkdbtest",
++				"username": "signer",
++				"password": "password"
+ 				}
+ 			}`,
+ 			notary.RethinkDBBackend)),
+@@ -142,7 +153,9 @@ func TestSetupCryptoServicesRethinkDBStoreConnectionFails(t *testing.T) {
+ 				"tls_ca_file": "../../fixtures/rethinkdb/ca.pem",
+ 				"client_cert_file": "../../fixtures/rethinkdb/cert.pem",
+ 				"client_key_file": "../../fixtures/rethinkdb/key.pem",
+-				"database": "rethinkdbtest"
++				"database": "rethinkdbtest",
++				"username": "signer",
++				"password": "password"
+ 				},
+ 				"default_alias": "timestamp"
+ 			}`,
+@@ -293,3 +306,106 @@ func TestSampleConfig(t *testing.T) {
+ 	_, err := parseSignerConfig("../../fixtures/signer-config-local.json")
+ 	require.NoError(t, err)
+ }
++
++// generateSelfSignedCert creates a self-signed certificate valid for 127.0.0.1
++// and returns the PEM-encoded certificate and private key.
++func generateSelfSignedCert(t *testing.T) ([]byte, []byte) {
++	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	require.NoError(t, err)
++
++	template := x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "127.0.0.1"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
++		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
++	}
++
++	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
++	require.NoError(t, err)
++
++	keyDER, err := x509.MarshalECPrivateKey(priv)
++	require.NoError(t, err)
++
++	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
++	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
++	return certPEM, keyPEM
++}
++
++// The configured username and password must be used to authenticate the
++// RethinkDB connection, rather than connecting anonymously.
++func TestSetupCryptoServicesRethinkDBUsesConfiguredCredentials(t *testing.T) {
++	certPEM, keyPEM := generateSelfSignedCert(t)
++
++	serverCert, err := tls.X509KeyPair(certPEM, keyPEM)
++	require.NoError(t, err)
++
++	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
++		Certificates: []tls.Certificate{serverCert},
++	})
++	require.NoError(t, err)
++	defer listener.Close()
++
++	caFile, err := ioutil.TempFile("", "rethinkdb-ca")
++	require.NoError(t, err)
++	defer os.Remove(caFile.Name())
++	_, err = caFile.Write(certPEM)
++	require.NoError(t, err)
++	require.NoError(t, caFile.Close())
++
++	// Capture the first message the client sends after the TLS handshake; the
++	// RethinkDB handshake embeds the username being authenticated as.
++	handshake := make(chan string, 1)
++	go func() {
++		conn, err := listener.Accept()
++		if err != nil {
++			return
++		}
++		defer conn.Close()
++		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
++		var buf bytes.Buffer
++		tmp := make([]byte, 512)
++		for {
++			n, err := conn.Read(tmp)
++			if n > 0 {
++				buf.Write(tmp[:n])
++				if bytes.Contains(buf.Bytes(), []byte("n=")) {
++					break
++				}
++			}
++			if err != nil {
++				break
++			}
++		}
++		handshake <- buf.String()
++	}()
++
++	config := fmt.Sprintf(`{"storage": {
++		"backend": "%s",
++		"db_url": "%s",
++		"tls_ca_file": "%s",
++		"client_cert_file": "../../fixtures/rethinkdb/cert.pem",
++		"client_key_file": "../../fixtures/rethinkdb/key.pem",
++		"database": "rethinkdbtest",
++		"username": "signer",
++		"password": "password"
++		},
++		"default_alias": "timestamp"
++	}`, notary.RethinkDBBackend, listener.Addr().String(), caFile.Name())
++
++	// The fake server does not complete the RethinkDB handshake, so the
++	// connection ultimately fails; we only care about what the client sent.
++	_, err = setUpCryptoservices(configure(config), []string{notary.RethinkDBBackend})
++	require.Error(t, err)
++
++	select {
++	case msg := <-handshake:
++		require.Contains(t, msg, "n=signer")
++	case <-time.After(10 * time.Second):
++		t.Fatal("timed out waiting for the RethinkDB handshake")
++	}
++}
+diff --git a/utils/configuration_test.go b/utils/configuration_test.go
+index ff23707..c393866 100644
+--- a/utils/configuration_test.go
++++ b/utils/configuration_test.go
+@@ -217,7 +217,8 @@ func TestParseRethinkStorageDBStoreInvalidBackend(t *testing.T) {
+ 			"tls_ca_file": "/tls/ca.pem",
+ 			"client_cert_file": "/tls/cert.pem",
+ 			"client_key_file": "/tls/key.pem",
+-			"database": "rethinkdbtest"
++			"database": "rethinkdbtest",
++			"username": "user"
+ 		}
+ 	}`)
+ 
+@@ -234,7 +235,9 @@ func TestParseRethinkStorageDBStoreEmptyDBUrl(t *testing.T) {
+ 			"tls_ca_file": "/tls/ca.pem",
+ 			"client_cert_file": "/tls/cert.pem",
+ 			"client_key_file": "/tls/key.pem",
+-			"database": "rethinkdbtest"
++			"database": "rethinkdbtest",
++			"username": "user",
++			"password": "password"
+ 		}
+ 	}`)
+ 
+@@ -251,7 +254,8 @@ func TestParseRethinkStorageDBStoreEmptyDBName(t *testing.T) {
+ 			"db_url": "username:password@tcp(hostname:1234)/dbname",
+ 			"tls_ca_file": "/tls/ca.pem",
+ 			"client_cert_file": "/tls/cert.pem",
+-			"client_key_file": "/tls/key.pem"
++			"client_key_file": "/tls/key.pem",
++			"username": "user"
+ 		}
+ 	}`)
+ 
+@@ -268,7 +272,8 @@ func TestParseRethinkStorageDBStoreEmptyCA(t *testing.T) {
+ 			"db_url": "username:password@tcp(hostname:1234)/dbname",
+ 			"database": "rethinkdbtest",
+ 			"client_cert_file": "/tls/cert.pem",
+-			"client_key_file": "/tls/key.pem"
++			"client_key_file": "/tls/key.pem",
++			"username": "user"
+ 		}
+ 	}`)
+ 
+@@ -284,7 +289,8 @@ func TestParseRethinkStorageDBStoreEmptyCertAndKey(t *testing.T) {
+ 			"backend": "rethinkdb",
+ 			"db_url": "username:password@tcp(hostname:1234)/dbname",
+ 			"database": "rethinkdbtest",
+-			"tls_ca_file": "/tls/ca.pem"
++			"tls_ca_file": "/tls/ca.pem",
++			"username": "user"
+ 		}
+ 	}`)
+ 
+@@ -293,6 +299,53 @@ func TestParseRethinkStorageDBStoreEmptyCertAndKey(t *testing.T) {
+ 	require.Contains(t, err.Error(), "cowardly refusal to connect to rethinkdb without a client cert")
+ }
+ 
++// ParseRethinkDBStorage will require a username to connect to the database after bootstrapping
++func TestParseRethinkStorageDBStoreEmptyUsername(t *testing.T) {
++	config := configure(`{
++		"storage": {
++			"backend": "rethinkdb",
++			"db_url": "username:password@tcp(hostname:1234)/dbname",
++			"database": "rethinkdbtest",
++			"client_cert_file": "/tls/cert.pem",
++			"client_key_file": "/tls/key.pem",
++			"tls_ca_file": "/tls/ca.pem"
++		}
++	}`)
++
++	_, err := ParseRethinkDBStorage(config)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "requires a username to connect to the db")
++}
++
++// ParseRethinkDBStorage retains the configured username and password so they
++// can be used to authenticate to the database
++func TestParseRethinkStorageDBStoreRetainsCredentials(t *testing.T) {
++	config := configure(`{
++"storage": {
++"backend": "rethinkdb",
++"db_url": "host:port",
++"database": "rethinkdbtest",
++"tls_ca_file": "/tls/ca.pem",
++"client_cert_file": "/tls/cert.pem",
++"client_key_file": "/tls/key.pem",
++"username": "signer",
++"password": "p455w0rd"
++}
++}`)
++
++	store, err := ParseRethinkDBStorage(config)
++	require.NoError(t, err)
++
++	value := reflect.ValueOf(store).Elem()
++	username := value.FieldByName("Username")
++	require.True(t, username.IsValid(), "RethinkDBStorage must retain the configured username")
++	require.Equal(t, "signer", username.String())
++
++	password := value.FieldByName("Password")
++	require.True(t, password.IsValid(), "RethinkDBStorage must retain the configured password")
++	require.Equal(t, "p455w0rd", password.String())
++}
++
+ func TestParseSQLStorageWithEnvironmentVariables(t *testing.T) {
+ 	config := configure(`{
+ 		"storage": {
+diff --git a/vendor/gopkg.in/dancannon/gorethink.v2/query_test.go b/vendor/gopkg.in/dancannon/gorethink.v2/query_test.go
+index 486be13..9337250 100644
+--- a/vendor/gopkg.in/dancannon/gorethink.v2/query_test.go
++++ b/vendor/gopkg.in/dancannon/gorethink.v2/query_test.go
+@@ -65,3 +65,17 @@ func (s *RethinkSuite) TestQueryRunRawTime(c *test.C) {
+ 	c.Assert(response["$reql_type$"], test.NotNil)
+ 	c.Assert(response["$reql_type$"], test.Equals, "TIME")
+ }
++
++func (s *RethinkSuite) TestQueryRunNil(c *test.C) {
++	res, err := Expr("Test").Run(nil)
++	c.Assert(res, test.IsNil)
++	c.Assert(err, test.NotNil)
++	c.Assert(err, test.Equals, ErrConnectionClosed)
++}
++
++func (s *RethinkSuite) TestQueryRunNotConnected(c *test.C) {
++	res, err := Expr("Test").Run(&Session{})
++	c.Assert(res, test.IsNil)
++	c.Assert(err, test.NotNil)
++	c.Assert(err, test.Equals, ErrConnectionClosed)
++}
+\ No newline at end of file
+diff --git a/vendor/gopkg.in/dancannon/gorethink.v2/session_test.go b/vendor/gopkg.in/dancannon/gorethink.v2/session_test.go
+index 5950382..53b27de 100644
+--- a/vendor/gopkg.in/dancannon/gorethink.v2/session_test.go
++++ b/vendor/gopkg.in/dancannon/gorethink.v2/session_test.go
+@@ -129,3 +129,25 @@ func (s *RethinkSuite) TestSessionConnectDatabase(c *test.C) {
+ 	c.Assert(err, test.NotNil)
+ 	c.Assert(err.Error(), test.Equals, "gorethink: Database `test2` does not exist. in: \nr.Table(\"test2\")")
+ }
++
++func (s *RethinkSuite) TestSessionConnectUsername(c *test.C) {
++	session, err := Connect(ConnectOpts{
++		Address: url,
++	})
++	c.Assert(err, test.IsNil)
++
++	DB("rethinkdb").Table("users").Insert(map[string]string{
++		"id":       "gorethink_test",
++		"password": "password",
++	}).Exec(session)
++
++	session, err = Connect(ConnectOpts{
++		Address:  url,
++		Username: "gorethink_test",
++		Password: "password",
++	})
++	c.Assert(err, test.IsNil)
++
++	_, err = Expr("Hello World").Run(session)
++	c.Assert(err, test.IsNil)
++}

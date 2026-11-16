@@ -1,0 +1,48 @@
+Test scope dependencies missing in the generated BOM
+With the below snippet the expectation was that junit dependency would be shown in the generated BOM, but noticed that it is missing. Notice that includeTestScope=true in the configuration below.
+
+```
+<dependencies>
+	<dependency>
+		<groupId>junit</groupId>
+		<artifactId>junit</artifactId>
+		<version>4.11</version>
+		<scope>test</scope>
+	</dependency>
+	<dependency>
+		<groupId>javax.servlet</groupId>
+		<artifactId>javax.servlet-api</artifactId>
+		<version>3.1.0</version>
+		<scope>provided</scope>
+	</dependency>
+</dependencies>
+<build>
+	<plugins>
+		<plugin>
+			<groupId>org.cyclonedx</groupId>
+			<artifactId>cyclonedx-maven-plugin</artifactId>
+			<version>2.0.3</version>
+			<executions>
+				<execution>
+					<phase>verify</phase>
+					<goals>
+						<goal>makeAggregateBom</goal>
+					</goals>
+				</execution>
+			</executions>
+			<configuration>
+				<projectType>library</projectType>
+				<schemaVersion>1.2</schemaVersion>
+				<includeBomSerialNumber>true</includeBomSerialNumber>
+				<includeCompileScope>true</includeCompileScope>
+				<includeProvidedScope>true</includeProvidedScope>
+				<includeRuntimeScope>true</includeRuntimeScope>
+				<includeSystemScope>true</includeSystemScope>
+				<includeTestScope>true</includeTestScope>
+				<includeLicenseText>true</includeLicenseText>
+				<outputFormat>xml</outputFormat>
+			</configuration>
+		</plugin>
+	</plugins>
+</build>
+```

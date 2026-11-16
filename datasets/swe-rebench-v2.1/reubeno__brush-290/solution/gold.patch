@@ -1,0 +1,379 @@
+diff --git a/README.md b/README.md
+index 40205d6..c9eac90 100644
+--- a/README.md
++++ b/README.md
+@@ -54,10 +54,9 @@ installed on your system, then you can also author a `~/.brushrc` file.
+ 
+ There are some known gaps in compatibility. Most notably:
+ 
+-* **Honoring `set` and `shopt` options (e.g., `set -e`).**
+-  The `set` builtin is implemented, as is `set -x` and a few other options, but most of the options aren't fully implemented. `set -e`, for example, will execute but its semantics aren't applied across execution.
+-* **Curly brace expansion.**
+-  Almost all forms of expansion are implemented; for some reason, we never got around to implementing an expansion that turns `{a,b}` into `a b`. There's even a test for this, but it's marked as a known failing test.
++* **Honoring all `set` and `shopt` options (e.g., `set -e`).**
++  The `set` builtin is implemented, as is `set -x` and some other options, but many of the options aren't fully implemented. `set -e`, for example, will execute but its semantics aren't applied across execution.
++
+ * **Anything tagged with a `TODO` comment or where `error::unimp()` is used to return a "not implemented" error**.
+   These aren't all tracked with GitHub issues right now, but there's a number of these scattered throughout the code base. Some are indicative of missing functionality that may be straightforward to implement; others may be more complicated.
+ 
+diff --git a/brush-core/src/expansion.rs b/brush-core/src/expansion.rs
+index 36ec8f9..2df009e 100644
+--- a/brush-core/src/expansion.rs
++++ b/brush-core/src/expansion.rs
+@@ -1,3 +1,4 @@
++use std::borrow::Cow;
+ use std::cmp::min;
+ 
+ use brush_parser::ast;
+@@ -298,6 +299,10 @@ pub(crate) async fn basic_expand_regex(
+     word: &ast::Word,
+ ) -> Result<crate::regex::Regex, error::Error> {
+     let mut expander = WordExpander::new(shell);
++
++    // Brace expansion does not appear to be used in regexes.
++    expander.force_disable_brace_expansion = true;
++
+     expander.basic_expand_regex(&word.flatten()).await
+ }
+ 
+@@ -351,6 +356,7 @@ pub(crate) async fn assign_to_named_parameter(
+ struct WordExpander<'a> {
+     shell: &'a mut Shell,
+     parser_options: brush_parser::ParserOptions,
++    force_disable_brace_expansion: bool,
+ }
+ 
+ impl<'a> WordExpander<'a> {
+@@ -360,6 +366,7 @@ impl<'a> WordExpander<'a> {
+         Self {
+             shell,
+             parser_options,
++            force_disable_brace_expansion: false,
+         }
+     }
+ 
+@@ -444,23 +451,56 @@ impl<'a> WordExpander<'a> {
+     async fn basic_expand(&mut self, word: &str) -> Result<Expansion, error::Error> {
+         tracing::debug!(target: trace_categories::EXPANSION, "Basic expanding: '{word}'");
+ 
+-        //
+-        // TODO: Brace expansion in unquoted pieces
+-        // Issue #42
+-        //
++        // Apply brace expansion first, before anything else.
++        let brace_expanded: String = self.brace_expand_if_needed(word)?.into_iter().join(" ");
++        if tracing::enabled!(target: trace_categories::EXPANSION, tracing::Level::DEBUG)
++            && brace_expanded != word
++        {
++            tracing::debug!(target: trace_categories::EXPANSION, "  => brace expanded to '{brace_expanded}'");
++        }
+ 
+-        //
+         // Expand: tildes, parameters, command substitutions, arithmetic.
+-        //
+-        let pieces = brush_parser::word::parse(word, &self.parser_options)?;
+-
+         let mut expansions = vec![];
+-        for piece in pieces {
++        for piece in brush_parser::word::parse(brace_expanded.as_str(), &self.parser_options)? {
+             let piece_expansion = self.expand_word_piece(piece.piece).await?;
+             expansions.push(piece_expansion);
+         }
+ 
+-        Ok(coalesce_expansions(expansions))
++        let coalesced = coalesce_expansions(expansions);
++
++        Ok(coalesced)
++    }
++
++    fn brace_expand_if_needed(&self, word: &'a str) -> Result<Vec<Cow<'a, str>>, error::Error> {
++        // We perform a non-authoritative check to see if the string *may* contain braces
++        // to expand. There may be false positives, but must be no false negatives.
++        if self.force_disable_brace_expansion
++            || !self.shell.options.perform_brace_expansion
++            || !may_contain_braces_to_expand(word)
++        {
++            return Ok(vec![word.into()]);
++        }
++
++        let parse_result = brush_parser::word::parse_brace_expansions(word, &self.parser_options);
++        if parse_result.is_err() {
++            tracing::error!("failed to parse for brace expansion: {parse_result:?}");
++            return Ok(vec![word.into()]);
++        }
++
++        let brace_expansion_pieces = parse_result?;
++        if let Some(brace_expansion_pieces) = brace_expansion_pieces {
++            tracing::debug!(target: trace_categories::EXPANSION, "Brace expansion pieces: {brace_expansion_pieces:?}");
++
++            let result = generate_and_combine_brace_expansions(brace_expansion_pieces);
++            let result = result
++                .into_iter()
++                .map(|s| if s.is_empty() { "\"\"".into() } else { s });
++            let result = result.map(|s| s.into()).collect();
++
++            Ok(result)
++        } else {
++            Ok(vec![word.into()])
++        }
+     }
+ 
+     /// Apply tilde-expansion, parameter expansion, command substitution, and arithmetic expansion;
+@@ -1564,6 +1604,49 @@ fn transform_expansion(
+     })
+ }
+ 
++fn may_contain_braces_to_expand(s: &str) -> bool {
++    // This is a completely inaccurate but quick heuristic used to see if
++    // it's even worth properly parsing the string to find brace expressions.
++    // It's mostly used to avoid more expensive parsing just because we've
++    // encountered a brace used in a parameter expansion.
++    let mut last_was_unescaped_dollar_sign = false;
++    let mut last_was_escape = false;
++    let mut saw_opening_brace = false;
++    let mut saw_closing_brace = false;
++    for c in s.chars() {
++        if !last_was_unescaped_dollar_sign {
++            if c == '{' {
++                saw_opening_brace = true;
++            } else if c == '}' {
++                saw_closing_brace = true;
++                if saw_opening_brace {
++                    return true;
++                }
++            }
++        }
++
++        last_was_unescaped_dollar_sign = !last_was_escape && c == '$';
++        last_was_escape = c == '\\';
++    }
++
++    saw_opening_brace && saw_closing_brace
++}
++
++fn generate_and_combine_brace_expansions(
++    pieces: Vec<brush_parser::word::BraceExpressionOrText>,
++) -> Vec<String> {
++    let expansions: Vec<Vec<String>> = pieces
++        .into_iter()
++        .map(|piece| piece.generate().collect())
++        .collect();
++
++    expansions
++        .into_iter()
++        .multi_cartesian_product()
++        .map(|v| v.join(""))
++        .collect()
++}
++
+ #[allow(clippy::panic_in_result_fn)]
+ #[allow(clippy::needless_return)]
+ #[cfg(test)]
+@@ -1608,6 +1691,29 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn test_brace_expansion() -> Result<()> {
++        let options = crate::shell::CreateOptions::default();
++        let mut shell = crate::shell::Shell::new(&options).await?;
++        let expander = WordExpander::new(&mut shell);
++
++        assert_eq!(expander.brace_expand_if_needed("abc")?, ["abc"]);
++        assert_eq!(expander.brace_expand_if_needed("a{,b}d")?, ["ad", "abd"]);
++        assert_eq!(expander.brace_expand_if_needed("a{b,c}d")?, ["abd", "acd"]);
++        assert_eq!(
++            expander.brace_expand_if_needed("a{1..3}d")?,
++            ["a1d", "a2d", "a3d"]
++        );
++        assert_eq!(
++            expander.brace_expand_if_needed(r#""{a,b}""#)?,
++            [r#""{a,b}""#]
++        );
++        assert_eq!(expander.brace_expand_if_needed("a{}b")?, ["a{}b"]);
++        assert_eq!(expander.brace_expand_if_needed("a{ }b")?, ["a{ }b"]);
++
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn test_field_splitting() -> Result<()> {
+         let options = crate::shell::CreateOptions::default();
+diff --git a/brush-parser/src/error.rs b/brush-parser/src/error.rs
+index f7e3cf0..fba17c2 100644
+--- a/brush-parser/src/error.rs
++++ b/brush-parser/src/error.rs
+@@ -41,6 +41,10 @@ pub enum WordParseError {
+     #[error("failed to parse parameter '{0}'")]
+     Parameter(String, peg::error::ParseError<peg::str::LineCol>),
+ 
++    /// An error occurred while parsing for brace expansion.
++    #[error("failed to parse for brace expansion: '{0}'")]
++    BraceExpansion(String, peg::error::ParseError<peg::str::LineCol>),
++
+     /// An error occurred while parsing a word.
+     #[error("failed to parse word '{0}'")]
+     Word(String, peg::error::ParseError<peg::str::LineCol>),
+diff --git a/brush-parser/src/word.rs b/brush-parser/src/word.rs
+index 90e3ab0..2828bc1 100644
+--- a/brush-parser/src/word.rs
++++ b/brush-parser/src/word.rs
+@@ -363,6 +363,86 @@ pub enum ParameterTransformOp {
+     ToUpperCase,
+ }
+ 
++/// Represents a sub-word that is either a brace expression or some other word text.
++#[derive(Clone, Debug)]
++pub enum BraceExpressionOrText {
++    /// A brace expression.
++    Expr(BraceExpression),
++    /// Other word text.
++    Text(String),
++}
++
++/// Represents a brace expression to be expanded.
++pub type BraceExpression = Vec<BraceExpressionMember>;
++
++impl BraceExpressionOrText {
++    /// Generates expansions for this value.
++    pub fn generate(self) -> Box<dyn Iterator<Item = String>> {
++        match self {
++            BraceExpressionOrText::Expr(members) => {
++                let mut iters = vec![];
++                for m in members {
++                    iters.push(m.generate());
++                }
++                Box::new(iters.into_iter().flatten())
++            }
++            BraceExpressionOrText::Text(text) => Box::new(std::iter::once(text)),
++        }
++    }
++}
++
++/// Member of a brace expression.
++#[derive(Clone, Debug)]
++pub enum BraceExpressionMember {
++    /// An inclusive numerical sequence.
++    NumberSequence {
++        /// Start of the sequence.
++        low: i64,
++        /// Inclusive end of the sequence.
++        high: i64,
++        /// Increment value.
++        increment: i64,
++    },
++    /// An inclusive character sequence.
++    CharSequence {
++        /// Start of the sequence.
++        low: char,
++        /// Inclusive end of the sequence.
++        high: char,
++        /// Increment value.
++        increment: i64,
++    },
++    /// Text.
++    Text(String),
++}
++
++impl BraceExpressionMember {
++    /// Generates expansions for this member.
++    pub fn generate(self) -> Box<dyn Iterator<Item = String>> {
++        match self {
++            BraceExpressionMember::NumberSequence {
++                low,
++                high,
++                increment,
++            } => Box::new(
++                (low..=high)
++                    .step_by(increment as usize)
++                    .map(|n| n.to_string()),
++            ),
++            BraceExpressionMember::CharSequence {
++                low,
++                high,
++                increment,
++            } => Box::new(
++                (low..=high)
++                    .step_by(increment as usize)
++                    .map(|c| c.to_string()),
++            ),
++            BraceExpressionMember::Text(text) => Box::new(std::iter::once(text)),
++        }
++    }
++}
++
+ /// Parse a word into its constituent pieces.
+ ///
+ /// # Arguments
+@@ -405,6 +485,20 @@ pub fn parse_parameter(
+         .map_err(|err| error::WordParseError::Parameter(word.to_owned(), err))
+ }
+ 
++/// Parse brace expansion from a given word .
++///
++/// # Arguments
++///
++/// * `word` - The word to parse.
++/// * `options` - The parser options to use.
++pub fn parse_brace_expansions(
++    word: &str,
++    options: &ParserOptions,
++) -> Result<Option<Vec<BraceExpressionOrText>>, error::WordParseError> {
++    expansion_parser::brace_expansions(word, options)
++        .map_err(|err| error::WordParseError::BraceExpansion(word.to_owned(), err))
++}
++
+ peg::parser! {
+     grammar expansion_parser(parser_options: &ParserOptions) for str {
+         pub(crate) rule unexpanded_word() -> Vec<WordPieceWithSource> = word(<![_]>)
+@@ -419,6 +513,50 @@ peg::parser! {
+                 all_pieces
+             }
+ 
++        pub(crate) rule brace_expansions() -> Option<Vec<BraceExpressionOrText>> =
++            pieces:(brace_expansion_piece()+) { Some(pieces) } /
++            [_]* { None }
++
++        rule brace_expansion_piece() -> BraceExpressionOrText =
++            expr:brace_expr() {
++                BraceExpressionOrText::Expr(expr)
++            } /
++            text:$(non_brace_expr_text()+) { BraceExpressionOrText::Text(text.to_owned()) }
++
++        rule non_brace_expr_text() -> () =
++            !"{" word_piece(<['{']>, false) {} /
++            !brace_expr() "{" {}
++
++        rule brace_expr() -> BraceExpression =
++            "{" inner:brace_expr_inner() "}" { inner }
++
++        rule brace_expr_inner() -> BraceExpression =
++            brace_text_list_expr() /
++            seq:brace_sequence_expr() { vec![seq] }
++
++        rule brace_text_list_expr() -> BraceExpression =
++            members:(brace_text_list_member() **<2,> ",") {
++                members.into_iter().flatten().collect()
++            }
++
++        rule brace_text_list_member() -> BraceExpression =
++            &[',' | '}'] { vec![BraceExpressionMember::Text(String::new())] } /
++            brace_expr() /
++            text:$(word_piece(<[',' | '}']>, false)) {
++                vec![BraceExpressionMember::Text(text.to_owned())]
++            }
++
++        rule brace_sequence_expr() -> BraceExpressionMember =
++            low:number() ".." high:number() increment:(".." n:number() { n })? {
++                BraceExpressionMember::NumberSequence { low, high, increment: increment.unwrap_or(1) }
++            } /
++            low:character() ".." high:character() increment:(".." n:number() { n })? {
++                BraceExpressionMember::CharSequence { low, high, increment: increment.unwrap_or(1) }
++            }
++
++        rule number() -> i64 = n:$(['0'..='9']+) { n.parse().unwrap() }
++        rule character() -> char = ['a'..='z' | 'A'..='Z']
++
+         // N.B. We don't bother returning the word pieces, as all users of this rule
+         // only try to extract the consumed input string and not the parse result.
+         rule arithmetic_word<T>(stop_condition: rule<T>) =

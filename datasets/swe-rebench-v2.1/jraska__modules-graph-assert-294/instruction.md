@@ -1,0 +1,4 @@
+Gradle Develocity verification errors
+Develocity is a tool by Gradle for build metrics. They offer a error classification in verification and non-verification errors. Non-verification errors are related to tooling bugs and infrastructure problems while verification errors are more or less expected failures in the analyzed code ([more about the topic](https://docs.gradle.com/develocity/failure-classification/)).
+
+Currently assertion failures of this module are classified as non-verification errors by Develocity. This is because e.g. in https://github.com/jraska/modules-graph-assert/blob/bad7704134e20739e0e74452ac71e3ca8dca4fe9/plugin/src/main/kotlin/com/jraska/module/graph/assertion/OnlyAllowedAssert.kt#L21 `GradleException` is used for those errors. To help classify such exceptions as verification errors the class `VerificationException` could be used instead.

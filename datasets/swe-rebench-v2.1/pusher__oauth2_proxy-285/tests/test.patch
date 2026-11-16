@@ -1,0 +1,219 @@
+diff --git a/http_test.go b/http_test.go
+index f5ee142..ddeb945 100644
+--- a/http_test.go
++++ b/http_test.go
+@@ -1,9 +1,26 @@
+ package main
+ 
+ import (
++	"bufio"
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"math/big"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
+ )
+@@ -106,3 +123,187 @@ func TestGCPHealthcheckNotIngressPut(t *testing.T) {
+ 
+ 	assert.Equal(t, "test", rw.Body.String())
+ }
++
++// TestForceHTTPSProxyTraffic checks the command-line option through the
++// running proxy: enabling it redirects plain HTTP traffic to the configured
++// HTTPS address, while omitting it does not force that redirect.
++func TestForceHTTPSProxyTraffic(t *testing.T) {
++	bin := filepath.Join(t.TempDir(), "oauth2_proxy")
++	build := exec.Command("go", "build", "-o", bin, ".")
++	if out, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("failed to build oauth2_proxy: %v\n%s", err, out)
++	}
++
++	for _, tc := range []struct {
++		name       string
++		forceHTTPS bool
++	}{
++		{name: "disabled by default"},
++		{name: "enabled", forceHTTPS: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			l, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatalf("failed to allocate a port: %v", err)
++			}
++			addr := l.Addr().String()
++			l.Close()
++
++			args := []string{
++				"-http-address=" + addr,
++				"-https-address=https://example.com",
++				"-cookie-secret=0123456789abcdef",
++				"-client-id=test",
++				"-client-secret=test",
++				"-email-domain=*",
++			}
++			if tc.forceHTTPS {
++				args = append(args, "-force-https")
++			}
++			cmd := exec.Command(bin, args...)
++			var output bytes.Buffer
++			cmd.Stdout = &output
++			cmd.Stderr = &output
++			if err := cmd.Start(); err != nil {
++				t.Fatalf("failed to start oauth2_proxy: %v", err)
++			}
++			defer func() {
++				cmd.Process.Kill()
++				cmd.Wait()
++			}()
++
++			client := &http.Client{
++				CheckRedirect: func(req *http.Request, via []*http.Request) error {
++					return http.ErrUseLastResponse
++				},
++			}
++			requestURL := "http://" + addr + "/"
++			var res *http.Response
++			deadline := time.Now().Add(15 * time.Second)
++			for {
++				res, err = client.Get(requestURL)
++				if err == nil {
++					break
++				}
++				if time.Now().After(deadline) {
++					t.Fatalf("proxy did not start serving traffic: %v\n%s", err, output.String())
++				}
++				time.Sleep(100 * time.Millisecond)
++			}
++			defer res.Body.Close()
++
++			if tc.forceHTTPS {
++				assert.Equal(t, http.StatusPermanentRedirect, res.StatusCode, "running proxy should redirect plain HTTP requests to HTTPS")
++				location, err := url.Parse(res.Header.Get("Location"))
++				if assert.NoError(t, err, "redirect location should be a valid URL") {
++					port := location.Port()
++					assert.True(t, strings.EqualFold(location.Scheme, "https") &&
++						strings.EqualFold(location.Hostname(), "example.com") &&
++						(port == "" || port == "443"), "redirect should target the configured HTTPS address")
++				}
++			} else {
++				assert.NotEqual(t, http.StatusPermanentRedirect, res.StatusCode, "the default must not force plain HTTP requests to HTTPS")
++			}
++		})
++	}
++}
++
++// writeSelfSignedCert writes a throwaway certificate and key to dir and
++// returns their paths.
++func writeSelfSignedCert(t *testing.T, dir string) (certFile, keyFile string) {
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatalf("failed to generate key: %v", err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "127.0.0.1"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
++		DNSNames:     []string{"localhost"},
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatalf("failed to create certificate: %v", err)
++	}
++	keyDER, err := x509.MarshalECPrivateKey(key)
++	if err != nil {
++		t.Fatalf("failed to marshal key: %v", err)
++	}
++	certFile = filepath.Join(dir, "cert.pem")
++	keyFile = filepath.Join(dir, "key.pem")
++	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
++		t.Fatalf("failed to write certificate: %v", err)
++	}
++	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0600); err != nil {
++		t.Fatalf("failed to write key: %v", err)
++	}
++	return certFile, keyFile
++}
++
++// TestForceHTTPSLeavesHTTPSRequestsAlone checks that, with the option enabled,
++// a request that already arrives over HTTPS is not redirected to HTTPS again.
++func TestForceHTTPSLeavesHTTPSRequestsAlone(t *testing.T) {
++	bin := filepath.Join(t.TempDir(), "oauth2_proxy")
++	build := exec.Command("go", "build", "-o", bin, ".")
++	if out, err := build.CombinedOutput(); err != nil {
++		t.Fatalf("failed to build oauth2_proxy: %v\n%s", err, out)
++	}
++
++	certFile, keyFile := writeSelfSignedCert(t, t.TempDir())
++
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("failed to allocate a port: %v", err)
++	}
++	addr := l.Addr().String()
++	l.Close()
++
++	args := []string{
++		"-https-address=" + addr,
++		"-tls-cert-file=" + certFile,
++		"-tls-key-file=" + keyFile,
++		"-cookie-secret=0123456789abcdef",
++		"-client-id=test",
++		"-client-secret=test",
++		"-email-domain=*",
++		"-force-https",
++	}
++	cmd := exec.Command(bin, args...)
++	var output bytes.Buffer
++	cmd.Stdout = &output
++	cmd.Stderr = &output
++	if err := cmd.Start(); err != nil {
++		t.Fatalf("failed to start oauth2_proxy: %v", err)
++	}
++	defer func() {
++		cmd.Process.Kill()
++		cmd.Wait()
++	}()
++
++	var conn *tls.Conn
++	deadline := time.Now().Add(15 * time.Second)
++	for {
++		conn, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
++		if err == nil {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("proxy did not start serving HTTPS traffic: %v\n%s", err, output.String())
++		}
++		time.Sleep(100 * time.Millisecond)
++	}
++	defer conn.Close()
++
++	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + addr + "\r\nConnection: close\r\n\r\n")); err != nil {
++		t.Fatalf("failed to send HTTPS request: %v", err)
++	}
++	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
++	if err != nil {
++		t.Fatalf("failed to read HTTPS response: %v\n%s", err, output.String())
++	}
++	defer res.Body.Close()
++
++	assert.NotEqual(t, http.StatusPermanentRedirect, res.StatusCode, "an HTTPS request should not be redirected to HTTPS again")
++}

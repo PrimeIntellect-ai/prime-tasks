@@ -1,0 +1,175 @@
+diff --git a/test/span_event_test.exs b/test/span_event_test.exs
+index bac6cdb..35db2a6 100644
+--- a/test/span_event_test.exs
++++ b/test/span_event_test.exs
+@@ -68,34 +68,15 @@ defmodule SpanEventTest do
+     Application.delete_env(:new_relic_agent, :span_event_reservoir_size)
+   end
+ 
+-  test "report a span event through the harvester" do
+-    TestHelper.restart_harvest_cycle(Collector.SpanEvent.HarvestCycle)
+-
+-    context = %DistributedTrace.Context{sampled: true}
+-    mfa = {:mod, :fun, 3}
+-
+-    event = %NewRelic.Span.Event{
+-      timestamp: System.system_time(:milliseconds),
+-      duration: 0.120,
+-      name: "SomeSpan",
+-      category: "generic",
+-      category_attributes: %{}
+-    }
+-
+-    Collector.SpanEvent.Harvester.report_span_event(event, context, mfa)
+-
+-    [[attrs, _, _]] = TestHelper.gather_harvest(Collector.SpanEvent.Harvester)
+-
+-    assert attrs[:type] == "Span"
+-    assert attrs[:category] == "generic"
+-
+-    TestHelper.pause_harvest_cycle(Collector.CustomEvent.HarvestCycle)
+-  end
+-
+   defmodule Traced do
+     use NewRelic.Tracer
+     @trace :hello
+     def hello do
++      do_hello()
++    end
++
++    @trace :do_hello
++    def do_hello do
+       Process.sleep(10)
+       "world"
+     end
+@@ -127,6 +108,8 @@ defmodule SpanEventTest do
+   end
+ 
+   test "report span events via function tracer inside transaction inside a DT" do
++    # Guard against a leaked reservoir size from another test
++    Application.delete_env(:new_relic_agent, :span_event_reservoir_size)
+     TestHelper.restart_harvest_cycle(Collector.SpanEvent.HarvestCycle)
+     TestHelper.restart_harvest_cycle(Collector.TransactionEvent.HarvestCycle)
+ 
+@@ -143,6 +126,9 @@ defmodule SpanEventTest do
+     [function_event, _, _] =
+       Enum.find(span_events, fn [ev, _, _] -> ev[:name] == "SpanEventTest.Traced.hello/0" end)
+ 
++    [nested_function_event, _, _] =
++      Enum.find(span_events, fn [ev, _, _] -> ev[:name] == "SpanEventTest.Traced.do_hello/0" end)
++
+     [task_event, _, _] =
+       Enum.find(span_events, fn [ev, _, _] -> String.starts_with?(ev[:name], "Process #PID") end)
+ 
+@@ -156,11 +142,13 @@ defmodule SpanEventTest do
+     assert tx_event[:traceId] == "d6b4ba0c3a712ca"
+     assert cowboy_event[:traceId] == "d6b4ba0c3a712ca"
+     assert function_event[:traceId] == "d6b4ba0c3a712ca"
++    assert nested_function_event[:traceId] == "d6b4ba0c3a712ca"
+     assert task_event[:traceId] == "d6b4ba0c3a712ca"
+     assert nested_event[:traceId] == "d6b4ba0c3a712ca"
+ 
+     assert cowboy_event[:transactionId] == tx_event[:guid]
+     assert function_event[:transactionId] == tx_event[:guid]
++    assert nested_function_event[:transactionId] == tx_event[:guid]
+     assert task_event[:transactionId] == tx_event[:guid]
+     assert nested_event[:transactionId] == tx_event[:guid]
+ 
+@@ -181,6 +169,8 @@ defmodule SpanEventTest do
+ 
+     assert cowboy_event[:parentId] == "5f474d64b9cc9b2a"
+     assert function_event[:parentId] == cowboy_event[:guid]
++    assert nested_function_event[:type] == "Span"
++    assert nested_function_event[:category] == "generic"
+     assert task_event[:parentId] == cowboy_event[:guid]
+     assert nested_event[:parentId] == task_event[:guid]
+ 
+@@ -195,6 +185,7 @@ defmodule SpanEventTest do
+     assert nested_event[:component] == "HTTPoison"
+     assert nested_event[:args]
+ 
++
+     # Ensure these will encode properly
+     Jason.encode!(tx_event)
+     Jason.encode!(span_events)
+@@ -205,8 +196,10 @@ defmodule SpanEventTest do
+ 
+   describe "Generate span GUIDs" do
+     test "for a process" do
+-      NewRelic.DistributedTrace.generate_guid(pid: self())
+-      NewRelic.DistributedTrace.generate_guid(pid: self(), mfa: {:m, :f, 1})
++      process_guid = NewRelic.DistributedTrace.generate_guid(pid: self())
++      assert is_binary(process_guid)
++      assert process_guid =~ ~r/^[0-9a-f]+$/
++      assert String.length(process_guid) == 16
+     end
+   end
+ 
+diff --git a/test/transaction_trace_test.exs b/test/transaction_trace_test.exs
+index 3b1587f..62fc82c 100644
+--- a/test/transaction_trace_test.exs
++++ b/test/transaction_trace_test.exs
+@@ -24,7 +24,7 @@ defmodule TransactionTraceTest do
+   defmodule ExternalService do
+     use NewRelic.Tracer
+     @trace {:query, category: :external}
+-    def query(n), do: Process.sleep(n)
++    def query(n), do: HelperModule.function(n)
+   end
+ 
+   defmodule TestPlugApp do
+@@ -43,7 +43,6 @@ defmodule TransactionTraceTest do
+           Task.async(fn ->
+             ExternalService.query(202)
+             Process.sleep(20)
+-            HelperModule.function(203)
+           end)
+           |> Task.await()
+         end)
+@@ -57,7 +56,7 @@ defmodule TransactionTraceTest do
+ 
+       Task.await(t1)
+       Task.await(t2)
+-      ExternalService.query(105)
++      ExternalService.query(405)
+       send_resp(conn, 200, "transaction_trace")
+     end
+ 
+@@ -189,9 +188,37 @@ defmodule TransactionTraceTest do
+ 
+     traces = TestHelper.gather_harvest(Collector.TransactionTrace.Harvester)
+     assert length(traces) == 2
++    assert Enum.any?(traces, &trace_has_nested_query_segments?/1)
+     Jason.encode!(traces)
+   end
+ 
++  defp trace_has_nested_query_segments?(trace) do
++    trace
++    |> Enum.at(4)
++    |> Enum.at(3)
++    |> Enum.at(4)
++    |> nested_query_segments?()
++  end
++
++  defp nested_query_segments?(segments) when is_list(segments) do
++    Enum.any?(segments, fn
++      [_, _, _, _, children | _] = segment ->
++        (segment_named?(segment, "ExternalService", "query") and
++           Enum.any?(children, &segment_named?(&1, "HelperModule", "function"))) or
++          nested_query_segments?(children)
++
++      _ ->
++        false
++    end)
++  end
++
++  defp segment_named?(segment, module_name, function_name) do
++    segment
++    |> Enum.filter(&is_binary/1)
++    |> Enum.join(".")
++    |> then(&(String.contains?(&1, module_name) and String.contains?(&1, function_name)))
++  end
++
+   test "Don't report traces with a short duration" do
+     longer_duration = 51
+     shorter_duration = 49

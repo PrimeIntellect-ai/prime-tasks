@@ -1,0 +1,4 @@
+please make applying the umask configurable for create_dir()
+Recent changes made pyfakefs apply the umask by default when creating files or dirs. For `create_file()`, this behaviour is configurable via the `apply_umask` parameter. Please add a similar parameter for `create_dir()`, to allow for ignoring the umask and thus enabling full control of the exact permissions on the new dir via the `perm_bits` parameter.
+
+Currently, we work around the umask always getting applied to directories by configuring an unrealistic all-permissive umask ("0000") on the fake filesystem ([like so](https://github.com/sabnzbd/sabnzbd/blob/f50810fb58656d9a3c33befb601ed63c1be105cf/tests/test_filesystem.py#L952)) to get rid of some test failures (https://github.com/sabnzbd/sabnzbd/issues/2883). Having an option to control the behaviour of `create_dir()` would obviously be a lot nicer.

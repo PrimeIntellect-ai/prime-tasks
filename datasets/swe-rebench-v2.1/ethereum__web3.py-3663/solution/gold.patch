@@ -1,0 +1,226 @@
+diff --git a/newsfragments/3642.bugfix.rst b/newsfragments/3642.bugfix.rst
+new file mode 100644
+index 00000000..f742e55f
+--- /dev/null
++++ b/newsfragments/3642.bugfix.rst
+@@ -0,0 +1,1 @@
++Checks that ``PersistentConnectionProvider`` response cache value is a dict before attempting to access it like one. Also adds checks to ``make_batch_request`` to make sure it is in batching mode before being called and is not after.
+diff --git a/web3/_utils/batching.py b/web3/_utils/batching.py
+index 9155b98c..9c574da0 100644
+--- a/web3/_utils/batching.py
++++ b/web3/_utils/batching.py
+@@ -1,6 +1,9 @@
+ from copy import (
+     copy,
+ )
++from functools import (
++    wraps,
++)
+ from types import (
+     TracebackType,
+ )
+@@ -12,9 +15,11 @@ from typing import (
+     Dict,
+     Generic,
+     List,
++    Protocol,
+     Sequence,
+     Tuple,
+     Type,
++    TypeVar,
+     Union,
+     cast,
+ )
+@@ -33,6 +38,7 @@ from web3.exceptions import (
+     Web3ValueError,
+ )
+ from web3.types import (
++    RPCEndpoint,
+     TFunc,
+     TReturn,
+ )
+@@ -55,7 +61,6 @@ if TYPE_CHECKING:
+         JSONBaseProvider,
+     )
+     from web3.types import (  # noqa: F401
+-        RPCEndpoint,
+         RPCResponse,
+     )
+ 
+@@ -215,3 +220,39 @@ def sort_batch_response_by_response_ids(
+             stacklevel=2,
+         )
+         return responses
++
++
++class SupportsBatching(Protocol):
++    _is_batching: bool
++
++
++R = TypeVar("R")
++T = TypeVar("T", bound=SupportsBatching)
++
++
++def async_batching_context(
++    method: Callable[[T, List[Tuple[RPCEndpoint, Any]]], Coroutine[Any, Any, R]]
++) -> Callable[[T, List[Tuple[RPCEndpoint, Any]]], Coroutine[Any, Any, R]]:
++    @wraps(method)
++    async def wrapper(self: T, requests: List[Tuple[RPCEndpoint, Any]]) -> R:
++        self._is_batching = True
++        try:
++            return await method(self, requests)
++        finally:
++            self._is_batching = False
++
++    return wrapper
++
++
++def batching_context(
++    method: Callable[[T, List[Tuple[RPCEndpoint, Any]]], R]
++) -> Callable[[T, List[Tuple[RPCEndpoint, Any]]], R]:
++    @wraps(method)
++    def wrapper(self: T, requests: List[Tuple[RPCEndpoint, Any]]) -> R:
++        self._is_batching = True
++        try:
++            return method(self, requests)
++        finally:
++            self._is_batching = False
++
++    return wrapper
+diff --git a/web3/providers/ipc.py b/web3/providers/ipc.py
+index 3a4f2b8d..23a13384 100644
+--- a/web3/providers/ipc.py
++++ b/web3/providers/ipc.py
+@@ -30,6 +30,7 @@ from web3.types import (
+ )
+ 
+ from .._utils.batching import (
++    batching_context,
+     sort_batch_response_by_response_ids,
+ )
+ from .._utils.caching import (
+@@ -201,6 +202,7 @@ class IPCProvider(JSONBaseProvider):
+         request = self.encode_rpc_request(method, params)
+         return self._make_request(request)
+ 
++    @batching_context
+     def make_batch_request(
+         self, requests: List[Tuple[RPCEndpoint, Any]]
+     ) -> List[RPCResponse]:
+diff --git a/web3/providers/legacy_websocket.py b/web3/providers/legacy_websocket.py
+index e2574c8d..1f978e86 100644
+--- a/web3/providers/legacy_websocket.py
++++ b/web3/providers/legacy_websocket.py
+@@ -27,6 +27,7 @@ from websockets.legacy.client import (
+ )
+ 
+ from web3._utils.batching import (
++    batching_context,
+     sort_batch_response_by_response_ids,
+ )
+ from web3._utils.caching import (
+@@ -143,6 +144,7 @@ class LegacyWebSocketProvider(JSONBaseProvider):
+         )
+         return future.result()
+ 
++    @batching_context
+     def make_batch_request(
+         self, requests: List[Tuple[RPCEndpoint, Any]]
+     ) -> List[RPCResponse]:
+diff --git a/web3/providers/persistent/persistent.py b/web3/providers/persistent/persistent.py
+index 5d7385bb..4f70af6d 100644
+--- a/web3/providers/persistent/persistent.py
++++ b/web3/providers/persistent/persistent.py
+@@ -24,6 +24,7 @@ from websockets import (
+ 
+ from web3._utils.batching import (
+     BATCH_REQUEST_ID,
++    async_batching_context,
+     sort_batch_response_by_response_ids,
+ )
+ from web3._utils.caching import (
+@@ -237,14 +238,17 @@ class PersistentConnectionProvider(AsyncJSONBaseProvider, ABC):
+         rpc_request = await self.send_request(method, params)
+         return await self.recv_for_request(rpc_request)
+ 
++    @async_batching_context
+     async def make_batch_request(
+         self, requests: List[Tuple[RPCEndpoint, Any]]
+     ) -> List[RPCResponse]:
+         request_data = self.encode_batch_rpc_request(requests)
+         await self.socket_send(request_data)
+ 
++        # breakpoint()
+         response = cast(
+-            List[RPCResponse], await self._get_response_for_request_id(BATCH_REQUEST_ID)
++            List[RPCResponse],
++            await self._get_response_for_request_id(BATCH_REQUEST_ID),
+         )
+         return response
+ 
+@@ -320,17 +324,16 @@ class PersistentConnectionProvider(AsyncJSONBaseProvider, ABC):
+             for (
+                 response
+             ) in self._request_processor._request_response_cache._data.values():
+-                request = (
+-                    self._request_processor._request_information_cache.get_cache_entry(
++                if isinstance(response, dict):
++                    request = self._request_processor._request_information_cache.get_cache_entry(  # noqa: E501
+                         generate_cache_key(response["id"])
+                     )
+-                )
+-                if "error" in response and request is None:
+-                    # if we find an error response in the cache without a corresponding
+-                    # request, raise the error
+-                    validate_rpc_response_and_raise_if_error(
+-                        response, None, logger=self.logger
+-                    )
++                    if "error" in response and request is None:
++                        # if we find an error response in the cache without a
++                        # corresponding request, raise the error
++                        validate_rpc_response_and_raise_if_error(
++                            cast(RPCResponse, response), None, logger=self.logger
++                        )
+ 
+     async def _message_listener(self) -> None:
+         self.logger.info(
+diff --git a/web3/providers/rpc/async_rpc.py b/web3/providers/rpc/async_rpc.py
+index 85e27c33..6e66bae9 100644
+--- a/web3/providers/rpc/async_rpc.py
++++ b/web3/providers/rpc/async_rpc.py
+@@ -36,6 +36,7 @@ from web3.types import (
+ )
+ 
+ from ..._utils.batching import (
++    async_batching_context,
+     sort_batch_response_by_response_ids,
+ )
+ from ..._utils.caching import (
+@@ -166,6 +167,7 @@ class AsyncHTTPProvider(AsyncJSONBaseProvider):
+         )
+         return response
+ 
++    @async_batching_context
+     async def make_batch_request(
+         self, batch_requests: List[Tuple[RPCEndpoint, Any]]
+     ) -> Union[List[RPCResponse], RPCResponse]:
+diff --git a/web3/providers/rpc/rpc.py b/web3/providers/rpc/rpc.py
+index 4c41d46e..d60ce8c1 100644
+--- a/web3/providers/rpc/rpc.py
++++ b/web3/providers/rpc/rpc.py
+@@ -34,6 +34,7 @@ from web3.types import (
+ )
+ 
+ from ..._utils.batching import (
++    batching_context,
+     sort_batch_response_by_response_ids,
+ )
+ from ..._utils.caching import (
+@@ -174,6 +175,7 @@ class HTTPProvider(JSONBaseProvider):
+         )
+         return response
+ 
++    @batching_context
+     def make_batch_request(
+         self, batch_requests: List[Tuple[RPCEndpoint, Any]]
+     ) -> Union[List[RPCResponse], RPCResponse]:

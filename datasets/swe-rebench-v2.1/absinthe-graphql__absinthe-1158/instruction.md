@@ -1,0 +1,2 @@
+Add generic import_directives for macro based schemas
+We have a library that defines its own prototype schema https://github.com/DivvyPayHQ/absinthe_federation/blob/main/lib/absinthe/federation/schema/prototype.ex that defines its own directives and we have a phoenix/absinthe API app that uses this library but also wants to define its own type system directives so we need a way to merge these two prototypes together.  Having this `import_directives` would really make this pretty straightforward.

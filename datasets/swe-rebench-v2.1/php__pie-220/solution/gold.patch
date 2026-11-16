@@ -1,0 +1,254 @@
+diff --git a/src/Command/InstallCommand.php b/src/Command/InstallCommand.php
+index 4f1237b..fd2c8fd 100644
+--- a/src/Command/InstallCommand.php
++++ b/src/Command/InstallCommand.php
+@@ -14,17 +14,9 @@ use Php\Pie\Platform\TargetPlatform;
+ use Psr\Container\ContainerInterface;
+ use Symfony\Component\Console\Attribute\AsCommand;
+ use Symfony\Component\Console\Command\Command;
+-use Symfony\Component\Console\Input\ArrayInput;
+ use Symfony\Component\Console\Input\InputInterface;
+ use Symfony\Component\Console\Output\OutputInterface;
+-use Webmozart\Assert\Assert;
+-
+-use function array_combine;
+-use function array_filter;
+-use function array_keys;
+-use function array_map;
+-use function array_merge;
+-use function array_values;
++
+ use function sprintf;
+ 
+ #[AsCommand(
+@@ -37,6 +29,7 @@ final class InstallCommand extends Command
+         private readonly ContainerInterface $container,
+         private readonly DependencyResolver $dependencyResolver,
+         private readonly ComposerIntegrationHandler $composerIntegrationHandler,
++        private readonly InvokeSubCommand $invokeSubCommand,
+     ) {
+         parent::__construct();
+     }
+@@ -48,27 +41,15 @@ final class InstallCommand extends Command
+         CommandHelper::configureDownloadBuildInstallOptions($this);
+     }
+ 
+-    private function invokeInstallForProject(InputInterface $input, OutputInterface $output): int
+-    {
+-        $originalSuppliedOptions = array_filter($input->getOptions());
+-        $installForProjectInput  = new ArrayInput(array_merge(
+-            ['command' => 'install-extensions-for-project'],
+-            array_combine(
+-                array_map(static fn ($key) => '--' . $key, array_keys($originalSuppliedOptions)),
+-                array_values($originalSuppliedOptions),
+-            ),
+-        ));
+-
+-        $application = $this->getApplication();
+-        Assert::notNull($application);
+-
+-        return $application->doRun($installForProjectInput, $output);
+-    }
+-
+     public function execute(InputInterface $input, OutputInterface $output): int
+     {
+         if (! $input->getArgument(CommandHelper::ARG_REQUESTED_PACKAGE_AND_VERSION)) {
+-            return $this->invokeInstallForProject($input, $output);
++            return ($this->invokeSubCommand)(
++                $this,
++                ['command' => 'install-extensions-for-project'],
++                $input,
++                $output,
++            );
+         }
+ 
+         if (! TargetPlatform::isRunningAsRoot()) {
+diff --git a/src/Command/InstallExtensionsForProjectCommand.php b/src/Command/InstallExtensionsForProjectCommand.php
+index b96f936..cf87564 100644
+--- a/src/Command/InstallExtensionsForProjectCommand.php
++++ b/src/Command/InstallExtensionsForProjectCommand.php
+@@ -8,10 +8,12 @@ use Composer\Package\Link;
+ use OutOfRangeException;
+ use Php\Pie\ComposerIntegration\PieComposerFactory;
+ use Php\Pie\ComposerIntegration\PieComposerRequest;
++use Php\Pie\ComposerIntegration\PieJsonEditor;
+ use Php\Pie\ExtensionName;
+ use Php\Pie\ExtensionType;
+ use Php\Pie\Installing\InstallForPhpProject\FindMatchingPackages;
+ use Php\Pie\Installing\InstallForPhpProject\FindRootPackage;
++use Php\Pie\Installing\InstallForPhpProject\InstallPiePackageFromPath;
+ use Php\Pie\Installing\InstallForPhpProject\InstallSelectedPackage;
+ use Psr\Container\ContainerInterface;
+ use Symfony\Component\Console\Attribute\AsCommand;
+@@ -32,6 +34,8 @@ use function array_walk;
+ use function assert;
+ use function getcwd;
+ use function in_array;
++use function is_string;
++use function realpath;
+ use function sprintf;
+ use function str_starts_with;
+ use function strlen;
+@@ -50,6 +54,7 @@ final class InstallExtensionsForProjectCommand extends Command
+         private readonly FindRootPackage $findRootPackage,
+         private readonly FindMatchingPackages $findMatchingPackages,
+         private readonly InstallSelectedPackage $installSelectedPackage,
++        private readonly InstallPiePackageFromPath $installPiePackageFromPath,
+         private readonly ContainerInterface $container,
+     ) {
+         parent::__construct();
+@@ -67,16 +72,28 @@ final class InstallExtensionsForProjectCommand extends Command
+         $helper = $this->getHelper('question');
+         assert($helper instanceof QuestionHelper);
+ 
+-        $targetPlatform = CommandHelper::determineTargetPlatformFromInputs($input, $output);
+-
+         $rootPackage = $this->findRootPackage->forCwd($input, $output);
+ 
+         if (ExtensionType::isValid($rootPackage->getType())) {
+-            $output->writeln('<error>This composer.json is for an extension, installing missing packages is not supported.</error>');
+-
+-            return Command::INVALID;
++            $cwd = realpath(getcwd());
++            if (! is_string($cwd) || $cwd === '') {
++                $output->writeln('<error>Failed to determine current working directory.</error>');
++
++                return Command::FAILURE;
++            }
++
++            return ($this->installPiePackageFromPath)(
++                $this,
++                $cwd,
++                $rootPackage,
++                PieJsonEditor::fromTargetPlatform(CommandHelper::determineTargetPlatformFromInputs($input, new NullOutput())),
++                $input,
++                $output,
++            );
+         }
+ 
++        $targetPlatform = CommandHelper::determineTargetPlatformFromInputs($input, $output);
++
+         $output->writeln(sprintf(
+             'Checking extensions for your project <info>%s</info> (path: %s)',
+             $rootPackage->getPrettyName(),
+diff --git a/src/Command/InvokeSubCommand.php b/src/Command/InvokeSubCommand.php
+new file mode 100644
+index 0000000..b6b2546
+--- /dev/null
++++ b/src/Command/InvokeSubCommand.php
+@@ -0,0 +1,44 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Php\Pie\Command;
++
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\ArrayInput;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++use Webmozart\Assert\Assert;
++
++use function array_combine;
++use function array_filter;
++use function array_keys;
++use function array_map;
++use function array_merge;
++use function array_values;
++
++/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
++class InvokeSubCommand
++{
++    /** @param array<array-key, mixed> $subCommandInput */
++    public function __invoke(
++        Command $command,
++        array $subCommandInput,
++        InputInterface $originalCommandInput,
++        OutputInterface $output,
++    ): int {
++        $originalSuppliedOptions = array_filter($originalCommandInput->getOptions());
++        $installForProjectInput  = new ArrayInput(array_merge(
++            $subCommandInput,
++            array_combine(
++                array_map(static fn ($key) => '--' . $key, array_keys($originalSuppliedOptions)),
++                array_values($originalSuppliedOptions),
++            ),
++        ));
++
++        $application = $command->getApplication();
++        Assert::notNull($application);
++
++        return $application->doRun($installForProjectInput, $output);
++    }
++}
+diff --git a/src/Installing/InstallForPhpProject/FindRootPackage.php b/src/Installing/InstallForPhpProject/FindRootPackage.php
+index 3f6ab11..3e26db9 100644
+--- a/src/Installing/InstallForPhpProject/FindRootPackage.php
++++ b/src/Installing/InstallForPhpProject/FindRootPackage.php
+@@ -11,6 +11,7 @@ use Symfony\Component\Console\Helper\HelperSet;
+ use Symfony\Component\Console\Input\InputInterface;
+ use Symfony\Component\Console\Output\OutputInterface;
+ 
++/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
+ class FindRootPackage
+ {
+     public function forCwd(InputInterface $input, OutputInterface $output): RootPackageInterface
+diff --git a/src/Installing/InstallForPhpProject/InstallPiePackageFromPath.php b/src/Installing/InstallForPhpProject/InstallPiePackageFromPath.php
+new file mode 100644
+index 0000000..73ccf36
+--- /dev/null
++++ b/src/Installing/InstallForPhpProject/InstallPiePackageFromPath.php
+@@ -0,0 +1,53 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Php\Pie\Installing\InstallForPhpProject;
++
++use Composer\Package\RootPackageInterface;
++use Php\Pie\Command\InvokeSubCommand;
++use Php\Pie\ComposerIntegration\PieJsonEditor;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++
++use function sprintf;
++
++/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
++class InstallPiePackageFromPath
++{
++    /** @psalm-suppress PossiblyUnusedMethod no direct reference; used in service locator */
++    public function __construct(private readonly InvokeSubCommand $invokeSubCommand)
++    {
++    }
++
++    /** @param non-empty-string $piePackagePath */
++    public function __invoke(Command $invokeContext, string $piePackagePath, RootPackageInterface $pieRootPackage, PieJsonEditor $pieJsonEditor, InputInterface $input, OutputInterface $output): int
++    {
++        $output->writeln(sprintf('Installing PIE extension from <info>%s</info>', $piePackagePath));
++        $pieJsonEditor
++            ->ensureExists()
++            ->addRepository('path', $piePackagePath);
++
++        try {
++            return ($this->invokeSubCommand)(
++                $invokeContext,
++                [
++                    'command' => 'install',
++                    'requested-package-and-version' => $pieRootPackage->getName() . ':*@dev',
++                ],
++                $input,
++                $output,
++            );
++        } finally {
++            $output->writeln(
++                sprintf(
++                    'Removing temporary path repository: %s',
++                    $piePackagePath,
++                ),
++                OutputInterface::VERBOSITY_VERBOSE,
++            );
++            $pieJsonEditor->removeRepository($piePackagePath);
++        }
++    }
++}

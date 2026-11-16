@@ -1,0 +1,266 @@
+diff --git a/.github/workflows/go.yml b/.github/workflows/go.yml
+index c7f5c261b..8b26c4dbc 100644
+--- a/.github/workflows/go.yml
++++ b/.github/workflows/go.yml
+@@ -9,6 +9,8 @@ on:
+ 
+ jobs:
+   build:
++    env:
++      TEST_ARGS: -v
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v3
+diff --git a/.golangci.yml b/.golangci.yml
+index b983567a5..551df33fb 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -2,12 +2,17 @@ run:
+   tests: false
+   skip-dirs:
+   - "mocks"
++  - "ffconfig"
+ linters-settings:
+   golint: {}
+   gocritic:
+     enabled-checks: []
+     disabled-checks:
+       - regexpMust
++  revive:
++    rules:
++    - name: unused-parameter
++      disabled: true    
+   goheader:
+     values:
+       regexp:
+diff --git a/Makefile b/Makefile
+index a82adf26d..7bab3d0dd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,7 +14,7 @@ GOGC=30
+ 
+ all: build test go-mod-tidy
+ test: deps lint
+-		$(VGO) test ./internal/... ./pkg/... ./cmd/... ./docs ./ffconfig/... -cover -coverprofile=coverage.txt -covermode=atomic -timeout=30s
++		$(VGO) test ./internal/... ./pkg/... ./cmd/... ./docs ./ffconfig/... -cover -coverprofile=coverage.txt -covermode=atomic -timeout=30s ${TEST_ARGS}
+ coverage.html:
+ 		$(VGO) tool cover -html=coverage.txt
+ coverage: test coverage.html
+diff --git a/internal/cache/cache.go b/internal/cache/cache.go
+index c57ce4f28..a32b8062d 100644
+--- a/internal/cache/cache.go
++++ b/internal/cache/cache.go
+@@ -1,4 +1,4 @@
+-// Copyright © 2022 Kaleido, Inc.
++// Copyright © 2023 Kaleido, Inc.
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ //
+@@ -100,6 +100,7 @@ func (cc *CConfig) TTL() time.Duration {
+ 
+ type Manager interface {
+ 	GetCache(cc *CConfig) (CInterface, error)
++	ResetCachesForNamespace(ns string)
+ 	ListKeys() []string
+ }
+ 
+@@ -115,11 +116,12 @@ type CInterface interface {
+ }
+ 
+ type CCache struct {
+-	enabled  bool
+-	ctx      context.Context
+-	name     string
+-	cache    *ccache.Cache
+-	cacheTTL time.Duration
++	enabled   bool
++	ctx       context.Context
++	namespace string
++	name      string
++	cache     *ccache.Cache
++	cacheTTL  time.Duration
+ }
+ 
+ func (c *CCache) Set(key string, val interface{}) {
+@@ -169,7 +171,20 @@ type cacheManager struct {
+ 	m       sync.Mutex
+ 	// maintain a list of named configured CCache, the name are unique configuration category id
+ 	// e.g. cache.batch
+-	configuredCaches map[string]CInterface
++	configuredCaches map[string]*CCache
++}
++
++func (cm *cacheManager) ResetCachesForNamespace(ns string) {
++	cm.m.Lock()
++	defer cm.m.Unlock()
++	for k, c := range cm.configuredCaches {
++		if c.namespace == ns {
++			// Clear the cache to free the memory immediately
++			c.cache.Clear()
++			// Remove it from the map, so the next call will generate a new one
++			delete(cm.configuredCaches, k)
++		}
++	}
+ }
+ 
+ func (cm *cacheManager) GetCache(cc *CConfig) (CInterface, error) {
+@@ -185,11 +200,12 @@ func (cm *cacheManager) GetCache(cc *CConfig) (CInterface, error) {
+ 	cache, exists := cm.configuredCaches[cacheName]
+ 	if !exists {
+ 		cache = &CCache{
+-			ctx:      cc.ctx,
+-			name:     cacheName,
+-			cache:    ccache.New(ccache.Configure().MaxSize(maxSize)),
+-			cacheTTL: cc.TTL(),
+-			enabled:  cm.enabled,
++			ctx:       cc.ctx,
++			namespace: cc.namespace,
++			name:      cacheName,
++			cache:     ccache.New(ccache.Configure().MaxSize(maxSize)),
++			cacheTTL:  cc.TTL(),
++			enabled:   cm.enabled,
+ 		}
+ 		cm.configuredCaches[cacheName] = cache
+ 	}
+@@ -209,7 +225,7 @@ func NewCacheManager(ctx context.Context) Manager {
+ 	cm := &cacheManager{
+ 		ctx:              ctx,
+ 		enabled:          config.GetBool(coreconfig.CacheEnabled),
+-		configuredCaches: map[string]CInterface{},
++		configuredCaches: map[string]*CCache{},
+ 	}
+ 	return cm
+ }
+diff --git a/internal/namespace/configreload.go b/internal/namespace/configreload.go
+index 99b39a473..cfa3e1ef4 100644
+--- a/internal/namespace/configreload.go
++++ b/internal/namespace/configreload.go
+@@ -121,7 +121,10 @@ func (nm *namespaceManager) stopDefunctNamespaces(ctx context.Context, newPlugin
+ 	updatedNamespaces = make(map[string]*namespace)
+ 	availableNamespaces = make(map[string]*namespace)
+ 	namespacesToStop := make(map[string]*namespace)
++	newNamespaceNames := make([]string, 0)
++	updatedNamespaceNames := make([]string, 0)
+ 	for nsName, newNS := range newNamespaces {
++		newNamespaceNames = append(newNamespaceNames, nsName)
+ 		if existingNS := nm.namespaces[nsName]; existingNS != nil {
+ 			var changes []string
+ 			if !existingNS.configHash.Equals(newNS.configHash) {
+@@ -147,15 +150,24 @@ func (nm *namespaceManager) stopDefunctNamespaces(ctx context.Context, newPlugin
+ 		// This is either changed, or brand new - mark it in the map
+ 		availableNamespaces[nsName] = newNS
+ 		updatedNamespaces[nsName] = newNS
++		updatedNamespaceNames = append(updatedNamespaceNames, nsName)
+ 	}
+ 
+ 	// Stop everything we need to stop
++	oldNamespaceNames := make([]string, 0)
++	stoppingNamespaceNames := make([]string, 0)
+ 	for nsName, existingNS := range nm.namespaces {
++		oldNamespaceNames = append(oldNamespaceNames, nsName)
+ 		if namespacesToStop[nsName] != nil || newNamespaces[nsName] == nil {
++			stoppingNamespaceNames = append(stoppingNamespaceNames, nsName)
+ 			log.L(ctx).Debugf("Stopping namespace '%s' after config reload. Loaded at %s", nsName, existingNS.loadTime)
+ 			nm.stopNamespace(ctx, existingNS)
++
++			// Clear cache managers for the stopped namespace, now the orchestrator is stopped
++			nm.cacheManager.ResetCachesForNamespace(nsName)
+ 		}
+ 	}
++	log.L(nm.ctx).Infof("Namespace reload summary: old=%v new=%v updated=%v stopping=%v", oldNamespaceNames, newNamespaceNames, updatedNamespaceNames, stoppingNamespaceNames)
+ 
+ 	return availableNamespaces, updatedNamespaces
+ 
+diff --git a/internal/namespace/manager.go b/internal/namespace/manager.go
+index c933c30c8..cb66f3aa3 100644
+--- a/internal/namespace/manager.go
++++ b/internal/namespace/manager.go
+@@ -182,6 +182,10 @@ func NewNamespaceManager() Manager {
+ }
+ 
+ func (nm *namespaceManager) Init(ctx context.Context, cancelCtx context.CancelFunc, reset chan bool, reloadConfig func() error) (err error) {
++	// Hold the mutex throughout initial init, as we do not want to allow config reload to go yet
++	nm.nsMux.Lock()
++	defer nm.nsMux.Unlock()
++
+ 	nm.reset = reset               // channel to ask our parent to reload us
+ 	nm.reloadConfig = reloadConfig // function to cause our parent to call InitConfig on all components, including us
+ 	nm.ctx = ctx
+@@ -196,10 +200,10 @@ func (nm *namespaceManager) Init(ctx context.Context, cancelCtx context.CancelFu
+ 		return err
+ 	}
+ 
+-	return nm.initComponents(ctx)
++	return nm.initComponents()
+ }
+ 
+-func (nm *namespaceManager) initComponents(ctx context.Context) (err error) {
++func (nm *namespaceManager) initComponents() (err error) {
+ 	if nm.metricsEnabled {
+ 		// Ensure metrics are registered, before initializing the namespaces
+ 		metrics.Registry()
+@@ -210,11 +214,7 @@ func (nm *namespaceManager) initComponents(ctx context.Context) (err error) {
+ 		return err
+ 	}
+ 
+-	if err := nm.startConfigListener(); err != nil {
+-		return err
+-	}
+-
+-	return nil
++	return nm.startConfigListener()
+ }
+ 
+ func (nm *namespaceManager) startV1NamespaceIfRequired(nsToCheck *namespace) error {
+@@ -303,7 +303,7 @@ func (nm *namespaceManager) namespaceStarter(ns *namespace) {
+ 		err = nm.initAndStartNamespace(ns)
+ 		// If we started successfully, then all is good
+ 		if err == nil {
+-			log.L(nm.ctx).Infof("Namespace %s started", ns.Name)
++			log.L(nm.ctx).Infof("Namespace started '%s'", ns.Name)
+ 			nm.nsMux.Lock()
+ 			ns.started = true
+ 			ns.initError = ""
+@@ -400,6 +400,7 @@ func (nm *namespaceManager) startNamespacesAndPlugins(namespacesToStart map[stri
+ 		// Note they will not be ready to process the events, and will error.
+ 		// That is fine as it will cause the plugin to push back the events,
+ 		// so they will not be rejected (or held in a retry loop).
++		log.L(nm.ctx).Infof("Initiating start of namespace '%s'", ns.Name)
+ 		if err := nm.preInitNamespace(ns); err != nil {
+ 			return err
+ 		}
+diff --git a/internal/sharedstorage/ipfs/ipfs.go b/internal/sharedstorage/ipfs/ipfs.go
+index c3ac2c226..775bd3398 100644
+--- a/internal/sharedstorage/ipfs/ipfs.go
++++ b/internal/sharedstorage/ipfs/ipfs.go
+@@ -1,4 +1,4 @@
+-// Copyright © 2022 Kaleido, Inc.
++// Copyright © 2023 Kaleido, Inc.
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ //
+@@ -67,7 +67,7 @@ func (i *IPFS) Init(ctx context.Context, config config.Section) error {
+ 	return nil
+ }
+ 
+-func (i *IPFS) SetHandler(namespace string, handler sharedstorage.Callbacks) {
++func (i *IPFS) SetHandler(_ string, handler sharedstorage.Callbacks) {
+ }
+ 
+ func (i *IPFS) Capabilities() *sharedstorage.Capabilities {
+diff --git a/mocks/cachemocks/manager.go b/mocks/cachemocks/manager.go
+index c6f0d3460..9cab453f4 100644
+--- a/mocks/cachemocks/manager.go
++++ b/mocks/cachemocks/manager.go
+@@ -54,6 +54,11 @@ func (_m *Manager) ListKeys() []string {
+ 	return r0
+ }
+ 
++// ResetCachesForNamespace provides a mock function with given fields: ns
++func (_m *Manager) ResetCachesForNamespace(ns string) {
++	_m.Called(ns)
++}
++
+ type mockConstructorTestingTNewManager interface {
+ 	mock.TestingT
+ 	Cleanup(func())

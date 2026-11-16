@@ -1,0 +1,465 @@
+diff --git a/lib/absinthe/blueprint/result/leaf.ex b/lib/absinthe/blueprint/result/leaf.ex
+index fb68c9c5..d7409d17 100644
+--- a/lib/absinthe/blueprint/result/leaf.ex
++++ b/lib/absinthe/blueprint/result/leaf.ex
+@@ -14,7 +14,7 @@ defmodule Absinthe.Blueprint.Result.Leaf do
+ 
+   @type t :: %__MODULE__{
+           emitter: Blueprint.Document.Field.t(),
+-          value: Blueprint.Execution.node_t(),
++          value: Blueprint.Document.Resolution.node_t(),
+           errors: [Phase.Error.t()],
+           flags: Blueprint.flags_t(),
+           extensions: %{any => any}
+diff --git a/lib/absinthe/blueprint/result/list.ex b/lib/absinthe/blueprint/result/list.ex
+index 40d41896..af78c02a 100644
+--- a/lib/absinthe/blueprint/result/list.ex
++++ b/lib/absinthe/blueprint/result/list.ex
+@@ -14,7 +14,7 @@ defmodule Absinthe.Blueprint.Result.List do
+ 
+   @type t :: %__MODULE__{
+           emitter: Blueprint.Document.Field.t(),
+-          values: [Blueprint.Execution.node_t()],
++          values: [Blueprint.Document.Resolution.node_t()],
+           errors: [Phase.Error.t()],
+           flags: Blueprint.flags_t(),
+           extensions: %{any => any}
+diff --git a/lib/absinthe/blueprint/result/object.ex b/lib/absinthe/blueprint/result/object.ex
+index 745dc160..4f4edf1a 100644
+--- a/lib/absinthe/blueprint/result/object.ex
++++ b/lib/absinthe/blueprint/result/object.ex
+@@ -15,7 +15,7 @@ defmodule Absinthe.Blueprint.Result.Object do
+ 
+   @type t :: %__MODULE__{
+           emitter: Blueprint.Document.Field.t(),
+-          fields: [Blueprint.Execution.node_t()],
++          fields: [Blueprint.Document.Resolution.node_t()],
+           errors: [Phase.Error.t()],
+           flags: Blueprint.flags_t(),
+           extensions: %{any => any}
+diff --git a/lib/absinthe/blueprint/schema/interface_type_definition.ex b/lib/absinthe/blueprint/schema/interface_type_definition.ex
+index 3ae4af3e..d33d79b0 100644
+--- a/lib/absinthe/blueprint/schema/interface_type_definition.ex
++++ b/lib/absinthe/blueprint/schema/interface_type_definition.ex
+@@ -2,6 +2,7 @@ defmodule Absinthe.Blueprint.Schema.InterfaceTypeDefinition do
+   @moduledoc false
+ 
+   alias Absinthe.Blueprint
++  alias Absinthe.Blueprint.Schema
+ 
+   @enforce_keys [:name]
+   defstruct [
+@@ -43,6 +44,12 @@ defmodule Absinthe.Blueprint.Schema.InterfaceTypeDefinition do
+     }
+   end
+ 
++  def find_implementors(iface, type_defs) do
++    for %Schema.ObjectTypeDefinition{} = obj <- type_defs,
++        iface.identifier in obj.interfaces,
++        do: obj.identifier
++  end
++
+   @doc false
+   def functions(), do: [:resolve_type]
+ 
+diff --git a/lib/absinthe/phase/schema/compile.ex b/lib/absinthe/phase/schema/compile.ex
+index 5c61ea0a..ece2db72 100644
+--- a/lib/absinthe/phase/schema/compile.ex
++++ b/lib/absinthe/phase/schema/compile.ex
+@@ -16,6 +16,12 @@ defmodule Absinthe.Phase.Schema.Compile do
+         {type_def.identifier, type_def.name}
+       end)
+ 
++    referenced_types =
++      for type_def <- schema.type_definitions,
++          type_def.__private__[:__absinthe_referenced__],
++          into: %{},
++          do: {type_def.identifier, type_def.name}
++
+     directive_list =
+       Map.new(schema.directive_definitions, fn type_def ->
+         {type_def.identifier, type_def.name}
+@@ -35,6 +41,14 @@ defmodule Absinthe.Phase.Schema.Compile do
+         unquote_splicing(directive_ast)
+ 
+         def __absinthe_types__() do
++          __absinthe_types__(:referenced)
++        end
++
++        def __absinthe_types__(:referenced) do
++          unquote(Macro.escape(referenced_types))
++        end
++
++        def __absinthe_types__(:all) do
+           unquote(Macro.escape(type_list))
+         end
+ 
+@@ -126,9 +140,7 @@ defmodule Absinthe.Phase.Schema.Compile do
+     |> Enum.filter(&match?(%Schema.InterfaceTypeDefinition{}, &1))
+     |> Map.new(fn iface ->
+       implementors =
+-        for %Schema.ObjectTypeDefinition{} = obj <- schema.type_definitions,
+-            iface.identifier in obj.interfaces,
+-            do: obj.identifier
++        Schema.InterfaceTypeDefinition.find_implementors(iface, schema.type_definitions)
+ 
+       {iface.identifier, Enum.sort(implementors)}
+     end)
+diff --git a/lib/absinthe/phase/schema/hydrate.ex b/lib/absinthe/phase/schema/hydrate.ex
+index a364be5c..9be28a75 100644
+--- a/lib/absinthe/phase/schema/hydrate.ex
++++ b/lib/absinthe/phase/schema/hydrate.ex
+@@ -205,4 +205,16 @@ defmodule Absinthe.Phase.Schema.Hydrate do
+ 
+     root
+   end
++
++  def apply_hydration(root, result) do
++    raise ArgumentError, """
++    Invalid hydration!
++
++    #{inspect(result)}
++
++    is not a valid way to hydrate
++
++    #{inspect(root)}
++    """
++  end
+ end
+diff --git a/lib/absinthe/phase/schema/mark_referenced.ex b/lib/absinthe/phase/schema/mark_referenced.ex
+new file mode 100644
+index 00000000..f0092527
+--- /dev/null
++++ b/lib/absinthe/phase/schema/mark_referenced.ex
+@@ -0,0 +1,151 @@
++defmodule Absinthe.Phase.Schema.MarkReferenced do
++  @moduledoc false
++
++  use Absinthe.Phase
++
++  alias Absinthe.Blueprint.{Schema, TypeReference}
++
++  def run(blueprint, _opts) do
++    %{schema_definitions: [schema]} = blueprint
++
++    schema =
++      Map.update!(schema, :type_definitions, &mark_referenced(&1, schema.directive_definitions))
++
++    {:ok, %{blueprint | schema_definitions: [schema]}}
++  end
++
++  @roots [:query, :mutation, :subscription]
++  defp mark_referenced(type_defs, directive_defs) do
++    types_by_ref =
++      Enum.reduce(type_defs, %{}, fn type_def, acc ->
++        acc
++        |> Map.put(type_def.identifier, type_def)
++        |> Map.put(type_def.name, type_def)
++      end)
++
++    referenced_type_ids =
++      @roots
++      |> Enum.map(&Map.get(types_by_ref, &1))
++      |> Enum.reject(&is_nil/1)
++      |> Enum.concat(directive_defs)
++      |> Enum.reduce(MapSet.new(), &referenced_types(&1, types_by_ref, &2))
++
++    for type <- type_defs do
++      if type.identifier in referenced_type_ids do
++        put_in(type.__private__[:__absinthe_referenced__], true)
++      else
++        type
++      end
++    end
++  end
++
++  defp referenced_types(%Schema.InputValueDefinition{type: type}, types, acc) do
++    referenced_types(type, types, acc)
++  end
++
++  defp referenced_types(%Schema.DirectiveDefinition{} = type, types, acc) do
++    type.arguments
++    |> Enum.reduce(acc, &referenced_types(&1, types, &2))
++  end
++
++  defp referenced_types(%Schema.EnumTypeDefinition{identifier: identifier}, _types, acc) do
++    MapSet.put(acc, identifier)
++  end
++
++  defp referenced_types(%Schema.FieldDefinition{} = field, types, acc) do
++    acc =
++      field.arguments
++      |> Enum.reduce(acc, &referenced_types(&1, types, &2))
++
++    referenced_types(field.type, types, acc)
++  end
++
++  defp referenced_types(
++         %Schema.InputObjectTypeDefinition{identifier: identifier} = input_object,
++         types,
++         acc
++       ) do
++    if identifier in acc do
++      acc
++    else
++      acc = MapSet.put(acc, identifier)
++
++      input_object.fields
++      |> Enum.reduce(acc, &referenced_types(&1, types, &2))
++    end
++  end
++
++  defp referenced_types(
++         %Schema.InterfaceTypeDefinition{identifier: identifier} = interface,
++         schema,
++         acc
++       ) do
++    if identifier in acc do
++      acc
++    else
++      acc = MapSet.put(acc, identifier)
++
++      acc =
++        interface
++        |> Schema.InterfaceTypeDefinition.find_implementors(Map.values(schema))
++        |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
++
++      interface.fields
++      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
++    end
++  end
++
++  defp referenced_types(%TypeReference.List{of_type: inner_type}, schema, acc) do
++    referenced_types(inner_type, schema, acc)
++  end
++
++  defp referenced_types(%TypeReference.NonNull{of_type: inner_type}, schema, acc) do
++    referenced_types(inner_type, schema, acc)
++  end
++
++  defp referenced_types(
++         %Schema.ObjectTypeDefinition{identifier: identifier} = object,
++         schema,
++         acc
++       ) do
++    if identifier in acc do
++      acc
++    else
++      acc = MapSet.put(acc, identifier)
++
++      acc =
++        object.fields
++        |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
++
++      object.interfaces
++      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
++    end
++  end
++
++  defp referenced_types(%Schema.ScalarTypeDefinition{identifier: identifier}, _schema, acc) do
++    MapSet.put(acc, identifier)
++  end
++
++  defp referenced_types(%Schema.UnionTypeDefinition{identifier: identifier} = union, schema, acc) do
++    if identifier in acc do
++      acc
++    else
++      acc = MapSet.put(acc, identifier)
++
++      union.types
++      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
++    end
++  end
++
++  defp referenced_types(%TypeReference.Identifier{} = ref, schema, acc) do
++    referenced_types(Map.fetch!(schema, ref.id), schema, acc)
++  end
++
++  defp referenced_types(%TypeReference.Name{} = ref, schema, acc) do
++    referenced_types(Map.fetch!(schema, ref.name), schema, acc)
++  end
++
++  defp referenced_types(type, schema, acc) when is_atom(type) and type != nil do
++    referenced_types(Map.fetch!(schema, type), schema, acc)
++  end
++end
+diff --git a/lib/absinthe/pipeline.ex b/lib/absinthe/pipeline.ex
+index da656a41..5fe857a7 100644
+--- a/lib/absinthe/pipeline.ex
++++ b/lib/absinthe/pipeline.ex
+@@ -149,6 +149,7 @@ defmodule Absinthe.Pipeline do
+       Phase.Schema.Validation.QueryTypeMustBeObject,
+       Phase.Schema.Validation.NamesMustBeValid,
+       Phase.Schema.RegisterTriggers,
++      Phase.Schema.MarkReferenced,
+       # This phase is run again now after additional validations
+       {Phase.Schema.Validation.Result, pass: :final},
+       Phase.Schema.Build,
+diff --git a/lib/absinthe/schema.ex b/lib/absinthe/schema.ex
+index a9ebae62..dbd96872 100644
+--- a/lib/absinthe/schema.ex
++++ b/lib/absinthe/schema.ex
+@@ -110,6 +110,7 @@ defmodule Absinthe.Schema do
+       defdelegate __absinthe_type__(name), to: __MODULE__.Compiled
+       defdelegate __absinthe_directive__(name), to: __MODULE__.Compiled
+       defdelegate __absinthe_types__(), to: __MODULE__.Compiled
++      defdelegate __absinthe_types__(group), to: __MODULE__.Compiled
+       defdelegate __absinthe_directives__(), to: __MODULE__.Compiled
+       defdelegate __absinthe_interface_implementors__(), to: __MODULE__.Compiled
+       defdelegate __absinthe_prototype_schema__(), to: __MODULE__.Compiled
+@@ -533,12 +534,8 @@ defmodule Absinthe.Schema do
+   """
+   @spec used_types(t) :: [Type.t()]
+   def used_types(schema) do
+-    [:query, :mutation, :subscription]
+-    |> Enum.map(&lookup_type(schema, &1))
+-    |> Enum.concat(directives(schema))
+-    |> Enum.filter(&(!is_nil(&1)))
+-    |> Enum.flat_map(&Type.referenced_types(&1, schema))
+-    |> MapSet.new()
++    schema.__absinthe_types__
++    |> Map.keys()
+     |> Enum.map(&Schema.lookup_type(schema, &1))
+     |> Enum.filter(&(!Type.introspection?(&1)))
+   end
+@@ -556,6 +553,9 @@ defmodule Absinthe.Schema do
+   @doc """
+   Converts a schema to an SDL string
+ 
++  Per the spec, only types that are actually referenced directly or transitively from
++  the root query, subscription, or mutation objects are included.
++
+   ## Example
+ 
+       Absinthe.Schema.to_sdl(MyAppWeb.Schema)
+@@ -575,6 +575,17 @@ defmodule Absinthe.Schema do
+     # successfully compile the schema.
+     {:ok, bp, _} = Absinthe.Pipeline.run(schema.__absinthe_blueprint__, pipeline)
+ 
++    bp =
++      Map.update!(bp, :schema_definitions, fn schema_defs ->
++        for schema_def <- schema_defs do
++          Map.update!(schema_def, :type_definitions, fn type_defs ->
++            Enum.filter(type_defs, fn type_def ->
++              type_def.__private__[:__absinthe_referenced__]
++            end)
++          end)
++        end
++      end)
++
+     inspect(bp, pretty: true)
+   end
+ 
+diff --git a/lib/absinthe/type.ex b/lib/absinthe/type.ex
+index bd53e140..c988cbff 100644
+--- a/lib/absinthe/type.ex
++++ b/lib/absinthe/type.ex
+@@ -375,108 +375,4 @@ defmodule Absinthe.Type do
+   def valid_input?(_, _) do
+     true
+   end
+-
+-  @spec referenced_types(t, Schema.t()) :: [t]
+-  def referenced_types(type, schema) do
+-    referenced_types(type, schema, MapSet.new())
+-  end
+-
+-  defp referenced_types(%Type.Argument{type: type}, schema, acc) do
+-    referenced_types(type, schema, acc)
+-  end
+-
+-  defp referenced_types(%Type.Directive{} = type, schema, acc) do
+-    type.args
+-    |> Map.values()
+-    |> Enum.reduce(acc, &referenced_types(&1.type, schema, &2))
+-  end
+-
+-  defp referenced_types(%Type.Enum{identifier: identifier}, _schema, acc) do
+-    MapSet.put(acc, identifier)
+-  end
+-
+-  defp referenced_types(%Type.Field{} = field, schema, acc) do
+-    acc =
+-      field.args
+-      |> Map.values()
+-      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-
+-    referenced_types(field.type, schema, acc)
+-  end
+-
+-  defp referenced_types(%Type.InputObject{identifier: identifier} = input_object, schema, acc) do
+-    if identifier in acc do
+-      acc
+-    else
+-      acc = MapSet.put(acc, identifier)
+-
+-      input_object.fields
+-      |> Map.values()
+-      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-    end
+-  end
+-
+-  defp referenced_types(%Type.Interface{identifier: identifier} = interface, schema, acc) do
+-    if identifier in acc do
+-      acc
+-    else
+-      acc = MapSet.put(acc, identifier)
+-
+-      acc =
+-        interface.fields
+-        |> Map.values()
+-        |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-
+-      schema
+-      |> Absinthe.Schema.implementors(identifier)
+-      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-    end
+-  end
+-
+-  defp referenced_types(%Type.List{of_type: inner_type}, schema, acc) do
+-    referenced_types(inner_type, schema, acc)
+-  end
+-
+-  defp referenced_types(%Type.NonNull{of_type: inner_type}, schema, acc) do
+-    referenced_types(inner_type, schema, acc)
+-  end
+-
+-  defp referenced_types(%Type.Object{identifier: identifier} = object, schema, acc) do
+-    if identifier in acc do
+-      acc
+-    else
+-      acc = MapSet.put(acc, identifier)
+-
+-      acc =
+-        object.fields
+-        |> Map.values()
+-        |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-
+-      object.interfaces
+-      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-    end
+-  end
+-
+-  defp referenced_types(%Type.Reference{} = ref, schema, acc) do
+-    referenced_types(ref.identifier, schema, acc)
+-  end
+-
+-  defp referenced_types(%Type.Scalar{identifier: identifier}, _schema, acc) do
+-    MapSet.put(acc, identifier)
+-  end
+-
+-  defp referenced_types(%Type.Union{identifier: identifier} = union, schema, acc) do
+-    if identifier in acc do
+-      acc
+-    else
+-      acc = MapSet.put(acc, identifier)
+-
+-      union.types
+-      |> Enum.reduce(acc, &referenced_types(&1, schema, &2))
+-    end
+-  end
+-
+-  defp referenced_types(type, schema, acc) when is_atom(type) and type != nil do
+-    referenced_types(Schema.lookup_type(schema, type), schema, acc)
+-  end
+ end

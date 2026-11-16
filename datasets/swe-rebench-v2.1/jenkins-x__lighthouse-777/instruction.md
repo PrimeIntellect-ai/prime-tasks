@@ -1,0 +1,2 @@
+Run/require certain contexts based on files changed in PR
+Right now, we've got Prow's behavior of having contexts either be required or not required, with no granularity. A really, really nice feature would be to say "the `frontend` context is only required and should only be run if files in the `ui` directory have changed in this PR", or "if the only file(s) changed in this PR are in the `examples` subdirectory, don't require/run any contexts".

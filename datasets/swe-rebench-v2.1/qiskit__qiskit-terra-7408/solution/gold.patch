@@ -1,0 +1,334 @@
+diff --git a/qiskit/circuit/parametertable.py b/qiskit/circuit/parametertable.py
+index 115854cd9..0fd00951e 100644
+--- a/qiskit/circuit/parametertable.py
++++ b/qiskit/circuit/parametertable.py
+@@ -12,43 +12,122 @@
+ """
+ Look-up table for variable parameters in QuantumCircuit.
+ """
+-import warnings
+ import functools
+-from collections.abc import MutableMapping, MappingView
++import warnings
++from collections.abc import MappingView, MutableMapping, MutableSet
++
++
++class ParameterReferences(MutableSet):
++    """A set of instruction parameter slot references.
++    Items are expected in the form ``(instruction, param_index)``. Membership
++    testing is overriden such that items that are otherwise value-wise equal
++    are still considered distinct if their ``instruction``\\ s are referentially
++    distinct.
++    """
++
++    def _instance_key(self, ref):
++        return (id(ref[0]), ref[1])
++
++    def __init__(self, refs):
++        self._instance_ids = {}
++
++        for ref in refs:
++            if not isinstance(ref, tuple) or len(ref) != 2:
++                raise ValueError("refs must be in form (instruction, param_index)")
++            k = self._instance_key(ref)
++            self._instance_ids[k] = ref[0]
++
++    def __getstate__(self):
++        # Leave behind the reference IDs (keys of _instance_ids) since they'll
++        # be incorrect after unpickling on the other side.
++        return list(self)
++
++    def __setstate__(self, refs):
++        # Recompute reference IDs for the newly unpickled instructions.
++        self._instance_ids = {self._instance_key(ref): ref[0] for ref in refs}
++
++    def __len__(self):
++        return len(self._instance_ids)
++
++    def __iter__(self):
++        for (_, idx), instruction in self._instance_ids.items():
++            yield (instruction, idx)
++
++    def __contains__(self, x) -> bool:
++        return self._instance_key(x) in self._instance_ids
+ 
+-from .instruction import Instruction
++    def __repr__(self) -> str:
++        return f"ParameterReferences({repr(list(self))})"
++
++    def add(self, value):
++        """Adds a reference to the listing if it's not already present."""
++        k = self._instance_key(value)
++        self._instance_ids[k] = value[0]
++
++    def discard(self, value):
++        k = self._instance_key(value)
++        self._instance_ids.pop(k, None)
++
++    def copy(self):
++        """Create a shallow copy."""
++        return ParameterReferences(self)
+ 
+ 
+ class ParameterTable(MutableMapping):
+-    """Class for managing and setting circuit parameters"""
++    """Class for tracking references to circuit parameters by specific
++    instruction instances.
++
++    Keys are parameters. Values are of type :class:`~ParameterReferences`,
++    which overrides membership testing to be referential for instructions,
++    and is set-like. Elements of :class:`~ParameterReferences`
++    are tuples of ``(instruction, param_index)``.
++    """
+ 
+     __slots__ = ["_table", "_keys", "_names"]
+ 
+-    def __init__(self, *args, **kwargs):
+-        """
+-        the structure of _table is,
+-           {var_object: [(instruction_object, parameter_index), ...]}
++    def __init__(self, mapping=None):
++        """Create a new instance, initialized with ``mapping`` if provided.
++
++        Args:
++            mapping (Mapping[Parameter, ParameterReferences]):
++                Mapping of parameter to the set of parameter slots that reference
++                it.
++
++        Raises:
++            ValueError: A value in ``mapping`` is not a :class:`~ParameterReferences`.
+         """
+-        self._table = dict(*args, **kwargs)
++        if mapping is not None:
++            if any(not isinstance(refs, ParameterReferences) for refs in mapping.values()):
++                raise ValueError("Values must be of type ParameterReferences")
++            self._table = mapping.copy()
++        else:
++            self._table = {}
++
+         self._keys = set(self._table)
+         self._names = {x.name for x in self._table}
+ 
+     def __getitem__(self, key):
+         return self._table[key]
+ 
+-    def __setitem__(self, parameter, instr_params):
+-        """Sets list of Instructions that depend on Parameter.
++    def __setitem__(self, parameter, refs):
++        """Associate a parameter with the set of parameter slots ``(instruction, param_index)``
++        that reference it.
++
++        .. note::
++
++            Items in ``refs`` are considered unique if their ``instruction`` is referentially
++            unique. See :class:`~ParameterReferences` for details.
+ 
+         Args:
+-            parameter (Parameter): the parameter to set
+-            instr_params (list): List of (Instruction, int) tuples. Int is the
+-              parameter index at which the parameter appears in the instruction.
++            parameter (Parameter): the parameter
++            refs (Union[ParameterReferences, Iterable[(Instruction, int)]]): the parameter slots.
++                If this is an iterable, a new :class:`~ParameterReferences` is created from its
++                contents.
+         """
++        if not isinstance(refs, ParameterReferences):
++            refs = ParameterReferences(refs)
+ 
+-        for instruction, param_index in instr_params:
+-            assert isinstance(instruction, Instruction)
+-            assert isinstance(param_index, int)
+-        self._table[parameter] = instr_params
++        self._table[parameter] = refs
+         self._keys.add(parameter)
+         self._names.add(parameter.name)
+ 
+diff --git a/qiskit/circuit/quantumcircuit.py b/qiskit/circuit/quantumcircuit.py
+index 5c6ff13e9..612a6abeb 100644
+--- a/qiskit/circuit/quantumcircuit.py
++++ b/qiskit/circuit/quantumcircuit.py
+@@ -49,7 +49,7 @@ from qiskit.utils.deprecation import deprecate_function
+ from .parameterexpression import ParameterExpression, ParameterValueType
+ from .quantumregister import QuantumRegister, Qubit, AncillaRegister, AncillaQubit
+ from .classicalregister import ClassicalRegister, Clbit
+-from .parametertable import ParameterTable, ParameterView
++from .parametertable import ParameterReferences, ParameterTable, ParameterView
+ from .parametervector import ParameterVector, ParameterVectorElement
+ from .instructionset import InstructionSet
+ from .register import Register
+@@ -1285,31 +1285,19 @@ class QuantumCircuit:
+ 
+             for parameter in atomic_parameters:
+                 if parameter in self._parameter_table:
+-                    if not self._check_dup_param_spec(
+-                        self._parameter_table[parameter], instruction, param_index
+-                    ):
+-                        self._parameter_table[parameter].append((instruction, param_index))
++                    self._parameter_table[parameter].add((instruction, param_index))
+                 else:
+                     if parameter.name in self._parameter_table.get_names():
+                         raise CircuitError(f"Name conflict on adding parameter: {parameter.name}")
+-                    self._parameter_table[parameter] = [(instruction, param_index)]
++                    self._parameter_table[parameter] = ParameterReferences(
++                        ((instruction, param_index),)
++                    )
+ 
+                     # clear cache if new parameter is added
+                     self._parameters = None
+ 
+         return instruction
+ 
+-    def _check_dup_param_spec(
+-        self,
+-        parameter_spec_list: Sequence[Tuple[Instruction, int]],
+-        instruction: Instruction,
+-        param_index: int,
+-    ) -> bool:
+-        for spec in parameter_spec_list:
+-            if spec[0] is instruction and spec[1] == param_index:
+-                return True
+-        return False
+-
+     def add_register(self, *regs: Union[Register, int, Sequence[Bit]]) -> None:
+         """Add registers."""
+         if not regs:
+@@ -2118,10 +2106,10 @@ class QuantumCircuit:
+ 
+         cpy._parameter_table = ParameterTable(
+             {
+-                param: [
++                param: ParameterReferences(
+                     (instr_copies[id(instr)], param_index)
+                     for instr, param_index in self._parameter_table[param]
+-                ]
++                )
+                 for param in self._parameter_table
+             }
+         )
+@@ -2569,7 +2557,7 @@ class QuantumCircuit:
+                 reference to a value that cannot be assigned.
+         """
+         # parameter might be in global phase only
+-        if parameter in self._parameter_table.keys():
++        if parameter in self._parameter_table:
+             for instr, param_index in self._parameter_table[parameter]:
+                 assignee = instr.params[param_index]
+                 # Normal ParameterExpression.
+@@ -2598,7 +2586,7 @@ class QuantumCircuit:
+                 entry = self._parameter_table.pop(parameter)
+                 for new_parameter in value.parameters:
+                     if new_parameter in self._parameter_table:
+-                        self._parameter_table[new_parameter].extend(entry)
++                        self._parameter_table[new_parameter] |= entry
+                     else:
+                         self._parameter_table[new_parameter] = entry
+             else:
+@@ -4128,11 +4116,12 @@ class QuantumCircuit:
+                 atomic_parameters.update(parameter.parameters)
+         for atomic_parameter in atomic_parameters:
+             entries = self._parameter_table[atomic_parameter]
+-            new_entries = [
++            new_entries = ParameterReferences(
+                 (entry_instruction, entry_index)
+                 for entry_instruction, entry_index in entries
+                 if entry_instruction is not instruction
+-            ]
++            )
++
+             if not new_entries:
+                 del self._parameter_table[atomic_parameter]
+                 # Invalidate cache.
+diff --git a/qiskit/opflow/gradients/circuit_gradients/lin_comb.py b/qiskit/opflow/gradients/circuit_gradients/lin_comb.py
+index 0fa8ada96..0a911b9ed 100644
+--- a/qiskit/opflow/gradients/circuit_gradients/lin_comb.py
++++ b/qiskit/opflow/gradients/circuit_gradients/lin_comb.py
+@@ -29,7 +29,7 @@ from qiskit.circuit import (
+     ParameterExpression,
+     Parameter,
+ )
+-from qiskit.circuit.parametertable import ParameterTable
++from qiskit.circuit.parametertable import ParameterReferences, ParameterTable
+ from qiskit.circuit.controlledgate import ControlledGate
+ from qiskit.circuit.library import SGate, SdgGate, XGate
+ from qiskit.circuit.library.standard_gates import (
+@@ -604,9 +604,9 @@ class LinComb(CircuitGradient):
+                     if isinstance(param_expression, ParameterExpression):
+                         for param in param_expression.parameters:
+                             if param not in table.keys():
+-                                table[param] = [(op, idx)]
++                                table[param] = ParameterReferences(((op, idx),))
+                             else:
+-                                table[param].append((op, idx))
++                                table[param].add((op, idx))
+ 
+             out._parameter_table = table
+ 
+diff --git a/qiskit/opflow/gradients/circuit_gradients/param_shift.py b/qiskit/opflow/gradients/circuit_gradients/param_shift.py
+index a49e1027e..3b2aacfa7 100644
+--- a/qiskit/opflow/gradients/circuit_gradients/param_shift.py
++++ b/qiskit/opflow/gradients/circuit_gradients/param_shift.py
+@@ -207,8 +207,13 @@ class ParamShift(CircuitGradient):
+ 
+             shifted_ops = []
+             summed_shifted_op = None
+-            for m, param_occurence in enumerate(circ._parameter_table[param]):
+-                param_index = param_occurence[1]
++
++            iref_to_data_index = {id(inst): idx for idx, (inst, _, _) in enumerate(circ.data)}
++
++            for param_reference in circ._parameter_table[param]:
++                original_gate, param_index = param_reference
++                m = iref_to_data_index[id(original_gate)]
++
+                 pshift_op = deepcopy(operator)
+                 mshift_op = deepcopy(operator)
+ 
+@@ -216,8 +221,8 @@ class ParamShift(CircuitGradient):
+                 pshift_circ = self.get_unique_circuits(pshift_op)[0]
+                 mshift_circ = self.get_unique_circuits(mshift_op)[0]
+ 
+-                pshift_gate = pshift_circ._parameter_table[param][m][0]
+-                mshift_gate = mshift_circ._parameter_table[param][m][0]
++                pshift_gate = pshift_circ.data[m][0]
++                mshift_gate = mshift_circ.data[m][0]
+ 
+                 p_param = pshift_gate.params[param_index]
+                 m_param = mshift_gate.params[param_index]
+diff --git a/qiskit/opflow/gradients/circuit_qfis/overlap_block_diag.py b/qiskit/opflow/gradients/circuit_qfis/overlap_block_diag.py
+index 01e947384..7daf64866 100644
+--- a/qiskit/opflow/gradients/circuit_qfis/overlap_block_diag.py
++++ b/qiskit/opflow/gradients/circuit_qfis/overlap_block_diag.py
+@@ -136,7 +136,7 @@ class OverlapBlockDiag(CircuitQFI):
+                         "gates parameterized by a single parameter. For such "
+                         "circuits use LinCombFull"
+                     )
+-                gate = circuit._parameter_table[param][0][0]
++                gate = next(iter(circuit._parameter_table[param]))[0]
+                 if len(gate.params) > 1:
+                     raise OpflowError(
+                         "OverlapDiag cannot yet support gates with more than one parameter."
+diff --git a/qiskit/opflow/gradients/circuit_qfis/overlap_diag.py b/qiskit/opflow/gradients/circuit_qfis/overlap_diag.py
+index 65b752d16..9efca9f67 100644
+--- a/qiskit/opflow/gradients/circuit_qfis/overlap_diag.py
++++ b/qiskit/opflow/gradients/circuit_qfis/overlap_diag.py
+@@ -120,7 +120,7 @@ class OverlapDiag(CircuitQFI):
+                     "circuits use LinCombFull"
+                 )
+ 
+-            gate = circuit._parameter_table[param][0][0]
++            gate = next(iter(circuit._parameter_table[param]))[0]
+ 
+             if len(gate.params) != 1:
+                 raise TypeError(
+diff --git a/releasenotes/notes/param-table-perf-72cd1c40533b3882.yaml b/releasenotes/notes/param-table-perf-72cd1c40533b3882.yaml
+new file mode 100644
+index 000000000..7388fbbb5
+--- /dev/null
++++ b/releasenotes/notes/param-table-perf-72cd1c40533b3882.yaml
+@@ -0,0 +1,6 @@
++---
++fixes:
++  - |
++    Improves the performance of building and working with parameterized
++    :class:`~qiskit.circuit.QuantumCircuit` instances with many gates
++    that share a relatively small number of parameters.

@@ -1,0 +1,597 @@
+diff --git a/rinja/Cargo.toml b/rinja/Cargo.toml
+index efc71169..69272201 100644
+--- a/rinja/Cargo.toml
++++ b/rinja/Cargo.toml
+@@ -44,7 +44,7 @@ maintenance = { status = "actively-developed" }
+ 
+ [features]
+ default = ["config", "std", "urlencode"]
+-full = ["default", "code-in-doc", "serde_json"]
++full = ["default", "blocks", "code-in-doc", "serde_json"]
+ 
+ alloc = [
+     "rinja_derive/alloc",
+@@ -52,6 +52,7 @@ alloc = [
+     "serde_json?/alloc",
+     "percent-encoding?/alloc"
+ ]
++blocks = ["rinja_derive/blocks"]
+ code-in-doc = ["rinja_derive/code-in-doc"]
+ config = ["rinja_derive/config"]
+ serde_json = ["rinja_derive/serde_json", "dep:serde", "dep:serde_json"]
+diff --git a/rinja_derive/Cargo.toml b/rinja_derive/Cargo.toml
+index 4306ab63..e9a2b548 100644
+--- a/rinja_derive/Cargo.toml
++++ b/rinja_derive/Cargo.toml
+@@ -39,6 +39,7 @@ syn = { version = "2.0.3", features = ["full"] }
+ 
+ [features]
+ alloc = []
++blocks = ["syn/full"]
+ code-in-doc = ["dep:pulldown-cmark"]
+ config = ["dep:serde", "dep:basic-toml", "parser/config"]
+ urlencode = []
+diff --git a/rinja_derive/src/generator.rs b/rinja_derive/src/generator.rs
+index 4cd60df5..749b5c68 100644
+--- a/rinja_derive/src/generator.rs
++++ b/rinja_derive/src/generator.rs
+@@ -25,7 +25,7 @@ pub(crate) fn template_to_string(
+     input: &TemplateInput<'_>,
+     contexts: &HashMap<&Arc<Path>, Context<'_>, FxBuildHasher>,
+     heritage: Option<&Heritage<'_, '_>>,
+-    tmpl_kind: TmplKind,
++    tmpl_kind: TmplKind<'_>,
+ ) -> Result<usize, CompileError> {
+     let generator = Generator::new(
+         input,
+@@ -50,11 +50,14 @@ pub(crate) fn template_to_string(
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub(crate) enum TmplKind {
++pub(crate) enum TmplKind<'a> {
+     /// [`rinja::Template`]
+     Struct,
+     /// [`rinja::helpers::EnumVariantTemplate`]
+     Variant,
++    /// Used in `blocks` implementation
++    #[allow(unused)]
++    Block(&'a str),
+ }
+ 
+ struct Generator<'a, 'h> {
+@@ -113,13 +116,14 @@ impl<'a, 'h> Generator<'a, 'h> {
+     fn impl_template(
+         mut self,
+         buf: &mut Buffer,
+-        tmpl_kind: TmplKind,
++        tmpl_kind: TmplKind<'a>,
+     ) -> Result<usize, CompileError> {
+         let ctx = &self.contexts[&self.input.path];
+ 
+         let target = match tmpl_kind {
+             TmplKind::Struct => "rinja::Template",
+             TmplKind::Variant => "rinja::helpers::EnumVariantTemplate",
++            TmplKind::Block(trait_name) => trait_name,
+         };
+         write_header(self.input.ast, buf, target);
+         buf.write(
+@@ -170,9 +174,158 @@ impl<'a, 'h> Generator<'a, 'h> {
+         }
+ 
+         buf.write('}');
++
++        #[cfg(feature = "blocks")]
++        for (block, span) in self.input.blocks {
++            self.impl_block(buf, block, span)?;
++        }
++
+         Ok(size_hint)
+     }
+ 
++    #[cfg(feature = "blocks")]
++    fn impl_block(
++        &self,
++        buf: &mut Buffer,
++        block: &str,
++        span: &proc_macro2::Span,
++    ) -> Result<(), CompileError> {
++        // RATIONALE: `*self` must be the input type, implementation details should not leak:
++        // - impl Self { fn as_block(self) } ->
++        // - struct __Rinja__Self__as__block__Wrapper { this: self } ->
++        // - impl Template for __Rinja__Self__as__block__Wrapper { fn render_into_with_values() } ->
++        // - impl __Rinja__Self__as__block for Self { render_into_with_values() }
++
++        use quote::quote_spanned;
++        use syn::{GenericParam, Ident, Lifetime, LifetimeParam, Token};
++
++        let span = *span;
++        buf.write(
++            "\
++            #[allow(missing_docs, non_camel_case_types, non_snake_case, unreachable_pub)]\
++            const _: () = {",
++        );
++
++        let ident = &self.input.ast.ident;
++
++        let doc = format!("A sub-template that renders only the block `{block}` of [`{ident}`].");
++        let method_name = format!("as_{block}");
++        let trait_name = format!("__Rinja__{ident}__as__{block}");
++        let wrapper_name = format!("__Rinja__{ident}__as__{block}__Wrapper");
++        let self_lt_name = format!("'__Rinja__{ident}__as__{block}__self");
++
++        let method_id = Ident::new(&method_name, span);
++        let trait_id = Ident::new(&trait_name, span);
++        let wrapper_id = Ident::new(&wrapper_name, span);
++        let self_lt = Lifetime::new(&self_lt_name, span);
++
++        // generics of the input with an additional lifetime to capture `self`
++        let mut wrapper_generics = self.input.ast.generics.clone();
++        if wrapper_generics.lt_token.is_none() {
++            wrapper_generics.lt_token = Some(Token![<](span));
++            wrapper_generics.gt_token = Some(Token![>](span));
++        }
++        wrapper_generics.params.insert(
++            0,
++            GenericParam::Lifetime(LifetimeParam::new(self_lt.clone())),
++        );
++
++        let (impl_generics, ty_generics, where_clause) = self.input.ast.generics.split_for_impl();
++        let (wrapper_impl_generics, wrapper_ty_generics, wrapper_where_clause) =
++            wrapper_generics.split_for_impl();
++
++        let input = TemplateInput {
++            block: Some((block, span)),
++            #[cfg(feature = "blocks")]
++            blocks: &[],
++            ..self.input.clone()
++        };
++        let size_hint = template_to_string(
++            buf,
++            &input,
++            self.contexts,
++            self.heritage,
++            TmplKind::Block(&trait_name),
++        )?;
++
++        buf.write(quote_spanned! {
++            span =>
++            pub trait #trait_id {
++                fn render_into_with_values<RinjaW>(
++                    &self,
++                    writer: &mut RinjaW,
++                    values: &dyn rinja::Values,
++                ) -> rinja::Result<()>
++                where
++                    RinjaW:
++                        rinja::helpers::core::fmt::Write + ?rinja::helpers::core::marker::Sized;
++            }
++
++            impl #impl_generics #ident #ty_generics #where_clause {
++                #[inline]
++                #[doc = #doc]
++                pub fn #method_id(&self) -> impl rinja::Template + '_ {
++                    #wrapper_id {
++                        this: self,
++                    }
++                }
++            }
++
++            #[rinja::helpers::core::prelude::rust_2021::derive(
++                rinja::helpers::core::prelude::rust_2021::Clone,
++                rinja::helpers::core::prelude::rust_2021::Copy
++            )]
++            pub struct #wrapper_id #wrapper_generics #wrapper_where_clause {
++                this: &#self_lt #ident #ty_generics,
++            }
++
++            impl #wrapper_impl_generics rinja::Template
++            for #wrapper_id #wrapper_ty_generics #wrapper_where_clause {
++                #[inline]
++                fn render_into_with_values<RinjaW>(
++                    &self,
++                    writer: &mut RinjaW,
++                    values: &dyn rinja::Values
++                ) -> rinja::Result<()>
++                where
++                    RinjaW: rinja::helpers::core::fmt::Write + ?rinja::helpers::core::marker::Sized
++                {
++                    <_ as #trait_id>::render_into_with_values(self.this, writer, values)
++                }
++
++                const SIZE_HINT: rinja::helpers::core::primitive::usize = #size_hint;
++            }
++
++            // cannot use `crate::integrations::impl_fast_writable()` w/o cloning the struct
++            impl #wrapper_impl_generics rinja::filters::FastWritable
++            for #wrapper_id #wrapper_ty_generics #wrapper_where_clause {
++                #[inline]
++                fn write_into<RinjaW>(&self, dest: &mut RinjaW) -> rinja::Result<()>
++                where
++                    RinjaW: rinja::helpers::core::fmt::Write + ?rinja::helpers::core::marker::Sized
++                {
++                    <_ as rinja::Template>::render_into(self, dest)
++                }
++            }
++
++            // cannot use `crate::integrations::impl_display()` w/o cloning the struct
++            impl #wrapper_impl_generics rinja::helpers::core::fmt::Display
++            for #wrapper_id #wrapper_ty_generics #wrapper_where_clause {
++                #[inline]
++                fn fmt(
++                    &self,
++                    f: &mut rinja::helpers::core::fmt::Formatter<'_>
++                ) -> rinja::helpers::core::fmt::Result {
++                    <_ as rinja::Template>::render_into(self, f)
++                        .map_err(|_| rinja::helpers::core::fmt::Error)
++                }
++            }
++        });
++
++        buf.write("};");
++        Ok(())
++    }
++
+     fn is_var_defined(&self, var_name: &str) -> bool {
+         self.locals.get(var_name).is_some() || self.input.fields.iter().any(|f| f == var_name)
+     }
+diff --git a/rinja_derive/src/generator/node.rs b/rinja_derive/src/generator/node.rs
+index 04756166..19acbd2b 100644
+--- a/rinja_derive/src/generator/node.rs
++++ b/rinja_derive/src/generator/node.rs
+@@ -1013,7 +1013,8 @@ impl<'a> Generator<'a, '_> {
+ 
+         self.write_buf_writable(ctx, buf)?;
+ 
+-        let block_fragment_write = self.input.block == name && self.buf_writable.discard;
++        let block_fragment_write =
++            self.input.block.map(|(block, _)| block) == name && self.buf_writable.discard;
+         // Allow writing to the buffer if we're in the block fragment
+         if block_fragment_write {
+             self.buf_writable.discard = false;
+diff --git a/rinja_derive/src/input.rs b/rinja_derive/src/input.rs
+index 5e20edb2..cb3d3ebb 100644
+--- a/rinja_derive/src/input.rs
++++ b/rinja_derive/src/input.rs
+@@ -17,6 +17,7 @@ use syn::{Attribute, Expr, ExprLit, ExprPath, Ident, Lit, LitBool, LitStr, Meta,
+ use crate::config::{Config, SyntaxAndCache};
+ use crate::{CompileError, FileInfo, MsgValidEscapers, OnceMap};
+ 
++#[derive(Clone)]
+ pub(crate) struct TemplateInput<'a> {
+     pub(crate) ast: &'a syn::DeriveInput,
+     pub(crate) enum_ast: Option<&'a syn::DeriveInput>,
+@@ -24,11 +25,13 @@ pub(crate) struct TemplateInput<'a> {
+     pub(crate) syntax: &'a SyntaxAndCache<'a>,
+     pub(crate) source: &'a Source,
+     pub(crate) source_span: Option<Span>,
+-    pub(crate) block: Option<&'a str>,
++    pub(crate) block: Option<(&'a str, Span)>,
++    #[cfg(feature = "blocks")]
++    pub(crate) blocks: &'a [(String, Span)],
+     pub(crate) print: Print,
+     pub(crate) escaper: &'a str,
+     pub(crate) path: Arc<Path>,
+-    pub(crate) fields: Vec<String>,
++    pub(crate) fields: Arc<[String]>,
+ }
+ 
+ impl TemplateInput<'_> {
+@@ -44,6 +47,8 @@ impl TemplateInput<'_> {
+         let TemplateArgs {
+             source: (source, source_span),
+             block,
++            #[cfg(feature = "blocks")]
++            blocks,
+             print,
+             escaping,
+             ext,
+@@ -76,7 +81,7 @@ impl TemplateInput<'_> {
+             || Ok(config.syntaxes.get(config.default_syntax).unwrap()),
+             |s| {
+                 config.syntaxes.get(s).ok_or_else(|| {
+-                    CompileError::no_file_info(format!("syntax `{s}` is undefined"), None)
++                    CompileError::no_file_info(format_args!("syntax `{s}` is undefined"), None)
+                 })
+             },
+         )?;
+@@ -98,7 +103,7 @@ impl TemplateInput<'_> {
+             })
+             .ok_or_else(|| {
+                 CompileError::no_file_info(
+-                    format!(
++                    format_args!(
+                         "no escaper defined for extension '{escaping}'. You can define an escaper \
+                         in the config file (named `rinja.toml` by default). {}",
+                         MsgValidEscapers(&config.escapers),
+@@ -133,11 +138,13 @@ impl TemplateInput<'_> {
+             syntax,
+             source,
+             source_span: *source_span,
+-            block: block.as_deref(),
++            block: block.as_ref().map(|(block, span)| (block.as_str(), *span)),
++            #[cfg(feature = "blocks")]
++            blocks: blocks.as_slice(),
+             print: *print,
+             escaper,
+             path,
+-            fields,
++            fields: fields.into(),
+         })
+     }
+ 
+@@ -289,11 +296,11 @@ impl AnyTemplateArgs {
+             return Ok(Self::Struct(TemplateArgs::new(ast)?));
+         };
+ 
+-        let enum_args = PartialTemplateArgs::new(ast, &ast.attrs)?;
++        let enum_args = PartialTemplateArgs::new(ast, &ast.attrs, false)?;
+         let vars_args = enum_data
+             .variants
+             .iter()
+-            .map(|variant| PartialTemplateArgs::new(ast, &variant.attrs))
++            .map(|variant| PartialTemplateArgs::new(ast, &variant.attrs, true))
+             .collect::<Result<Vec<_>, _>>()?;
+         if vars_args.is_empty() {
+             return Ok(Self::Struct(TemplateArgs::from_partial(ast, enum_args)?));
+@@ -346,7 +353,9 @@ impl AnyTemplateArgs {
+ 
+ pub(crate) struct TemplateArgs {
+     pub(crate) source: (Source, Option<Span>),
+-    block: Option<String>,
++    block: Option<(String, Span)>,
++    #[cfg(feature = "blocks")]
++    blocks: Vec<(String, Span)>,
+     print: Print,
+     escaping: Option<String>,
+     ext: Option<String>,
+@@ -361,7 +370,7 @@ pub(crate) struct TemplateArgs {
+ 
+ impl TemplateArgs {
+     pub(crate) fn new(ast: &syn::DeriveInput) -> Result<Self, CompileError> {
+-        Self::from_partial(ast, PartialTemplateArgs::new(ast, &ast.attrs)?)
++        Self::from_partial(ast, PartialTemplateArgs::new(ast, &ast.attrs, false)?)
+     }
+ 
+     pub(crate) fn from_partial(
+@@ -395,7 +404,14 @@ impl TemplateArgs {
+                     ));
+                 }
+             },
+-            block: args.block.map(|value| value.value()),
++            block: args.block.map(|value| (value.value(), value.span())),
++            #[cfg(feature = "blocks")]
++            blocks: args
++                .blocks
++                .unwrap_or_default()
++                .into_iter()
++                .map(|value| (value.value(), value.span()))
++                .collect(),
+             print: args.print.unwrap_or_default(),
+             escaping: args.escape.map(|value| value.value()),
+             ext: args.ext.as_ref().map(|value| value.value()),
+@@ -413,6 +429,8 @@ impl TemplateArgs {
+         Self {
+             source: (Source::Source("".into()), None),
+             block: None,
++            #[cfg(feature = "blocks")]
++            blocks: vec![],
+             print: Print::default(),
+             escaping: None,
+             ext: Some("txt".to_string()),
+@@ -509,7 +527,7 @@ fn no_rinja_code_block(span: Span, ast: &syn::DeriveInput) -> CompileError {
+         syn::Data::Union(_) => "union",
+     };
+     CompileError::no_file_info(
+-        format!(
++        format_args!(
+             "when using `in_doc` with the value `true`, the {kind}'s documentation needs a \
+              `rinja` code block"
+         ),
+@@ -641,7 +659,7 @@ impl FromStr for Print {
+ 
+ fn cyclic_graph_error(dependency_graph: &[(Arc<Path>, Arc<Path>)]) -> Result<(), CompileError> {
+     Err(CompileError::no_file_info(
+-        format!(
++        format_args!(
+             "cyclic dependency in graph {:#?}",
+             dependency_graph
+                 .iter()
+@@ -692,6 +710,8 @@ pub(crate) struct PartialTemplateArgs {
+     pub(crate) config: Option<LitStr>,
+     pub(crate) whitespace: Option<Whitespace>,
+     pub(crate) crate_name: Option<ExprPath>,
++    #[cfg(feature = "blocks")]
++    pub(crate) blocks: Option<Vec<LitStr>>,
+ }
+ 
+ #[derive(Clone)]
+@@ -719,8 +739,9 @@ const _: () = {
+         pub(crate) fn new(
+             ast: &syn::DeriveInput,
+             attrs: &[Attribute],
++            is_enum_variant: bool,
+         ) -> Result<Option<Self>, CompileError> {
+-            new(ast, attrs)
++            new(ast, attrs, is_enum_variant)
+         }
+     }
+ 
+@@ -728,6 +749,7 @@ const _: () = {
+     fn new(
+         ast: &syn::DeriveInput,
+         attrs: &[Attribute],
++        is_enum_variant: bool,
+     ) -> Result<Option<PartialTemplateArgs>, CompileError> {
+         // FIXME: implement once <https://github.com/rust-lang/rfcs/pull/3715> is stable
+         if let syn::Data::Union(data) = &ast.data {
+@@ -752,6 +774,8 @@ const _: () = {
+             config: None,
+             whitespace: None,
+             crate_name: None,
++            #[cfg(feature = "blocks")]
++            blocks: None,
+         };
+         let mut has_data = false;
+ 
+@@ -774,7 +798,7 @@ const _: () = {
+                 .parse_args_with(<Punctuated<Meta, Token![,]>>::parse_terminated)
+                 .map_err(|e| {
+                     CompileError::no_file_info(
+-                        format!("unable to parse template arguments: {e}"),
++                        format_args!("unable to parse template arguments: {e}"),
+                         Some(attr.path().span()),
+                     )
+                 })?;
+@@ -794,9 +818,41 @@ const _: () = {
+                 };
+ 
+                 if ident == "rinja" {
++                    if is_enum_variant {
++                        return Err(CompileError::no_file_info(
++                            "template attribute `rinja` can only be used on the `enum`, \
++                            not its variants",
++                            Some(ident.span()),
++                        ));
++                    }
+                     ensure_only_once(ident, &mut this.crate_name)?;
+                     this.crate_name = Some(get_exprpath(ident, pair.value)?);
+                     continue;
++                } else if ident == "blocks" {
++                    if !cfg!(feature = "blocks") {
++                        return Err(CompileError::no_file_info(
++                            "enable feature `blocks` to use `blocks` argument",
++                            Some(ident.span()),
++                        ));
++                    } else if is_enum_variant {
++                        return Err(CompileError::no_file_info(
++                            "template attribute `blocks` can only be used on the `enum`, \
++                            not its variants",
++                            Some(ident.span()),
++                        ));
++                    }
++                    #[cfg(feature = "blocks")]
++                    {
++                        ensure_only_once(ident, &mut this.blocks)?;
++                        this.blocks = Some(
++                            get_exprarray(ident, pair.value)?
++                                .elems
++                                .into_iter()
++                                .map(|value| get_strlit(ident, get_lit(ident, value)?))
++                                .collect::<Result<_, _>>()?,
++                        );
++                        continue;
++                    }
+                 }
+ 
+                 let value = get_lit(ident, pair.value)?;
+@@ -845,7 +901,7 @@ const _: () = {
+                     set_parseable_string(ident, value, &mut this.whitespace)?;
+                 } else {
+                     return Err(CompileError::no_file_info(
+-                        format!("unsupported template attribute `{ident}` found"),
++                        format_args!("unsupported template attribute `{ident}` found"),
+                         Some(ident.span()),
+                     ));
+                 }
+@@ -898,7 +954,7 @@ const _: () = {
+             Ok(())
+         } else {
+             Err(CompileError::no_file_info(
+-                format!("template attribute `{name}` already set"),
++                format_args!("template attribute `{name}` already set"),
+                 Some(name.span()),
+             ))
+         }
+@@ -911,7 +967,7 @@ const _: () = {
+                 Expr::Group(group) => expr = *group.expr,
+                 v => {
+                     return Err(CompileError::no_file_info(
+-                        format!("template attribute `{name}` expects a literal"),
++                        format_args!("template attribute `{name}` expects a literal"),
+                         Some(v.span()),
+                     ));
+                 }
+@@ -924,7 +980,7 @@ const _: () = {
+             Ok(s)
+         } else {
+             Err(CompileError::no_file_info(
+-                format!("template attribute `{name}` expects a string literal"),
++                format_args!("template attribute `{name}` expects a string literal"),
+                 Some(value.lit.span()),
+             ))
+         }
+@@ -935,7 +991,7 @@ const _: () = {
+             Ok(s)
+         } else {
+             Err(CompileError::no_file_info(
+-                format!("template attribute `{name}` expects a boolean value"),
++                format_args!("template attribute `{name}` expects a boolean value"),
+                 Some(value.lit.span()),
+             ))
+         }
+@@ -948,7 +1004,23 @@ const _: () = {
+                 Expr::Group(group) => expr = *group.expr,
+                 v => {
+                     return Err(CompileError::no_file_info(
+-                        format!("template attribute `{name}` expects a path or identifier"),
++                        format_args!("template attribute `{name}` expects a path or identifier"),
++                        Some(v.span()),
++                    ));
++                }
++            }
++        }
++    }
++
++    #[cfg(feature = "blocks")]
++    fn get_exprarray(name: &Ident, mut expr: Expr) -> Result<syn::ExprArray, CompileError> {
++        loop {
++            match expr {
++                Expr::Array(array) => return Ok(array),
++                Expr::Group(group) => expr = *group.expr,
++                v => {
++                    return Err(CompileError::no_file_info(
++                        format_args!("template attribute `{name}` expects an array"),
+                         Some(v.span()),
+                     ));
+                 }
+diff --git a/rinja_derive/src/lib.rs b/rinja_derive/src/lib.rs
+index 27e6ac50..0d6a68f5 100644
+--- a/rinja_derive/src/lib.rs
++++ b/rinja_derive/src/lib.rs
+@@ -262,7 +262,7 @@ fn build_template_item(
+     ast: &syn::DeriveInput,
+     enum_ast: Option<&syn::DeriveInput>,
+     template_args: &TemplateArgs,
+-    tmpl_kind: TmplKind,
++    tmpl_kind: TmplKind<'_>,
+ ) -> Result<usize, CompileError> {
+     let config_path = template_args.config_path();
+     let s = read_config_file(config_path, template_args.config_span)?;
+@@ -286,11 +286,11 @@ fn build_template_item(
+     let heritage = if !ctx.blocks.is_empty() || ctx.extends.is_some() {
+         let heritage = Heritage::new(ctx, &contexts);
+ 
+-        if let Some(block_name) = input.block {
++        if let Some((block_name, block_span)) = input.block {
+             if !heritage.blocks.contains_key(&block_name) {
+                 return Err(CompileError::no_file_info(
+-                    format!("cannot find block {block_name}"),
+-                    None,
++                    format_args!("cannot find block `{block_name}`"),
++                    Some(block_span),
+                 ));
+             }
+         }
+diff --git a/rinja_derive_standalone/Cargo.toml b/rinja_derive_standalone/Cargo.toml
+index 63686383..50a9f252 100644
+--- a/rinja_derive_standalone/Cargo.toml
++++ b/rinja_derive_standalone/Cargo.toml
+@@ -46,6 +46,7 @@ syn = { version = "2.0.3", features = ["full"] }
+ default = ["__standalone"]
+ __standalone = []
+ 
++blocks = ["syn/full"]
+ code-in-doc = ["dep:pulldown-cmark"]
+ config = ["dep:serde", "dep:basic-toml", "parser/config"]
+ urlencode = []

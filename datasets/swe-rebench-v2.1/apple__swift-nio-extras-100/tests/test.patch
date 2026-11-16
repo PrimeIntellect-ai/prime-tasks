@@ -1,0 +1,121 @@
+diff --git a/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest+XCTest.swift b/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest+XCTest.swift
+index 3159ca3..1be6791 100644
+--- a/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest+XCTest.swift
++++ b/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest+XCTest.swift
+@@ -44,6 +44,7 @@ extension HTTPResponseCompressorTest {
+                 ("testOverridesContentEncodingHeader", testOverridesContentEncodingHeader),
+                 ("testRemovingHandlerFailsPendingWrites", testRemovingHandlerFailsPendingWrites),
+                 ("testDoesNotBufferWritesNoAlgorithm", testDoesNotBufferWritesNoAlgorithm),
++                ("testChunkedGzipResponseProducesCorrectNumberOfWrites", testChunkedGzipResponseProducesCorrectNumberOfWrites),
+                 ("testStartsWithSameUnicodeScalarsWorksOnEmptyStrings", testStartsWithSameUnicodeScalarsWorksOnEmptyStrings),
+                 ("testStartsWithSameUnicodeScalarsWorksOnLongerNeedleFalse", testStartsWithSameUnicodeScalarsWorksOnLongerNeedleFalse),
+                 ("testStartsWithSameUnicodeScalarsWorksOnSameStrings", testStartsWithSameUnicodeScalarsWorksOnSameStrings),
+diff --git a/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest.swift b/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest.swift
+index 6824b62..cb5ba8e 100644
+--- a/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest.swift
++++ b/Tests/NIOHTTPCompressionTests/HTTPResponseCompressorTest.swift
+@@ -125,6 +125,7 @@ class HTTPResponseCompressorTest: XCTestCase {
+     private enum WriteStrategy {
+         case once
+         case intermittentFlushes
++        case flushEveryWrite
+     }
+ 
+     private func sendRequest(acceptEncoding: String?, channel: EmbeddedChannel) throws {
+@@ -179,6 +180,23 @@ class HTTPResponseCompressorTest: XCTestCase {
+         try promiseOrderer.waitUntilComplete()
+     }
+ 
++    private func writeFlushEveryWrite(head: HTTPResponseHead, body: [ByteBuffer], channel: EmbeddedChannel) throws {
++        let promiseOrderer = PromiseOrderer(eventLoop: channel.eventLoop)
++        channel.pipeline.write(NIOAny(HTTPServerResponsePart.head(head)), promise: promiseOrderer.makePromise())
++        channel.pipeline.flush()
++        for bodyChunk in body {
++            channel.pipeline.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(bodyChunk))),
++                                   promise: promiseOrderer.makePromise())
++            channel.pipeline.flush()
++        }
++        channel.pipeline.write(NIOAny(HTTPServerResponsePart.end(nil)),
++                               promise: promiseOrderer.makePromise())
++        channel.pipeline.flush()
++
++        // Get all the promises to fire.
++        try promiseOrderer.waitUntilComplete()
++    }
++
+     private func compressResponse(head: HTTPResponseHead,
+                                   body: [ByteBuffer],
+                                   channel: EmbeddedChannel,
+@@ -188,6 +206,8 @@ class HTTPResponseCompressorTest: XCTestCase {
+             try writeOneChunk(head: head, body: body, channel: channel)
+         case .intermittentFlushes:
+             try writeIntermittentFlushes(head: head, body: body, channel: channel)
++        case .flushEveryWrite:
++            try writeFlushEveryWrite(head: head, body: body, channel: channel)
+         }
+ 
+         // Feed the output from this channel into a client one. We need to have the client see a
+@@ -259,7 +279,7 @@ class HTTPResponseCompressorTest: XCTestCase {
+         case .once:
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "content-length"], ["\(compressedBody.readableBytes)"])
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "transfer-encoding"], [])
+-        case .intermittentFlushes:
++        case .intermittentFlushes, .flushEveryWrite:
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "content-length"], [])
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "transfer-encoding"], ["chunked"])
+         }
+@@ -297,7 +317,7 @@ class HTTPResponseCompressorTest: XCTestCase {
+         case .once:
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "content-length"], ["\(compressedBody.readableBytes)"])
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "transfer-encoding"], [])
+-        case .intermittentFlushes:
++        case .intermittentFlushes, .flushEveryWrite:
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "content-length"], [])
+             XCTAssertEqual(compressedResponse.headers[canonicalForm: "transfer-encoding"], ["chunked"])
+         }
+@@ -545,6 +565,45 @@ class HTTPResponseCompressorTest: XCTestCase {
+         XCTAssertNoThrow(try channel.pipeline.removeHandler(name: "compressor").wait())
+         XCTAssertNoThrow(try writePromise.futureResult.wait())
+     }
++    
++    func testChunkedGzipResponseProducesCorrectNumberOfWrites() throws {
++        // A chunked gzip response must be a complete, valid gzip stream: the gzip
++        // trailer has to be emitted even when the final flush carries no body bytes.
++        // Otherwise zlib-based decoders (and command-line gzip) reject the response.
++        let channel = try compressionChannel()
++        defer {
++            XCTAssertNoThrow(try channel.finish())
++        }
++        try sendRequest(acceptEncoding: "gzip", channel: channel)
++
++        let bodySize = 2048
++        let response = HTTPResponseHead(version: HTTPVersion(major: 1, minor: 1), status: .ok)
++        let body = [UInt8](repeating: 60, count: bodySize)
++        var bodyBuffer = channel.allocator.buffer(capacity: bodySize)
++        bodyBuffer.writeBytes(body)
++
++        var bodyChunks = [ByteBuffer]()
++        for index in stride(from: 0, to: bodyBuffer.readableBytes, by: 2) {
++            bodyChunks.append(bodyBuffer.getSlice(at: index, length: 2)!)
++        }
++
++        let data = try compressResponse(head: response,
++                                        body: bodyChunks,
++                                        channel: channel,
++                                        writeStrategy: .flushEveryWrite)
++        let compressedResponse = data.0
++        var compressedChunks = data.1
++        var compressedBody = compressedChunks[0].merge(compressedChunks[1...])
++
++        XCTAssertEqual(compressedResponse.headers[canonicalForm: "content-encoding"], ["gzip"])
++
++        // The decompressor asserts that it reaches the end of the gzip stream and that
++        // the decompressed bytes match the original body.
++        assertDecompressedResponseMatches(responseData: &compressedBody,
++                                          expectedResponse: bodyBuffer,
++                                          allocator: channel.allocator,
++                                          decompressor: z_stream.decompressGzip)
++    }
+ 
+     func testStartsWithSameUnicodeScalarsWorksOnEmptyStrings() throws {
+         XCTAssertTrue("".startsWithSameUnicodeScalars(string: ""))

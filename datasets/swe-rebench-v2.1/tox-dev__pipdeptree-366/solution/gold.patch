@@ -1,0 +1,189 @@
+diff --git a/README.md b/README.md
+index 07763d4..3ec2291 100644
+--- a/README.md
++++ b/README.md
+@@ -31,6 +31,8 @@ that this capability has been recently added in version `2.0.0`.
+ 
+ Alternatively, you may also install pipdeptree inside the virtualenv and then run it from there.
+ 
++As of version `2.21.0`, you may also pass `--python auto`, where it will attempt to detect your virtual environment and grab the interpreter from there. It will fail if it is unable to detect one.
++
+ ## Usage and examples
+ 
+ To give you a brief idea, here is the output of `pipdeptree` compared with `pip freeze`:
+diff --git a/src/pipdeptree/__main__.py b/src/pipdeptree/__main__.py
+index ae9d63a..d5881a0 100644
+--- a/src/pipdeptree/__main__.py
++++ b/src/pipdeptree/__main__.py
+@@ -6,6 +6,7 @@ import sys
+ from typing import Sequence
+ 
+ from pipdeptree._cli import get_options
++from pipdeptree._detect_env import detect_active_interpreter
+ from pipdeptree._discovery import get_installed_distributions
+ from pipdeptree._models import PackageDAG
+ from pipdeptree._render import render
+@@ -24,6 +25,9 @@ def main(args: Sequence[str] | None = None) -> None | int:
+     warning_printer = get_warning_printer()
+     warning_printer.warning_type = options.warn
+ 
++    if options.python == "auto":
++        options.python = detect_active_interpreter()
++
+     pkgs = get_installed_distributions(
+         interpreter=options.python, local_only=options.local_only, user_only=options.user_only
+     )
+diff --git a/src/pipdeptree/_adapter.py b/src/pipdeptree/_adapter.py
+index 6117724..2593662 100644
+--- a/src/pipdeptree/_adapter.py
++++ b/src/pipdeptree/_adapter.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ import locale
+ from json import JSONDecodeError
+ from pathlib import Path
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any
+ 
+ from pip._internal.models.direct_url import (
+     DirectUrl,  # noqa: PLC2701
+@@ -34,7 +34,7 @@ class PipBaseDistributionAdapter:
+         self._version = Version(dist.version)
+ 
+     @property
+-    def raw_name(self) -> str:
++    def raw_name(self) -> str | Any:
+         return self._raw_name
+ 
+     @property
+@@ -71,6 +71,6 @@ class PipBaseDistributionAdapter:
+         result = None
+         egg_link_path = egg_link_path_from_sys_path(self.raw_name)
+         if egg_link_path:
+-            with Path(egg_link_path).open("r", encoding=locale.getpreferredencoding(False)) as f:
++            with Path(egg_link_path).open("r", encoding=locale.getpreferredencoding(False)) as f:  # noqa: FBT003
+                 result = f.readline().rstrip()
+         return result
+diff --git a/src/pipdeptree/_cli.py b/src/pipdeptree/_cli.py
+index 9359b1a..29e10f9 100644
+--- a/src/pipdeptree/_cli.py
++++ b/src/pipdeptree/_cli.py
+@@ -52,7 +52,14 @@ def build_parser() -> ArgumentParser:
+     )
+ 
+     select = parser.add_argument_group(title="select", description="choose what to render")
+-    select.add_argument("--python", default=sys.executable, help="Python interpreter to inspect")
++    select.add_argument(
++        "--python",
++        default=sys.executable,
++        help=(
++            'Python interpreter to inspect. With "auto", it attempts to detect your virtual environment and fails if'
++            " it can't."
++        ),
++    )
+     select.add_argument(
+         "-p",
+         "--packages",
+diff --git a/src/pipdeptree/_detect_env.py b/src/pipdeptree/_detect_env.py
+new file mode 100644
+index 0000000..e1ba079
+--- /dev/null
++++ b/src/pipdeptree/_detect_env.py
+@@ -0,0 +1,98 @@
++from __future__ import annotations
++
++import os
++import platform
++import subprocess  # noqa: S404
++import sys
++from pathlib import Path
++from typing import Callable
++
++
++def detect_active_interpreter() -> str:
++    """
++    Attempt to detect a venv, virtualenv, poetry, or conda environment by looking for certain markers.
++
++    If it fails to find any, it will fail with a message.
++    """
++    detection_funcs: list[Callable[[], Path | None]] = [
++        detect_venv_or_virtualenv_interpreter,
++        detect_conda_env_interpreter,
++        detect_poetry_env_interpreter,
++    ]
++    for detect in detection_funcs:
++        path = detect()
++        if not path:
++            continue
++        if not path.exists():
++            break
++        return str(path)
++
++    print("Unable to detect virtual environment.", file=sys.stderr)  # noqa: T201
++    raise SystemExit(1)
++
++
++def detect_venv_or_virtualenv_interpreter() -> Path | None:
++    # Both virtualenv and venv set this environment variable.
++    env_var = os.environ.get("VIRTUAL_ENV")
++    if not env_var:
++        return None
++
++    path = Path(env_var)
++    path /= determine_bin_dir()
++
++    file_name = determine_interpreter_file_name()
++    return path / file_name if file_name else None
++
++
++def determine_bin_dir() -> str:
++    return "Scripts" if os.name == "nt" else "bin"
++
++
++def detect_conda_env_interpreter() -> Path | None:
++    # Env var mentioned in https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html#saving-environment-variables.
++    env_var = os.environ.get("CONDA_PREFIX")
++    if not env_var:
++        return None
++
++    path = Path(env_var)
++
++    # On POSIX systems, conda adds the python executable to the /bin directory. On Windows, it resides in the parent
++    # directory of /bin (i.e. the root directory).
++    # See https://docs.anaconda.com/free/working-with-conda/configurations/python-path/#examples.
++    if os.name == "posix":  # pragma: posix cover
++        path /= "bin"
++
++    file_name = determine_interpreter_file_name()
++
++    return path / file_name if file_name else None
++
++
++def detect_poetry_env_interpreter() -> Path | None:
++    # poetry doesn't expose an environment variable like other implementations, so we instead use its CLI to snatch the
++    # active interpreter.
++    # See https://python-poetry.org/docs/managing-environments/#displaying-the-environment-information.
++    try:
++        result = subprocess.run(
++            ("poetry", "env", "info", "--executable"),  # noqa: S603
++            check=True,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.DEVNULL,
++        )
++    except Exception:  # noqa: BLE001
++        return None
++
++    return Path(result.stdout.strip())
++
++
++def determine_interpreter_file_name() -> str | None:
++    impl_name_to_file_name_dict = {"CPython": "python", "PyPy": "pypy"}
++    name = impl_name_to_file_name_dict.get(platform.python_implementation())
++    if not name:
++        return None
++    if os.name == "nt":  # pragma: nt cover
++        return name + ".exe"
++    return name
++
++
++__all__ = ["detect_active_interpreter"]

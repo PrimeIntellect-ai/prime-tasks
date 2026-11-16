@@ -1,0 +1,154 @@
+diff --git a/pkg/gcc/send_side_bwe_test.go b/pkg/gcc/send_side_bwe_test.go
+index 34ddfa0..e66ddb1 100644
+--- a/pkg/gcc/send_side_bwe_test.go
++++ b/pkg/gcc/send_side_bwe_test.go
+@@ -19,7 +19,7 @@ type mockTWCCResponder struct {
+ 	rtpChan chan []byte
+ }
+ 
+-func (m *mockTWCCResponder) Read(out []byte, attributes interceptor.Attributes) (int, interceptor.Attributes, error) {
++func (m *mockTWCCResponder) Read(out []byte, _ interceptor.Attributes) (int, interceptor.Attributes, error) {
+ 	pkt := <-m.rtpChan
+ 	copy(out, pkt)
+ 	return len(pkt), nil, nil
+@@ -35,7 +35,7 @@ type mockGCCWriteStream struct {
+ 	twccResponder *mockTWCCResponder
+ }
+ 
+-func (m *mockGCCWriteStream) Write(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
++func (m *mockGCCWriteStream) Write(header *rtp.Header, payload []byte, _ interceptor.Attributes) (int, error) {
+ 	pkt, err := (&rtp.Packet{Header: *header, Payload: payload}).Marshal()
+ 	if err != nil {
+ 		panic(err)
+@@ -125,12 +125,10 @@ func BenchmarkSendSideBWE_WriteRTCP(b *testing.B) {
+ 				for j := 0; j < seqs; j++ {
+ 					seq++
+ 
+-					if rand.Intn(5) == 0 { //nolint:gosec,staticcheck
+-						// skip this packet
++					if rand.Intn(5) != 0 { //nolint:gosec,staticcheck
++						arrivalTime += int64(rtcp.TypeTCCDeltaScaleFactor * (rand.Intn(128) + 1)) //nolint:gosec
++						r.Record(5000, seq, arrivalTime)
+ 					}
+-
+-					arrivalTime += int64(rtcp.TypeTCCDeltaScaleFactor * (rand.Intn(128) + 1)) //nolint:gosec
+-					r.Record(5000, seq, arrivalTime)
+ 				}
+ 
+ 				rtcpPackets := r.BuildFeedbackPacket()
+diff --git a/pkg/nack/responder_interceptor_test.go b/pkg/nack/responder_interceptor_test.go
+index fa1d881..0cc6feb 100644
+--- a/pkg/nack/responder_interceptor_test.go
++++ b/pkg/nack/responder_interceptor_test.go
+@@ -113,7 +113,7 @@ func TestResponderInterceptor_DisableCopy(t *testing.T) {
+ 
+ // this test is only useful when being run with the race detector, it won't fail otherwise:
+ //
+-//     go test -race ./pkg/nack/
++// go test -race ./pkg/nack/
+ func TestResponderInterceptor_Race(t *testing.T) {
+ 	f, err := NewResponderInterceptor(
+ 		ResponderSize(32768),
+@@ -147,3 +147,76 @@ func TestResponderInterceptor_Race(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestGeneratorInterceptor_UnbindRemoteStream(t *testing.T) {
++	const interval = time.Millisecond * 10
++	f, err := NewGeneratorInterceptor(
++		GeneratorInterval(interval),
++		GeneratorLog(logging.NewDefaultLoggerFactory().NewLogger("test")),
++	)
++	require.NoError(t, err)
++
++	i, err := f.NewInterceptor("")
++	require.NoError(t, err)
++
++	info := &interceptor.StreamInfo{
++		SSRC:         1,
++		RTCPFeedback: []interceptor.RTCPFeedback{{Type: "nack"}},
++	}
++	stream := test.NewMockStream(info, i)
++	defer func() {
++		require.NoError(t, stream.Close())
++	}()
++
++	// Packets 11 and 12 are missing, so the generator keeps requesting them.
++	for _, seqNum := range []uint16{10, 13} {
++		stream.ReceiveRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: seqNum}})
++		select {
++		case r := <-stream.ReadRTP():
++			require.NoError(t, r.Err)
++			require.Equal(t, seqNum, r.Packet.SequenceNumber)
++		case <-time.After(100 * time.Millisecond):
++			t.Fatal("receiver rtp packet not found")
++		}
++	}
++
++	nackFor := func(pkts []rtcp.Packet, ssrc uint32) bool {
++		for _, pkt := range pkts {
++			if nack, ok := pkt.(*rtcp.TransportLayerNack); ok && nack.MediaSSRC == ssrc {
++				return true
++			}
++		}
++		return false
++	}
++
++	select {
++	case pkts := <-stream.WrittenRTCP():
++		require.True(t, nackFor(pkts, 1), "nack expected before the remote stream is removed")
++	case <-time.After(time.Second):
++		t.Fatal("nack not written before the remote stream is removed")
++	}
++
++	i.UnbindRemoteStream(info)
++
++	// Drain any nack that was written before the removal took effect.
++	drained := true
++	for drained {
++		select {
++		case <-stream.WrittenRTCP():
++		default:
++			drained = false
++		}
++	}
++
++	// Once the remote stream is removed, no further nacks should be generated for it.
++	timeout := time.NewTimer(interval * 5)
++	defer timeout.Stop()
++	for {
++		select {
++		case pkts := <-stream.WrittenRTCP():
++			require.False(t, nackFor(pkts, 1), "no nack expected for a removed remote stream")
++		case <-timeout.C:
++			return
++		}
++	}
++}
+diff --git a/pkg/nack/send_buffer_test.go b/pkg/nack/send_buffer_test.go
+index 751f6c0..7b00009 100644
+--- a/pkg/nack/send_buffer_test.go
++++ b/pkg/nack/send_buffer_test.go
+@@ -98,7 +98,7 @@ func TestSendBuffer_Overridden(t *testing.T) {
+ 
+ // this test is only useful when being run with the race detector, it won't fail otherwise:
+ //
+-//     go test -race ./pkg/nack/
++// go test -race ./pkg/nack/
+ func TestSendBuffer_Race(t *testing.T) {
+ 	pm := newPacketManager()
+ 	for _, start := range []uint16{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 511, 512, 513, 32767, 32768, 32769, 65527, 65528, 65529, 65530, 65531, 65532, 65533, 65534, 65535} {
+diff --git a/pkg/report/receiver_interceptor_test.go b/pkg/report/receiver_interceptor_test.go
+index 412122c..aa87a81 100644
+--- a/pkg/report/receiver_interceptor_test.go
++++ b/pkg/report/receiver_interceptor_test.go
+@@ -182,7 +182,7 @@ func TestReceiverInterceptor(t *testing.T) {
+ 		assert.Equal(t, 1, len(rr.Reports))
+ 		assert.Equal(t, rtcp.ReceptionReport{
+ 			SSRC:               uint32(123456),
+-			LastSequenceNumber: 1<<16 | 0x0000,
++			LastSequenceNumber: 1 << 16,
+ 			LastSenderReport:   0,
+ 			FractionLost:       0,
+ 			TotalLost:          0,

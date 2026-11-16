@@ -1,0 +1,205 @@
+diff --git a/cmd/helm/uninstall.go b/cmd/helm/uninstall.go
+index f4f5d87e8..67f778f15 100644
+--- a/cmd/helm/uninstall.go
++++ b/cmd/helm/uninstall.go
+@@ -71,6 +71,7 @@ func newUninstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 	f.BoolVar(&client.DryRun, "dry-run", false, "simulate a uninstall")
+ 	f.BoolVar(&client.DisableHooks, "no-hooks", false, "prevent hooks from running during uninstallation")
+ 	f.BoolVar(&client.KeepHistory, "keep-history", false, "remove all associated resources and mark the release as deleted, but retain the release history")
++	f.BoolVar(&client.Wait, "wait", false, "if set, will wait until all the resources are deleted before returning. It will wait for as long as --timeout")
+ 	f.DurationVar(&client.Timeout, "timeout", 300*time.Second, "time to wait for any individual Kubernetes operation (like Jobs for hooks)")
+ 	f.StringVar(&client.Description, "description", "", "add a custom description")
+ 
+diff --git a/pkg/action/uninstall.go b/pkg/action/uninstall.go
+index c762159cb..65993df4c 100644
+--- a/pkg/action/uninstall.go
++++ b/pkg/action/uninstall.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/pkg/errors"
+ 
+ 	"helm.sh/helm/v3/pkg/chartutil"
++	"helm.sh/helm/v3/pkg/kube"
+ 	"helm.sh/helm/v3/pkg/release"
+ 	"helm.sh/helm/v3/pkg/releaseutil"
+ 	helmtime "helm.sh/helm/v3/pkg/time"
+@@ -37,6 +38,7 @@ type Uninstall struct {
+ 	DisableHooks bool
+ 	DryRun       bool
+ 	KeepHistory  bool
++	Wait         bool
+ 	Timeout      time.Duration
+ 	Description  string
+ }
+@@ -110,13 +112,21 @@ func (u *Uninstall) Run(name string) (*release.UninstallReleaseResponse, error)
+ 		u.cfg.Log("uninstall: Failed to store updated release: %s", err)
+ 	}
+ 
+-	kept, errs := u.deleteRelease(rel)
++	deletedResources, kept, errs := u.deleteRelease(rel)
+ 
+ 	if kept != "" {
+ 		kept = "These resources were kept due to the resource policy:\n" + kept
+ 	}
+ 	res.Info = kept
+ 
++	if u.Wait {
++		if kubeClient, ok := u.cfg.KubeClient.(kube.InterfaceExt); ok {
++			if err := kubeClient.WaitForDelete(deletedResources, u.Timeout); err != nil {
++				errs = append(errs, err)
++			}
++		}
++	}
++
+ 	if !u.DisableHooks {
+ 		if err := u.cfg.execHook(rel, release.HookPostDelete, u.Timeout); err != nil {
+ 			errs = append(errs, err)
+@@ -172,12 +182,12 @@ func joinErrors(errs []error) string {
+ 	return strings.Join(es, "; ")
+ }
+ 
+-// deleteRelease deletes the release and returns manifests that were kept in the deletion process
+-func (u *Uninstall) deleteRelease(rel *release.Release) (string, []error) {
++// deleteRelease deletes the release and returns list of delete resources and manifests that were kept in the deletion process
++func (u *Uninstall) deleteRelease(rel *release.Release) (kube.ResourceList, string, []error) {
+ 	var errs []error
+ 	caps, err := u.cfg.getCapabilities()
+ 	if err != nil {
+-		return rel.Manifest, []error{errors.Wrap(err, "could not get apiVersions from Kubernetes")}
++		return nil, rel.Manifest, []error{errors.Wrap(err, "could not get apiVersions from Kubernetes")}
+ 	}
+ 
+ 	manifests := releaseutil.SplitManifests(rel.Manifest)
+@@ -187,7 +197,7 @@ func (u *Uninstall) deleteRelease(rel *release.Release) (string, []error) {
+ 		// FIXME: One way to delete at this point would be to try a label-based
+ 		// deletion. The problem with this is that we could get a false positive
+ 		// and delete something that was not legitimately part of this release.
+-		return rel.Manifest, []error{errors.Wrap(err, "corrupted release record. You must manually delete the resources")}
++		return nil, rel.Manifest, []error{errors.Wrap(err, "corrupted release record. You must manually delete the resources")}
+ 	}
+ 
+ 	filesToKeep, filesToDelete := filterManifestsToKeep(files)
+@@ -203,10 +213,10 @@ func (u *Uninstall) deleteRelease(rel *release.Release) (string, []error) {
+ 
+ 	resources, err := u.cfg.KubeClient.Build(strings.NewReader(builder.String()), false)
+ 	if err != nil {
+-		return "", []error{errors.Wrap(err, "unable to build kubernetes objects for delete")}
++		return nil, "", []error{errors.Wrap(err, "unable to build kubernetes objects for delete")}
+ 	}
+ 	if len(resources) > 0 {
+ 		_, errs = u.cfg.KubeClient.Delete(resources)
+ 	}
+-	return kept, errs
++	return resources, kept, errs
+ }
+diff --git a/pkg/kube/client.go b/pkg/kube/client.go
+index 76a832b0e..cc38243ac 100644
+--- a/pkg/kube/client.go
++++ b/pkg/kube/client.go
+@@ -162,6 +162,15 @@ func (c *Client) WaitWithJobs(resources ResourceList, timeout time.Duration) err
+ 	return w.waitForResources(resources)
+ }
+ 
++// WaitForDelete wait up to the given timeout for the specified resources to be deleted.
++func (c *Client) WaitForDelete(resources ResourceList, timeout time.Duration) error {
++	w := waiter{
++		log:     c.Log,
++		timeout: timeout,
++	}
++	return w.waitForDeletedResources(resources)
++}
++
+ func (c *Client) namespace() string {
+ 	if c.Namespace != "" {
+ 		return c.Namespace
+diff --git a/pkg/kube/fake/fake.go b/pkg/kube/fake/fake.go
+index ff800864c..652074bdf 100644
+--- a/pkg/kube/fake/fake.go
++++ b/pkg/kube/fake/fake.go
+@@ -63,7 +63,15 @@ func (f *FailingKubeClient) WaitWithJobs(resources kube.ResourceList, d time.Dur
+ 	if f.WaitError != nil {
+ 		return f.WaitError
+ 	}
+-	return f.PrintingKubeClient.Wait(resources, d)
++	return f.PrintingKubeClient.WaitWithJobs(resources, d)
++}
++
++// WaitForDelete returns the configured error if set or prints
++func (f *FailingKubeClient) WaitForDelete(resources kube.ResourceList, d time.Duration) error {
++	if f.WaitError != nil {
++		return f.WaitError
++	}
++	return f.PrintingKubeClient.WaitForDelete(resources, d)
+ }
+ 
+ // Delete returns the configured error if set or prints
+diff --git a/pkg/kube/fake/printer.go b/pkg/kube/fake/printer.go
+index e8bd1845b..1e8cf0066 100644
+--- a/pkg/kube/fake/printer.go
++++ b/pkg/kube/fake/printer.go
+@@ -57,6 +57,11 @@ func (p *PrintingKubeClient) WaitWithJobs(resources kube.ResourceList, _ time.Du
+ 	return err
+ }
+ 
++func (p *PrintingKubeClient) WaitForDelete(resources kube.ResourceList, _ time.Duration) error {
++	_, err := io.Copy(p.Out, bufferize(resources))
++	return err
++}
++
+ // Delete implements KubeClient delete.
+ //
+ // It only prints out the content to be deleted.
+diff --git a/pkg/kube/interface.go b/pkg/kube/interface.go
+index 59a4cbdcc..299e34e95 100644
+--- a/pkg/kube/interface.go
++++ b/pkg/kube/interface.go
+@@ -70,4 +70,13 @@ type Interface interface {
+ 	IsReachable() error
+ }
+ 
++// InterfaceExt is introduced to avoid breaking backwards compatibility for Interface implementers.
++//
++// TODO Helm 4: Remove InterfaceExt and integrate its method(s) into the Interface.
++type InterfaceExt interface {
++	// WaitForDelete wait up to the given timeout for the specified resources to be deleted.
++	WaitForDelete(resources ResourceList, timeout time.Duration) error
++}
++
+ var _ Interface = (*Client)(nil)
++var _ InterfaceExt = (*Client)(nil)
+diff --git a/pkg/kube/wait.go b/pkg/kube/wait.go
+index f9ea2ea85..8928d6745 100644
+--- a/pkg/kube/wait.go
++++ b/pkg/kube/wait.go
+@@ -28,6 +28,7 @@ import (
+ 	batchv1 "k8s.io/api/batch/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -60,6 +61,24 @@ func (w *waiter) waitForResources(created ResourceList) error {
+ 	}, ctx.Done())
+ }
+ 
++// waitForDeletedResources polls to check if all the resources are deleted or a timeout is reached
++func (w *waiter) waitForDeletedResources(deleted ResourceList) error {
++	w.log("beginning wait for %d resources to be deleted with timeout of %v", len(deleted), w.timeout)
++
++	ctx, cancel := context.WithTimeout(context.Background(), w.timeout)
++	defer cancel()
++
++	return wait.PollImmediateUntil(2*time.Second, func() (bool, error) {
++		for _, v := range deleted {
++			err := v.Get()
++			if err == nil || !apierrors.IsNotFound(err) {
++				return false, err
++			}
++		}
++		return true, nil
++	}, ctx.Done())
++}
++
+ // SelectorsForObject returns the pod label selector for a given object
+ //
+ // Modified version of https://github.com/kubernetes/kubernetes/blob/v1.14.1/pkg/kubectl/polymorphichelpers/helpers.go#L84

@@ -1,0 +1,428 @@
+diff --git a/xngin-plan/src/builder/tests.rs b/xngin-plan/src/builder/tests.rs
+index 2cf49ca..48e26da 100644
+--- a/xngin-plan/src/builder/tests.rs
++++ b/xngin-plan/src/builder/tests.rs
+@@ -1,7 +1,10 @@
+ use super::*;
++use crate::join::estimate::Estimate;
++use crate::join::graph::VertexSet;
+ use crate::join::{Join, JoinGraph, QualifiedJoin};
+ use crate::op::OpKind;
+ use crate::op::OpVisitor;
++use std::collections::HashMap;
+ use std::sync::Arc;
+ use xngin_catalog::mem_impl::{ColumnSpec, MemCatalogBuilder};
+ use xngin_catalog::ColumnAttr;
+@@ -446,8 +449,218 @@ fn test_plan_build_attach_value() {
+     }
+ }
+ 
+-/* below are helper functions to setup and test planning */
++#[test]
++fn test_join_reorder_sequential() {
++    use crate::join::reorder::{join_reorder, Sequential};
++    use crate::rule::joingraph_initialize;
++    let cat = j_catalog();
++    for (s, jks) in vec![
++        ("select 1 from t1 join t2 on t1.c1 = t2.c1", vec!["inner"]),
++        (
++            "select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t1.c1 = t3.c1",
++            vec!["inner", "inner"],
++        ),
++        (
++            "select 1 from t1 join t2 on t1.c1 = t2.c1 left join t3 on t1.c1 = t3.c1",
++            vec!["left", "inner"],
++        ),
++        (
++            "select 1 from t1 left join t2 on t1.c1 = t2.c1 join t3 on t1.c1 = t3.c1",
++            vec!["inner", "left"],
++        ),
++        (
++            "select 1 from t0 full join t1 on t0.c0 = t1.c0 join t2 on t1.c1 = t2.c1 left join t3 on t2.c2 = t3.c2",
++            vec!["left", "inner", "full"],
++        ),
++        (
++            "select 1 from t1 left join t2 on t1.c1 = t2.c1 join t3 on t1.c1 = t3.c1 and t2.c1 = t3.c1",
++            vec!["inner", "left"],
++        ),
++    ] {
++        assert_j_plan1(&cat, s, |s, mut q| {
++            joingraph_initialize(&mut q.qry_set, q.root).unwrap();
++            join_reorder(&mut q, || Sequential).unwrap();
++            print_plan(s, &q);
++            let subq = q.root_query().unwrap();
++            // the join graph must have been replaced by a concrete join tree.
++            assert!(get_join_graph(subq).is_none());
++            assert_eq!(jks, extract_join_kinds(&subq.root))
++        })
++    }
++}
++
++#[test]
++fn test_join_reorder_attached_subquery() {
++    use crate::join::reorder::{join_reorder, Sequential};
++    use crate::rule::joingraph_initialize;
++
++    let cat = j_catalog();
++    let sql = "select (select t1.c1 from t1 join t2 on t1.c1 = t2.c1) as value";
++    let builder = PlanBuilder::new(Arc::clone(&cat), "j").unwrap();
++    let (_, qr) = parse_query(MySQL(sql)).unwrap();
++    let mut plan = builder.build_plan(&qr).unwrap();
++    joingraph_initialize(&mut plan.qry_set, plan.root).unwrap();
++    for qid in plan.attaches.clone() {
++        joingraph_initialize(&mut plan.qry_set, qid).unwrap();
++    }
++
++    let attached_with_graph: Vec<_> = plan
++        .attaches
++        .iter()
++        .copied()
++        .filter(|qid| {
++            plan.qry_set
++                .get(qid)
++                .map(|subq| get_join_graph(subq).is_some())
++                .unwrap_or(false)
++        })
++        .collect();
++    assert!(!attached_with_graph.is_empty());
+ 
++    join_reorder(&mut plan, || Sequential).unwrap();
++
++    for qid in attached_with_graph {
++        let subq = plan.qry_set.get(&qid).unwrap();
++        assert!(get_join_graph(subq).is_none());
++        assert!(!extract_join_kinds(&subq.root).is_empty());
++    }
++}
++
++#[test]
++fn test_join_reorder_api_is_public_to_external_crates() {
++    use std::fs;
++    use std::process::Command;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    let deps = std::env::current_exe()
++        .unwrap()
++        .parent()
++        .unwrap()
++        .to_path_buf();
++    let find_rlib = |crate_name: &str| {
++        fs::read_dir(&deps)
++            .unwrap()
++            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
++            .filter(|path| {
++                path.file_name()
++                    .and_then(|name| name.to_str())
++                    .map(|name| {
++                        name.starts_with(&format!("lib{}-", crate_name)) && name.ends_with(".rlib")
++                    })
++                    .unwrap_or(false)
++            })
++            .max_by_key(|path| {
++                fs::metadata(path)
++                    .and_then(|metadata| metadata.modified())
++                    .ok()
++            })
++            .unwrap_or_else(|| panic!("could not find compiled {} library", crate_name))
++    };
++    let plan_rlib = find_rlib("xngin_plan");
++    let nonce = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap()
++        .as_nanos();
++    let dir =
++        std::env::temp_dir().join(format!("xngin-public-api-{}-{}", std::process::id(), nonce));
++    fs::create_dir_all(&dir).unwrap();
++    let source = dir.join("external.rs");
++    let binary = dir.join("external");
++    fs::write(
++        &source,
++        r#"
++use xngin_plan::error::{Error, Result};
++use xngin_plan::join::estimate::Estimate;
++use xngin_plan::join::graph::{Graph, VertexSet};
++use xngin_plan::join::JoinKind;
++use xngin_plan::join::reorder::{join_reorder, Goo, Reorder, Sequential};
++use xngin_plan::op::Op;
++use xngin_plan::query::QueryPlan;
++
++fn estimate_rows<E: Estimate>(estimator: &mut E, vset: VertexSet, kind: JoinKind) -> Result<(f64, f64)> {
++    Ok((
++        estimator.estimated_qry_rows(vset)?,
++        estimator.estimated_join_rows(kind, vset, vset, vset, &[], &[])?,
++    ))
++}
++struct Strategy;
++impl Reorder for Strategy {
++    fn reorder(self, _: &Graph) -> Result<Op> { Err(Error::InvalidJoinVertexSet) }
++}
++fn main() {
++    let _goo = Goo::new(());
++    let _strategy = Strategy;
++    let _sequential = Sequential;
++    let _: fn(&mut QueryPlan, fn() -> Sequential) -> Result<()> =
++        join_reorder::<Sequential, fn() -> Sequential>;
++}
++"#,
++    )
++    .unwrap();
++    let output = Command::new("rustc")
++        .arg("--edition=2021")
++        .arg(&source)
++        .arg("--extern")
++        .arg(format!("xngin_plan={}", plan_rlib.display()))
++        .arg("-L")
++        .arg(format!("dependency={}", deps.display()))
++        .arg("-o")
++        .arg(&binary)
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "external use of the documented API did not compile:\n{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let _ = fs::remove_dir_all(dir);
++}
++
++#[test]
++fn test_join_reorder_greedy() {
++    use crate::join::reorder::{join_reorder, Goo};
++    use crate::rule::joingraph_initialize;
++    let cat = j_catalog();
++    let tbl_map = table_map(&*cat, "j", vec!["t0", "t1", "t2", "t3"]);
++    for (s, qrs, js, first_pair) in vec![
++        (
++            "select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t2.c1 = t3.c1",
++            vec![("t1", 100.0), ("t2", 100.0), ("t3", 100.0)],
++            vec![("t1", "t2", 0.1), ("t2", "t3", 0.2)],
++            vec!["t1", "t2"],
++        ),
++        (
++            "select 1 from t1 join t2 on t1.c1 = t2.c1 join t3 on t2.c1 = t3.c1",
++            vec![("t1", 100.0), ("t2", 100.0), ("t3", 100.0)],
++            vec![("t1", "t2", 0.2), ("t2", "t3", 0.1)],
++            vec!["t2", "t3"],
++        ),
++    ] {
++        assert_j_plan1(&cat, s, |s, mut q| {
++            joingraph_initialize(&mut q.qry_set, q.root).unwrap();
++            let graph = {
++                let subq = q.root_query().unwrap();
++                get_join_graph(subq).unwrap()
++            };
++            let est = build_preset_estimator(&mut q.qry_set, &graph, &tbl_map, &qrs, &js);
++            join_reorder(&mut q, || Goo::new(est.clone())).unwrap();
++            print_plan(s, &q);
++            let subq = q.root_query().unwrap();
++            assert!(get_join_graph(subq).is_none());
++            // the first join performed by the greedy algorithm must combine the
++            // pair of tables with the smallest intermediate result.
++            let (l, r) = root_join_sides(&subq.root, &q.qry_set).unwrap();
++            let pair = if l.len() == 2 { l } else { r };
++            let mut names: Vec<&str> = pair.iter().map(|id| tbl_name(&tbl_map, *id)).collect();
++            names.sort();
++            let mut expected = first_pair.clone();
++            expected.sort();
++            assert_eq!(expected, names);
++        })
++    }
++}
++/* below are helper functions to setup and test planning */
++#[inline]
+ pub(crate) fn j_catalog() -> Arc<dyn QueryCatalog> {
+     let mut builder = MemCatalogBuilder::default();
+     builder.add_schema("j").unwrap();
+@@ -508,6 +721,21 @@ pub(crate) fn j_catalog() -> Arc<dyn QueryCatalog> {
+     Arc::new(cat)
+ }
+ 
++#[inline]
++pub(crate) fn table_map(
++    cat: &dyn QueryCatalog,
++    schema_name: &'static str,
++    tbl_names: Vec<&'static str>,
++) -> HashMap<&'static str, TableID> {
++    let schema = cat.find_schema_by_name(schema_name).unwrap();
++    let mut m = HashMap::with_capacity(tbl_names.len());
++    for tn in tbl_names {
++        let tbl = cat.find_table_by_name(&schema.id, tn).unwrap();
++        m.insert(tn, tbl.id);
++    }
++    m
++}
++
+ pub(crate) fn assert_j_plan<F: FnOnce(&str, QueryPlan)>(sql: &str, f: F) {
+     let cat = j_catalog();
+     let plan = build_plan(&cat, sql);
+@@ -661,6 +889,170 @@ pub(crate) fn get_join_graph(subq: &Subquery) -> Option<JoinGraph> {
+     c.0
+ }
+ 
++pub(crate) fn get_tbl_id(qry_set: &mut QuerySet, qry_id: QueryID) -> Option<TableID> {
++    struct Find;
++    impl OpVisitor for Find {
++        type Cont = ();
++        type Break = TableID;
++        #[inline]
++        fn enter(&mut self, op: &Op) -> ControlFlow<TableID> {
++            match op {
++                Op::Table(_, tbl_id) => ControlFlow::Break(*tbl_id),
++                _ => ControlFlow::Continue(()),
++            }
++        }
++    }
++    qry_set
++        .transform_op(qry_id, |_, _, op| match op.walk(&mut Find) {
++            ControlFlow::Break(tbl_id) => Some(tbl_id),
++            _ => None,
++        })
++        .unwrap()
++}
++
++/// Simple estimator with presettings based on query set.
++/// The join kind, condition and filter predicates are all ignored.
++#[derive(Debug, Default, Clone)]
++struct PresetEstimator {
++    // rows per query
++    qmap: HashMap<VertexSet, f64>,
++    // selectivity per join
++    jmap: HashMap<(VertexSet, VertexSet), f64>,
++}
++
++impl PresetEstimator {
++    fn add_qry(&mut self, vset: VertexSet, count: f64) {
++        self.qmap.insert(vset, count);
++    }
++
++    fn add_join(&mut self, l_vset: VertexSet, r_vset: VertexSet, sel: f64) {
++        self.jmap.insert((l_vset, r_vset), sel);
++        self.jmap.insert((r_vset, l_vset), sel);
++    }
++}
++
++impl Estimate for PresetEstimator {
++    fn estimated_qry_rows(&mut self, vset: VertexSet) -> Result<f64> {
++        self.qmap
++            .get(&vset)
++            .cloned()
++            .ok_or(Error::InvalidJoinVertexSet)
++    }
++
++    fn estimated_join_rows(
++        &mut self,
++        _kind: JoinKind,
++        l_vset: VertexSet,
++        r_vset: VertexSet,
++        e_vset: VertexSet,
++        _cond: &[xngin_expr::Expr],
++        _filt: &[xngin_expr::Expr],
++    ) -> Result<f64> {
++        match (
++            self.qmap.get(&l_vset).cloned(),
++            self.qmap.get(&r_vset).cloned(),
++        ) {
++            (Some(l_rows), Some(r_rows)) => {
++                if let Some(sel) = self.jmap.get(&(e_vset & l_vset, e_vset & r_vset)).cloned() {
++                    let rows = l_rows * r_rows * sel;
++                    self.qmap.insert(l_vset | r_vset, rows);
++                    Ok(rows)
++                } else {
++                    Err(Error::InvalidJoinVertexSet)
++                }
++            }
++            _ => Err(Error::InvalidJoinVertexSet),
++        }
++    }
++}
++
++fn build_preset_estimator(
++    qry_set: &mut QuerySet,
++    graph: &JoinGraph,
++    tbl_map: &HashMap<&'static str, TableID>,
++    qry_rows: &[(&'static str, f64)],
++    join_sels: &[(&'static str, &'static str, f64)],
++) -> PresetEstimator {
++    let mut name2vset: HashMap<&'static str, VertexSet> = HashMap::new();
++    for vid in graph.vertexes {
++        let qid = graph.vmap.get(&vid).cloned().unwrap();
++        let tbl_id = get_tbl_id(qry_set, qid).unwrap();
++        for (tn, tid) in tbl_map.iter() {
++            if *tid == tbl_id {
++                let mut vs = VertexSet::default();
++                vs |= vid;
++                name2vset.insert(*tn, vs);
++            }
++        }
++    }
++    let mut est = PresetEstimator::default();
++    for (tn, rows) in qry_rows {
++        if let Some(vs) = name2vset.get(tn) {
++            est.add_qry(*vs, *rows);
++        }
++    }
++    for (l, r, sel) in join_sels {
++        let lv = *name2vset.get(l).unwrap();
++        let rv = *name2vset.get(r).unwrap();
++        est.add_join(lv, rv, *sel);
++    }
++    est
++}
++
++fn collect_tbl_ids(op: &Op, qry_set: &QuerySet, out: &mut Vec<TableID>) {
++    match op {
++        Op::Table(_, id) => out.push(*id),
++        Op::Query(qid) => {
++            if let Some(subq) = qry_set.get(qid) {
++                collect_tbl_ids(&subq.root, qry_set, out);
++            }
++        }
++        Op::Join(j) => match j.as_ref() {
++            Join::Cross(jos) => {
++                for jo in jos {
++                    collect_tbl_ids(jo.as_ref(), qry_set, out);
++                }
++            }
++            Join::Qualified(q) => {
++                collect_tbl_ids(q.left.as_ref(), qry_set, out);
++                collect_tbl_ids(q.right.as_ref(), qry_set, out);
++            }
++        },
++        Op::Proj(p) => collect_tbl_ids(&p.source, qry_set, out),
++        Op::Filt(f) => collect_tbl_ids(&f.source, qry_set, out),
++        _ => {}
++    }
++}
++
++fn root_join_sides(op: &Op, qry_set: &QuerySet) -> Option<(Vec<TableID>, Vec<TableID>)> {
++    match op {
++        Op::Proj(p) => root_join_sides(&p.source, qry_set),
++        Op::Filt(f) => root_join_sides(&f.source, qry_set),
++        Op::Query(qid) => qry_set
++            .get(qid)
++            .and_then(|subq| root_join_sides(&subq.root, qry_set)),
++        Op::Join(j) => match j.as_ref() {
++            Join::Qualified(q) => {
++                let mut l = vec![];
++                collect_tbl_ids(q.left.as_ref(), qry_set, &mut l);
++                let mut r = vec![];
++                collect_tbl_ids(q.right.as_ref(), qry_set, &mut r);
++                Some((l, r))
++            }
++            _ => None,
++        },
++        _ => None,
++    }
++}
++
++fn tbl_name(tbl_map: &HashMap<&'static str, TableID>, id: TableID) -> &'static str {
++    for (tn, tid) in tbl_map.iter() {
++        if *tid == id {
++            return tn;
++        }
++    }
++    panic!("table id not found")
++}
+ struct CollectFiltExpr(Vec<xngin_expr::Expr>);
+ 
+ impl OpVisitor for CollectFiltExpr {

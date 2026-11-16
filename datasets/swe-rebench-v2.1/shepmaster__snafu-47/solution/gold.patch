@@ -1,0 +1,320 @@
+diff --git a/snafu-derive/src/lib.rs b/snafu-derive/src/lib.rs
+index 5b38981..aa2a59b 100644
+--- a/snafu-derive/src/lib.rs
++++ b/snafu-derive/src/lib.rs
+@@ -21,6 +21,11 @@ pub fn snafu_derive(input: TokenStream) -> TokenStream {
+ 
+ type UserInput = Box<quote::ToTokens>;
+ 
++enum SnafuInfo {
++    Enum(EnumInfo),
++    Struct(StructInfo),
++}
++
+ struct EnumInfo {
+     name: syn::Ident,
+     generics: syn::Generics,
+@@ -38,6 +43,12 @@ struct VariantInfo {
+     visibility: Option<UserInput>,
+ }
+ 
++struct StructInfo {
++    name: syn::Ident,
++    generics: syn::Generics,
++    inner_type: syn::Type,
++}
++
+ #[derive(Clone)]
+ struct Field {
+     name: syn::Ident,
+@@ -51,29 +62,48 @@ fn impl_snafu_macro(ty: syn::DeriveInput) -> TokenStream {
+     }
+ }
+ 
+-fn parse_snafu_information(ty: syn::DeriveInput) -> SynResult<EnumInfo> {
++fn parse_snafu_information(ty: syn::DeriveInput) -> SynResult<SnafuInfo> {
+     use syn::spanned::Spanned;
+-    use syn::{Data, Fields};
++    use syn::Data;
+ 
+     let span = ty.span();
++    let syn::DeriveInput {
++        ident,
++        generics,
++        data,
++        attrs,
++        ..
++    } = ty;
++
++    match data {
++        Data::Enum(enum_) => parse_snafu_enum(enum_, ident, generics, attrs).map(SnafuInfo::Enum),
++        Data::Struct(struct_) => {
++            parse_snafu_struct(struct_, ident, generics, span).map(SnafuInfo::Struct)
++        }
++        _ => {
++            return Err(SynError::new(
++                span,
++                "Can only derive `Snafu` for an enum or a newtype",
++            ));
++        }
++    }
++}
++
++fn parse_snafu_enum(
++    enum_: syn::DataEnum,
++    name: syn::Ident,
++    generics: syn::Generics,
++    attrs: Vec<syn::Attribute>,
++) -> SynResult<EnumInfo> {
++    use syn::spanned::Spanned;
++    use syn::Fields;
+ 
+-    let default_visibility = attributes_from_syn(ty.attrs)?
++    let default_visibility = attributes_from_syn(attrs)?
+         .into_iter()
+         .flat_map(SnafuAttribute::into_visibility)
+         .next()
+         .unwrap_or_else(private_visibility);
+ 
+-    let enum_ = match ty.data {
+-        Data::Enum(enum_) => enum_,
+-        _ => {
+-            return Err(SynError::new(span, "Can only derive `Snafu` for an enum"));
+-        }
+-    };
+-
+-    let name = ty.ident;
+-
+-    let generics = ty.generics;
+-
+     let variants: Result<_, SynError> = enum_
+         .variants
+         .into_iter()
+@@ -165,6 +195,45 @@ fn parse_snafu_information(ty: syn::DeriveInput) -> SynResult<EnumInfo> {
+     })
+ }
+ 
++fn parse_snafu_struct(
++    struct_: syn::DataStruct,
++    name: syn::Ident,
++    generics: syn::Generics,
++    span: proc_macro2::Span,
++) -> SynResult<StructInfo> {
++    use syn::Fields;
++
++    let mut fields = match struct_.fields {
++        Fields::Unnamed(f) => f,
++        _ => {
++            return Err(SynError::new(
++                span,
++                "Can only derive `Snafu` for tuple structs",
++            ));
++        }
++    };
++
++    fn one_field_error(span: proc_macro2::Span) -> SynError {
++        SynError::new(
++            span,
++            "Can only derive `Snafu` for tuple structs with exactly one field",
++        )
++    }
++
++    let inner = fields.unnamed.pop().ok_or_else(|| one_field_error(span))?;
++    if !fields.unnamed.is_empty() {
++        return Err(one_field_error(span));
++    }
++
++    let inner_type = inner.into_value().ty;
++
++    Ok(StructInfo {
++        name,
++        inner_type,
++        generics,
++    })
++}
++
+ enum MyMeta<T> {
+     CompatParen(T),
+     CompatDirect(T),
+@@ -339,12 +408,27 @@ fn private_visibility() -> UserInput {
+     Box::new(quote! {})
+ }
+ 
++impl From<SnafuInfo> for proc_macro::TokenStream {
++    fn from(other: SnafuInfo) -> proc_macro::TokenStream {
++        match other {
++            SnafuInfo::Enum(e) => e.into(),
++            SnafuInfo::Struct(s) => s.into(),
++        }
++    }
++}
++
+ impl From<EnumInfo> for proc_macro::TokenStream {
+     fn from(other: EnumInfo) -> proc_macro::TokenStream {
+         other.generate_snafu().into()
+     }
+ }
+ 
++impl From<StructInfo> for proc_macro::TokenStream {
++    fn from(other: StructInfo) -> proc_macro::TokenStream {
++        other.generate_snafu().into()
++    }
++}
++
+ impl EnumInfo {
+     fn generate_snafu(self) -> proc_macro2::TokenStream {
+         let context_selectors = ContextSelectors(&self);
+@@ -765,6 +849,67 @@ impl<'a> quote::ToTokens for ErrorCompatImpl<'a> {
+     }
+ }
+ 
++impl StructInfo {
++    fn generate_snafu(self) -> proc_macro2::TokenStream {
++        let StructInfo {
++            inner_type,
++            generics,
++            name,
++        } = self;
++        let parameterized_struct_name = quote! { #name#generics };
++
++        let source_fn = if cfg!(feature = "rust_1_30") {
++            quote! {
++                fn source(&self) -> Option<&(std::error::Error + 'static)> {
++                    std::error::Error::source(&self.0)
++                }
++            }
++        } else {
++            quote! {}
++        };
++
++        let backtrace_fn = if cfg!(feature = "backtraces") {
++            quote! {
++                fn backtrace(&self) -> Option<&snafu::Backtrace> {
++                    snafu::ErrorCompat::backtrace(&self.0)
++                }
++            }
++        } else {
++            quote! {}
++        };
++
++        quote! {
++            impl#generics std::error::Error for #parameterized_struct_name {
++                fn description(&self) -> &str {
++                    std::error::Error::description(&self.0)
++                }
++
++                fn cause(&self) -> Option<&std::error::Error> {
++                    std::error::Error::cause(&self.0)
++                }
++
++                #source_fn
++            }
++
++            impl#generics snafu::ErrorCompat for #parameterized_struct_name {
++                #backtrace_fn
++            }
++
++            impl#generics std::fmt::Display for #parameterized_struct_name {
++                fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
++                    std::fmt::Display::fmt(&self.0, f)
++                }
++            }
++
++            impl#generics From<#inner_type> for #parameterized_struct_name {
++                fn from(other: #inner_type) -> Self {
++                    #name(other)
++                }
++            }
++        }
++    }
++}
++
+ trait Transpose<T, E> {
+     fn my_transpose(self) -> Result<Option<T>, E>;
+ }
+diff --git a/src/guide/mod.rs b/src/guide/mod.rs
+index b4c2d3f..b7d9b45 100644
+--- a/src/guide/mod.rs
++++ b/src/guide/mod.rs
+@@ -5,7 +5,8 @@
+ //! philosophy](guide::philosophy).
+ //!
+ //! For more advanced usage, take a deeper dive into [how the `Snafu`
+-//! macro works](guide::the_macro) and what [attributes are
++//! macro works](guide::the_macro), how to create [opaque error
++//! types](guide::opaque), and what [attributes are
+ //! available](guide::attributes).
+ //!
+ //! For optional features of the crate, see our [list of feature
+@@ -20,6 +21,7 @@
+ pub mod attributes;
+ pub mod compatibility;
+ pub mod feature_flags;
++pub mod opaque;
+ pub mod philosophy;
+ pub mod the_macro;
+ pub mod upgrading;
+diff --git a/src/guide/opaque.rs b/src/guide/opaque.rs
+new file mode 100644
+index 0000000..4a9a8da
+--- /dev/null
++++ b/src/guide/opaque.rs
+@@ -0,0 +1,58 @@
++//! # How to create opaque error types for public APIs
++//!
++//! While creating error types on top of Rust enums allows for great
++//! flexibility inside your code, that same flexibility may not be
++//! desired in a public API. Public enums also expose their variants
++//! and the variant's fields, allowing consumers to rely on those
++//! details.
++//!
++//! The most conservative approach is to create an *opaque* error type
++//! that only implements a handful of traits. This can be done by
++//! deriving `Snafu` for a newtype struct that contains another SNAFU
++//! error:
++//!
++//! ```rust
++//! # use snafu::Snafu;
++//! #[derive(Debug, Snafu)]
++//! pub struct Error(InnerError);
++//!
++//! // That's all it takes! The rest is demonstration of how to use it.
++//!
++//! pub fn login(id: i32) -> Result<(), Error> {
++//!     validate_user(id)?;
++//!     is_user_locked(id)?;
++//!     Ok(())
++//! }
++//!
++//! #[derive(Debug, Snafu)]
++//! enum InnerError {
++//!     #[snafu(display = r#"("User ID {} is invalid", user_id)"#)]
++//!     InvalidUser { user_id: i32 },
++//!     #[snafu(display = r#"("User ID {} is locked", user_id)"#)]
++//!     UserLocked { user_id: i32 },
++//! }
++//!
++//! fn validate_user(user_id: i32) -> Result<(), InnerError> {
++//!     InvalidUser { user_id }.fail()
++//! }
++//!
++//! fn is_user_locked(user_id: i32) -> Result<(), InnerError> {
++//!     UserLocked { user_id }.fail()
++//! }
++//! ```
++//!
++//! ## Delegated traits
++//!
++//! - [`Error`][]
++//! - [`Display`][]
++//! - [`ErrorCompat`][]
++//!
++//! [`Error`]: std::error::Error
++//! [`Display`]: std::fmt::Display
++//! [`ErrorCompat`]: crate::ErrorCompat
++//!
++//! ## `From`
++//!
++//! The `From` trait is also implemented to convert the inner type into
++//! the opaque type. This makes converting from internal errors to public
++//! errors very easy.

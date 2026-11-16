@@ -1,0 +1,187 @@
+diff --git a/tests/renderers/test_shader_composer.py b/tests/renderers/test_shader_composer.py
+index fd2f9b7..2d64616 100644
+--- a/tests/renderers/test_shader_composer.py
++++ b/tests/renderers/test_shader_composer.py
+@@ -1,14 +1,26 @@
+ from pygfx.renderers.wgpu.shader import BaseShader
+ from pygfx.renderers.wgpu.shader.base import resolve_depth_output
++from pygfx.renderers.wgpu.shaders.meshshader import MeshShader
+ from pygfx.renderers.wgpu import Binding
+ from pygfx.utils import array_from_shadertype
+ from pygfx import Buffer
+ from pytest import raises
++from types import SimpleNamespace
++from pygfx.utils.trackable import PropTracker
+ import numpy as np
++import pygfx as gfx
+ 
+ 
+-def get_bindings_code(shader):
+-    return shader._binding_definitions.get_code()
++def get_shader_code(shader):
++    return shader.generate_wgsl(blending_code="", write_pick=False)
++
++
++def collect_bindings(shader, wobject, shared):
++    """Collect the shader's bindings the way the pipeline does."""
++    get_bindings_info = getattr(shader, "get_bindings_info", None)
++    if get_bindings_info is not None:
++        return get_bindings_info(wobject, shared)
++    return shader.get_bindings(wobject, shared)
+ 
+ 
+ class LocalBaseShader(BaseShader):
+@@ -79,7 +91,7 @@ def test_logic_beyond_templating():
+ def test_uniform_definitions():
+     class MyShader(LocalBaseShader):
+         def get_code(self):
+-            return ""
++            return "{{bindings_code}}"
+ 
+         def clear_bindings(self):
+             self._binding_definitions._uniform_struct_names.clear()
+@@ -87,6 +99,9 @@ def test_uniform_definitions():
+ 
+     shader = MyShader()
+ 
++    # Make it look like we're inside get_bindings ...
++    shader._template_vars_current = shader._template_vars_bindings
++
+     # Fails
+     with raises(TypeError):  # Not a valid struct type
+         shader.define_binding(0, 0, Binding("zz", "buffer/uniform", "not a struct"))
+@@ -99,7 +114,7 @@ def test_uniform_definitions():
+     struct = dict(foo="f4", bar="i4")
+     shader.define_binding(0, 0, Binding("zz", "buffer/uniform", struct))
+     assert (
+-        get_bindings_code(shader).strip()
++        get_shader_code(shader).strip()
+         == """
+         struct Struct_u_1 {
+             foo: f32,
+@@ -116,7 +131,7 @@ def test_uniform_definitions():
+     shader.clear_bindings()
+     shader.define_binding(0, 0, Binding("zz", "buffer/uniform", struct))
+     assert (
+-        get_bindings_code(shader).strip()
++        get_shader_code(shader).strip()
+         == """
+         struct Struct_u_1 {
+             foo: vec4<f32>,
+@@ -133,7 +148,7 @@ def test_uniform_definitions():
+     shader.clear_bindings()
+     shader.define_binding(0, 0, Binding("zz", "buffer/uniform", struct))
+     assert (
+-        get_bindings_code(shader).strip()
++        get_shader_code(shader).strip()
+         == """
+         struct Struct_u_1 {
+             foo: mat4x4<f32>,
+@@ -160,7 +175,7 @@ def test_uniform_definitions():
+         ),
+     )
+     assert (
+-        get_bindings_code(shader).strip()
++        get_shader_code(shader).strip()
+         == """
+         struct Struct_Foo {
+             foo: mat4x4<f32>,
+@@ -185,6 +200,91 @@ def test_uniform_definitions():
+         shader.define_binding(0, 0, Binding("zz", "buffer/uniform", struct))
+ 
+ 
++def test_binding_recollection():
++    # When bindings are (re)collected, bindings and binding-derived template
++    # variables that are no longer produced must not survive from an earlier
++    # collection, while template variables set at init must be kept.
++
++    class MyShader(LocalBaseShader):
++        def get_code(self):
++            return "{{bindings_code}} {$ if use_extra is defined $}EXTRA{$ else $}NONE{$ endif $}"
++
++        def get_bindings(self, wobject, shared):
++            if wobject.use_extra:
++                self["use_extra"] = True
++                bindings = {0: Binding("zz", "buffer/uniform", dict(foo="f4"))}
++                self.define_bindings(0, bindings)
++                return {0: bindings}
++            return {0: {}}
++
++    shader = MyShader(always=True)
++    assert hasattr(shader, "_template_vars_current")
++    assert hasattr(shader, "_template_vars_bindings")
++
++    # First collection: the extra binding and template variable are present.
++    first_bindings = shader.get_bindings_info(SimpleNamespace(use_extra=True), None)
++    assert isinstance(first_bindings, dict)
++    assert set(first_bindings) == {0}
++    assert set(first_bindings[0]) == {0}
++    assert isinstance(first_bindings[0][0], Binding)
++    assert first_bindings[0][0].name == "zz"
++    assert "zz" in get_shader_code(shader)
++    assert "EXTRA" in shader.generate_wgsl()
++
++    # Second collection: the binding and template variable are gone.
++    collect_bindings(shader, SimpleNamespace(use_extra=False), None)
++    assert "zz" not in get_shader_code(shader)
++    assert "NONE" in shader.generate_wgsl()
++
++    # Template variables set at init are not cleared.
++    assert shader["always"] is True
++
++
++def test_env_map_recollection():
++    # Dynamically applying and removing an env_map must be reflected in the
++    # collected bindings.
++
++    class FakeShared:
++        def __init__(self):
++            self.uniform_buffer = Buffer(
++                array_from_shadertype(dict(foo="f4")), force_contiguous=True
++            )
++
++    geometry = gfx.box_geometry(1, 1, 1)
++    material = gfx.MeshStandardMaterial()
++    mesh = gfx.Mesh(geometry, material)
++    shader = MeshShader(mesh)
++    shared = FakeShared()
++    tracker = PropTracker()
++
++    def track_env_map_dependency():
++        with tracker.track_usage("bindings"):
++            material.env_map
++
++    # Track the material property consumed when shader bindings are selected.
++    track_env_map_dependency()
++
++    # Without an env_map there is no env-map binding.
++    collect_bindings(shader, mesh, shared)
++    assert "t_env_map" not in get_shader_code(shader)
++    assert "use_IBL" not in shader._template_vars_bindings
++
++    # Applying an env_map invalidates the bindings collected by the pipeline.
++    texture = gfx.Texture(np.zeros((10, 10, 6, 4), np.uint8), dim=2, size=(10, 10, 6))
++    material.env_map = gfx.TextureMap(texture)
++    assert tracker.pop_changed() == {"bindings"}
++    collect_bindings(shader, mesh, shared)
++    assert "t_env_map" in get_shader_code(shader)
++
++    # Removing it invalidates bindings again and removes all derived state.
++    track_env_map_dependency()
++    material.env_map = None
++    assert tracker.pop_changed() == {"bindings"}
++    collect_bindings(shader, mesh, shared)
++    assert "t_env_map" not in get_shader_code(shader)
++    assert "use_IBL" not in shader._template_vars_bindings
++
++
+ def test_resolve_depth_output():
+     code1 = """
+     struct FragmentOutput {
+@@ -222,4 +322,6 @@ if __name__ == "__main__":
+     test_templating()
+     test_logic_beyond_templating()
+     test_uniform_definitions()
++    test_binding_recollection()
++    test_env_map_recollection()
+     test_resolve_depth_output()

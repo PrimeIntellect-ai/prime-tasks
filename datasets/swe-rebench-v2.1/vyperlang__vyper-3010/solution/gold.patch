@@ -1,0 +1,130 @@
+diff --git a/vyper/builtin_functions/functions.py b/vyper/builtin_functions/functions.py
+index bcc1bce0..549d8883 100644
+--- a/vyper/builtin_functions/functions.py
++++ b/vyper/builtin_functions/functions.py
+@@ -1827,6 +1827,7 @@ class CreateFromBlueprint(_CreateBase):
+     _kwargs = {
+         "value": KwargSettings(Uint256Definition(), zero_value),
+         "salt": KwargSettings(Bytes32Definition(), empty_value),
++        "raw_args": KwargSettings(BoolDefinition(), False, require_literal=True),
+         "code_offset": KwargSettings(Uint256Definition(), zero_value),
+     }
+     _has_varargs = True
+@@ -1837,24 +1838,33 @@ class CreateFromBlueprint(_CreateBase):
+         maxlen = EIP_170_LIMIT + ctor_args.typ.abi_type.size_bound()
+         return _create_addl_gas_estimate(maxlen, should_use_create2)
+ 
+-    def _build_create_IR(self, expr, args, context, value, salt, code_offset):
++    def _build_create_IR(self, expr, args, context, value, salt, code_offset, raw_args):
+         target = args[0]
+         ctor_args = args[1:]
+ 
+         ctor_args = [ensure_in_memory(arg, context) for arg in ctor_args]
+ 
+-        to_encode = ir_tuple_from_args(ctor_args)
++        if raw_args:
++            if len(ctor_args) != 1 or not isinstance(ctor_args[0].typ, ByteArrayType):
++                raise StructureException("raw_args must be used with exactly 1 bytes argument")
+ 
+-        # pretend we allocated enough memory for the encoder
+-        # (we didn't, but we are clobbering unused memory so it's safe.)
+-        bufsz = to_encode.typ.abi_type.size_bound()
+-        argbuf = IRnode.from_list(
+-            context.new_internal_variable(get_type_for_exact_size(bufsz)), location=MEMORY
+-        )
++            argbuf = bytes_data_ptr(ctor_args[0])
++            argslen = get_bytearray_length(ctor_args[0])
++            bufsz = ctor_args[0].typ.maxlen
++        else:
++            # encode the varargs
++            to_encode = ir_tuple_from_args(ctor_args)
++
++            # pretend we allocated enough memory for the encoder
++            # (we didn't, but we are clobbering unused memory so it's safe.)
++            bufsz = to_encode.typ.abi_type.size_bound()
++            argbuf = IRnode.from_list(
++                context.new_internal_variable(get_type_for_exact_size(bufsz)), location=MEMORY
++            )
+ 
+-        # return a complex expression which writes to memory and returns
+-        # the length of the encoded data
+-        argslen = abi_encode(argbuf, to_encode, context, bufsz=bufsz, returns_len=True)
++            # return a complex expression which writes to memory and returns
++            # the length of the encoded data
++            argslen = abi_encode(argbuf, to_encode, context, bufsz=bufsz, returns_len=True)
+ 
+         # NOTE: we need to invoke the abi encoder before evaluating MSIZE,
+         # then copy the abi encoded buffer to past-the-end of the initcode
+diff --git a/vyper/cli/vyper_compile.py b/vyper/cli/vyper_compile.py
+index a03c3938..76a142e7 100755
+--- a/vyper/cli/vyper_compile.py
++++ b/vyper/cli/vyper_compile.py
+@@ -42,6 +42,7 @@ no-optimize        - Do not optimize (don't use this for production code)
+ combined_json_outputs = [
+     "bytecode",
+     "bytecode_runtime",
++    "blueprint_bytecode",
+     "abi",
+     "layout",
+     "source_map",
+diff --git a/vyper/compiler/__init__.py b/vyper/compiler/__init__.py
+index 7ad2d0e2..507261a9 100644
+--- a/vyper/compiler/__init__.py
++++ b/vyper/compiler/__init__.py
+@@ -39,6 +39,7 @@ OUTPUT_FORMATS = {
+     # requires bytecode
+     "bytecode": output.build_bytecode_output,
+     "bytecode_runtime": output.build_bytecode_runtime_output,
++    "blueprint_bytecode": output.build_blueprint_bytecode_output,
+     "opcodes": output.build_opcodes_output,
+     "opcodes_runtime": output.build_opcodes_runtime_output,
+ }
+diff --git a/vyper/compiler/output.py b/vyper/compiler/output.py
+index 051c479e..c73dbcf5 100644
+--- a/vyper/compiler/output.py
++++ b/vyper/compiler/output.py
+@@ -243,6 +243,10 @@ def build_bytecode_output(compiler_data: CompilerData) -> str:
+     return f"0x{compiler_data.bytecode.hex()}"
+ 
+ 
++def build_blueprint_bytecode_output(compiler_data: CompilerData) -> str:
++    return f"0x{compiler_data.blueprint_bytecode.hex()}"
++
++
+ # EIP-170. Ref: https://eips.ethereum.org/EIPS/eip-170
+ EIP170_CONTRACT_SIZE_LIMIT: int = 2 ** 14 + 2 ** 13
+ 
+diff --git a/vyper/compiler/phases.py b/vyper/compiler/phases.py
+index fbc15e16..b0489bd0 100644
+--- a/vyper/compiler/phases.py
++++ b/vyper/compiler/phases.py
+@@ -148,6 +148,17 @@ class CompilerData:
+     def bytecode_runtime(self) -> bytes:
+         return generate_bytecode(self.assembly_runtime, is_runtime=True)
+ 
++    @cached_property
++    def blueprint_bytecode(self) -> bytes:
++        blueprint_preamble = b"\xFE\x71\x00"  # ERC5202 preamble
++        blueprint_bytecode = blueprint_preamble + self.bytecode
++
++        # the length of the deployed code in bytes
++        len_bytes = len(blueprint_bytecode).to_bytes(2, "big")
++        deploy_bytecode = b"\x61" + len_bytes + b"\x3d\x81\x60\x0a\x3d\x39\xf3"
++
++        return deploy_bytecode + blueprint_bytecode
++
+ 
+ def generate_ast(source_code: str, source_id: int, contract_name: str) -> vy_ast.Module:
+     """
+diff --git a/vyper/ir/compile_ir.py b/vyper/ir/compile_ir.py
+index 9a2661fe..dd1a0b45 100644
+--- a/vyper/ir/compile_ir.py
++++ b/vyper/ir/compile_ir.py
+@@ -994,6 +994,7 @@ def assembly_to_evm(assembly, pc_ofst=0, insert_vyper_signature=False):
+     if insert_vyper_signature:
+         # CBOR encoded: {"vyper": [major,minor,patch]}
+         bytecode_suffix += b"\xa1\x65vyper\x83" + bytes(list(version_tuple))
++        bytecode_suffix += len(bytecode_suffix).to_bytes(2, "big")
+ 
+     CODE_OFST_SIZE = 2  # size of a PUSH instruction for a code symbol
+ 

@@ -1,0 +1,185 @@
+diff --git a/pkg/provider/azure_loadbalancer_test.go b/pkg/provider/azure_loadbalancer_test.go
+index 9ab439b8..0bddb068 100644
+--- a/pkg/provider/azure_loadbalancer_test.go
++++ b/pkg/provider/azure_loadbalancer_test.go
+@@ -37,6 +37,7 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/interfaceclient/mockinterfaceclient"
++	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/loadbalancerclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/loadbalancerclient/mockloadbalancerclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/publicipclient/mockpublicipclient"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/securitygroupclient/mocksecuritygroupclient"
+@@ -360,25 +361,60 @@ func TestSubnet(t *testing.T) {
+ 	}
+ }
+ 
++type rejectConflictingHighAvailabilityRulesClient struct {
++	loadbalancerclient.Interface
++}
++
++func (client *rejectConflictingHighAvailabilityRulesClient) CreateOrUpdate(ctx context.Context, resourceGroupName, loadBalancerName string, parameters network.LoadBalancer, etag string) *retry.Error {
++	if parameters.LoadBalancingRules != nil {
++		rules := *parameters.LoadBalancingRules
++		for currentIndex, current := range rules {
++			currentProperties := current.LoadBalancingRulePropertiesFormat
++			if currentProperties == nil || currentProperties.FrontendIPConfiguration == nil || currentProperties.BackendAddressPool == nil || !to.Bool(currentProperties.EnableFloatingIP) {
++				continue
++			}
++			for _, other := range rules[currentIndex+1:] {
++				otherProperties := other.LoadBalancingRulePropertiesFormat
++				if otherProperties == nil || otherProperties.FrontendIPConfiguration == nil || otherProperties.BackendAddressPool == nil || !to.Bool(otherProperties.EnableFloatingIP) {
++					continue
++				}
++				conflict := to.String(currentProperties.FrontendIPConfiguration.ID) == to.String(otherProperties.FrontendIPConfiguration.ID) &&
++					to.String(currentProperties.BackendAddressPool.ID) == to.String(otherProperties.BackendAddressPool.ID) &&
++					currentProperties.Protocol == otherProperties.Protocol &&
++					to.Int32(currentProperties.BackendPort) == to.Int32(otherProperties.BackendPort)
++				if conflict {
++					return &retry.Error{HTTPStatusCode: http.StatusBadRequest}
++				}
++			}
++		}
++	}
++	return client.Interface.CreateOrUpdate(ctx, resourceGroupName, loadBalancerName, parameters, etag)
++}
++
+ func TestEnsureLoadBalancerDeleted(t *testing.T) {
+ 	const vmCount = 8
+ 	const availabilitySetCount = 4
+ 
+ 	tests := []struct {
+-		desc              string
+-		service           v1.Service
+-		isInternalSvc     bool
+-		expectCreateError bool
+-		wrongRGAtDelete   bool
++		desc               string
++		service            v1.Service
++		isInternalSvc      bool
++		expectCreateError  bool
++		skipRuleCountCheck bool
++		wrongRGAtDelete    bool
+ 	}{
+ 		{
+ 			desc:    "external service should be created and deleted successfully",
+ 			service: getTestService("service1", v1.ProtocolTCP, nil, false, 80),
+ 		},
+ 		{
+-			desc:          "internal service should be created and deleted successfully",
+-			service:       getInternalTestService("service2", 80),
+-			isInternalSvc: true,
++			desc: "multi-port HA internal service should be created successfully",
++			service: getTestService("service2", v1.ProtocolTCP, map[string]string{
++				ServiceAnnotationLoadBalancerInternal:                    "true",
++				ServiceAnnotationLoadBalancerEnableHighAvailabilityPorts: "true",
++			}, false, 80, 8080),
++			isInternalSvc:      true,
++			skipRuleCountCheck: true,
+ 		},
+ 		{
+ 			desc:    "annotated service with same resourceGroup should be created and deleted successfully",
+@@ -409,9 +445,15 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
+ 		if c.service.Annotations[ServiceAnnotationLoadBalancerInternal] == "true" {
+ 			validateTestSubnet(t, az, &c.service)
+ 		}
++		if c.service.Annotations[ServiceAnnotationLoadBalancerEnableHighAvailabilityPorts] == "true" {
++			az.LoadBalancerSku = loadBalancerSkuStandard
++		}
+ 
+ 		expectedLBs := make([]network.LoadBalancer, 0)
+ 		setMockLBs(az, ctrl, &expectedLBs, "service", 1, i+1, c.isInternalSvc)
++		if c.service.Annotations[ServiceAnnotationLoadBalancerEnableHighAvailabilityPorts] == "true" {
++			az.LoadBalancerClient = &rejectConflictingHighAvailabilityRulesClient{Interface: az.LoadBalancerClient}
++		}
+ 
+ 		// create the service first.
+ 		lbStatus, err := az.EnsureLoadBalancer(context.TODO(), testClusterName, &c.service, clusterResources.nodes)
+@@ -423,7 +465,9 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
+ 			result, rerr := az.LoadBalancerClient.List(context.TODO(), az.Config.ResourceGroup)
+ 			assert.Nil(t, rerr, "TestCase[%d]: %s", i, c.desc)
+ 			assert.Equal(t, len(result), 1, "TestCase[%d]: %s", i, c.desc)
+-			assert.Equal(t, len(*result[0].LoadBalancingRules), 1, "TestCase[%d]: %s", i, c.desc)
++			if !c.skipRuleCountCheck {
++				assert.Equal(t, len(*result[0].LoadBalancingRules), 1, "TestCase[%d]: %s", i, c.desc)
++			}
+ 		}
+ 
+ 		expectedLBs = make([]network.LoadBalancer, 0)
+@@ -1598,15 +1642,16 @@ func TestReconcileLoadBalancerRule(t *testing.T) {
+ 	defer ctrl.Finish()
+ 
+ 	testCases := []struct {
+-		desc            string
+-		service         v1.Service
+-		loadBalancerSku string
+-		wantLb          bool
+-		probeProtocol   string
+-		probePath       string
+-		expectedProbes  []network.Probe
+-		expectedRules   []network.LoadBalancingRule
+-		expectedErr     error
++		desc                  string
++		service               v1.Service
++		loadBalancerSku       string
++		wantLb                bool
++		probeProtocol         string
++		probePath             string
++		expectedProbes        []network.Probe
++		expectedRules         []network.LoadBalancingRule
++		expectedErr           error
++		highAvailabilityPorts bool
+ 	}{
+ 		{
+ 			desc:    "reconcileLoadBalancerRule shall return nil if wantLb is false",
+@@ -1647,6 +1692,26 @@ func TestReconcileLoadBalancerRule(t *testing.T) {
+ 			expectedProbes:  getDefaultTestProbes("http", "/healthy"),
+ 			expectedRules:   getDefaultTestRules(true),
+ 		},
++		{
++			desc: "reconcileLoadBalancerRule shall return corresponding probe and lbRule (slb with HA enabled)",
++			service: getTestService("test1", v1.ProtocolTCP, map[string]string{
++				"service.beta.kubernetes.io/azure-load-balancer-enable-high-availability-ports": "true",
++				"service.beta.kubernetes.io/azure-load-balancer-internal":                       "true",
++			}, false, 80),
++			loadBalancerSku:       "standard",
++			wantLb:                true,
++			highAvailabilityPorts: true,
++		},
++		{
++			desc: "reconcileLoadBalancerRule shall return corresponding probe and lbRule (slb with HA enabled multi-ports services)",
++			service: getTestService("test1", v1.ProtocolTCP, map[string]string{
++				"service.beta.kubernetes.io/azure-load-balancer-enable-high-availability-ports": "true",
++				"service.beta.kubernetes.io/azure-load-balancer-internal":                       "true",
++			}, false, 80, 8080),
++			loadBalancerSku:       "standard",
++			wantLb:                true,
++			highAvailabilityPorts: true,
++		},
+ 	}
+ 	for i, test := range testCases {
+ 		az := GetTestCloud(ctrl)
+@@ -1664,9 +1729,21 @@ func TestReconcileLoadBalancerRule(t *testing.T) {
+ 		if test.expectedErr != nil {
+ 			assert.Equal(t, test.expectedErr, err, "TestCase[%d]: %s", i, test.desc)
+ 		} else {
+-			assert.Equal(t, test.expectedProbes, probe, "TestCase[%d]: %s", i, test.desc)
+-			assert.Equal(t, test.expectedRules, lbrule, "TestCase[%d]: %s", i, test.desc)
+ 			assert.NoError(t, err)
++			if test.highAvailabilityPorts {
++				if len(test.service.Spec.Ports) == 1 {
++					assert.NotEmpty(t, lbrule, "TestCase[%d]: %s", i, test.desc)
++				}
++				for _, rule := range lbrule {
++					if assert.NotNil(t, rule.LoadBalancingRulePropertiesFormat, "TestCase[%d]: %s", i, test.desc) {
++						assert.Equal(t, int32(0), to.Int32(rule.FrontendPort), "TestCase[%d]: %s", i, test.desc)
++						assert.Equal(t, int32(0), to.Int32(rule.BackendPort), "TestCase[%d]: %s", i, test.desc)
++					}
++				}
++			} else {
++				assert.Equal(t, test.expectedProbes, probe, "TestCase[%d]: %s", i, test.desc)
++				assert.Equal(t, test.expectedRules, lbrule, "TestCase[%d]: %s", i, test.desc)
++			}
+ 		}
+ 	}
+ }

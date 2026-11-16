@@ -1,0 +1,741 @@
+diff --git a/.gitignore b/.gitignore
+index 52dac0bf..1fcbcfbd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,6 +7,7 @@ vendor/pkg
+ /contrib/cmd/fs-idmap/fs-idmap
+ /contrib/cmd/memfd-bind/memfd-bind
+ /contrib/cmd/pidfd-kill/pidfd-kill
++/contrib/cmd/remap-rootfs/remap-rootfs
+ man/man8
+ release
+ Vagrantfile
+diff --git a/Makefile b/Makefile
+index df935e41..caa44417 100644
+--- a/Makefile
++++ b/Makefile
+@@ -71,10 +71,10 @@ runc-bin: runc-dmz
+ 	$(GO_BUILD) -o runc .
+ 
+ .PHONY: all
+-all: runc recvtty sd-helper seccompagent fs-idmap memfd-bind pidfd-kill
++all: runc recvtty sd-helper seccompagent fs-idmap memfd-bind pidfd-kill remap-rootfs
+ 
+-.PHONY: recvtty sd-helper seccompagent fs-idmap memfd-bind pidfd-kill
+-recvtty sd-helper seccompagent fs-idmap memfd-bind pidfd-kill:
++.PHONY: recvtty sd-helper seccompagent fs-idmap memfd-bind pidfd-kill remap-rootfs
++recvtty sd-helper seccompagent fs-idmap memfd-bind pidfd-kill remap-rootfs:
+ 	$(GO_BUILD) -o contrib/cmd/$@/$@ ./contrib/cmd/$@
+ 
+ .PHONY: static
+diff --git a/contrib/cmd/remap-rootfs/remap-rootfs.go b/contrib/cmd/remap-rootfs/remap-rootfs.go
+new file mode 100644
+index 00000000..b9739ba8
+--- /dev/null
++++ b/contrib/cmd/remap-rootfs/remap-rootfs.go
+@@ -0,0 +1,143 @@
++package main
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"syscall"
++
++	"github.com/urfave/cli"
++
++	"github.com/opencontainers/runtime-spec/specs-go"
++)
++
++const usage = `contrib/cmd/remap-rootfs
++
++remap-rootfs is a helper tool to remap the root filesystem of a Open Container
++Initiative bundle using user namespaces such that the file owners are remapped
++from "host" mappings to the user namespace's mappings.
++
++Effectively, this is a slightly more complicated 'chown -R', and is primarily
++used within runc's integration tests to remap the test filesystem to match the
++test user namespace. Note that calling remap-rootfs multiple times, or changing
++the mapping and then calling remap-rootfs will likely produce incorrect results
++because we do not "un-map" any pre-applied mappings from previous remap-rootfs
++calls.
++
++Note that the bundle is assumed to be produced by a trusted source, and thus
++malicious configuration files will likely not be handled safely.
++
++To use remap-rootfs, simply pass it the path to an OCI bundle (a directory
++containing a config.json):
++
++    $ sudo remap-rootfs ./bundle
++`
++
++func toHostID(mappings []specs.LinuxIDMapping, id uint32) (int, bool) {
++	for _, m := range mappings {
++		if m.ContainerID <= id && id < m.ContainerID+m.Size {
++			return int(m.HostID + id), true
++		}
++	}
++	return -1, false
++}
++
++type inodeID struct {
++	Dev, Ino uint64
++}
++
++func toInodeID(st *syscall.Stat_t) inodeID {
++	return inodeID{Dev: st.Dev, Ino: st.Ino}
++}
++
++func remapRootfs(root string, uidMap, gidMap []specs.LinuxIDMapping) error {
++	seenInodes := make(map[inodeID]struct{})
++	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++
++		mode := info.Mode()
++		st := info.Sys().(*syscall.Stat_t)
++
++		// Skip symlinks.
++		if mode.Type() == os.ModeSymlink {
++			return nil
++		}
++		// Skip hard-links to files we've already remapped.
++		id := toInodeID(st)
++		if _, seen := seenInodes[id]; seen {
++			return nil
++		}
++		seenInodes[id] = struct{}{}
++
++		// Calculate the new uid:gid.
++		uid := st.Uid
++		newUID, ok1 := toHostID(uidMap, uid)
++		gid := st.Gid
++		newGID, ok2 := toHostID(gidMap, gid)
++
++		// Skip files that cannot be mapped.
++		if !ok1 || !ok2 {
++			niceName := path
++			if relName, err := filepath.Rel(root, path); err == nil {
++				niceName = "/" + relName
++			}
++			fmt.Printf("skipping file %s: cannot remap user %d:%d -> %d:%d\n", niceName, uid, gid, newUID, newGID)
++			return nil
++		}
++		if err := os.Lchown(path, newUID, newGID); err != nil {
++			return err
++		}
++		// Re-apply any setid bits that would be cleared due to chown(2).
++		return os.Chmod(path, mode)
++	})
++}
++
++func main() {
++	app := cli.NewApp()
++	app.Name = "remap-rootfs"
++	app.Usage = usage
++
++	app.Action = func(ctx *cli.Context) error {
++		args := ctx.Args()
++		if len(args) != 1 {
++			return errors.New("exactly one bundle argument must be provided")
++		}
++		bundle := args[0]
++
++		configFile, err := os.Open(filepath.Join(bundle, "config.json"))
++		if err != nil {
++			return err
++		}
++		defer configFile.Close()
++
++		var spec specs.Spec
++		if err := json.NewDecoder(configFile).Decode(&spec); err != nil {
++			return fmt.Errorf("parsing config.json: %w", err)
++		}
++
++		if spec.Root == nil {
++			return errors.New("invalid config.json: root section is null")
++		}
++		rootfs := filepath.Join(bundle, spec.Root.Path)
++
++		if spec.Linux == nil {
++			return errors.New("invalid config.json: linux section is null")
++		}
++		uidMap := spec.Linux.UIDMappings
++		gidMap := spec.Linux.GIDMappings
++		if len(uidMap) == 0 && len(gidMap) == 0 {
++			fmt.Println("skipping remapping -- no userns mappings specified")
++			return nil
++		}
++
++		return remapRootfs(rootfs, uidMap, gidMap)
++	}
++	if err := app.Run(os.Args); err != nil {
++		fmt.Fprintln(os.Stderr, "error:", err)
++		os.Exit(1)
++	}
++}
+diff --git a/libcontainer/configs/config_linux.go b/libcontainer/configs/config_linux.go
+index 1900fc97..3c0e71e4 100644
+--- a/libcontainer/configs/config_linux.go
++++ b/libcontainer/configs/config_linux.go
+@@ -1,12 +1,13 @@
+ package configs
+ 
+-import "errors"
++import (
++	"errors"
++	"fmt"
++)
+ 
+ var (
+-	errNoUIDMap   = errors.New("User namespaces enabled, but no uid mappings found.")
+-	errNoUserMap  = errors.New("User namespaces enabled, but no user mapping found.")
+-	errNoGIDMap   = errors.New("User namespaces enabled, but no gid mappings found.")
+-	errNoGroupMap = errors.New("User namespaces enabled, but no group mapping found.")
++	errNoUIDMap = errors.New("user namespaces enabled, but no uid mappings found")
++	errNoGIDMap = errors.New("user namespaces enabled, but no gid mappings found")
+ )
+ 
+ // Please check https://man7.org/linux/man-pages/man2/personality.2.html for const details.
+@@ -31,7 +32,7 @@ func (c Config) HostUID(containerId int) (int, error) {
+ 		}
+ 		id, found := c.hostIDFromMapping(containerId, c.UIDMappings)
+ 		if !found {
+-			return -1, errNoUserMap
++			return -1, fmt.Errorf("user namespaces enabled, but no mapping found for uid %d", containerId)
+ 		}
+ 		return id, nil
+ 	}
+@@ -54,7 +55,7 @@ func (c Config) HostGID(containerId int) (int, error) {
+ 		}
+ 		id, found := c.hostIDFromMapping(containerId, c.GIDMappings)
+ 		if !found {
+-			return -1, errNoGroupMap
++			return -1, fmt.Errorf("user namespaces enabled, but no mapping found for gid %d", containerId)
+ 		}
+ 		return id, nil
+ 	}
+diff --git a/libcontainer/configs/validate/rootless.go b/libcontainer/configs/validate/rootless.go
+index 6d32704a..faceea04 100644
+--- a/libcontainer/configs/validate/rootless.go
++++ b/libcontainer/configs/validate/rootless.go
+@@ -2,6 +2,7 @@ package validate
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -28,25 +29,18 @@ func rootlessEUIDCheck(config *configs.Config) error {
+ 	return nil
+ }
+ 
+-func hasIDMapping(id int, mappings []configs.IDMap) bool {
+-	for _, m := range mappings {
+-		if id >= m.ContainerID && id < m.ContainerID+m.Size {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+ func rootlessEUIDMappings(config *configs.Config) error {
+ 	if !config.Namespaces.Contains(configs.NEWUSER) {
+ 		return errors.New("rootless container requires user namespaces")
+ 	}
+-
+-	if len(config.UIDMappings) == 0 {
+-		return errors.New("rootless containers requires at least one UID mapping")
+-	}
+-	if len(config.GIDMappings) == 0 {
+-		return errors.New("rootless containers requires at least one GID mapping")
++	// We only require mappings if we are not joining another userns.
++	if path := config.Namespaces.PathOf(configs.NEWUSER); path == "" {
++		if len(config.UIDMappings) == 0 {
++			return errors.New("rootless containers requires at least one UID mapping")
++		}
++		if len(config.GIDMappings) == 0 {
++			return errors.New("rootless containers requires at least one GID mapping")
++		}
+ 	}
+ 	return nil
+ }
+@@ -68,8 +62,8 @@ func rootlessEUIDMount(config *configs.Config) error {
+ 					// Ignore unknown mount options.
+ 					continue
+ 				}
+-				if !hasIDMapping(uid, config.UIDMappings) {
+-					return errors.New("cannot specify uid= mount options for unmapped uid in rootless containers")
++				if _, err := config.HostUID(uid); err != nil {
++					return fmt.Errorf("cannot specify uid=%d mount option for rootless container: %w", uid, err)
+ 				}
+ 			}
+ 
+@@ -79,8 +73,8 @@ func rootlessEUIDMount(config *configs.Config) error {
+ 					// Ignore unknown mount options.
+ 					continue
+ 				}
+-				if !hasIDMapping(gid, config.GIDMappings) {
+-					return errors.New("cannot specify gid= mount options for unmapped gid in rootless containers")
++				if _, err := config.HostGID(gid); err != nil {
++					return fmt.Errorf("cannot specify gid=%d mount option for rootless container: %w", gid, err)
+ 				}
+ 			}
+ 		}
+diff --git a/libcontainer/configs/validate/validator.go b/libcontainer/configs/validate/validator.go
+index 0df7242b..2594d05c 100644
+--- a/libcontainer/configs/validate/validator.go
++++ b/libcontainer/configs/validate/validator.go
+@@ -104,11 +104,19 @@ func security(config *configs.Config) error {
+ func namespaces(config *configs.Config) error {
+ 	if config.Namespaces.Contains(configs.NEWUSER) {
+ 		if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
+-			return errors.New("USER namespaces aren't enabled in the kernel")
++			return errors.New("user namespaces aren't enabled in the kernel")
+ 		}
++		hasPath := config.Namespaces.PathOf(configs.NEWUSER) != ""
++		hasMappings := config.UIDMappings != nil || config.GIDMappings != nil
++		if !hasPath && !hasMappings {
++			return errors.New("user namespaces enabled, but no namespace path to join nor mappings to apply specified")
++		}
++		// The hasPath && hasMappings validation case is handled in specconv --
++		// we cache the mappings in Config during specconv in the hasPath case,
++		// so we cannot do that validation here.
+ 	} else {
+ 		if config.UIDMappings != nil || config.GIDMappings != nil {
+-			return errors.New("User namespace mappings specified, but USER namespace isn't enabled in the config")
++			return errors.New("user namespace mappings specified, but user namespace isn't enabled in the config")
+ 		}
+ 	}
+ 
+@@ -122,6 +130,11 @@ func namespaces(config *configs.Config) error {
+ 		if _, err := os.Stat("/proc/self/timens_offsets"); os.IsNotExist(err) {
+ 			return errors.New("time namespaces aren't enabled in the kernel")
+ 		}
++		hasPath := config.Namespaces.PathOf(configs.NEWTIME) != ""
++		hasOffsets := config.TimeOffsets != nil
++		if hasPath && hasOffsets {
++			return errors.New("time namespace enabled, but both namespace path and time offsets specified -- you may only provide one")
++		}
+ 	} else {
+ 		if config.TimeOffsets != nil {
+ 			return errors.New("time namespace offsets specified, but time namespace isn't enabled in the config")
+diff --git a/libcontainer/init_linux.go b/libcontainer/init_linux.go
+index 6ab0698e..c02538d6 100644
+--- a/libcontainer/init_linux.go
++++ b/libcontainer/init_linux.go
+@@ -494,15 +494,6 @@ func setupUser(config *initConfig) error {
+ 		}
+ 	}
+ 
+-	// Rather than just erroring out later in setuid(2) and setgid(2), check
+-	// that the user is mapped here.
+-	if _, err := config.Config.HostUID(execUser.Uid); err != nil {
+-		return errors.New("cannot set uid to unmapped user in user namespace")
+-	}
+-	if _, err := config.Config.HostGID(execUser.Gid); err != nil {
+-		return errors.New("cannot set gid to unmapped user in user namespace")
+-	}
+-
+ 	if config.RootlessEUID {
+ 		// We cannot set any additional groups in a rootless container and thus
+ 		// we bail if the user asked us to do so. TODO: We currently can't do
+@@ -538,9 +529,15 @@ func setupUser(config *initConfig) error {
+ 	}
+ 
+ 	if err := unix.Setgid(execUser.Gid); err != nil {
++		if err == unix.EINVAL {
++			return fmt.Errorf("cannot setgid to unmapped gid %d in user namespace", execUser.Gid)
++		}
+ 		return err
+ 	}
+ 	if err := unix.Setuid(execUser.Uid); err != nil {
++		if err == unix.EINVAL {
++			return fmt.Errorf("cannot setuid to unmapped uid %d in user namespace", execUser.Uid)
++		}
+ 		return err
+ 	}
+ 
+diff --git a/libcontainer/nsenter/nsexec.c b/libcontainer/nsenter/nsexec.c
+index 9b10b232..f64cc41e 100644
+--- a/libcontainer/nsenter/nsexec.c
++++ b/libcontainer/nsenter/nsexec.c
+@@ -48,6 +48,8 @@ enum sync_t {
+ 	SYNC_MOUNTSOURCES_ACK = 0x47,	/* All mount sources have been sent. */
+ 	SYNC_MOUNT_IDMAP_PLS = 0x48,	/* Tell parent to mount idmap sources. */
+ 	SYNC_MOUNT_IDMAP_ACK = 0x49,	/* All idmap mounts have been done. */
++	SYNC_TIMEOFFSETS_PLS = 0x50,	/* Request parent to write timens offsets. */
++	SYNC_TIMEOFFSETS_ACK = 0x51,	/* Timens offsets were written. */
+ };
+ 
+ #define STAGE_SETUP  -1
+@@ -755,13 +757,13 @@ void receive_idmapsources(int sockfd)
+ 	receive_fd_sources(sockfd, "_LIBCONTAINER_IDMAP_FDS");
+ }
+ 
+-static void update_timens_offsets(char *map, size_t map_len)
++static void update_timens_offsets(pid_t pid, char *map, size_t map_len)
+ {
+ 	if (map == NULL || map_len == 0)
+ 		return;
+-	write_log(DEBUG, "update /proc/self/timens_offsets to '%s'", map);
+-	if (write_file(map, map_len, "/proc/self/timens_offsets") < 0)
+-		bail("failed to update /proc/self/timens_offsets");
++	write_log(DEBUG, "update /proc/%d/timens_offsets to '%s'", pid, map);
++	if (write_file(map, map_len, "/proc/%d/timens_offsets", pid) < 0)
++		bail("failed to update /proc/%d/timens_offsets", pid);
+ }
+ 
+ void nsexec(void)
+@@ -1008,6 +1010,15 @@ void nsexec(void)
+ 						bail("failed to sync with child: write(SYNC_MOUNT_IDMAP_ACK)");
+ 					}
+ 
++					break;
++				case SYNC_TIMEOFFSETS_PLS:
++					write_log(DEBUG, "stage-1 requested timens offsets to be configured");
++					update_timens_offsets(stage1_pid, config.timensoffset, config.timensoffset_len);
++					s = SYNC_TIMEOFFSETS_ACK;
++					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
++						sane_kill(stage1_pid, SIGKILL);
++						bail("failed to sync with child: write(SYNC_TIMEOFFSETS_ACK)");
++					}
+ 					break;
+ 				case SYNC_CHILD_FINISH:
+ 					write_log(DEBUG, "stage-1 complete");
+@@ -1161,7 +1172,19 @@ void nsexec(void)
+ 			 * was broken, so we'll just do it the long way anyway.
+ 			 */
+ 			try_unshare(config.cloneflags, "remaining namespaces");
+-			update_timens_offsets(config.timensoffset, config.timensoffset_len);
++
++			if (config.timensoffset) {
++				write_log(DEBUG, "request stage-0 to write timens offsets");
++
++				s = SYNC_TIMEOFFSETS_PLS;
++				if (write(syncfd, &s, sizeof(s)) != sizeof(s))
++					bail("failed to sync with parent: write(SYNC_TIMEOFFSETS_PLS)");
++
++				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
++					bail("failed to sync with parent: read(SYNC_TIMEOFFSETS_ACK)");
++				if (s != SYNC_TIMEOFFSETS_ACK)
++					bail("failed to sync with parent: SYNC_TIMEOFFSETS_ACK: got %u", s);
++			}
+ 
+ 			/* Ask our parent to send the mount sources fds. */
+ 			if (config.mountsources) {
+diff --git a/libcontainer/specconv/spec_linux.go b/libcontainer/specconv/spec_linux.go
+index c1632ac1..90275043 100644
+--- a/libcontainer/specconv/spec_linux.go
++++ b/libcontainer/specconv/spec_linux.go
+@@ -18,6 +18,7 @@ import (
+ 	"github.com/opencontainers/runc/libcontainer/configs"
+ 	"github.com/opencontainers/runc/libcontainer/devices"
+ 	"github.com/opencontainers/runc/libcontainer/seccomp"
++	"github.com/opencontainers/runc/libcontainer/userns"
+ 	libcontainerUtils "github.com/opencontainers/runc/libcontainer/utils"
+ 	"github.com/opencontainers/runtime-spec/specs-go"
+ 	"github.com/sirupsen/logrus"
+@@ -515,6 +516,9 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
+ }
+ 
+ func toConfigIDMap(specMaps []specs.LinuxIDMapping) []configs.IDMap {
++	if specMaps == nil {
++		return nil
++	}
+ 	idmaps := make([]configs.IDMap, len(specMaps))
+ 	for i, id := range specMaps {
+ 		idmaps[i] = configs.IDMap{
+@@ -968,6 +972,26 @@ func setupUserNamespace(spec *specs.Spec, config *configs.Config) error {
+ 		config.UIDMappings = toConfigIDMap(spec.Linux.UIDMappings)
+ 		config.GIDMappings = toConfigIDMap(spec.Linux.GIDMappings)
+ 	}
++	if path := config.Namespaces.PathOf(configs.NEWUSER); path != "" {
++		// We cannot allow uid or gid mappings to be set if we are also asked
++		// to join a userns.
++		if config.UIDMappings != nil || config.GIDMappings != nil {
++			return errors.New("user namespaces enabled, but both namespace path and mapping specified -- you may only provide one")
++		}
++		// Cache the current userns mappings in our configuration, so that we
++		// can calculate uid and gid mappings within runc. These mappings are
++		// never used for configuring the container if the path is set.
++		uidMap, gidMap, err := userns.GetUserNamespaceMappings(path)
++		if err != nil {
++			return fmt.Errorf("failed to cache mappings for userns: %w", err)
++		}
++		config.UIDMappings = uidMap
++		config.GIDMappings = gidMap
++		logrus.WithFields(logrus.Fields{
++			"uid_map": uidMap,
++			"gid_map": gidMap,
++		}).Debugf("config uses path-based userns configuration -- current uid and gid mappings cached")
++	}
+ 	rootUID, err := config.HostRootUID()
+ 	if err != nil {
+ 		return err
+diff --git a/libcontainer/userns/userns_maps.c b/libcontainer/userns/userns_maps.c
+new file mode 100644
+index 00000000..84f2c618
+--- /dev/null
++++ b/libcontainer/userns/userns_maps.c
+@@ -0,0 +1,79 @@
++#define _GNU_SOURCE
++#include <fcntl.h>
++#include <sched.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <stdarg.h>
++#include <stdlib.h>
++
++/*
++ * All of the code here is run inside an aync-signal-safe context, so we need
++ * to be careful to not call any functions that could cause issues. In theory,
++ * since we are a Go program, there are fewer restrictions in practice, it's
++ * better to be safe than sorry.
++ *
++ * The only exception is exit, which we need to call to make sure we don't
++ * return into runc.
++ */
++
++void bail(int pipefd, const char *fmt, ...)
++{
++	va_list args;
++
++	va_start(args, fmt);
++	vdprintf(pipefd, fmt, args);
++	va_end(args);
++
++	exit(1);
++}
++
++int spawn_userns_cat(char *userns_path, char *path, int outfd, int errfd)
++{
++	char buffer[4096] = { 0 };
++
++	pid_t child = fork();
++	if (child != 0)
++		return child;
++	/* in child */
++
++	/* Join the target userns. */
++	int nsfd = open(userns_path, O_RDONLY);
++	if (nsfd < 0)
++		bail(errfd, "open userns path %s failed: %m", userns_path);
++
++	int err = setns(nsfd, CLONE_NEWUSER);
++	if (err < 0)
++		bail(errfd, "setns %s failed: %m", userns_path);
++
++	close(nsfd);
++
++	/* Pipe the requested file contents. */
++	int fd = open(path, O_RDONLY);
++	if (fd < 0)
++		bail(errfd, "open %s in userns %s failed: %m", path, userns_path);
++
++	int nread, ntotal = 0;
++	while ((nread = read(fd, buffer, sizeof(buffer))) != 0) {
++		if (nread < 0)
++			bail(errfd, "read bytes from %s failed (after %d total bytes read): %m", path, ntotal);
++		ntotal += nread;
++
++		int nwritten = 0;
++		while (nwritten < nread) {
++			int n = write(outfd, buffer, nread - nwritten);
++			if (n < 0)
++				bail(errfd, "write %d bytes from %s failed (after %d bytes written): %m",
++				     nread - nwritten, path, nwritten);
++			nwritten += n;
++		}
++		if (nread != nwritten)
++			bail(errfd, "mismatch for bytes read and written: %d read != %d written", nread, nwritten);
++	}
++
++	close(fd);
++	close(outfd);
++	close(errfd);
++
++	/* We must exit here, otherwise we would return into a forked runc. */
++	exit(0);
++}
+diff --git a/libcontainer/userns/userns_maps_linux.go b/libcontainer/userns/userns_maps_linux.go
+new file mode 100644
+index 00000000..d81290de
+--- /dev/null
++++ b/libcontainer/userns/userns_maps_linux.go
+@@ -0,0 +1,171 @@
++//go:build linux
++
++package userns
++
++import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++	"unsafe"
++
++	"github.com/opencontainers/runc/libcontainer/configs"
++	"github.com/sirupsen/logrus"
++)
++
++/*
++#include <stdlib.h>
++extern int spawn_userns_cat(char *userns_path, char *path, int outfd, int errfd);
++*/
++import "C"
++
++func parseIdmapData(data []byte) (ms []configs.IDMap, err error) {
++	scanner := bufio.NewScanner(bytes.NewReader(data))
++	for scanner.Scan() {
++		var m configs.IDMap
++		line := scanner.Text()
++		if _, err := fmt.Sscanf(line, "%d %d %d", &m.ContainerID, &m.HostID, &m.Size); err != nil {
++			return nil, fmt.Errorf("parsing id map failed: invalid format in line %q: %w", line, err)
++		}
++		ms = append(ms, m)
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, fmt.Errorf("parsing id map failed: %w", err)
++	}
++	return ms, nil
++}
++
++// Do something equivalent to nsenter --user=<nsPath> cat <path>, but more
++// efficiently. Returns the contents of the requested file from within the user
++// namespace.
++func spawnUserNamespaceCat(nsPath string, path string) ([]byte, error) {
++	rdr, wtr, err := os.Pipe()
++	if err != nil {
++		return nil, fmt.Errorf("create pipe for userns spawn failed: %w", err)
++	}
++	defer rdr.Close()
++	defer wtr.Close()
++
++	errRdr, errWtr, err := os.Pipe()
++	if err != nil {
++		return nil, fmt.Errorf("create error pipe for userns spawn failed: %w", err)
++	}
++	defer errRdr.Close()
++	defer errWtr.Close()
++
++	cNsPath := C.CString(nsPath)
++	defer C.free(unsafe.Pointer(cNsPath))
++	cPath := C.CString(path)
++	defer C.free(unsafe.Pointer(cPath))
++
++	childPid := C.spawn_userns_cat(cNsPath, cPath, C.int(wtr.Fd()), C.int(errWtr.Fd()))
++
++	if childPid < 0 {
++		return nil, fmt.Errorf("failed to spawn fork for userns")
++	} else if childPid == 0 {
++		// this should never happen
++		panic("runc executing inside fork child -- unsafe state!")
++	}
++
++	// We are in the parent -- close the write end of the pipe before reading.
++	wtr.Close()
++	output, err := io.ReadAll(rdr)
++	rdr.Close()
++	if err != nil {
++		return nil, fmt.Errorf("reading from userns spawn failed: %w", err)
++	}
++
++	// Ditto for the error pipe.
++	errWtr.Close()
++	errOutput, err := io.ReadAll(errRdr)
++	errRdr.Close()
++	if err != nil {
++		return nil, fmt.Errorf("reading from userns spawn error pipe failed: %w", err)
++	}
++	errOutput = bytes.TrimSpace(errOutput)
++
++	// Clean up the child.
++	child, err := os.FindProcess(int(childPid))
++	if err != nil {
++		return nil, fmt.Errorf("could not find userns spawn process: %w", err)
++	}
++	state, err := child.Wait()
++	if err != nil {
++		return nil, fmt.Errorf("failed to wait for userns spawn process: %w", err)
++	}
++	if !state.Success() {
++		errStr := string(errOutput)
++		if errStr == "" {
++			errStr = fmt.Sprintf("unknown error (status code %d)", state.ExitCode())
++		}
++		return nil, fmt.Errorf("userns spawn: %s", errStr)
++	} else if len(errOutput) > 0 {
++		// We can just ignore weird output in the error pipe if the process
++		// didn't bail(), but for completeness output for debugging.
++		logrus.Debugf("userns spawn succeeded but unexpected error message found: %s", string(errOutput))
++	}
++	// The subprocess succeeded, return whatever it wrote to the pipe.
++	return output, nil
++}
++
++func GetUserNamespaceMappings(nsPath string) (uidMap, gidMap []configs.IDMap, err error) {
++	var (
++		pid         int
++		extra       rune
++		tryFastPath bool
++	)
++
++	// nsPath is usually of the form /proc/<pid>/ns/user, which means that we
++	// already have a pid that is part of the user namespace and thus we can
++	// just use the pid to read from /proc/<pid>/*id_map.
++	//
++	// Note that Sscanf doesn't consume the whole input, so we check for any
++	// trailing data with %c. That way, we can be sure the pattern matched
++	// /proc/$pid/ns/user _exactly_ iff n === 1.
++	if n, _ := fmt.Sscanf(nsPath, "/proc/%d/ns/user%c", &pid, &extra); n == 1 {
++		tryFastPath = pid > 0
++	}
++
++	for _, mapType := range []struct {
++		name  string
++		idMap *[]configs.IDMap
++	}{
++		{"uid_map", &uidMap},
++		{"gid_map", &gidMap},
++	} {
++		var mapData []byte
++
++		if tryFastPath {
++			path := fmt.Sprintf("/proc/%d/%s", pid, mapType.name)
++			data, err := os.ReadFile(path)
++			if err != nil {
++				// Do not error out here -- we need to try the slow path if the
++				// fast path failed.
++				logrus.Debugf("failed to use fast path to read %s from userns %s (error: %s), falling back to slow userns-join path", mapType.name, nsPath, err)
++			} else {
++				mapData = data
++			}
++		} else {
++			logrus.Debugf("cannot use fast path to read %s from userns %s, falling back to slow userns-join path", mapType.name, nsPath)
++		}
++
++		if mapData == nil {
++			// We have to actually join the namespace if we cannot take the
++			// fast path. The path is resolved with respect to the child
++			// process, so just use /proc/self.
++			data, err := spawnUserNamespaceCat(nsPath, "/proc/self/"+mapType.name)
++			if err != nil {
++				return nil, nil, err
++			}
++			mapData = data
++		}
++		idMap, err := parseIdmapData(mapData)
++		if err != nil {
++			return nil, nil, fmt.Errorf("failed to parse %s of userns %s: %w", mapType.name, nsPath, err)
++		}
++		*mapType.idMap = idMap
++	}
++
++	return uidMap, gidMap, nil
++}

@@ -1,0 +1,234 @@
+diff --git a/jupyter_client/consoleapp.py b/jupyter_client/consoleapp.py
+index 4e9ad35..434fdf0 100644
+--- a/jupyter_client/consoleapp.py
++++ b/jupyter_client/consoleapp.py
+@@ -306,8 +306,11 @@ class JupyterConsoleApp(ConnectionFileMixin):
+                 parent=self,
+                 data_dir=self.data_dir,
+             )
++            # access kernel_spec to ensure the NoSuchKernel error is raised
++            # if it's going to be
++            kernel_spec = self.kernel_manager.kernel_spec  # noqa: F841
+         except NoSuchKernel:
+-            self.log.critical("Could not find kernel %s", self.kernel_name)
++            self.log.critical("Could not find kernel %r", self.kernel_name)
+             self.exit(1)  # type:ignore[attr-defined]
+ 
+         self.kernel_manager = t.cast(KernelManager, self.kernel_manager)
+diff --git a/jupyter_client/kernelspec.py b/jupyter_client/kernelspec.py
+index 41ed2ba..b903ee6 100644
+--- a/jupyter_client/kernelspec.py
++++ b/jupyter_client/kernelspec.py
+@@ -281,7 +281,6 @@ class KernelSpecManager(LoggingConfigurable):
+ 
+         resource_dir = self._find_spec_directory(kernel_name.lower())
+         if resource_dir is None:
+-            self.log.warning("Kernelspec name %s cannot be found!", kernel_name)
+             raise NoSuchKernel(kernel_name)
+ 
+         return self._get_kernel_spec_by_name(kernel_name, resource_dir)
+diff --git a/jupyter_client/localinterfaces.py b/jupyter_client/localinterfaces.py
+index 8e622f1..e257b26 100644
+--- a/jupyter_client/localinterfaces.py
++++ b/jupyter_client/localinterfaces.py
+@@ -8,11 +8,11 @@ import re
+ import socket
+ import subprocess
+ from subprocess import PIPE, Popen
+-from typing import Any, Callable, Iterable, Sequence
++from typing import Any, Callable, Iterable, Mapping, Sequence
+ from warnings import warn
+ 
+-LOCAL_IPS: list = []
+-PUBLIC_IPS: list = []
++LOCAL_IPS: list[str] = []
++PUBLIC_IPS: list[str] = []
+ 
+ LOCALHOST: str = ""
+ 
+@@ -75,27 +75,34 @@ class NoIPAddresses(Exception):  # noqa
+     pass
+ 
+ 
+-def _populate_from_list(addrs: Sequence[str] | None) -> None:
++def _populate_from_list(addrs: Sequence[str]) -> None:
+     """populate local and public IPs from flat list of all IPs"""
++    _populate_from_dict({"all": addrs})
++
++
++def _populate_from_dict(addrs: Mapping[str, Sequence[str]]) -> None:
++    """populate local and public IPs from dict of {'en0': 'ip'}"""
+     if not addrs:
+-        raise NoIPAddresses
++        raise NoIPAddresses()
+ 
+     global LOCALHOST
+     public_ips = []
+     local_ips = []
+ 
+-    for ip in addrs:
+-        local_ips.append(ip)
+-        if not ip.startswith("127."):
+-            public_ips.append(ip)
+-        elif not LOCALHOST:
+-            LOCALHOST = ip
++    for iface, ip_list in addrs.items():
++        for ip in ip_list:
++            local_ips.append(ip)
++            if not LOCALHOST and (iface.startswith("lo") or ip.startswith("127.")):
++                LOCALHOST = ip
++            if not iface.startswith("lo") and not ip.startswith(("127.", "169.254.")):
++                # don't include link-local address in public_ips
++                public_ips.append(ip)
+ 
+     if not LOCALHOST or LOCALHOST == "127.0.0.1":
+         LOCALHOST = "127.0.0.1"
+         local_ips.insert(0, LOCALHOST)
+ 
+-    local_ips.extend(["0.0.0.0", ""])  # noqa
++    local_ips.extend(["0.0.0.0", ""])  # noqa: S104
+ 
+     LOCAL_IPS[:] = _uniq_stable(local_ips)
+     PUBLIC_IPS[:] = _uniq_stable(public_ips)
+@@ -155,59 +162,38 @@ def _load_ips_psutil() -> None:
+     """load ip addresses with netifaces"""
+     import psutil
+ 
+-    global LOCALHOST
+-    local_ips = []
+-    public_ips = []
++    addr_dict: dict[str, list[str]] = {}
+ 
+     # dict of iface_name: address_list, eg
+     # {"lo": [snicaddr(family=<AddressFamily.AF_INET>, address="127.0.0.1",
+     #   ...), snicaddr(family=<AddressFamily.AF_INET6>, ...)]}
+     for iface, ifaddresses in psutil.net_if_addrs().items():
+-        for address_data in ifaddresses:
+-            if address_data.family == socket.AF_INET:
+-                addr = address_data.address
+-                if not (iface.startswith("lo") or addr.startswith("127.")):
+-                    public_ips.append(addr)
+-                elif not LOCALHOST:
+-                    LOCALHOST = addr
+-                local_ips.append(addr)
+-    if not LOCALHOST:
+-        # we never found a loopback interface (can this ever happen?), assume common default
+-        LOCALHOST = "127.0.0.1"
+-        local_ips.insert(0, LOCALHOST)
+-    local_ips.extend(["0.0.0.0", ""])  # noqa
+-    LOCAL_IPS[:] = _uniq_stable(local_ips)
+-    PUBLIC_IPS[:] = _uniq_stable(public_ips)
++        addr_dict[iface] = [
++            address_data.address
++            for address_data in ifaddresses
++            if address_data.family == socket.AF_INET
++        ]
++
++    _populate_from_dict(addr_dict)
+ 
+ 
+ def _load_ips_netifaces() -> None:
+     """load ip addresses with netifaces"""
+     import netifaces  # type: ignore[import-not-found]
+ 
+-    global LOCALHOST
+-    local_ips = []
+-    public_ips = []
++    addr_dict: dict[str, list[str]] = {}
+ 
+     # list of iface names, 'lo0', 'eth0', etc.
+     for iface in netifaces.interfaces():
+         # list of ipv4 addrinfo dicts
++        addr_dict[iface] = []
++
+         ipv4s = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
+         for entry in ipv4s:
+             addr = entry.get("addr")
+-            if not addr:
+-                continue
+-            if not (iface.startswith("lo") or addr.startswith("127.")):
+-                public_ips.append(addr)
+-            elif not LOCALHOST:
+-                LOCALHOST = addr
+-            local_ips.append(addr)
+-    if not LOCALHOST:
+-        # we never found a loopback interface (can this ever happen?), assume common default
+-        LOCALHOST = "127.0.0.1"
+-        local_ips.insert(0, LOCALHOST)
+-    local_ips.extend(["0.0.0.0", ""])  # noqa
+-    LOCAL_IPS[:] = _uniq_stable(local_ips)
+-    PUBLIC_IPS[:] = _uniq_stable(public_ips)
++            if addr:
++                addr_dict[iface].append(addr)
++    _populate_from_dict(addr_dict)
+ 
+ 
+ def _load_ips_gethostbyname() -> None:
+diff --git a/jupyter_client/runapp.py b/jupyter_client/runapp.py
+index 9ed4b15..bea5d5c 100644
+--- a/jupyter_client/runapp.py
++++ b/jupyter_client/runapp.py
+@@ -3,10 +3,9 @@
+ # Distributed under the terms of the Modified BSD License.
+ from __future__ import annotations
+ 
+-import queue
++import atexit
+ import signal
+ import sys
+-import time
+ import typing as t
+ 
+ from jupyter_core.application import JupyterApp, base_aliases, base_flags
+@@ -73,7 +72,8 @@ class RunApp(JupyterApp, JupyterConsoleApp):  # type:ignore[misc]
+         super().initialize(argv)
+         JupyterConsoleApp.initialize(self)
+         signal.signal(signal.SIGINT, self.handle_sigint)
+-        self.init_kernel_info()
++        if self.kernel_manager:
++            atexit.register(self.kernel_manager.shutdown_kernel)
+ 
+     def handle_sigint(self, *args: t.Any) -> None:
+         """Handle SIGINT."""
+@@ -82,28 +82,11 @@ class RunApp(JupyterApp, JupyterConsoleApp):  # type:ignore[misc]
+         else:
+             self.log.error("Cannot interrupt kernels we didn't start.\n")
+ 
+-    def init_kernel_info(self) -> None:
+-        """Wait for a kernel to be ready, and store kernel info"""
+-        timeout = self.kernel_timeout
+-        tic = time.time()
+-        self.kernel_client.hb_channel.unpause()
+-        msg_id = self.kernel_client.kernel_info()
+-        while True:
+-            try:
+-                reply = self.kernel_client.get_shell_msg(timeout=1)
+-            except queue.Empty as e:
+-                if (time.time() - tic) > timeout:
+-                    msg = "Kernel didn't respond to kernel_info_request"
+-                    raise RuntimeError(msg) from e
+-            else:
+-                if reply["parent_header"].get("msg_id") == msg_id:
+-                    self.kernel_info = reply["content"]
+-                    return
+-
+     def start(self) -> None:
+         """Start the application."""
+         self.log.debug("jupyter run: starting...")
+         super().start()
++        self.kernel_client.wait_for_ready(timeout=self.kernel_timeout)
+         if self.filenames_to_run:
+             for filename in self.filenames_to_run:
+                 self.log.debug("jupyter run: executing `%s`", filename)
+@@ -112,8 +95,10 @@ class RunApp(JupyterApp, JupyterConsoleApp):  # type:ignore[misc]
+                     reply = self.kernel_client.execute_interactive(code, timeout=OUTPUT_TIMEOUT)
+                     return_code = 0 if reply["content"]["status"] == "ok" else 1
+                     if return_code:
+-                        raise Exception("jupyter-run error running '%s'" % filename)
++                        msg = f"jupyter-run error running '{filename}'"
++                        raise Exception(msg)
+         else:
++            self.log.debug("jupyter run: executing from stdin")
+             code = sys.stdin.read()
+             reply = self.kernel_client.execute_interactive(code, timeout=OUTPUT_TIMEOUT)
+             return_code = 0 if reply["content"]["status"] == "ok" else 1

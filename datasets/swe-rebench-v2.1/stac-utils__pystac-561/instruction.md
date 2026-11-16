@@ -1,0 +1,2 @@
+Implement RequiredPropertyMissing exception where appropriate
+#309 implements an exception that raises when a required property is missing, using the `repr` of an object in the message to give users as much detail as possible to identify where the error is. This issue will apply after that PR is merged, and the goal of the issue is to implement throwing this exception (normally via the `get_required` utility method) where appropriate and ensuring that object `repr`s give details for any object that is throwing this exception.

@@ -1,0 +1,178 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 31dd778b..07b2606a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,9 +2,29 @@
+ 
+ ## Version 7
+ 
++### v7.9.4
++
++- This version contains a cherry-picked fix made in v8.4.1.
++- Fixed a bug found and reported by [@leosuncin](https://github.com/leosuncin) in issue #705.
++  - CORS didn't work well in case of using `DependsOnMethod`.
++  - The list of the allowed methods in the response to `OPTIONS` request did only contain the first method declared
++    within `DependsOnMethod` instance.
++
++```typescript
++// reproduction minimal setup
++const routing: Routing = {
++  test: new DependsOnMethod({
++    get: getEndpoint,
++    post: postEndpoint,
++  }),
++};
++// when requesting OPTIONS for "/test", the response has the following header:
++// Access-Control-Allow-Methods: GET, OPTIONS
++```
++
+ ### v7.9.3
+ 
+-- This version is a cherry-pick of the fix made in v8.3.2.
++- This version contains a cherry-picked fix made in v8.3.2.
+ - Fixed the bug #673 found and reported by [@shroudedcode](https://github.com/shroudedcode).
+   - Preventing double parsing of incoming data by input schemas of middlewares containing transformations.
+   - The bug caused inability of using any transforming schema in middlewares.
+diff --git a/src/endpoint.ts b/src/endpoint.ts
+index 4e755240..028a8dc5 100644
+--- a/src/endpoint.ts
++++ b/src/endpoint.ts
+@@ -41,6 +41,7 @@ export abstract class AbstractEndpoint {
+   public abstract getNegativeMimeTypes(): string[];
+   public abstract getSecurity(): LogicalContainer<Security>;
+   public abstract getScopes(): string[];
++  public abstract _setSiblingMethods(methods: Method[]): void;
+ }
+ 
+ type EndpointProps<
+@@ -73,6 +74,7 @@ export class Endpoint<
+ > extends AbstractEndpoint {
+   protected readonly description?: string;
+   protected readonly methods: M[] = [];
++  protected siblingMethods: Method[] = [];
+   protected readonly middlewares: AnyMiddlewareDef[] = [];
+   protected readonly inputSchema: IN;
+   protected readonly mimeTypes: string[];
+@@ -108,6 +110,14 @@ export class Endpoint<
+     }
+   }
+ 
++  /**
++   * @desc Sets the other methods supported by the same path. Used by Routing in DependsOnMethod case, for options.
++   * @deprecated This method is for internal needs of the library, please avoid using it.
++   * */
++  public override _setSiblingMethods(methods: Method[]): void {
++    this.siblingMethods = methods;
++  }
++
+   public override getDescription() {
+     return this.description;
+   }
+@@ -157,7 +167,8 @@ export class Endpoint<
+   }
+ 
+   #getDefaultCorsHeaders(): Record<string, string> {
+-    const accessMethods = (this.methods as (M | AuxMethod)[])
++    const accessMethods = (this.methods as Array<Method | AuxMethod>)
++      .concat(this.siblingMethods)
+       .concat("options")
+       .join(", ")
+       .toUpperCase();
+diff --git a/src/mock.ts b/src/mock.ts
+index 8a80811c..fde0cb2f 100644
+--- a/src/mock.ts
++++ b/src/mock.ts
+@@ -15,25 +15,8 @@ interface TestEndpointProps<REQ, RES, LOG> {
+   __noJest?: boolean;
+ }
+ 
+-/**
+- * @description You need to install Jest and probably @types/jest to use this method
+- */
+-export const testEndpoint = async <
+-  REQ extends Partial<Record<keyof Request, any>> | undefined = undefined,
+-  RES extends Partial<Record<keyof Response, any>> | undefined = undefined,
+-  LOG extends Partial<Record<keyof Logger, any>> | undefined = undefined
+->({
+-  endpoint,
+-  requestProps,
+-  responseProps,
+-  configProps,
+-  loggerProps,
+-  __noJest,
+-}: TestEndpointProps<REQ, RES, LOG>) => {
+-  if (!jest || __noJest) {
+-    throw new Error("You need to install Jest in order to use testEndpoint().");
+-  }
+-  const requestMock = <
++export const makeRequestMock = <REQ>(requestProps?: REQ) =>
++  <
+     { method: string } & Record<"header", jest.Mock> &
+       (REQ extends undefined ? {} : REQ)
+   >{
+@@ -41,6 +24,8 @@ export const testEndpoint = async <
+     header: jest.fn(() => mimeJson),
+     ...requestProps,
+   };
++
++export const makeResponseMock = <RES>(responseProps?: RES) => {
+   const responseMock = <
+     {
+       writableEnded: boolean;
+@@ -55,7 +40,7 @@ export const testEndpoint = async <
+     set: jest.fn(() => responseMock),
+     status: jest.fn((code: number) => {
+       responseMock.statusCode = code;
+-      responseMock.statusMessage = http.STATUS_CODES[code];
++      responseMock.statusMessage = http.STATUS_CODES[code]!;
+       return responseMock;
+     }),
+     json: jest.fn(() => responseMock),
+@@ -65,6 +50,29 @@ export const testEndpoint = async <
+     }),
+     ...responseProps,
+   };
++  return responseMock;
++};
++
++/**
++ * @description You need to install Jest and probably @types/jest to use this method
++ */
++export const testEndpoint = async <
++  REQ extends Partial<Record<keyof Request, any>> | undefined = undefined,
++  RES extends Partial<Record<keyof Response, any>> | undefined = undefined,
++  LOG extends Partial<Record<keyof Logger, any>> | undefined = undefined
++>({
++  endpoint,
++  requestProps,
++  responseProps,
++  configProps,
++  loggerProps,
++  __noJest,
++}: TestEndpointProps<REQ, RES, LOG>) => {
++  if (!jest || __noJest) {
++    throw new Error("You need to install Jest in order to use testEndpoint().");
++  }
++  const requestMock = makeRequestMock(requestProps);
++  const responseMock = makeResponseMock(responseProps);
+   const loggerMock = <
+     Record<"info" | "warn" | "error" | "debug", jest.Mock> &
+       (LOG extends undefined ? {} : LOG)
+diff --git a/src/routing.ts b/src/routing.ts
+index 17e2d0b7..667d128d 100644
+--- a/src/routing.ts
++++ b/src/routing.ts
+@@ -63,9 +63,11 @@ export const routingCycle = ({
+         }
+       );
+       if (hasCors && Object.keys(element.methods).length > 0) {
+-        const firstEndpoint = Object.values(
++        const [firstMethod, ...siblingMethods] = Object.keys(
+           element.methods
+-        )[0] as AbstractEndpoint;
++        ) as Method[];
++        const firstEndpoint = element.methods[firstMethod]!;
++        firstEndpoint._setSiblingMethods(siblingMethods);
+         endpointCb(firstEndpoint, path, "options");
+       }
+     } else {

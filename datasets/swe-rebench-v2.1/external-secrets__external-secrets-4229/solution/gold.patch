@@ -1,0 +1,199 @@
+diff --git a/.github/workflows/helm.yml b/.github/workflows/helm.yml
+index e135f9bb2..3ace57443 100644
+--- a/.github/workflows/helm.yml
++++ b/.github/workflows/helm.yml
+@@ -36,7 +36,7 @@ jobs:
+ 
+       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+         with:
+-          python-version: 3.7
++          python-version: 3.11
+ 
+       - name: Set up chart-testing
+         uses: helm/chart-testing-action@e6669bcd63d7cb57cb4380c33043eebe5d111992 # v2.6.1
+diff --git a/apis/generators/v1alpha1/types_ecr.go b/apis/generators/v1alpha1/types_ecr.go
+index b66a7f3b2..19e124b86 100644
+--- a/apis/generators/v1alpha1/types_ecr.go
++++ b/apis/generators/v1alpha1/types_ecr.go
+@@ -32,6 +32,11 @@ type ECRAuthorizationTokenSpec struct {
+ 	// desired AWS service.
+ 	// +optional
+ 	Role string `json:"role,omitempty"`
++
++	// Scope specifies the ECR service scope.
++	// Valid options are private and public.
++	// +optional
++	Scope string `json:"scope,omitempty"`
+ }
+ 
+ // AWSAuth tells the controller how to do authentication with aws.
+diff --git a/config/crds/bases/generators.external-secrets.io_clustergenerators.yaml b/config/crds/bases/generators.external-secrets.io_clustergenerators.yaml
+index a4bf5a1a5..c5bcaa0fa 100644
+--- a/config/crds/bases/generators.external-secrets.io_clustergenerators.yaml
++++ b/config/crds/bases/generators.external-secrets.io_clustergenerators.yaml
+@@ -348,6 +348,11 @@ spec:
+                           You can assume a role before making calls to the
+                           desired AWS service.
+                         type: string
++                      scope:
++                        description: |-
++                          Scope specifies the ECR service scope.
++                          Valid options are private and public.
++                        type: string
+                     required:
+                     - region
+                     type: object
+diff --git a/config/crds/bases/generators.external-secrets.io_ecrauthorizationtokens.yaml b/config/crds/bases/generators.external-secrets.io_ecrauthorizationtokens.yaml
+index 292bee764..9d10f672c 100644
+--- a/config/crds/bases/generators.external-secrets.io_ecrauthorizationtokens.yaml
++++ b/config/crds/bases/generators.external-secrets.io_ecrauthorizationtokens.yaml
+@@ -183,6 +183,11 @@ spec:
+                   You can assume a role before making calls to the
+                   desired AWS service.
+                 type: string
++              scope:
++                description: |-
++                  Scope specifies the ECR service scope.
++                  Valid options are private and public.
++                type: string
+             required:
+             - region
+             type: object
+diff --git a/deploy/crds/bundle.yaml b/deploy/crds/bundle.yaml
+index 85d24bc2b..68f233358 100644
+--- a/deploy/crds/bundle.yaml
++++ b/deploy/crds/bundle.yaml
+@@ -14170,6 +14170,11 @@ spec:
+                             You can assume a role before making calls to the
+                             desired AWS service.
+                           type: string
++                        scope:
++                          description: |-
++                            Scope specifies the ECR service scope.
++                            Valid options are private and public.
++                          type: string
+                       required:
+                         - region
+                       type: object
+@@ -15652,6 +15657,11 @@ spec:
+                     You can assume a role before making calls to the
+                     desired AWS service.
+                   type: string
++                scope:
++                  description: |-
++                    Scope specifies the ECR service scope.
++                    Valid options are private and public.
++                  type: string
+               required:
+                 - region
+               type: object
+diff --git a/pkg/generator/ecr/ecr.go b/pkg/generator/ecr/ecr.go
+index 257ea4baf..578b492d3 100644
+--- a/pkg/generator/ecr/ecr.go
++++ b/pkg/generator/ecr/ecr.go
+@@ -25,6 +25,8 @@ import (
+ 	"github.com/aws/aws-sdk-go/aws/session"
+ 	"github.com/aws/aws-sdk-go/service/ecr"
+ 	"github.com/aws/aws-sdk-go/service/ecr/ecriface"
++	"github.com/aws/aws-sdk-go/service/ecrpublic"
++	"github.com/aws/aws-sdk-go/service/ecrpublic/ecrpubliciface"
+ 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/yaml"
+@@ -37,14 +39,15 @@ import (
+ type Generator struct{}
+ 
+ const (
+-	errNoSpec     = "no config spec provided"
+-	errParseSpec  = "unable to parse spec: %w"
+-	errCreateSess = "unable to create aws session: %w"
+-	errGetToken   = "unable to get authorization token: %w"
++	errNoSpec          = "no config spec provided"
++	errParseSpec       = "unable to parse spec: %w"
++	errCreateSess      = "unable to create aws session: %w"
++	errGetPrivateToken = "unable to get authorization token: %w"
++	errGetPublicToken  = "unable to get public authorization token: %w"
+ )
+ 
+ func (g *Generator) Generate(ctx context.Context, jsonSpec *apiextensions.JSON, kube client.Client, namespace string) (map[string][]byte, error) {
+-	return g.generate(ctx, jsonSpec, kube, namespace, ecrFactory)
++	return g.generate(ctx, jsonSpec, kube, namespace, ecrPrivateFactory, ecrPublicFactory)
+ }
+ 
+ func (g *Generator) generate(
+@@ -52,7 +55,8 @@ func (g *Generator) generate(
+ 	jsonSpec *apiextensions.JSON,
+ 	kube client.Client,
+ 	namespace string,
+-	ecrFunc ecrFactoryFunc,
++	ecrPrivateFunc ecrPrivateFactoryFunc,
++	ecrPublicFunc ecrPublicFactoryFunc,
+ ) (map[string][]byte, error) {
+ 	if jsonSpec == nil {
+ 		return nil, errors.New(errNoSpec)
+@@ -76,10 +80,19 @@ func (g *Generator) generate(
+ 	if err != nil {
+ 		return nil, fmt.Errorf(errCreateSess, err)
+ 	}
+-	client := ecrFunc(sess)
++
++	if res.Spec.Scope == "public" {
++		return fetchECRPublicToken(sess, ecrPublicFunc)
++	}
++
++	return fetchECRPrivateToken(sess, ecrPrivateFunc)
++}
++
++func fetchECRPrivateToken(sess *session.Session, ecrPrivateFunc ecrPrivateFactoryFunc) (map[string][]byte, error) {
++	client := ecrPrivateFunc(sess)
+ 	out, err := client.GetAuthorizationToken(&ecr.GetAuthorizationTokenInput{})
+ 	if err != nil {
+-		return nil, fmt.Errorf(errGetToken, err)
++		return nil, fmt.Errorf(errGetPrivateToken, err)
+ 	}
+ 	if len(out.AuthorizationData) != 1 {
+ 		return nil, fmt.Errorf("unexpected number of authorization tokens. expected 1, found %d", len(out.AuthorizationData))
+@@ -104,12 +117,41 @@ func (g *Generator) generate(
+ 	}, nil
+ }
+ 
+-type ecrFactoryFunc func(aws *session.Session) ecriface.ECRAPI
++func fetchECRPublicToken(sess *session.Session, ecrPublicFunc ecrPublicFactoryFunc) (map[string][]byte, error) {
++	client := ecrPublicFunc(sess)
++	out, err := client.GetAuthorizationToken(&ecrpublic.GetAuthorizationTokenInput{})
++	if err != nil {
++		return nil, fmt.Errorf(errGetPublicToken, err)
++	}
++
++	decodedToken, err := base64.StdEncoding.DecodeString(*out.AuthorizationData.AuthorizationToken)
++	if err != nil {
++		return nil, err
++	}
++	parts := strings.Split(string(decodedToken), ":")
++	if len(parts) != 2 {
++		return nil, errors.New("unexpected token format")
++	}
++
++	exp := out.AuthorizationData.ExpiresAt.UTC().Unix()
++	return map[string][]byte{
++		"username":   []byte(parts[0]),
++		"password":   []byte(parts[1]),
++		"expires_at": []byte(strconv.FormatInt(exp, 10)),
++	}, nil
++}
++
++type ecrPrivateFactoryFunc func(aws *session.Session) ecriface.ECRAPI
++type ecrPublicFactoryFunc func(aws *session.Session) ecrpubliciface.ECRPublicAPI
+ 
+-func ecrFactory(aws *session.Session) ecriface.ECRAPI {
++func ecrPrivateFactory(aws *session.Session) ecriface.ECRAPI {
+ 	return ecr.New(aws)
+ }
+ 
++func ecrPublicFactory(aws *session.Session) ecrpubliciface.ECRPublicAPI {
++	return ecrpublic.New(aws)
++}
++
+ func parseSpec(data []byte) (*genv1alpha1.ECRAuthorizationToken, error) {
+ 	var spec genv1alpha1.ECRAuthorizationToken
+ 	err := yaml.Unmarshal(data, &spec)

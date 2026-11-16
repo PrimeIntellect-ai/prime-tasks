@@ -1,0 +1,152 @@
+diff --git a/src/emulator/auth/operations.ts b/src/emulator/auth/operations.ts
+index 97c20c9f8..a6be154d1 100644
+--- a/src/emulator/auth/operations.ts
++++ b/src/emulator/auth/operations.ts
+@@ -64,6 +64,7 @@ export const authOperations: AuthOps = {
+         query: queryAccounts,
+         sendOobCode,
+         update: setAccountInfo,
++        batchGet,
+       },
+     },
+   },
+@@ -229,6 +230,33 @@ function lookup(
+   };
+ }
+ 
++function batchGet(
++  state: ProjectState,
++  reqBody: unknown,
++  ctx: ExegesisContext
++): Schemas["GoogleCloudIdentitytoolkitV1DownloadAccountResponse"] {
++  const limit = Math.min(Math.floor(ctx.params.query.maxResults) || 20, 1000);
++  assert(limit >= 0, "((Auth Emulator: maxResults must not be negative.))");
++
++  const users = state.queryUsers(
++    {},
++    { sortByField: "localId", order: "ASC", startToken: ctx.params.query.nextPageToken }
++  );
++  let newPageToken: string | undefined = undefined;
++  if (users.length > limit) {
++    users.length = limit;
++    if (users.length) {
++      newPageToken = users[users.length - 1].localId;
++    }
++  }
++
++  return {
++    kind: "identitytoolkit#DownloadAccountResponse",
++    users,
++    nextPageToken: newPageToken,
++  };
++}
++
+ function createAuthUri(
+   state: ProjectState,
+   reqBody: Schemas["GoogleCloudIdentitytoolkitV1CreateAuthUriRequest"]
+@@ -1278,7 +1306,7 @@ function parseIdToken(
+   // TODO: Check JWT expiration here.
+   const user = state.getUserByLocalId(decoded.payload.user_id);
+   assert(user, "USER_NOT_FOUND");
+-  assert(!user.validSince || decoded.payload.iat >= parseInt(user.validSince), "TOKEN_EXPIRED");
++  assert(!user.validSince || decoded.payload.iat >= Number(user.validSince), "TOKEN_EXPIRED");
+   assert(!user.disabled, "USER_DISABLED");
+ 
+   const signInProvider = decoded.payload.firebase.sign_in_provider;
+diff --git a/src/emulator/auth/server.ts b/src/emulator/auth/server.ts
+index 370495c57..a81541405 100644
+--- a/src/emulator/auth/server.ts
++++ b/src/emulator/auth/server.ts
+@@ -30,6 +30,8 @@ import {
+ import { logError } from "./utils";
+ import { camelCase } from "lodash";
+ import { registerHandlers } from "./handlers";
++import bodyParser = require("body-parser");
++import { URLSearchParams } from "url";
+ const apiSpec = apiSpecUntyped as OpenAPIObject;
+ 
+ const API_SPEC_PATH = "/emulator/openapi.json";
+@@ -380,15 +382,36 @@ function registerLegacyRoutes(app: express.Express): void {
+     throw new NotImplementedError(`signOutUser is not implemented in the Auth Emulator.`);
+   });
+ 
+-  // TODO: Need to rewrite paths and put project ID into the URL.
++  // Rewrites that require parsing targetProjectId from request body, e.g.
+   // /downloadAccount => /v1/projects/{target_project_id}/accounts:batchGet
+-  // /uploadAccount => /v1/projects/{target_project_id}/accounts:batchCreate
+-  app.post(`${relyingPartyPrefix}downloadAccount`, () => {
+-    throw new NotImplementedError(`downloadAccount is not implemented in the Auth Emulator.`);
+-  });
+-  app.post(`${relyingPartyPrefix}uploadAccount`, () => {
+-    throw new NotImplementedError(`uploadAccount is not implemented in the Auth Emulator.`);
+-  });
++  for (const [oldPath, newMethod, newPath] of [
++    ["downloadAccount", "GET", "accounts:batchGet"],
++    ["uploadAccount", "POST", "accounts:batchCreate"],
++  ]) {
++    app.post(`${relyingPartyPrefix}${oldPath}`, bodyParser.json(), (req, res, next) => {
++      req.body = convertKeysToCamelCase(req.body || {});
++      const targetProjectId = req.body.targetProjectId;
++      if (!targetProjectId) {
++        // Matching production behavior when targetProjectId is unspecified.
++        return next(new BadRequestError("INSUFFICIENT_PERMISSION"));
++      }
++
++      delete req.body.targetProjectId;
++      req.method = newMethod;
++      let qs = req.url.split("?", 2)[1] || "";
++      if (newMethod === "GET") {
++        Object.assign(req.query, req.body);
++
++        // Update the URL to match query since exegeisis does its own parsing.
++        const bodyAsQuery = new URLSearchParams(req.body).toString();
++        qs = qs ? `${qs}&${bodyAsQuery}` : bodyAsQuery;
++        delete req.body;
++        delete req.headers["content-type"];
++      }
++      req.url = `${v1Prefix}projects/${encodeURIComponent(targetProjectId)}/${newPath}?${qs}`;
++      next();
++    });
++  }
+ }
+ 
+ function toExegesisController(
+diff --git a/src/emulator/auth/state.ts b/src/emulator/auth/state.ts
+index d06d5a67f..b88bc2270 100644
+--- a/src/emulator/auth/state.ts
++++ b/src/emulator/auth/state.ts
+@@ -401,18 +401,21 @@ export class ProjectState {
+     filter: {
+       /* no filter supported yet */
+     },
+-    sort: {
++    options: {
+       order: "ASC" | "DESC";
+       sortByField: "localId";
++      startToken?: string;
+     }
+   ): UserInfo[] {
+     const users = [];
+     for (const user of this.users.values()) {
+-      /* TODO */ filter;
+-      users.push(user);
++      if (!options.startToken || user.localId > options.startToken) {
++        /* TODO */ filter;
++        users.push(user);
++      }
+     }
+     users.sort((a, b) => {
+-      if (sort.sortByField === "localId") {
++      if (options.sortByField === "localId") {
+         if (a.localId < b.localId) {
+           return -1;
+         } else if (a.localId > b.localId) {
+@@ -421,7 +424,7 @@ export class ProjectState {
+       }
+       return 0;
+     });
+-    return sort.order === "DESC" ? users.reverse() : users;
++    return options.order === "DESC" ? users.reverse() : users;
+   }
+ 
+   createTemporaryProof(phoneNumber: string): TemporaryProofRecord {

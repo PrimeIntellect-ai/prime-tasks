@@ -1,0 +1,261 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 352c3a05..27f6761f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,7 +5,8 @@ Changelog
+ 
+ Features:
+ 
+-  - Experimental support for inlay hints #2138
++  - Show references to new objects when finding references to `__construct` method #2194
++  - Support for inlay hints #2138
+   - Deprecation diagnostics #2120
+   - Auto configuration - automatically suggest and apply configuration #2114
+   - Transform to "promote" unassigned consturctor properties #2106
+diff --git a/lib/Indexer/Adapter/ReferenceFinder/IndexedReferenceFinder.php b/lib/Indexer/Adapter/ReferenceFinder/IndexedReferenceFinder.php
+index bbe86b20..31a0bcd5 100644
+--- a/lib/Indexer/Adapter/ReferenceFinder/IndexedReferenceFinder.php
++++ b/lib/Indexer/Adapter/ReferenceFinder/IndexedReferenceFinder.php
+@@ -6,10 +6,12 @@ use Generator;
+ use Phpactor\Indexer\Adapter\ReferenceFinder\Util\ContainerTypeResolver;
+ use Phpactor\Indexer\Model\QueryClient;
+ use Phpactor\Indexer\Model\LocationConfidence;
++use Phpactor\Indexer\Model\RecordReference;
+ use Phpactor\Indexer\Model\Record\MemberRecord;
+ use Phpactor\ReferenceFinder\PotentialLocation;
+ use Phpactor\ReferenceFinder\ReferenceFinder;
+ use Phpactor\TextDocument\ByteOffset;
++use Phpactor\TextDocument\Location;
+ use Phpactor\TextDocument\TextDocument;
+ use Phpactor\WorseReflection\Core\Exception\NotFound;
+ use Phpactor\WorseReflection\Core\Inference\Symbol;
+@@ -101,10 +103,12 @@ class IndexedReferenceFinder implements ReferenceFinder
+                 return;
+             }
+ 
++
++
+             // note that we check the all implementations: this will multiply
+             // the number of NOT and MAYBE matches
+             foreach ($this->implementationsOf($containerType) as $containerType) {
+-                yield from $this->query->member()->referencesTo(
++                yield from $this->memberReferencesTo(
+                     $this->symbolTypeToReferenceType($nodeContext),
+                     $nodeContext->symbol()->name(),
+                     $containerType
+@@ -187,4 +191,48 @@ class IndexedReferenceFinder implements ReferenceFinder
+             $symbolType
+         ));
+     }
++
++    /**
++     * @param "method"|"constant"|"property" $referenceType
++     * @return Generator<LocationConfidence>
++     */
++    private function memberReferencesTo(string $referenceType, string $memberName, string $containerType): Generator
++    {
++        if ($memberName === '__construct' && $referenceType === 'method') {
++            yield from $this->newObjectReferences($containerType);
++            return;
++        }
++        yield from $this->query->member()->referencesTo($referenceType, $memberName, $containerType);
++    }
++    /**
++     * @return Generator<LocationConfidence>
++     */
++    private function newObjectReferences(string $containerType): Generator
++    {
++        $class = $this->query->class()->get($containerType);
++        if (!$class) {
++            return;
++        }
++        foreach ($class->references() as $reference) {
++            $file = $this->query->file()->get($reference);
++            if (null === $file) {
++                continue;
++            }
++            foreach ($file->references() as $fileReference) {
++                if (
++                    $fileReference->type() !== 'class' ||
++                    !$fileReference->hasFlag(RecordReference::FLAG_NEW_OBJECT) ||
++                    $fileReference->identifier() !== $containerType
++                ) {
++                    continue;
++                }
++                yield LocationConfidence::surely(
++                    Location::fromPathAndOffset(
++                        $file->filePath() ?? '',
++                        $fileReference->offset()
++                    )
++                );
++            }
++        }
++    }
+ }
+diff --git a/lib/Indexer/Adapter/Tolerant/Indexer/ClassLikeReferenceIndexer.php b/lib/Indexer/Adapter/Tolerant/Indexer/ClassLikeReferenceIndexer.php
+index 7e753cd2..491de5d6 100644
+--- a/lib/Indexer/Adapter/Tolerant/Indexer/ClassLikeReferenceIndexer.php
++++ b/lib/Indexer/Adapter/Tolerant/Indexer/ClassLikeReferenceIndexer.php
+@@ -4,6 +4,7 @@ namespace Phpactor\Indexer\Adapter\Tolerant\Indexer;
+ 
+ use Microsoft\PhpParser\Node;
+ use Microsoft\PhpParser\Node\Expression\CallExpression;
++use Microsoft\PhpParser\Node\Expression\ObjectCreationExpression;
+ use Microsoft\PhpParser\Node\QualifiedName;
+ use Microsoft\PhpParser\Node\TraitUseClause;
+ use Phpactor\Indexer\Model\Index;
+@@ -52,7 +53,7 @@ class ClassLikeReferenceIndexer extends AbstractClassLikeIndexer
+         assert($node instanceof QualifiedName);
+ 
+         $name =
+-            $node->parent->parent instanceof TraitUseClause ?
++            $node->parent?->parent instanceof TraitUseClause ?
+                 TolerantQualifiedNameResolver::getResolvedName($node) :
+                 $node->getResolvedName();
+ 
+@@ -72,7 +73,13 @@ class ClassLikeReferenceIndexer extends AbstractClassLikeIndexer
+ 
+         $fileRecord = $index->get(FileRecord::fromPath($document->uri()->path()));
+         assert($fileRecord instanceof FileRecord);
+-        $fileRecord->addReference(new RecordReference(ClassRecord::RECORD_TYPE, $targetRecord->identifier(), $node->getStartPosition()));
++        $reference = new RecordReference(ClassRecord::RECORD_TYPE, $targetRecord->identifier(), $node->getStartPosition());
++
++        if ($node->parent instanceof ObjectCreationExpression) {
++            $reference->addFlag(RecordReference::FLAG_NEW_OBJECT);
++        }
++
++        $fileRecord->addReference($reference);
+         $index->write($fileRecord);
+     }
+ }
+diff --git a/lib/Indexer/Model/Record/ClassRecord.php b/lib/Indexer/Model/Record/ClassRecord.php
+index ce2a8232..e05d8fe8 100644
+--- a/lib/Indexer/Model/Record/ClassRecord.php
++++ b/lib/Indexer/Model/Record/ClassRecord.php
+@@ -10,6 +10,7 @@ final class ClassRecord implements Record, HasFileReferences, HasFlags, HasPath,
+     use FullyQualifiedReferenceTrait;
+     use HasFileReferencesTrait;
+     use HasPathTrait;
++    use HasFlagsTrait;
+     public const RECORD_TYPE = 'class';
+     public const TYPE_CLASS = 'class';
+     public const TYPE_INTERFACE = 'interface';
+@@ -32,8 +33,6 @@ final class ClassRecord implements Record, HasFileReferences, HasFlags, HasPath,
+      */
+     private ?string $type = null;
+ 
+-    private int $flags = 0;
+-
+     public static function fromName(string $name): self
+     {
+         return new self($name);
+@@ -113,28 +112,4 @@ final class ClassRecord implements Record, HasFileReferences, HasFlags, HasPath,
+         $clone->type = $type;
+         return $clone;
+     }
+-
+-    public function setFlags(int $flags): self
+-    {
+-        $this->flags = $flags;
+-
+-        return $this;
+-    }
+-
+-    public function addFlag(int $flag): self
+-    {
+-        $this->flags = $this->flags | $flag;
+-
+-        return $this;
+-    }
+-
+-    public function hasFlag(int $flag): bool
+-    {
+-        return (bool) ($this->flags & $flag);
+-    }
+-
+-    public function flags(): int
+-    {
+-        return $this->flags;
+-    }
+ }
+diff --git a/lib/Indexer/Model/Record/FileRecord.php b/lib/Indexer/Model/Record/FileRecord.php
+index 175ae8d2..d12582cb 100644
+--- a/lib/Indexer/Model/Record/FileRecord.php
++++ b/lib/Indexer/Model/Record/FileRecord.php
+@@ -59,7 +59,8 @@ class FileRecord implements HasPath, Record
+             $reference->type(),
+             $reference->identifier(),
+             $reference->offset(),
+-            $reference->contaninerType()
++            $reference->contaninerType(),
++            $reference->flags()
+         ];
+ 
+         return $this;
+diff --git a/lib/Indexer/Model/Record/HasFlagsTrait.php b/lib/Indexer/Model/Record/HasFlagsTrait.php
+new file mode 100644
+index 00000000..442d421e
+--- /dev/null
++++ b/lib/Indexer/Model/Record/HasFlagsTrait.php
+@@ -0,0 +1,32 @@
++<?php
++
++namespace Phpactor\Indexer\Model\Record;
++
++trait HasFlagsTrait
++{
++    private int $flags = 0;
++
++    public function setFlags(int $flags): self
++    {
++        $this->flags = $flags;
++
++        return $this;
++    }
++
++    public function addFlag(int $flag): self
++    {
++        $this->flags = $this->flags | $flag;
++
++        return $this;
++    }
++
++    public function hasFlag(int $flag): bool
++    {
++        return (bool) ($this->flags & $flag);
++    }
++
++    public function flags(): int
++    {
++        return $this->flags;
++    }
++}
+diff --git a/lib/Indexer/Model/RecordReference.php b/lib/Indexer/Model/RecordReference.php
+index 9893c524..356b5a84 100644
+--- a/lib/Indexer/Model/RecordReference.php
++++ b/lib/Indexer/Model/RecordReference.php
+@@ -2,14 +2,22 @@
+ 
+ namespace Phpactor\Indexer\Model;
+ 
+-class RecordReference
++use Phpactor\Indexer\Model\Record\HasFlags;
++use Phpactor\Indexer\Model\Record\HasFlagsTrait;
++
++class RecordReference implements HasFlags
+ {
++    use HasFlagsTrait;
++    const FLAG_NEW_OBJECT = 1;
++
+     public function __construct(
+         private string $type,
+         private string $identifier,
+         private int $offset,
+-        private ?string $contaninerType = null
++        private ?string $contaninerType = null,
++        int $flags = 0
+     ) {
++        $this->flags = $flags;
+     }
+ 
+     public function offset(): int

@@ -1,0 +1,144 @@
+diff --git a/README.md b/README.md
+index d448095..04d5362 100644
+--- a/README.md
++++ b/README.md
+@@ -725,6 +725,23 @@ issue by using the `ignore_commits_by` option in combination with the
+ [requirement on a protected branch]: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/defining-the-mergeability-of-pull-requests/about-protected-branches#require-status-checks-before-merging
+ [commit-current-user-check]: https://github.com/github/platform-samples/blob/master/pre-receive-hooks/commit-current-user-check.sh
+ 
++### Invalidate On Push
++
++`policy-bot` can be configured to invalidate approvals when a commit is pushed using
++the `invalidate_on_push` option. This option is disabled by default.
++
++However, in recent versions of GitHub after [2023-07-01 breaking changes][], policy-bot
++is unable to load pushedDate for commits. This means that it is unable to determine
++whether a commit was pushed after the approval was granted.
++
++A server option (`do_not_load_commit_pushed_date`) is provided to toggle loading the push
++date for commits. If enabled, policy-bot will not be able to determine whether a commit
++was pushed after an approval was granted.
++
++Can also be configured by using the following env variable `POLICYBOT_OPTIONS_DO_NOT_LOAD_COMMIT_PUSHED_DATE`.
++
++[2023-07-01 breaking changes]: https://docs.github.com/en/graphql/overview/breaking-changes#changes-scheduled-for-2023-07-01
++
+ ## Deployment
+ 
+ `policy-bot` is easy to deploy in your own environment as it has no dependencies
+diff --git a/pull/github.go b/pull/github.go
+index 180734a..dd8282c 100644
+--- a/pull/github.go
++++ b/pull/github.go
+@@ -121,6 +121,8 @@ type GitHubContext struct {
+ 	client   *github.Client
+ 	v4client *githubv4.Client
+ 
++	doNotLoadCommitPushedDate bool
++
+ 	owner  string
+ 	repo   string
+ 	number int
+@@ -145,7 +147,7 @@ type GitHubContext struct {
+ // obtain information. It caches responses for the lifetime of the context. The
+ // pull request passed to the context must contain at least the base repository
+ // and the number or the function panics.
+-func NewGitHubContext(ctx context.Context, mbrCtx MembershipContext, client *github.Client, v4client *githubv4.Client, loc Locator) (Context, error) {
++func NewGitHubContext(ctx context.Context, mbrCtx MembershipContext, client *github.Client, v4client *githubv4.Client, loc Locator, doNotLoadCommitPushedDate bool) (Context, error) {
+ 	if loc.Owner == "" || loc.Repo == "" || loc.Number == 0 {
+ 		panic("pull request object does not contain full identifying information")
+ 	}
+@@ -166,6 +168,8 @@ func NewGitHubContext(ctx context.Context, mbrCtx MembershipContext, client *git
+ 		repo:   loc.Repo,
+ 		number: loc.Number,
+ 		pr:     pr,
++
++		doNotLoadCommitPushedDate: doNotLoadCommitPushedDate,
+ 	}, nil
+ }
+ 
+@@ -814,6 +818,9 @@ func (ghc *GitHubContext) loadCommits() ([]*Commit, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if ghc.doNotLoadCommitPushedDate {
++			return commits, nil
++		}
+ 		if head.PushedAt != nil {
+ 			return commits, nil
+ 		}
+@@ -862,7 +869,7 @@ func (ghc *GitHubContext) loadCommitsOnce() (head *Commit, commits []*Commit, er
+ 	// In the second case, retrying after a delay can fix things, but the delay
+ 	// can be 15+ seconds in practice, so using the alternate API should
+ 	// improve latency at the cost of more API requests.
+-	if head.PushedAt == nil {
++	if head.PushedAt == nil && !ghc.doNotLoadCommitPushedDate {
+ 		log.Debug().
+ 			Bool("fork", ghc.pr.IsCrossRepository).
+ 			Msgf("failed to load pushed date via pull request, falling back to commit APIs")
+diff --git a/server/handler/base.go b/server/handler/base.go
+index 62e7fb6..9265b18 100644
+--- a/server/handler/base.go
++++ b/server/handler/base.go
+@@ -69,7 +69,7 @@ func (b *Base) NewEvalContext(ctx context.Context, installationID int64, loc pul
+ 	}
+ 
+ 	mbrCtx := NewCrossOrgMembershipContext(ctx, client, loc.Owner, b.Installations, b.ClientCreator)
+-	prctx, err := pull.NewGitHubContext(ctx, mbrCtx, client, v4client, loc)
++	prctx, err := pull.NewGitHubContext(ctx, mbrCtx, client, v4client, loc, b.PullOpts.DoNotLoadCommitPushedDate)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/handler/eval_options.go b/server/handler/eval_options.go
+index 96dc84a..d7b4014 100644
+--- a/server/handler/eval_options.go
++++ b/server/handler/eval_options.go
+@@ -16,6 +16,7 @@ package handler
+ 
+ import (
+ 	"os"
++	"strconv"
+ )
+ 
+ const (
+@@ -45,6 +46,11 @@ type PullEvaluationOptions struct {
+ 	//
+ 	// TODO(bkeyes): remove in version 2.0
+ 	Deprecated_AppName string `yaml:"app_name"`
++
++	// As of 2023-07-01 the commit.pushedDate graphql field is removed from GitHub.
++	// !Warning!
++	// Setting this option effectively breaks all usage of the invalidate_on_push approval rule
++	DoNotLoadCommitPushedDate bool `yaml:"do_not_load_commit_pushed_date"`
+ }
+ 
+ func (p *PullEvaluationOptions) fillDefaults() {
+@@ -57,7 +63,6 @@ func (p *PullEvaluationOptions) fillDefaults() {
+ 	if p.SharedPolicyPath == "" {
+ 		p.SharedPolicyPath = DefaultSharedPolicyPath
+ 	}
+-
+ 	if p.StatusCheckContext == "" {
+ 		p.StatusCheckContext = DefaultStatusCheckContext
+ 	}
+@@ -68,6 +73,7 @@ func (p *PullEvaluationOptions) SetValuesFromEnv(prefix string) {
+ 	setStringFromEnv("SHARED_REPOSITORY", prefix, &p.SharedRepository)
+ 	setStringFromEnv("SHARED_POLICY_PATH", prefix, &p.SharedPolicyPath)
+ 	setStringFromEnv("STATUS_CHECK_CONTEXT", prefix, &p.StatusCheckContext)
++	setBoolFromEnv("DO_NOT_LOAD_COMMIT_PUSHED_DATE", prefix, &p.DoNotLoadCommitPushedDate)
+ 	p.fillDefaults()
+ }
+ 
+@@ -78,3 +84,12 @@ func setStringFromEnv(key, prefix string, value *string) bool {
+ 	}
+ 	return false
+ }
++
++func setBoolFromEnv(key, prefix string, value *bool) bool {
++	if v, ok := os.LookupEnv(prefix + key); ok {
++		parsedResult, _ := strconv.ParseBool(v)
++		*value = parsedResult
++		return true
++	}
++	return false
++}

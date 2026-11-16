@@ -1,0 +1,2 @@
+Have starting_time be 0.0 by default
+In my experience, the starting time of a `TimeSeries` is almost always `0.0`. Of course we should keep the flexibility to make it some other time if needed, but I think it's safe to assume if a user supplies a `rate` and no `timestamps` or `starting_time` that they mean `starting_time=0.0`. I propose that this be a default value for `TimeSeries` objects and all objects that inherit from `TimeSeries`.

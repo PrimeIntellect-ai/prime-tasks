@@ -1,0 +1,389 @@
+diff --git a/README.md b/README.md
+index 90e13dd..c6f4ef4 100644
+--- a/README.md
++++ b/README.md
+@@ -73,7 +73,9 @@ transforms are available:
+   annotations and handling features like enums. Does not check types. Sucrase
+   transforms each file independently, so you should enable the `isolatedModules`
+   TypeScript flag so that the typechecker will disallow the few features like
+-  `const enum`s that need cross-file compilation.
++  `const enum`s that need cross-file compilation. The Sucrase option `keepUnusedImports`
++  can be used to disable all automatic removal of imports and exports, analogous to TS
++  `verbatimModuleSyntax`.
+ * **flow**:  Removes Flow type annotations. Does not check types.
+ * **imports**: Transforms ES Modules (`import`/`export`) to CommonJS
+   (`require`/`module.exports`) using the same approach as Babel and TypeScript
+diff --git a/src/CJSImportProcessor.ts b/src/CJSImportProcessor.ts
+index d3ca41b..14f62ef 100644
+--- a/src/CJSImportProcessor.ts
++++ b/src/CJSImportProcessor.ts
+@@ -43,6 +43,7 @@ export default class CJSImportProcessor {
+     readonly enableLegacyTypeScriptModuleInterop: boolean,
+     readonly options: Options,
+     readonly isTypeScriptTransformEnabled: boolean,
++    readonly keepUnusedImports: boolean,
+     readonly helperManager: HelperManager,
+   ) {}
+ 
+@@ -65,8 +66,8 @@ export default class CJSImportProcessor {
+   }
+ 
+   /**
+-   * In TypeScript, import statements that only import types should be removed. This does not count
+-   * bare imports.
++   * In TypeScript, import statements that only import types should be removed.
++   * This includes `import {} from 'foo';`, but not `import 'foo';`.
+    */
+   pruneTypeOnlyImports(): void {
+     this.nonTypeIdentifiers = getNonTypeIdentifiers(this.tokens, this.options);
+@@ -84,14 +85,18 @@ export default class CJSImportProcessor {
+         ...importInfo.wildcardNames,
+         ...importInfo.namedImports.map(({localName}) => localName),
+       ];
+-      if (names.every((name) => this.isTypeName(name))) {
++      if (names.every((name) => this.shouldAutomaticallyElideImportedName(name))) {
+         this.importsToReplace.set(path, "");
+       }
+     }
+   }
+ 
+-  isTypeName(name: string): boolean {
+-    return this.isTypeScriptTransformEnabled && !this.nonTypeIdentifiers.has(name);
++  shouldAutomaticallyElideImportedName(name: string): boolean {
++    return (
++      this.isTypeScriptTransformEnabled &&
++      !this.keepUnusedImports &&
++      !this.nonTypeIdentifiers.has(name)
++    );
+   }
+ 
+   private generateImportReplacements(): void {
+diff --git a/src/Options-gen-types.ts b/src/Options-gen-types.ts
+index 9a407fd..85ade2d 100644
+--- a/src/Options-gen-types.ts
++++ b/src/Options-gen-types.ts
+@@ -25,6 +25,7 @@ export const Options = t.iface([], {
+   jsxImportSource: t.opt("string"),
+   jsxPragma: t.opt("string"),
+   jsxFragmentPragma: t.opt("string"),
++  keepUnusedImports: t.opt("boolean"),
+   preserveDynamicImport: t.opt("boolean"),
+   injectCreateRequireForImportRequire: t.opt("boolean"),
+   enableLegacyTypeScriptModuleInterop: t.opt("boolean"),
+diff --git a/src/Options.ts b/src/Options.ts
+index f855047..d131c0b 100644
+--- a/src/Options.ts
++++ b/src/Options.ts
+@@ -55,6 +55,12 @@ export interface Options {
+    * compiling JSX with the classic runtime.
+    */
+   jsxFragmentPragma?: string;
++  /**
++   * If specified, disable automatic removal of type-only import and export
++   * statements and names. Only statements and names that explicitly use the
++   * `type` keyword are removed.
++   */
++  keepUnusedImports?: boolean;
+   /**
+    * If specified, the imports transform does not attempt to change dynamic
+    * import() expressions into require() calls.
+diff --git a/src/index.ts b/src/index.ts
+index 7ca1595..607aa64 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -115,16 +115,18 @@ function getSucraseContext(code: string, options: Options): SucraseContext {
+       enableLegacyTypeScriptModuleInterop,
+       options,
+       options.transforms.includes("typescript"),
++      Boolean(options.keepUnusedImports),
+       helperManager,
+     );
+     importProcessor.preprocessTokens();
+     // We need to mark shadowed globals after processing imports so we know that the globals are,
+     // but before type-only import pruning, since that relies on shadowing information.
+     identifyShadowedGlobals(tokenProcessor, scopes, importProcessor.getGlobalNames());
+-    if (options.transforms.includes("typescript")) {
++    if (options.transforms.includes("typescript") && !options.keepUnusedImports) {
+       importProcessor.pruneTypeOnlyImports();
+     }
+-  } else if (options.transforms.includes("typescript")) {
++  } else if (options.transforms.includes("typescript") && !options.keepUnusedImports) {
++    // Shadowed global detection is needed for TS implicit elision of imported names.
+     identifyShadowedGlobals(tokenProcessor, scopes, getTSImportedNames(tokenProcessor));
+   }
+   return {tokenProcessor, scopes, nameManager, importProcessor, helperManager};
+diff --git a/src/transformers/CJSImportTransformer.ts b/src/transformers/CJSImportTransformer.ts
+index 0bab773..fa367ee 100644
+--- a/src/transformers/CJSImportTransformer.ts
++++ b/src/transformers/CJSImportTransformer.ts
+@@ -39,6 +39,7 @@ export default class CJSImportTransformer extends Transformer {
+     readonly isTypeScriptTransformEnabled: boolean,
+     readonly isFlowTransformEnabled: boolean,
+     readonly preserveDynamicImport: boolean,
++    readonly keepUnusedImports: boolean,
+   ) {
+     super();
+     this.declarationInfo = isTypeScriptTransformEnabled
+@@ -101,7 +102,7 @@ export default class CJSImportTransformer extends Transformer {
+ 
+   private processImportEquals(): boolean {
+     const importName = this.tokens.identifierNameAtIndex(this.tokens.currentIndex() + 1);
+-    if (this.importProcessor.isTypeName(importName)) {
++    if (this.importProcessor.shouldAutomaticallyElideImportedName(importName)) {
+       // If this name is only used as a type, elide the whole import.
+       elideImportEquals(this.tokens);
+     } else {
+@@ -222,6 +223,9 @@ export default class CJSImportTransformer extends Transformer {
+       }
+       this.tokens.removeToken();
+     }
++    if (this.keepUnusedImports) {
++      return false;
++    }
+     if (this.isTypeScriptTransformEnabled) {
+       return !foundNonTypeImport;
+     } else if (this.isFlowTransformEnabled) {
+@@ -546,7 +550,12 @@ export default class CJSImportTransformer extends Transformer {
+       this.tokens.appendCode(` exports.default = ${name};`);
+       // After this point, this is a plain "export default E" statement.
+     } else if (
+-      shouldElideDefaultExport(this.isTypeScriptTransformEnabled, this.tokens, this.declarationInfo)
++      shouldElideDefaultExport(
++        this.isTypeScriptTransformEnabled,
++        this.keepUnusedImports,
++        this.tokens,
++        this.declarationInfo,
++      )
+     ) {
+       // If the exported value is just an identifier and should be elided by TypeScript
+       // rules, then remove it entirely. It will always have the form `export default e`,
+@@ -898,6 +907,10 @@ export default class CJSImportTransformer extends Transformer {
+   }
+ 
+   private shouldElideExportedIdentifier(name: string): boolean {
+-    return this.isTypeScriptTransformEnabled && !this.declarationInfo.valueDeclarations.has(name);
++    return (
++      this.isTypeScriptTransformEnabled &&
++      !this.keepUnusedImports &&
++      !this.declarationInfo.valueDeclarations.has(name)
++    );
+   }
+ }
+diff --git a/src/transformers/ESMImportTransformer.ts b/src/transformers/ESMImportTransformer.ts
+index d40dd4c..eb550cf 100644
+--- a/src/transformers/ESMImportTransformer.ts
++++ b/src/transformers/ESMImportTransformer.ts
+@@ -33,15 +33,18 @@ export default class ESMImportTransformer extends Transformer {
+     readonly reactHotLoaderTransformer: ReactHotLoaderTransformer | null,
+     readonly isTypeScriptTransformEnabled: boolean,
+     readonly isFlowTransformEnabled: boolean,
++    readonly keepUnusedImports: boolean,
+     options: Options,
+   ) {
+     super();
+-    this.nonTypeIdentifiers = isTypeScriptTransformEnabled
+-      ? getNonTypeIdentifiers(tokens, options)
+-      : new Set();
+-    this.declarationInfo = isTypeScriptTransformEnabled
+-      ? getDeclarationInfo(tokens)
+-      : EMPTY_DECLARATION_INFO;
++    this.nonTypeIdentifiers =
++      isTypeScriptTransformEnabled && !keepUnusedImports
++        ? getNonTypeIdentifiers(tokens, options)
++        : new Set();
++    this.declarationInfo =
++      isTypeScriptTransformEnabled && !keepUnusedImports
++        ? getDeclarationInfo(tokens)
++        : EMPTY_DECLARATION_INFO;
+     this.injectCreateRequireForImportRequire = Boolean(options.injectCreateRequireForImportRequire);
+   }
+ 
+@@ -277,6 +280,9 @@ export default class ESMImportTransformer extends Transformer {
+       this.tokens.copyExpectedToken(tt.braceR);
+     }
+ 
++    if (this.keepUnusedImports) {
++      return false;
++    }
+     if (this.isTypeScriptTransformEnabled) {
+       return !foundNonTypeImport;
+     } else if (this.isFlowTransformEnabled) {
+@@ -288,12 +294,21 @@ export default class ESMImportTransformer extends Transformer {
+   }
+ 
+   private shouldAutomaticallyElideImportedName(name: string): boolean {
+-    return this.isTypeScriptTransformEnabled && !this.nonTypeIdentifiers.has(name);
++    return (
++      this.isTypeScriptTransformEnabled &&
++      !this.keepUnusedImports &&
++      !this.nonTypeIdentifiers.has(name)
++    );
+   }
+ 
+   private processExportDefault(): boolean {
+     if (
+-      shouldElideDefaultExport(this.isTypeScriptTransformEnabled, this.tokens, this.declarationInfo)
++      shouldElideDefaultExport(
++        this.isTypeScriptTransformEnabled,
++        this.keepUnusedImports,
++        this.tokens,
++        this.declarationInfo,
++      )
+     ) {
+       // If the exported value is just an identifier and should be elided by TypeScript
+       // rules, then remove it entirely. It will always have the form `export default e`,
+@@ -373,7 +388,7 @@ export default class ESMImportTransformer extends Transformer {
+     }
+     this.tokens.copyExpectedToken(tt.braceR);
+ 
+-    if (isReExport && !foundNonTypeExport) {
++    if (!this.keepUnusedImports && isReExport && !foundNonTypeExport) {
+       // This is a type-only re-export, so skip evaluating the other module. Technically this
+       // leaves the statement as `export {}`, but that's ok since that's a no-op.
+       this.tokens.removeToken();
+@@ -392,6 +407,7 @@ export default class ESMImportTransformer extends Transformer {
+   private shouldElideExportedName(name: string): boolean {
+     return (
+       this.isTypeScriptTransformEnabled &&
++      !this.keepUnusedImports &&
+       this.declarationInfo.typeDeclarations.has(name) &&
+       !this.declarationInfo.valueDeclarations.has(name)
+     );
+diff --git a/src/transformers/RootTransformer.ts b/src/transformers/RootTransformer.ts
+index 40ec67f..b0663b6 100644
+--- a/src/transformers/RootTransformer.ts
++++ b/src/transformers/RootTransformer.ts
+@@ -97,6 +97,7 @@ export default class RootTransformer {
+           transforms.includes("typescript"),
+           transforms.includes("flow"),
+           Boolean(options.preserveDynamicImport),
++          Boolean(options.keepUnusedImports),
+         ),
+       );
+     } else {
+@@ -108,6 +109,7 @@ export default class RootTransformer {
+           reactHotLoaderTransformer,
+           transforms.includes("typescript"),
+           transforms.includes("flow"),
++          Boolean(options.keepUnusedImports),
+           options,
+         ),
+       );
+diff --git a/src/util/shouldElideDefaultExport.ts b/src/util/shouldElideDefaultExport.ts
+index 7d969fa..b1a9a03 100644
+--- a/src/util/shouldElideDefaultExport.ts
++++ b/src/util/shouldElideDefaultExport.ts
+@@ -7,10 +7,11 @@ import type {DeclarationInfo} from "./getDeclarationInfo";
+  */
+ export default function shouldElideDefaultExport(
+   isTypeScriptTransformEnabled: boolean,
++  keepUnusedImports: boolean,
+   tokens: TokenProcessor,
+   declarationInfo: DeclarationInfo,
+ ): boolean {
+-  if (!isTypeScriptTransformEnabled) {
++  if (!isTypeScriptTransformEnabled || keepUnusedImports) {
+     return false;
+   }
+   const exportToken = tokens.currentToken();
+diff --git a/ts-node-plugin/index.js b/ts-node-plugin/index.js
+index d072c67..b523fb3 100644
+--- a/ts-node-plugin/index.js
++++ b/ts-node-plugin/index.js
+@@ -21,14 +21,20 @@ const JsxEmitReactJSXDev = 5;
+  * JS syntax downleveling (at least not in a way that is useful for Node).
+  *
+  * One notable caveat is that importsNotUsedAsValues and preserveValueImports
+- * are ignored right now, and Sucrase uses TypeScript's default behavior of
+- * eliding imports only used as types. This usually makes no difference when
+- * running the code, so for now we ignore these options without a warning.
++ * are ignored right now, since they are deprecated and don't have exact Sucrase
++ * equivalents. To preserve imports and exports, use verbatimModuleSyntax.
+  */
+ function create(createOptions) {
+   const {nodeModuleEmitKind} = createOptions;
+-  const {module, jsx, jsxFactory, jsxFragmentFactory, jsxImportSource, esModuleInterop} =
+-    createOptions.service.config.options;
++  const {
++    module,
++    jsx,
++    jsxFactory,
++    jsxFragmentFactory,
++    jsxImportSource,
++    esModuleInterop,
++    verbatimModuleSyntax,
++  } = createOptions.service.config.options;
+ 
+   return {
+     transpile(input, transpileOptions) {
+@@ -59,6 +65,7 @@ function create(createOptions) {
+         jsxImportSource,
+         jsxPragma: jsxFactory,
+         jsxFragmentPragma: jsxFragmentFactory,
++        keepUnusedImports: verbatimModuleSyntax,
+         preserveDynamicImport: nodeModuleEmitKind === "nodecjs",
+         injectCreateRequireForImportRequire: nodeModuleEmitKind === "nodeesm",
+         enableLegacyTypeScriptModuleInterop: !esModuleInterop,
+diff --git a/website/src/Constants.ts b/website/src/Constants.ts
+index 58ae205..d9a13b3 100644
+--- a/website/src/Constants.ts
++++ b/website/src/Constants.ts
+@@ -59,6 +59,7 @@ export const DEFAULT_OPTIONS: HydratedOptions = {
+   jsxImportSource: "react",
+   jsxPragma: "React.createElement",
+   jsxFragmentPragma: "React.Fragment",
++  keepUnusedImports: false,
+   preserveDynamicImport: false,
+   injectCreateRequireForImportRequire: false,
+   enableLegacyTypeScriptModuleInterop: false,
+diff --git a/website/src/SucraseOptionsBox.tsx b/website/src/SucraseOptionsBox.tsx
+index 18389ae..ec71dca 100644
+--- a/website/src/SucraseOptionsBox.tsx
++++ b/website/src/SucraseOptionsBox.tsx
+@@ -33,6 +33,7 @@ interface BooleanOptionProps {
+     | "enableLegacyBabel5ModuleInterop"
+     | "production"
+     | "disableESTransforms"
++    | "keepUnusedImports"
+     | "preserveDynamicImport"
+     | "injectCreateRequireForImportRequire";
+   options: HydratedOptions;
+@@ -200,6 +201,14 @@ export default function SucraseOptionsBox({
+               )}
+             </div>
+             <div className={css(styles.secondaryOptionColumn)}>
++              {(options.transforms.includes("typescript") ||
++                options.transforms.includes("flow")) && (
++                <BooleanOption
++                  optionName="keepUnusedImports"
++                  options={options}
++                  onUpdateOptions={onUpdateOptions}
++                />
++              )}
+               {options.transforms.includes("imports") && (
+                 <>
+                   <BooleanOption
+diff --git a/website/src/worker/Worker.worker.ts b/website/src/worker/Worker.worker.ts
+index f533090..cf8fdd3 100644
+--- a/website/src/worker/Worker.worker.ts
++++ b/website/src/worker/Worker.worker.ts
+@@ -159,7 +159,10 @@ function runBabel(): {code: string; time: number | null} {
+     }
+   }
+   if (sucraseOptions.transforms.includes("typescript")) {
+-    presets.push(["typescript", {allowDeclareFields: true}]);
++    presets.push([
++      "typescript",
++      {allowDeclareFields: true, onlyRemoveTypeImports: sucraseOptions.keepUnusedImports},
++    ]);
+   }
+   if (sucraseOptions.transforms.includes("flow")) {
+     presets.push("flow");
+@@ -257,6 +260,7 @@ function runTypeScript(): {code: string; time: number | null} {
+           esModuleInterop: !sucraseOptions.enableLegacyTypeScriptModuleInterop,
+           jsxFactory: sucraseOptions.jsxPragma,
+           jsxFragmentFactory: sucraseOptions.jsxFragmentPragma,
++          verbatimModuleSyntax: sucraseOptions.keepUnusedImports,
+         },
+       }).outputText,
+   );

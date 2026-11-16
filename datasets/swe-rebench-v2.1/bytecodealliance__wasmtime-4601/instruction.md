@@ -1,0 +1,4 @@
+Fold Wasm<--->host trampoline functionality into component trampolines
+This is a follow up to https://github.com/bytecodealliance/wasmtime/pull/4431
+
+In that PR we don't save entry SP and exit FP/return pointer for calls into/out of components because they use a different set of trampolines. However, simply saving the entry SP and exit FP/return pointer isn't something we can simply add to the existing component trampolines because they are defined in CLIF and CLIF doesn't have a way to talk about these particular architecture-specific details. Mach insts do via operand constraints given to regalloc, but CLIF itself doesn't. So we would need to either have two layered trampolines that bounce from the first to the second when calling into / out of components (very not ideal) or we need to add an instruction to CLIF or something to grab the current SP/FP/return pointer (probably we should do this, but it requires some thought/design).

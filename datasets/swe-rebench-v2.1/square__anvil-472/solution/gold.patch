@@ -1,0 +1,406 @@
+diff --git a/annotations/src/main/java/com/squareup/anvil/annotations/ContributesSubcomponent.kt b/annotations/src/main/java/com/squareup/anvil/annotations/ContributesSubcomponent.kt
+index 5e8254cdd..6d7ab5ad3 100644
+--- a/annotations/src/main/java/com/squareup/anvil/annotations/ContributesSubcomponent.kt
++++ b/annotations/src/main/java/com/squareup/anvil/annotations/ContributesSubcomponent.kt
+@@ -93,7 +93,12 @@ public annotation class ContributesSubcomponent(
+    * List of bindings, multibindings, modules and component interfaces that are contributed to the
+    * same scope, but should be excluded from the subcomponent.
+    */
+-  val exclude: Array<KClass<*>> = []
++  val exclude: Array<KClass<*>> = [],
++  /**
++   * This contributed subcomponent will replace these contributed subcomponents. All replaced
++   * subcomponents must use the same scope.
++   */
++  val replaces: Array<KClass<*>> = []
+ ) {
+   /**
+    * A factory for a contributed subcomponent.
+diff --git a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/ClassReference.kt b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/ClassReference.kt
+index c8dd5e792..78fc45938 100644
+--- a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/ClassReference.kt
++++ b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/ClassReference.kt
+@@ -189,6 +189,7 @@ private fun replacesIndex(annotationFqName: FqName): Int {
+   return when (annotationFqName) {
+     contributesToFqName -> 1
+     contributesBindingFqName, contributesMultibindingFqName -> 2
++    contributesSubcomponentFqName -> 4
+     else -> throw NotImplementedError(
+       "Couldn't find index of replaces argument for $annotationFqName."
+     )
+diff --git a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/CompilerUtils.kt b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/CompilerUtils.kt
+index b2f376bc6..adacd0341 100644
+--- a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/CompilerUtils.kt
++++ b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/CompilerUtils.kt
+@@ -108,13 +108,17 @@ public fun AnnotationDescriptor.getAnnotationValue(key: String): ConstantValue<*
+ 
+ @ExperimentalAnvilApi
+ public fun AnnotationDescriptor.scope(module: ModuleDescriptor): ClassDescriptor {
+-  val annotationValue = getAnnotationValue("scope") as? KClassValue
++  return scopeOrNull(module)
+     ?: throw AnvilCompilationException(
+       annotationDescriptor = this,
+       message = "Couldn't find scope for $fqName."
+     )
++}
+ 
+-  return annotationValue.argumentType(module).requireClassDescriptor()
++@ExperimentalAnvilApi
++public fun AnnotationDescriptor.scopeOrNull(module: ModuleDescriptor): ClassDescriptor? {
++  val annotationValue = getAnnotationValue("scope") as? KClassValue
++  return annotationValue?.argumentType(module)?.requireClassDescriptor()
+ }
+ 
+ @ExperimentalAnvilApi
+diff --git a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/PsiUtils.kt b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/PsiUtils.kt
+index 01f8c582d..5ac8d6529 100644
+--- a/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/PsiUtils.kt
++++ b/compiler-utils/src/main/java/com/squareup/anvil/compiler/internal/PsiUtils.kt
+@@ -167,10 +167,25 @@ public fun KtClassOrObject.scopeOrNull(
+   module: ModuleDescriptor
+ ): FqName? {
+   return findAnnotation(annotationFqName, module)
+-    ?.findAnnotationArgument<KtClassLiteralExpression>(name = "scope", index = 0)
++    ?.scopeOrNull(module)
++}
++
++public fun KtAnnotationEntry.scopeOrNull(
++  module: ModuleDescriptor
++): FqName? {
++  return findAnnotationArgument<KtClassLiteralExpression>(name = "scope", index = 0)
+     ?.requireFqName(module)
+ }
+ 
++public fun KtAnnotationEntry.scope(
++  module: ModuleDescriptor
++): FqName {
++  return scopeOrNull(module) ?: throw AnvilCompilationException(
++    "Couldn't find scope for ${fqNameOrNull(module)}.",
++    element = this
++  )
++}
++
+ @ExperimentalAnvilApi
+ public fun KtClassOrObject.parentScope(
+   annotationFqName: FqName,
+diff --git a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentGenerator.kt b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentGenerator.kt
+index e194e0732..0250adce4 100644
+--- a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentGenerator.kt
++++ b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentGenerator.kt
+@@ -15,6 +15,8 @@ import com.squareup.anvil.compiler.contributesSubcomponentFqName
+ import com.squareup.anvil.compiler.contributesToFqName
+ import com.squareup.anvil.compiler.daggerSubcomponentBuilderFqName
+ import com.squareup.anvil.compiler.daggerSubcomponentFactoryFqName
++import com.squareup.anvil.compiler.internal.ClassReference
++import com.squareup.anvil.compiler.internal.annotations
+ import com.squareup.anvil.compiler.internal.asClassName
+ import com.squareup.anvil.compiler.internal.buildFile
+ import com.squareup.anvil.compiler.internal.classesAndInnerClass
+@@ -23,9 +25,11 @@ import com.squareup.anvil.compiler.internal.generateClassName
+ import com.squareup.anvil.compiler.internal.hasAnnotation
+ import com.squareup.anvil.compiler.internal.isInterface
+ import com.squareup.anvil.compiler.internal.parentScope
++import com.squareup.anvil.compiler.internal.replaces
+ import com.squareup.anvil.compiler.internal.requireFqName
+ import com.squareup.anvil.compiler.internal.safePackageString
+ import com.squareup.anvil.compiler.internal.scope
++import com.squareup.anvil.compiler.internal.toClassReference
+ import com.squareup.kotlinpoet.FileSpec
+ import com.squareup.kotlinpoet.KModifier.PUBLIC
+ import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
+@@ -77,6 +81,14 @@ internal class ContributesSubcomponentGenerator : CodeGenerator {
+             element = clazz.identifyingElement
+           )
+         }
++
++        val scope = clazz.scope(contributesSubcomponentFqName, module)
++
++        clazz.toClassReference()
++          .replaces(module, contributesSubcomponentFqName)
++          .onEach {
++            it.checkUsesSameScope(scope, clazz, module)
++          }
+       }
+       .map { clazz ->
+         val fileName = clazz.generateClassName()
+@@ -228,6 +240,31 @@ internal class ContributesSubcomponentGenerator : CodeGenerator {
+     }
+   }
+ 
++  private fun ClassReference.checkUsesSameScope(
++    scope: FqName,
++    subcomponent: KtClassOrObject,
++    module: ModuleDescriptor
++  ) {
++    annotations(module)
++      .filter { it.fqName == contributesSubcomponentFqName }
++      .ifEmpty {
++        throw AnvilCompilationException(
++          element = subcomponent,
++          message = "Couldn't find the annotation @ContributesSubcomponent for $fqName."
++        )
++      }
++      .forEach { annotation ->
++        val otherScope = annotation.scope(module).fqName
++        if (otherScope != scope) {
++          throw AnvilCompilationException(
++            element = subcomponent,
++            message = "${subcomponent.requireFqName()} with scope $scope wants to replace " +
++              "$fqName with scope $otherScope. The replacement must use the same scope."
++          )
++        }
++      }
++  }
++
+   private val KtClassOrObject.childrenInBody: List<PsiElement>
+     get() = children.filterIsInstance<KtClassBody>().singleOrNull()?.children?.toList()
+       ?: emptyList()
+diff --git a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentHandlerGenerator.kt b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentHandlerGenerator.kt
+index ed4b022e1..2f70523ac 100644
+--- a/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentHandlerGenerator.kt
++++ b/compiler/src/main/java/com/squareup/anvil/compiler/codegen/ContributesSubcomponentHandlerGenerator.kt
+@@ -37,6 +37,8 @@ import com.squareup.anvil.compiler.internal.isAbstractClass
+ import com.squareup.anvil.compiler.internal.isInterface
+ import com.squareup.anvil.compiler.internal.isPublic
+ import com.squareup.anvil.compiler.internal.parentScope
++import com.squareup.anvil.compiler.internal.replaces
++import com.squareup.anvil.compiler.internal.requireFqName
+ import com.squareup.anvil.compiler.internal.returnType
+ import com.squareup.anvil.compiler.internal.safePackageString
+ import com.squareup.anvil.compiler.internal.scope
+@@ -89,7 +91,11 @@ internal class ContributesSubcomponentHandlerGenerator(
+ ) : CodeGenerator {
+ 
+   private val triggers = mutableListOf<Trigger>()
+-  private val contributions = mutableListOf<Contribution>()
++  private val contributions = mutableSetOf<Contribution>()
++  private val replacedReferences = mutableSetOf<ClassReference>()
++  private val generatedContributions = mutableSetOf<Contribution>()
++
++  private var isFirstRound = true
+ 
+   override fun isApplicable(context: AnvilContext): Boolean =
+     throw NotImplementedError(
+@@ -101,9 +107,13 @@ internal class ContributesSubcomponentHandlerGenerator(
+     module: ModuleDescriptor,
+     projectFiles: Collection<KtFile>
+   ): Collection<GeneratedFile> {
++    if (isFirstRound) {
++      isFirstRound = false
++      populateInitialContributions(module)
++    }
+ 
+     // Find new @MergeComponent (and similar triggers) that would cause generating new code.
+-    val newTriggers = projectFiles
++    triggers += projectFiles
+       .classesAndInnerClass(module)
+       .mapNotNull { clazz ->
+         val annotation = generationTrigger.firstOrNull { trigger ->
+@@ -114,51 +124,9 @@ internal class ContributesSubcomponentHandlerGenerator(
+ 
+         Trigger(clazz, clazz.scope(annotation, module), exclusions)
+       }
+-      .also {
+-        triggers += it
+-      }
+-
+-    // If there is a new trigger, then find all contributed subcomponents from precompiled
+-    // dependencies for this scope and generate the necessary code.
+-    contributions += newTriggers
+-      .flatMap { trigger ->
+-        classScanner
+-          .findContributedClasses(
+-            module = module,
+-            packageName = HINT_SUBCOMPONENTS_PACKAGE_PREFIX,
+-            annotation = contributesSubcomponentFqName,
+-            // Don't use trigger.scope, because it refers to the parent scope of the
+-            // @ContributesSubcomponent annotation.
+-            scope = null
+-          )
+-          .mapNotNull { descriptor ->
+-            val annotation = descriptor.annotation(contributesSubcomponentFqName)
+-
+-            val parentScope = annotation.parentScope(module).fqNameSafe
+-            if (parentScope != trigger.scope) return@mapNotNull null
+-
+-            val modules = (annotation.getAnnotationValue("modules") as? ArrayValue)
+-              ?.value
+-              ?.map { it.argumentType(module).fqName() }
+-              ?: emptyList()
+-
+-            val exclude = (annotation.getAnnotationValue("exclude") as? ArrayValue)
+-              ?.value
+-              ?.map { it.argumentType(module).fqName() }
+-              ?: emptyList()
+-
+-            Contribution(
+-              classReference = descriptor.toClassReference(),
+-              scope = annotation.scope(module).fqNameSafe,
+-              parentScope = parentScope,
+-              modules = modules,
+-              exclude = exclude
+-            )
+-          }
+-      }
+ 
+     // Find new contributed subcomponents in this module. If there's a trigger for them, then we
+-    // also need to generate code for them.
++    // also need to generate code for them later.
+     contributions += projectFiles
+       .classesAndInnerClass(module)
+       .mapNotNull { clazz ->
+@@ -183,6 +151,21 @@ internal class ContributesSubcomponentHandlerGenerator(
+           exclude = exclude
+         )
+       }
++      .toList()
++      .also { contributions ->
++        // Find all replaced subcomponents and remember them.
++        replacedReferences += contributions.flatMap { contribution ->
++          contribution.classReference.replaces(module, contributesSubcomponentFqName)
++            .also {
++              checkReplacedSubcomponentWasNotAlreadyGenerated(contribution.classReference, it)
++            }
++        }
++      }
++
++    // Remove any contribution, if it was replaced by another contribution.
++    contributions.removeAll { contribution ->
++      contribution.classReference in replacedReferences
++    }
+ 
+     val newContributions = contributions
+       .flatMap { contribution ->
+@@ -195,6 +178,9 @@ internal class ContributesSubcomponentHandlerGenerator(
+             GenerateCodeEvent(trigger, contribution)
+           }
+       }
++      .also {
++        generatedContributions += it.map { generateCodeEvent -> generateCodeEvent.contribution }
++      }
+ 
+     contributions -= newContributions.mapTo(mutableSetOf()) { it.contribution }
+ 
+@@ -441,6 +427,63 @@ internal class ContributesSubcomponentHandlerGenerator(
+     )
+   }
+ 
++  private fun checkReplacedSubcomponentWasNotAlreadyGenerated(
++    contributedReference: ClassReference,
++    replacedReferences: List<ClassReference>
++  ) {
++    replacedReferences.forEach { replacedReference ->
++      if (generatedContributions.any { it.classReference == replacedReference }) {
++        throw AnvilCompilationExceptionClassReference(
++          classReference = contributedReference,
++          message = "${contributedReference.fqName} tries to replace " +
++            "${replacedReference.fqName}, but the code for ${replacedReference.fqName} was " +
++            "already generated. This is not supported."
++        )
++      }
++    }
++  }
++
++  private fun populateInitialContributions(
++    module: ModuleDescriptor
++  ) {
++    // Find all contributed subcomponents from precompiled dependencies and generate the
++    // necessary code eventually if there's a trigger.
++    contributions += classScanner
++      .findContributedClasses(
++        module = module,
++        packageName = HINT_SUBCOMPONENTS_PACKAGE_PREFIX,
++        annotation = contributesSubcomponentFqName,
++        scope = null
++      )
++      .map { descriptor ->
++        val annotation = descriptor.annotation(contributesSubcomponentFqName)
++
++        val modules = (annotation.getAnnotationValue("modules") as? ArrayValue)
++          ?.value
++          ?.map { it.argumentType(module).fqName() }
++          ?: emptyList()
++
++        val exclude = (annotation.getAnnotationValue("exclude") as? ArrayValue)
++          ?.value
++          ?.map { it.argumentType(module).fqName() }
++          ?: emptyList()
++
++        Contribution(
++          classReference = descriptor.toClassReference(),
++          scope = annotation.scope(module).fqNameSafe,
++          parentScope = annotation.parentScope(module).fqNameSafe,
++          modules = modules,
++          exclude = exclude
++        )
++      }
++
++    // Find all replaced subcomponents from precompiled dependencies.
++    replacedReferences += contributions
++      .flatMap {
++        it.classReference.replaces(module, contributesSubcomponentFqName)
++      }
++  }
++
+   private companion object {
+     val generationTrigger = setOf(
+       mergeComponentFqName,
+@@ -457,8 +500,28 @@ internal class ContributesSubcomponentHandlerGenerator(
+     val scope: FqName,
+     val exclusions: List<FqName>
+   ) {
++    val clazzFqName = clazz.requireFqName()
++
+     override fun toString(): String {
+-      return "Trigger(clazz=$clazz, scope=$scope)"
++      return "Trigger(clazz=$clazzFqName, scope=$scope)"
++    }
++
++    override fun equals(other: Any?): Boolean {
++      if (this === other) return true
++      if (javaClass != other?.javaClass) return false
++
++      other as Trigger
++
++      if (scope != other.scope) return false
++      if (clazzFqName != other.clazzFqName) return false
++
++      return true
++    }
++
++    override fun hashCode(): Int {
++      var result = scope.hashCode()
++      result = 31 * result + clazzFqName.hashCode()
++      return result
+     }
+   }
+ 
+@@ -472,7 +535,27 @@ internal class ContributesSubcomponentHandlerGenerator(
+     val clazzFqName = classReference.fqName
+ 
+     override fun toString(): String {
+-      return "Contribution(class=$classReference, parentScope=$parentScope)"
++      return "Contribution(class=$classReference, scope=$scope, parentScope=$parentScope)"
++    }
++
++    override fun equals(other: Any?): Boolean {
++      if (this === other) return true
++      if (javaClass != other?.javaClass) return false
++
++      other as Contribution
++
++      if (scope != other.scope) return false
++      if (parentScope != other.parentScope) return false
++      if (clazzFqName != other.clazzFqName) return false
++
++      return true
++    }
++
++    override fun hashCode(): Int {
++      var result = scope.hashCode()
++      result = 31 * result + parentScope.hashCode()
++      result = 31 * result + clazzFqName.hashCode()
++      return result
+     }
+   }
+ 

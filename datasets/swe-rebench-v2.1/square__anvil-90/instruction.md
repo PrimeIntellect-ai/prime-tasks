@@ -1,0 +1,2 @@
+Allow using Anvil to generate Factories for subcomponents
+At the moment if a module contains a `@Component` or `@Subcomponent` class and Anvil is setup to generate Dagger factories the compiler plugin throws an error, because it cannot generate this code. This check is correct for `@Component`s, but not subcomponents. Subcomponents are generated in the same module as the root component is generated.

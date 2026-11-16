@@ -1,0 +1,330 @@
+diff --git a/qiskit/__init__.py b/qiskit/__init__.py
+index 4109b14c0..72adbc105 100644
+--- a/qiskit/__init__.py
++++ b/qiskit/__init__.py
+@@ -14,9 +14,36 @@
+ 
+ """Main Qiskit public functionality."""
+ 
++import importlib.metadata
++import importlib.util
++import os
+ import sys
+ import warnings
+ 
++try:
++    importlib.metadata.version("qiskit-terra")
++except importlib.metadata.PackageNotFoundError:
++    # All good!
++    pass
++else:
++    # 'qiskit.tools' is present in all 0.x series of Qiskit and not in Qiskit 1.0+.  If a dev has an
++    # editable install and switches from 0.x branches to 1.0+ branches, they might have an empty
++    # `qiskit/tools` folder in their path, which will appear as a "namespace package" with no valid
++    # location.  We catch that case as "not actually having Qiskit 0.x" as a convenience to devs.
++    _has_tools = getattr(importlib.util.find_spec("qiskit.tools"), "has_location", False)
++    _suppress_error = os.environ.get("QISKIT_SUPPRESS_1_0_IMPORT_ERROR", False) == "1"
++    if not _suppress_error and _has_tools:
++        raise ImportError(
++            "Qiskit is installed in an invalid environment that has both Qiskit >=1.0"
++            " and an earlier version."
++            " You should create a new virtual environment, and ensure that you do not mix"
++            " dependencies between Qiskit <1.0 and >=1.0."
++            " Any packages that depend on 'qiskit-terra' are not compatible with Qiskit 1.0 and"
++            " will need to be updated."
++            " Qiskit unfortunately cannot enforce this requirement during environment resolution."
++            " See https://qisk.it/packaging-1-0 for more detail."
++        )
++
+ import qiskit._accelerate
+ 
+ 
+diff --git a/qiskit/circuit/quantumcircuit.py b/qiskit/circuit/quantumcircuit.py
+index dd211f84a..1f82cdba5 100644
+--- a/qiskit/circuit/quantumcircuit.py
++++ b/qiskit/circuit/quantumcircuit.py
+@@ -505,9 +505,11 @@ class QuantumCircuit:
+         #   copy.deepcopy(memo).
+         cls = self.__class__
+         result = cls.__new__(cls)
+-        for k in self.__dict__.keys() - {"_data"}:
++        for k in self.__dict__.keys() - {"_data", "_builder_api"}:
+             setattr(result, k, copy.deepcopy(self.__dict__[k], memo))
+ 
++        result._builder_api = _OuterCircuitScopeInterface(result)
++
+         # Avoids pulling self._data into a Python list
+         # like we would when pickling.
+         result._data = self._data.copy()
+diff --git a/qiskit/qasm3/ast.py b/qiskit/qasm3/ast.py
+index e81fcb1d9..9b8271ce7 100644
+--- a/qiskit/qasm3/ast.py
++++ b/qiskit/qasm3/ast.py
+@@ -596,11 +596,31 @@ class DefaultCase(Expression):
+     """An object representing the `default` special label in switch statements."""
+ 
+ 
+-class SwitchStatement(Statement):
+-    """AST node for the proposed 'switch-case' extension to OpenQASM 3."""
++class SwitchStatementPreview(Statement):
++    """AST node for the proposed 'switch-case' extension to OpenQASM 3, before the syntax was
++    stabilized.  This corresponds to the :attr:`.ExperimentalFeatures.SWITCH_CASE_V1` logic.
++
++    The stabilized form of the syntax instead uses :class:`.SwitchStatement`."""
+ 
+     def __init__(
+         self, target: Expression, cases: Iterable[Tuple[Iterable[Expression], ProgramBlock]]
+     ):
+         self.target = target
+         self.cases = [(tuple(values), case) for values, case in cases]
++
++
++class SwitchStatement(Statement):
++    """AST node for the stable 'switch' statement of OpenQASM 3.
++
++    The only real difference from an AST form is that the default is required to be separate; it
++    cannot be joined with other cases (even though that's meaningless, the V1 syntax permitted it)."""
++
++    def __init__(
++        self,
++        target: Expression,
++        cases: Iterable[Tuple[Iterable[Expression], ProgramBlock]],
++        default: Optional[ProgramBlock] = None,
++    ):
++        self.target = target
++        self.cases = [(tuple(values), case) for values, case in cases]
++        self.default = default
+diff --git a/qiskit/qasm3/experimental.py b/qiskit/qasm3/experimental.py
+index f52bca12c..8e925acb5 100644
+--- a/qiskit/qasm3/experimental.py
++++ b/qiskit/qasm3/experimental.py
+@@ -27,4 +27,44 @@ class ExperimentalFeatures(enum.Flag):
+     SWITCH_CASE_V1 = enum.auto()
+     """Support exporting switch-case statements as proposed by
+     https://github.com/openqasm/openqasm/pull/463 at `commit bfa787aa3078
+-    <https://github.com/openqasm/openqasm/pull/463/commits/bfa787aa3078>`__."""
++    <https://github.com/openqasm/openqasm/pull/463/commits/bfa787aa3078>`__.
++
++    These have the output format:
++
++    .. code-block::
++
++        switch (i) {
++            case 0:
++            case 1:
++                x $0;
++            break;
++
++            case 2: {
++                z $0;
++            }
++            break;
++
++            default: {
++                cx $0, $1;
++            }
++            break;
++        }
++
++    This differs from the syntax of the ``switch`` statement as stabilized.  If this flag is not
++    passed, then the parser will instead output using the stabilized syntax, which would render the
++    same example above as:
++
++    .. code-block::
++
++        switch (i) {
++            case 0, 1 {
++                x $0;
++            }
++            case 2 {
++                z $0;
++            }
++            default {
++                cx $0, $1;
++            }
++        }
++    """
+diff --git a/qiskit/qasm3/exporter.py b/qiskit/qasm3/exporter.py
+index c1398aff7..d8d3a4208 100644
+--- a/qiskit/qasm3/exporter.py
++++ b/qiskit/qasm3/exporter.py
+@@ -833,14 +833,6 @@ class QASM3Builder:
+ 
+     def build_switch_statement(self, instruction: CircuitInstruction) -> Iterable[ast.Statement]:
+         """Build a :obj:`.SwitchCaseOp` into a :class:`.ast.SwitchStatement`."""
+-        if ExperimentalFeatures.SWITCH_CASE_V1 not in self.experimental:
+-            raise QASM3ExporterError(
+-                "'switch' statements are not stabilized in OpenQASM 3 yet."
+-                " To enable experimental support, set the flag"
+-                " 'ExperimentalFeatures.SWITCH_CASE_V1' in the 'experimental' keyword"
+-                " argument of the exporter."
+-            )
+-
+         real_target = self.build_expression(expr.lift(instruction.operation.target))
+         global_scope = self.global_scope()
+         target = self._reserve_variable_name(
+@@ -850,21 +842,48 @@ class QASM3Builder:
+             ast.ClassicalDeclaration(ast.IntType(), target, None)
+         )
+ 
+-        def case(values, case_block):
+-            values = [
+-                ast.DefaultCase() if v is CASE_DEFAULT else self.build_integer(v) for v in values
++        if ExperimentalFeatures.SWITCH_CASE_V1 in self.experimental:
++            # In this case, defaults can be folded in with other cases (useless as that is).
++
++            def case(values, case_block):
++                values = [
++                    ast.DefaultCase() if v is CASE_DEFAULT else self.build_integer(v)
++                    for v in values
++                ]
++                self.push_scope(case_block, instruction.qubits, instruction.clbits)
++                case_body = self.build_program_block(case_block.data)
++                self.pop_scope()
++                return values, case_body
++
++            return [
++                ast.AssignmentStatement(target, real_target),
++                ast.SwitchStatementPreview(
++                    target,
++                    (
++                        case(values, block)
++                        for values, block in instruction.operation.cases_specifier()
++                    ),
++                ),
+             ]
+-            self.push_scope(case_block, instruction.qubits, instruction.clbits)
+-            case_body = self.build_program_block(case_block.data)
++
++        # Handle the stabilised syntax.
++        cases = []
++        default = None
++        for values, block in instruction.operation.cases_specifier():
++            self.push_scope(block, instruction.qubits, instruction.clbits)
++            case_body = self.build_program_block(block.data)
+             self.pop_scope()
+-            return values, case_body
++            if CASE_DEFAULT in values:
++                # Even if it's mixed in with other cases, we can skip them and only output the
++                # `default` since that's valid and execution will be the same; the evaluation of
++                # case labels can't have side effects.
++                default = case_body
++                continue
++            cases.append(([self.build_integer(value) for value in values], case_body))
+ 
+         return [
+             ast.AssignmentStatement(target, real_target),
+-            ast.SwitchStatement(
+-                target,
+-                (case(values, block) for values, block in instruction.operation.cases_specifier()),
+-            ),
++            ast.SwitchStatement(target, cases, default=default),
+         ]
+ 
+     def build_while_loop(self, instruction: CircuitInstruction) -> ast.WhileLoopStatement:
+diff --git a/qiskit/qasm3/printer.py b/qiskit/qasm3/printer.py
+index fee68824f..94d12a7ec 100644
+--- a/qiskit/qasm3/printer.py
++++ b/qiskit/qasm3/printer.py
+@@ -18,7 +18,6 @@ from typing import Sequence
+ 
+ from . import ast
+ from .experimental import ExperimentalFeatures
+-from .exceptions import QASM3ExporterError
+ 
+ # Precedence and associativity table for prefix, postfix and infix operators.  The rules are a
+ # lookup table of two-tuples; the "binding power" of the operator to the left and to the right.
+@@ -504,13 +503,33 @@ class BasicPrinter:
+         self._end_line()
+ 
+     def _visit_SwitchStatement(self, node: ast.SwitchStatement) -> None:
+-        if ExperimentalFeatures.SWITCH_CASE_V1 not in self._experimental:
+-            raise QASM3ExporterError(
+-                "'switch' statements are not stabilised in OpenQASM 3 yet."
+-                " To enable experimental support, set the flag"
+-                " 'ExperimentalFeatures.SWITCH_CASE_V1' in the 'experimental' keyword"
+-                " argument of the printer."
+-            )
++        self._start_line()
++        self.stream.write("switch (")
++        self.visit(node.target)
++        self.stream.write(") {")
++        self._end_line()
++        self._current_indent += 1
++        for labels, case in node.cases:
++            if not labels:
++                continue
++            self._start_line()
++            self.stream.write("case ")
++            self._visit_sequence(labels, separator=", ")
++            self.stream.write(" ")
++            self.visit(case)
++            self._end_line()
++        if node.default is not None:
++            self._start_line()
++            self.stream.write("default ")
++            self.visit(node.default)
++            self._end_line()
++        self._current_indent -= 1
++        self._start_line()
++        self.stream.write("}")
++        self._end_line()
++
++    def _visit_SwitchStatementPreview(self, node: ast.SwitchStatementPreview) -> None:
++        # This is the pre-release syntax, which had lots of extra `break` statements in it.
+         self._start_line()
+         self.stream.write("switch (")
+         self.visit(node.target)
+diff --git a/qiskit/transpiler/preset_passmanagers/__init__.py b/qiskit/transpiler/preset_passmanagers/__init__.py
+index 9b6efe661..6a8dab2ba 100644
+--- a/qiskit/transpiler/preset_passmanagers/__init__.py
++++ b/qiskit/transpiler/preset_passmanagers/__init__.py
+@@ -84,7 +84,7 @@ def generate_preset_pass_manager(
+     routing_method=None,
+     translation_method=None,
+     scheduling_method=None,
+-    approximation_degree=None,
++    approximation_degree=1.0,
+     seed_transpiler=None,
+     unitary_synthesis_method="default",
+     unitary_synthesis_plugin_config=None,
+diff --git a/releasenotes/notes/preset-pass-manager-approximation-degree-503198b1974adf79.yaml b/releasenotes/notes/preset-pass-manager-approximation-degree-503198b1974adf79.yaml
+new file mode 100644
+index 000000000..01cf21e33
+--- /dev/null
++++ b/releasenotes/notes/preset-pass-manager-approximation-degree-503198b1974adf79.yaml
+@@ -0,0 +1,12 @@
++---
++upgrade:
++  - |
++    The implicit use of ``approximation_degree!=1.0`` by default in the
++    :func:`~.generate_preset_pass_manager` function has been
++    disabled.  The previous default could cause undue and unexpected approximations, especially in
++    workloads involving Trotterization or similar runs of operations that are close, but decidedly
++    not equal, to the identity.
++
++    This change brings the inner pass-manager generation defaults in line with :func:`.transpile`,
++    which was always the intention.  See `#8595 <https://github.com/Qiskit/qiskit/pull/8595>`__ for
++    more detail.
+diff --git a/releasenotes/notes/qasm3-stable-switch-61a10036d1587778.yaml b/releasenotes/notes/qasm3-stable-switch-61a10036d1587778.yaml
+new file mode 100644
+index 000000000..9cf905563
+--- /dev/null
++++ b/releasenotes/notes/qasm3-stable-switch-61a10036d1587778.yaml
+@@ -0,0 +1,16 @@
++---
++features:
++  - |
++    The OpenQASM 3 exporter (see :func:`~.qasm3.dump` and :func:`~.qasm3.dumps` functions in
++    :mod:`qiskit.qasm3`) now supports the stabilised syntax of the ``switch`` statement in OpenQASM 3
++    by default.  The pre-certification syntax of the ``switch`` statement is still available by
++    using the :attr:`.ExperimentalFeatures.SWITCH_CASE_V1` flag in the ``experimental`` argument of
++    the exporter.  There is no feature flag required for the stabilised syntax, but if you are
++    interfacing with other tooling that is not yet updated, you may need to pass the experimental
++    flag.
++
++    The syntax of the stabilised form is slightly different with regards to terminating ``break``
++    statements (no longer required nor permitted), and multiple cases are now combined into a single
++    ``case`` line, rather than using C-style fall-through.  For more detail, see `the OpenQASM 3
++    documentation on the switch-case construct
++    <https://openqasm.com/language/classical.html#the-switch-statement>`__.

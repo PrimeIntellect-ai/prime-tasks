@@ -1,0 +1,228 @@
+diff --git a/cmd/print_test.go b/cmd/print_test.go
+index 216a775..f374c24 100644
+--- a/cmd/print_test.go
++++ b/cmd/print_test.go
+@@ -16,7 +16,15 @@ limitations under the License.
+ package cmd
+ 
+ import (
++	"bytes"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 
+ 	"k8s.io/cli-runtime/pkg/printers"
+@@ -73,3 +81,207 @@ func Test_getResourcePrinter(t *testing.T) {
+ 
+ 	}
+ }
++
++// startFakeAPIServer starts an HTTP server that mimics the subset of the
++// Kubernetes API used by the print command: discovery plus listing Ingresses.
++// Ingresses are returned according to the namespace encoded in the request
++// path, so a namespaced query only returns resources from that namespace.
++func startFakeAPIServer(t *testing.T) *httptest.Server {
++	t.Helper()
++
++	ingresses := []string{
++		ingressJSON("ing-foo", "foo"),
++		ingressJSON("ing-bar", "bar"),
++		ingressJSON("ing-ctx", "ctx-ns"),
++	}
++
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/api":
++			fmt.Fprint(w, `{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[]}`)
++		case "/apis":
++			fmt.Fprint(w, `{"kind":"APIGroupList","apiVersion":"v1","groups":[{"name":"networking.k8s.io","versions":[{"groupVersion":"networking.k8s.io/v1","version":"v1"}],"preferredVersion":{"groupVersion":"networking.k8s.io/v1","version":"v1"}}]}`)
++		case "/api/v1":
++			fmt.Fprint(w, `{"kind":"APIResourceList","groupVersion":"v1","resources":[]}`)
++		case "/apis/networking.k8s.io/v1":
++			fmt.Fprint(w, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"networking.k8s.io/v1","resources":[{"name":"ingresses","singularName":"ingress","namespaced":true,"kind":"Ingress","verbs":["get","list"]}]}`)
++		default:
++			items := ingresses
++			const prefix = "/apis/networking.k8s.io/v1/namespaces/"
++			if strings.HasPrefix(r.URL.Path, prefix) {
++				ns := strings.Split(strings.TrimPrefix(r.URL.Path, prefix), "/")[0]
++				items = nil
++				for _, ing := range ingresses {
++					if strings.Contains(ing, fmt.Sprintf(`"namespace":%q`, ns)) {
++						items = append(items, ing)
++					}
++				}
++			}
++			fmt.Fprintf(w, `{"kind":"IngressList","apiVersion":"networking.k8s.io/v1","metadata":{},"items":[%s]}`, strings.Join(items, ","))
++		}
++	}))
++	return srv
++}
++
++func ingressJSON(name, namespace string) string {
++	return fmt.Sprintf(`{"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"name":%q,"namespace":%q},"spec":{"rules":[{"host":%q,"http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"svc","port":{"number":80}}}}]}}]}}`,
++		name, namespace, name+".example.com")
++}
++
++// writeKubeConfig points KUBECONFIG at a kubeconfig whose current context
++// selects the "ctx-ns" namespace and talks to the given server.
++func writeKubeConfig(t *testing.T, server string) {
++	t.Helper()
++
++	dir, err := os.MkdirTemp("", "i2gw-kube")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { os.RemoveAll(dir) })
++
++	kubeConfigFile := filepath.Join(dir, "config")
++	content := fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: %s
++  name: test
++contexts:
++- context:
++    cluster: test
++    user: test
++    namespace: ctx-ns
++  name: test
++current-context: test
++users:
++- name: test
++  user: {}
++`, server)
++
++	if err := os.WriteFile(kubeConfigFile, []byte(content), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Setenv("KUBECONFIG", kubeConfigFile); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func captureStdout(t *testing.T, f func()) string {
++	t.Helper()
++
++	old := os.Stdout
++	r, w, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	os.Stdout = w
++
++	done := make(chan string)
++	go func() {
++		var buf bytes.Buffer
++		_, _ = io.Copy(&buf, r)
++		done <- buf.String()
++	}()
++
++	f()
++
++	w.Close()
++	os.Stdout = old
++	return <-done
++}
++
++// Test_printCmd_namespaceFlags verifies that the print command exposes the
++// --namespace/-n and --all-namespaces/-A flags required by the contract.
++func Test_printCmd_namespaceFlags(t *testing.T) {
++	namespaceFlag := printCmd.Flags().Lookup("namespace")
++	if namespaceFlag == nil {
++		namespaceFlag = printCmd.InheritedFlags().Lookup("namespace")
++	}
++	if namespaceFlag == nil {
++		t.Fatalf("expected the print command to expose a --namespace flag")
++	}
++	if namespaceFlag.Shorthand != "n" {
++		t.Errorf("expected --namespace shorthand to be %q, got %q", "n", namespaceFlag.Shorthand)
++	}
++
++	allNamespacesFlag := printCmd.Flags().Lookup("all-namespaces")
++	if allNamespacesFlag == nil {
++		allNamespacesFlag = printCmd.InheritedFlags().Lookup("all-namespaces")
++	}
++	if allNamespacesFlag == nil {
++		t.Fatalf("expected the print command to expose a --all-namespaces flag")
++	}
++	if allNamespacesFlag.Shorthand != "A" {
++		t.Errorf("expected --all-namespaces shorthand to be %q, got %q", "A", allNamespacesFlag.Shorthand)
++	}
++}
++
++// Test_printCmd_namespaceFiltering verifies that the namespace selected via the
++// command flags is applied to the resources that are queried and printed.
++func Test_printCmd_namespaceFiltering(t *testing.T) {
++	testCases := []struct {
++		name        string
++		args        []string
++		wantPresent []string
++		wantAbsent  []string
++	}{
++		{
++			name:        "namespace flag restricts output to the requested namespace",
++			args:        []string{"--namespace=foo"},
++			wantPresent: []string{"ing-foo"},
++			wantAbsent:  []string{"ing-bar", "ing-ctx"},
++		},
++		{
++			name:        "all-namespaces flag includes every namespace",
++			args:        []string{"-A"},
++			wantPresent: []string{"ing-foo", "ing-bar", "ing-ctx"},
++		},
++		{
++			name:        "current context namespace is used when no flag is given",
++			wantPresent: []string{"ing-ctx"},
++			wantAbsent:  []string{"ing-foo", "ing-bar"},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := startFakeAPIServer(t)
++			defer srv.Close()
++			writeKubeConfig(t, srv.URL)
++
++			for _, name := range []string{"namespace", "all-namespaces"} {
++				flag := printCmd.Flags().Lookup(name)
++				if flag == nil {
++					flag = printCmd.InheritedFlags().Lookup(name)
++				}
++				if flag != nil {
++					if err := flag.Value.Set(flag.DefValue); err != nil {
++						t.Fatalf("failed to reset --%s: %v", name, err)
++					}
++					flag.Changed = false
++				}
++			}
++
++			rootCmd.SetArgs(append([]string{"print"}, tc.args...))
++			var runErr error
++			output := captureStdout(t, func() {
++				runErr = rootCmd.Execute()
++			})
++			if runErr != nil {
++				t.Fatalf("print command returned error: %v", runErr)
++			}
++
++			for _, want := range tc.wantPresent {
++				if !strings.Contains(output, want) {
++					t.Errorf("expected output to contain %q, got:\n%s", want, output)
++				}
++			}
++			for _, absent := range tc.wantAbsent {
++				if strings.Contains(output, absent) {
++					t.Errorf("expected output not to contain %q, got:\n%s", absent, output)
++				}
++			}
++		})
++	}
++}

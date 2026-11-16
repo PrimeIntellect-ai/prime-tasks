@@ -1,0 +1,2 @@
+Component API differs from underlying Imgix API
+While [it is explained](https://github.com/imgix/react-imgix/blob/master/README.md#basic-use-case) that the `fit` prop defaults to `crop`, this differs from the [documentation](https://docs.imgix.com/apis/url/size/fit) where the default value for `fit` is `clip`. Is there a reason for this? I would have expected the component to follow the defaults from the official API.

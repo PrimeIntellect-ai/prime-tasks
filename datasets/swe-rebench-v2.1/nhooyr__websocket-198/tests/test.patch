@@ -1,0 +1,231 @@
+diff --git a/accept_test.go b/accept_test.go
+index 4966779..4ffd797 100644
+--- a/accept_test.go
++++ b/accept_test.go
+@@ -4,12 +4,15 @@ package websocket
+ 
+ import (
+ 	"bufio"
++	"context"
+ 	"errors"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
++	"reflect"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"nhooyr.io/websocket/internal/test/assert"
+ )
+@@ -42,6 +45,35 @@ func TestAccept(t *testing.T) {
+ 		assert.Contains(t, err, `request Origin "harhar.com" is not authorized for Host`)
+ 	})
+ 
++	t.Run("originPatterns", func(t *testing.T) {
++		t.Parallel()
++
++		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			c, err := Accept(w, r, acceptOptionsWithOriginPatterns(t, []string{"*.example.com"}))
++			if err != nil {
++				return
++			}
++			c.Close(StatusNormalClosure, "")
++		}))
++		defer s.Close()
++
++		wsURL := "ws" + strings.TrimPrefix(s.URL, "http")
++
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
++		defer cancel()
++
++		c, _, err := Dial(ctx, wsURL, &DialOptions{
++			HTTPHeader: http.Header{"Origin": []string{"https://two.example.com"}},
++		})
++		assert.Success(t, err)
++		c.Close(StatusNormalClosure, "")
++
++		_, _, err = Dial(ctx, wsURL, &DialOptions{
++			HTTPHeader: http.Header{"Origin": []string{"https://evil.com"}},
++		})
++		assert.Error(t, err)
++	})
++
+ 	t.Run("badCompression", func(t *testing.T) {
+ 		t.Parallel()
+ 
+@@ -240,43 +272,78 @@ func Test_selectSubprotocol(t *testing.T) {
+ 	}
+ }
+ 
+-func Test_authenticateOrigin(t *testing.T) {
++func acceptOptionsWithOriginPatterns(t *testing.T, patterns []string) *AcceptOptions {
++	t.Helper()
++	opts := &AcceptOptions{}
++	field := reflect.ValueOf(opts).Elem().FieldByName("OriginPatterns")
++	if !field.IsValid() || field.Type() != reflect.TypeOf([]string(nil)) {
++		t.Errorf("AcceptOptions must expose OriginPatterns as []string")
++		return opts
++	}
++	field.Set(reflect.ValueOf(patterns))
++	return opts
++}
++
++func TestAcceptOriginAuthorization(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	testCases := []struct {
+-		name    string
+-		origin  string
+-		host    string
+-		success bool
++		name           string
++		origin         func(string) string
++		setOrigin      bool
++		originPatterns []string
++		success        bool
+ 	}{
+ 		{
+-			name:    "none",
++			name:    "noOrigin",
+ 			success: true,
+-			host:    "example.com",
+ 		},
+ 		{
+-			name:    "invalid",
+-			origin:  "$#)(*)$#@*$(#@*$)#@*%)#(@*%)#(@%#@$#@$#$#@$#@}{}{}",
+-			host:    "example.com",
+-			success: false,
++			name:      "emptyOrigin",
++			origin:    func(string) string { return "" },
++			setOrigin: true,
++			success:   true,
+ 		},
+ 		{
+-			name:    "unauthorized",
+-			origin:  "https://example.com",
+-			host:    "example1.com",
+-			success: false,
++			name:      "invalidOrigin",
++			origin:    func(string) string { return "$#)(*)$#@*$(#@*$)#@*%)#(@*%)#(@%#@$#@$#$#@$#@}{}{}" },
++			setOrigin: true,
+ 		},
+ 		{
+-			name:    "authorized",
+-			origin:  "https://example.com",
+-			host:    "example.com",
+-			success: true,
++			name:      "unauthorizedOrigin",
++			origin:    func(string) string { return "https://example.com" },
++			setOrigin: true,
+ 		},
+ 		{
+-			name:    "authorizedCaseInsensitive",
+-			origin:  "https://examplE.com",
+-			host:    "example.com",
+-			success: true,
++			name: "sameHostOrigin",
++			origin: func(host string) string {
++				return "http://" + host
++			},
++			setOrigin: true,
++			success:   true,
++		},
++		{
++			name: "sameHostOriginCaseInsensitive",
++			origin: func(host string) string {
++				parts := strings.Split(host, ":")
++				parts[0] = strings.ToUpper(parts[0])
++				return "http://" + strings.Join(parts, ":")
++			},
++			setOrigin: true,
++			success:   true,
++		},
++		{
++			name:           "originPattern",
++			origin:         func(string) string { return "https://two.examplE.com" },
++			setOrigin:      true,
++			originPatterns: []string{"*.example.com", "bar.com"},
++			success:        true,
++		},
++		{
++			name:           "originPatternUnauthorized",
++			origin:         func(string) string { return "https://two.example.com" },
++			setOrigin:      true,
++			originPatterns: []string{"exam3.com", "bar.com"},
+ 		},
+ 	}
+ 
+@@ -285,12 +352,31 @@ func Test_authenticateOrigin(t *testing.T) {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			t.Parallel()
+ 
+-			r := httptest.NewRequest("GET", "http://"+tc.host+"/", nil)
+-			r.Header.Set("Origin", tc.origin)
+-
+-			err := authenticateOrigin(r)
++			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				opts := &AcceptOptions{}
++				if tc.originPatterns != nil {
++					opts = acceptOptionsWithOriginPatterns(t, tc.originPatterns)
++				}
++				c, err := Accept(w, r, opts)
++				if err == nil {
++					c.Close(StatusNormalClosure, "")
++				}
++			}))
++			defer s.Close()
++
++			wsURL := "ws" + strings.TrimPrefix(s.URL, "http")
++			opts := &DialOptions{}
++			if tc.setOrigin {
++				opts.HTTPHeader = http.Header{"Origin": []string{tc.origin(strings.TrimPrefix(s.URL, "http://"))}}
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			c, _, err := Dial(ctx, wsURL, opts)
+ 			if tc.success {
+ 				assert.Success(t, err)
++				if err == nil {
++					c.Close(StatusNormalClosure, "")
++				}
+ 			} else {
+ 				assert.Error(t, err)
+ 			}
+diff --git a/example_test.go b/example_test.go
+index 666914d..c92e2a4 100644
+--- a/example_test.go
++++ b/example_test.go
+@@ -6,7 +6,7 @@ import (
+ 	"context"
+ 	"log"
+ 	"net/http"
+-	"net/url"
++	"reflect"
+ 	"time"
+ 
+ 	"nhooyr.io/websocket"
+@@ -121,18 +121,12 @@ func Example_writeOnly() {
+ // from the origin example.com.
+ func Example_crossOrigin() {
+ 	fn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		origin := r.Header.Get("Origin")
+-		if origin != "" {
+-			u, err := url.Parse(origin)
+-			if err != nil || u.Host != "example.com" {
+-				http.Error(w, "bad origin header", http.StatusForbidden)
+-				return
+-			}
++		opts := &websocket.AcceptOptions{}
++		field := reflect.ValueOf(opts).Elem().FieldByName("OriginPatterns")
++		if field.IsValid() {
++			field.Set(reflect.ValueOf([]string{"example.com"}))
+ 		}
+-
+-		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+-			InsecureSkipVerify: true,
+-		})
++		c, err := websocket.Accept(w, r, opts)
+ 		if err != nil {
+ 			log.Println(err)
+ 			return

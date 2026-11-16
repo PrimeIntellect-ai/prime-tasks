@@ -1,0 +1,616 @@
+diff --git a/api-extractor/report/hls.js.api.md b/api-extractor/report/hls.js.api.md
+index a25a3f189..53d9ef807 100644
+--- a/api-extractor/report/hls.js.api.md
++++ b/api-extractor/report/hls.js.api.md
+@@ -305,6 +305,8 @@ export type BaseData = {
+ export class BasePlaylistController extends Logger implements NetworkComponentAPI {
+     constructor(hls: Hls, logPrefix: string);
+     // (undocumented)
++    protected canLoad: boolean;
++    // (undocumented)
+     protected checkRetry(errorEvent: ErrorData): boolean;
+     // (undocumented)
+     destroy(): void;
+@@ -319,7 +321,7 @@ export class BasePlaylistController extends Logger implements NetworkComponentAP
+     // (undocumented)
+     protected playlistLoaded(index: number, data: LevelLoadedData | AudioTrackLoadedData | TrackLoadedData, previousDetails?: LevelDetails): void;
+     // (undocumented)
+-    protected scheduleLoading(levelOrTrack: Level | MediaPlaylist, deliveryDirectives?: HlsUrlParameters): void;
++    protected scheduleLoading(levelOrTrack: Level | MediaPlaylist, deliveryDirectives?: HlsUrlParameters, updatedDetails?: LevelDetails): void;
+     // (undocumented)
+     protected shouldLoadPlaylist(playlist: Level | MediaPlaylist | null | undefined): playlist is Level | MediaPlaylist;
+     // (undocumented)
+@@ -520,7 +522,7 @@ export class BaseStreamController extends TaskLoop implements NetworkComponentAP
+     // (undocumented)
+     protected resetTransmuxer(): void;
+     // (undocumented)
+-    protected resetWhenMissingContext(chunkMeta: ChunkMetadata): void;
++    protected resetWhenMissingContext(chunkMeta: ChunkMetadata | Fragment): void;
+     // (undocumented)
+     resumeBuffering(): void;
+     // (undocumented)
+@@ -2012,6 +2014,7 @@ class Hls implements HlsEventEmitter {
+     // (undocumented)
+     listeners<E extends keyof HlsListeners>(event: E): HlsListeners[E][];
+     get liveSyncPosition(): number | null;
++    get loadingEnabled(): boolean;
+     get loadLevel(): number;
+     // Warning: (ae-setter-with-docs) The doc comment for the property "loadLevel" must appear on the getter, not the setter.
+     set loadLevel(newLevel: number);
+@@ -3158,6 +3161,8 @@ export class LevelDetails {
+     // (undocumented)
+     m3u8: string;
+     // (undocumented)
++    get maxPartIndex(): number;
++    // (undocumented)
+     misses: number;
+     // (undocumented)
+     get partEnd(): number;
+@@ -3258,6 +3263,8 @@ export interface LevelLoadedData {
+     networkDetails: any;
+     // (undocumented)
+     stats: LoaderStats;
++    // (undocumented)
++    withoutMultiVariant?: boolean;
+ }
+ 
+ // Warning: (ae-missing-release-tag) "LevelLoadingData" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+diff --git a/src/controller/abr-controller.ts b/src/controller/abr-controller.ts
+index 2164fdc9f..a58c88c9f 100644
+--- a/src/controller/abr-controller.ts
++++ b/src/controller/abr-controller.ts
+@@ -718,7 +718,7 @@ class AbrController extends Logger implements AbrComponentAPI {
+     if (levels.length === 1) {
+       return 0;
+     }
+-    const level: Level | undefined = levels[selectionBaseLevel];
++    const level = levels[selectionBaseLevel] as Level | undefined;
+     const live = !!this.hls.latestLevelDetails?.live;
+     const firstSelection = loadLevel === -1 || lastLoadedFragLevel === -1;
+     let currentCodecSet: string | undefined;
+@@ -920,7 +920,7 @@ class AbrController extends Logger implements AbrComponentAPI {
+               )} of ${maxAutoLevel} max with CODECS and VIDEO-RANGE:"${
+                 levels[levelsSkipped[0]].codecs
+               }" ${levels[levelsSkipped[0]].videoRange}; not compatible with "${
+-                level.codecs
++                currentCodecSet
+               }" ${currentVideoRange}`,
+             );
+           }
+diff --git a/src/controller/base-playlist-controller.ts b/src/controller/base-playlist-controller.ts
+index f2723adbb..10d86845b 100644
+--- a/src/controller/base-playlist-controller.ts
++++ b/src/controller/base-playlist-controller.ts
+@@ -24,8 +24,8 @@ export default class BasePlaylistController
+   implements NetworkComponentAPI
+ {
+   protected hls: Hls;
++  protected canLoad: boolean = false;
+   private timer: number = -1;
+-  private canLoad: boolean = false;
+ 
+   constructor(hls: Hls, logPrefix: string) {
+     super(logPrefix, hls.logger);
+@@ -170,6 +170,25 @@ export default class BasePlaylistController
+     if (details.live || previousDetails?.live) {
+       const levelOrTrack = 'levelInfo' in data ? data.levelInfo : data.track;
+       details.reloaded(previousDetails);
++      // Merge live playlists to adjust fragment starts and fill in delta playlist skipped segments
++      if (previousDetails && details.fragments.length > 0) {
++        mergeDetails(previousDetails, details);
++      }
++      if (details.requestScheduled === -1) {
++        details.requestScheduled = stats.loading.start;
++      }
++      const bufferInfo = this.hls.mainForwardBufferInfo;
++      const position = bufferInfo ? bufferInfo.end - bufferInfo.len : 0;
++      const distanceToLiveEdgeMs = (details.edge - position) * 1000;
++      const reloadInterval = computeReloadInterval(
++        details,
++        distanceToLiveEdgeMs,
++      );
++      if (details.requestScheduled + reloadInterval < now) {
++        details.requestScheduled = now;
++      } else {
++        details.requestScheduled += reloadInterval;
++      }
+       this.log(
+         `live playlist ${index} ${
+           details.advanced
+@@ -179,10 +198,6 @@ export default class BasePlaylistController
+               : 'MISSED'
+         }`,
+       );
+-      // Merge live playlists to adjust fragment starts and fill in delta playlist skipped segments
+-      if (previousDetails && details.fragments.length > 0) {
+-        mergeDetails(previousDetails, details);
+-      }
+       if (!this.canLoad || !details.live) {
+         return;
+       }
+@@ -196,12 +211,16 @@ export default class BasePlaylistController
+         const endSn = details.endSN;
+         const lastPartIndex = details.lastPartIndex;
+         const hasParts = lastPartIndex !== -1;
+-        const lastPart = lastPartSn === endSn;
+-        // When low latency mode is disabled, we'll skip part requests once the last part index is found
+-        const nextSnStartIndex = lowLatencyMode ? 0 : lastPartIndex;
++        const atLastPartOfSegment = lastPartSn === endSn;
+         if (hasParts) {
+-          msn = lastPart ? endSn + 1 : lastPartSn;
+-          part = lastPart ? nextSnStartIndex : lastPartIndex + 1;
++          // When low latency mode is disabled, request the last part of the next segment
++          if (atLastPartOfSegment) {
++            msn = endSn + 1;
++            part = lowLatencyMode ? 0 : lastPartIndex;
++          } else {
++            msn = lastPartSn;
++            part = lowLatencyMode ? lastPartIndex + 1 : details.maxPartIndex;
++          }
+         } else {
+           msn = endSn + 1;
+         }
+@@ -258,7 +277,8 @@ export default class BasePlaylistController
+           msn,
+           part,
+         );
+-        if (lowLatencyMode || !lastPart) {
++        if (lowLatencyMode || !atLastPartOfSegment) {
++          details.requestScheduled = now;
+           this.loadingPlaylist(levelOrTrack, deliveryDirectives);
+           return;
+         }
+@@ -270,25 +290,12 @@ export default class BasePlaylistController
+           part,
+         );
+       }
+-      if (details.requestScheduled === -1) {
+-        details.requestScheduled = stats.loading.start;
+-      }
+       if (deliveryDirectives && msn !== undefined && details.canBlockReload) {
+-        details.requestScheduled -= details.partTarget * 1000 || 1000;
+-      }
+-      const bufferInfo = this.hls.mainForwardBufferInfo;
+-      const position = bufferInfo ? bufferInfo.end - bufferInfo.len : 0;
+-      const distanceToLiveEdgeMs = (details.edge - position) * 1000;
+-      const reloadInterval = computeReloadInterval(
+-        details,
+-        distanceToLiveEdgeMs,
+-      );
+-      if (details.requestScheduled + reloadInterval < now) {
+-        details.requestScheduled = now;
+-      } else {
+-        details.requestScheduled += reloadInterval;
++        details.requestScheduled =
++          stats.loading.first +
++          Math.max(reloadInterval - elapsed * 2, reloadInterval / 2);
+       }
+-      this.scheduleLoading(levelOrTrack, deliveryDirectives);
++      this.scheduleLoading(levelOrTrack, deliveryDirectives, details);
+     } else {
+       this.clearTimer();
+     }
+@@ -297,8 +304,9 @@ export default class BasePlaylistController
+   protected scheduleLoading(
+     levelOrTrack: Level | MediaPlaylist,
+     deliveryDirectives?: HlsUrlParameters,
++    updatedDetails?: LevelDetails,
+   ) {
+-    const details = levelOrTrack.details;
++    const details = updatedDetails || levelOrTrack.details;
+     if (!details) {
+       this.loadingPlaylist(levelOrTrack, deliveryDirectives);
+       return;
+@@ -316,22 +324,8 @@ export default class BasePlaylistController
+         estimatedTimeUntilUpdate,
+       )} ms`,
+     );
+-    // this.log(
+-    //   `live reload ${details.updated ? 'REFRESHED' : 'MISSED'}
+-    // reload in ${estimatedTimeUntilUpdate / 1000}
+-    // round trip ${(stats.loading.end - stats.loading.start) / 1000}
+-    // diff ${
+-    //   (reloadInterval -
+-    //     (estimatedTimeUntilUpdate +
+-    //       stats.loading.end -
+-    //       stats.loading.start)) /
+-    //   1000
+-    // }
+-    // reload interval ${reloadInterval / 1000}
+-    // target duration ${details.targetduration}
+-    // distance to edge ${distanceToLiveEdgeMs / 1000}`
+-    // );
+ 
++    this.clearTimer();
+     this.timer = self.setTimeout(
+       () => this.loadingPlaylist(levelOrTrack, deliveryDirectives),
+       estimatedTimeUntilUpdate,
+@@ -379,6 +373,7 @@ export default class BasePlaylistController
+       } else {
+         const delay = getRetryDelay(retryConfig, retryCount);
+         // Schedule level/track reload
++        this.clearTimer();
+         this.timer = self.setTimeout(() => this.loadPlaylist(), delay);
+         this.warn(
+           `Retrying playlist loading ${retryCount + 1}/${
+diff --git a/src/controller/base-stream-controller.ts b/src/controller/base-stream-controller.ts
+index 7f2b2b844..0858151fc 100644
+--- a/src/controller/base-stream-controller.ts
++++ b/src/controller/base-stream-controller.ts
+@@ -1871,7 +1871,7 @@ export default class BaseStreamController
+     }
+   }
+ 
+-  protected resetWhenMissingContext(chunkMeta: ChunkMetadata) {
++  protected resetWhenMissingContext(chunkMeta: ChunkMetadata | Fragment) {
+     this.warn(
+       `The loading context changed while buffering fragment ${chunkMeta.sn} of ${this.playlistLabel()} ${chunkMeta.level}. This chunk will not be buffered.`,
+     );
+diff --git a/src/controller/interstitials-controller.ts b/src/controller/interstitials-controller.ts
+index f49d10f73..69a919d04 100644
+--- a/src/controller/interstitials-controller.ts
++++ b/src/controller/interstitials-controller.ts
+@@ -1114,7 +1114,7 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
+         player.media?.play();
+       }
+     } else if (scheduledItem !== null) {
+-      this.resumePrimary(scheduledItem, index);
++      this.resumePrimary(scheduledItem, index, currentItem);
+       if (this.shouldPlay) {
+         this.hls.media?.play();
+       }
+@@ -1144,12 +1144,16 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
+   private resumePrimary(
+     scheduledItem: InterstitialSchedulePrimaryItem,
+     index: number,
++    fromItem: InterstitialScheduleItem | null,
+   ) {
+     this.playingItem = scheduledItem;
+     this.playingAsset = null;
+     this.waitingItem = null;
+ 
+     this.bufferedToItem(scheduledItem);
++    if (!fromItem) {
++      return;
++    }
+ 
+     this.log(`resuming ${segmentToString(scheduledItem)}`);
+ 
+@@ -1231,13 +1235,22 @@ MediaSource ${JSON.stringify(attachMediaSourceData)} from ${logFromSource}`,
+     } else {
+       this.transferMediaTo(hls, media);
+       if (skipSeekToStartPosition) {
+-        hls.startLoad(timelinePos, skipSeekToStartPosition);
++        this.startLoadingPrimaryAt(timelinePos, skipSeekToStartPosition);
+       }
+     }
+     if (!skipSeekToStartPosition) {
+       // Set primary position to resume time
+       this.timelinePos = timelinePos;
+-      hls.startLoad(timelinePos, skipSeekToStartPosition);
++      this.startLoadingPrimaryAt(timelinePos, skipSeekToStartPosition);
++    }
++  }
++
++  private startLoadingPrimaryAt(
++    timelinePos: number,
++    skipSeekToStartPosition?: boolean,
++  ) {
++    if (this.hls.loadingEnabled) {
++      this.hls.startLoad(timelinePos, skipSeekToStartPosition);
+     }
+   }
+ 
+@@ -1688,7 +1701,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
+   private preloadPrimary(item: InterstitialSchedulePrimaryItem) {
+     const index = this.findItemIndex(item);
+     const timelinePos = this.getPrimaryResumption(item, index);
+-    this.hls.startLoad(timelinePos);
++    this.startLoadingPrimaryAt(timelinePos);
+   }
+ 
+   private bufferedToEvent(
+@@ -1869,7 +1882,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))}`,
+     }
+     const playerConfig: Partial<HlsConfig> = {
+       ...userConfig,
+-      // autoStartLoad: false,
++      autoStartLoad: true,
+       startFragPrefetch: true,
+       primarySessionId: primary.sessionId,
+       assetPlayerId: assetItem.identifier,
+diff --git a/src/controller/level-controller.ts b/src/controller/level-controller.ts
+index 55b799d5a..226433b20 100644
+--- a/src/controller/level-controller.ts
++++ b/src/controller/level-controller.ts
+@@ -380,18 +380,6 @@ export default class LevelController extends BasePlaylistController {
+       altAudio: !audioOnly && audioTracks.some((t) => !!t.url),
+     };
+     this.hls.trigger(Events.MANIFEST_PARSED, edata);
+-
+-    // Initiate loading after all controllers have received MANIFEST_PARSED
+-    const {
+-      config: { autoStartLoad, startPosition },
+-      forceStartLoad,
+-    } = this.hls;
+-    if (autoStartLoad || forceStartLoad) {
+-      this.log(
+-        `${autoStartLoad ? 'auto' : 'force'} startLoad with configured startPosition ${startPosition}`,
+-      );
+-      this.hls.startLoad(startPosition);
+-    }
+   }
+ 
+   get levels(): Level[] | null {
+@@ -606,8 +594,8 @@ export default class LevelController extends BasePlaylistController {
+       return;
+     }
+ 
+-    // only process level loaded events matching with expected level
+-    if (curLevel === this.currentLevel) {
++    // only process level loaded events matching with expected level or prior to switch when media playlist is loaded directly
++    if (curLevel === this.currentLevel || data.withoutMultiVariant) {
+       // reset level load error counter on successful level loaded only if there is no issues with fragments
+       if (curLevel.fragmentError === 0) {
+         curLevel.loadError = 0;
+@@ -676,6 +664,9 @@ export default class LevelController extends BasePlaylistController {
+   }
+ 
+   removeLevel(levelIndex: number) {
++    if (this._levels.length === 1) {
++      return;
++    }
+     const levels = this._levels.filter((level, index) => {
+       if (index !== levelIndex) {
+         return true;
+@@ -697,6 +688,14 @@ export default class LevelController extends BasePlaylistController {
+     if (this.currentLevelIndex > -1 && this.currentLevel?.details) {
+       this.currentLevelIndex = this.currentLevel.details.fragments[0].level;
+     }
++    if (this.manualLevelIndex > -1) {
++      this.manualLevelIndex = this.currentLevelIndex;
++    }
++    const maxLevel = levels.length - 1;
++    this._firstLevel = Math.min(this._firstLevel, maxLevel);
++    if (this._startLevel) {
++      this._startLevel = Math.min(this._startLevel, maxLevel);
++    }
+     this.hls.trigger(Events.LEVELS_UPDATED, { levels });
+   }
+ 
+diff --git a/src/controller/stream-controller.ts b/src/controller/stream-controller.ts
+index 4140bcd64..e02055a2b 100644
+--- a/src/controller/stream-controller.ts
++++ b/src/controller/stream-controller.ts
+@@ -1095,6 +1095,9 @@ export default class StreamController
+   ) {
+     if (this.level > -1 && this.fragCurrent) {
+       this.level = this.fragCurrent.level;
++      if (this.level === -1) {
++        this.resetWhenMissingContext(this.fragCurrent);
++      }
+     }
+     this.levels = data.levels;
+   }
+diff --git a/src/hls.ts b/src/hls.ts
+index 5eaddaa83..71e90651d 100644
+--- a/src/hls.ts
++++ b/src/hls.ts
+@@ -98,8 +98,9 @@ export default class Hls implements HlsEventEmitter {
+   private cmcdController?: CMCDController;
+   private _media: HTMLMediaElement | null = null;
+   private _url: string | null = null;
+-  private triggeringException?: boolean;
+   private _sessionId?: string;
++  private triggeringException?: boolean;
++  private started: boolean = false;
+ 
+   /**
+    * Get the video-dev/hls.js package version.
+@@ -527,10 +528,17 @@ export default class Hls implements HlsEventEmitter {
+         (skipSeekToStartPosition ? ', <skip seek to start>' : '')
+       })`,
+     );
++    this.started = true;
+     this.resumeBuffering();
+-    this.networkControllers.forEach((controller) => {
+-      controller.startLoad(startPosition, skipSeekToStartPosition);
+-    });
++    for (let i = 0; i < this.networkControllers.length; i++) {
++      this.networkControllers[i].startLoad(
++        startPosition,
++        skipSeekToStartPosition,
++      );
++      if (!this.started || !this.networkControllers) {
++        break;
++      }
++    }
+   }
+ 
+   /**
+@@ -538,9 +546,20 @@ export default class Hls implements HlsEventEmitter {
+    */
+   stopLoad() {
+     this.logger.log('stopLoad');
+-    this.networkControllers.forEach((controller) => {
+-      controller.stopLoad();
+-    });
++    this.started = false;
++    for (let i = 0; i < this.networkControllers.length; i++) {
++      this.networkControllers[i].stopLoad();
++      if (this.started || !this.networkControllers) {
++        break;
++      }
++    }
++  }
++
++  /**
++   * Returns whether loading, toggled with `startLoad()` and `stopLoad()`, is active or not`.
++   */
++  get loadingEnabled(): boolean {
++    return this.started;
+   }
+ 
+   /**
+diff --git a/src/loader/level-details.ts b/src/loader/level-details.ts
+index c363f27c9..08781615e 100644
+--- a/src/loader/level-details.ts
++++ b/src/loader/level-details.ts
+@@ -155,6 +155,22 @@ export class LevelDetails {
+     return -1;
+   }
+ 
++  get maxPartIndex(): number {
++    const partList = this.partList;
++    if (partList) {
++      const lastIndex = this.lastPartIndex;
++      if (lastIndex !== -1) {
++        for (let i = partList.length; i--; ) {
++          if (partList[i].index > lastIndex) {
++            return partList[i].index;
++          }
++        }
++        return lastIndex;
++      }
++    }
++    return 0;
++  }
++
+   get lastPartSn(): number {
+     if (this.partList?.length) {
+       return this.partList[this.partList.length - 1].fragment.sn;
+diff --git a/src/loader/playlist-loader.ts b/src/loader/playlist-loader.ts
+index 7f1010791..1fa21109f 100644
+--- a/src/loader/playlist-loader.ts
++++ b/src/loader/playlist-loader.ts
+@@ -250,7 +250,9 @@ class PlaylistLoader implements NetworkComponentAPI {
+       ) {
+         // same URL can't overlap, or wait for blocking request
+         if (loaderContext.url === context.url) {
+-          logger.log(`[playlist-loader]: playlist request ongoing`);
++          logger.log(
++            `[playlist-loader]: ignore ${context.url} ongoing request`,
++          );
+         } else {
+           logger.log(
+             `[playlist-loader]: ignore ${context.url} in favor of ${loaderContext.url}`,
+@@ -349,7 +351,10 @@ class PlaylistLoader implements NetworkComponentAPI {
+         }
+ 
+         stats.parsing.start = performance.now();
+-        if (M3U8Parser.isMediaPlaylist(string)) {
++        if (
++          M3U8Parser.isMediaPlaylist(string) ||
++          context.type !== PlaylistContextType.MANIFEST
++        ) {
+           this.handleTrackOrLevelPlaylist(
+             response,
+             stats,
+@@ -386,6 +391,22 @@ class PlaylistLoader implements NetworkComponentAPI {
+     loader.load(context, loaderConfig, loaderCallbacks);
+   }
+ 
++  private checkAutostartLoad() {
++    if (!this.hls) {
++      return;
++    }
++    const {
++      config: { autoStartLoad, startPosition },
++      forceStartLoad,
++    } = this.hls;
++    if (autoStartLoad || forceStartLoad) {
++      this.hls.logger.log(
++        `${autoStartLoad ? 'auto' : 'force'} startLoad with configured startPosition ${startPosition}`,
++      );
++      this.hls.startLoad(startPosition);
++    }
++  }
++
+   private handleMasterPlaylist(
+     response: LoaderResponse,
+     stats: LoaderStats,
+@@ -474,6 +495,8 @@ class PlaylistLoader implements NetworkComponentAPI {
+       startTimeOffset,
+       variableList,
+     });
++
++    this.checkAutostartLoad();
+   }
+ 
+   private handleTrackOrLevelPlaylist(
+@@ -493,7 +516,7 @@ class PlaylistLoader implements NetworkComponentAPI {
+         ? (id as number)
+         : 0;
+     const levelType = mapContextToLevelType(context);
+-    const levelDetails: LevelDetails = M3U8Parser.parseLevelPlaylist(
++    const levelDetails = M3U8Parser.parseLevelPlaylist(
+       response.data as string,
+       url,
+       levelId,
+@@ -543,6 +566,14 @@ class PlaylistLoader implements NetworkComponentAPI {
+       networkDetails,
+       loader,
+     );
++
++    if (
++      type === PlaylistContextType.MANIFEST &&
++      (!levelDetails.playlistParsingError ||
++        (!levelDetails.fragments.length && levelDetails.live))
++    ) {
++      this.checkAutostartLoad();
++    }
+   }
+ 
+   private handleManifestParsingError(
+@@ -662,7 +693,9 @@ class PlaylistLoader implements NetworkComponentAPI {
+         ? (level as number)
+         : undefined;
+     if (!levelDetails.fragments.length) {
+-      const error = new Error('No Segments found in Playlist');
++      const error = (levelDetails.playlistParsingError = new Error(
++        'No Segments found in Playlist',
++      ));
+       hls.trigger(Events.ERROR, {
+         type: ErrorTypes.NETWORK_ERROR,
+         details: ErrorDetails.LEVEL_EMPTY_ERROR,
+@@ -721,6 +754,7 @@ class PlaylistLoader implements NetworkComponentAPI {
+           stats,
+           networkDetails,
+           deliveryDirectives,
++          withoutMultiVariant: type === PlaylistContextType.MANIFEST,
+         });
+         break;
+       case PlaylistContextType.AUDIO_TRACK:
+diff --git a/src/types/events.ts b/src/types/events.ts
+index ad1c7e39b..2314887f3 100644
+--- a/src/types/events.ts
++++ b/src/types/events.ts
+@@ -220,6 +220,7 @@ export interface LevelLoadedData {
+   networkDetails: any;
+   stats: LoaderStats;
+   deliveryDirectives: HlsUrlParameters | null;
++  withoutMultiVariant?: boolean;
+ }
+ 
+ export interface LevelUpdatedData {
+diff --git a/src/utils/level-helper.ts b/src/utils/level-helper.ts
+index cba4e78b3..8dab67253 100644
+--- a/src/utils/level-helper.ts
++++ b/src/utils/level-helper.ts
+@@ -538,10 +538,13 @@ export function findPart(
+ 
+ export function reassignFragmentLevelIndexes(levels: Level[]) {
+   levels.forEach((level, index) => {
+-    const { details } = level;
+-    if (details?.fragments) {
+-      details.fragments.forEach((fragment) => {
++    const fragments = level.details?.fragments;
++    if (fragments) {
++      fragments.forEach((fragment) => {
+         fragment.level = index;
++        if (fragment.initSegment) {
++          fragment.initSegment.level = index;
++        }
+       });
+     }
+   });

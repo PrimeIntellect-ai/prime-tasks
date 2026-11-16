@@ -1,0 +1,172 @@
+diff --git a/cmd/snapshot-controller/main.go b/cmd/snapshot-controller/main.go
+index ff78b9eea..10c85eedf 100644
+--- a/cmd/snapshot-controller/main.go
++++ b/cmd/snapshot-controller/main.go
+@@ -20,6 +20,8 @@ import (
+ 	"context"
+ 	"flag"
+ 	"fmt"
++	"net"
++	"net/http"
+ 	"os"
+ 	"os/signal"
+ 	"sync"
+@@ -143,23 +145,15 @@ func main() {
+ 	// Create and register metrics manager
+ 	metricsManager := metrics.NewMetricsManager()
+ 	wg := &sync.WaitGroup{}
+-	wg.Add(1)
++
++	mux := http.NewServeMux()
+ 	if *httpEndpoint != "" {
+-		srv, err := metricsManager.StartMetricsEndpoint(*metricsPath, *httpEndpoint, promklog{}, wg)
++		err := metricsManager.PrepareMetricsPath(mux, *metricsPath, promklog{})
+ 		if err != nil {
+-			klog.Errorf("Failed to start metrics server: %s", err.Error())
++			klog.Errorf("Failed to prepare metrics path: %s", err.Error())
+ 			os.Exit(1)
+ 		}
+-		defer func() {
+-			err := srv.Shutdown(context.Background())
+-			if err != nil {
+-				klog.Errorf("Failed to shutdown metrics server: %s", err.Error())
+-			}
+-
+-			klog.Infof("Metrics server successfully shutdown")
+-			wg.Done()
+-		}()
+-		klog.Infof("Metrics server successfully started on %s, %s", *httpEndpoint, *metricsPath)
++		klog.Infof("Metrics path successfully registered at %s", *metricsPath)
+ 	}
+ 
+ 	// Add Snapshot types to the default Kubernetes so events can be logged for them
+@@ -199,6 +193,32 @@ func main() {
+ 		close(stopCh)
+ 	}
+ 
++	// start listening & serving http endpoint if set
++	if *httpEndpoint != "" {
++		l, err := net.Listen("tcp", *httpEndpoint)
++		if err != nil {
++			klog.Fatalf("failed to listen on address[%s], error[%v]", *httpEndpoint, err)
++		}
++		srv := &http.Server{Addr: l.Addr().String(), Handler: mux}
++		go func() {
++			defer wg.Done()
++			if err := srv.Serve(l); err != http.ErrServerClosed {
++				klog.Fatalf("failed to start endpoint at:%s/%s, error: %v", *httpEndpoint, *metricsPath, err)
++			}
++		}()
++		klog.Infof("Metrics http server successfully started on %s, %s", *httpEndpoint, *metricsPath)
++
++		defer func() {
++			err := srv.Shutdown(context.Background())
++			if err != nil {
++				klog.Errorf("Failed to shutdown metrics server: %s", err.Error())
++			}
++
++			klog.Infof("Metrics server successfully shutdown")
++			wg.Done()
++		}()
++	}
++
+ 	if !*leaderElection {
+ 		run(context.TODO())
+ 	} else {
+@@ -210,6 +230,10 @@ func main() {
+ 			klog.Fatalf("failed to create leaderelection client: %v", err)
+ 		}
+ 		le := leaderelection.NewLeaderElection(leClientset, lockName, run)
++		if *httpEndpoint != "" {
++			le.PrepareHealthCheck(mux, leaderelection.DefaultHealthCheckTimeout)
++		}
++
+ 		if *leaderElectionNamespace != "" {
+ 			le.WithNamespace(*leaderElectionNamespace)
+ 		}
+diff --git a/pkg/metrics/metrics.go b/pkg/metrics/metrics.go
+index 92bb07364..c7f5f8950 100644
+--- a/pkg/metrics/metrics.go
++++ b/pkg/metrics/metrics.go
+@@ -17,8 +17,6 @@ limitations under the License.
+ package metrics
+ 
+ import (
+-	"fmt"
+-	"net"
+ 	"net/http"
+ 	"sync"
+ 	"time"
+@@ -26,7 +24,6 @@ import (
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	k8smetrics "k8s.io/component-base/metrics"
+-	klog "k8s.io/klog/v2"
+ )
+ 
+ const (
+@@ -89,12 +86,11 @@ type OperationStatus interface {
+ var metricBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60, 120, 300, 600}
+ 
+ type MetricsManager interface {
+-	// StartMetricsEndpoint starts the metrics endpoint at the specified addr/pattern for
+-	// metrics managed by this MetricsManager. It spawns a goroutine to listen to
+-	// and serve HTTP requests received on addr/pattern.
+-	// If the "pattern" is empty (i.e., ""), no endpoint will be started.
++	// PrepareMetricsPath prepares the metrics path the specified pattern for
++	// metrics managed by this MetricsManager.
++	// If the "pattern" is empty (i.e., ""), it will not be registered.
+ 	// An error will be returned if there is any.
+-	StartMetricsEndpoint(pattern, addr string, logger promhttp.Logger, wg *sync.WaitGroup) (*http.Server, error)
++	PrepareMetricsPath(mux *http.ServeMux, pattern string, logger promhttp.Logger) error
+ 
+ 	// OperationStart takes in an operation and caches its start time.
+ 	// if the operation already exists, it's an no-op.
+@@ -304,31 +300,15 @@ func (opMgr *operationMetricsManager) scheduleOpsInFlightMetric() {
+ 	}
+ }
+ 
+-func (opMgr *operationMetricsManager) StartMetricsEndpoint(pattern, addr string, logger promhttp.Logger, wg *sync.WaitGroup) (*http.Server, error) {
+-	if addr == "" {
+-		return nil, fmt.Errorf("metrics endpoint will not be started as endpoint address is not specified")
+-	}
+-	// start listening
+-	l, err := net.Listen("tcp", addr)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to listen on address[%s], error[%v]", addr, err)
+-	}
+-	mux := http.NewServeMux()
++func (opMgr *operationMetricsManager) PrepareMetricsPath(mux *http.ServeMux, pattern string, logger promhttp.Logger) error {
+ 	mux.Handle(pattern, k8smetrics.HandlerFor(
+ 		opMgr.registry,
+ 		k8smetrics.HandlerOpts{
+ 			ErrorLog:      logger,
+ 			ErrorHandling: k8smetrics.ContinueOnError,
+ 		}))
+-	srv := &http.Server{Addr: l.Addr().String(), Handler: mux}
+-	// start serving the endpoint
+-	go func() {
+-		defer wg.Done()
+-		if err := srv.Serve(l); err != http.ErrServerClosed {
+-			klog.Fatalf("failed to start endpoint at:%s/%s, error: %v", addr, pattern, err)
+-		}
+-	}()
+-	return srv, nil
++
++	return nil
+ }
+ 
+ func (opMgr *operationMetricsManager) GetRegistry() k8smetrics.KubeRegistry {
+diff --git a/pkg/sidecar-controller/snapshot_controller_base.go b/pkg/sidecar-controller/snapshot_controller_base.go
+index 0d2030652..07876a189 100644
+--- a/pkg/sidecar-controller/snapshot_controller_base.go
++++ b/pkg/sidecar-controller/snapshot_controller_base.go
+@@ -26,7 +26,7 @@ import (
+ 	storagelisters "github.com/kubernetes-csi/external-snapshotter/client/v4/listers/volumesnapshot/v1"
+ 	"github.com/kubernetes-csi/external-snapshotter/v4/pkg/snapshotter"
+ 
+-	"k8s.io/api/core/v1"
++	v1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/util/wait"

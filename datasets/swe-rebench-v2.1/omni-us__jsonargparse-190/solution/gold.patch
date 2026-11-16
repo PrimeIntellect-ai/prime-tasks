@@ -1,0 +1,553 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 9978d96..fdb1696 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -12,13 +12,22 @@ The semantic versioning only considers the public API as described in
+ paths are considered internals and can change in minor and patch releases.
+ 
+ 
+-v4.16.1 (2022-11-??)
++v4.17.0 (2022-11-??)
+ --------------------
+ 
++Added
++^^^^^
++- AST resolver now ignores if/elif/else code when condition is a global constant
++  `#187 <https://github.com/omni-us/jsonargparse/issues/187>`__.
++- AST resolver support for conditional ``**kwargs`` use in multiple calls `#187
++  <https://github.com/omni-us/jsonargparse/issues/187#issuecomment-1295141338>`__.
++
+ Fixed
+ ^^^^^
+ - ``str`` type fails to parse value when pyyaml raises ``ConstructorError``
+   `#189 <https://github.com/omni-us/jsonargparse/issues/189>`__.
++- ``Namespace`` clone should not deepcopy leaf values `#187
++  <https://github.com/omni-us/jsonargparse/issues/187>`__.
+ 
+ 
+ v4.16.0 (2022-10-28)
+diff --git a/README.rst b/README.rst
+index e44e098..575662d 100644
+--- a/README.rst
++++ b/README.rst
+@@ -155,11 +155,6 @@ tool. In a shell you could see the help and run a command as follows:
+     $ python example.py Lucky --prize=1000
+     Lucky won 1000€!
+ 
+-.. doctest:: :hide:
+-
+-    >>> CLI(command, args=['Lucky', '--prize=1000'])
+-    Lucky won 1000€!
+-
+ .. note::
+ 
+     Parsing of docstrings is an optional feature. For this example to work as
+@@ -1440,6 +1435,14 @@ unrelated to these variables.
+     def gets_from_kwargs(**kwargs):
+         val = kwargs.get('name', 'default')
+ 
++    def constant_conditional(**kwargs):
++        if global_boolean_1:
++            first_function(**kwargs)
++        elif not global_boolean_2:
++            second_function(**kwargs)
++        else:
++            third_function(**kwargs)
++
+ **Cases for classes**
+ 
+ .. testcode:: ast_resolver
+@@ -1498,6 +1501,29 @@ class, there can be additional parameters. For example in:
+ The ``param`` parameter would be excluded from the resolved parameters because
+ it is internally hard coded.
+ 
++A special case which is supported but with caveats, is multiple calls that use
++``**kwargs``. For example:
++
++.. testcode:: ast_resolver
++
++    def conditional_calls(**kwargs):
++        if condition_1:
++            first_function(**kwargs)
++        elif condition_2:
++            second_function(**kwargs)
++        else:
++            third_function(**kwargs)
++
++The resolved parameters that have the same type hint and default accross all
++calls are supported normally. When there is a discrepancy between the calls, the
++parameters behave differently and are shown in the help in special "Conditional
++arguments" sections. The main difference is that these arguments are not
++included in :py:meth:`.ArgumentParser.get_defaults` or the output of
++``--print_config``. This is necessary because the parser does not know which of
++the calls will be used at runtime, and adding them would cause
++:py:meth:`.ArgumentParser.instantiate_classes` to fail due to unexpected keyword
++arguments.
++
+ .. note::
+ 
+     The parameter resolvers log messages of failures and unsupported cases. To
+diff --git a/jsonargparse/core.py b/jsonargparse/core.py
+index e9e49a6..4b41376 100644
+--- a/jsonargparse/core.py
++++ b/jsonargparse/core.py
+@@ -7,7 +7,6 @@ import logging
+ import os
+ import re
+ import sys
+-from copy import deepcopy
+ from typing import Any, Callable, Dict, List, NoReturn, Optional, Sequence, Set, Tuple, Type, Union
+ 
+ from .formatters import DefaultHelpFormatter, empty_help, formatter_context, get_env_var
+@@ -24,7 +23,8 @@ from .loaders_dumpers import (
+     set_omegaconf_loader,
+     yaml_load,
+ )
+-from .namespace import is_meta_key, Namespace, patch_namespace, split_key, split_key_leaf, strip_meta
++from .namespace import is_meta_key, Namespace, patch_namespace, recreate_branches, split_key, split_key_leaf, strip_meta
++from .parameter_resolvers import ConditionalDefault
+ from .signatures import is_pure_dataclass, SignatureArguments
+ from .typehints import ActionTypeHint, is_subclass_spec
+ from .typing import is_final_class
+@@ -699,7 +699,7 @@ class ArgumentParser(ActionsContainer, ArgumentLinking, argparse.ArgumentParser)
+         """
+         check_valid_dump_format(format)
+ 
+-        cfg = deepcopy(cfg)
++        cfg = cfg.clone()
+         cfg = strip_meta(cfg)
+         ActionLink.strip_link_target_keys(self, cfg)
+ 
+@@ -817,7 +817,7 @@ class ArgumentParser(ActionsContainer, ArgumentLinking, argparse.ArgumentParser)
+                 f.write(self.dump(cfg, **dump_kwargs))  # type: ignore
+ 
+         else:
+-            cfg = deepcopy(cfg)
++            cfg = cfg.clone()
+             ActionLink.strip_link_target_keys(self, cfg)
+ 
+             if not skip_check:
+@@ -944,8 +944,12 @@ class ArgumentParser(ActionsContainer, ArgumentLinking, argparse.ArgumentParser)
+         """
+         cfg = Namespace()
+         for action in filter_default_actions(self._actions):
+-            if action.default != argparse.SUPPRESS and action.dest != argparse.SUPPRESS:
+-                cfg[action.dest] = deepcopy(action.default)
++            if (
++                action.default != argparse.SUPPRESS and
++                action.dest != argparse.SUPPRESS and
++                not isinstance(action.default, ConditionalDefault)
++            ):
++                cfg[action.dest] = recreate_branches(action.default)
+ 
+         self._logger.info('Loaded default values from parser.')
+ 
+@@ -1136,7 +1140,7 @@ class ArgumentParser(ActionsContainer, ArgumentLinking, argparse.ArgumentParser)
+         Returns:
+             The stripped configuration object.
+         """
+-        cfg = deepcopy(cfg)
++        cfg = cfg.clone()
+ 
+         del_keys = []
+         for key in cfg.keys():
+diff --git a/jsonargparse/namespace.py b/jsonargparse/namespace.py
+index 2bc78c2..bc3a858 100644
+--- a/jsonargparse/namespace.py
++++ b/jsonargparse/namespace.py
+@@ -2,7 +2,6 @@
+ 
+ import argparse
+ from contextlib import contextmanager
+-from copy import deepcopy
+ from typing import Any, Callable, Dict, Iterator, List, Optional, overload, Tuple, Union
+ 
+ 
+@@ -49,9 +48,9 @@ def strip_meta(cfg):
+         cfg: The configuration object to strip.
+ 
+     Returns:
+-        A deepcopy of the configuration object excluding all metadata keys.
++        A copy of the configuration object excluding all metadata keys.
+     """
+-    cfg = deepcopy(cfg)
++    cfg = recreate_branches(cfg)
+ 
+     del_keys = []
+     for key in cfg.keys():
+@@ -68,6 +67,17 @@ def strip_meta(cfg):
+     return cfg
+ 
+ 
++def recreate_branches(data):
++    new_data = data
++    if isinstance(data, (Namespace, dict)):
++        new_data = type(data)()
++        for key, val in getattr(data, '__dict__', data).items():
++            new_data[key] = recreate_branches(val)
++    elif isinstance(data, list):
++        new_data = [recreate_branches(v) for v in data]
++    return new_data
++
++
+ @contextmanager
+ def patch_namespace():
+     namespace_class = argparse.Namespace
+@@ -79,13 +89,13 @@ def patch_namespace():
+ 
+ 
+ def namespace_to_dict(namespace: 'Namespace') -> Dict[str, Any]:
+-    """Returns a deepcopy of a nested namespace converted into a nested dictionary."""
++    """Returns a copy of a nested namespace converted into a nested dictionary."""
+     return namespace.clone().as_dict()
+ 
+ 
+ def dict_to_namespace(cfg_dict: Union[Dict[str, Any], 'Namespace']) -> 'Namespace':
+     """Converts a nested dictionary into a nested namespace."""
+-    cfg_dict = deepcopy(cfg_dict)
++    cfg_dict = recreate_branches(cfg_dict)
+     def expand_dict(cfg):
+         for k, v in cfg.items():
+             if isinstance(v, dict) and all(isinstance(k, str) for k in v.keys()):
+@@ -268,7 +278,7 @@ class Namespace(argparse.Namespace):
+ 
+     def clone(self) -> 'Namespace':
+         """Creates an new identical nested namespace."""
+-        return deepcopy(self)
++        return recreate_branches(self)
+ 
+     def update(self, value: Union['Namespace', Any], key: Optional[str] = None, only_unset: bool = False) -> 'Namespace':
+         """Sets or replaces all items from the given nested namespace.
+diff --git a/jsonargparse/parameter_resolvers.py b/jsonargparse/parameter_resolvers.py
+index ba045f5..3c47529 100644
+--- a/jsonargparse/parameter_resolvers.py
++++ b/jsonargparse/parameter_resolvers.py
+@@ -10,7 +10,15 @@ from dataclasses import dataclass
+ from functools import partial
+ from typing import Any, Callable, List, Optional, Tuple, Type, Union
+ 
+-from .util import ClassFromFunctionBase, is_subclass, LoggerProperty, parse_logger
++from .util import (
++    ClassFromFunctionBase,
++    get_import_path,
++    is_subclass,
++    iter_to_set_str,
++    LoggerProperty,
++    parse_logger,
++    unique,
++)
+ from .optionals import parse_docs
+ 
+ 
+@@ -22,19 +30,39 @@ class ParamData:
+     kind: Optional[inspect._ParameterKind] = None
+     doc: Optional[str] = None
+     component: Optional[Union[Callable, Type, Tuple]] = None
+-    parent: Optional[Type] = None
++    parent: Optional[Union[Type, Tuple]] = None
++    origin: Optional[Union[str, Tuple]] = None
+ 
+ 
+ ParamList = List[ParamData]
+ parameter_attributes = [s[1:] for s in inspect.Parameter.__slots__]  # type: ignore
+ kinds = inspect._ParameterKind
+ ast_assign_type: Tuple[Type[ast.AST], ...] = (ast.AnnAssign, ast.Assign)
++param_kwargs_get = '**.get()'
++param_kwargs_pop = '**.pop()'
+ 
+ 
+ class SourceNotAvailable(Exception):
+     "Raised when the source code for some component is not available."
+ 
+ 
++class ConditionalDefault(list):
++    def __repr__(self):
++        return iter_to_set_str(self, sep=', ')
++
++
++def get_parameter_origins(component, parent) -> str:
++    if isinstance(component, tuple):
++        assert parent is None or len(component) == len(parent)
++        return iter_to_set_str(
++            get_parameter_origins(c, parent[n] if parent else None)
++            for n, c in enumerate(component)
++        )
++    if parent:
++        return f'{get_import_path(parent)}.{component.__name__}'
++    return get_import_path(component)
++
++
+ def is_staticmethod(attr) -> bool:
+     return isinstance(attr, staticmethod)
+ 
+@@ -75,6 +103,10 @@ def ast_get_assign_targets(node):
+     return node.targets if isinstance(node, ast.Assign) else [node.target]
+ 
+ 
++def ast_is_not(node) -> bool:
++    return isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not)
++
++
+ dict_ast = ast.dump(ast_variable_load('dict'))
+ 
+ 
+@@ -239,10 +271,11 @@ def get_kwargs_pop_or_get_parameter(node, component, parent, doc_params, logger)
+         name=name,
+         annotation=inspect._empty,
+         default=default,
+-        kind=inspect._ParameterKind.KEYWORD_ONLY,
++        kind=kinds.KEYWORD_ONLY,
+         doc=doc_params.get(name),
+         parent=parent,
+         component=component,
++        origin=param_kwargs_get if node.func.attr == 'get' else param_kwargs_pop,
+     )
+ 
+ 
+@@ -266,35 +299,41 @@ def replace_args_and_kwargs(params: ParamList, args: ParamList, kwargs: ParamLis
+     return params
+ 
+ 
+-def common_parameters(params_list: List[ParamList]) -> ParamList:
++def group_parameters(params_list: List[ParamList]) -> ParamList:
+     if len(params_list) == 1:
++        for param in params_list[0]:
++            if not isinstance(param.origin, tuple):
++                param.origin = None
+         return params_list[0]
+-    common = []
++    grouped = []
++    params_count = 0
++    params_skip = set()
+     params_dict = defaultdict(lambda: [])
+     for params in params_list:
++        if params[0].origin not in {param_kwargs_get, param_kwargs_pop}:
++            params_count += 1
+         for param in params:
+-            params_dict[param.name].append(param)
++            if param.name not in params_skip and param.kind != kinds.POSITIONAL_ONLY:
++                params_dict[param.name].append(param)
++                if param.origin == param_kwargs_pop:
++                    params_skip.add(param.name)
+     for params in params_dict.values():
+-        if (
+-            len(params) == len(params_list) and
+-            len(set(p.annotation for p in params)) == 1 and
+-            kinds.POSITIONAL_ONLY not in set(p.kind for p in params)
+-        ):
+-            common.append(params[0])
+-    return common
+-
+-
+-def merge_parameters(source: Union[ParamData, ParamList], target: ParamList) -> ParamList:
+-    if not isinstance(source, list):
+-        source = [source]
+-    source_dict = {p.name: p for p in source}
+-    replace_names = set()
+-    for p in target:
+-        if p.name in source_dict and p.annotation is inspect._empty and source_dict[p.name] is not inspect._empty:
+-            replace_names.add(p.name)
+-    target = [p for p in target if p.name not in replace_names]
+-    target_names = set(p.name for p in target)
+-    return target + [s for s in source if s.name not in target_names]
++        gparam = params[0]
++        types = unique(p.annotation for p in params if p.annotation is not inspect._empty)
++        defaults = unique(p.default for p in params if p.default is not inspect._empty)
++        if len(params) >= params_count and len(types) <= 1 and len(defaults) <= 1:
++            gparam.origin = None
++        else:
++            gparam.parent = tuple(p.parent for p in params)
++            gparam.component = tuple(p.component for p in params)
++            gparam.origin = tuple(p.origin for p in params)
++            gparam.default = ConditionalDefault((p.default for p in params) if len(defaults) > 1 else defaults)
++            if len(types) > 1:
++                gparam.annotation = Union[tuple(types)] if types else inspect._empty
++        docs = [p.doc for p in params if p.doc]
++        gparam.doc = docs[0] if docs else None
++        grouped.append(gparam)
++    return grouped
+ 
+ 
+ def has_dunder_new_method(cls, attr_name):
+@@ -431,6 +470,18 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+                 self.values_found.append((key, node))
+         self.generic_visit(node)
+ 
++    def visit_If(self, node):
++        is_test_not = ast_is_not(node.test)
++        test_node = node.test.operand if is_test_not else node.test
++        component_globals = self.component.__globals__
++        if isinstance(test_node, ast.Name) and test_node.id in component_globals:
++            condition = bool(component_globals[test_node.id])
++            if is_test_not:
++                condition = not condition
++            body = node.body if condition else node.orelse
++            node = ast.If(test=ast.Constant(value=True), body=body, orelse=[])
++        self.generic_visit(node)
++
+     def find_values_usage(self, values):
+         self.find_values = values
+         self.values_found = []
+@@ -487,18 +538,17 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+         if kwargs_name:
+             values_to_find[kwargs_name] = kwargs_value = ast_variable_load(kwargs_name)
+ 
+-        args: ParamList = []
+-        kwargs: ParamList = []
+         values_found = self.find_values_usage(values_to_find)
+         if not values_found:
+-            return args, kwargs
++            return [], []
+ 
++        params_list = []
+         kwargs_value_dump = ast.dump(kwargs_value)
+         for node in [v for k, v in values_found if k == kwargs_name]:
+             if isinstance(node, ast.Call):
+                 if ast_is_kwargs_pop_or_get(node, kwargs_value_dump):
+                     param = get_kwargs_pop_or_get_parameter(node, self.component, self.parent, self.doc_params, self.logger)
+-                    kwargs = merge_parameters(param, kwargs)
++                    params_list.append([param])
+                     continue
+                 kwarg = ast_get_call_kwarg_with_value(node, kwargs_value)
+                 params = []
+@@ -511,19 +561,22 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+                     get_param_args = self.get_node_component(node)
+                     if get_param_args:
+                         params = get_signature_parameters(*get_param_args, logger=self.logger)
+-                args, kwargs_ = split_args_and_kwargs(remove_given_parameters(node, params))
+-                kwargs = merge_parameters(kwargs_, kwargs)
+-                break
++                params = remove_given_parameters(node, params)
++                if params:
++                    self.add_node_origins(params, node)
++                    params_list.append(params)
+             elif isinstance(node, ast_assign_type):
+                 self_attr = self.parent and ast_is_attr_assign(node, self.self_name)
+                 if self_attr:
+                     params = self.get_parameters_attr_use_in_members(self_attr)
+-                    kwargs = merge_parameters(params, kwargs)
+-                    break
++                    if params:
++                        self.add_node_origins(params, node)
++                        params_list.append(params)
+                 else:
+                     self.logger.debug(f'AST resolver: unsupported type of assign: {ast_str(node)}')
+ 
+-        return args, kwargs
++        params = group_parameters(params_list)
++        return split_args_and_kwargs(params)
+ 
+     def get_parameters_attr_use_in_members(self, attr_name) -> ParamList:
+         attr_value = ast_attribute_load(self.self_name, attr_name)
+@@ -540,6 +593,14 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+         self.logger.debug(f'AST resolver: did not find use of {self.self_name}.{attr_name} in members of {self.parent}')
+         return []
+ 
++    def add_node_origins(self, params: ParamList, node) -> None:
++        origin = None
++        for param in params:
++            if param.origin is None:
++                if not origin:
++                    origin = f'{get_parameter_origins(self.component, self.parent)}:{node.lineno}'
++                param.origin = origin
++
+     def get_parameters_call_attr(self, attr_name: str, attr_value: ast.AST) -> Optional[ParamList]:
+         values_to_find = {attr_name: attr_value}
+         values_found = self.find_values_usage(values_to_find)
+@@ -547,9 +608,10 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+         if values_found:
+             for _, node in values_found:
+                 match = self.match_call_that_uses_attr(node, attr_name)
+-                if match is not None:
++                if match:
++                    self.add_node_origins(match, node)
+                     matched.append(match)
+-            matched = common_parameters(matched)
++            matched = group_parameters(matched)
+         return matched or None
+ 
+     def get_parameters(self) -> ParamList:
+diff --git a/jsonargparse/signatures.py b/jsonargparse/signatures.py
+index bc5514d..1fba318 100644
+--- a/jsonargparse/signatures.py
++++ b/jsonargparse/signatures.py
+@@ -8,7 +8,7 @@ from typing import Any, Callable, List, Optional, Set, Tuple, Type, Union
+ 
+ from .actions import _ActionConfigLoad
+ from .optionals import get_doc_short_description
+-from .parameter_resolvers import get_signature_parameters, ParamData
++from .parameter_resolvers import get_parameter_origins, get_signature_parameters, ParamData
+ from .typehints import ActionTypeHint, is_optional, LazyInitBaseClass
+ from .typing import is_final_class
+ from .util import get_import_path, is_subclass, iter_to_set_str, LoggerProperty
+@@ -277,8 +277,7 @@ class SignatureArguments(LoggerProperty):
+         if default == inspect_empty:
+             default = param.default
+         is_required = default == inspect_empty
+-        src = (param.parent.__name__+'.' if param.parent else '')
+-        src += iter_to_set_str(x.__name__ for x in (param.component if isinstance(param.component, tuple) else [param.component]))
++        src = get_parameter_origins(param.component, param.parent)
+         skip_message = f'Skipping parameter "{name}" from "{src}" because of: '
+         if not fail_untyped and annotation == inspect_empty:
+             annotation = Any
+@@ -310,6 +309,15 @@ class SignatureArguments(LoggerProperty):
+         is_final_class_typehint = is_final_class(annotation)
+         dest = (nested_key+'.' if nested_key else '') + name
+         args = [dest if is_required and as_positional else '--'+dest]
++        if param.origin:
++            group_name = '; '.join(str(o) for o in param.origin)
++            if group_name in group.parser.groups:
++                group = group.parser.groups[group_name]
++            else:
++                group = group.parser.add_argument_group(
++                    f'Conditional arguments [origins: {group_name}]',
++                    name=group_name,
++                )
+         if annotation in {str, int, float, bool} or \
+            is_subclass(annotation, (str, int, float)) or \
+            is_final_class_typehint or \
+diff --git a/jsonargparse/util.py b/jsonargparse/util.py
+index 0df0b81..3c2b623 100644
+--- a/jsonargparse/util.py
++++ b/jsonargparse/util.py
+@@ -14,7 +14,7 @@ from functools import wraps
+ from types import BuiltinFunctionType, FunctionType, ModuleType
+ from typing import Any, Callable, Optional, Tuple, Type, TypeVar, Union
+ 
+-from .loaders_dumpers import load_value
++from .loaders_dumpers import json_dump, load_value
+ from .optionals import (
+     fsspec_support,
+     get_config_read_mode,
+@@ -285,8 +285,30 @@ def change_to_path_dir(path: Optional['Path']):
+             os.chdir(cwd)
+ 
+ 
++def hash_item(item):
++    try:
++        if isinstance(item, (dict, list)):
++            item_hash = hash(json_dump(item))
++        else:
++            item_hash = hash(item)
++    except Exception:
++        item_hash = hash(repr(item))
++    return item_hash
++
++
++def unique(iterable):
++    unique_items = []
++    seen = set()
++    for item in iterable:
++        key = hash_item(item)
++        if key not in seen:
++            unique_items.append(item)
++            seen.add(key)
++    return unique_items
++
++
+ def iter_to_set_str(val, sep=','):
+-    val = list(val)
++    val = unique(val)
+     if len(val) == 1:
+         return str(val[0])
+     return '{'+sep.join(str(x) for x in val)+'}'

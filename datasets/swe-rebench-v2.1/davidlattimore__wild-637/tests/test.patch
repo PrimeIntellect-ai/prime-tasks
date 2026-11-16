@@ -1,0 +1,282 @@
+diff --git a/wild/tests/integration_tests.rs b/wild/tests/integration_tests.rs
+index 69a916f..8960111 100644
+--- a/wild/tests/integration_tests.rs
++++ b/wild/tests/integration_tests.rs
+@@ -2122,6 +2122,227 @@ fn run_with_config(
+     Ok(())
+ }
+ 
++#[test]
++fn rustc_can_expand_proc_macro_linked_with_wild() {
++    let temp_dir = std::env::temp_dir().join(format!("wild-proc-macro-{}", std::process::id()));
++    std::fs::create_dir_all(&temp_dir).unwrap();
++    let make_macro_source = temp_dir.join("make_macro.rs");
++    let macro_source = temp_dir.join("meta_macro.rs");
++    let program_source = temp_dir.join("use_macro.rs");
++    let meta_program_source = temp_dir.join("meta_macro_use.rs");
++    let hygiene_source = temp_dir.join("meta_macro_hygiene.rs");
++    let tls_source = temp_dir.join("tls.c");
++    let tls_library = temp_dir.join("libtls.so");
++    let make_macro_library = temp_dir.join("libmake_macro.rlib");
++    let macro_library = temp_dir.join("libmeta_macro.so");
++    let program = temp_dir.join("use_macro");
++    let meta_program = temp_dir.join("meta_macro_use");
++    let make_macro_code = r#"#[macro_export]
++macro_rules! make_it {
++    ($name:ident) => {
++        #[proc_macro]
++        pub fn $name(input: TokenStream) -> TokenStream {
++            println!("Def site: {:?}", Span::def_site());
++            println!("Input: {:?}", input);
++            unsafe { ZERO_TLS += 1; let _ = ZERO_TLS; }
++            let new: TokenStream = input.into_iter().map(|mut token| {
++                token.set_span(Span::def_site());
++                token
++            }).collect();
++            println!("Respanned: {:?}", new);
++            new
++        }
++    };
++}
++"#;
++    let macro_code = r#"#![feature(thread_local, proc_macro_def_site)]
++extern crate proc_macro;
++extern crate make_macro;
++use proc_macro::{Span, TokenStream};
++#[thread_local]
++static mut ZERO_TLS: usize = 0;
++make_macro::make_it!(print_def_site);
++#[proc_macro]
++pub fn dummy(input: TokenStream) -> TokenStream { input }
++#[proc_macro]
++pub fn make_value(input: TokenStream) -> TokenStream {
++    unsafe { ZERO_TLS += 1; let _ = ZERO_TLS; }
++    let _ = input.to_string();
++    "42".parse().unwrap()
++}
++"#;
++    let program_code = r#"use meta_macro::make_value;
++fn main() { assert_eq!(make_value!(), 42); }
++"#;
++    let meta_program_code = r#"#![no_std]
++extern crate std;
++extern crate meta_macro;
++fn main() { meta_macro::print_def_site!(); }
++"#;
++    let hygiene_code = r#"#![no_std]
++extern crate std;
++extern crate meta_macro;
++macro_rules! produce_it {
++    () => { meta_macro::print_def_site!($crate::dummy!()); };
++}
++fn main() { produce_it!(); }
++"#;
++    std::fs::write(&make_macro_source, make_macro_code).unwrap();
++    std::fs::write(&macro_source, macro_code).unwrap();
++    std::fs::write(&program_source, program_code).unwrap();
++    std::fs::write(&meta_program_source, meta_program_code).unwrap();
++    std::fs::write(&hygiene_source, hygiene_code).unwrap();
++    std::fs::write(
++        &tls_source,
++        "#include <stdlib.h>\n__attribute__((aligned(256))) static __thread long tls_value;\n__attribute__((constructor)) static void check_tls(void) { tls_value = 42; if (tls_value != 42) abort(); }\n",
++    )
++    .unwrap();
++
++    let wild = Path::new(env!("CARGO_BIN_EXE_wild"));
++    let build_tls = Command::new("clang")
++        .arg(format!("--ld-path={}", wild.display()))
++        .args(["-fPIC", "-shared"])
++        .arg(&tls_source)
++        .arg("-o")
++        .arg(&tls_library)
++        .output()
++        .unwrap();
++    assert!(
++        build_tls.status.success(),
++        "could not build the TLS library with Wild: {}",
++        String::from_utf8_lossy(&build_tls.stderr)
++    );
++
++    let build_make_macro = Command::new("rustc")
++        .args([
++            "+nightly",
++            "--crate-name",
++            "make_macro",
++            "--crate-type",
++            "rlib",
++            "--edition=2018",
++        ])
++        .arg(&make_macro_source)
++        .arg("-o")
++        .arg(&make_macro_library)
++        .env("RUSTC_BOOTSTRAP", "1")
++        .env("LD_PRELOAD", &tls_library)
++        .output()
++        .unwrap();
++    assert!(
++        build_make_macro.status.success(),
++        "could not build the proc-macro support crate: {}",
++        String::from_utf8_lossy(&build_make_macro.stderr)
++    );
++
++    let build_macro = Command::new("rustc")
++        .args([
++            "+nightly",
++            "--crate-name",
++            "meta_macro",
++            "--crate-type",
++            "proc-macro",
++            "--edition=2018",
++        ])
++        .arg(&macro_source)
++        .arg("--extern")
++        .arg(format!("make_macro={}", make_macro_library.display()))
++        .arg("-L")
++        .arg(format!("dependency={}", temp_dir.display()))
++        .args(["-C", "linker=clang", "-C"])
++        .arg(format!("link-arg=--ld-path={}", wild.display()))
++        .arg("-o")
++        .arg(&macro_library)
++        .env("RUSTC_BOOTSTRAP", "1")
++        .env("LD_PRELOAD", &tls_library)
++        .output()
++        .unwrap();
++    assert!(
++        build_macro.status.success(),
++        "could not build the proc-macro with Wild: {}",
++        String::from_utf8_lossy(&build_macro.stderr)
++    );
++
++    let compile_program = Command::new("rustc")
++        .args(["+nightly", "--edition=2018"])
++        .arg(&program_source)
++        .arg("--extern")
++        .arg(format!("meta_macro={}", macro_library.display()))
++        .arg("-L")
++        .arg(format!("dependency={}", temp_dir.display()))
++        .arg("-o")
++        .arg(&program)
++        .env("RUSTC_BOOTSTRAP", "1")
++        .env("LD_PRELOAD", &tls_library)
++        .output()
++        .unwrap();
++    assert!(
++        compile_program.status.success(),
++        "rustc failed while expanding the proc macro: {}",
++        String::from_utf8_lossy(&compile_program.stderr)
++    );
++    let run_program = Command::new(&program).output().unwrap();
++    assert!(
++        run_program.status.success(),
++        "program using the proc macro did not run successfully: {}",
++        String::from_utf8_lossy(&run_program.stderr)
++    );
++
++    let compile_meta = Command::new("rustc")
++        .args(["+nightly", "--edition=2018", "-Z", "span-debug"])
++        .arg(&meta_program_source)
++        .arg("--extern")
++        .arg(format!("meta_macro={}", macro_library.display()))
++        .arg("-L")
++        .arg(format!("dependency={}", temp_dir.display()))
++        .arg("-o")
++        .arg(&meta_program)
++        .env("RUSTC_BOOTSTRAP", "1")
++        .env("LD_PRELOAD", &tls_library)
++        .output()
++        .unwrap();
++    assert!(
++        compile_meta.status.success(),
++        "rustc failed on proc-macro definition-site expansion: {}",
++        String::from_utf8_lossy(&compile_meta.stderr)
++    );
++    let run_meta = Command::new(&meta_program).output().unwrap();
++    assert!(
++        run_meta.status.success(),
++        "program using the definition-site proc macro did not run successfully: {}",
++        String::from_utf8_lossy(&run_meta.stderr)
++    );
++
++    let compile_hygiene = Command::new("rustc")
++        .args([
++            "+nightly",
++            "--edition=2018",
++            "-Z",
++            "span-debug",
++            "-Z",
++            "macro-backtrace",
++            "-Z",
++            "unpretty=expanded,hygiene",
++            "-Z",
++            "trim-diagnostic-paths=no",
++        ])
++        .arg(&hygiene_source)
++        .arg("--extern")
++        .arg(format!("meta_macro={}", macro_library.display()))
++        .arg("-L")
++        .arg(format!("dependency={}", temp_dir.display()))
++        .env("RUSTC_BOOTSTRAP", "1")
++        .env("LD_PRELOAD", &tls_library)
++        .output()
++        .unwrap();
++    let _ = std::fs::remove_dir_all(&temp_dir);
++    assert!(
++        compile_hygiene.status.success(),
++        "rustc failed while expanding the hygienic proc macro: {}",
++        String::from_utf8_lossy(&compile_hygiene.stderr)
++    );
++}
++
+ #[rstest]
+ fn integration_test(
+     #[values(
+@@ -2170,6 +2391,7 @@ fn integration_test(
+         "tls-local-exec.c",
+         "undefined_symbols.c",
+         "whole_archive.c",
++        "dynamic-bss-only.c",
+         "shared.c",
+         "duplicate_strong_symbols.c"
+     )]
+diff --git a/wild/tests/sources/dynamic-bss-only.c b/wild/tests/sources/dynamic-bss-only.c
+new file mode 100644
+index 0000000..daf3235
+--- /dev/null
++++ b/wild/tests/sources/dynamic-bss-only.c
+@@ -0,0 +1,36 @@
++//#CompArgs:-fPIC -ftls-model=global-dynamic
++//#CompSoArgs:-fPIC -ftls-model=global-dynamic -DSHARED_LIB
++//#Shared:dynamic-bss-only.c
++//#LinkerDriver:gcc
++//#LinkArgs:-Wl,-z,now
++//#DiffIgnore:.dynamic.DT_RELAENT
++//#DiffIgnore:.dynamic.DT_RELA
++//#DiffIgnore:.dynamic.DT_NEEDED
++//#DiffIgnore:section.rodata
++#ifdef SHARED_LIB
++
++__attribute__ ((aligned(256)))
++static __thread long int tvar1;
++
++long int get_tvar1(void) {
++    return tvar1;
++}
++
++void set_tvar1(long int value) {
++    tvar1 = value;
++}
++
++#else
++
++long int get_tvar1(void);
++void set_tvar1(long int value);
++static __thread long int main_tls;
++
++int main() {
++    main_tls = 7;
++    set_tvar1(42);
++    if (main_tls != 7) return 1;
++    return (int)get_tvar1();
++}
++
++#endif

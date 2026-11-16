@@ -1,0 +1,225 @@
+diff --git a/cmd/gpq/command/convert.go b/cmd/gpq/command/convert.go
+index 5557282..0130c9d 100644
+--- a/cmd/gpq/command/convert.go
++++ b/cmd/gpq/command/convert.go
+@@ -35,6 +35,7 @@ type ConvertCmd struct {
+ 	Max                int    `help:"Maximum number of features to consider when building a schema." default:"100"`
+ 	InputPrimaryColumn string `help:"Primary geometry column name when reading Parquet withtout metadata." default:"geometry"`
+ 	Compression        string `help:"Parquet compression to use.  Possible values: ${enum}." enum:"uncompressed, snappy, gzip, brotli, zstd" default:"zstd"`
++	RowGroupLength     int    `help:"Maximum number of rows per group when writing Parquet."`
+ }
+ 
+ type FormatType string
+@@ -149,7 +150,12 @@ func (c *ConvertCmd) Run() error {
+ 		if outputFormat != ParquetType && outputFormat != GeoParquetType {
+ 			return errors.New("GeoJSON input can only be converted to GeoParquet")
+ 		}
+-		convertOptions := &geojson.ConvertOptions{MinFeatures: c.Min, MaxFeatures: c.Max, Compression: c.Compression}
++		convertOptions := &geojson.ConvertOptions{
++			MinFeatures:    c.Min,
++			MaxFeatures:    c.Max,
++			Compression:    c.Compression,
++			RowGroupLength: c.RowGroupLength,
++		}
+ 		return geojson.ToParquet(input, output, convertOptions)
+ 	}
+ 
+@@ -160,6 +166,7 @@ func (c *ConvertCmd) Run() error {
+ 	convertOptions := &geoparquet.ConvertOptions{
+ 		InputPrimaryColumn: c.InputPrimaryColumn,
+ 		Compression:        c.Compression,
++		RowGroupLength:     c.RowGroupLength,
+ 	}
+ 
+ 	return geoparquet.FromParquet(input, output, convertOptions)
+diff --git a/internal/geojson/geojson.go b/internal/geojson/geojson.go
+index bfeb93a..2a12f42 100644
+--- a/internal/geojson/geojson.go
++++ b/internal/geojson/geojson.go
+@@ -58,10 +58,11 @@ func FromParquet(reader parquet.ReaderAtSeeker, writer io.Writer) error {
+ }
+ 
+ type ConvertOptions struct {
+-	MinFeatures int
+-	MaxFeatures int
+-	Compression string
+-	Metadata    string
++	MinFeatures    int
++	MaxFeatures    int
++	Compression    string
++	RowGroupLength int
++	Metadata       string
+ }
+ 
+ var defaultOptions = &ConvertOptions{
+@@ -80,12 +81,19 @@ func ToParquet(input io.Reader, output io.Writer, convertOptions *ConvertOptions
+ 	featuresRead := 0
+ 
+ 	var pqWriterProps *parquet.WriterProperties
++	var writerOptions []parquet.WriterProperty
+ 	if convertOptions.Compression != "" {
+ 		compression, err := pqutil.GetCompression(convertOptions.Compression)
+ 		if err != nil {
+ 			return err
+ 		}
+-		pqWriterProps = parquet.NewWriterProperties(parquet.WithCompression(compression))
++		writerOptions = append(writerOptions, parquet.WithCompression(compression))
++	}
++	if convertOptions.RowGroupLength > 0 {
++		writerOptions = append(writerOptions, parquet.WithMaxRowGroupLength(int64(convertOptions.RowGroupLength)))
++	}
++	if len(writerOptions) > 0 {
++		pqWriterProps = parquet.NewWriterProperties(writerOptions...)
+ 	}
+ 
+ 	var featureWriter *geoparquet.FeatureWriter
+diff --git a/internal/geoparquet/geoparquet.go b/internal/geoparquet/geoparquet.go
+index 6bc9605..67eeaa2 100644
+--- a/internal/geoparquet/geoparquet.go
++++ b/internal/geoparquet/geoparquet.go
+@@ -21,6 +21,7 @@ import (
+ type ConvertOptions struct {
+ 	InputPrimaryColumn string
+ 	Compression        string
++	RowGroupLength     int
+ }
+ 
+ func getMetadata(fileReader *file.Reader, convertOptions *ConvertOptions) *Metadata {
+@@ -171,6 +172,7 @@ func FromParquet(input parquet.ReaderAtSeeker, output io.Writer, convertOptions
+ 		TransformColumn: transformColumn,
+ 		BeforeClose:     beforeClose,
+ 		Compression:     compression,
++		RowGroupLength:  convertOptions.RowGroupLength,
+ 	}
+ 
+ 	return pqutil.TransformByColumn(config)
+diff --git a/internal/pqutil/transform.go b/internal/pqutil/transform.go
+index 3e4e946..2061a7d 100644
+--- a/internal/pqutil/transform.go
++++ b/internal/pqutil/transform.go
+@@ -23,6 +23,7 @@ type TransformConfig struct {
+ 	Reader          parquet.ReaderAtSeeker
+ 	Writer          io.Writer
+ 	Compression     *compress.Compression
++	RowGroupLength  int
+ 	TransformSchema SchemaTransformer
+ 	TransformColumn ColumnTransformer
+ 	BeforeClose     func(*file.Reader, *file.Writer) error
+@@ -50,6 +51,10 @@ func getWriterProperties(config *TransformConfig, fileReader *file.Reader) (*par
+ 		}
+ 	}
+ 
++	if config.RowGroupLength > 0 {
++		writerProperties = append(writerProperties, parquet.WithMaxRowGroupLength(int64(config.RowGroupLength)))
++	}
++
+ 	return parquet.NewWriterProperties(writerProperties...), nil
+ }
+ 
+@@ -104,34 +109,85 @@ func TransformByColumn(config *TransformConfig) error {
+ 
+ 	ctx := pqarrow.NewArrowWriteContext(context.Background(), nil)
+ 
+-	numRowGroups := fileReader.NumRowGroups()
+-	for rowGroupIndex := 0; rowGroupIndex < numRowGroups; rowGroupIndex += 1 {
+-		rowGroupReader := arrowReader.RowGroup(rowGroupIndex)
+-		rowGroupWriter := fileWriter.AppendRowGroup()
++	if config.RowGroupLength > 0 {
++		columnReaders := make([]*pqarrow.ColumnReader, numFields)
+ 		for fieldNum := 0; fieldNum < numFields; fieldNum += 1 {
+-			arr, readErr := rowGroupReader.Column(fieldNum).Read(ctx)
+-			if readErr != nil {
+-				return readErr
++			colReader, err := arrowReader.GetColumn(ctx, fieldNum)
++			if err != nil {
++				return err
+ 			}
+-			if config.TransformColumn != nil {
+-				inputField := inputManifest.Fields[fieldNum].Field
+-				outputField := outputManifest.Fields[fieldNum].Field
+-				transformed, err := config.TransformColumn(inputField, outputField, arr)
+-				if err != nil {
+-					return err
++			columnReaders[fieldNum] = colReader
++		}
++
++		numRows := fileReader.NumRows()
++		numRowsWritten := int64(0)
++		for {
++			rowGroupWriter := fileWriter.AppendRowGroup()
++			for fieldNum := 0; fieldNum < numFields; fieldNum += 1 {
++				colReader := columnReaders[fieldNum]
++				arr, readErr := colReader.NextBatch(int64(config.RowGroupLength))
++				if readErr != nil {
++					return readErr
+ 				}
+-				if transformed.DataType() != outputField.Type {
+-					return fmt.Errorf("transform generated an unexpected type, got %s, expected %s", transformed.DataType().Name(), outputField.Type.Name())
++				if config.TransformColumn != nil {
++					inputField := inputManifest.Fields[fieldNum].Field
++					outputField := outputManifest.Fields[fieldNum].Field
++					transformed, err := config.TransformColumn(inputField, outputField, arr)
++					if err != nil {
++						return err
++					}
++					if transformed.DataType() != outputField.Type {
++						return fmt.Errorf("transform generated an unexpected type, got %s, expected %s", transformed.DataType().Name(), outputField.Type.Name())
++					}
++					arr = transformed
++				}
++				colWriter, colWriterErr := pqarrow.NewArrowColumnWriter(arr, 0, int64(arr.Len()), outputManifest, rowGroupWriter, fieldNum)
++				if colWriterErr != nil {
++					return colWriterErr
++				}
++				if err := colWriter.Write(ctx); err != nil {
++					return err
+ 				}
+-				arr = transformed
+-			}
+-			colWriter, colWriterErr := pqarrow.NewArrowColumnWriter(arr, 0, int64(arr.Len()), outputManifest, rowGroupWriter, fieldNum)
+-			if colWriterErr != nil {
+-				return colWriterErr
+ 			}
+-			if err := colWriter.Write(ctx); err != nil {
++			numRowsInGroup, err := rowGroupWriter.NumRows()
++			if err != nil {
+ 				return err
+ 			}
++			numRowsWritten += int64(numRowsInGroup)
++			if numRowsWritten >= numRows {
++				break
++			}
++		}
++	} else {
++		numRowGroups := fileReader.NumRowGroups()
++		for rowGroupIndex := 0; rowGroupIndex < numRowGroups; rowGroupIndex += 1 {
++			rowGroupReader := arrowReader.RowGroup(rowGroupIndex)
++			rowGroupWriter := fileWriter.AppendRowGroup()
++			for fieldNum := 0; fieldNum < numFields; fieldNum += 1 {
++				arr, readErr := rowGroupReader.Column(fieldNum).Read(ctx)
++				if readErr != nil {
++					return readErr
++				}
++				if config.TransformColumn != nil {
++					inputField := inputManifest.Fields[fieldNum].Field
++					outputField := outputManifest.Fields[fieldNum].Field
++					transformed, err := config.TransformColumn(inputField, outputField, arr)
++					if err != nil {
++						return err
++					}
++					if transformed.DataType() != outputField.Type {
++						return fmt.Errorf("transform generated an unexpected type, got %s, expected %s", transformed.DataType().Name(), outputField.Type.Name())
++					}
++					arr = transformed
++				}
++				colWriter, colWriterErr := pqarrow.NewArrowColumnWriter(arr, 0, int64(arr.Len()), outputManifest, rowGroupWriter, fieldNum)
++				if colWriterErr != nil {
++					return colWriterErr
++				}
++				if err := colWriter.Write(ctx); err != nil {
++					return err
++				}
++			}
+ 		}
+ 	}
+ 

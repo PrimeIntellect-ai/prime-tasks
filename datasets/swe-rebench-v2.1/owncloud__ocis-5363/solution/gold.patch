@@ -1,0 +1,307 @@
+diff --git a/services/graph/pkg/identity/backend.go b/services/graph/pkg/identity/backend.go
+index cefa4cb2..b521e32d 100644
+--- a/services/graph/pkg/identity/backend.go
++++ b/services/graph/pkg/identity/backend.go
+@@ -51,6 +51,8 @@ type EducationBackend interface {
+ 	GetEducationSchool(ctx context.Context, nameOrID string, queryParam url.Values) (*libregraph.EducationSchool, error)
+ 	// GetEducationSchools lists all schools
+ 	GetEducationSchools(ctx context.Context, queryParam url.Values) ([]*libregraph.EducationSchool, error)
++	// UpdateEducationSchool updates attributes of a school
++	UpdateEducationSchool(ctx context.Context, numberOrID string, school libregraph.EducationSchool) (*libregraph.EducationSchool, error)
+ 	// GetEducationSchoolUsers lists all members of a school
+ 	GetEducationSchoolUsers(ctx context.Context, id string) ([]*libregraph.EducationUser, error)
+ 	// AddUsersToEducationSchool adds new members (reference by a slice of IDs) to supplied school in the identity backend.
+diff --git a/services/graph/pkg/identity/err_school.go b/services/graph/pkg/identity/err_school.go
+index cbe42c70..6460fa46 100644
+--- a/services/graph/pkg/identity/err_school.go
++++ b/services/graph/pkg/identity/err_school.go
+@@ -30,6 +30,11 @@ func (i *ErrEducationBackend) GetEducationSchools(ctx context.Context, queryPara
+ 	return nil, errNotImplemented
+ }
+ 
++// UpdateEducationSchool implements the EducationBackend interface for the ErrEducationBackend backend.
++func (i *ErrEducationBackend) UpdateEducationSchool(ctx context.Context, numberOrID string, school libregraph.EducationSchool) (*libregraph.EducationSchool, error) {
++	return nil, errNotImplemented
++}
++
+ // GetEducationSchoolUsers implements the EducationBackend interface for the ErrEducationBackend backend.
+ func (i *ErrEducationBackend) GetEducationSchoolUsers(ctx context.Context, id string) ([]*libregraph.EducationUser, error) {
+ 	return nil, errNotImplemented
+diff --git a/services/graph/pkg/identity/ldap_school.go b/services/graph/pkg/identity/ldap_school.go
+index d73939a5..a50f543f 100644
+--- a/services/graph/pkg/identity/ldap_school.go
++++ b/services/graph/pkg/identity/ldap_school.go
+@@ -34,6 +34,15 @@ type schoolAttributeMap struct {
+ 	id           string
+ }
+ 
++type schoolUpdateOperation uint8
++
++const (
++	tooManyValues schoolUpdateOperation = iota
++	schoolUnchanged
++	displayNameUpdated
++	schoolNumberUpdated
++)
++
+ func defaultEducationConfig() educationConfig {
+ 	return educationConfig{
+ 		schoolObjectClass:       "ocEducationSchool",
+@@ -95,6 +104,8 @@ func (i *LDAP) CreateEducationSchool(ctx context.Context, school libregraph.Educ
+ 		return nil, ErrReadOnly
+ 	}
+ 
++	// Here we should verify that the school number is not already used
++
+ 	dn := fmt.Sprintf("%s=%s,%s",
+ 		i.educationConfig.schoolAttributeMap.displayName,
+ 		oldap.EscapeDNAttributeValue(school.GetDisplayName()),
+@@ -128,6 +139,130 @@ func (i *LDAP) CreateEducationSchool(ctx context.Context, school libregraph.Educ
+ 	return i.createSchoolModelFromLDAP(e), nil
+ }
+ 
++// UpdateEducationSchoolOperation contains the logic for which update operation to apply to a school
++func (i *LDAP) UpdateEducationSchoolOperation(
++	schoolUpdate libregraph.EducationSchool,
++	currentSchool libregraph.EducationSchool,
++) schoolUpdateOperation {
++	providedDisplayName := schoolUpdate.GetDisplayName()
++	schoolNumber := schoolUpdate.GetSchoolNumber()
++
++	if providedDisplayName != "" && schoolNumber != "" {
++		return tooManyValues
++	}
++
++	if providedDisplayName != "" && providedDisplayName != currentSchool.GetDisplayName() {
++		return displayNameUpdated
++	}
++
++	if schoolNumber != "" && schoolNumber != currentSchool.GetSchoolNumber() {
++		return schoolNumberUpdated
++	}
++
++	return schoolUnchanged
++}
++
++// updateDisplayName updates the school OU in the identity backend
++func (i *LDAP) updateDisplayName(ctx context.Context, dn string, providedDisplayName string) error {
++	logger := i.logger.SubloggerWithRequestID(ctx)
++	newDisplayName := fmt.Sprintf(
++		"%s=%s",
++		i.educationConfig.schoolAttributeMap.displayName,
++		providedDisplayName,
++	)
++
++	mrdn := ldap.NewModifyDNRequest(dn, newDisplayName, true, "")
++	i.logger.Debug().Str("backend", "ldap").
++		Str("dn", mrdn.DN).
++		Str("newrdn", mrdn.NewRDN).
++		Msg("updateDisplayName")
++
++	if err := i.conn.ModifyDN(mrdn); err != nil {
++		var lerr *ldap.Error
++		logger.Debug().Err(err).Msg("error updating school name")
++		if errors.As(err, &lerr) {
++			if lerr.ResultCode == ldap.LDAPResultEntryAlreadyExists {
++				err = errorcode.New(errorcode.NameAlreadyExists, lerr.Error())
++			}
++		}
++		return err
++	}
++
++	return nil
++}
++
++// updateSchoolNumber checks if a school number is already taken, and if not updates the school number
++func (i *LDAP) updateSchoolNumber(ctx context.Context, dn string, schoolNumber string) error {
++	logger := i.logger.SubloggerWithRequestID(ctx)
++	_, err := i.getSchoolByNumberOrID(schoolNumber)
++	if err == nil {
++		errmsg := fmt.Sprintf("school number '%s' already exists", schoolNumber)
++		err = fmt.Errorf(errmsg)
++		return err
++	}
++
++	mr := ldap.NewModifyRequest(dn, nil)
++	mr.Replace(i.educationConfig.schoolAttributeMap.schoolNumber, []string{schoolNumber})
++
++	if err := i.conn.Modify(mr); err != nil {
++		var lerr *ldap.Error
++		logger.Debug().Err(err).Msg("error updating school number")
++		if errors.As(err, &lerr) {
++			if lerr.ResultCode == ldap.LDAPResultEntryAlreadyExists {
++				err = errorcode.New(errorcode.NameAlreadyExists, lerr.Error())
++			}
++		}
++		return err
++	}
++
++	return nil
++}
++
++// UpdateEducationSchool updates the supplied school in the identity backend
++func (i *LDAP) UpdateEducationSchool(ctx context.Context, numberOrID string, school libregraph.EducationSchool) (*libregraph.EducationSchool, error) {
++	logger := i.logger.SubloggerWithRequestID(ctx)
++	logger.Debug().Str("backend", "ldap").Msg("UpdateEducationSchool")
++	if !i.writeEnabled {
++		return nil, ErrReadOnly
++	}
++
++	providedDisplayName := school.GetDisplayName()
++	schoolNumber := school.GetSchoolNumber()
++
++	if providedDisplayName != "" && schoolNumber != "" {
++		return nil, fmt.Errorf("school name and school number cannot be updated in the same request")
++	}
++
++	e, err := i.getSchoolByNumberOrID(numberOrID)
++	if err != nil {
++		return nil, err
++	}
++
++	currentSchool := i.createSchoolModelFromLDAP(e)
++	switch i.UpdateEducationSchoolOperation(school, *currentSchool) {
++	case tooManyValues:
++		return nil, fmt.Errorf("school name and school number cannot be updated in the same request")
++	case schoolUnchanged:
++		logger.Debug().Str("backend", "ldap").Msg("UpdateEducationSchool: Nothing changed")
++		return i.createSchoolModelFromLDAP(e), nil
++	case displayNameUpdated:
++		if err := i.updateDisplayName(ctx, e.DN, providedDisplayName); err != nil {
++			return nil, err
++		}
++	case schoolNumberUpdated:
++		if err := i.updateSchoolNumber(ctx, e.DN, schoolNumber); err != nil {
++			return nil, err
++		}
++	}
++
++	// Read	back school from LDAP
++	e, err = i.getSchoolByNumberOrID(i.getID(e))
++	if err != nil {
++		return nil, err
++	}
++	return i.createSchoolModelFromLDAP(e), nil
++}
++
+ // DeleteEducationSchool deletes a given school, identified by id
+ func (i *LDAP) DeleteEducationSchool(ctx context.Context, id string) error {
+ 	logger := i.logger.SubloggerWithRequestID(ctx)
+@@ -408,9 +543,9 @@ func (i *LDAP) createSchoolModelFromLDAP(e *ldap.Entry) *libregraph.EducationSch
+ 		return nil
+ 	}
+ 
+-	displayName := e.GetEqualFoldAttributeValue(i.educationConfig.schoolAttributeMap.displayName)
+-	id := e.GetEqualFoldAttributeValue(i.educationConfig.schoolAttributeMap.id)
+-	schoolNumber := e.GetEqualFoldAttributeValue(i.educationConfig.schoolAttributeMap.schoolNumber)
++	displayName := i.getDisplayName(e)
++	id := i.getID(e)
++	schoolNumber := i.getSchoolNumber(e)
+ 
+ 	if id != "" && displayName != "" && schoolNumber != "" {
+ 		school := libregraph.NewEducationSchool()
+@@ -422,3 +557,18 @@ func (i *LDAP) createSchoolModelFromLDAP(e *ldap.Entry) *libregraph.EducationSch
+ 	i.logger.Warn().Str("dn", e.DN).Str("id", id).Str("displayName", displayName).Str("schoolNumber", schoolNumber).Msg("Invalid School. Missing required attribute")
+ 	return nil
+ }
++
++func (i *LDAP) getSchoolNumber(e *ldap.Entry) string {
++	schoolNumber := e.GetEqualFoldAttributeValue(i.educationConfig.schoolAttributeMap.schoolNumber)
++	return schoolNumber
++}
++
++func (i *LDAP) getID(e *ldap.Entry) string {
++	id := e.GetEqualFoldAttributeValue(i.educationConfig.schoolAttributeMap.id)
++	return id
++}
++
++func (i *LDAP) getDisplayName(e *ldap.Entry) string {
++	displayName := e.GetEqualFoldAttributeValue(i.educationConfig.schoolAttributeMap.displayName)
++	return displayName
++}
+diff --git a/services/graph/pkg/identity/mocks/education_backend.go b/services/graph/pkg/identity/mocks/education_backend.go
+index 031510d3..772299ba 100644
+--- a/services/graph/pkg/identity/mocks/education_backend.go
++++ b/services/graph/pkg/identity/mocks/education_backend.go
+@@ -234,6 +234,29 @@ func (_m *EducationBackend) RemoveUserFromEducationSchool(ctx context.Context, s
+ 	return r0
+ }
+ 
++// UpdateEducationSchool provides a mock function with given fields: ctx, numberOrID, school
++func (_m *EducationBackend) UpdateEducationSchool(ctx context.Context, numberOrID string, school libregraph.EducationSchool) (*libregraph.EducationSchool, error) {
++	ret := _m.Called(ctx, numberOrID, school)
++
++	var r0 *libregraph.EducationSchool
++	if rf, ok := ret.Get(0).(func(context.Context, string, libregraph.EducationSchool) *libregraph.EducationSchool); ok {
++		r0 = rf(ctx, numberOrID, school)
++	} else {
++		if ret.Get(0) != nil {
++			r0 = ret.Get(0).(*libregraph.EducationSchool)
++		}
++	}
++
++	var r1 error
++	if rf, ok := ret.Get(1).(func(context.Context, string, libregraph.EducationSchool) error); ok {
++		r1 = rf(ctx, numberOrID, school)
++	} else {
++		r1 = ret.Error(1)
++	}
++
++	return r0, r1
++}
++
+ // UpdateEducationUser provides a mock function with given fields: ctx, nameOrID, user
+ func (_m *EducationBackend) UpdateEducationUser(ctx context.Context, nameOrID string, user libregraph.EducationUser) (*libregraph.EducationUser, error) {
+ 	ret := _m.Called(ctx, nameOrID, user)
+diff --git a/services/graph/pkg/service/v0/educationschools.go b/services/graph/pkg/service/v0/educationschools.go
+index c6b8b8c2..8ac3df94 100644
+--- a/services/graph/pkg/service/v0/educationschools.go
++++ b/services/graph/pkg/service/v0/educationschools.go
+@@ -112,24 +112,31 @@ func (g Graph) PatchEducationSchool(w http.ResponseWriter, r *http.Request) {
+ 	schoolID := chi.URLParam(r, "schoolID")
+ 	schoolID, err := url.PathUnescape(schoolID)
+ 	if err != nil {
+-		logger.Debug().Str("id", schoolID).Msg("could not change school: unescaping school id failed")
++		logger.Debug().Str("id", schoolID).Msg("could not update school: unescaping school id failed")
+ 		errorcode.InvalidRequest.Render(w, r, http.StatusBadRequest, "unescaping school id failed")
+ 		return
+ 	}
+ 
+ 	if schoolID == "" {
+-		logger.Debug().Msg("could not change school: missing school id")
++		logger.Debug().Msg("could not update school: missing school id")
+ 		errorcode.InvalidRequest.Render(w, r, http.StatusBadRequest, "missing school id")
+ 		return
+ 	}
+-	changes := libregraph.NewEducationSchool()
+-	err = json.NewDecoder(r.Body).Decode(changes)
++
++	school := libregraph.NewEducationSchool()
++	err = json.NewDecoder(r.Body).Decode(school)
+ 	if err != nil {
+-		logger.Debug().Err(err).Interface("body", r.Body).Msg("could not change school: invalid request body")
++		logger.Debug().Err(err).Interface("body", r.Body).Msg("could not update school: invalid request body")
+ 		errorcode.InvalidRequest.Render(w, r, http.StatusBadRequest, fmt.Sprintf("invalid request body: %s", err.Error()))
+ 		return
+ 	}
+ 
++	if school, err = g.identityEducationBackend.UpdateEducationSchool(r.Context(), schoolID, *school); err != nil {
++		logger.Debug().Err(err).Interface("school", school).Msg("could not update school: backend error")
++		errorcode.GeneralException.Render(w, r, http.StatusInternalServerError, err.Error())
++		return
++	}
++
+ 	/* TODO requires reva changes
+ 	e := events.SchoolFeatureChanged{SchoolID: schoolID}
+ 	if currentUser, ok := ctxpkg.ContextGetUser(r.Context()); ok {
+@@ -138,8 +145,8 @@ func (g Graph) PatchEducationSchool(w http.ResponseWriter, r *http.Request) {
+ 	g.publishEvent(e)
+ 	*/
+ 
+-	render.Status(r, http.StatusNoContent)
+-	render.NoContent(w, r)
++	render.Status(r, http.StatusOK)
++	render.JSON(w, r, school)
+ }
+ 
+ // GetEducationSchool implements the Service interface.

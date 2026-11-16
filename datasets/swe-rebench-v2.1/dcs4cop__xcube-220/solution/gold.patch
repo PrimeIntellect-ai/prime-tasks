@@ -1,0 +1,248 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 30b3bf37..fddbf17b 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -16,6 +16,10 @@
+ 
+ * CLI commands execute much faster now when invoked with the `--help` and `--info` options.
+ 
++### Fixes
++
++* `xcube resample` now correctly re-chunks its output. By default, chunking of the 
++  `time` dimension is set to one. (#212)
+ 
+ ### Incompatible changes
+ 
+diff --git a/xcube/cli/resample.py b/xcube/cli/resample.py
+index 58ade0a3..f73c273e 100644
+--- a/xcube/cli/resample.py
++++ b/xcube/cli/resample.py
+@@ -167,7 +167,7 @@ def _resample_in_time(input_path: str = None,
+                       methods: Sequence[str] = (DEFAULT_RESAMPLING_METHOD,),
+                       frequency: str = DEFAULT_RESAMPLING_FREQUENCY,
+                       offset: str = None,
+-                      base: str = DEFAULT_RESAMPLING_BASE,
++                      base: int = DEFAULT_RESAMPLING_BASE,
+                       interp_kind: str = DEFAULT_INTERPOLATION_KIND,
+                       tolerance: str = None,
+                       dry_run: bool = False,
+@@ -176,6 +176,7 @@ def _resample_in_time(input_path: str = None,
+     from xcube.core.dsio import open_cube
+     from xcube.core.dsio import write_cube
+     from xcube.core.resample import resample_in_time
++    from xcube.core.update import update_dataset_chunk_encoding
+ 
+     if not output_format:
+         output_format = guess_dataset_format(output_path)
+@@ -191,9 +192,15 @@ def _resample_in_time(input_path: str = None,
+                                   base=base,
+                                   interp_kind=interp_kind,
+                                   tolerance=tolerance,
++                                  time_chunk_size=1,
+                                   var_names=variables,
+                                   metadata=metadata)
+ 
++        agg_ds = update_dataset_chunk_encoding(agg_ds,
++                                               chunk_sizes={},
++                                               format_name=output_format,
++                                               in_place=True)
++
+         monitor(f'Writing resampled cube to {output_path!r}...')
+         if not dry_run:
+             write_cube(agg_ds, output_path, output_format, cube_asserted=True)
+diff --git a/xcube/core/chunk.py b/xcube/core/chunk.py
+index 7d74d653..327b2847 100644
+--- a/xcube/core/chunk.py
++++ b/xcube/core/chunk.py
+@@ -4,41 +4,24 @@ from typing import Dict, Tuple, Iterable
+ import numpy as np
+ import xarray as xr
+ 
+-from xcube.constants import FORMAT_NAME_ZARR, FORMAT_NAME_NETCDF4
++from xcube.core.update import update_dataset_chunk_encoding
+ 
+ 
+ def chunk_dataset(dataset: xr.Dataset,
+                   chunk_sizes: Dict[str, int] = None,
+                   format_name: str = None) -> xr.Dataset:
+     """
+-    Chunk dataset and update encodings for given format.
++    Chunk *dataset* using *chunk_sizes* and optionally update encodings for given *format_name*.
+ 
+     :param dataset: input dataset
+     :param chunk_sizes: mapping from dimension name to new chunk size
+-    :param format_name: format, e.g. "zarr" or "netcdf4"
+-    :return: the re-chunked dataset
++    :param format_name: optional format, e.g. "zarr" or "netcdf4"
++    :return: the (re)chunked dataset
+     """
+-    chunked_ds = dataset.chunk(chunks=chunk_sizes)
+-
+-    # Update encoding so writing of chunked_ds recognizes new chunks
+-    chunk_sizes_attr_name = None
+-    if format_name == FORMAT_NAME_ZARR:
+-        chunk_sizes_attr_name = "chunks"
+-    if format_name == FORMAT_NAME_NETCDF4:
+-        chunk_sizes_attr_name = "chunksizes"
+-    if chunk_sizes_attr_name:
+-        for var_name in chunked_ds.variables:
+-            var = chunked_ds[var_name]
+-            if chunk_sizes:
+-                sizes = tuple(chunk_sizes[dim_name] if dim_name in chunk_sizes
+-                              else var.shape[var.dims.index(dim_name)]
+-                              for dim_name in var.dims)
+-                var.encoding.update({chunk_sizes_attr_name: sizes})
+-            elif chunk_sizes_attr_name in var.encoding:
+-                # Remove any explicit and wrong specification so writing will use Dask chunks (TBC!)
+-                del var.encoding[chunk_sizes_attr_name]
+-
+-    return chunked_ds
++    dataset = dataset.chunk(chunks=chunk_sizes)
++    if format_name:
++        dataset = update_dataset_chunk_encoding(dataset, chunk_sizes=chunk_sizes, format_name=format_name)
++    return dataset
+ 
+ 
+ def get_empty_dataset_chunks(dataset: xr.Dataset) -> Dict[str, Tuple[Tuple[int, ...]]]:
+diff --git a/xcube/core/resample.py b/xcube/core/resample.py
+index 5b995407..9f353b1a 100644
+--- a/xcube/core/resample.py
++++ b/xcube/core/resample.py
+@@ -23,32 +23,44 @@ from typing import Dict, Any, Sequence, Union
+ 
+ import xarray as xr
+ 
++from xcube.core.schema import CubeSchema
+ from xcube.core.select import select_vars
++from xcube.core.verify import assert_cube
+ 
+ 
+ def resample_in_time(cube: xr.Dataset,
+                      frequency: str,
+                      method: Union[str, Sequence[str]],
+                      offset=None,
+-                     base: str = 0,
++                     base: int = 0,
+                      tolerance=None,
+                      interp_kind=None,
++                     time_chunk_size=None,
+                      var_names: Sequence[str] = None,
+-                     metadata: Dict[str, Any] = None):
++                     metadata: Dict[str, Any] = None,
++                     cube_asserted: bool = False) -> xr.Dataset:
+     """
+     Resample a xcube dataset in the time dimension.
+ 
+     :param cube: The xcube dataset.
+-    :param frequency: Resampling frequency.
++    :param frequency: Temporal aggregation frequency. Use format "<count><offset>"
++        "where <offset> is one of 'H', 'D', 'W', 'M', 'Q', 'Y'.
+     :param method: Resampling method or sequence of resampling methods.
+-    :param offset: Offset used to adjust the resampled time labels. Some pandas date offset strings are supported.
+-    :param base: Resampling method.
++    :param offset: Offset used to adjust the resampled time labels.
++        Uses same syntax as *frequency*.
++    :param base: For frequencies that evenly subdivide 1 day, the "origin" of the
++        aggregated intervals. For example, for '24H' frequency, base could range from 0 through 23.
++    :param time_chunk_size: If not None, the chunk size to be used for the "time" dimension.
+     :param var_names: Variable names to include.
+     :param tolerance: Time tolerance for selective upsampling methods. Defaults to *frequency*.
+     :param interp_kind: Kind of interpolation if *method* is 'interpolation'.
+     :param metadata: Output metadata.
++    :param cube_asserted: If False, *cube* will be verified, otherwise it is expected to be a valid cube.
+     :return: A new xcube dataset resampled in time.
+     """
++    if not cube_asserted:
++        assert_cube(cube)
++
+     if var_names:
+         cube = select_vars(cube, var_names)
+ 
+@@ -70,7 +82,8 @@ def resample_in_time(cube: xr.Dataset,
+         resampling_method = getattr(resampler, method)
+         kwargs = get_method_kwargs(method, frequency, interp_kind, tolerance)
+         resampled_cube = resampling_method(**kwargs)
+-        resampled_cube = resampled_cube.rename({var_name: f'{var_name}_{method}' for var_name in resampled_cube.data_vars})
++        resampled_cube = resampled_cube.rename(
++            {var_name: f'{var_name}_{method}' for var_name in resampled_cube.data_vars})
+         resampled_cubes.append(resampled_cube)
+ 
+     if len(resampled_cubes) == 1:
+@@ -86,7 +99,14 @@ def resample_in_time(cube: xr.Dataset,
+     # TODO: add other time_coverage_ attributes
+     resampled_cube.attrs.update(time_coverage_start=time_coverage_start,
+                                 time_coverage_end=time_coverage_end)
+-    return resampled_cube
++
++    schema = CubeSchema.new(cube)
++    chunk_sizes = {schema.dims[i]: schema.chunks[i] for i in range(schema.ndim)}
++
++    if isinstance(time_chunk_size, int) and time_chunk_size >= 0:
++        chunk_sizes['time'] = time_chunk_size
++
++    return resampled_cube.chunk(chunk_sizes)
+ 
+ 
+ def get_method_kwargs(method, frequency, interp_kind, tolerance):
+diff --git a/xcube/core/update.py b/xcube/core/update.py
+index f1b18be2..28bdb9a6 100644
+--- a/xcube/core/update.py
++++ b/xcube/core/update.py
+@@ -24,6 +24,8 @@ from typing import Any, Dict
+ 
+ import xarray as xr
+ 
++from xcube.constants import FORMAT_NAME_NETCDF4
++from xcube.constants import FORMAT_NAME_ZARR
+ from xcube.util.config import NameDictPairList
+ 
+ _LON_ATTRS_DATA = ('lon', 'lon_bnds', 'degrees_east',
+@@ -192,3 +194,48 @@ def update_dataset_var_attrs(dataset: xr.Dataset,
+             var.attrs.update(var_attrs)
+ 
+     return dataset
++
++
++def update_dataset_chunk_encoding(dataset: xr.Dataset,
++                                  chunk_sizes: Dict[str, int] = None,
++                                  format_name: str = None,
++                                  in_place: bool = False) -> xr.Dataset:
++    """
++    Update each variable's encoding in *dataset* with respect to *chunk_sizes*
++    so *dataset* is written in chunks for given *format_name*.
++
++    :param dataset: input dataset.
++    :param chunk_sizes: the chunk sizes to be used for the encoding.
++        If None, any chunking encoding is removed.
++    :param format_name: format name, e.g. "zarr" or "netcdf4".
++    :param in_place: If ``True``, *dataset* will be modified in place and returned.
++    """
++    if format_name == FORMAT_NAME_ZARR:
++        chunk_sizes_attr_name = "chunks"
++    elif format_name == FORMAT_NAME_NETCDF4:
++        chunk_sizes_attr_name = "chunksizes"
++    else:
++        return dataset
++    if not in_place:
++        dataset = dataset.copy()
++    for var_name in dataset.variables:
++        var = dataset[var_name]
++        if chunk_sizes is not None:
++            def get_size(i):
++                dim_name = var.dims[i]
++                size = chunk_sizes.get(dim_name)
++                if isinstance(size, int):
++                    return size
++                if var.chunks:
++                    size = var.chunks[i]
++                    if isinstance(size, int):
++                        return size
++                    if len(size):
++                        return size[0]
++                return var.shape[i]
++
++            var.encoding.update({chunk_sizes_attr_name: tuple(map(get_size, range(var.ndim)))})
++        elif chunk_sizes_attr_name in var.encoding:
++            # Remove any explicit and possibly unintended specification
++            del var.encoding[chunk_sizes_attr_name]
++    return dataset

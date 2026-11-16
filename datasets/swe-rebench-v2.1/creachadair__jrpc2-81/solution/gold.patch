@@ -1,0 +1,401 @@
+diff --git a/client.go b/client.go
+index 339c9ff..b0f6655 100644
+--- a/client.go
++++ b/client.go
+@@ -6,7 +6,6 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+-	"fmt"
+ 	"io"
+ 	"strconv"
+ 	"sync"
+@@ -150,22 +149,18 @@ func (c *Client) deliver(rsp *jmessage) {
+ 	}
+ 
+ 	id := string(fixID(rsp.ID))
+-	if p := c.pending[id]; p == nil {
++	p := c.pending[id]
++	if p == nil {
+ 		c.log("Discarding response for unknown ID %q", id)
+-	} else if !c.versionOK(rsp.V) {
+-		delete(c.pending, id)
+-		p.ch <- &jmessage{
+-			ID: rsp.ID,
+-			E: &Error{
+-				Code:    code.InvalidRequest,
+-				Message: fmt.Sprintf("incorrect version marker %q", rsp.V),
+-			},
+-		}
++		return
++	}
++	// Remove the pending request from the set and deliver its response.
++	// Determining whether it's an error is the caller's responsibility.
++	delete(c.pending, id)
++	if rsp.err != nil {
++		p.ch <- &jmessage{ID: rsp.ID, E: rsp.err}
+ 		c.log("Invalid response for ID %q", id)
+ 	} else {
+-		// Remove the pending request from the set and deliver its response.
+-		// Determining whether it's an error is the caller's responsibility.
+-		delete(c.pending, id)
+ 		p.ch <- rsp
+ 		c.log("Completed request for ID %q", id)
+ 	}
+@@ -422,8 +417,6 @@ func (c *Client) stop(err error) {
+ 	c.ch = nil
+ }
+ 
+-func (c *Client) versionOK(v string) bool { return v == Version }
+-
+ // marshalParams validates and marshals params to JSON for a request.  The
+ // value of params must be either nil or encodable as a JSON object or array.
+ func (c *Client) marshalParams(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+diff --git a/error.go b/error.go
+index 7e95246..67bb443 100644
+--- a/error.go
++++ b/error.go
+@@ -61,6 +61,9 @@ var errEmptyBatch = &Error{Code: code.InvalidRequest, Message: "empty request ba
+ // errInvalidParams is the error reported for invalid request parameters.
+ var errInvalidParams = &Error{Code: code.InvalidParams, Message: code.InvalidParams.String()}
+ 
++// errTaskNotExecuted is the internal sentinel error for an unassigned task.
++var errTaskNotExecuted = new(Error)
++
+ // ErrConnClosed is returned by a server's push-to-client methods if they are
+ // called after the client connection is closed.
+ var ErrConnClosed = errors.New("client connection is closed")
+diff --git a/jhttp/bridge.go b/jhttp/bridge.go
+index f637e24..2d627dc 100644
+--- a/jhttp/bridge.go
++++ b/jhttp/bridge.go
+@@ -40,7 +40,7 @@ import (
+ // headers. Use jhttp.HTTPRequest to retrieve the request from the context.
+ type Bridge struct {
+ 	local    server.Local
+-	parseReq func(*http.Request) ([]*jrpc2.Request, error)
++	parseReq func(*http.Request) ([]*jrpc2.ParsedRequest, error)
+ 	getter   *Getter
+ }
+ 
+@@ -77,12 +77,8 @@ func (b Bridge) serveInternal(w http.ResponseWriter, req *http.Request) error {
+ 	// The HTTP request requires a response, but the server will not reply if
+ 	// all the requests are notifications. Check whether we have any calls
+ 	// needing a response, and choose whether to wait for a reply based on that.
+-	//
+-	// Note that we are forgiving about a missing version marker in a request,
+-	// since we can't tell at this point whether the server is willing to accept
+-	// messages like that.
+ 	jreq, err := b.parseHTTPRequest(req)
+-	if err != nil && err != jrpc2.ErrInvalidVersion {
++	if err != nil {
+ 		return err
+ 	}
+ 
+@@ -93,50 +89,67 @@ func (b Bridge) serveInternal(w http.ResponseWriter, req *http.Request) error {
+ 	// To do this, we keep track of the inbound ID for each request so that we
+ 	// can map the responses back. This takes advantage of the fact that the
+ 	// *jrpc2.Client detangles batch order so that responses come back in the
+-	// same order (modulo notifications) even if the server response did not
++	// same order (omitting notifications) even if the server response did not
+ 	// preserve order.
++	//
++	// Requests that are already known to be invalid are converted to error
++	// responses directly. Besides preventing the server from doing the same
++	// error check a second time, this avoids the issue that a remapped ID may
++	// obcure an invalid request ID (see #80).
++	var results []json.RawMessage
+ 
+ 	// Generate request specifications for the client.
+-	var inboundID []string                // for requests
+-	spec := make([]jrpc2.Spec, len(jreq)) // requests & notifications
+-	for i, req := range jreq {
+-		spec[i] = jrpc2.Spec{
+-			Method: req.Method(),
+-			Notify: req.IsNotification(),
++	var inboundID []string // for calls
++	var spec []jrpc2.Spec  // requests & notifications
++	for _, req := range jreq {
++		if req.Error != nil {
++			// Filter out statically invalid requests.
++			msg, err := marshalError(req)
++			if err != nil {
++				return err
++			}
++			results = append(results, msg)
++			continue
+ 		}
+-		if req.HasParams() {
+-			var p json.RawMessage
+-			req.UnmarshalParams(&p)
+-			spec[i].Params = p
+-		}
+-		if !spec[i].Notify {
+-			inboundID = append(inboundID, req.ID())
++
++		spec = append(spec, jrpc2.Spec{
++			Method: req.Method,
++			Notify: req.ID == "",
++			Params: req.Params,
++		})
++		if req.ID != "" {
++			inboundID = append(inboundID, req.ID)
+ 		}
+ 	}
+ 
+-	// Attach the HTTP request to the client context, so the encoder can see it.
+-	ctx := context.WithValue(req.Context(), httpReqKey{}, req)
+-	rsps, err := b.local.Client.Batch(ctx, spec)
+-	if err != nil {
+-		return err
++	if len(spec) != 0 {
++		// Attach the HTTP request to the client context, so the encoder can see it.
++		ctx := context.WithValue(req.Context(), httpReqKey{}, req)
++		rsps, err := b.local.Client.Batch(ctx, spec)
++		if err != nil {
++			return err
++		}
++		for i, rsp := range rsps {
++			// Map the responses back to their original IDs and marshal to JSON.
++			rsp.SetID(inboundID[i])
++			msg, err := json.Marshal(rsp)
++			if err != nil {
++				return err
++			}
++			results = append(results, msg)
++		}
+ 	}
+ 
+-	// If all the requests were notifications, report success without responses.
+-	if len(rsps) == 0 {
++	// If all the requests were notifications and there were no invalid ones,
++	// report success without responses.
++	if len(results) == 0 {
+ 		w.WriteHeader(http.StatusNoContent)
+ 		return nil
+ 	}
+-
+-	// Otherwise, map the responses back to their original IDs, and marshal the
+-	// response back into the body.
+-	for i, rsp := range rsps {
+-		rsp.SetID(inboundID[i])
+-	}
+-
+-	return b.encodeResponses(rsps, w)
++	return b.encodeResponses(results, w)
+ }
+ 
+-func (b Bridge) parseHTTPRequest(req *http.Request) ([]*jrpc2.Request, error) {
++func (b Bridge) parseHTTPRequest(req *http.Request) ([]*jrpc2.ParsedRequest, error) {
+ 	if b.parseReq != nil {
+ 		return b.parseReq(req)
+ 	}
+@@ -147,7 +160,7 @@ func (b Bridge) parseHTTPRequest(req *http.Request) ([]*jrpc2.Request, error) {
+ 	return jrpc2.ParseRequests(body)
+ }
+ 
+-func (b Bridge) encodeResponses(rsps []*jrpc2.Response, w http.ResponseWriter) error {
++func (b Bridge) encodeResponses(rsps []json.RawMessage, w http.ResponseWriter) error {
+ 	// If there is only a single reply, send it alone; otherwise encode a batch.
+ 	// Per the spec (https://www.jsonrpc.org/specification#batch), this is OK;
+ 	// we are not required to respond to a batch with an array:
+@@ -155,11 +168,11 @@ func (b Bridge) encodeResponses(rsps []*jrpc2.Response, w http.ResponseWriter) e
+ 	//   The Server SHOULD respond with an Array containing the corresponding
+ 	//   Response objects
+ 	//
+-	data, err := marshalResponses(rsps)
+-	if err != nil {
+-		return err
++	if len(rsps) == 1 {
++		writeJSON(w, http.StatusOK, rsps[0])
++	} else {
++		writeJSON(w, http.StatusOK, rsps)
+ 	}
+-	writeJSON(w, http.StatusOK, json.RawMessage(data))
+ 	return nil
+ }
+ 
+@@ -215,7 +228,7 @@ type BridgeOptions struct {
+ 	//
+ 	// Setting this hook disables the default requirement that the request
+ 	// method be POST and the content-type be application/json.
+-	ParseRequest func(*http.Request) ([]*jrpc2.Request, error)
++	ParseRequest func(*http.Request) ([]*jrpc2.ParsedRequest, error)
+ 
+ 	// If non-nil, this function is used to parse a JSON-RPC method name and
+ 	// parameters from the URL of an HTTP GET request. If this function reports
+@@ -241,7 +254,7 @@ func (o *BridgeOptions) serverOptions() *jrpc2.ServerOptions {
+ 	return o.Server
+ }
+ 
+-func (o *BridgeOptions) parseRequest() func(*http.Request) ([]*jrpc2.Request, error) {
++func (o *BridgeOptions) parseRequest() func(*http.Request) ([]*jrpc2.ParsedRequest, error) {
+ 	if o == nil {
+ 		return nil
+ 	}
+@@ -267,10 +280,17 @@ func HTTPRequest(ctx context.Context) *http.Request {
+ 	return nil
+ }
+ 
+-// marshalResponses encodes a batch of JSON-RPC responses into JSON.
+-func marshalResponses(rsps []*jrpc2.Response) ([]byte, error) {
+-	if len(rsps) == 1 {
+-		return json.Marshal(rsps[0])
++// marshalError encodes an error response for an invalid request.
++func marshalError(req *jrpc2.ParsedRequest) ([]byte, error) {
++	v, err := json.Marshal(req.Error)
++	if err != nil {
++		return nil, err
++	}
++
++	// If the ID is empty, set the response ID to null.
++	id := req.ID
++	if id == "" {
++		id = "null"
+ 	}
+-	return json.Marshal(rsps)
++	return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":%s}`, id, string(v))), nil
+ }
+diff --git a/json.go b/json.go
+index 141de86..83f0e0e 100644
+--- a/json.go
++++ b/json.go
+@@ -9,35 +9,37 @@ import (
+ 	"github.com/creachadair/jrpc2/code"
+ )
+ 
+-// ErrInvalidVersion is returned by ParseRequests if one or more of the
+-// requests in the input has a missing or invalid version marker.
+-var ErrInvalidVersion error = &Error{Code: code.InvalidRequest, Message: "incorrect version marker"}
+-
+ // ParseRequests parses a single request or a batch of requests from JSON.
+-//
+-// If msg is syntactically valid apart from one or more of the requests having
+-// a missing or invalid JSON-RPC version, ParseRequests returns ErrInvalidVersion
+-// along with the parsed results.
+-func ParseRequests(msg []byte) ([]*Request, error) {
+-	var req jmessages
+-	if err := req.parseJSON(msg); err != nil {
++// This function reports an error only if msg is not valid JSON. The caller
++// must check the individual results for their validity.
++func ParseRequests(msg []byte) ([]*ParsedRequest, error) {
++	var reqs jmessages
++	if err := reqs.parseJSON(msg); err != nil {
+ 		return nil, err
+ 	}
+ 	var err error
+-	out := make([]*Request, len(req))
+-	for i, req := range req {
+-		if req.V != Version {
+-			err = ErrInvalidVersion
+-		}
+-		out[i] = &Request{
+-			id:     fixID(req.ID),
+-			method: req.M,
+-			params: req.P,
++	out := make([]*ParsedRequest, len(reqs))
++	for i, req := range reqs {
++		out[i] = &ParsedRequest{
++			ID:     string(fixID(req.ID)),
++			Method: req.M,
++			Params: req.P,
++			Error:  req.err,
+ 		}
+ 	}
+ 	return out, err
+ }
+ 
++// A ParsedRequest is the parsed form of a request message. If a request is
++// valid, its Error field is nil. Otherwise, the Error field describes why the
++// request is invalid, and the other fields may be incomplete or missing.
++type ParsedRequest struct {
++	ID     string
++	Method string
++	Params json.RawMessage
++	Error  *Error
++}
++
+ // jmessages is either a single protocol message or an array of protocol
+ // messages.  This handles the decoding of batch requests in JSON-RPC 2.0.
+ type jmessages []*jmessage
+@@ -111,8 +113,8 @@ type jmessage struct {
+ 	// and R. Specifically, if M != "" then E and R must both be unset. This is
+ 	// checked during parsing.
+ 
+-	batch bool  // this message was part of a batch
+-	err   error // if not nil, this message is invalid and err is why
++	batch bool   // this message was part of a batch
++	err   *Error // if not nil, this message is invalid and err is why
+ }
+ 
+ // isValidID reports whether v is a valid JSON encoding of a request ID.
+@@ -129,8 +131,13 @@ func isValidID(v json.RawMessage) bool {
+ 	return false // anything else is garbage
+ }
+ 
++// isValidVersion reports whether v is a valid JSON-RPC version string.
++func isValidVersion(v string) bool { return v == Version }
++
+ func (j *jmessage) fail(code code.Code, msg string) {
+-	j.err = &Error{Code: code, Message: msg}
++	if j.err == nil {
++		j.err = &Error{Code: code, Message: msg}
++	}
+ }
+ 
+ func (j *jmessage) toJSON() ([]byte, error) {
+@@ -221,6 +228,11 @@ func (j *jmessage) parseJSON(data []byte) error {
+ 		}
+ 	}
+ 
++	// Report an error for an invalid version marker
++	if !isValidVersion(j.V) {
++		j.fail(code.InvalidRequest, "invalid version marker")
++	}
++
+ 	// Report an error if request/response fields overlap.
+ 	if j.M != "" && (j.E != nil || j.R != nil) {
+ 		j.fail(code.InvalidRequest, "mixed request and reply fields")
+diff --git a/server.go b/server.go
+index 837d6f7..f4d275a 100644
+--- a/server.go
++++ b/server.go
+@@ -283,17 +283,13 @@ func (s *Server) checkAndAssign(next jmessages) tasks {
+ 
+ 	// Phase 1: Check for errors and duplicate request IDs.
+ 	for _, req := range next {
+-		if req.err != nil {
+-			// keep the existing error
+-		} else if !s.versionOK(req.V) {
+-			req.err = ErrInvalidVersion
+-		}
+-
+ 		fid := fixID(req.ID)
+ 		t := &task{
+ 			hreq:  &Request{id: fid, method: req.M, params: req.P},
+ 			batch: req.batch,
+-			err:   req.err,
++		}
++		if req.err != nil {
++			t.err = req.err
+ 		}
+ 		id := string(fid)
+ 		if old := dup[id]; old != nil {
+@@ -749,8 +745,6 @@ func (s *Server) cancel(id string) bool {
+ 	return ok
+ }
+ 
+-func (s *Server) versionOK(v string) bool { return v == Version }
+-
+ // A task represents a pending method invocation received by the server.
+ type task struct {
+ 	m Handler // the assigned handler (after assignment)
+@@ -787,7 +781,7 @@ func (ts tasks) responses(rpcLog RPCLogger) jmessages {
+ 		}
+ 		if task.m == nil {
+ 			// No method was ever assigned for this task, so it was never run.
+-			rsp.err = errors.New("task not executed")
++			rsp.err = errTaskNotExecuted
+ 		}
+ 		if task.err == nil {
+ 			rsp.R = task.val

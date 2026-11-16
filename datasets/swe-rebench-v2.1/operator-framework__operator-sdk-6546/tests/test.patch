@@ -1,0 +1,264 @@
+diff --git a/internal/helm/controller/reconcile_test.go b/internal/helm/controller/reconcile_test.go
+index c26c3b23..4639b247 100644
+--- a/internal/helm/controller/reconcile_test.go
++++ b/internal/helm/controller/reconcile_test.go
+@@ -15,11 +15,31 @@
+ package controller
+ 
+ import (
++	"context"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"helm.sh/helm/v3/pkg/action"
++	"helm.sh/helm/v3/pkg/chart/loader"
++	"helm.sh/helm/v3/pkg/chartutil"
++	"helm.sh/helm/v3/pkg/kube"
++	kubefake "helm.sh/helm/v3/pkg/kube/fake"
++	rpb "helm.sh/helm/v3/pkg/release"
++	"helm.sh/helm/v3/pkg/storage"
++	"helm.sh/helm/v3/pkg/storage/driver"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/client-go/tools/record"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	"github.com/operator-framework/operator-sdk/internal/helm/release"
+ )
+ 
+ func TestDetermineReconcilePeriod(t *testing.T) {
+@@ -190,3 +210,149 @@ func annotations(m map[string]interface{}) *unstructured.Unstructured {
+ 		},
+ 	}
+ }
++
++// noStatusClient wraps a client.Client and ignores status subresource writes.
++// The reconciler stores a typed status struct on the unstructured object, which
++// the fake client cannot deep copy.
++type noStatusClient struct {
++	client.Client
++}
++
++func (c noStatusClient) Status() client.SubResourceWriter { return noStatusWriter{} }
++
++type noStatusWriter struct{}
++
++func (noStatusWriter) Create(context.Context, client.Object, client.Object, ...client.SubResourceCreateOption) error {
++	return nil
++}
++
++func (noStatusWriter) Update(context.Context, client.Object, ...client.SubResourceUpdateOption) error {
++	return nil
++}
++
++func (noStatusWriter) Patch(context.Context, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
++	return nil
++}
++
++// recordingKubeClient records the force flag passed to each Update call so a
++// test can observe how a rollback was performed.
++type recordingKubeClient struct {
++	kubefake.FailingKubeClient
++	updateForces []bool
++}
++
++func (c *recordingKubeClient) Update(current, target kube.ResourceList, force bool) (*kube.Result, error) {
++	c.updateForces = append(c.updateForces, force)
++	return c.FailingKubeClient.Update(current, target, force)
++}
++
++// fakeActionConfigGetter always returns the same action configuration.
++type fakeActionConfigGetter struct {
++	cfg *action.Configuration
++}
++
++func (f fakeActionConfigGetter) ActionConfigFor(client.Object) (*action.Configuration, error) {
++	return f.cfg, nil
++}
++
++// TestReconcileRollsBackFailedUpgrade drives a real Helm release manager through
++// Reconcile and verifies that a failed upgrade results in a rollback whose force
++// flag follows the helm.sdk.operatorframework.io/rollback-force annotation.
++func TestReconcileRollsBackFailedUpgrade(t *testing.T) {
++	gvk := schema.GroupVersionKind{Group: "example.com", Version: "v1alpha1", Kind: "Memcached"}
++
++	chartDir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(chartDir, "Chart.yaml"),
++		[]byte("apiVersion: v2\nname: test\nversion: 0.1.0\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Join(chartDir, "templates"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(chartDir, "templates", "cm.yaml"),
++		[]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	chart, err := loader.LoadDir(chartDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	tests := []struct {
++		name        string
++		annotations map[string]string
++		wantForce   bool
++	}{
++		{
++			name:        "rolls back with force by default",
++			annotations: nil,
++			wantForce:   true,
++		},
++		{
++			name:        "rolls back without force when annotation is false",
++			annotations: map[string]string{"helm.sdk.operatorframework.io/rollback-force": "false"},
++			wantForce:   false,
++		},
++		{
++			name:        "rolls back with force when annotation is invalid",
++			annotations: map[string]string{"helm.sdk.operatorframework.io/rollback-force": "not-a-boolean"},
++			wantForce:   true,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			store := storage.Init(driver.NewMemory())
++			kc := &recordingKubeClient{}
++			kc.Out = io.Discard
++			cfg := &action.Configuration{
++				Releases:     store,
++				KubeClient:   kc,
++				Capabilities: chartutil.DefaultCapabilities,
++				Log:          func(string, ...interface{}) {},
++			}
++
++			cr := &unstructured.Unstructured{}
++			cr.SetGroupVersionKind(gvk)
++			cr.SetNamespace("ns")
++			cr.SetName("sample")
++			cr.SetFinalizers([]string{uninstallFinalizer})
++			cr.SetAnnotations(tc.annotations)
++			cr.Object["spec"] = map[string]interface{}{"size": int64(1)}
++
++			// Seed a deployed release so the upgrade has something to upgrade.
++			if err := store.Create(&rpb.Release{
++				Name:      "sample",
++				Namespace: "ns",
++				Version:   1,
++				Info:      &rpb.Info{Status: rpb.StatusDeployed},
++				Chart:     chart,
++				Config:    map[string]interface{}{},
++				Manifest:  "",
++			}); err != nil {
++				t.Fatal(err)
++			}
++
++			// Make the upgrade fail after the release has been recorded.
++			kc.UpdateError = errors.New("upgrade failed")
++
++			cl := noStatusClient{Client: fake.NewClientBuilder().WithObjects(cr).Build()}
++			r := HelmOperatorReconciler{
++				Client:         cl,
++				EventRecorder:  record.NewFakeRecorder(10),
++				GVK:            gvk,
++				ManagerFactory: release.NewManagerFactory(nil, fakeActionConfigGetter{cfg: cfg}, chartDir),
++			}
++
++			_, _ = r.Reconcile(context.Background(), reconcile.Request{
++				NamespacedName: client.ObjectKey{Namespace: "ns", Name: "sample"},
++			})
++
++			if assert.NotEmpty(t, kc.updateForces,
++				"the release update should expose the force option") {
++				assert.Equal(t, tc.wantForce, kc.updateForces[len(kc.updateForces)-1],
++					"the rollback force should follow the rollback-force annotation")
++			}
++		})
++	}
++}
+diff --git a/testdata/ansible/memcached-operator/Makefile b/testdata/ansible/memcached-operator/Makefile
+index 8f7a290a..21e47735 100644
+--- a/testdata/ansible/memcached-operator/Makefile
++++ b/testdata/ansible/memcached-operator/Makefile
+@@ -48,7 +48,7 @@ endif
+ 
+ # Set the Operator SDK version to use. By default, what is installed on the system is used.
+ # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
+-OPERATOR_SDK_VERSION ?= v1.30.0
++OPERATOR_SDK_VERSION ?= v1.31.0
+ 
+ # Image URL to use all building/pushing image targets
+ IMG ?= controller:latest
+diff --git a/testdata/go/v3/memcached-operator/Makefile b/testdata/go/v3/memcached-operator/Makefile
+index 456e32ea..8cfc9f6c 100644
+--- a/testdata/go/v3/memcached-operator/Makefile
++++ b/testdata/go/v3/memcached-operator/Makefile
+@@ -48,7 +48,7 @@ endif
+ 
+ # Set the Operator SDK version to use. By default, what is installed on the system is used.
+ # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
+-OPERATOR_SDK_VERSION ?= v1.30.0
++OPERATOR_SDK_VERSION ?= v1.31.0
+ 
+ # Image URL to use all building/pushing image targets
+ IMG ?= controller:latest
+diff --git a/testdata/go/v3/monitoring/memcached-operator/Makefile b/testdata/go/v3/monitoring/memcached-operator/Makefile
+index 97eb0676..42aaf68a 100644
+--- a/testdata/go/v3/monitoring/memcached-operator/Makefile
++++ b/testdata/go/v3/monitoring/memcached-operator/Makefile
+@@ -48,7 +48,7 @@ endif
+ 
+ # Set the Operator SDK version to use. By default, what is installed on the system is used.
+ # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
+-OPERATOR_SDK_VERSION ?= v1.30.0
++OPERATOR_SDK_VERSION ?= v1.31.0
+ 
+ # Image URL to use all building/pushing image targets
+ IMG ?= controller:latest
+diff --git a/testdata/go/v4-alpha/memcached-operator/Makefile b/testdata/go/v4-alpha/memcached-operator/Makefile
+index 54ca3963..a7cce76d 100644
+--- a/testdata/go/v4-alpha/memcached-operator/Makefile
++++ b/testdata/go/v4-alpha/memcached-operator/Makefile
+@@ -48,7 +48,7 @@ endif
+ 
+ # Set the Operator SDK version to use. By default, what is installed on the system is used.
+ # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
+-OPERATOR_SDK_VERSION ?= v1.30.0
++OPERATOR_SDK_VERSION ?= v1.31.0
+ 
+ # Image URL to use all building/pushing image targets
+ IMG ?= controller:latest
+diff --git a/testdata/go/v4-alpha/monitoring/memcached-operator/Makefile b/testdata/go/v4-alpha/monitoring/memcached-operator/Makefile
+index b7893952..7c598cd3 100644
+--- a/testdata/go/v4-alpha/monitoring/memcached-operator/Makefile
++++ b/testdata/go/v4-alpha/monitoring/memcached-operator/Makefile
+@@ -48,7 +48,7 @@ endif
+ 
+ # Set the Operator SDK version to use. By default, what is installed on the system is used.
+ # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
+-OPERATOR_SDK_VERSION ?= v1.30.0
++OPERATOR_SDK_VERSION ?= v1.31.0
+ 
+ # Image URL to use all building/pushing image targets
+ IMG ?= controller:latest
+diff --git a/testdata/helm/memcached-operator/Makefile b/testdata/helm/memcached-operator/Makefile
+index 7f51daee..51efb063 100644
+--- a/testdata/helm/memcached-operator/Makefile
++++ b/testdata/helm/memcached-operator/Makefile
+@@ -48,7 +48,7 @@ endif
+ 
+ # Set the Operator SDK version to use. By default, what is installed on the system is used.
+ # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
+-OPERATOR_SDK_VERSION ?= v1.30.0
++OPERATOR_SDK_VERSION ?= v1.31.0
+ 
+ # Image URL to use all building/pushing image targets
+ IMG ?= controller:latest

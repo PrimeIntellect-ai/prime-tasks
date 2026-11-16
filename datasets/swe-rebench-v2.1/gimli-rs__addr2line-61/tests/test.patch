@@ -1,0 +1,268 @@
+diff --git a/tests/integration_test.rs b/tests/integration_test.rs
+index 612114a..483c260 100644
+--- a/tests/integration_test.rs
++++ b/tests/integration_test.rs
+@@ -1,6 +1,8 @@
+ extern crate addr2line;
+ extern crate itertools;
+ 
++use std::borrow::Cow;
++use std::collections::{HashMap, HashSet};
+ use std::env;
+ use std::path::{self, PathBuf};
+ use std::process;
+@@ -9,6 +11,28 @@ use std::io::BufReader;
+ use std::thread;
+ use itertools::Itertools;
+ 
++/// The file component of a location, which may be optional or a plain path
++/// (an empty path means that no file is known).
++trait FileComponent {
++    fn to_file_str(&self) -> Option<Cow<str>>;
++}
++
++impl FileComponent for Option<PathBuf> {
++    fn to_file_str(&self) -> Option<Cow<str>> {
++        self.as_ref().map(|f| f.to_string_lossy())
++    }
++}
++
++impl FileComponent for PathBuf {
++    fn to_file_str(&self) -> Option<Cow<str>> {
++        if self.as_os_str().is_empty() {
++            None
++        } else {
++            Some(self.to_string_lossy())
++        }
++    }
++}
++
+ fn self_path() -> (PathBuf, PathBuf) {
+     let path = env::current_exe().unwrap();
+     let mut debug = path.clone();
+@@ -64,7 +88,10 @@ fn identity_map((target, debug): (PathBuf, PathBuf)) {
+     let mappings = get_test_addresses(target.as_path());
+ 
+     // Parse the debug symbols using "our" addr2line
+-    let mut ours = addr2line::Mapping::new(&debug).unwrap();
++    let mut ours = addr2line::Options::default()
++        .with_symbol_table()
++        .build(&debug)
++        .unwrap();
+ 
+     // Spin up the "real" addr2line
+     let theirs = spawn_oracle(target.as_path(), &[], mappings.clone());
+@@ -72,7 +99,6 @@ fn identity_map((target, debug): (PathBuf, PathBuf)) {
+ 
+     // Go through addresses one by one, and check that we get the same answer as addr2line does.
+     let mut all = 0;
+-    let mut excusable = 0;
+     let mut got = 0;
+     for addr in mappings {
+         // Read the oracle ouput
+@@ -84,42 +110,37 @@ fn identity_map((target, debug): (PathBuf, PathBuf)) {
+         let loc = loc.expect("debug symbols for test binary should be error-free");
+         if let Some((file, lineno, _)) = loc {
+             // We dared to guess -- did we give the right answer?
+-            let mut file = file.to_string_lossy();
++            let mut file = file.to_file_str();
+             if cfg!(target_os = "macos") {
+                 use std::borrow::Cow;
+                 // atos doesn't include the full path, just file name
+-                let f = path::PathBuf::from(&*file);
+-                file = Cow::Owned(f.file_name().unwrap().to_string_lossy().into_owned());
++                file = file.map(|f| {
++                    let f = path::PathBuf::from(&*f);
++                    Cow::Owned(f.file_name().unwrap().to_string_lossy().into_owned())
++                });
+             }
++            let file = file.as_ref().map(Cow::as_ref);
++            let test = (file, lineno);
+ 
+-            all += 1;
+             if oracle.0.is_none() && lineno.is_none() {
+                 // This can happen for the main() wrapper.
+-                println!("we found 0x{:08x}: {}:??", addr, file);
+-                excusable += 1;
++                println!("we found 0x{:08x}: {}:?", addr, file.unwrap_or("??"));
+             } else {
+-                assert_eq!((addr, oracle), (addr, (Some(&*file), lineno)));
++                assert_eq!((addr, oracle), (addr, test));
++                all += 1;
+                 got += 1;
+             }
+         } else if oracle.0.is_some() {
+             // addr2line found something, and we didn't :(
+             println!("we missed 0x{:08x}: {:?}", addr, oracle);
+             all += 1;
+-            if oracle.1.is_none() {
+-                excusable += 1;
+-            }
+         } else {
+             // addr2line did not find a source file, so it's okay that we didn't either.
+         }
+     }
+ 
+     assert_ne!(got, 0);
+-    println!(
+-        "resolved {}/{} addresses ({} file-only misses)",
+-        got,
+-        all,
+-        excusable
+-    );
++    println!("resolved {}/{} addresses", got, all,);
+ }
+ 
+ #[cfg(not(target_os = "macos"))]
+@@ -132,6 +153,7 @@ fn with_functions((target, debug): (PathBuf, PathBuf)) {
+     // Parse the debug symbols using "our" addr2line
+     let mut ours = addr2line::Options::default()
+         .with_functions()
++        .with_symbol_table()
+         .build(&debug)
+         .unwrap();
+ 
+@@ -141,7 +163,6 @@ fn with_functions((target, debug): (PathBuf, PathBuf)) {
+ 
+     // Go through addresses one by one, and check that we get the same answer as addr2line does.
+     let mut all = 0;
+-    let mut excusable = 0;
+     let mut func_hits = 0;
+     let mut got = 0;
+     for addr in mappings {
+@@ -155,31 +176,34 @@ fn with_functions((target, debug): (PathBuf, PathBuf)) {
+         let loc = loc.expect("debug symbols for test binary should be error-free");
+         if let Some((file, lineno, func)) = loc {
+             // We dared to guess -- did we give the right answer?
+-            let f = &*file.to_string_lossy();
+-            let test = (Some(f), lineno);
++            let file = file.to_file_str();
++            let file = file.as_ref().map(Cow::as_ref);
++            let test = (file, lineno);
+ 
+             all += 1;
+-            if oracle.0.is_none() && lineno.is_none() {
++            if oracle.0.is_none() && file.is_some() && lineno.is_none() {
+                 // This can happen for the main() wrapper.
+-                println!("we found 0x{:08x}: {}", addr, f);
+-                excusable += 1;
++                println!(
++                    "we found 0x{:08x}: {}:? {:?}",
++                    addr,
++                    file.unwrap_or("??"),
++                    func
++                );
+             } else {
+-                assert_eq!(oracle, test);
+-
+-                if let Some(func) = func {
+-                    // We even tried to guess the function!
+-                    assert_eq!(function, func);
+-                    func_hits += 1;
+-                }
++                assert_eq!((addr, oracle), (addr, test));
+                 got += 1;
+             }
++
++            if let Some(func) = func {
++                // Multiple symbols can cover the same address, so the oracle
++                // may choose a different valid alias.
++                assert!(!func.is_empty());
++                func_hits += 1;
++            }
+         } else if oracle.0.is_some() {
+             // addr2line found something, and we didn't :(
+             println!("we missed 0x{:08x}: {:?}", addr, oracle);
+             all += 1;
+-            if oracle.1.is_none() {
+-                excusable += 1;
+-            }
+         } else {
+             // addr2line did not find a source file, so it's okay that we didn't either.
+         }
+@@ -188,10 +212,9 @@ fn with_functions((target, debug): (PathBuf, PathBuf)) {
+     assert_ne!(got, 0);
+     assert_ne!(func_hits, 0);
+     println!(
+-        "resolved {}/{} addresses ({} file-only misses, {} function hits)",
++        "resolved {}/{} addresses ({} function hits)",
+         got,
+         all,
+-        excusable,
+         func_hits
+     );
+ }
+@@ -308,3 +331,73 @@ fn canonicalize_oracle_output(line: &str) -> (Option<&str>, Option<u64>) {
+ 
+     oracle
+ }
++
++/// When `with_symbol_table` is enabled, an address that has no DWARF debug
++/// information must still resolve through the object file's symbol table.
++#[test]
++fn release_fixture_symbol_table_fallback() {
++    let (target, debug) = release_fixture_path();
++    let mappings = get_test_addresses(target.as_path());
++
++    // A mapping that only consults DWARF debug information.
++    let mut dwarf_only = addr2line::Options::default()
++        .with_functions()
++        .build(&debug)
++        .unwrap();
++
++    // A mapping that also falls back to the symbol table.
++    let mut with_symbols = addr2line::Options::default()
++        .with_functions()
++        .with_symbol_table()
++        .build(&debug)
++        .unwrap();
++
++    let symbol_names = text_symbol_names(target.as_path());
++    let mut fallback_hits = 0;
++    for addr in mappings {
++        // Addresses with no DWARF information resolve to `None` when the
++        // symbol table is not consulted.
++        if dwarf_only.locate(addr).unwrap().is_some() {
++            continue;
++        }
++
++        // With the symbol table enabled, the address must resolve to a
++        // location that carries the symbol's function name.
++        if let Some((_, _, func)) = with_symbols.locate(addr).unwrap() {
++            let func = func.expect("symbol-table fallback with function lookup has a name");
++            assert!(
++                symbol_names.get(&addr).map_or(false, |names| names.contains(func.as_ref())),
++                "fallback name {:?} for {:#x} is not a text symbol name",
++                func,
++                addr
++            );
++            fallback_hits += 1;
++        }
++    }
++
++    assert_ne!(fallback_hits, 0);
++}
++
++/// Obtain the names of text symbols, allowing aliases at the same address.
++fn text_symbol_names(target: &path::Path) -> HashMap<u64, HashSet<String>> {
++    let output = process::Command::new("/usr/bin/nm")
++        .arg(target)
++        .output()
++        .expect("failed to execute nm");
++    let mut names = HashMap::new();
++    for line in String::from_utf8_lossy(&output.stdout).lines() {
++        let mut fields = line.split_whitespace();
++        let address = match fields.next().and_then(|value| u64::from_str_radix(value, 16).ok()) {
++            Some(address) => address,
++            None => continue,
++        };
++        match fields.next() {
++            Some("T") | Some("t") => {}
++            _ => continue,
++        }
++        if let Some(name) = fields.next() {
++            names.entry(address).or_insert_with(HashSet::new).insert(name.to_owned());
++        }
++    }
++    names
++}

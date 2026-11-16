@@ -1,0 +1,285 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0df3fc6..5222b43 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,7 @@
+ - オブジェクトを添字で参照できるように（`object['index']`のように）
+ - 「エラー型（`error`）」を導入
+ - `Json:parse`がパース失敗時にエラー型の値を返すように
++- `let` で定義した変数が上書きできてしまうのを修正
+ 
+ # 0.15.0
+ - Mathを強化
+diff --git a/etc/aiscript.api.md b/etc/aiscript.api.md
+index f5c4ff0..18e1608 100644
+--- a/etc/aiscript.api.md
++++ b/etc/aiscript.api.md
+@@ -528,7 +528,8 @@ type InfixOperator = '||' | '&&' | '==' | '!=' | '<=' | '>=' | '<' | '>' | '+' |
+ 
+ // @public (undocumented)
+ export class Interpreter {
+-    constructor(vars: Record<string, Value>, opts?: {
++    // Warning: (ae-forgotten-export) The symbol "Variable" needs to be exported by the entry point index.d.ts
++    constructor(vars: Record<string, Variable>, opts?: {
+         in?(q: string): Promise<string>;
+         out?(value: Value): void;
+         log?(type: string, params: Record<string, any>): void;
+@@ -813,13 +814,13 @@ class RuntimeError extends AiScriptError {
+ // @public (undocumented)
+ export class Scope {
+     constructor(layerdStates?: Scope['layerdStates'], parent?: Scope, name?: Scope['name']);
+-    add(name: string, val: Value): void;
++    add(name: string, variable: Variable): void;
+     assign(name: string, val: Value): void;
+     // (undocumented)
+-    createChildScope(states?: Map<string, Value>, name?: Scope['name']): Scope;
++    createChildScope(states?: Map<string, Variable>, name?: Scope['name']): Scope;
+     exists(name: string): boolean;
+     get(name: string): Value;
+-    getAll(): Map<string, Value>;
++    getAll(): Map<string, Variable>;
+     // (undocumented)
+     name: string;
+     // (undocumented)
+diff --git a/src/interpreter/index.ts b/src/interpreter/index.ts
+index 11cc4f7..67d4ea4 100644
+--- a/src/interpreter/index.ts
++++ b/src/interpreter/index.ts
+@@ -11,6 +11,7 @@ import { NULL, RETURN, unWrapRet, FN_NATIVE, BOOL, NUM, STR, ARR, OBJ, FN, BREAK
+ import { getPrimProp } from './primitive-props.js';
+ import type { Value, VFn } from './value.js';
+ import type * as Ast from '../node.js';
++import { Variable } from './variable.js';
+ 
+ const IRQ_RATE = 300;
+ const IRQ_AT = IRQ_RATE - 1;
+@@ -22,7 +23,7 @@ export class Interpreter {
+ 	private abortHandlers: (() => void)[] = [];
+ 
+ 	constructor(
+-		private vars: Record<string, Value>,
++		private vars: Record<string, Variable>,
+ 		private opts: {
+ 			in?(q: string): Promise<string>;
+ 			out?(value: Value): void;
+@@ -31,20 +32,27 @@ export class Interpreter {
+ 		} = {},
+ 	) {
+ 		const io = {
+-			print: FN_NATIVE(([v]) => {
++			print: Variable.const(FN_NATIVE(([v]) => {
+ 				expectAny(v);
+ 				if (this.opts.out) this.opts.out(v);
+-			}),
+-			readline: FN_NATIVE(async args => {
++			})),
++			readline: Variable.const(FN_NATIVE(async args => {
+ 				const q = args[0];
+ 				assertString(q);
+ 				if (this.opts.in == null) return NULL;
+ 				const a = await this.opts.in!(q.value);
+ 				return STR(a);
+-			}),
++			})),
+ 		};
+ 
+-		this.vars = { ...vars, ...std, ...io };
++		this.vars = {
++			...vars,
++			...Object.fromEntries(
++				Object.entries(std)
++					.map(([k, v]) => [k, Variable.const(v)]),
++			),
++			...io,
++		};
+ 
+ 		this.scope = new Scope([new Map(Object.entries(this.vars))]);
+ 		this.scope.opts.log = (type, params): void => {
+@@ -142,9 +150,13 @@ export class Interpreter {
+ 		for (const node of ns.members) {
+ 			switch (node.type) {
+ 				case 'def': {
+-					const v = await this._eval(node.expr, scope);
+-					scope.add(node.name, v);
+-					this.scope.add(ns.name + ':' + node.name, v);
++					const variable: Variable = {
++						isMutable: node.mut,
++						value: await this._eval(node.expr, scope),
++					};
++					scope.add(node.name, variable);
++
++					this.scope.add(ns.name + ':' + node.name, variable);
+ 					break;
+ 				}
+ 
+@@ -167,12 +179,15 @@ export class Interpreter {
+ 				registerAbortHandler: this.registerAbortHandler,
+ 				unregisterAbortHandler: this.unregisterAbortHandler,
+ 			});
+-			// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition 
++			// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+ 			return result ?? NULL;
+ 		} else {
+-			const _args = new Map() as Map<string, Value>;
++			const _args = new Map<string, Variable>();
+ 			for (let i = 0; i < (fn.args ?? []).length; i++) {
+-				_args.set(fn.args![i]!, args[i]!);
++				_args.set(fn.args![i]!, {
++					isMutable: true,
++					value: args[i]!,
++				});
+ 			}
+ 			const fnScope = fn.scope!.createChildScope(_args);
+ 			return unWrapRet(await this._run(fn.statements!, fnScope));
+@@ -266,7 +281,10 @@ export class Interpreter {
+ 					assertNumber(to);
+ 					for (let i = from.value; i < from.value + to.value; i++) {
+ 						const v = await this._eval(node.for, scope.createChildScope(new Map([
+-							[node.var!, NUM(i)],
++							[node.var!, {
++								isMutable: false,
++								value: NUM(i),
++							}],
+ 						])));
+ 						if (v.type === 'break') {
+ 							break;
+@@ -283,7 +301,10 @@ export class Interpreter {
+ 				assertArray(items);
+ 				for (const item of items.value) {
+ 					const v = await this._eval(node.for, scope.createChildScope(new Map([
+-						[node.var, item],
++						[node.var, {
++							isMutable: false,
++							value: item,
++						}],
+ 					])));
+ 					if (v.type === 'break') {
+ 						break;
+@@ -306,7 +327,10 @@ export class Interpreter {
+ 					}
+ 					value.attr = attrs;
+ 				}
+-				scope.add(node.name, value);
++				scope.add(node.name, {
++					isMutable: node.mut,
++					value: value,
++				});
+ 				return NULL;
+ 			}
+ 
+diff --git a/src/interpreter/scope.ts b/src/interpreter/scope.ts
+index 0ab8b79..9938252 100644
+--- a/src/interpreter/scope.ts
++++ b/src/interpreter/scope.ts
+@@ -1,10 +1,11 @@
+ import { autobind } from '../utils/mini-autobind.js';
+ import { RuntimeError } from '../error.js';
+ import type { Value } from './value.js';
++import type { Variable } from './variable.js';
+ 
+ export class Scope {
+ 	private parent?: Scope;
+-	private layerdStates: Map<string, Value>[];
++	private layerdStates: Map<string, Variable>[];
+ 	public name: string;
+ 	public opts: {
+ 		log?(type: string, params: Record<string, any>): void;
+@@ -36,7 +37,7 @@ export class Scope {
+ 	}
+ 
+ 	@autobind
+-	public createChildScope(states: Map<string, Value> = new Map(), name?: Scope['name']): Scope {
++	public createChildScope(states: Map<string, Variable> = new Map(), name?: Scope['name']): Scope {
+ 		const layer = [states, ...this.layerdStates];
+ 		return new Scope(layer, this, name);
+ 	}
+@@ -49,7 +50,7 @@ export class Scope {
+ 	public get(name: string): Value {
+ 		for (const layer of this.layerdStates) {
+ 			if (layer.has(name)) {
+-				const state = layer.get(name)!;
++				const state = layer.get(name)!.value;
+ 				this.log('read', { var: name, val: state });
+ 				return state;
+ 			}
+@@ -81,10 +82,10 @@ export class Scope {
+ 	 * 現在のスコープに存在する全ての変数を取得します
+ 	 */
+ 	@autobind
+-	public getAll(): Map<string, Value> {
++	public getAll(): Map<string, Variable> {
+ 		const vars = this.layerdStates.reduce((arr, layer) => {
+ 			return [...arr, ...layer];
+-		}, [] as [string, Value][]);
++		}, [] as [string, Variable][]);
+ 		return new Map(vars);
+ 	}
+ 
+@@ -94,16 +95,16 @@ export class Scope {
+ 	 * @param val - 初期値
+ 	 */
+ 	@autobind
+-	public add(name: string, val: Value): void {
+-		this.log('add', { var: name, val: val });
++	public add(name: string, variable: Variable): void {
++		this.log('add', { var: name, val: variable });
+ 		const states = this.layerdStates[0]!;
+ 		if (states.has(name)) {
+ 			throw new RuntimeError(
+ 				`Variable '${name}' is alerady exists in scope '${this.name}'`,
+ 				{ scope: this.layerdStates });
+ 		}
+-		states.set(name, val);
+-		if (this.parent == null) this.onUpdated(name, val);
++		states.set(name, variable);
++		if (this.parent == null) this.onUpdated(name, variable.value);
+ 	}
+ 
+ 	/**
+@@ -116,7 +117,13 @@ export class Scope {
+ 		let i = 1;
+ 		for (const layer of this.layerdStates) {
+ 			if (layer.has(name)) {
+-				layer.set(name, val);
++				const variable = layer.get(name)!;
++				if (!variable.isMutable) {
++					throw new RuntimeError(`Cannot assign to an immutable variable ${name}.`);
++				}
++
++				variable.value = val;
++
+ 				this.log('assign', { var: name, val: val });
+ 				if (i === this.layerdStates.length) this.onUpdated(name, val);
+ 				return;
+diff --git a/src/interpreter/variable.ts b/src/interpreter/variable.ts
+new file mode 100644
+index 0000000..30252b5
+--- /dev/null
++++ b/src/interpreter/variable.ts
+@@ -0,0 +1,26 @@
++import type { Value } from './value.js';
++
++export type Variable =
++  | {
++    isMutable: false
++    readonly value: Value
++  }
++  | {
++    isMutable: true
++    value: Value
++  }
++
++export const Variable = {
++	mut(value: Value): Variable {
++		return {
++			isMutable: true,
++			value,
++		};
++	},
++	const(value: Value): Variable {
++		return {
++			isMutable: false,
++			value,
++		};
++	},
++};

@@ -1,0 +1,487 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 2a11b9b..67ac980 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,7 +17,7 @@ default-members = [".", "crates/redb-derive", "crates/redb-python"]
+ 
+ [workspace.package]
+ edition = "2024"
+-rust-version = "1.85"
++rust-version = "1.88"
+ license = "MIT OR Apache-2.0"
+ homepage = "https://www.redb.org"
+ repository = "https://github.com/cberner/redb"
+diff --git a/rust-toolchain b/rust-toolchain
+index c4f7465..0e56385 100644
+--- a/rust-toolchain
++++ b/rust-toolchain
+@@ -1,1 +1,1 @@
+-1.85
++1.88
+diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
+index a64bf7d..5997623 100644
+--- a/src/transaction_tracker.rs
++++ b/src/transaction_tracker.rs
+@@ -4,10 +4,12 @@ use crate::{Key, Result, Savepoint, TypeName, Value};
+ use log::debug;
+ use std::cmp::Ordering;
+ use std::collections::btree_map::BTreeMap;
++use std::collections::{HashMap, HashSet};
++use std::mem;
+ use std::mem::size_of;
+ use std::sync::{Condvar, Mutex};
+ 
+-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug)]
++#[derive(Copy, Clone, Hash, Ord, PartialOrd, Eq, PartialEq, Debug)]
+ pub(crate) struct TransactionId(u64);
+ 
+ impl TransactionId {
+@@ -28,14 +30,6 @@ impl TransactionId {
+         *self = next;
+         next
+     }
+-
+-    pub(crate) fn parent(self) -> Option<TransactionId> {
+-        if self.0 == 0 {
+-            None
+-        } else {
+-            Some(TransactionId(self.0 - 1))
+-        }
+-    }
+ }
+ 
+ #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
+@@ -89,8 +83,12 @@ struct State {
+     valid_savepoints: BTreeMap<SavepointId, TransactionId>,
+     // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
+     // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
+-    // Therefore, we hold a read transaction on their parent
+-    pending_non_durable_commits: Vec<TransactionId>,
++    // Therefore, we hold a read transaction on their nearest durable ancestor
++    //
++    // Maps non-durable transaction id -> durable ancestor
++    pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
++    // Non-durable commits which have NOT been processed in the freed table
++    unprocessed_freed_non_durable_commits: HashSet<TransactionId>,
+ }
+ 
+ pub(crate) struct TransactionTracker {
+@@ -108,6 +106,7 @@ impl TransactionTracker {
+                 live_write_transaction: None,
+                 valid_savepoints: Default::default(),
+                 pending_non_durable_commits: Default::default(),
++                unprocessed_freed_non_durable_commits: Default::default(),
+             }),
+             live_write_transaction_available: Condvar::new(),
+         }
+@@ -136,28 +135,44 @@ impl TransactionTracker {
+ 
+     pub(crate) fn clear_pending_non_durable_commits(&self) {
+         let mut state = self.state.lock().unwrap();
+-        let ids: Vec<TransactionId> = state.pending_non_durable_commits.drain(..).collect();
+-        for id in ids {
+-            if let Some(parent) = id.parent() {
+-                let ref_count = state.live_read_transactions.get_mut(&parent).unwrap();
+-                *ref_count -= 1;
+-                if *ref_count == 0 {
+-                    state.live_read_transactions.remove(&parent);
+-                }
++        let ids = mem::take(&mut state.pending_non_durable_commits);
++        for (_, durable_ancestor) in ids {
++            let ref_count = state
++                .live_read_transactions
++                .get_mut(&durable_ancestor)
++                .unwrap();
++            *ref_count -= 1;
++            if *ref_count == 0 {
++                state.live_read_transactions.remove(&durable_ancestor);
+             }
+         }
+     }
+ 
+-    pub(crate) fn register_non_durable_commit(&self, id: TransactionId) {
++    pub(crate) fn is_unprocessed_non_durable_commit(&self, id: TransactionId) -> bool {
++        let state = self.state.lock().unwrap();
++        state.unprocessed_freed_non_durable_commits.contains(&id)
++    }
++
++    pub(crate) fn mark_unprocessed_non_durable_commit(&self, id: TransactionId) {
+         let mut state = self.state.lock().unwrap();
+-        if let Some(parent) = id.parent() {
+-            state
+-                .live_read_transactions
+-                .entry(parent)
+-                .and_modify(|x| *x += 1)
+-                .or_insert(1);
+-        }
+-        state.pending_non_durable_commits.push(id);
++        state.unprocessed_freed_non_durable_commits.remove(&id);
++    }
++
++    pub(crate) fn register_non_durable_commit(
++        &self,
++        id: TransactionId,
++        durable_ancestor: TransactionId,
++    ) {
++        let mut state = self.state.lock().unwrap();
++        state
++            .live_read_transactions
++            .entry(durable_ancestor)
++            .and_modify(|x| *x += 1)
++            .or_insert(1);
++        state
++            .pending_non_durable_commits
++            .insert(id, durable_ancestor);
++        state.unprocessed_freed_non_durable_commits.insert(id);
+     }
+ 
+     pub(crate) fn restore_savepoint_counter_state(&self, next_savepoint: SavepointId) {
+@@ -258,4 +273,16 @@ impl TransactionTracker {
+             .next()
+             .copied()
+     }
++
++    // Returns the transaction id of the oldest non-durable transaction which has not been processed
++    // for freeing, which has live read transactions
++    pub(crate) fn oldest_live_read_nondurable_transaction(&self) -> Option<TransactionId> {
++        let state = self.state.lock().unwrap();
++        for id in state.live_read_transactions.keys() {
++            if state.pending_non_durable_commits.contains_key(id) {
++                return Some(*id);
++            }
++        }
++        None
++    }
+ }
+diff --git a/src/transactions.rs b/src/transactions.rs
+index 3ab858a..6f3c840 100644
+--- a/src/transactions.rs
++++ b/src/transactions.rs
+@@ -1579,6 +1579,7 @@ impl WriteTransaction {
+                         self.store_system_freed_pages(
+                             system_tree_ref,
+                             system_freed_pages.clone(),
++                            None,
+                             &mut pagination_counter,
+                         )?;
+ 
+@@ -1624,15 +1625,31 @@ impl WriteTransaction {
+ 
+     // Commit without a durability guarantee
+     pub(crate) fn non_durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
++        let free_until_transaction = self
++            .transaction_tracker
++            .oldest_live_read_nondurable_transaction()
++            .map_or(self.transaction_id, |x| x.next());
++        self.process_freed_pages_nondurable(free_until_transaction)?;
++
++        let mut post_commit_frees = vec![];
++
+         let system_root = {
+             let mut system_tables = self.system_tables.lock().unwrap();
+             let system_freed_pages = system_tables.system_freed_pages();
+             system_tables.table_tree.flush_table_root_updates()?;
++            for page in system_freed_pages
++                .lock()
++                .unwrap()
++                .extract_if(.., |p| self.mem.unpersisted(*p))
++            {
++                post_commit_frees.push(page);
++            }
+             // Store all freed pages for a future commit(), since we can't free pages during a
+             // non-durable commit (it's non-durable, so could be rolled back anytime in the future)
+             self.store_system_freed_pages(
+                 &mut system_tables.table_tree,
+                 system_freed_pages,
++                Some(&mut post_commit_frees),
+                 &mut 0,
+             )?;
+ 
+@@ -1646,8 +1663,15 @@ impl WriteTransaction {
+             .non_durable_commit(user_root, system_root, self.transaction_id)?;
+         // Register this as a non-durable transaction to ensure that the freed pages we just pushed
+         // are only processed after this has been persisted
+-        self.transaction_tracker
+-            .register_non_durable_commit(self.transaction_id);
++        self.transaction_tracker.register_non_durable_commit(
++            self.transaction_id,
++            self.mem.get_last_durable_transaction_id()?,
++        );
++
++        for page in post_commit_frees {
++            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
++        }
++
+         Ok(())
+     }
+ 
+@@ -1753,10 +1777,146 @@ impl WriteTransaction {
+         Ok(())
+     }
+ 
++    // NOTE: must be called before store_system_freed_pages() during commit, since this can create
++    // more pages freed by the current transaction
++    //
++    // This method only frees pages that are unpersisted, in non-durable transactions, since
++    // it is called from a non-durable commit() and therefore can't modify anything that the
++    // on-disk state in the last durable transaction might reference.
++    fn process_freed_pages_nondurable(&mut self, free_until: TransactionId) -> Result {
++        // We assume below that PageNumber is length 8
++        assert_eq!(PageNumber::serialized_size(), 8);
++
++        let mut processed = vec![];
++
++        // Handle the data freed tree
++        let mut system_tables = self.system_tables.lock().unwrap();
++        {
++            let last_key = TransactionIdWithPagination {
++                transaction_id: free_until.raw_id(),
++                pagination_id: 0,
++            };
++            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
++            let mut candidate_transactions = vec![];
++            for entry in data_freed.range(..last_key)? {
++                let (key, _) = entry?;
++                let transaction_id = TransactionId::new(key.value().transaction_id);
++                if self
++                    .transaction_tracker
++                    .is_unprocessed_non_durable_commit(transaction_id)
++                {
++                    candidate_transactions.push(transaction_id);
++                }
++            }
++            for transaction_id in candidate_transactions {
++                let mut key = TransactionIdWithPagination {
++                    transaction_id: transaction_id.raw_id(),
++                    pagination_id: 0,
++                };
++                loop {
++                    let Some(entry) = data_freed.get(&key)? else {
++                        break;
++                    };
++                    let pages = entry.value();
++                    let mut new_pages = vec![];
++                    for i in 0..pages.len() {
++                        let page = pages.get(i);
++                        if !self
++                            .mem
++                            .free_if_unpersisted(page, &mut PageTrackerPolicy::Ignore)
++                        {
++                            new_pages.push(page);
++                        }
++                    }
++                    if new_pages.len() != pages.len() {
++                        drop(entry);
++                        if new_pages.is_empty() {
++                            data_freed.remove(&key)?;
++                        } else {
++                            let required = PageList::required_bytes(new_pages.len());
++                            let mut page_list_mut =
++                                data_freed.insert_reserve(&key, required.try_into().unwrap())?;
++                            for page in new_pages {
++                                page_list_mut.as_mut().push_back(page);
++                            }
++                        }
++                    }
++                    key.pagination_id += 1;
++                }
++                processed.push(transaction_id);
++            }
++        }
++
++        // Handle the system freed tree
++        {
++            let last_key = TransactionIdWithPagination {
++                transaction_id: free_until.raw_id(),
++                pagination_id: 0,
++            };
++            let mut data_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
++            let mut candidate_transactions = vec![];
++            for entry in data_freed.range(..last_key)? {
++                let (key, _) = entry?;
++                let transaction_id = TransactionId::new(key.value().transaction_id);
++                if self
++                    .transaction_tracker
++                    .is_unprocessed_non_durable_commit(transaction_id)
++                {
++                    candidate_transactions.push(transaction_id);
++                }
++            }
++            for transaction_id in candidate_transactions {
++                let mut key = TransactionIdWithPagination {
++                    transaction_id: transaction_id.raw_id(),
++                    pagination_id: 0,
++                };
++                loop {
++                    let Some(entry) = data_freed.get(&key)? else {
++                        break;
++                    };
++                    let pages = entry.value();
++                    let mut new_pages = vec![];
++                    for i in 0..pages.len() {
++                        let page = pages.get(i);
++                        if !self
++                            .mem
++                            .free_if_unpersisted(page, &mut PageTrackerPolicy::Ignore)
++                        {
++                            new_pages.push(page);
++                        }
++                    }
++                    if new_pages.len() != pages.len() {
++                        drop(entry);
++                        if new_pages.is_empty() {
++                            data_freed.remove(&key)?;
++                        } else {
++                            let required = PageList::required_bytes(new_pages.len());
++                            let mut page_list_mut =
++                                data_freed.insert_reserve(&key, required.try_into().unwrap())?;
++                            for page in new_pages {
++                                page_list_mut.as_mut().push_back(page);
++                            }
++                        }
++                    }
++                    key.pagination_id += 1;
++                }
++                processed.push(transaction_id);
++            }
++        }
++
++        for transaction_id in processed {
++            self.transaction_tracker
++                .mark_unprocessed_non_durable_commit(transaction_id);
++        }
++
++        Ok(())
++    }
++
+     fn store_system_freed_pages(
+         &self,
+         system_tree: &mut TableTreeMut,
+         system_freed_pages: Arc<Mutex<Vec<PageNumber>>>,
++        mut unpersisted_pages: Option<&mut Vec<PageNumber>>,
+         pagination_counter: &mut u64,
+     ) -> Result {
+         assert_eq!(PageNumber::serialized_size(), 8); // We assume below that PageNumber is length 8
+@@ -1778,7 +1938,13 @@ impl WriteTransaction {
+                     let len = freed_pages.len();
+                     access_guard.as_mut().clear();
+                     for page in freed_pages.drain(len - min(len, chunk_size)..) {
+-                        access_guard.as_mut().push_back(page);
++                        if let Some(ref mut unpersisted_pages) = unpersisted_pages
++                            && self.mem.unpersisted(page)
++                        {
++                            unpersisted_pages.push(page);
++                        } else {
++                            access_guard.as_mut().push_back(page);
++                        }
+                     }
+                     drop(access_guard);
+ 
+@@ -1841,6 +2007,25 @@ impl WriteTransaction {
+             master_tree.print_debug(true)?;
+         }
+ 
++        // Flush any pending updates to make sure we get the latest root
++        let mut system_tables = self.system_tables.lock().unwrap();
++        if let Some(page) = system_tables
++            .table_tree
++            .flush_table_root_updates()
++            .unwrap()
++            .finalize_dirty_checksums()
++            .unwrap()
++        {
++            eprintln!("System tree:");
++            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new(
++                Some(page),
++                PageHint::None,
++                self.transaction_guard.clone(),
++                self.mem.clone(),
++            )?;
++            master_tree.print_debug(true)?;
++        }
++
+         Ok(())
+     }
+ }
+diff --git a/src/tree_store/page_store/page_manager.rs b/src/tree_store/page_store/page_manager.rs
+index 7b56111..ef9cd91 100644
+--- a/src/tree_store/page_store/page_manager.rs
++++ b/src/tree_store/page_store/page_manager.rs
+@@ -89,6 +89,7 @@ pub(crate) struct TransactionalMemory {
+     // Pages allocated since the last commit
+     // TODO: maybe this should be moved to WriteTransaction?
+     allocated_since_commit: Mutex<PageNumberHashSet>,
++    unpersisted: Mutex<PageNumberHashSet>,
+     // True if the allocator state was corrupted when the file was opened
+     // TODO: maybe we can remove this flag now that CheckedBackend exists?
+     needs_recovery: AtomicBool,
+@@ -245,6 +246,7 @@ impl TransactionalMemory {
+ 
+         Ok(Self {
+             allocated_since_commit: Mutex::new(Default::default()),
++            unpersisted: Mutex::new(Default::default()),
+             needs_recovery: AtomicBool::new(needs_recovery),
+             storage,
+             state: Mutex::new(state),
+@@ -564,6 +566,7 @@ impl TransactionalMemory {
+             }
+         }
+         self.allocated_since_commit.lock().unwrap().clear();
++        self.unpersisted.lock().unwrap().clear();
+ 
+         let mut state = self.state.lock().unwrap();
+         assert_eq!(
+@@ -593,7 +596,8 @@ impl TransactionalMemory {
+         debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
+         assert!(!self.needs_recovery.load(Ordering::Acquire));
+ 
+-        self.allocated_since_commit.lock().unwrap().clear();
++        let mut unpersisted = self.unpersisted.lock().unwrap();
++        unpersisted.extend(self.allocated_since_commit.lock().unwrap().drain());
+         self.storage.write_barrier()?;
+ 
+         let mut state = self.state.lock().unwrap();
+@@ -767,6 +771,11 @@ impl TransactionalMemory {
+         }
+     }
+ 
++    pub(crate) fn get_last_durable_transaction_id(&self) -> Result<TransactionId> {
++        let state = self.state.lock()?;
++        Ok(state.header.primary_slot().transaction_id)
++    }
++
+     pub(crate) fn free(&self, page: PageNumber, allocated: &mut PageTrackerPolicy) {
+         self.allocated_since_commit.lock().unwrap().remove(&page);
+         self.free_helper(page, allocated);
+@@ -809,6 +818,20 @@ impl TransactionalMemory {
+         self.storage.cancel_pending_write(address_range.start, len);
+     }
+ 
++    // Frees the page if no durable commit has occurred, since it was allocated. Returns true, if the page was freed
++    pub(crate) fn free_if_unpersisted(
++        &self,
++        page: PageNumber,
++        allocated: &mut PageTrackerPolicy,
++    ) -> bool {
++        if self.unpersisted.lock().unwrap().remove(&page) {
++            self.free_helper(page, allocated);
++            true
++        } else {
++            false
++        }
++    }
++
+     // Frees the page if it was allocated since the last commit. Returns true, if the page was freed
+     pub(crate) fn free_if_uncommitted(
+         &self,
+@@ -828,6 +851,10 @@ impl TransactionalMemory {
+         self.allocated_since_commit.lock().unwrap().contains(&page)
+     }
+ 
++    pub(crate) fn unpersisted(&self, page: PageNumber) -> bool {
++        self.unpersisted.lock().unwrap().contains(&page)
++    }
++
+     pub(crate) fn allocate_helper(
+         &self,
+         allocation_size: usize,

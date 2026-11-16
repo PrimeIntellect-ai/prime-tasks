@@ -1,0 +1,334 @@
+diff --git a/monitor/redis/watcher_integration_test.go b/monitor/redis/watcher_integration_test.go
+index 080b31a..feece34 100644
+--- a/monitor/redis/watcher_integration_test.go
++++ b/monitor/redis/watcher_integration_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/beatlabs/harvester/change"
++	"github.com/beatlabs/harvester/config"
+ 	"github.com/go-redis/redis/v8"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -27,40 +28,57 @@ func TestWatch(t *testing.T) {
+ 		val3 = "value3"
+ 	)
+ 
+-	set(t, client, key1, val1)
+-	set(t, client, key2, val2)
+-	set(t, client, key3, val3)
+ 	defer func() {
+ 		del(t, client, key1)
+ 		del(t, client, key2)
+ 		del(t, client, key3)
+ 	}()
+ 
+-	ch := make(chan []*change.Change)
+ 	w, err := New(client, 10*time.Millisecond, []string{key1, key2, key3})
+ 	require.NoError(t, err)
+ 	require.NotNil(t, w)
++
+ 	ctx, cnl := context.WithCancel(context.Background())
+ 	defer cnl()
++
++	// Initial values, set even before watching - not all keys have a value
++	set(t, client, key1, val1)
++	set(t, client, key2, val1)
++
++	// Start watching
++	ch := make(chan []*change.Change, 100)
++	defer close(ch)
+ 	err = w.Watch(ctx, ch)
+ 	require.NoError(t, err)
+ 
+-	for i := 0; i < 2; i++ {
+-		cc := <-ch
+-		for _, cng := range cc {
+-			switch cng.Key() {
+-			case key1:
+-				assert.Equal(t, val1, cng.Value())
+-			case key2:
+-				assert.Equal(t, val2, cng.Value())
+-			case key3:
+-				assert.Equal(t, val3, cng.Value())
+-			default:
+-				assert.Fail(t, "key invalid", cng.Key())
+-			}
+-			assert.True(t, cng.Version() == 0)
+-		}
++	// First values update
++	time.Sleep(1 * time.Second)
++	set(t, client, key1, val1) // Same value
++	set(t, client, key2, val2)
++	set(t, client, key3, val1) // First value for this key
++
++	// Second values update
++	time.Sleep(1 * time.Second)
++	set(t, client, key1, val1) // Same value
++	set(t, client, key2, val1) // Second value - same as the initial value
++	set(t, client, key3, val3)
++
++	time.Sleep(1 * time.Second)
++
++	found := transformChangesToSlices(ch)
++	expected := []*change.Change{
++		// Initial values
++		change.New(config.SourceRedis, key1, val1, 1),
++		change.New(config.SourceRedis, key2, val1, 1),
++		// First update
++		change.New(config.SourceRedis, key2, val2, 2),
++		change.New(config.SourceRedis, key3, val1, 1),
++		// Second update
++		change.New(config.SourceRedis, key2, val1, 3),
++		change.New(config.SourceRedis, key3, val3, 2),
+ 	}
++
++	assert.ElementsMatch(t, expected, found)
+ }
+ 
+ func set(t *testing.T, client redis.UniversalClient, key string, val string) {
+@@ -74,3 +92,15 @@ func del(t *testing.T, client redis.UniversalClient, key string) {
+ 	require.NoError(t, err)
+ 	require.Equal(t, int64(1), delResult)
+ }
++
++func transformChangesToSlices(ch chan []*change.Change) []*change.Change {
++	changes := make([]*change.Change, 0)
++	for {
++		select {
++		case cc := <-ch:
++			changes = append(changes, cc...)
++		default:
++			return changes
++		}
++	}
++}
+diff --git a/monitor/redis/watcher_test.go b/monitor/redis/watcher_test.go
+index 80c9778..9079257 100644
+--- a/monitor/redis/watcher_test.go
++++ b/monitor/redis/watcher_test.go
+@@ -1,11 +1,15 @@
+ package redis
+ 
+ import (
++	"bytes"
+ 	"context"
++	stdlog "log"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/beatlabs/harvester/change"
++	"github.com/beatlabs/harvester/config"
+ 	"github.com/go-redis/redis/v8"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -65,3 +69,208 @@ func TestWatcher_Watch(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestWatcher_Versioning(t *testing.T) {
++	client := (&clientStub{t: t}).
++		WithValues("val1.1", "val2.1", "val3.1"). // Initial values
++		WithValues("val1.1", "val2.2", "val3.2"). // Only keys 2 and 3 are updated
++		WithValues("val1.1", "val2.1", "val3.2")  // Only 2 is updated, to its previous value
++
++	expected := [][]*change.Change{
++		{
++			change.New(config.SourceRedis, "key1", "val1.1", 1),
++			change.New(config.SourceRedis, "key2", "val2.1", 1),
++			change.New(config.SourceRedis, "key3", "val3.1", 1),
++		},
++		{
++			change.New(config.SourceRedis, "key2", "val2.2", 2),
++			change.New(config.SourceRedis, "key3", "val3.2", 2),
++		},
++		{
++			change.New(config.SourceRedis, "key2", "val2.1", 3),
++		},
++	}
++
++	w, err := New(client, 1*time.Millisecond, []string{"key1", "key2", "key3"})
++	require.NoError(t, err)
++
++	ctx, cancel := context.WithCancel(context.Background())
++
++	ch := make(chan []*change.Change, 10)
++	err = w.Watch(ctx, ch)
++	assert.NoError(t, err)
++
++	time.Sleep(100 * time.Millisecond)
++
++	cancel()
++
++	found := make([][]*change.Change, 0)
++
++	wg := sync.WaitGroup{}
++	wg.Add(1)
++
++	go func() {
++		for {
++			select {
++			case cc := <-ch:
++				if len(cc) == 0 {
++					break
++				}
++				found = append(found, cc)
++			default:
++				wg.Done()
++				return
++			}
++		}
++	}()
++	wg.Wait()
++
++	assert.ElementsMatch(t, flattenChangeBatches(expected), flattenChangeBatches(found))
++}
++
++func flattenChangeBatches(batches [][]*change.Change) []*change.Change {
++	var changes []*change.Change
++	for _, batch := range batches {
++		changes = append(changes, batch...)
++	}
++	return changes
++}
++
++func TestWatcher_NoChangeNoEmission(t *testing.T) {
++	// The stub returns the same values on every polling cycle, so after the
++	// first cycle nothing changes and no further slice or debug log must be emitted.
++	client := (&clientStub{t: t}).WithRepeatedValues("val1.1", "val2.1")
++	logs := &synchronizedBuffer{}
++	previousLogOutput := stdlog.Writer()
++	stdlog.SetOutput(logs)
++	defer stdlog.SetOutput(previousLogOutput)
++
++	w, err := New(client, 1*time.Millisecond, []string{"key1", "key2"})
++	require.NoError(t, err)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	ch := make(chan []*change.Change, 10)
++	require.NoError(t, w.Watch(ctx, ch))
++
++	// The first polling cycle reports the initial values.
++	select {
++	case first := <-ch:
++		require.Len(t, first, 2)
++	case <-time.After(time.Second):
++		t.Fatal("expected an initial change slice")
++	}
++	logsAfterInitial := logs.String()
++
++	// Subsequent cycles observe identical values, so no slice must be emitted.
++	select {
++	case cc := <-ch:
++		t.Fatalf("expected no change slice when nothing changed, got %v", cc)
++	case <-time.After(100 * time.Millisecond):
++	}
++
++	cancel()
++	time.Sleep(10 * time.Millisecond)
++	assert.Equal(t, logsAfterInitial, logs.String(), "unchanged Redis observations must not produce further debug logs")
++}
++
++func TestWatcher_UnchangedObservationKeepsVersion(t *testing.T) {
++	// key1 is observed unchanged in the second cycle; its next real change must
++	// therefore carry version 2, not a version advanced by the unchanged observation.
++	client := (&clientStub{t: t}).
++		WithValues("a", "x").
++		WithValues("a", "x").
++		WithValues("b", "x")
++
++	w, err := New(client, 1*time.Millisecond, []string{"key1", "key2"})
++	require.NoError(t, err)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	ch := make(chan []*change.Change, 10)
++	require.NoError(t, w.Watch(ctx, ch))
++
++	expected := []*change.Change{
++		change.New(config.SourceRedis, "key1", "a", 1),
++		change.New(config.SourceRedis, "key2", "x", 1),
++		change.New(config.SourceRedis, "key1", "b", 2),
++	}
++
++	found := make([]*change.Change, 0, len(expected))
++	for len(found) < len(expected) {
++		select {
++		case cc := <-ch:
++			found = append(found, cc...)
++		case <-time.After(time.Second):
++			t.Fatalf("expected %d changes, got %v", len(expected), found)
++		}
++	}
++
++	// Let any remaining polling cycles run; nothing further must be emitted.
++	time.Sleep(20 * time.Millisecond)
++	cancel()
++	found = append(found, drainChangeChannel(ch)...)
++
++	assert.ElementsMatch(t, expected, found)
++}
++
++func drainChangeChannel(ch chan []*change.Change) []*change.Change {
++	var changes []*change.Change
++	for {
++		select {
++		case cc := <-ch:
++			changes = append(changes, cc...)
++		default:
++			return changes
++		}
++	}
++}
++
++type synchronizedBuffer struct {
++	mu     sync.Mutex
++	buffer bytes.Buffer
++}
++
++func (b *synchronizedBuffer) Write(p []byte) (int, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buffer.Write(p)
++}
++
++func (b *synchronizedBuffer) String() string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buffer.String()
++}
++
++type clientStub struct {
++	t *testing.T
++	*redis.Client
++
++	cmds   []*redis.SliceCmd
++	repeat []interface{}
++}
++
++func (c *clientStub) WithValues(values ...interface{}) *clientStub {
++	c.cmds = append(c.cmds, redis.NewSliceResult(values, nil))
++	return c
++}
++
++func (c *clientStub) WithRepeatedValues(values ...interface{}) *clientStub {
++	c.repeat = values
++	return c
++}
++
++func (c *clientStub) MGet(_ context.Context, keys ...string) *redis.SliceCmd {
++	if len(c.cmds) == 0 {
++		if c.repeat != nil {
++			return redis.NewSliceResult(c.repeat, nil)
++		}
++		return redis.NewSliceResult(make([]interface{}, len(keys)), nil)
++	}
++	shifted := c.cmds[0]
++	c.cmds = c.cmds[1:]
++	return shifted
++}

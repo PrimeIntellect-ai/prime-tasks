@@ -1,0 +1,171 @@
+diff --git a/test/unit/builders_test.dart b/test/unit/builders_test.dart
+index 7f5a620e..6a02b126 100644
+--- a/test/unit/builders_test.dart
++++ b/test/unit/builders_test.dart
+@@ -1,9 +1,17 @@
++import 'dart:convert';
++
++import 'package:http/http.dart' as http;
++import 'package:nyxx/nyxx.dart';
++import 'package:nyxx/src/core/channel/channel.dart';
+ import 'package:nyxx/src/core/channel/text_channel.dart';
+ import 'package:nyxx/src/core/guild/status.dart';
+ import 'package:nyxx/src/core/permissions/permissions.dart';
+ import 'package:nyxx/src/core/snowflake.dart';
+ import 'package:nyxx/src/core/user/presence.dart';
+ import 'package:nyxx/src/internal/cache/cacheable.dart';
++import 'package:nyxx/src/internal/http/http_handler.dart';
++import 'package:nyxx/src/internal/http/http_request.dart';
++import 'package:nyxx/src/internal/http/http_response.dart';
+ import 'package:nyxx/src/utils/builders/channel_builder.dart';
+ import 'package:nyxx/src/utils/builders/embed_builder.dart';
+ import 'package:nyxx/src/utils/builders/member_builder.dart';
+@@ -20,7 +28,148 @@ import '../mocks/member.mock.dart';
+ import '../mocks/message.mock.dart';
+ import '../mocks/nyxx_rest.mock.dart';
+ 
++class _ForumRestClient extends NyxxRestMock {
++  late final _RecordingHttpHandler recordingHandler = _RecordingHttpHandler(this);
++
++  @override
++  HttpHandler get httpHandler => recordingHandler;
++}
++
++class _RecordingHttpHandler extends HttpHandler {
++  final requests = <http.Request>[];
++  late Map<String, dynamic> Function(http.Request request) responsePayload;
++
++  _RecordingHttpHandler(INyxxRest client) : super(client);
++
++  @override
++  Future<HttpResponse> execute(HttpRequest request) async {
++    final preparedRequest = await request.prepareRequest() as http.Request;
++    requests.add(preparedRequest);
++    final response = HttpResponseSuccess(
++      http.StreamedResponse(
++        Stream.value(utf8.encode(jsonEncode(responsePayload(preparedRequest)))),
++        200,
++      ),
++    );
++    await response.finalize();
++    return response;
++  }
++}
++
++Iterable<dynamic> _threadsFrom(dynamic result) {
++  if (result is Iterable) {
++    return result.cast<dynamic>();
++  }
++
++  return (result.threads as Iterable).cast<dynamic>();
++}
++
+ main() {
++  test("forum channels are deserialized with their forum metadata", () {
++    final channel = Channel.deserialize(NyxxRestEmptyMock(), {
++      "id": "123",
++      "type": 15,
++      "guild_id": "456",
++      "name": "help",
++      "position": 0,
++      "permission_overwrites": [],
++      "available_tags": [
++        {
++          "id": "789",
++          "string": "helpful",
++          "name": "helpful",
++          "label": "not the Discord tag name",
++          "emoji_id": "1001",
++          "emoji_name": "💬",
++        },
++      ],
++    });
++
++    expect(channel.channelType.value, 15);
++    final dynamic forumChannel = channel;
++    expect(forumChannel.availableTags, hasLength(1));
++    expect(forumChannel.availableTags.first.name, 'helpful');
++    expect(forumChannel.availableTags.first.emojiName, '💬');
++  });
++
++  test('forum post creation and archived-thread retrieval use Discord HTTP operations', () async {
++    final rest = _ForumRestClient();
++    final threadJson = (String id) => {
++          'id': id,
++          'type': 11,
++          'guild_id': '456',
++          'parent_id': '123',
++          'name': 'thread',
++          'owner_id': '1',
++          'message_count': 0,
++          'member_count': 0,
++          'thread_metadata': {
++            'archived': true,
++            'archive_timestamp': '2022-01-01T00:00:00.000Z',
++            'auto_archive_duration': 1440,
++          },
++        };
++    rest.recordingHandler.responsePayload = (request) {
++      if (request.method == 'POST') {
++        return threadJson('901');
++      }
++
++      final id = request.url.path.endsWith('/public')
++          ? '902'
++          : request.url.path.contains('/users/@me/')
++              ? '904'
++              : '903';
++      return {
++        'threads': [threadJson(id)],
++        'members': [],
++        'has_more': false,
++      };
++    };
++
++    final channel = Channel.deserialize(rest, {
++      'id': '123',
++      'type': 15,
++      'guild_id': '456',
++      'name': 'help',
++      'position': 0,
++      'permission_overwrites': [],
++      'available_tags': [],
++    });
++    final dynamic forumChannel = channel;
++
++    final created = await forumChannel.createThread(
++      ForumThreadBuilder('new post', MessageBuilder.content('first post')),
++    );
++    expect(created.id, Snowflake(901));
++
++    final publicThreads = await forumChannel.fetchPublicArchivedThreads();
++    final privateThreads = await forumChannel.fetchPrivateArchivedThreads();
++    final joinedPrivateThreads = await forumChannel.fetchJoinedPrivateArchivedThreads();
++    expect(_threadsFrom(publicThreads).map((thread) => thread.id), contains(Snowflake(902)));
++    expect(_threadsFrom(privateThreads).map((thread) => thread.id), contains(Snowflake(903)));
++    expect(_threadsFrom(joinedPrivateThreads).map((thread) => thread.id), contains(Snowflake(904)));
++
++    final createRequest = rest.recordingHandler.requests.firstWhere((request) => request.method == 'POST');
++    expect(createRequest.url.path, contains('/channels/123/threads'));
++    final body = jsonDecode(createRequest.body) as Map<String, dynamic>;
++    expect(body['name'], 'new post');
++    expect((body['message'] as Map<String, dynamic>)['content'], 'first post');
++
++    final archivePaths = rest.recordingHandler.requests.where((request) => request.method == 'GET').map((request) => request.url.path).toSet();
++    expect(
++      archivePaths.any((path) => path.endsWith('/channels/123/threads/archived/public')),
++      isTrue,
++    );
++    expect(
++      archivePaths.any((path) => path.endsWith('/channels/123/threads/archived/private')),
++      isTrue,
++    );
++    expect(
++      archivePaths.any((path) => path.endsWith('/channels/123/users/@me/threads/archived/private')),
++      isTrue,
++    );
++  });
++
+   test("ThreadBuilder", () {
+     final publicBuilder = ThreadBuilder('test name')
+       ..archiveAfter = ThreadArchiveTime.threeDays

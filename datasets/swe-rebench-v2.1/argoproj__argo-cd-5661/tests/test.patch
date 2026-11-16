@@ -1,0 +1,161 @@
+diff --git a/reposerver/repository/repository_test.go b/reposerver/repository/repository_test.go
+index bd727644..6cbadf62 100644
+--- a/reposerver/repository/repository_test.go
++++ b/reposerver/repository/repository_test.go
+@@ -78,7 +78,7 @@ func newServiceWithOpt(cf clientFunc) (*Service, *gitmocks.Client) {
+ 
+ 	chart := "my-chart"
+ 	version := semver.MustParse("1.1.0")
+-	helmClient.On("GetIndex").Return(&helm.Index{Entries: map[string]helm.Entries{
++	helmClient.On("GetIndex", true).Return(&helm.Index{Entries: map[string]helm.Entries{
+ 		chart: {{Version: "1.0.0"}, {Version: version.String()}},
+ 	}}, nil)
+ 	helmClient.On("ExtractChart", chart, version).Return("./testdata/my-chart", io.NopCloser, nil)
+@@ -1106,17 +1106,20 @@ func Test_newEnv(t *testing.T) {
+ 	}, "my-revision"))
+ }
+ 
+-func TestService_newHelmClientResolveRevision(t *testing.T) {
++func TestGetAppDetailsRejectsInvalidHelmRevision(t *testing.T) {
+ 	service := newService(".")
+-
+-	t.Run("EmptyRevision", func(t *testing.T) {
+-		_, _, err := service.newHelmClientResolveRevision(&argoappv1.Repository{}, "", "")
+-		assert.EqualError(t, err, "invalid revision '': improper constraint: ")
+-	})
+-	t.Run("InvalidRevision", func(t *testing.T) {
+-		_, _, err := service.newHelmClientResolveRevision(&argoappv1.Repository{}, "???", "")
+-		assert.EqualError(t, err, "invalid revision '???': improper constraint: ???")
+-	})
++	for _, revision := range []string{"", "???"} {
++		t.Run(revision, func(t *testing.T) {
++			_, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
++				Repo: &argoappv1.Repository{Repo: "https://example.com/charts"},
++				Source: &argoappv1.ApplicationSource{
++					Chart:          "my-chart",
++					TargetRevision: revision,
++				},
++			})
++			assert.Error(t, err)
++		})
++	}
+ }
+ 
+ func TestGetAppDetailsWithAppParameterFile(t *testing.T) {
+diff --git a/util/helm/client_test.go b/util/helm/client_test.go
+index 44e87cb1..4b19b8e1 100644
+--- a/util/helm/client_test.go
++++ b/util/helm/client_test.go
+@@ -1,8 +1,13 @@
+ package helm
+ 
+ import (
++	"net/http"
++	"net/http/httptest"
+ 	"os"
++	"reflect"
++	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/Masterminds/semver"
+ 	"github.com/stretchr/testify/assert"
+@@ -10,15 +15,39 @@ import (
+ 	"github.com/argoproj/argo-cd/util/io"
+ )
+ 
++const testIndexYaml = `apiVersion: v1
++entries:
++  my-chart:
++  - version: 1.0.0
++    name: my-chart
++`
++
++func getIndex(client Client, noCache bool) (*Index, error) {
++	method := reflect.ValueOf(client).MethodByName("GetIndex")
++	args := []reflect.Value{}
++	if method.Type().NumIn() > 0 {
++		args = append(args, reflect.ValueOf(noCache))
++	}
++	result := method.Call(args)
++	var index *Index
++	if !result[0].IsNil() {
++		index = result[0].Interface().(*Index)
++	}
++	if result[1].IsNil() {
++		return index, nil
++	}
++	return index, result[1].Interface().(error)
++}
++
+ func TestIndex(t *testing.T) {
+ 	t.Run("Invalid", func(t *testing.T) {
+ 		client := NewClient("", Creds{}, false)
+-		_, err := client.GetIndex()
++		_, err := getIndex(client, false)
+ 		assert.Error(t, err)
+ 	})
+ 	t.Run("Stable", func(t *testing.T) {
+ 		client := NewClient("https://argoproj.github.io/argo-helm", Creds{}, false)
+-		index, err := client.GetIndex()
++		index, err := getIndex(client, false)
+ 		assert.NoError(t, err)
+ 		assert.NotNil(t, index)
+ 	})
+@@ -27,10 +56,55 @@ func TestIndex(t *testing.T) {
+ 			Username: "my-password",
+ 			Password: "my-username",
+ 		}, false)
+-		index, err := client.GetIndex()
++		index, err := getIndex(client, false)
+ 		assert.NoError(t, err)
+ 		assert.NotNil(t, index)
+ 	})
++
++	t.Run("Cached", func(t *testing.T) {
++		var requests int32
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			atomic.AddInt32(&requests, 1)
++			_, _ = w.Write([]byte(testIndexYaml))
++		}))
++		defer server.Close()
++
++		client := NewClient(server.URL, Creds{}, false)
++		duration, parseErr := time.ParseDuration(os.Getenv("ARGOCD_HELM_INDEX_CACHE_DURATION"))
++		cacheEnabled := parseErr == nil && duration > 0
++		expectedRequests := int32(0)
++		checkIndex := func(noCache bool) {
++			index, err := getIndex(client, noCache)
++			assert.NoError(t, err)
++			assert.NotNil(t, index)
++			if !noCache && cacheEnabled && expectedRequests > 0 {
++				assert.Equal(t, expectedRequests, atomic.LoadInt32(&requests))
++				return
++			}
++			expectedRequests++
++			assert.Equal(t, expectedRequests, atomic.LoadInt32(&requests))
++		}
++
++		// The first fetch downloads the index. Repeated non-forced fetches reuse
++		// it only while a positive cache duration is configured.
++		checkIndex(false)
++		checkIndex(false)
++
++		// A separate client for this repository follows the same cache policy.
++		otherClient := NewClient(server.URL, Creds{}, false)
++		index, err := getIndex(otherClient, false)
++		assert.NoError(t, err)
++		assert.NotNil(t, index)
++		if cacheEnabled {
++			assert.Equal(t, expectedRequests, atomic.LoadInt32(&requests))
++		} else {
++			expectedRequests++
++			assert.Equal(t, expectedRequests, atomic.LoadInt32(&requests))
++		}
++
++		// A forced retrieval always downloads a fresh index.
++		checkIndex(true)
++	})
+ }
+ 
+ func Test_nativeHelmChart_ExtractChart(t *testing.T) {

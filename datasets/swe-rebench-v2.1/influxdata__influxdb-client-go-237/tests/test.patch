@@ -1,0 +1,92 @@
+diff --git a/internal/write/service_test.go b/internal/write/service_test.go
+index bb7ec7e..df6d728 100644
+--- a/internal/write/service_test.go
++++ b/internal/write/service_test.go
+@@ -7,6 +7,9 @@ package write
+ import (
+ 	"context"
+ 	"errors"
++	"os"
++	"os/exec"
++	"path/filepath"
+ 	"testing"
+ 	"time"
+ 
+@@ -259,3 +262,77 @@ func TestRetryOnConnectionError(t *testing.T) {
+ 	assert.Equal(t, "4", hs.Lines()[3])
+ 
+ }
++
++func TestWritePointWithZeroRetriesReturnsErrorWithoutDeferringBatch(t *testing.T) {
++	program := `package main
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
++	"github.com/influxdata/influxdb-client-go/v2/api/write"
++)
++
++func main() {
++	var mu sync.Mutex
++	var requests []string
++	var count int
++	server := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, err := io.ReadAll(r.Body)
++		if err != nil { panic(err) }
++		mu.Lock()
++		count++
++		current := count
++		if current > 1 { requests = append(requests, string(body)) }
++		mu.Unlock()
++		if current == 1 {
++			conn, _, err := w.(http.Hijacker).Hijack()
++			if err != nil { panic(err) }
++			conn.Close()
++			return
++		}
++		w.WriteHeader(http.StatusNoContent)
++	})}
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil { panic(err) }
++	go server.Serve(listener)
++	defer server.Close()
++	options := influxdb2.DefaultOptions().SetMaxRetries(0).SetRetryInterval(1)
++	unreachable, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil { panic(err) }
++	unreachableURL := "http://" + unreachable.Addr().String()
++	if err = unreachable.Close(); err != nil { panic(err) }
++	point := write.NewPoint("first", nil, map[string]interface{}{"value": 1}, time.Time{})
++	unreachableClient := influxdb2.NewClientWithOptions(unreachableURL, "", options)
++	err = unreachableClient.WriteAPIBlocking("", "bucket").WritePoint(context.Background(), point)
++	unreachableClient.Close()
++	if err == nil { panic("WritePoint returned no error for an unreachable server") }
++	client := influxdb2.NewClientWithOptions("http://"+listener.Addr().String(), "", options)
++	defer client.Close()
++	api := client.WriteAPIBlocking("", "bucket")
++	err = api.WritePoint(context.Background(), point)
++	if err == nil { panic("WritePoint returned no error after the connection was dropped") }
++	time.Sleep(20 * time.Millisecond)
++	if err = api.WriteRecord(context.Background(), "second value=2i"); err != nil { panic(err) }
++	mu.Lock()
++	defer mu.Unlock()
++	if count != 2 { panic(fmt.Sprintf("expected 2 HTTP requests, got %d", count)) }
++	if len(requests) != 1 || strings.TrimSpace(requests[0]) != "second value=2i" {
++		panic(fmt.Sprintf("unexpected successful request bodies: %q", requests))
++	}
++}
++`
++	programPath := filepath.Join(t.TempDir(), "main.go")
++	require.NoError(t, os.WriteFile(programPath, []byte(program), 0600))
++	cmd := exec.Command("go", "run", programPath)
++	cmd.Dir = filepath.Join("..", "..")
++	output, err := cmd.CombinedOutput()
++	require.NoError(t, err, string(output))
++}

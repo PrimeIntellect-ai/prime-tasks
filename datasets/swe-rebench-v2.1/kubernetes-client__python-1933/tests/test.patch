@@ -1,0 +1,171 @@
+diff --git a/kubernetes/base/config/kube_config_test.py b/kubernetes/base/config/kube_config_test.py
+index da0d2f35..04a2a3dc 100644
+--- a/kubernetes/base/config/kube_config_test.py
++++ b/kubernetes/base/config/kube_config_test.py
+@@ -19,7 +19,10 @@ import json
+ import os
+ from pprint import pprint
+ import shutil
++import socket
++import struct
+ import tempfile
++import threading
+ import unittest
+ from collections import namedtuple
+ 
+@@ -28,6 +31,7 @@ import yaml
+ from six import PY3, next
+ 
+ from kubernetes.client import Configuration
++from kubernetes.client.rest import RESTClientObject
+ 
+ from .config_exception import ConfigException
+ from .dateutil import format_rfc3339, parse_rfc3339
+@@ -102,7 +106,7 @@ TEST_CLIENT_KEY = "client-key"
+ TEST_CLIENT_KEY_BASE64 = _base64(TEST_CLIENT_KEY)
+ TEST_CLIENT_CERT = "client-cert"
+ TEST_CLIENT_CERT_BASE64 = _base64(TEST_CLIENT_CERT)
+-
++TEST_TLS_SERVER_NAME = "kubernetes.io"
+ 
+ TEST_OIDC_TOKEN = "test-oidc-token"
+ TEST_OIDC_INFO = "{\"name\": \"test\"}"
+@@ -592,7 +596,14 @@ class TestKubeConfigLoader(BaseTestCase):
+                     "cluster": "clustertestcmdpath",
+                     "user": "usertestcmdpathscope"
+                 }
+-            }
++            },
++            {
++                "name": "tls-server-name",
++                "context": {
++                    "cluster": "tls-server-name",
++                    "user": "ssl"
++                }
++            },
+         ],
+         "clusters": [
+             {
+@@ -634,7 +645,17 @@ class TestKubeConfigLoader(BaseTestCase):
+             {
+                 "name": "clustertestcmdpath",
+                 "cluster": {}
+-            }
++            },
++            {
++                "name": "tls-server-name",
++                "cluster": {
++                    "server": TEST_SSL_HOST,
++                    "certificate-authority-data":
++                        TEST_CERTIFICATE_AUTH_BASE64,
++                    "insecure-skip-tls-verify": False,
++                    "tls-server-name": TEST_TLS_SERVER_NAME,
++                }
++            },
+         ],
+         "users": [
+             {
+@@ -1251,6 +1272,103 @@ class TestKubeConfigLoader(BaseTestCase):
+             active_context="no_ssl_verification").load_and_set(actual)
+         self.assertEqual(expected, actual)
+ 
++    def test_tls_server_name(self):
++        expected = FakeConfig(
++            host=TEST_SSL_HOST,
++            token=BEARER_TOKEN_FORMAT % TEST_DATA_BASE64,
++            cert_file=self._create_temp_file(TEST_CLIENT_CERT),
++            key_file=self._create_temp_file(TEST_CLIENT_KEY),
++            ssl_ca_cert=self._create_temp_file(TEST_CERTIFICATE_AUTH),
++            verify_ssl=True,
++            tls_server_name=TEST_TLS_SERVER_NAME
++        )
++        actual = FakeConfig()
++        KubeConfigLoader(
++            config_dict=self.TEST_KUBE_CONFIG,
++            active_context="tls-server-name").load_and_set(actual)
++        self.assertEqual(expected, actual)
++
++    def test_tls_server_name_is_sent_in_https_handshake(self):
++        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        listener.bind(('127.0.0.1', 0))
++        listener.listen(1)
++        listener.settimeout(3)
++        request_url = 'https://127.0.0.1:%d' % listener.getsockname()[1]
++        received = {}
++
++        def capture_client_hello():
++            connection, _ = listener.accept()
++            with connection:
++                connection.settimeout(3)
++                header = connection.recv(5)
++                if len(header) == 5 and header[0] == 22:
++                    record_length = struct.unpack('!H', header[3:5])[0]
++                    record = header
++                    while len(record) < 5 + record_length:
++                        chunk = connection.recv(5 + record_length - len(record))
++                        if not chunk:
++                            break
++                        record += chunk
++                    received['record'] = record
++                else:
++                    received['record'] = header
++
++        server = threading.Thread(target=capture_client_hello)
++        server.daemon = True
++        server.start()
++
++        actual = Configuration()
++        KubeConfigLoader(
++            config_dict=self.TEST_KUBE_CONFIG,
++            active_context="tls-server-name").load_and_set(actual)
++        actual.host = request_url
++        actual.verify_ssl = False
++        actual.ssl_ca_cert = None
++        actual.cert_file = None
++        actual.key_file = None
++        actual.retries = 0
++        try:
++            try:
++                RESTClientObject(actual).request(
++                    'GET', request_url, _request_timeout=2)
++            except Exception:
++                # The listener closes after inspecting the ClientHello rather
++                # than completing a TLS session or serving an HTTP response.
++                pass
++        finally:
++            server.join(4)
++            listener.close()
++
++        record = received.get('record', b'')
++        self.assertTrue(record.startswith(b'\x16'))
++        hello = record[5:]
++        self.assertEqual(1, hello[0])  # TLS ClientHello handshake message
++        offset = 4 + 2 + 32  # handshake header, version, and random
++        session_length = hello[offset]
++        offset += 1 + session_length
++        cipher_length = struct.unpack('!H', hello[offset:offset + 2])[0]
++        offset += 2 + cipher_length
++        compression_length = hello[offset]
++        offset += 1 + compression_length
++        extensions_length = struct.unpack('!H', hello[offset:offset + 2])[0]
++        offset += 2
++        extensions_end = offset + extensions_length
++        server_name = None
++        while offset + 4 <= extensions_end:
++            extension_type, extension_length = struct.unpack(
++                '!HH', hello[offset:offset + 4])
++            offset += 4
++            extension = hello[offset:offset + extension_length]
++            offset += extension_length
++            if extension_type == 0:
++                names_length = struct.unpack('!H', extension[:2])[0]
++                name_type = extension[2]
++                name_length = struct.unpack('!H', extension[3:5])[0]
++                if names_length >= 3 + name_length and name_type == 0:
++                    server_name = extension[5:5 + name_length].decode('ascii')
++                    break
++        self.assertEqual(TEST_TLS_SERVER_NAME, server_name)
++
+     def test_list_contexts(self):
+         loader = KubeConfigLoader(
+             config_dict=self.TEST_KUBE_CONFIG,

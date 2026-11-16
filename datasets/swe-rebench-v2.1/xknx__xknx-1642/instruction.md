@@ -1,0 +1,7 @@
+Feature request: Add Fan mode and Swing mode to climate KNX devices
+Hi All,
+Would it be possible to add Fan Mode and Swing Mode to KNX Climate devices? It is supported by Home Assistant in other Climate integrations (e.g. Sensibo Climate). If needed I can help with testing, I have a KNX modules for Mitsubishi A/C units which enable to control all features of the A/C unit including Fan modes and Swing modes. If needed I can also share which DPTs are used to control those modes.
+
+### Additional contract requirements
+
+For climate devices, “fan mode” means the existing selectable fan-speed representation: callers can configure STEP or PERCENT mode, receive the current speed, and set a speed. It does not require a separate collection of named fan presets. Swing and horizontal swing are independently controllable on/off features. When their command and state group addresses are configured, callers can set either feature to on or off, and the corresponding reported state is available through `current_swing` or `current_horizontal_swing`. The climate device exposes these controls as `set_swing(bool)` and `set_horizontal_swing(bool)`. The constructor accepts the command and state addresses as the keyword arguments `group_address_swing` and `group_address_swing_state` for vertical swing, and `group_address_horizontal_swing` and `group_address_horizontal_swing_state` for horizontal swing.

@@ -1,0 +1,199 @@
+diff --git a/couchdb/chttp/chttp.go b/couchdb/chttp/chttp.go
+index 9bc4ebe7..5d439ec0 100644
+--- a/couchdb/chttp/chttp.go
++++ b/couchdb/chttp/chttp.go
+@@ -435,7 +435,9 @@ func ETag(resp *http.Response) (string, bool) {
+ 	return strings.Trim(etag[0], `"`), ok
+ }
+ 
+-// GetRev extracts the revision from the response's Etag header
++// GetRev extracts the revision from the response's Etag header, if found. If
++// not, it falls back to reading the revision from the _rev field of the
++// document itself, then restores resp.Body for re-reading.
+ func GetRev(resp *http.Response) (string, error) {
+ 	rev, ok := ETag(resp)
+ 	if ok {
+diff --git a/couchdb/constants.go b/couchdb/constants.go
+index 43cb1be3..c4f3d7c8 100644
+--- a/couchdb/constants.go
++++ b/couchdb/constants.go
+@@ -18,4 +18,5 @@ const Version = "4.0.0-prerelease"
+ const (
+ 	typeJSON      = "application/json"
+ 	typeMPRelated = "multipart/related"
++	typeMPMixed   = "multipart/mixed"
+ )
+diff --git a/couchdb/db.go b/couchdb/db.go
+index 6e6079b8..6b2b7d1d 100644
+--- a/couchdb/db.go
++++ b/couchdb/db.go
+@@ -191,38 +191,53 @@ func (d *db) Get(ctx context.Context, docID string, options driver.Options) (dri
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return processDoc(docID, resp)
+-}
+-
+-func processDoc(docID string, resp *http.Response) (*document, error) {
+ 	ct, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+ 	if err != nil {
+ 		return nil, &internal.Error{Status: http.StatusBadGateway, Err: err}
+ 	}
++
++	switch ct {
++	case typeJSON, typeMPRelated:
++		etag, _ := chttp.ETag(resp)
++		return processDoc(docID, ct, params["boundary"], etag, resp.Body)
++	case typeMPMixed:
++		boundary := strings.Trim(params["boundary"], "\"")
++		if boundary == "" {
++			return nil, &internal.Error{Status: http.StatusBadGateway, Err: errors.New("kivik: boundary missing for multipart/related response")}
++		}
++		mpReader := multipart.NewReader(resp.Body, boundary)
++		return &multiDocs{
++			id:       docID,
++			respBody: resp.Body,
++			reader:   mpReader,
++		}, nil
++	default:
++		return nil, &internal.Error{Status: http.StatusBadGateway, Err: fmt.Errorf("kivik: invalid content type in response: %s", ct)}
++	}
++}
++
++func processDoc(docID, ct, boundary, rev string, body io.ReadCloser) (*document, error) {
+ 	switch ct {
+ 	case typeJSON:
+-		rev, err := chttp.GetRev(resp)
+-		if err != nil {
+-			return nil, err
++		if rev == "" {
++			var err error
++			body, rev, err = chttp.ExtractRev(body)
++			if err != nil {
++				return nil, err
++			}
+ 		}
+ 
+ 		return &document{
+ 			id:   docID,
+ 			rev:  rev,
+-			body: resp.Body,
++			body: body,
+ 		}, nil
+ 	case typeMPRelated:
+-		// I'm unsure whether it's ever possible to get a multipart/related
+-		// response with no ETag. If this is possible, this needs to be improved
+-		// to parse the JSON part of the mp/related response to extract the rev,
+-		// similar to how chttp.GetRev works.
+-		rev, _ := chttp.ETag(resp)
+-
+-		boundary := strings.Trim(params["boundary"], "\"")
++		boundary := strings.Trim(boundary, "\"")
+ 		if boundary == "" {
+ 			return nil, &internal.Error{Status: http.StatusBadGateway, Err: errors.New("kivik: boundary missing for multipart/related response")}
+ 		}
+-		mpReader := multipart.NewReader(resp.Body, boundary)
++		mpReader := multipart.NewReader(body, boundary)
+ 		body, err := mpReader.NextPart()
+ 		if err != nil {
+ 			return nil, &internal.Error{Status: http.StatusBadGateway, Err: err}
+@@ -233,6 +248,11 @@ func processDoc(docID string, resp *http.Response) (*document, error) {
+ 		if err != nil {
+ 			return nil, &internal.Error{Status: http.StatusBadGateway, Err: err}
+ 		}
++		_, rev, err := chttp.ExtractRev(io.NopCloser(bytes.NewReader(content)))
++		if err != nil {
++			return nil, err
++		}
++
+ 		var metaDoc struct {
+ 			Attachments map[string]attMeta `json:"_attachments"`
+ 		}
+@@ -245,7 +265,7 @@ func processDoc(docID string, resp *http.Response) (*document, error) {
+ 			rev:  rev,
+ 			body: io.NopCloser(bytes.NewBuffer(content)),
+ 			attachments: &multipartAttachments{
+-				content:  resp.Body,
++				content:  body,
+ 				mpReader: mpReader,
+ 				meta:     metaDoc.Attachments,
+ 			},
+@@ -255,6 +275,69 @@ func processDoc(docID string, resp *http.Response) (*document, error) {
+ 	}
+ }
+ 
++type multiDocs struct {
++	id           string
++	respBody     io.Closer
++	reader       *multipart.Reader
++	readerCloser io.Closer
++}
++
++var _ driver.Rows = (*multiDocs)(nil)
++
++func (d *multiDocs) Next(row *driver.Row) error {
++	if d.readerCloser != nil {
++		if err := d.readerCloser.Close(); err != nil {
++			return err
++		}
++		d.readerCloser = nil
++	}
++	part, err := d.reader.NextPart()
++	if err != nil {
++		return err
++	}
++	ct, params, err := mime.ParseMediaType(part.Header.Get("Content-Type"))
++	if err != nil {
++		return err
++	}
++
++	if _, ok := params["error"]; ok {
++		var body struct {
++			Rev string `json:"missing"`
++		}
++		err := json.NewDecoder(part).Decode(&body)
++		row.ID = d.id
++		row.Error = &internal.Error{Status: http.StatusNotFound, Err: errors.New("missing")}
++		row.Rev = body.Rev
++		return err
++	}
++
++	doc, err := processDoc(d.id, ct, params["boundary"], "", part)
++	if err != nil {
++		return err
++	}
++
++	row.ID = doc.id
++	row.Doc = doc.body
++	row.Rev = doc.rev
++	row.Attachments = doc.attachments
++
++	return nil
++}
++
++func (d *multiDocs) Close() error {
++	if d.readerCloser != nil {
++		if err := d.readerCloser.Close(); err != nil {
++			return err
++		}
++		d.readerCloser = nil
++	}
++	return d.respBody.Close()
++}
++
++func (*multiDocs) UpdateSeq() string { return "" }
++func (*multiDocs) Offset() int64     { return 0 }
++func (*multiDocs) TotalRows() int64  { return 0 }
++
+ type attMeta struct {
+ 	ContentType string `json:"content_type"`
+ 	Size        *int64 `json:"length"`
+@@ -356,7 +439,7 @@ func (d *db) get(ctx context.Context, method, docID string, options driver.Optio
+ 
+ 	chttpOpts := chttp.NewOptions(options)
+ 
+-	chttpOpts.Accept = typeMPRelated + "," + typeJSON
++	chttpOpts.Accept = strings.Join([]string{typeMPMixed, typeMPRelated, typeJSON}, ", ")
+ 	var err error
+ 	chttpOpts.Query, err = optionsToParams(opts)
+ 	if err != nil {

@@ -1,0 +1,248 @@
+diff --git a/app/src/main/java/org/astraea/app/web/BeanHandler.java b/app/src/main/java/org/astraea/app/web/BeanHandler.java
+index 1eddecd2..9c19f25b 100644
+--- a/app/src/main/java/org/astraea/app/web/BeanHandler.java
++++ b/app/src/main/java/org/astraea/app/web/BeanHandler.java
+@@ -17,6 +17,7 @@
+ package org.astraea.app.web;
+ 
+ import java.util.List;
++import java.util.Optional;
+ import java.util.concurrent.CompletionStage;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+@@ -27,9 +28,9 @@ import org.astraea.common.metrics.MBeanClient;
+ 
+ public class BeanHandler implements Handler {
+   private final Admin admin;
+-  private final Function<String, Integer> jmxPorts;
++  private final Function<Integer, Optional<Integer>> jmxPorts;
+ 
+-  BeanHandler(Admin admin, Function<String, Integer> jmxPorts) {
++  BeanHandler(Admin admin, Function<Integer, Optional<Integer>> jmxPorts) {
+     this.admin = admin;
+     this.jmxPorts = jmxPorts;
+   }
+@@ -42,7 +43,12 @@ public class BeanHandler implements Handler {
+         .thenApply(
+             brokers ->
+                 brokers.stream()
+-                    .map(b -> MBeanClient.jndi(b.host(), jmxPorts.apply(b.host())))
++                    .flatMap(
++                        b ->
++                            jmxPorts
++                                .apply(b.id())
++                                .map(port -> MBeanClient.jndi(b.host(), port))
++                                .stream())
+                     .collect(Collectors.toList()))
+         .thenApply(
+             clients ->
+diff --git a/app/src/main/java/org/astraea/app/web/RecordHandler.java b/app/src/main/java/org/astraea/app/web/RecordHandler.java
+index afd91b25..9394f494 100644
+--- a/app/src/main/java/org/astraea/app/web/RecordHandler.java
++++ b/app/src/main/java/org/astraea/app/web/RecordHandler.java
+@@ -34,6 +34,7 @@ import java.util.stream.Collectors;
+ import org.astraea.common.Cache;
+ import org.astraea.common.EnumInfo;
+ import org.astraea.common.FutureUtils;
++import org.astraea.common.Lazy;
+ import org.astraea.common.Utils;
+ import org.astraea.common.admin.Admin;
+ import org.astraea.common.admin.Partition;
+@@ -64,23 +65,26 @@ public class RecordHandler implements Handler {
+   private static final int MAX_CACHE_SIZE = 100;
+   private static final Duration CACHE_EXPIRE_DURATION = Duration.ofMinutes(10);
+ 
+-  final String bootstrapServers;
+   // visible for testing
+-  final Producer<byte[], byte[]> producer;
++  final Lazy<Producer<byte[], byte[]>> producer;
+   private final Cache<String, Producer<byte[], byte[]>> transactionalProducerCache;
+ 
+   final Admin admin;
+ 
+-  RecordHandler(Admin admin, String bootstrapServers) {
++  RecordHandler(Admin admin) {
+     this.admin = admin;
+-    this.bootstrapServers = requireNonNull(bootstrapServers);
+-    this.producer = Producer.builder().bootstrapServers(bootstrapServers).build();
++    this.producer =
++        Lazy.of(
++            () ->
++                Producer.builder()
++                    .bootstrapServers(admin.bootstrapServers().toCompletableFuture().join())
++                    .build());
+     this.transactionalProducerCache =
+         Cache.<String, Producer<byte[], byte[]>>builder(
+                 transactionId ->
+                     Producer.builder()
+                         .config(ProducerConfigs.TRANSACTIONAL_ID_CONFIG, transactionId)
+-                        .bootstrapServers(bootstrapServers)
++                        .bootstrapServers(admin.bootstrapServers().toCompletableFuture().join())
+                         .buildTransactional())
+             .maxCapacity(MAX_CACHE_SIZE)
+             .expireAfterAccess(CACHE_EXPIRE_DURATION)
+@@ -133,7 +137,7 @@ public class RecordHandler implements Handler {
+             .orElse(SerDe.STRING)
+             .deserializer;
+     consumerBuilder
+-        .bootstrapServers(bootstrapServers)
++        .bootstrapServers(admin.bootstrapServers().toCompletableFuture().join())
+         .keyDeserializer(keyDeserializer)
+         .valueDeserializer(valueDeserializer);
+ 
+@@ -176,7 +180,10 @@ public class RecordHandler implements Handler {
+       throw new IllegalArgumentException("records should contain at least one record");
+ 
+     var producer =
+-        postRequest.transactionId().map(transactionalProducerCache::get).orElse(this.producer);
++        postRequest
++            .transactionId()
++            .map(transactionalProducerCache::get)
++            .orElse(this.producer.get());
+ 
+     var result =
+         CompletableFuture.supplyAsync(
+diff --git a/app/src/main/java/org/astraea/app/web/WebService.java b/app/src/main/java/org/astraea/app/web/WebService.java
+index edf7264d..6da19831 100644
+--- a/app/src/main/java/org/astraea/app/web/WebService.java
++++ b/app/src/main/java/org/astraea/app/web/WebService.java
+@@ -19,41 +19,73 @@ package org.astraea.app.web;
+ import com.beust.jcommander.Parameter;
+ import com.sun.net.httpserver.HttpHandler;
+ import com.sun.net.httpserver.HttpServer;
+-import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.time.Duration;
+ import java.util.Map;
+-import java.util.NoSuchElementException;
+ import java.util.Optional;
++import java.util.concurrent.TimeUnit;
+ import java.util.function.Function;
++import org.astraea.common.Utils;
+ import org.astraea.common.admin.Admin;
++import org.astraea.common.argument.DurationField;
+ import org.astraea.common.argument.NonNegativeIntegerField;
+ import org.astraea.common.argument.StringMapField;
+ 
+-public class WebService {
++public class WebService implements AutoCloseable {
+ 
+-  public static void main(String[] args) throws Exception {
+-    execute(org.astraea.common.argument.Argument.parse(new Argument(), args));
+-  }
++  private final HttpServer server;
++  private final Admin admin;
+ 
+-  private static void execute(Argument arg) throws IOException {
+-    var server = HttpServer.create(new InetSocketAddress(arg.port), 0);
+-    server.createContext("/topics", to(new TopicHandler(Admin.of(arg.configs()))));
+-    server.createContext("/groups", to(new GroupHandler(Admin.of(arg.configs()))));
+-    server.createContext("/brokers", to(new BrokerHandler(Admin.of(arg.configs()))));
+-    server.createContext("/producers", to(new ProducerHandler(Admin.of(arg.configs()))));
+-    server.createContext("/quotas", to(new QuotaHandler(Admin.of(arg.configs()))));
+-    server.createContext("/transactions", to(new TransactionHandler(Admin.of(arg.configs()))));
+-    if (arg.needJmx())
+-      server.createContext("/beans", to(new BeanHandler(Admin.of(arg.configs()), arg.jmxPorts())));
+-    server.createContext(
+-        "/records", to(new RecordHandler(Admin.of(arg.configs()), arg.bootstrapServers())));
+-    server.createContext("/reassignments", to(new ReassignmentHandler(Admin.of(arg.configs()))));
+-    server.createContext(
+-        "/balancer", to(new BalancerHandler(Admin.of(arg.configs()), arg.brokerJmxPorts())));
+-    server.createContext("/throttles", to(new ThrottleHandler(Admin.of(arg.configs()))));
++  public WebService(Admin admin, int port, Function<Integer, Optional<Integer>> brokerIdToJmxPort) {
++    this.admin = admin;
++    server = Utils.packException(() -> HttpServer.create(new InetSocketAddress(port), 0));
++    server.createContext("/topics", to(new TopicHandler(admin)));
++    server.createContext("/groups", to(new GroupHandler(admin)));
++    server.createContext("/brokers", to(new BrokerHandler(admin)));
++    server.createContext("/producers", to(new ProducerHandler(admin)));
++    server.createContext("/quotas", to(new QuotaHandler(admin)));
++    server.createContext("/transactions", to(new TransactionHandler(admin)));
++    server.createContext("/beans", to(new BeanHandler(admin, brokerIdToJmxPort)));
++    server.createContext("/records", to(new RecordHandler(admin)));
++    server.createContext("/reassignments", to(new ReassignmentHandler(admin)));
++    server.createContext("/balancer", to(new BalancerHandler(admin, brokerIdToJmxPort)));
++    server.createContext("/throttles", to(new ThrottleHandler(admin)));
+     server.start();
+   }
+ 
++  public int port() {
++    return server.getAddress().getPort();
++  }
++
++  @Override
++  public void close() {
++    Utils.swallowException(admin::close);
++    server.stop(3);
++  }
++
++  public static void main(String[] args) throws Exception {
++    var arg = org.astraea.common.argument.Argument.parse(new Argument(), args);
++    Function<Integer, Optional<Integer>> brokerIdToPort =
++        id -> {
++          var r = Optional.ofNullable(arg.jmxPorts.get(String.valueOf(id))).map(Integer::parseInt);
++          if (r.isPresent()) return r;
++          if (arg.jmxPort > 0) return Optional.of(arg.jmxPort);
++          return Optional.empty();
++        };
++    try (var service = new WebService(Admin.of(arg.configs()), arg.port, brokerIdToPort)) {
++      if (arg.ttl == null) {
++        System.out.println("enter ctrl + c to terminate web service");
++        TimeUnit.MILLISECONDS.sleep(Long.MAX_VALUE);
++      } else {
++        System.out.println(
++            "this web service will get terminated automatically after "
++                + arg.ttl.toSeconds()
++                + " seconds");
++        TimeUnit.MILLISECONDS.sleep(arg.ttl.toMillis());
++      }
++    }
++  }
++
+   private static HttpHandler to(Handler handler) {
+     return exchange -> handler.handle(Channel.of(exchange));
+   }
+@@ -75,36 +107,17 @@ public class WebService {
+ 
+     @Parameter(
+         names = {"--jmx.ports"},
+-        description = "Map: the JMX port for each node. For example: 192.168.50.2=19999",
+-        validateWith = StringMapField.class,
+-        converter = StringMapField.class)
+-    Map<String, String> jmxPorts = Map.of();
+-
+-    @Parameter(
+-        names = {"--broker.jmx.ports"},
+         description =
+             "Map: the JMX port for each broker. For example: 1024=19999 means for the broker with id 1024, its JMX port located at 19999 port",
+         validateWith = StringMapField.class,
+         converter = StringMapField.class)
+-    Map<String, String> brokerJmxPorts = Map.of();
+-
+-    boolean needJmx() {
+-      return jmxPort > 0 || !jmxPorts.isEmpty();
+-    }
+-
+-    Function<String, Integer> jmxPorts() {
+-      return name ->
+-          Optional.of(jmxPorts.getOrDefault(name, String.valueOf(jmxPort)))
+-              .map(Integer::valueOf)
+-              .filter(i -> i > 0)
+-              .orElseThrow(() -> new NoSuchElementException(name + " has no jmx port"));
+-    }
++    Map<String, String> jmxPorts = Map.of();
+ 
+-    Function<Integer, Optional<Integer>> brokerJmxPorts() {
+-      return broker ->
+-          Optional.of(brokerJmxPorts.getOrDefault(String.valueOf(broker), String.valueOf(jmxPort)))
+-              .map(Integer::valueOf)
+-              .filter(i -> i > 0);
+-    }
++    @Parameter(
++        names = {"--ttl"},
++        description = "Duration: the life of web service",
++        validateWith = DurationField.class,
++        converter = DurationField.class)
++    Duration ttl = null;
+   }
+ }

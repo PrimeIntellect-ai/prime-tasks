@@ -1,0 +1,217 @@
+diff --git a/ci/code_checks.sh b/ci/code_checks.sh
+index 255e680d8d..59cbc075b5 100755
+--- a/ci/code_checks.sh
++++ b/ci/code_checks.sh
+@@ -70,10 +70,8 @@ if [[ -z "$CHECK" || "$CHECK" == "docstrings" ]]; then
+         --format=actions \
+         -i ES01 `# For now it is ok if docstrings are missing the extended summary` \
+         -i "pandas.Series.dt PR01" `# Accessors are implemented as classes, but we do not document the Parameters section` \
+-        -i "pandas.Grouper PR02" \
+         -i "pandas.MultiIndex.append PR07,SA01" \
+         -i "pandas.MultiIndex.copy PR07,RT03,SA01" \
+-        -i "pandas.MultiIndex.drop PR07,RT03,SA01" \
+         -i "pandas.MultiIndex.get_level_values SA01" \
+         -i "pandas.MultiIndex.get_loc PR07" \
+         -i "pandas.MultiIndex.get_loc_level PR07" \
+diff --git a/doc/source/whatsnew/v3.0.0.rst b/doc/source/whatsnew/v3.0.0.rst
+index cc7706741e..ba6636cb42 100644
+--- a/doc/source/whatsnew/v3.0.0.rst
++++ b/doc/source/whatsnew/v3.0.0.rst
+@@ -509,6 +509,7 @@ Datetimelike
+ - Bug in :meth:`DatetimeIndex.is_year_start` and :meth:`DatetimeIndex.is_quarter_start` returning ``False`` on double-digit frequencies (:issue:`58523`)
+ - Bug in :meth:`DatetimeIndex.union` when ``unit`` was non-nanosecond (:issue:`59036`)
+ - Bug in :meth:`Series.dt.microsecond` producing incorrect results for pyarrow backed :class:`Series`. (:issue:`59154`)
++- Bug in :meth:`to_datetime` not respecting dayfirst if an uncommon date string was passed. (:issue:`58859`)
+ - Bug in setting scalar values with mismatched resolution into arrays with non-nanosecond ``datetime64``, ``timedelta64`` or :class:`DatetimeTZDtype` incorrectly truncating those scalars (:issue:`56410`)
+ 
+ Timedelta
+diff --git a/pandas/_libs/tslibs/conversion.pyx b/pandas/_libs/tslibs/conversion.pyx
+index 3a55f5fa0c..0fadbbbed2 100644
+--- a/pandas/_libs/tslibs/conversion.pyx
++++ b/pandas/_libs/tslibs/conversion.pyx
+@@ -606,37 +606,42 @@ cdef _TSObject convert_str_to_tsobject(str ts, tzinfo tz,
+         # equiv: datetime.today().replace(tzinfo=tz)
+         return convert_datetime_to_tsobject(dt, tz, nanos=0, reso=NPY_FR_us)
+     else:
+-        string_to_dts_failed = string_to_dts(
+-            ts, &dts, &out_bestunit, &out_local,
+-            &out_tzoffset, False
+-        )
+-        if not string_to_dts_failed:
+-            reso = get_supported_reso(out_bestunit)
+-            check_dts_bounds(&dts, reso)
+-            obj = _TSObject()
+-            obj.dts = dts
+-            obj.creso = reso
+-            ival = npy_datetimestruct_to_datetime(reso, &dts)
+-
+-            if out_local == 1:
+-                obj.tzinfo = timezone(timedelta(minutes=out_tzoffset))
+-                obj.value = tz_localize_to_utc_single(
+-                    ival, obj.tzinfo, ambiguous="raise", nonexistent=None, creso=reso
+-                )
+-                if tz is None:
+-                    check_overflows(obj, reso)
+-                    return obj
+-                _adjust_tsobject_tz_using_offset(obj, tz)
+-                return  obj
+-            else:
+-                if tz is not None:
+-                    # shift for _localize_tso
+-                    ival = tz_localize_to_utc_single(
+-                        ival, tz, ambiguous="raise", nonexistent=None, creso=reso
++        if not dayfirst:  # GH 58859
++            string_to_dts_failed = string_to_dts(
++                ts, &dts, &out_bestunit, &out_local,
++                &out_tzoffset, False
++            )
++            if not string_to_dts_failed:
++                reso = get_supported_reso(out_bestunit)
++                check_dts_bounds(&dts, reso)
++                obj = _TSObject()
++                obj.dts = dts
++                obj.creso = reso
++                ival = npy_datetimestruct_to_datetime(reso, &dts)
++
++                if out_local == 1:
++                    obj.tzinfo = timezone(timedelta(minutes=out_tzoffset))
++                    obj.value = tz_localize_to_utc_single(
++                        ival,
++                        obj.tzinfo,
++                        ambiguous="raise",
++                        nonexistent=None,
++                        creso=reso,
+                     )
+-                obj.value = ival
+-                maybe_localize_tso(obj, tz, obj.creso)
+-                return obj
++                    if tz is None:
++                        check_overflows(obj, reso)
++                        return obj
++                    _adjust_tsobject_tz_using_offset(obj, tz)
++                    return  obj
++                else:
++                    if tz is not None:
++                        # shift for _localize_tso
++                        ival = tz_localize_to_utc_single(
++                            ival, tz, ambiguous="raise", nonexistent=None, creso=reso
++                        )
++                    obj.value = ival
++                    maybe_localize_tso(obj, tz, obj.creso)
++                    return obj
+ 
+         dt = parse_datetime_string(
+             ts,
+diff --git a/pandas/_libs/tslibs/parsing.pyx b/pandas/_libs/tslibs/parsing.pyx
+index 35d2433a70..3081834021 100644
+--- a/pandas/_libs/tslibs/parsing.pyx
++++ b/pandas/_libs/tslibs/parsing.pyx
+@@ -377,32 +377,33 @@ def parse_datetime_string_with_reso(
+         raise ValueError(f'Given date string "{date_string}" not likely a datetime')
+ 
+     # Try iso8601 first, as it handles nanoseconds
+-    string_to_dts_failed = string_to_dts(
+-        date_string, &dts, &out_bestunit, &out_local,
+-        &out_tzoffset, False
+-    )
+-    if not string_to_dts_failed:
+-        # Match Timestamp and drop picoseconds, femtoseconds, attoseconds
+-        # The new resolution will just be nano
+-        # GH#50417
+-        if out_bestunit in _timestamp_units:
+-            out_bestunit = NPY_DATETIMEUNIT.NPY_FR_ns
+-
+-        if out_bestunit == NPY_DATETIMEUNIT.NPY_FR_ns:
+-            # TODO: avoid circular import
+-            from pandas import Timestamp
+-            parsed = Timestamp(date_string)
+-        else:
+-            if out_local:
+-                tz = timezone(timedelta(minutes=out_tzoffset))
++    if not dayfirst:  # GH 58859
++        string_to_dts_failed = string_to_dts(
++            date_string, &dts, &out_bestunit, &out_local,
++            &out_tzoffset, False
++        )
++        if not string_to_dts_failed:
++            # Match Timestamp and drop picoseconds, femtoseconds, attoseconds
++            # The new resolution will just be nano
++            # GH#50417
++            if out_bestunit in _timestamp_units:
++                out_bestunit = NPY_DATETIMEUNIT.NPY_FR_ns
++
++            if out_bestunit == NPY_DATETIMEUNIT.NPY_FR_ns:
++                # TODO: avoid circular import
++                from pandas import Timestamp
++                parsed = Timestamp(date_string)
+             else:
+-                tz = None
+-            parsed = datetime_new(
+-                dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.us, tz
+-            )
++                if out_local:
++                    tz = timezone(timedelta(minutes=out_tzoffset))
++                else:
++                    tz = None
++                parsed = datetime_new(
++                    dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.us, tz
++                )
+ 
+-        reso = npy_unit_to_attrname[out_bestunit]
+-        return parsed, reso
++            reso = npy_unit_to_attrname[out_bestunit]
++            return parsed, reso
+ 
+     parsed = _parse_delimited_date(date_string, dayfirst, &out_bestunit)
+     if parsed is not None:
+diff --git a/pandas/core/groupby/grouper.py b/pandas/core/groupby/grouper.py
+index 5f680de776..5f9ebdcea4 100644
+--- a/pandas/core/groupby/grouper.py
++++ b/pandas/core/groupby/grouper.py
+@@ -72,6 +72,9 @@ class Grouper:
+         Currently unused, reserved for future use.
+     **kwargs
+         Dictionary of the keyword arguments to pass to Grouper.
++
++    Attributes
++    ----------
+     key : str, defaults to None
+         Groupby key, which selects the grouping column of the target.
+     level : name/number, defaults to None
+diff --git a/pandas/core/indexes/multi.py b/pandas/core/indexes/multi.py
+index 19c94fa410..ee24e485a9 100644
+--- a/pandas/core/indexes/multi.py
++++ b/pandas/core/indexes/multi.py
+@@ -2316,16 +2316,32 @@ class MultiIndex(Index):
+         """
+         Make a new :class:`pandas.MultiIndex` with the passed list of codes deleted.
+ 
++        This method allows for the removal of specified labels from a MultiIndex.
++        The labels to be removed can be provided as a list of tuples if no level
++        is specified, or as a list of labels from a specific level if the level
++        parameter is provided. This can be useful for refining the structure of a
++        MultiIndex to fit specific requirements.
++
+         Parameters
+         ----------
+         codes : array-like
+             Must be a list of tuples when ``level`` is not specified.
+         level : int or level name, default None
++            Level from which the labels will be dropped.
+         errors : str, default 'raise'
++            If 'ignore', suppress error and existing labels are dropped.
+ 
+         Returns
+         -------
+         MultiIndex
++            A new MultiIndex with the specified labels removed.
++
++        See Also
++        --------
++        MultiIndex.remove_unused_levels : Create new MultiIndex from current that
++            removes unused levels.
++        MultiIndex.reorder_levels : Rearrange levels using input order.
++        MultiIndex.rename : Rename levels in a MultiIndex.
+ 
+         Examples
+         --------

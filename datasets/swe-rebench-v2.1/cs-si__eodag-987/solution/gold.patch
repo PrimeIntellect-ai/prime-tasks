@@ -1,0 +1,422 @@
+diff --git a/eodag/api/core.py b/eodag/api/core.py
+index 5bd91ddc..a7a08e78 100644
+--- a/eodag/api/core.py
++++ b/eodag/api/core.py
+@@ -83,6 +83,7 @@ from eodag.utils.exceptions import (
+ from eodag.utils.stac_reader import fetch_stac_items
+ 
+ if TYPE_CHECKING:
++    from pydantic.fields import FieldInfo
+     from shapely.geometry.base import BaseGeometry
+     from whoosh.index import Index
+ 
+@@ -2086,7 +2087,7 @@ class EODataAccessGateway:
+         self,
+         provider: Optional[str] = None,
+         product_type: Optional[str] = None,
+-    ) -> Dict[str, Tuple[Annotated, Any]]:
++    ) -> Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]:
+         """Fetch the queryable properties for a given product type and/or provider.
+ 
+         :param provider: (optional) The provider.
+@@ -2096,7 +2097,7 @@ class EODataAccessGateway:
+         :returns: A dict containing the EODAG queryable properties, associating
+                   parameters to a tuple containing their annotaded type and default
+                   value
+-        :rtype: Dict[str, Tuple[Annotated, Any]]
++        :rtype: Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]
+         """
+         # unknown product type
+         if product_type is not None and product_type not in self.list_product_types(
+@@ -2106,7 +2107,7 @@ class EODataAccessGateway:
+ 
+         # dictionary of the queryable properties of the providers supporting the given product type
+         providers_available_queryables: Dict[
+-            str, Dict[str, Tuple[Annotated, Any]]
++            str, Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]
+         ] = dict()
+ 
+         if provider is None and product_type is None:
+diff --git a/eodag/config.py b/eodag/config.py
+index 237ad87c..bba53bad 100644
+--- a/eodag/config.py
++++ b/eodag/config.py
+@@ -20,8 +20,8 @@ from __future__ import annotations
+ import logging
+ import os
+ import tempfile
++from inspect import isclass
+ from typing import (
+-    TYPE_CHECKING,
+     Any,
+     Dict,
+     ItemsView,
+@@ -32,6 +32,7 @@ from typing import (
+     TypedDict,
+     Union,
+     ValuesView,
++    get_type_hints,
+ )
+ 
+ import orjson
+@@ -39,13 +40,16 @@ import requests
+ import yaml
+ import yaml.constructor
+ import yaml.parser
++from jsonpath_ng import JSONPath
+ from pkg_resources import resource_filename
++from requests.auth import AuthBase
+ 
+ from eodag.utils import (
+     HTTP_REQ_TIMEOUT,
+     USER_AGENT,
+     cached_yaml_load,
+     cached_yaml_load_all,
++    cast_scalar_value,
+     deepcopy,
+     dict_items_recursive_apply,
+     merge_mappings,
+@@ -56,10 +60,6 @@ from eodag.utils import (
+ )
+ from eodag.utils.exceptions import ValidationError
+ 
+-if TYPE_CHECKING:
+-    from jsonpath_ng import JSONPath
+-    from requests.auth import AuthBase
+-
+ logger = logging.getLogger("eodag.config")
+ 
+ EXT_PRODUCT_TYPES_CONF_URI = (
+@@ -250,7 +250,7 @@ class PluginConfig(yaml.YAMLObject):
+     need_auth: bool
+     result_type: str
+     results_entry: str
+-    pagination: Pagination
++    pagination: PluginConfig.Pagination
+     query_params_key: str
+     discover_metadata: Dict[str, str]
+     discover_product_types: Dict[str, Any]
+@@ -266,7 +266,7 @@ class PluginConfig(yaml.YAMLObject):
+     merge_responses: bool  # PostJsonSearch for aws_eos
+     collection: bool  # PostJsonSearch for aws_eos
+     max_connections: int  # StaticStacSearch
+-    timeout: int  # StaticStacSearch
++    timeout: float  # StaticStacSearch
+ 
+     # download -------------------------------------------------------------------------
+     base_uri: str
+@@ -275,7 +275,7 @@ class PluginConfig(yaml.YAMLObject):
+     order_enabled: bool  # HTTPDownload
+     order_method: str  # HTTPDownload
+     order_headers: Dict[str, str]  # HTTPDownload
+-    order_status_on_success: OrderStatusOnSuccess
++    order_status_on_success: PluginConfig.OrderStatusOnSuccess
+     bucket_path_level: int  # S3RestDownload
+ 
+     # auth -----------------------------------------------------------------------------
+@@ -471,13 +471,38 @@ def override_config_from_env(config: Dict[str, Any]) -> None:
+         :type mapping: dict
+         """
+         parts = env_var.split("__")
+-        if len(parts) == 1:
++        iter_parts = iter(parts)
++        env_type = get_type_hints(PluginConfig).get(next(iter_parts, ""), str)
++        child_env_type = (
++            get_type_hints(env_type).get(next(iter_parts, ""), None)
++            if isclass(env_type)
++            else None
++        )
++        if len(parts) == 2 and child_env_type:
++            # for nested config (pagination, ...)
++            # try converting env_value type from type hints
++            try:
++                env_value = cast_scalar_value(env_value, child_env_type)
++            except TypeError:
++                logger.warning(
++                    f"Could not convert {parts} value {env_value} to {child_env_type}"
++                )
++            mapping.setdefault(parts[0], {})
++            mapping[parts[0]][parts[1]] = env_value
++        elif len(parts) == 1:
++            # try converting env_value type from type hints
++            try:
++                env_value = cast_scalar_value(env_value, env_type)
++            except TypeError:
++                logger.warning(
++                    f"Could not convert {parts[0]} value {env_value} to {env_type}"
++                )
+             mapping[parts[0]] = env_value
+         else:
+             new_map = mapping.setdefault(parts[0], {})
+             build_mapping_from_env("__".join(parts[1:]), env_value, new_map)
+ 
+-    mapping_from_env = {}
++    mapping_from_env: Dict[str, Any] = {}
+     for env_var in os.environ:
+         if env_var.startswith("EODAG__"):
+             build_mapping_from_env(
+@@ -500,7 +525,6 @@ def override_config_from_mapping(
+     :type mapping: dict
+     """
+     for provider, new_conf in mapping.items():
+-        new_conf: Dict[str, Any]
+         old_conf: Optional[Dict[str, Any]] = config.get(provider)
+         if old_conf is not None:
+             old_conf.update(new_conf)
+diff --git a/eodag/plugins/apis/base.py b/eodag/plugins/apis/base.py
+index cd65bb26..ab7f1497 100644
+--- a/eodag/plugins/apis/base.py
++++ b/eodag/plugins/apis/base.py
+@@ -21,6 +21,8 @@ import logging
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+ 
+ if TYPE_CHECKING:
++    from pydantic.fields import FieldInfo
++
+     from eodag.api.product import EOProduct
+     from eodag.api.search_result import SearchResult
+     from eodag.config import PluginConfig
+@@ -95,7 +97,7 @@ class Api(PluginTopic):
+ 
+     def discover_queryables(
+         self, product_type: Optional[str] = None
+-    ) -> Optional[Dict[str, Tuple[Annotated, Any]]]:
++    ) -> Optional[Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]]:
+         """Fetch queryables list from provider using `discover_queryables` conf"""
+         return None
+ 
+diff --git a/eodag/plugins/apis/usgs.py b/eodag/plugins/apis/usgs.py
+index 69443435..b306f2e3 100644
+--- a/eodag/plugins/apis/usgs.py
++++ b/eodag/plugins/apis/usgs.py
+@@ -327,7 +327,9 @@ class UsgsApi(Download, Api):
+                         stream.raise_for_status()
+                     except RequestException as e:
+                         if e.response and hasattr(e.response, "content"):
+-                            error_message = f"{e.response.content} - {e}"
++                            error_message = (
++                                f"{e.response.content.decode('utf-8')} - {e}"
++                            )
+                         else:
+                             error_message = str(e)
+                         raise NotAvailableError(error_message)
+@@ -341,7 +343,7 @@ class UsgsApi(Download, Api):
+                                     progress_callback(len(chunk))
+             except requests.exceptions.Timeout as e:
+                 if e.response and hasattr(e.response, "content"):
+-                    error_message = f"{e.response.content} - {e}"
++                    error_message = f"{e.response.content.decode('utf-8')} - {e}"
+                 else:
+                     error_message = str(e)
+                 raise NotAvailableError(error_message)
+diff --git a/eodag/plugins/download/http.py b/eodag/plugins/download/http.py
+index 2d419fcf..0f5515c6 100644
+--- a/eodag/plugins/download/http.py
++++ b/eodag/plugins/download/http.py
+@@ -104,7 +104,9 @@ class HTTPDownload(Download):
+         super(HTTPDownload, self).__init__(provider, config)
+         if not hasattr(self.config, "base_uri"):
+             raise MisconfiguredError(
+-                "{} plugin require a base_uri configuration key".format(self.__name__)
++                "{} plugin require a base_uri configuration key".format(
++                    type(self).__name__
++                )
+             )
+ 
+     def orderDownload(
+@@ -166,10 +168,14 @@ class HTTPDownload(Download):
+                 logger.debug(ordered_message)
+                 logger.info("%s was ordered", product.properties["title"])
+             except RequestException as e:
++                if e.response and hasattr(e.response, "content"):
++                    error_message = f"{e.response.content.decode('utf-8')} - {e}"
++                else:
++                    error_message = str(e)
+                 logger.warning(
+                     "%s could not be ordered, request returned %s",
+                     product.properties["title"],
+-                    f"{e.response.content} - {e}",
++                    error_message,
+                 )
+ 
+         order_metadata_mapping = getattr(self.config, "order_on_response", {}).get(
+@@ -177,9 +183,8 @@ class HTTPDownload(Download):
+         )
+         if order_metadata_mapping:
+             logger.debug("Parsing order response to update product metada-mapping")
+-            order_metadata_mapping_jsonpath = {}
+             order_metadata_mapping_jsonpath = mtd_cfg_as_conversion_and_querypath(
+-                order_metadata_mapping, order_metadata_mapping_jsonpath
++                order_metadata_mapping,
+             )
+             properties_update = properties_from_json(
+                 response.json(),
+diff --git a/eodag/plugins/search/base.py b/eodag/plugins/search/base.py
+index 02420873..fed7ca11 100644
+--- a/eodag/plugins/search/base.py
++++ b/eodag/plugins/search/base.py
+@@ -33,6 +33,8 @@ from eodag.utils import (
+ )
+ 
+ if TYPE_CHECKING:
++    from pydantic.fields import FieldInfo
++
+     from eodag.api.product import EOProduct
+     from eodag.config import PluginConfig
+     from eodag.utils import Annotated
+@@ -90,7 +92,7 @@ class Search(PluginTopic):
+ 
+     def discover_queryables(
+         self, product_type: Optional[str] = None
+-    ) -> Optional[Dict[str, Tuple[Annotated, Any]]]:
++    ) -> Optional[Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]]:
+         """Fetch queryables list from provider using `discover_queryables` conf"""
+         return None
+ 
+diff --git a/eodag/plugins/search/qssearch.py b/eodag/plugins/search/qssearch.py
+index ea7a8cc4..f398b44b 100644
+--- a/eodag/plugins/search/qssearch.py
++++ b/eodag/plugins/search/qssearch.py
+@@ -1270,7 +1270,7 @@ class StacSearch(PostJsonSearch):
+ 
+     def discover_queryables(
+         self, product_type: Optional[str] = None
+-    ) -> Optional[Dict[str, Tuple[Annotated, Any]]]:
++    ) -> Optional[Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]]:
+         """Fetch queryables list from provider using `discover_queryables` conf
+ 
+         :param product_type: (optional) product type
+diff --git a/eodag/rest/types/stac_queryables.py b/eodag/rest/types/stac_queryables.py
+index 6a4139fe..e395ea97 100644
+--- a/eodag/rest/types/stac_queryables.py
++++ b/eodag/rest/types/stac_queryables.py
+@@ -17,13 +17,16 @@
+ # limitations under the License.
+ from __future__ import annotations
+ 
+-from typing import Any, Dict, List, Optional, Tuple, Union
++from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+ 
+ from pydantic import BaseModel, Field
+ 
+ from eodag.types import python_field_definition_to_json
+ from eodag.utils import Annotated
+ 
++if TYPE_CHECKING:
++    from pydantic.fields import FieldInfo
++
+ 
+ class StacQueryableProperty(BaseModel):
+     """A class representing a queryable property.
+@@ -49,7 +52,7 @@ class StacQueryableProperty(BaseModel):
+ 
+     @classmethod
+     def from_python_field_definition(
+-        cls, id: str, python_field_definition: Tuple[Annotated, Any]
++        cls, id: str, python_field_definition: Tuple[Annotated[Any, FieldInfo], Any]
+     ) -> StacQueryableProperty:
+         """Build Model from python_field_definition"""
+         def_dict = python_field_definition_to_json(python_field_definition)
+diff --git a/eodag/types/__init__.py b/eodag/types/__init__.py
+index 02b5f98f..0e7b1b5a 100644
+--- a/eodag/types/__init__.py
++++ b/eodag/types/__init__.py
+@@ -122,7 +122,7 @@ def json_field_definition_to_python(
+ 
+ 
+ def python_field_definition_to_json(
+-    python_field_definition: Tuple[Annotated, Any]
++    python_field_definition: Tuple[Annotated[Any, FieldInfo], Any]
+ ) -> Dict[str, Any]:
+     """Get json field definition from python `typing.Annotated`
+ 
+@@ -144,7 +144,8 @@ def python_field_definition_to_json(
+         or len(python_field_definition) != 2
+     ):
+         raise ValidationError(
+-            "%s must be an instance of Tuple[Annotated, Any]" % python_field_definition
++            "%s must be an instance of Tuple[Annotated[Any, FieldInfo], Any]"
++            % python_field_definition
+         )
+ 
+     python_field_annotated = python_field_definition[0]
+@@ -196,7 +197,7 @@ def python_field_definition_to_json(
+ 
+ def model_fields_to_annotated_tuple(
+     model_fields: Dict[str, FieldInfo]
+-) -> Dict[str, Tuple[Annotated, Any]]:
++) -> Dict[str, Tuple[Annotated[Any, FieldInfo], Any]]:
+     """Convert BaseModel.model_fields from FieldInfo to Annotated tuple usable as create_model argument
+ 
+     >>> from pydantic import create_model
+diff --git a/eodag/utils/__init__.py b/eodag/utils/__init__.py
+index 08827ee8..e5918e53 100644
+--- a/eodag/utils/__init__.py
++++ b/eodag/utils/__init__.py
+@@ -373,29 +373,9 @@ def merge_mappings(mapping1: Dict[Any, Any], mapping2: Dict[Any, Any]) -> None:
+                         and current_value_type == list
+                     ):
+                         mapping1[m1_keys_lowercase.get(key, key)] = value
+-                    elif isinstance(value, str):
+-                        # Bool is a type with special meaning in Python, thus the special
+-                        # case
+-                        if current_value_type is bool:
+-                            if value.capitalize() not in ("True", "False"):
+-                                raise ValueError(
+-                                    "Only true or false strings (case insensitive) are "
+-                                    "allowed for booleans"
+-                                )
+-                            # Get the real Python value of the boolean. e.g: value='tRuE'
+-                            # => eval(value.capitalize())=True.
+-                            # str.capitalize() transforms the first character of the string
+-                            # to a capital letter
+-                            mapping1[m1_keys_lowercase.get(key, key)] = eval(
+-                                value.capitalize()
+-                            )
+-                        else:
+-                            mapping1[
+-                                m1_keys_lowercase.get(key, key)
+-                            ] = current_value_type(value)
+                     else:
+-                        mapping1[m1_keys_lowercase.get(key, key)] = current_value_type(
+-                            value
++                        mapping1[m1_keys_lowercase.get(key, key)] = cast_scalar_value(
++                            value, current_value_type
+                         )
+                 except (TypeError, ValueError):
+                     # Ignore any override value that does not have the same type
+@@ -1398,3 +1378,34 @@ def parse_header(header: str) -> Message:
+     m = Message()
+     m["content-type"] = header
+     return m
++
++
++def cast_scalar_value(value: Any, new_type: Any) -> Any:
++    """Convert a scalar (not nested) value type to the given one
++
++    >>> cast_scalar_value('1', int)
++    1
++    >>> cast_scalar_value(1, str)
++    '1'
++    >>> cast_scalar_value('false', bool)
++    False
++
++    :param value: the scalar value to convert
++    :param new_type: the wanted type
++    :returns: scalar value converted to new_type
++    """
++    if isinstance(value, str) and new_type is bool:
++        # Bool is a type with special meaning in Python, thus the special
++        # case
++        if value.capitalize() not in ("True", "False"):
++            raise ValueError(
++                "Only true or false strings (case insensitive) are "
++                "allowed for booleans"
++            )
++        # Get the real Python value of the boolean. e.g: value='tRuE'
++        # => eval(value.capitalize())=True.
++        # str.capitalize() transforms the first character of the string
++        # to a capital letter
++        return eval(value.capitalize())
++
++    return new_type(value)

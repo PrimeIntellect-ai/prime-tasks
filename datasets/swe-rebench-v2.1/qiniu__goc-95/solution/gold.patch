@@ -1,0 +1,167 @@
+diff --git a/go.mod b/go.mod
+index 91b80f1..a4b18ff 100644
+--- a/go.mod
++++ b/go.mod
+@@ -16,6 +16,7 @@ require (
+ 	github.com/spf13/pflag v1.0.5
+ 	github.com/spf13/viper v1.6.2
+ 	github.com/stretchr/testify v1.5.1
++	golang.org/x/mod v0.3.0
+ 	golang.org/x/net v0.0.0-20200625001655-4c5254603344
+ 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
+ 	golang.org/x/tools v0.0.0-20200730221956-1ac65761fe2c
+diff --git a/go.sum b/go.sum
+index 722c912..9881f5d 100644
+--- a/go.sum
++++ b/go.sum
+@@ -822,6 +822,7 @@ golang.org/x/mod v0.0.0-20190513183733-4bf6d317e70e/go.mod h1:mXi4GBBbnImb6dmsKG
+ golang.org/x/mod v0.1.0/go.mod h1:0QHyrYULN0/3qlju5TqG8bIK38QM8yzMo5ekMj3DlcY=
+ golang.org/x/mod v0.1.1-0.20191105210325-c90efee705ee/go.mod h1:QqPTAvyqsEbceGzBzNggFXnrqF1CaUcvgkdR5Ot7KZg=
+ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
++golang.org/x/mod v0.3.0 h1:RM4zey1++hCTbCVQfnWeKs9/IEsaBLA8vTkd0WVtmH4=
+ golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/net v0.0.0-20170114055629-f2499483f923/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+ golang.org/x/net v0.0.0-20180724234803-3673e40ba225/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+diff --git a/pkg/build/build.go b/pkg/build/build.go
+index 50b2809..e05cf1b 100644
+--- a/pkg/build/build.go
++++ b/pkg/build/build.go
+@@ -41,7 +41,8 @@ type Build struct {
+ 	// Project Root:
+ 	// 1. legacy, root == GOPATH
+ 	// 2. mod, root == go.mod Dir
+-	Target string // the binary name that go build generate
++	ModRoot string // path for go.mod
++	Target  string // the binary name that go build generate
+ 	// keep compatible with go commands:
+ 	// go run [build flags] [-exec xprog] package [arguments...]
+ 	// go build [-o output] [-i] [build flags] [packages]
+diff --git a/pkg/build/gomodules.go b/pkg/build/gomodules.go
+index 8c7e2e3..32c9b79 100644
+--- a/pkg/build/gomodules.go
++++ b/pkg/build/gomodules.go
+@@ -17,8 +17,12 @@
+ package build
+ 
+ import (
++	"io/ioutil"
++	"path/filepath"
++
+ 	"github.com/otiai10/copy"
+ 	log "github.com/sirupsen/logrus"
++	"golang.org/x/mod/modfile"
+ )
+ 
+ func (b *Build) cpGoModulesProject() {
+@@ -36,3 +40,51 @@ func (b *Build) cpGoModulesProject() {
+ 		}
+ 	}
+ }
++
++// updateGoModFile rewrites the go.mod file in the temporary directory,
++// if it has a 'replace' directive, and the directive has a relative local path
++// it will be rewritten with a absolute path.
++// ex.
++// suppose original project is located at /path/to/aa/bb/cc, go.mod contains a directive:
++// 'replace github.com/qiniu/bar => ../home/foo/bar'
++// after the project is copied to temporary directory, it should be rewritten as
++// 'replace github.com/qiniu/bar => /path/to/aa/bb/home/foo/bar'
++func (b *Build) updateGoModFile() (updateFlag bool, newModFile []byte, err error) {
++	tempModfile := filepath.Join(b.TmpDir, "go.mod")
++	buf, err := ioutil.ReadFile(tempModfile)
++	if err != nil {
++		return
++	}
++	oriGoModFile, err := modfile.Parse(tempModfile, buf, nil)
++	if err != nil {
++		return
++	}
++
++	updateFlag = false
++	for index := range oriGoModFile.Replace {
++		replace := oriGoModFile.Replace[index]
++		oldPath := replace.Old.Path
++		oldVersion := replace.Old.Version
++		newPath := replace.New.Path
++		newVersion := replace.New.Version
++		// replace to a local filesystem does not have a version
++		// absolute path no need to rewrite
++		if newVersion == "" && !filepath.IsAbs(newPath) {
++			var absPath string
++			fullPath := filepath.Join(b.ModRoot, newPath)
++			absPath, _ = filepath.Abs(fullPath)
++			// DropReplace & AddReplace will not return error
++			// so no need to check the error
++			_ = oriGoModFile.DropReplace(oldPath, oldVersion)
++			_ = oriGoModFile.AddReplace(oldPath, oldVersion, absPath, newVersion)
++			updateFlag = true
++		}
++	}
++	oriGoModFile.Cleanup()
++	// Format will not return error, so ignore the returned error
++	// func (f *File) Format() ([]byte, error) {
++	//     return Format(f.Syntax), nil
++	// }
++	newModFile, _ = oriGoModFile.Format()
++	return
++}
+diff --git a/pkg/build/tmpfolder.go b/pkg/build/tmpfolder.go
+index f9a027c..cbfeced 100644
+--- a/pkg/build/tmpfolder.go
++++ b/pkg/build/tmpfolder.go
+@@ -20,6 +20,7 @@ import (
+ 	"crypto/sha256"
+ 	"errors"
+ 	"fmt"
++	"io/ioutil"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+@@ -75,10 +76,9 @@ func (b *Build) mvProjectsToTmp() error {
+ 	// Create a new tmp folder
+ 	err := os.MkdirAll(filepath.Join(b.TmpDir, "src"), os.ModePerm)
+ 	if err != nil {
+-		log.Errorf("Fail to create the temporary build directory. The err is: %v", err)
+-		return err
++		return fmt.Errorf("Fail to create the temporary build directory. The err is: %v", err)
+ 	}
+-	log.Printf("Tmp project generated in: %v", b.TmpDir)
++	log.Infof("Tmp project generated in: %v", b.TmpDir)
+ 
+ 	// traverse pkg list to get project meta info
+ 	b.IsMod, b.Root, err = b.traversePkgsList()
+@@ -89,7 +89,6 @@ func (b *Build) mvProjectsToTmp() error {
+ 	// we should get corresponding working directory in temporary directory
+ 	b.TmpWorkingDir, err = b.getTmpwd()
+ 	if err != nil {
+-		log.Errorf("fail to get workding directory in temporary directory: %v", err)
+ 		return fmt.Errorf("getTmpwd failed with error: %w", err)
+ 	}
+ 	// issue #14
+@@ -100,6 +99,18 @@ func (b *Build) mvProjectsToTmp() error {
+ 		b.cpLegacyProject()
+ 	} else if b.IsMod == true { // go 1.11, 1.12 has no Build.Root
+ 		b.cpGoModulesProject()
++		updated, newGoModContent, err := b.updateGoModFile()
++		if err != nil {
++			return fmt.Errorf("fail to generate new go.mod: %v", err)
++		}
++		if updated {
++			log.Infoln("go.mod needs rewrite")
++			tmpModFile := filepath.Join(b.TmpDir, "go.mod")
++			err := ioutil.WriteFile(tmpModFile, newGoModContent, os.ModePerm)
++			if err != nil {
++				return fmt.Errorf("fail to update go.mod: %v", err)
++			}
++		}
+ 	} else if b.IsMod == false && b.Root == "" {
+ 		b.TmpWorkingDir = b.TmpDir
+ 		b.cpNonStandardLegacy()
+@@ -134,6 +145,7 @@ func (b *Build) traversePkgsList() (isMod bool, root string, err error) {
+ 			return
+ 		}
+ 		isMod = true
++		b.ModRoot = v.Module.Dir
+ 		return
+ 	}
+ 	log.Error(ErrShouldNotReached)

@@ -1,0 +1,187 @@
+diff --git a/caikit/config/config.yml b/caikit/config/config.yml
+index 979d6dc6..3fd5d499 100644
+--- a/caikit/config/config.yml
++++ b/caikit/config/config.yml
+@@ -104,9 +104,6 @@ runtime:
+         server_shutdown_grace_period_seconds: 45
+         # Listen on a unix socket (model mesh feature)
+         unix_socket_path: /tmp/mmesh/grpc.sock
+-    # Service exposure options
+-    port: 8085
+-    unix_socket_path: /tmp/mmesh/grpc.sock
+ 
+     # Configuration for the http server
+     http:
+diff --git a/caikit/runtime/grpc_server.py b/caikit/runtime/grpc_server.py
+index ad90e823..69b2aacc 100644
+--- a/caikit/runtime/grpc_server.py
++++ b/caikit/runtime/grpc_server.py
+@@ -81,7 +81,6 @@ class RuntimeGRPCServer(RuntimeServerBase):
+         if handle_terminations:
+             signal.signal(signal.SIGINT, self.interrupt)
+             signal.signal(signal.SIGTERM, self.interrupt)
+-        self.port = self.config.runtime.port
+ 
+         # Initialize basic server
+         # py_grpc_prometheus.server_metrics.
+@@ -246,6 +245,7 @@ class RuntimeGRPCServer(RuntimeServerBase):
+             grace_period_seconds (Union[float, int]): Grace period for service shutdown.
+                 Defaults to application config
+         """
++        log.debug("Shutting down grpc server")
+         if grace_period_seconds is None:
+             grace_period_seconds = (
+                 self.config.runtime.grpc.server_shutdown_grace_period_seconds
+@@ -254,6 +254,8 @@ class RuntimeGRPCServer(RuntimeServerBase):
+         # Ensure we flush out any remaining billing metrics and stop metering
+         if self.config.runtime.metering.enabled:
+             self._global_predict_servicer.stop_metering()
++        # Shut down the model manager's model polling if enabled
++        self._shut_down_model_manager()
+ 
+     def render_protos(self, proto_out_dir: str) -> None:
+         """Renders all the necessary protos for this service into a directory
+@@ -297,10 +299,16 @@ class RuntimeGRPCServer(RuntimeServerBase):
+ def main(blocking: bool = True):
+     # Configure using the log level and formatter type specified in config.
+     caikit.core.toolkit.logging.configure()
++    log.debug("Starting up caikit.runtime.grpc_server")
+ 
+     # Start serving Prometheus metrics
+     caikit_config = get_config()
+-    start_http_server(caikit_config.runtime.metrics.port)
++    if caikit_config.runtime.metrics.enabled:
++        log.info(
++            "Serving prometheus metrics on port %s", caikit_config.runtime.metrics.port
++        )
++        with alog.ContextTimer(log.info, "Booted metrics server in "):
++            start_http_server(caikit_config.runtime.metrics.port)
+ 
+     # Enable signal handling
+     handle_terminations = True
+diff --git a/caikit/runtime/http_server.py b/caikit/runtime/http_server.py
+index 4658360e..873c6f3c 100644
+--- a/caikit/runtime/http_server.py
++++ b/caikit/runtime/http_server.py
+@@ -92,6 +92,9 @@ GRPC_CODE_TO_HTTP = {
+ REQUIRED_INPUTS_KEY = "inputs"
+ OPTIONAL_INPUTS_KEY = "parameters"
+ 
++# Endpoint to use for health checks
++HEALTH_ENDPOINT = "/health"
++
+ ## RuntimeHTTPServer ###########################################################
+ 
+ 
+@@ -122,6 +125,9 @@ class RuntimeHTTPServer(RuntimeServerBase):
+ 
+         self.package_name = inference_service.descriptor.full_name.rsplit(".", 1)[0]
+ 
++        # Add the health endpoint
++        self.app.get(HEALTH_ENDPOINT)(self._health_check)
++
+         # Bind all routes to the server
+         self._bind_routes(inference_service)
+         # self._bind_routes(train_service)
+@@ -157,6 +163,15 @@ class RuntimeHTTPServer(RuntimeServerBase):
+         )
+         self.server = uvicorn.Server(config=config)
+ 
++        # Patch the exit handler to call this server's stop
++        original_handler = self.server.handle_exit
++
++        def shutdown_wrapper(*args, **kwargs):
++            original_handler(*args, **kwargs)
++            self.stop()
++
++        self.server.handle_exit = shutdown_wrapper
++
+         # Placeholder for thread when running without blocking
+         self._uvicorn_server_thread = None
+ 
+@@ -194,6 +209,9 @@ class RuntimeHTTPServer(RuntimeServerBase):
+         if self.config.runtime.metering.enabled:
+             self.global_predict_servicer.stop_metering()
+ 
++        # Shut down the model manager's model polling if enabled
++        self._shut_down_model_manager()
++
+     def run_in_thread(self):
+         self._uvicorn_server_thread = threading.Thread(target=self.server.run)
+         self._uvicorn_server_thread.start()
+@@ -523,6 +541,10 @@ class RuntimeHTTPServer(RuntimeServerBase):
+         PYDANTIC_REGISTRY[dm_class] = pydantic_model
+         return pydantic_model
+ 
++    @staticmethod
++    def _health_check():
++        log.debug4("Server healthy")
++
+ 
+ ## Main ########################################################################
+ 
+diff --git a/caikit/runtime/model_management/model_manager.py b/caikit/runtime/model_management/model_manager.py
+index 24f097f5..486b2708 100644
+--- a/caikit/runtime/model_management/model_manager.py
++++ b/caikit/runtime/model_management/model_manager.py
+@@ -141,9 +141,12 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
+ 
+     def shut_down(self):
+         """Shut down cache purging"""
++        self._enable_lazy_load_poll = False
+         timer = getattr(self, "_lazy_sync_timer", None)
+         if timer is not None:
+             timer.cancel()
++            if timer.is_alive():
++                timer.join()
+ 
+     ## Model Management ##
+ 
+@@ -247,8 +250,15 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
+                     self._lazy_load_poll_period_seconds,
+                 )
+             if self._lazy_sync_timer is not None and self._lazy_sync_timer.is_alive():
+-                log.debug2("Canceling live timer")
++                log.debug3("Canceling live timer")
+                 self._lazy_sync_timer.cancel()
++            log.debug3(
++                "Starting next poll timer for %ss", self._lazy_load_poll_period_seconds
++            )
++            log.debug4(
++                "All open threads: %s",
++                [thread.name for thread in threading.enumerate()],
++            )
+             self._lazy_sync_timer = threading.Timer(
+                 self._lazy_load_poll_period_seconds, self.sync_local_models
+             )
+diff --git a/caikit/runtime/server_base.py b/caikit/runtime/server_base.py
+index ebe10034..3fce363f 100644
+--- a/caikit/runtime/server_base.py
++++ b/caikit/runtime/server_base.py
+@@ -24,6 +24,7 @@ import alog
+ 
+ # Local
+ from caikit.config import get_config
++from caikit.runtime.model_management.model_manager import ModelManager
+ 
+ log = alog.use_channel("SERVR-BASE")
+ 
+@@ -45,6 +46,7 @@ class RuntimeServerBase(abc.ABC):
+         self.tls_config = (
+             tls_config_override if tls_config_override else self.config.runtime.tls
+         )
++        log.debug4("Full caikit config: %s", get_config())
+ 
+     @classmethod
+     def _find_port(cls, start=8888, end=None, host="127.0.0.1"):
+@@ -75,6 +77,10 @@ class RuntimeServerBase(abc.ABC):
+                 # port is open
+                 return start
+ 
++    def _shut_down_model_manager(self):
++        """Shared utility for shutting down the model manager"""
++        ModelManager.get_instance().shut_down()
++
+     @abc.abstractmethod
+     def start(self, blocking: bool = True):
+         pass

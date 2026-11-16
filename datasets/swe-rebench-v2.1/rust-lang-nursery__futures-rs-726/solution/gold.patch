@@ -1,0 +1,374 @@
+diff --git a/.travis.yml b/.travis.yml
+index f3bf51c6..9c6f16b6 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -12,7 +12,7 @@ matrix:
+       after_success:
+         - travis-cargo doc-upload
+     - os: linux
+-      rust: 1.15.0
++      rust: 1.13.0
+       script: cargo test
+ sudo: false
+ script:
+diff --git a/Cargo.toml b/Cargo.toml
+index c3e7760e..2e702a99 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "futures"
+-version = "0.1.18"
++version = "0.1.17"
+ authors = ["Alex Crichton <alex@alexcrichton.com>"]
+ license = "MIT/Apache-2.0"
+ readme = "README.md"
+diff --git a/README.md b/README.md
+index de3b99c0..e30902d0 100644
+--- a/README.md
++++ b/README.md
+@@ -16,7 +16,7 @@ First, add this to your `Cargo.toml`:
+ 
+ ```toml
+ [dependencies]
+-futures = "0.1.17"
++futures = "0.1.14"
+ ```
+ 
+ Next, add this to your crate:
+@@ -39,7 +39,7 @@ a `#[no_std]` environment, use:
+ 
+ ```toml
+ [dependencies]
+-futures = { version = "0.1.17", default-features = false }
++futures = { version = "0.1.14", default-features = false }
+ ```
+ 
+ # License
+diff --git a/src/future/mod.rs b/src/future/mod.rs
+index 7cccd907..c858a583 100644
+--- a/src/future/mod.rs
++++ b/src/future/mod.rs
+@@ -967,7 +967,7 @@ pub trait Future {
+     /// Create a cloneable handle to this future where all handles will resolve
+     /// to the same result.
+     ///
+-    /// The shared() method provides a method to convert any future into a
++    /// The shared() method provides a mean to convert any future into a
+     /// cloneable future. It enables a future to be polled by multiple threads.
+     ///
+     /// The returned `Shared` future resolves successfully with
+diff --git a/src/stream/filter_map.rs b/src/stream/filter_map.rs
+index f91d26a4..79bc57f1 100644
+--- a/src/stream/filter_map.rs
++++ b/src/stream/filter_map.rs
+@@ -1,4 +1,4 @@
+-use {Async, Poll};
++use {Async, Future, IntoFuture, Poll};
+ use stream::Stream;
+ 
+ /// A combinator used to filter the results of a stream and simultaneously map
+@@ -7,22 +7,33 @@ use stream::Stream;
+ /// This structure is returned by the `Stream::filter_map` method.
+ #[derive(Debug)]
+ #[must_use = "streams do nothing unless polled"]
+-pub struct FilterMap<S, F> {
++pub struct FilterMap<S, F, R>
++    where S: Stream,
++          F: FnMut(S::Item) -> R,
++          R: IntoFuture<Error=S::Error>,
++{
+     stream: S,
+     f: F,
++    pending: Option<R::Future>,
+ }
+ 
+-pub fn new<S, F, B>(s: S, f: F) -> FilterMap<S, F>
++pub fn new<S, F, R>(s: S, f: F) -> FilterMap<S, F, R>
+     where S: Stream,
+-          F: FnMut(S::Item) -> Option<B>,
++          F: FnMut(S::Item) -> R,
++          R: IntoFuture<Error=S::Error>,
+ {
+     FilterMap {
+         stream: s,
+         f: f,
++        pending: None,
+     }
+ }
+ 
+-impl<S, F> FilterMap<S, F> {
++impl<S, F, R> FilterMap<S, F, R>
++    where S: Stream,
++          F: FnMut(S::Item) -> R,
++          R: IntoFuture<Error=S::Error>,
++{
+     /// Acquires a reference to the underlying stream that this combinator is
+     /// pulling from.
+     pub fn get_ref(&self) -> &S {
+@@ -48,8 +59,10 @@ impl<S, F> FilterMap<S, F> {
+ }
+ 
+ // Forwarding impl of Sink from the underlying stream
+-impl<S, F> ::sink::Sink for FilterMap<S, F>
+-    where S: ::sink::Sink
++impl<S, F, R> ::sink::Sink for FilterMap<S, F, R>
++    where S: Stream + ::sink::Sink,
++          F: FnMut(S::Item) -> R,
++          R: IntoFuture<Error=S::Error>,
+ {
+     type SinkItem = S::SinkItem;
+     type SinkError = S::SinkError;
+@@ -67,22 +80,36 @@ impl<S, F> ::sink::Sink for FilterMap<S, F>
+     }
+ }
+ 
+-impl<S, F, B> Stream for FilterMap<S, F>
++impl<S, F, R, B> Stream for FilterMap<S, F, R>
+     where S: Stream,
+-          F: FnMut(S::Item) -> Option<B>,
++          F: FnMut(S::Item) -> R,
++          R: IntoFuture<Item=Option<B>, Error=S::Error>,
+ {
+     type Item = B;
+     type Error = S::Error;
+ 
+     fn poll(&mut self) -> Poll<Option<B>, S::Error> {
+         loop {
+-            match try_ready!(self.stream.poll()) {
+-                Some(e) => {
+-                    if let Some(e) = (self.f)(e) {
+-                        return Ok(Async::Ready(Some(e)))
+-                    }
++            if self.pending.is_none() {
++                let item = match try_ready!(self.stream.poll()) {
++                    Some(e) => e,
++                    None => return Ok(Async::Ready(None)),
++                };
++                let fut = ((self.f)(item)).into_future();
++                self.pending = Some(fut);
++            }
++
++            match self.pending.as_mut().unwrap().poll() {
++                x @ Ok(Async::Ready(Some(_))) => {
++                    self.pending = None;
++                    return x
++                }
++                Ok(Async::Ready(None)) => self.pending = None,
++                Ok(Async::NotReady) => return Ok(Async::NotReady),
++                Err(e) => {
++                    self.pending = None;
++                    return Err(e)
+                 }
+-                None => return Ok(Async::Ready(None)),
+             }
+         }
+     }
+diff --git a/src/stream/future.rs b/src/stream/future.rs
+index 5b052ee4..918b2c85 100644
+--- a/src/stream/future.rs
++++ b/src/stream/future.rs
+@@ -14,46 +14,6 @@ pub fn new<S: Stream>(s: S) -> StreamFuture<S> {
+     StreamFuture { stream: Some(s) }
+ }
+ 
+-impl<S> StreamFuture<S> {
+-    /// Acquires a reference to the underlying stream that this combinator is
+-    /// pulling from.
+-    ///
+-    /// This method returns an `Option` to account for the fact that `StreamFuture`'s
+-    /// implementation of `Future::poll` consumes the underlying stream during polling 
+-    /// in order to return it to the caller of `Future::poll` if the stream yielded
+-    /// an element.
+-    pub fn get_ref(&self) -> Option<&S> {
+-        self.stream.as_ref()
+-    }
+-
+-    /// Acquires a mutable reference to the underlying stream that this
+-    /// combinator is pulling from.
+-    ///
+-    /// Note that care must be taken to avoid tampering with the state of the
+-    /// stream which may otherwise confuse this combinator.
+-    ///
+-    /// This method returns an `Option` to account for the fact that `StreamFuture`'s
+-    /// implementation of `Future::poll` consumes the underlying stream during polling 
+-    /// in order to return it to the caller of `Future::poll` if the stream yielded
+-    /// an element.
+-    pub fn get_mut(&mut self) -> Option<&mut S> {
+-        self.stream.as_mut()
+-    }
+-
+-    /// Consumes this combinator, returning the underlying stream.
+-    ///
+-    /// Note that this may discard intermediate state of this combinator, so
+-    /// care should be taken to avoid losing resources when this is called.
+-    ///
+-    /// This method returns an `Option` to account for the fact that `StreamFuture`'s
+-    /// implementation of `Future::poll` consumes the underlying stream during polling 
+-    /// in order to return it to the caller of `Future::poll` if the stream yielded
+-    /// an element.
+-    pub fn into_inner(self) -> Option<S> {
+-        self.stream
+-    }
+-}
+-
+ impl<S: Stream> Future for StreamFuture<S> {
+     type Item = (Option<S::Item>, S);
+     type Error = (S::Error, S);
+diff --git a/src/stream/mod.rs b/src/stream/mod.rs
+index 566d143b..0dad2695 100644
+--- a/src/stream/mod.rs
++++ b/src/stream/mod.rs
+@@ -115,7 +115,7 @@ if_std! {
+     pub use self::chunks::Chunks;
+     pub use self::collect::Collect;
+     pub use self::wait::Wait;
+-    pub use self::split::{SplitStream, SplitSink, ReuniteError};
++    pub use self::split::{SplitStream, SplitSink};
+     pub use self::futures_unordered::FuturesUnordered;
+     pub use self::futures_ordered::{futures_ordered, FuturesOrdered};
+ 
+@@ -393,21 +393,25 @@ pub trait Stream {
+     /// # Examples
+     ///
+     /// ```
++    /// use futures::future;
+     /// use futures::prelude::*;
+     /// use futures::sync::mpsc;
+     ///
+     /// let (_tx, rx) = mpsc::channel::<i32>(1);
+     /// let evens_plus_one = rx.filter_map(|x| {
+-    ///     if x % 0 == 2 {
+-    ///         Some(x + 1)
+-    ///     } else {
+-    ///         None
+-    ///     }
++    ///     future::ok(
++    ///         if x % 0 == 2 {
++    ///             Some(x + 1)
++    ///         } else {
++    ///             None
++    ///         }
++    ///     )
+     /// });
+     /// ```
+-    fn filter_map<F, B>(self, f: F) -> FilterMap<Self, F>
+-        where F: FnMut(Self::Item) -> Option<B>,
+-              Self: Sized
++    fn filter_map<F, R, B>(self, f: F) -> FilterMap<Self, F, R>
++        where F: FnMut(Self::Item) -> R,
++              R: IntoFuture<Item=Option<B>, Error=Self::Error>,
++              Self: Sized,
+     {
+         filter_map::new(self, f)
+     }
+diff --git a/src/sync/oneshot.rs b/src/sync/oneshot.rs
+index d95883d3..9e79442b 100644
+--- a/src/sync/oneshot.rs
++++ b/src/sync/oneshot.rs
+@@ -477,7 +477,7 @@ pub fn spawn<F, E>(future: F, executor: &E) -> SpawnHandle<F::Item, F::Error>
+ {
+     let data = Arc::new(ExecuteInner {
+         inner: Inner::new(),
+-        keep_running: AtomicBool::new(false),
++        keep_running: AtomicBool::new(true),
+     });
+     executor.execute(Execute {
+         future: future,
+@@ -506,7 +506,7 @@ impl<T, E> SpawnHandle<T, E> {
+     /// well if the future hasn't already resolved. This function can be used
+     /// when to drop this future but keep executing the underlying future.
+     pub fn forget(self) {
+-        self.rx.keep_running.store(true, SeqCst);
++        self.rx.keep_running.store(false, SeqCst);
+     }
+ }
+ 
+diff --git a/src/unsync/mpsc.rs b/src/unsync/mpsc.rs
+index 68cf6b8c..0cff01b1 100644
+--- a/src/unsync/mpsc.rs
++++ b/src/unsync/mpsc.rs
+@@ -35,6 +35,7 @@ fn channel_<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
+         capacity: buffer,
+         blocked_senders: VecDeque::new(),
+         blocked_recv: None,
++        sender_count: 1,
+     }));
+     let sender = Sender { shared: Rc::downgrade(&shared) };
+     let receiver = Receiver { state: State::Open(shared) };
+@@ -47,6 +48,8 @@ struct Shared<T> {
+     capacity: Option<usize>,
+     blocked_senders: VecDeque<Task>,
+     blocked_recv: Option<Task>,
++    // TODO: Redundant to Rc::weak_count; use that if/when stabilized
++    sender_count: usize,
+ }
+ 
+ /// The transmission end of a channel.
+@@ -61,7 +64,7 @@ impl<T> Sender<T> {
+     fn do_send(&self, msg: T) -> StartSend<T, SendError<T>> {
+         let shared = match self.shared.upgrade() {
+             Some(shared) => shared,
+-            None => return Err(SendError(msg)), // receiver was dropped
++            None => return Err(SendError(msg)),
+         };
+         let mut shared = shared.borrow_mut();
+ 
+@@ -73,6 +76,7 @@ impl<T> Sender<T> {
+             _ => {
+                 shared.buffer.push_back(msg);
+                 if let Some(task) = shared.blocked_recv.take() {
++                    drop(shared);
+                     task.notify();
+                 }
+                 Ok(AsyncSink::Ready)
+@@ -83,7 +87,11 @@ impl<T> Sender<T> {
+ 
+ impl<T> Clone for Sender<T> {
+     fn clone(&self) -> Self {
+-        Sender { shared: self.shared.clone() }
++        let result = Sender { shared: self.shared.clone() };
++        if let Some(shared) = self.shared.upgrade() {
++            shared.borrow_mut().sender_count += 1;
++        }
++        result
+     }
+ }
+ 
+@@ -110,9 +118,12 @@ impl<T> Drop for Sender<T> {
+             Some(shared) => shared,
+             None => return,
+         };
+-        if Rc::weak_count(&shared) == 0 {
+-            if let Some(task) = shared.borrow_mut().blocked_recv.take() {
++        let mut shared = shared.borrow_mut();
++        shared.sender_count -= 1;
++        if shared.sender_count == 0 {
++            if let Some(task) = shared.blocked_recv.take() {
+                 // Wake up receiver as its stream has ended
++                drop(shared);
+                 task.notify();
+             }
+         }
+diff --git a/src/unsync/oneshot.rs b/src/unsync/oneshot.rs
+index 7ae2890f..c895e68a 100644
+--- a/src/unsync/oneshot.rs
++++ b/src/unsync/oneshot.rs
+@@ -260,7 +260,7 @@ pub fn spawn<F, E>(future: F, executor: &E) -> SpawnHandle<F::Item, F::Error>
+     where F: Future,
+           E: Executor<Execute<F>>,
+ {
+-    let flag = Rc::new(Cell::new(false));
++    let flag = Rc::new(Cell::new(true));
+     let (tx, rx) = channel();
+     executor.execute(Execute {
+         future: future,
+@@ -293,7 +293,7 @@ impl<T, E> SpawnHandle<T, E> {
+     /// well if the future hasn't already resolved. This function can be used
+     /// when to drop this future but keep executing the underlying future.
+     pub fn forget(self) {
+-        self.keep_running.set(true);
++        self.keep_running.set(false);
+     }
+ }
+ 

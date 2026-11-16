@@ -1,0 +1,277 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e7ce1af56..a3fcd88f2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ - [#546](https://github.com/FuelLabs/fuel-vm/pull/546): Improve debug formatting of instruction in panic receipts.
+ 
++### Fixed
++
++#### Breaking
++
++- [#524](https://github.com/FuelLabs/fuel-vm/pull/524): Fix a crash in `CCP` instruction when overflowing contract bounds. Fix a bug in `CCP` where overflowing contract bounds in a different way would not actually copy the contract bytes, but just zeroes out the section. Fix a bug in `LDC` where it would revert the transaction when the contract bounds were exceeded, when it's just supposed to fill the rest of the bytes with zeroes.
++
+ ## [Version 0.36.0]
+ 
+ ### Changed
+diff --git a/fuel-types/src/bytes.rs b/fuel-types/src/bytes.rs
+index 5415e9e59..e6bea4a5c 100644
+--- a/fuel-types/src/bytes.rs
++++ b/fuel-types/src/bytes.rs
+@@ -21,6 +21,26 @@ pub const fn padded_len(bytes: &[u8]) -> usize {
+     padded_len_usize(bytes.len())
+ }
+ 
++/// Return the word-padded length of an arbitrary length
++pub const fn padded_len_word(len: Word) -> Word {
++    let pad = len % (WORD_SIZE as Word);
++
++    // `pad != 0` is checked because we shouldn't pad in case the length is already
++    // well-formed.
++    //
++    // Example being `w := WORD_SIZE` and `x := 2 · w`
++    //
++    // 1) With the check (correct result)
++    // f(x) -> x + (x % w != 0) · (w - x % w)
++    // f(x) -> x + 0 · w
++    // f(x) -> x
++    //
++    // 2) Without the check (incorrect result)
++    // f(x) -> x + w - x % w
++    // f(x) -> x + w
++    len + (pad != 0) as Word * ((WORD_SIZE as Word) - pad)
++}
++
+ /// Return the word-padded length of an arbitrary length
+ pub const fn padded_len_usize(len: usize) -> usize {
+     let pad = len % WORD_SIZE;
+diff --git a/fuel-vm/src/interpreter/blockchain.rs b/fuel-vm/src/interpreter/blockchain.rs
+index 3687f099d..e2d541369 100644
+--- a/fuel-vm/src/interpreter/blockchain.rs
++++ b/fuel-vm/src/interpreter/blockchain.rs
+@@ -19,9 +19,9 @@ use super::{
+         AppendReceipt,
+     },
+     memory::{
++        copy_from_slice_zero_fill_noownerchecks,
+         read_bytes,
+         try_mem_write,
+-        try_zeroize,
+         OwnershipRegisters,
+     },
+     ExecutableTransaction,
+@@ -39,12 +39,7 @@ use crate::{
+     },
+     consts::*,
+     context::Context,
+-    error::{
+-        Bug,
+-        BugId,
+-        BugVariant,
+-        RuntimeError,
+-    },
++    error::RuntimeError,
+     interpreter::{
+         receipts::ReceiptsCtx,
+         InputContracts,
+@@ -463,9 +458,9 @@ impl<'vm, S, I> LoadContractCodeCtx<'vm, S, I> {
+     /// ```
+     pub(crate) fn load_contract_code(
+         mut self,
+-        a: Word,
+-        b: Word,
+-        c: Word,
++        contract_id_addr: Word,
++        contract_offset: Word,
++        length_unpadded: Word,
+     ) -> Result<(), RuntimeError>
+     where
+         I: Iterator<Item = &'vm ContractId>,
+@@ -479,10 +474,12 @@ impl<'vm, S, I> LoadContractCodeCtx<'vm, S, I> {
+             return Err(PanicReason::ExpectedUnallocatedStack.into())
+         }
+ 
+-        // Validate arguments
+-        let contract_id = ContractId::from(read_bytes(self.memory, a)?);
+-        let contract_offset = b as usize;
+-        let length = bytes::padded_len_usize(c as usize);
++        let contract_id = ContractId::from(read_bytes(self.memory, contract_id_addr)?);
++        let contract_offset: usize = contract_offset
++            .try_into()
++            .map_err(|_| PanicReason::MemoryOverflow)?;
++
++        let length = bytes::padded_len_word(length_unpadded);
+         let dst_range = MemoryRange::new(ssp, length)?;
+ 
+         if dst_range.end >= *self.hp as usize {
+@@ -490,48 +487,31 @@ impl<'vm, S, I> LoadContractCodeCtx<'vm, S, I> {
+             return Err(PanicReason::MemoryOverflow.into())
+         }
+ 
+-        if length > self.contract_max_size as usize {
++        if length > self.contract_max_size {
+             return Err(PanicReason::MemoryOverflow.into())
+         }
+ 
+-        // Clear memory
+-        self.memory[dst_range.usizes()].fill(0);
+-
+         self.input_contracts.check(&contract_id)?;
+ 
+-        // fetch the storage contract
++        // Fetch the storage contract
+         let contract = super::contract::contract(self.storage, &contract_id)?;
+         let contract = contract.as_ref().as_ref();
+ 
+-        if contract_offset > contract.len() {
+-            return Err(PanicReason::MemoryOverflow.into())
+-        }
+-
+-        let contract = &contract[contract_offset..];
+-        let len = contract.len().min(length);
+-
+-        let code = &contract[..len];
+-
+-        let dst_range = dst_range.truncated(code.len());
+-
+-        let memory = self
+-            .memory
+-            .get_mut(dst_range.usizes())
+-            .expect("Checked memory access");
+-
+-        // perform the code copy
+-        memory.copy_from_slice(code);
+-
+-        self.sp
+-            //TODO this is looser than the compare against [RegId::HP,RegId::SSP+length]
+-            .checked_add(length as Word)
+-            .map(|sp| {
+-                *self.sp = sp;
+-                *self.ssp = sp;
+-            })
+-            .ok_or_else(|| Bug::new(BugId::ID007, BugVariant::StackPointerOverflow))?;
++        // Mark stack space as allocated
++        let new_stack = dst_range.words().end;
++        *self.sp = new_stack;
++        *self.ssp = new_stack;
++
++        // Copy the code. Ownership checks are not used as the stack is adjusted above.
++        copy_from_slice_zero_fill_noownerchecks(
++            self.memory,
++            contract,
++            dst_range.start,
++            contract_offset,
++            length,
++        )?;
+ 
+-        // update frame pointer, if we have a stack frame (e.g. fp > 0)
++        // Update frame pointer, if we have a stack frame (e.g. fp > 0)
+         if fp > 0 {
+             let fp_code_size = MemoryRange::new_overflowing_op(
+                 usize::overflowing_add,
+@@ -649,36 +629,40 @@ struct CodeCopyCtx<'vm, S, I> {
+ impl<'vm, S, I> CodeCopyCtx<'vm, S, I> {
+     pub(crate) fn code_copy(
+         mut self,
+-        a: Word,
+-        b: Word,
+-        c: Word,
+-        d: Word,
++        dst_addr: Word,
++        contract_id_addr: Word,
++        contract_offset: Word,
++        length: Word,
+     ) -> Result<(), RuntimeError>
+     where
+         I: Iterator<Item = &'vm ContractId>,
+         S: InterpreterStorage,
+     {
+-        let contract = CheckedMemConstLen::<{ ContractId::LEN }>::new(b)?;
+-
+-        MemoryRange::new(a, d)?;
+-        let c_range = MemoryRange::new(c, d)?;
+-
+-        let contract = ContractId::from_bytes_ref(contract.read(self.memory));
++        let contract_id = ContractId::from(read_bytes(self.memory, contract_id_addr)?);
++        let offset: usize = contract_offset
++            .try_into()
++            .map_err(|_| PanicReason::MemoryOverflow)?;
++
++        // Check target memory range ownership
++        if !self
++            .owner
++            .has_ownership_range(&MemoryRange::new(dst_addr, length)?)
++        {
++            return Err(PanicReason::MemoryOverflow.into())
++        }
+ 
+-        self.input_contracts.check(contract)?;
++        self.input_contracts.check(&contract_id)?;
+ 
+-        let contract = super::contract::contract(self.storage, contract)?.into_owned();
++        let contract = super::contract::contract(self.storage, &contract_id)?;
+ 
+-        if contract.as_ref().len() < d as usize {
+-            try_zeroize(a, d, self.owner, self.memory)?;
+-        } else {
+-            try_mem_write(
+-                a,
+-                &contract.as_ref()[c_range.usizes()],
+-                self.owner,
+-                self.memory,
+-            )?;
+-        }
++        // Owner checks already performed above
++        copy_from_slice_zero_fill_noownerchecks(
++            self.memory,
++            contract.as_ref().as_ref(),
++            dst_addr,
++            offset,
++            length,
++        )?;
+ 
+         inc_pc(self.pc)
+     }
+diff --git a/fuel-vm/src/interpreter/memory.rs b/fuel-vm/src/interpreter/memory.rs
+index a63d05b15..0b796e54c 100644
+--- a/fuel-vm/src/interpreter/memory.rs
++++ b/fuel-vm/src/interpreter/memory.rs
+@@ -169,6 +169,13 @@ impl MemoryRange {
+         Self(start..end)
+     }
+ 
++    /// Splits range at given relative offset. Panics if offset > range length.
++    pub fn split_at_offset(self, at: usize) -> (Self, Self) {
++        let mid = self.0.start + at;
++        assert!(mid <= self.0.end);
++        (Self(self.0.start..mid), Self(mid..self.0.end))
++    }
++
+     /// This function is safe because it is only used to shrink the range
+     /// and worst case the range will be empty.
+     pub fn shrink_end(&mut self, by: usize) {
+@@ -707,3 +714,23 @@ pub(crate) fn write_bytes<const COUNT: usize>(
+     memory[range.usizes()].copy_from_slice(&bytes);
+     Ok(())
+ }
++
++/// Attempt copy from slice to memory, filling zero bytes when exceeding slice boundaries.
++/// Performs overflow and memory range checks, but no ownership checks.
++pub(crate) fn copy_from_slice_zero_fill_noownerchecks<A: ToAddr, B: ToAddr>(
++    memory: &mut [u8; MEM_SIZE],
++    src: &[u8],
++    dst_addr: A,
++    src_offset: usize,
++    len: B,
++) -> Result<(), RuntimeError> {
++    let range = MemoryRange::new(dst_addr, len)?;
++
++    let src_end = src_offset.saturating_add(range.len()).min(src.len());
++    let data = src.get(src_offset..src_end).unwrap_or_default();
++    let (r_data, r_zero) = range.split_at_offset(data.len());
++    memory[r_data.usizes()].copy_from_slice(data);
++    memory[r_zero.usizes()].fill(0);
++
++    Ok(())
++}

@@ -1,0 +1,201 @@
+diff --git a/ctapipe/containers.py b/ctapipe/containers.py
+index cb4282c5..511be059 100644
+--- a/ctapipe/containers.py
++++ b/ctapipe/containers.py
+@@ -920,12 +920,17 @@ class ReconstructedGeometryContainer(Container):
+         "reconstructed core position uncertainty along tilted frame Y axis",
+         unit=u.m,
+     )
+-    h_max = Field(nan * u.m, "reconstructed height of the shower maximum", unit=u.m)
++    h_max = Field(
++        nan * u.m,
++        "reconstructed vertical height above sea level of the shower maximum",
++        unit=u.m,
++    )
+     h_max_uncert = Field(nan * u.m, "uncertainty of h_max", unit=u.m)
++
+     is_valid = Field(
+         False,
+         (
+-            "direction validity flag. True if the shower direction"
++            "Geometry validity flag. True if the shower geometry"
+             "was properly reconstructed by the algorithm"
+         ),
+     )
+diff --git a/ctapipe/reco/hillas_intersection.py b/ctapipe/reco/hillas_intersection.py
+index d7288b58..0906cf0f 100644
+--- a/ctapipe/reco/hillas_intersection.py
++++ b/ctapipe/reco/hillas_intersection.py
+@@ -44,6 +44,7 @@ INVALID = ReconstructedGeometryContainer(
+ )
+ 
+ FOV_ANGULAR_DISTANCE_LIMIT_RAD = (45 * u.deg).to_value(u.rad)
++H_MAX_UPPER_LIMIT_M = 100_000
+ 
+ 
+ def _far_outside_fov(fov_lat, fov_lon):
+@@ -260,7 +261,8 @@ class HillasIntersection(HillasGeometryReconstructor):
+         sky_pos = nom.transform_to(array_pointing.frame)
+         tilt = SkyCoord(x=core_x * u.m, y=core_y * u.m, z=0 * u.m, frame=tilted_frame)
+         grd = project_to_ground(tilt)
+-        x_max = self.reconstruct_xmax(
++
++        h_max = self.reconstruct_h_max(
+             nom.fov_lon,
+             nom.fov_lat,
+             tilt.x,
+@@ -287,8 +289,8 @@ class HillasIntersection(HillasGeometryReconstructor):
+             is_valid=True,
+             alt_uncert=src_error.to(u.rad),
+             az_uncert=src_error.to(u.rad),
+-            h_max=x_max,
+-            h_max_uncert=u.Quantity(np.nan * x_max.unit),
++            h_max=h_max,
++            h_max_uncert=u.Quantity(np.nan * h_max.unit),
+             goodness_of_fit=np.nan,
+             prefix=self.__class__.__name__,
+         )
+@@ -309,7 +311,7 @@ class HillasIntersection(HillasGeometryReconstructor):
+ 
+         """
+         if len(hillas_parameters) < 2:
+-            return None  # Throw away events with < 2 images
++            return (np.nan, np.nan, np.nan, np.nan)  # Throw away events with < 2 images
+ 
+         # Find all pairs of Hillas parameters
+         combos = itertools.combinations(list(hillas_parameters.values()), 2)
+@@ -381,7 +383,8 @@ class HillasIntersection(HillasGeometryReconstructor):
+             core uncertainty X
+         """
+         if len(hillas_parameters) < 2:
+-            return None  # Throw away events with < 2 images
++            return (np.nan, np.nan, np.nan, np.nan)  # Throw away events with < 2 images
++
+         hill_list = list()
+         tx = list()
+         ty = list()
+@@ -437,7 +440,7 @@ class HillasIntersection(HillasGeometryReconstructor):
+ 
+         return x_pos, y_pos, np.sqrt(var_x), np.sqrt(var_y)
+ 
+-    def reconstruct_xmax(
++    def reconstruct_h_max(
+         self, source_x, source_y, core_x, core_y, hillas_parameters, tel_x, tel_y, zen
+     ):
+         """
+@@ -495,25 +498,19 @@ class HillasIntersection(HillasGeometryReconstructor):
+             np.array(ty),
+         )
+         weight = np.array(amp)
+-        mean_height = np.sum(height * weight) / np.sum(weight)
++        mean_distance = np.average(height, weights=weight)
+ 
+         # This value is height above telescope in the tilted system,
+         # we should convert to height above ground
+-        mean_height *= np.cos(zen)
++        mean_height = mean_distance * np.cos(zen.to_value(u.rad))
+ 
+         # Add on the height of the detector above sea level
+-        mean_height += 2100  # TODO: replace with instrument info
+-
+-        if mean_height > 100000 or np.isnan(mean_height):
+-            mean_height = 100000
++        mean_height += self.subarray.reference_location.geodetic.height.to_value(u.m)
+ 
+-        mean_height *= u.m
+-        # Lookup this height in the depth tables, the convert Hmax to Xmax
+-        # x_max = self.thickness_profile(mean_height.to(u.km))
+-        # Convert to slant depth
+-        # x_max /= np.cos(zen)
++        if mean_height > H_MAX_UPPER_LIMIT_M:
++            mean_height = np.nan
+ 
+-        return mean_height
++        return u.Quantity(mean_height, u.m)
+ 
+     @staticmethod
+     def intersect_lines(xp1, yp1, phi1, xp2, yp2, phi2):
+diff --git a/ctapipe/reco/hillas_reconstructor.py b/ctapipe/reco/hillas_reconstructor.py
+index 1fbd305d..0f82e2bc 100644
+--- a/ctapipe/reco/hillas_reconstructor.py
++++ b/ctapipe/reco/hillas_reconstructor.py
+@@ -19,6 +19,7 @@ from ..coordinates import (
+     altaz_to_righthanded_cartesian,
+     project_to_ground,
+ )
++from ..instrument import SubarrayDescription
+ from .reconstructor import (
+     HillasGeometryReconstructor,
+     InvalidWidthException,
+@@ -106,7 +107,7 @@ class HillasReconstructor(HillasGeometryReconstructor):
+ 
+     """
+ 
+-    def __init__(self, subarray, **kwargs):
++    def __init__(self, subarray: SubarrayDescription, **kwargs):
+         super().__init__(subarray=subarray, **kwargs)
+         _cam_radius_m = {
+             cam: cam.geometry.guess_radius().to_value(u.m)
+@@ -181,7 +182,10 @@ class HillasReconstructor(HillasGeometryReconstructor):
+         _, lat, lon = cartesian_to_spherical(*direction)
+ 
+         # estimate max height of shower
+-        h_max = self.estimate_h_max(cog_cartesian, telescope_positions)
++        h_max = (
++            self.estimate_relative_h_max(cog_cartesian, telescope_positions)
++            + self.subarray.reference_location.geodetic.height
++        )
+ 
+         # az is clockwise, lon counter-clockwise, make sure it stays in [0, 2pi)
+         az = Longitude(-lon)
+@@ -412,18 +416,22 @@ class HillasReconstructor(HillasGeometryReconstructor):
+         return core_pos_ground, core_pos_tilted
+ 
+     @staticmethod
+-    def estimate_h_max(cog_vectors, positions):
+-        """
+-        Estimate the max height by intersecting the lines of the cog directions of each telescope.
++    def estimate_relative_h_max(cog_vectors, positions):
++        """Estimate the relative (to the observatory) vertical height of
++        shower-max by intersecting the lines of the cog directions of each
++        telescope.
+ 
+         Returns
+         -------
+-        astropy.unit.Quantity
+-            the estimated max height
++        astropy.unit.Quantity:
++            the estimated height above observatory level (not sea level) of the
++            shower-max point
++
+         """
+         positions = positions.cartesian.xyz.T.to_value(u.m)
+-        # not sure if its better to return the length of the vector of the z component
+-        return u.Quantity(
+-            np.linalg.norm(line_line_intersection_3d(cog_vectors, positions)),
++        shower_max = u.Quantity(
++            line_line_intersection_3d(cog_vectors, positions),
+             u.m,
+         )
++
++        return shower_max[2]  # the z-coordinate only
+diff --git a/docs/changes/2403.bugfix.rst b/docs/changes/2403.bugfix.rst
+new file mode 100644
+index 00000000..042b14c5
+--- /dev/null
++++ b/docs/changes/2403.bugfix.rst
+@@ -0,0 +1,14 @@
++Fixed the definition of ``h_max``, which was both inconsistent between
++`~ctapipe.reco.HillasReconstructor` and `~ctapipe.reco.HillasIntersection`
++implementations, and was also incorrect since it was measured from the
++observatory elevation rather than from sea level.
++
++The value of ``h_max`` is now defined as the height above sea level of the
++shower-max point (in meters), not the distance to that point. Therefore it is
++not corrected for the zenith angle of the shower. This is consistent with the
++options currently used for *CORSIKA*, where the *SLANT* option is set to false,
++meaning heights are actual heights not distances from the impact point, and
++``x_max`` is a *depth*, not a *slant depth*. Note that this definition may be
++inconsistent with other observatories where slant-depths are used, and also note
++that the slant depth or distance to shower max are the more useful quantities
++for shower physics.

@@ -1,0 +1,146 @@
+diff --git a/skein/model.py b/skein/model.py
+index 32cd9d6..f8941fb 100644
+--- a/skein/model.py
++++ b/skein/model.py
+@@ -10,8 +10,9 @@ import yaml
+ from . import proto as _proto
+ from .compatibility import urlparse, string, integer, math_ceil, makedirs
+ from .objects import Enum, ProtobufMessage, Specification, required
+-from .exceptions import context, FileNotFoundError
+-from .utils import implements, format_list, datetime_from_millis, runtime, xor
++from .exceptions import context, FileNotFoundError, FileExistsError
++from .utils import (implements, format_list, datetime_from_millis, runtime,
++                    xor, lock_file)
+ 
+ __all__ = ('ApplicationSpec', 'Service', 'Resources', 'File', 'FileType',
+            'FileVisibility', 'ACLs', 'Master', 'Security', 'ApplicationState',
+@@ -347,9 +348,17 @@ class Security(Specification):
+             return cls.from_directory(properties.config_dir)
+         except FileNotFoundError:
+             pass
+-        context.warn("Skein global security credentials not found, writing now "
+-                     "to %r." % properties.config_dir)
+-        return cls.new_credentials().to_directory(directory=properties.config_dir)
++
++        new = cls.new_credentials()
++        try:
++            out = new.to_directory(properties.config_dir)
++            context.warn("Skein global security credentials not found, "
++                         "writing now to %r." % properties.config_dir)
++        except FileExistsError:
++            # Race condition between competing processes, use the credentials
++            # written by the other process.
++            out = cls.from_directory(properties.config_dir)
++        return out
+ 
+     @classmethod
+     def from_directory(cls, directory):
+@@ -392,19 +401,21 @@ class Security(Specification):
+         cert_bytes = self._get_bytes('cert')
+         key_bytes = self._get_bytes('key')
+ 
+-        for path, name in [(cert_path, 'skein.crt'), (key_path, 'skein.pem')]:
+-            if os.path.exists(path):
+-                if force:
+-                    os.unlink(path)
+-                else:
+-                    msg = ("%r file already exists, use `%s` to overwrite" %
+-                           (name, '--force' if context.is_cli else 'force'))
+-                    raise context.FileExistsError(msg)
+-
+-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+-        for path, data in [(cert_path, cert_bytes), (key_path, key_bytes)]:
+-            with os.fdopen(os.open(path, flags, 0o600), 'wb') as fil:
+-                fil.write(data)
++        lock_path = os.path.join(directory, 'skein.lock')
++        with lock_file(lock_path):
++            for path, name in [(cert_path, 'skein.crt'), (key_path, 'skein.pem')]:
++                if os.path.exists(path):
++                    if force:
++                        os.unlink(path)
++                    else:
++                        msg = ("%r file already exists, use `%s` to overwrite" %
++                               (name, '--force' if context.is_cli else 'force'))
++                        raise context.FileExistsError(msg)
++
++            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
++            for path, data in [(cert_path, cert_bytes), (key_path, key_bytes)]:
++                with os.fdopen(os.open(path, flags, 0o600), 'wb') as fil:
++                    fil.write(data)
+ 
+         return Security(cert_file=cert_path, key_file=key_path)
+ 
+diff --git a/skein/utils.py b/skein/utils.py
+index 0d3fb6c..47f5850 100644
+--- a/skein/utils.py
++++ b/skein/utils.py
+@@ -1,13 +1,69 @@
+ from __future__ import print_function, division, absolute_import
+ 
+ import errno
++import fcntl
+ import os
++import threading
++import weakref
+ from contextlib import contextmanager
+ from datetime import datetime, timedelta
+ 
+ from .compatibility import unicode, UTC
+ 
+ 
++_paths_lock = threading.Lock()
++_paths_to_locks = weakref.WeakValueDictionary()
++
++
++def lock_file(path):
++    """File based lock on ``path``.
++
++    Creates a file based lock. When acquired, other processes or threads are
++    prevented from acquiring the same lock until it is released.
++    """
++    with _paths_lock:
++        lock = _paths_to_locks.get(path)
++        if lock is None:
++            _paths_to_locks[path] = lock = _FileLock(path)
++    return lock
++
++
++class _FileLock(object):
++    """Internal file based lock object"""
++    def __init__(self, path):
++        self._path = path
++        self._file = None
++        self._threadlock = threading.Lock()
++
++    def _acquire_file(self):
++        if self._file is None:
++            self._file = open(self._path, "wb")
++        fcntl.flock(self._file, fcntl.LOCK_EX)
++
++    def _release_file(self):
++        fcntl.flock(self._file, fcntl.LOCK_UN)
++        self._file.close()
++        self._file = None
++
++    def acquire(self):
++        self._threadlock.acquire()
++        try:
++            self._acquire_file()
++        except Exception:  # pragma: no cover
++            self._threadlock.release()
++            raise
++
++    def release(self):
++        self._release_file()
++        self._threadlock.release()
++
++    def __enter__(self):
++        self.acquire()
++
++    def __exit__(self, *args):
++        self.release()
++
++
+ def pid_exists(pid):
+     try:
+         os.kill(pid, 0)

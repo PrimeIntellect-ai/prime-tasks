@@ -1,0 +1,272 @@
+diff --git a/cmd/tfsec/main.go b/cmd/tfsec/main.go
+index 926dae084..1a1ee6d71 100644
+--- a/cmd/tfsec/main.go
++++ b/cmd/tfsec/main.go
+@@ -76,8 +76,8 @@ func init() {
+ 	rootCmd.Flags().BoolVar(&includeIgnored, "include-ignored", includeIgnored, "Include ignored checks in the result output")
+ 	rootCmd.Flags().BoolVar(&allDirs, "force-all-dirs", allDirs, "Don't search for tf files, include everything below provided directory.")
+ 	rootCmd.Flags().BoolVar(&runStatistics, "run-statistics", runStatistics, "View statistics table of current findings.")
+-	rootCmd.Flags().BoolVar(&ignoreWarnings, "ignore-warnings", ignoreWarnings, "Don't show warnings in the output.")
+-	rootCmd.Flags().BoolVar(&ignoreInfo, "ignore-info", ignoreWarnings, "Don't show info results in the output.")
++	rootCmd.Flags().BoolVar(&ignoreWarnings, "ignore-warnings", ignoreWarnings, "[DEPRECATED] Don't show warnings in the output.")
++	rootCmd.Flags().BoolVar(&ignoreInfo, "ignore-info", ignoreWarnings, "[DEPRECATED] Don't show info results in the output.")
+ 	rootCmd.Flags().BoolVarP(&stopOnCheckError, "allow-checks-to-panic", "p", stopOnCheckError, "Allow panics to propagate up from rule checking")
+ }
+ 
+@@ -123,6 +123,10 @@ var rootCmd = &cobra.Command{
+ 		var filterResultsList []string
+ 		var outputFile *os.File
+ 
++		if ignoreWarnings || ignoreInfo {
++			fmt.Fprint(os.Stderr, "WARNING: The --ignore-info and --ignore-warnings flags are deprecated and will soon be removed.\n")
++		}
++
+ 		if len(args) == 1 {
+ 			dir, err = filepath.Abs(args[0])
+ 		} else {
+diff --git a/example/counts/main.tf b/example/counts/main.tf
+new file mode 100644
+index 000000000..9a861278c
+--- /dev/null
++++ b/example/counts/main.tf
+@@ -0,0 +1,34 @@
++resource "aws_security_group_rule" "trust-rules-dev" {
++	count = 4
++	description = var.trust-sg-rules[count.index]["description"]
++	type = "ingress"
++	protocol = "tcp"
++	cidr_blocks = ["0.0.0.0/2"]
++	to_port = var.trust-sg-rules[count.index]["to_port"]
++	from_port = 10
++	security_group_id = aws_security_group.trust-rules-dev.id
++}
++	
++resource "aws_security_group" "trust-rules-dev" {
++	description = "description"
++}
++	
++variable "trust-sg-rules" {
++	description = "A list of maps that creates a number of sg"
++	type = list(map(string))
++	
++	default = [
++		{
++			description = "Allow egress of http traffic"
++			from_port = "80"
++			to_port = "80"
++			type = "egress"
++		},
++		{
++			description = "Allow egress of http traffic"
++			from_port = "80"
++			to_port = "80"
++			type = "egress"
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/internal/app/tfsec/block/block.go b/internal/app/tfsec/block/block.go
+index dea8a7c79..17d681c39 100644
+--- a/internal/app/tfsec/block/block.go
++++ b/internal/app/tfsec/block/block.go
+@@ -25,6 +25,7 @@ type Block interface {
+ 	FullName() string
+ 	TypeLabel() string
+ 	NameLabel() string
++	Clone(index int) Block
+ 	HasChild(childElement string) bool
+ 	MissingChild(childElement string) bool
+ 	InModule() bool
+diff --git a/internal/app/tfsec/block/hclblock.go b/internal/app/tfsec/block/hclblock.go
+index 950e688a9..eb1778a6c 100644
+--- a/internal/app/tfsec/block/hclblock.go
++++ b/internal/app/tfsec/block/hclblock.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/hcl/v2/hclsyntax"
+ 	"github.com/zclconf/go-cty/cty"
++	"github.com/zclconf/go-cty/cty/gocty"
+ )
+ 
+ type HCLBlock struct {
+@@ -24,6 +25,29 @@ func NewHCLBlock(hclBlock *hcl.Block, ctx *hcl.EvalContext, moduleBlock Block) B
+ 	}
+ }
+ 
++func (block *HCLBlock) Clone(index int) Block {
++	childCtx := block.evalContext.Parent().NewChild()
++	if childCtx.Variables == nil {
++		childCtx.Variables = make(map[string]cty.Value)
++	}
++	cloneHCL := *block.hclBlock
++	clone := NewHCLBlock(&cloneHCL, childCtx, block.moduleBlock).(*HCLBlock)
++	if len(clone.hclBlock.Labels) > 0 {
++		position := len(clone.hclBlock.Labels) - 1
++		labels := make([]string, len(clone.hclBlock.Labels))
++		for i := 0; i < len(labels); i++ {
++			labels[i] = clone.hclBlock.Labels[i]
++		}
++		labels[position] = fmt.Sprintf("%s[%d]", clone.hclBlock.Labels[position], index)
++		clone.hclBlock.Labels = labels
++	}
++	indexVal, _ := gocty.ToCtyValue(index, cty.Number)
++	clone.evalContext.Variables["count"] = cty.ObjectVal(map[string]cty.Value{
++		"index": indexVal,
++	})
++	return clone
++}
++
+ func (block *HCLBlock) AttachEvalContext(ctx *hcl.EvalContext) {
+ 	block.evalContext = ctx
+ }
+diff --git a/internal/app/tfsec/parser/evaluator.go b/internal/app/tfsec/parser/evaluator.go
+index 6e70aefc5..1877849ca 100644
+--- a/internal/app/tfsec/parser/evaluator.go
++++ b/internal/app/tfsec/parser/evaluator.go
+@@ -48,7 +48,7 @@ func NewEvaluator(
+ 	}
+ 
+ 	for _, b := range blocks {
+-		b.AttachEvalContext(ctx)
++		b.AttachEvalContext(ctx.NewChild())
+ 	}
+ 
+ 	return &Evaluator{
+@@ -174,9 +174,63 @@ func (e *Evaluator) EvaluateAll() (block.Blocks, error) {
+ 		allBlocks = mergeBlocks(allBlocks, module.Blocks)
+ 	}
+ 
++	// expand out resources and modules via count
++	allBlocks = e.expandBlockCounts(allBlocks)
++
++	for i := 0; i < maxContextIterations; i++ {
++
++		e.evaluateStep(i)
++
++		// if ctx matches the last evaluation, we can bail, nothing left to resolve
++		if reflect.DeepEqual(lastContext.Variables, e.ctx.Variables) {
++			break
++		}
++
++		if len(e.ctx.Variables) != len(lastContext.Variables) {
++			lastContext.Variables = make(map[string]cty.Value, len(e.ctx.Variables))
++		}
++		for k, v := range e.ctx.Variables {
++			lastContext.Variables[k] = v
++		}
++	}
++
+ 	return allBlocks, nil
+ }
+ 
++/*
++Input:
++resource.aws_s3_bucket.blah -> count=3
++Output:
++resource.aws_s3_bucket.blah[0] -> count.index=0
++resource.aws_s3_bucket.blah[1] -> count.index=1
++resource.aws_s3_bucket.blah[2] -> count.index=2
++*/
++func (e *Evaluator) expandBlockCounts(blocks block.Blocks) block.Blocks {
++	var filtered block.Blocks
++	for _, block := range blocks {
++		countAttr := block.GetAttribute("count")
++		if countAttr == nil {
++			filtered = append(filtered, block)
++			continue
++		}
++
++		count := 1
++		if !countAttr.Value().IsNull() && countAttr.Value().IsKnown() {
++			if countAttr.Value().Type() == cty.Number {
++				f, _ := countAttr.Value().AsBigFloat().Float64()
++				count = int(f)
++			}
++		}
++
++		for i := 0; i < count; i++ {
++			clone := block.Clone(i)
++			filtered = append(filtered, clone)
++		}
++	}
++	return filtered
++
++}
++
+ func mergeBlocks(allBlocks block.Blocks, newBlocks block.Blocks) block.Blocks {
+ 	var merger = make(map[block.Block]bool)
+ 	for _, b := range allBlocks {
+diff --git a/pkg/result/result.go b/pkg/result/result.go
+index c84bb8db5..984316b1a 100644
+--- a/pkg/result/result.go
++++ b/pkg/result/result.go
+@@ -48,7 +48,11 @@ func (r *Result) Passed() bool {
+ }
+ 
+ func (r *Result) HashCode() string {
+-	return fmt.Sprintf("%s:%s", r.Range, r.RuleID)
++	var blockName string
++	if r.topLevelBlock != nil {
++		blockName = r.topLevelBlock.FullName()
++	}
++	return fmt.Sprintf("%s:%s:%s", blockName, r.Range, r.RuleID)
+ }
+ 
+ func (r *Result) WithRuleID(id string) *Result {
+@@ -143,6 +147,9 @@ func (r *Result) WithAttributeAnnotation(attr block.Attribute) *Result {
+ 			}
+ 			typeStr = "list"
+ 			raw = fmt.Sprintf("[%s]", strings.Join(strValues, ", "))
++		default:
++			typeStr = "unknown"
++			raw = "???"
+ 		}
+ 	}
+ 
+diff --git a/pkg/rule/check.go b/pkg/rule/check.go
+index 67bafd08b..2818839e5 100644
+--- a/pkg/rule/check.go
++++ b/pkg/rule/check.go
+@@ -7,7 +7,6 @@ import (
+ 	"strings"
+ 
+ 	"github.com/aquasecurity/tfsec/pkg/provider"
+-	"github.com/zclconf/go-cty/cty"
+ 
+ 	"github.com/aquasecurity/tfsec/pkg/result"
+ 
+@@ -48,23 +47,6 @@ func CheckRule(r *Rule, block block.Block, ctx *hclcontext.Context, ignoreErrors
+ 	return resultSet
+ }
+ 
+-func isResourceCountZero(block block.Block) bool {
+-	if block.Type() == "resource" {
+-		countAttr := block.GetAttribute("count")
+-		if countAttr != nil {
+-			if !countAttr.Value().IsNull() && countAttr.Value().IsKnown() {
+-				if countAttr.Value().Type() == cty.Number {
+-					if f, _ := countAttr.Value().AsBigFloat().Float64(); f == 0 {
+-						return true
+-					}
+-				}
+-			}
+-		}
+-	}
+-	return false
+-
+-}
+-
+ // IsRuleRequiredForBlock returns true if the Rule should be applied to the given HCL block
+ func IsRuleRequiredForBlock(rule *Rule, block block.Block) bool {
+ 
+@@ -72,10 +54,6 @@ func IsRuleRequiredForBlock(rule *Rule, block block.Block) bool {
+ 		return false
+ 	}
+ 
+-	if isResourceCountZero(block) {
+-		return false
+-	}
+-
+ 	if len(rule.RequiredTypes) > 0 {
+ 		var found bool
+ 		for _, requiredType := range rule.RequiredTypes {

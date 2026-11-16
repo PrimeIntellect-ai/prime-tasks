@@ -1,0 +1,292 @@
+diff --git a/src/cfnlint/context/conditions/_conditions.py b/src/cfnlint/context/conditions/_conditions.py
+index 9403c4203..3f50720f8 100644
+--- a/src/cfnlint/context/conditions/_conditions.py
++++ b/src/cfnlint/context/conditions/_conditions.py
+@@ -5,8 +5,9 @@ SPDX-License-Identifier: MIT-0
+ 
+ from __future__ import annotations
+ 
++import itertools
+ from dataclasses import dataclass, field
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Iterator
+ 
+ from sympy import Not, Or
+ from sympy.logic.boolalg import BooleanFunction
+@@ -14,6 +15,10 @@ from sympy.logic.inference import satisfiable
+ 
+ from cfnlint.conditions._utils import get_hash
+ from cfnlint.context.conditions._condition import Condition
++from cfnlint.context.conditions._utils import (
++    build_instance_from_scenario,
++    get_conditions_from_property,
++)
+ from cfnlint.context.conditions.exceptions import Unsatisfiable
+ 
+ if TYPE_CHECKING:
+@@ -25,6 +30,7 @@ class Conditions:
+     # Template level condition management
+     conditions: dict[str, Condition] = field(init=True, default_factory=dict)
+     cnf: BooleanFunction | None = field(init=True, default=None)
++    _max_scenarios: int = field(init=False, default=128)
+ 
+     @classmethod
+     def create_from_instance(
+@@ -106,6 +112,30 @@ class Conditions:
+             cnf=cnf,
+         )
+ 
++    def _build_conditions(self, conditions: set[str]) -> Iterator["Conditions"]:
++        scenarios_attempted = 0
++        for product in itertools.product([True, False], repeat=len(conditions)):
++            params = dict(zip(conditions, product))
++            try:
++                yield self.evolve(params)
++            except Unsatisfiable:
++                pass
++
++            scenarios_attempted += 1
++            # On occassions people will use a lot of non-related conditions
++            # this is fail safe to limit the maximum number of responses
++            if scenarios_attempted >= self._max_scenarios:
++                return
++
++    def evolve_from_instance(self, instance: Any) -> Iterator[tuple[Any, "Conditions"]]:
++
++        conditions = get_conditions_from_property(instance)
++
++        for scenario in self._build_conditions(conditions):
++            yield build_instance_from_scenario(
++                instance, scenario.status, is_root=True
++            ), scenario
++
+     @property
+     def status(self) -> dict[str, bool]:
+         obj = {}
+diff --git a/src/cfnlint/context/conditions/_utils.py b/src/cfnlint/context/conditions/_utils.py
+new file mode 100644
+index 000000000..74b33bf56
+--- /dev/null
++++ b/src/cfnlint/context/conditions/_utils.py
+@@ -0,0 +1,112 @@
++"""
++Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++SPDX-License-Identifier: MIT-0
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from cfnlint.decode.node import Mark, dict_node, list_node
++from cfnlint.helpers import is_function
++
++
++def get_conditions_from_property(instance: Any, is_root: bool = True) -> set[str]:
++    """
++    Gets the name of the conditions used directly inside the object.
++
++    We do not look at nested objects for conditions.
++
++    Args:
++        instance (Any): The object or listto process.
++        is_root (bool): If we are at the root of the object. Default: True.
++
++    Returns:
++        set[str]: The set of conditions used in the object or list.
++    """
++    results: set[str] = set()
++    if isinstance(instance, list):
++        for v in instance:
++            results = results.union(get_conditions_from_property(v, is_root=False))
++        return results
++
++    fn_k, fn_v = is_function(instance)
++    if fn_k == "Fn::If":
++        if isinstance(fn_v, list) and len(fn_v) == 3:
++            if isinstance(fn_v[0], str):
++                results.add(fn_v[0])
++                results = results.union(
++                    get_conditions_from_property(fn_v[1], is_root=is_root)
++                )
++                results = results.union(
++                    get_conditions_from_property(fn_v[2], is_root=is_root)
++                )
++        return results
++    if is_root:
++        if isinstance(instance, dict):
++            for k, v in instance.items():
++                results = results.union(get_conditions_from_property(v, is_root=False))
++    return results
++
++
++def build_instance_from_scenario(
++    instance: Any, scenario: dict[str, bool], is_root: bool = True
++) -> Any:
++    """
++    Get object values from a provided scenario.
++
++    This function recursively processes the provided object, resolving any
++    conditional logic (such as Fn::If) based on the given scenario.
++
++    Args:
++        instance (Any): The object or listto process.
++        scenario (dict): The scenario to use when resolving conditional logic.
++        is_root (bool): If we are at the root of the object. Default: True.
++
++    Returns:
++        dict or list or any: The processed object, with conditional logic resolved.
++        The return type can be a dictionary, list, or any other data type,
++        depending on the structure of the input object.
++    """
++
++    if isinstance(instance, list):
++        new_list: list[Any] = list_node(
++            [],
++            getattr(instance, "start_mark", Mark(0, 0)),
++            getattr(instance, "end_mark", Mark(0, 0)),
++        )
++        for v in instance:
++            new_value = build_instance_from_scenario(v, scenario, is_root=False)
++            if new_value is not None:
++                new_list.append(new_value)
++        return new_list
++
++    if isinstance(instance, dict):
++        fn_k, fn_v = is_function(instance)
++        if fn_k == "Fn::If":
++            if isinstance(fn_v, list) and len(fn_v) == 3:
++                if isinstance(fn_v[0], str):
++                    if_path = scenario.get(fn_v[0], None)
++                    if if_path is not None:
++                        new_value = build_instance_from_scenario(
++                            fn_v[1] if if_path else fn_v[2], scenario, is_root
++                        )
++                        if new_value is not None:
++                            return new_value
++                        return None
++            return instance
++        if fn_k == "Ref" and fn_v == "AWS::NoValue":
++            return {} if is_root else None
++        if is_root:
++            new_obj: dict[str, Any] = dict_node(
++                {},
++                getattr(instance, "start_mark", Mark(0, 0)),
++                getattr(instance, "end_mark", Mark(0, 0)),
++            )
++            for k, v in instance.items():
++                new_value = build_instance_from_scenario(v, scenario, is_root=False)
++                if new_value is not None:
++                    new_obj[k] = new_value
++            return new_obj
++
++    return instance
+diff --git a/src/cfnlint/jsonschema/_filter.py b/src/cfnlint/jsonschema/_filter.py
+index 3cd695c99..82ca42844 100644
+--- a/src/cfnlint/jsonschema/_filter.py
++++ b/src/cfnlint/jsonschema/_filter.py
+@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT-0
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field, fields
+-from typing import TYPE_CHECKING, Any, Sequence, Tuple
++from typing import TYPE_CHECKING, Any, Iterator, Sequence, Tuple
+ 
+ from cfnlint.helpers import FUNCTIONS, REGEX_DYN_REF, ToPy, ensure_list
+ 
+@@ -107,7 +107,9 @@ class FunctionFilter:
+ 
+         return standard_schema, group_schema
+ 
+-    def filter(self, validator: Any, instance: Any, schema: Any):
++    def filter(
++        self, validator: Any, instance: Any, schema: Any
++    ) -> Iterator[tuple[Any, dict[str, Any], "Validator"]]:
+         # Lets validate dynamic references when appropriate
+         if validator.is_type(instance, "string") and self.validate_dynamic_references:
+             if REGEX_DYN_REF.findall(instance):
+@@ -117,14 +119,14 @@ class FunctionFilter:
+                     p in set(FUNCTIONS) - set(["Fn::If"])
+                     for p in validator.context.path.path
+                 ):
+-                    yield (instance, {"dynamicReference": schema})
++                    yield (instance, {"dynamicReference": schema}, validator)
+                     return
+                 return
+ 
+         # if there are no functions then we don't need to worry
+         # about ref AWS::NoValue or If conditions
+         if not validator.context.functions:
+-            yield instance, schema
++            yield instance, schema, validator
+             return
+ 
+         # dependencies, required, minProperties, maxProperties
+@@ -133,9 +135,14 @@ class FunctionFilter:
+         standard_schema, group_schema = self._filter_schemas(schema, validator)
+ 
+         if group_schema:
+-            scenarios = validator.cfn.get_object_without_conditions(instance)
+-            for scenario in scenarios:
+-                yield (scenario.get("Object"), group_schema)
++            for (
++                scenario_instance,
++                scenario,
++            ) in validator.context.conditions.evolve_from_instance(instance):
++                scenario_validator = validator.evolve(
++                    context=validator.context.evolve(conditions=scenario)
++                )
++                yield (scenario_instance, group_schema, scenario_validator)
+ 
+         if validator.is_type(instance, "object"):
+             if len(instance) == 1:
+@@ -145,10 +152,10 @@ class FunctionFilter:
+                         k_schema = {
+                             k_py.py: standard_schema,
+                         }
+-                        yield (instance, k_schema)
++                        yield (instance, k_schema, validator)
+                         return
+ 
+-        yield (instance, standard_schema)
++        yield (instance, standard_schema, validator)
+ 
+     def evolve(self, **kwargs) -> "FunctionFilter":
+         """
+diff --git a/src/cfnlint/jsonschema/validators.py b/src/cfnlint/jsonschema/validators.py
+index e6c5ada5a..98263ca8a 100644
+--- a/src/cfnlint/jsonschema/validators.py
++++ b/src/cfnlint/jsonschema/validators.py
+@@ -229,7 +229,7 @@ def create(
+                 self.resolver.push_scope(scope)
+             try:
+                 # we need filter and apply schemas against the new instances
+-                for _instance, _schema in self.function_filter.filter(
++                for _instance, _schema, _validator in self.function_filter.filter(
+                     self, instance, schema
+                 ):
+                     for k, v in _schema.items():
+@@ -238,7 +238,9 @@ def create(
+                             continue
+ 
+                         try:
+-                            for err in validator(self, v, _instance, _schema) or ():
++                            for err in (
++                                validator(_validator, v, _instance, _schema) or ()
++                            ):
+                                 msg = custom_msg(k, _schema) or err.message
+                                 if msg is not None:
+                                     err.message = msg
+diff --git a/src/cfnlint/template/template.py b/src/cfnlint/template/template.py
+index d14b56291..6e78c4cd4 100644
+--- a/src/cfnlint/template/template.py
++++ b/src/cfnlint/template/template.py
+@@ -962,7 +962,7 @@ class Template:  # pylint: disable=R0904,too-many-lines,too-many-instance-attrib
+                         result[key] = new_value
+             return result
+         if isinstance(obj, list):
+-            result = list_node({}, obj.start_mark, obj.end_mark)
++            result = list_node([], obj.start_mark, obj.end_mark)
+             for item in obj:
+                 element = get_value(item, scenario)
+                 if element is not None:

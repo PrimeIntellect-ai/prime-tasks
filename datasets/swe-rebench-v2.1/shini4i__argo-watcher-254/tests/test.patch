@@ -1,0 +1,203 @@
+diff --git a/internal/models/gitops_test.go b/internal/models/gitops_test.go
+new file mode 100644
+index 0000000..b377e66
+--- /dev/null
++++ b/internal/models/gitops_test.go
+@@ -0,0 +1,172 @@
++package models
++
++import (
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/x509"
++	"encoding/json"
++	"encoding/pem"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/go-git/go-git/v5"
++	"github.com/go-git/go-git/v5/config"
++	"github.com/go-git/go-git/v5/plumbing"
++	"github.com/go-git/go-git/v5/plumbing/object"
++)
++
++func TestApplicationUpdateGitImageTagUsesWriteBackTarget(t *testing.T) {
++	if os.Getenv("ARGO_WATCHER_GIT_TEST_CHILD") == "1" {
++		appJSON := fmt.Sprintf(`{"metadata":{"name":"demo","annotations":{"argo-watcher/managed-images":"app=example/image","argo-watcher/app.helm.image-tag":"image.tag"%s}},"spec":{"source":{"repoURL":%q,"targetRevision":%q,"path":%q},"sources":[{"repoURL":"ignored","targetRevision":"ignored","path":"ignored"}]}}`,
++			childMultiSourceAnnotations(), os.Getenv("ARGO_WATCHER_GIT_TEST_SOURCE_REPO"), os.Getenv("ARGO_WATCHER_GIT_TEST_SOURCE_BRANCH"), os.Getenv("ARGO_WATCHER_GIT_TEST_SOURCE_PATH"))
++		if os.Getenv("ARGO_WATCHER_GIT_TEST_MODE") == "single" {
++			appJSON = strings.Replace(appJSON, `,"sources":[{"repoURL":"ignored","targetRevision":"ignored","path":"ignored"}]`, "", 1)
++		}
++		var app Application
++		if err := json.Unmarshal([]byte(appJSON), &app); err != nil {
++			t.Fatal(err)
++		}
++		if err := app.UpdateGitImageTag(&Task{Id: "test", Images: []Image{{Image: "example/image", Tag: "new-tag"}}}); err != nil {
++			t.Fatal(err)
++		}
++		return
++	}
++
++	keyPath := filepath.Join(t.TempDir(), "id_rsa")
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	for _, test := range []struct {
++		name string
++		mode string
++	}{
++		{name: "multi-source application writes to its annotated repository and path", mode: "multi"},
++		{name: "single-source application keeps using its source repository and path", mode: "single"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			remote, targetBranch, targetPath := newLocalGitRemote(t)
++			sourceRepo, sourceBranch, sourcePath := "file:///missing-decoy-repository", "missing-decoy-branch", "wrong/path"
++			if test.mode == "single" {
++				sourceRepo, sourceBranch, sourcePath = remote, targetBranch, targetPath
++			}
++			cmd := exec.Command(os.Args[0], "-test.run=^TestApplicationUpdateGitImageTagUsesWriteBackTarget$")
++			cmd.Env = testEnvironment(os.Environ(), map[string]string{
++				"ARGO_WATCHER_GIT_TEST_CHILD":         "1",
++				"ARGO_WATCHER_GIT_TEST_MODE":          test.mode,
++				"ARGO_WATCHER_GIT_TEST_SOURCE_REPO":   sourceRepo,
++				"ARGO_WATCHER_GIT_TEST_SOURCE_BRANCH": sourceBranch,
++				"ARGO_WATCHER_GIT_TEST_SOURCE_PATH":   sourcePath,
++				"ARGO_WATCHER_GIT_TEST_WRITE_REPO":    remote,
++				"ARGO_WATCHER_GIT_TEST_WRITE_BRANCH":  targetBranch,
++				"ARGO_WATCHER_GIT_TEST_WRITE_PATH":    targetPath,
++				"SSH_KEY_PATH":                        keyPath,
++				"SSH_KEY_PASS":                        "",
++				"SSH_COMMIT_USER":                     "Test User",
++				"SSH_COMMIT_MAIL":                     "test@example.com",
++			})
++			output, err := cmd.CombinedOutput()
++			if err != nil {
++				t.Fatalf("updater did not complete the direct write-back: %v\n%s", err, output)
++			}
++
++			repo, err := git.PlainOpen(remote)
++			if err != nil {
++				t.Fatal(err)
++			}
++			ref, err := repo.Reference(plumbing.NewBranchReferenceName(targetBranch), true)
++			if err != nil {
++				t.Fatal(err)
++			}
++			commit, err := repo.CommitObject(ref.Hash())
++			if err != nil {
++				t.Fatal(err)
++			}
++			file, err := commit.File(filepath.ToSlash(filepath.Join(targetPath, ".argocd-source-demo.yaml")))
++			if err != nil {
++				t.Fatalf("write-back file was not created at the selected location: %v", err)
++			}
++			content, err := file.Contents()
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !strings.Contains(content, "new-tag") {
++				t.Fatalf("write-back file does not contain the updated image tag: %s", content)
++			}
++		})
++	}
++}
++
++func childMultiSourceAnnotations() string {
++	if os.Getenv("ARGO_WATCHER_GIT_TEST_MODE") != "multi" {
++		return ""
++	}
++	return fmt.Sprintf(`,"argo-watcher/write-back-repo":%q,"argo-watcher/write-back-branch":%q,"argo-watcher/write-back-path":%q`,
++		os.Getenv("ARGO_WATCHER_GIT_TEST_WRITE_REPO"), os.Getenv("ARGO_WATCHER_GIT_TEST_WRITE_BRANCH"), os.Getenv("ARGO_WATCHER_GIT_TEST_WRITE_PATH"))
++}
++
++func newLocalGitRemote(t *testing.T) (string, string, string) {
++	t.Helper()
++	root := t.TempDir()
++	remotePath := filepath.Join(root, "remote")
++	branch := "target"
++	path := "deploy/chart"
++
++	repo, err := git.PlainInit(remotePath, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Join(remotePath, path), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(remotePath, path, "keep.txt"), []byte("base"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	worktree, err := repo.Worktree()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := worktree.Add("."); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := worktree.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "Test", Email: "test@example.com", When: time.Now()}}); err != nil {
++		t.Fatal(err)
++	}
++	if err := repo.CreateBranch(&config.Branch{Name: branch}); err != nil {
++		t.Fatal(err)
++	}
++	head, err := repo.Head()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName(branch), head.Hash())); err != nil {
++		t.Fatal(err)
++	}
++	return remotePath, branch, path
++}
++
++func testEnvironment(existing []string, values map[string]string) []string {
++	result := make([]string, 0, len(existing)+len(values))
++	for _, item := range existing {
++		name := item
++		if index := strings.IndexByte(item, '='); index >= 0 {
++			name = item[:index]
++		}
++		if _, replaced := values[name]; !replaced {
++			result = append(result, item)
++		}
++	}
++	for name, value := range values {
++		result = append(result, name+"="+value)
++	}
++	return result
++}
+diff --git a/pkg/updater/updater_test.go b/pkg/updater/updater_test.go
+index e9d8916..42986a8 100644
+--- a/pkg/updater/updater_test.go
++++ b/pkg/updater/updater_test.go
+@@ -32,7 +32,7 @@ func TestGitRepoClone(t *testing.T) {
+ 		{
+ 			name: "successful clone",
+ 			mockSSH: func() {
+-				mockGitHandler.EXPECT().NewPublicKeysFromFile("git", sshKeyPath, sshKeyPass).Return(&ssh.PublicKeys{}, nil)
++				mockGitHandler.EXPECT().AddSSHKey("git", sshKeyPath, sshKeyPass).Return(&ssh.PublicKeys{}, nil)
+ 				mockGitHandler.EXPECT().Clone(memory.NewStorage(), memfs.New(), &git.CloneOptions{
+ 					URL:           "mockRepoURL",
+ 					ReferenceName: "refs/heads/mockBranch",
+@@ -44,9 +44,9 @@ func TestGitRepoClone(t *testing.T) {
+ 			expected: nil,
+ 		},
+ 		{
+-			name: "failed NewPublicKeysFromFile",
++			name: "failed AddSSHKey",
+ 			mockSSH: func() {
+-				mockGitHandler.EXPECT().NewPublicKeysFromFile("git", sshKeyPath, sshKeyPass).Return(nil, errors.New("failed to fetch keys"))
++				mockGitHandler.EXPECT().AddSSHKey("git", sshKeyPath, sshKeyPass).Return(nil, errors.New("failed to fetch keys"))
+ 			},
+ 			expected: errors.New("failed to fetch keys"),
+ 		},

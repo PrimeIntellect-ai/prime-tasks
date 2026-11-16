@@ -1,0 +1,360 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8f915c8e..18758bd8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
+ -   #1597 : Handle class docstrings.
+ -   \[INTERNALS\] Add `class_type` attribute to `TypedAstNode`.
+ -   #1494 : Add support for functions returning class instances.
++-   #1495 : Add support for functions with class instance arguments.
+ 
+ ### Fixed
+ 
+diff --git a/pyccel/ast/cwrapper.py b/pyccel/ast/cwrapper.py
+index 37754223..cfed10f5 100644
+--- a/pyccel/ast/cwrapper.py
++++ b/pyccel/ast/cwrapper.py
+@@ -55,6 +55,7 @@ __all__ = (
+ #----- C / PYTHON FUNCTIONS ---
+     'Py_INCREF',
+     'Py_DECREF',
++    'PyObject_TypeCheck',
+ )
+ 
+ #-------------------------------------------------------------------
+@@ -541,6 +542,12 @@ class PyClassDef(ClassDef):
+ 
+     **kwargs : dict
+         See ClassDef.
++
++    See Also
++    --------
++    ClassDef
++        The class from which PyClassDef inherits. This is also the object being
++        wrapped.
+     """
+     __slots__ = ('_original_class', '_struct_name', '_type_name', '_type_object')
+ 
+@@ -721,6 +728,10 @@ PyErr_SetString = FunctionDef(name = 'PyErr_SetString',
+ PyNotImplementedError = Variable(PyccelPyObject(), name = 'PyExc_NotImplementedError')
+ PyTypeError = Variable(PyccelPyObject(), name = 'PyExc_TypeError')
+ 
++PyObject_TypeCheck = FunctionDef(name = 'PyObject_TypeCheck',
++            arguments = [FunctionDefArgument(Variable(PyccelPyObject(), 'o', memory_handling = 'alias')), FunctionDefArgument(Variable(PyccelPyClassType(), 'c_type', memory_handling='alias'))],
++            results = [FunctionDefResult(Variable(NativeBool(), 'r'))],
++            body = [])
+ 
+ # Functions definitions are defined in pyccel/stdlib/cwrapper/cwrapper.c
+ check_type_registry = {
+diff --git a/pyccel/codegen/printing/ccode.py b/pyccel/codegen/printing/ccode.py
+index ac0c0d4b..4f637211 100644
+--- a/pyccel/codegen/printing/ccode.py
++++ b/pyccel/codegen/printing/ccode.py
+@@ -48,7 +48,7 @@ from pyccel.ast.variable import DottedName
+ from pyccel.ast.variable import DottedVariable
+ from pyccel.ast.variable import InhomogeneousTupleVariable
+ 
+-from pyccel.ast.c_concepts import ObjectAddress, CMacro, CStringExpression
++from pyccel.ast.c_concepts import ObjectAddress, CMacro, CStringExpression, PointerCast
+ 
+ from pyccel.codegen.printing.codeprinter import CodePrinter
+ 
+@@ -348,7 +348,7 @@ class CCodePrinter(CodePrinter):
+         bool
+             True if a C pointer, False otherwise.
+         """
+-        if isinstance(a, (Nil, ObjectAddress)):
++        if isinstance(a, (Nil, ObjectAddress, PointerCast)):
+             return True
+         if isinstance(a, FunctionCall):
+             a = a.funcdef.results[0].var
+@@ -1856,20 +1856,20 @@ class CCodePrinter(CodePrinter):
+          # Ensure the correct syntax is used for pointers
+         args = []
+         for a, f in zip(expr.args, func.arguments):
+-            a = a.value if a else Nil()
++            arg_val = a.value or Nil()
+             f = f.var
+             if self.is_c_pointer(f):
+-                if isinstance(a, Variable):
+-                    args.append(ObjectAddress(a))
+-                elif not self.is_c_pointer(a):
++                if isinstance(arg_val, Variable):
++                    args.append(ObjectAddress(arg_val))
++                elif not self.is_c_pointer(arg_val):
+                     tmp_var = self.scope.get_temporary_variable(f.dtype)
+-                    assign = Assign(tmp_var, a)
++                    assign = Assign(tmp_var, arg_val)
+                     self._additional_code += self._print(assign)
+                     args.append(ObjectAddress(tmp_var))
+                 else:
+-                    args.append(a)
++                    args.append(arg_val)
+             else :
+-                args.append(a)
++                args.append(arg_val)
+ 
+         args += self._temporary_args
+         self._temporary_args = []
+@@ -2280,8 +2280,10 @@ class CCodePrinter(CodePrinter):
+ 
+     def _print_PointerCast(self, expr):
+         declare_type = self.get_declare_type(expr.cast_type)
++        if not self.is_c_pointer(expr.cast_type):
++            declare_type += '*'
+         var_code = self._print(ObjectAddress(expr.obj))
+-        return f'(*({declare_type}*)({var_code}))'
++        return f'(*({declare_type})({var_code}))'
+ 
+     def _print_Comment(self, expr):
+         comments = self._print(expr.text)
+diff --git a/pyccel/codegen/wrapper/c_to_python_wrapper.py b/pyccel/codegen/wrapper/c_to_python_wrapper.py
+index 115fe222..54341ec1 100644
+--- a/pyccel/codegen/wrapper/c_to_python_wrapper.py
++++ b/pyccel/codegen/wrapper/c_to_python_wrapper.py
+@@ -21,7 +21,7 @@ from pyccel.ast.cwrapper      import PyArg_ParseTupleNode, Py_None, PyClassDef
+ from pyccel.ast.cwrapper      import py_to_c_registry, check_type_registry, PyBuildValueNode
+ from pyccel.ast.cwrapper      import PyErr_SetString, PyTypeError, PyNotImplementedError
+ from pyccel.ast.cwrapper      import C_to_Python, PyFunctionDef, PyInterface
+-from pyccel.ast.cwrapper      import PyModule_AddObject, Py_DECREF
++from pyccel.ast.cwrapper      import PyModule_AddObject, Py_DECREF, PyObject_TypeCheck
+ from pyccel.ast.cwrapper      import Py_INCREF, PyType_Ready, WrapperCustomDataType
+ from pyccel.ast.c_concepts    import ObjectAddress, PointerCast
+ from pyccel.ast.datatypes     import NativeVoid, NativeInteger, CustomDataType, DataTypeFactory
+@@ -91,7 +91,7 @@ class CToPythonWrapper(Wrapper):
+                 var = Variable(dtype=self._python_object_map[dtype],
+                                 name=self.scope.get_new_name(name),
+                                 memory_handling='alias',
+-                                cls_base = self.scope.find(dtype.name, 'classes'),
++                                cls_base = self.scope.find(dtype.name, 'classes', raise_if_missing = True),
+                                 is_temp=is_temp)
+             except KeyError as e:
+                 raise NotImplementedError("Can't return an object whose type was imported. See #1650") from e
+@@ -121,7 +121,7 @@ class CToPythonWrapper(Wrapper):
+         list of Variable
+             Variables which will hold the arguments in Python.
+         """
+-        collect_args = [self.get_new_PyObject(a.var.name+'_obj', a.var.dtype) for a in args]
++        collect_args = [self.get_new_PyObject(getattr(a, 'original_function_argument_variable', a.var).name+'_obj') for a in args]
+         self._python_object_map.update(dict(zip(args, collect_args)))
+         return collect_args
+ 
+@@ -238,8 +238,11 @@ class CToPythonWrapper(Wrapper):
+         """
+         rank = arg.rank
+         error_code = ()
+-        if rank == 0:
+-            dtype = arg.dtype
++        dtype = arg.dtype
++        if isinstance(dtype, CustomDataType):
++            python_cls_base = self.scope.find(dtype.name, 'classes', raise_if_missing = True)
++            func_call = FunctionCall(PyObject_TypeCheck, [py_obj, python_cls_base.type_object])
++        elif rank == 0:
+             prec  = arg.precision
+             try :
+                 cast_function = check_type_registry[(dtype, prec)]
+@@ -258,7 +261,7 @@ class CToPythonWrapper(Wrapper):
+ 
+             func_call = FunctionCall(func, [py_obj])
+         else:
+-            dtype = str(arg.dtype)
++            dtype = str(dtype)
+             prec  = get_final_precision(arg)
+             try :
+                 type_ref = numpy_dtype_registry[(dtype, prec)]
+@@ -747,18 +750,8 @@ class CToPythonWrapper(Wrapper):
+         # This function creates variables so it must be called before extracting them from the scope.
+         result_wrap = [l for r in python_results for l in self._wrap(r)]
+ 
+-        # Get the names of the arguments which should be used to call the C-compatible function
+-        func_call_arg_names = []
+-        for a in original_c_args:
+-            if isinstance(a, BindCFunctionDefArgument):
+-                orig_var = a.original_function_argument_variable
+-                if orig_var.rank == 0 and orig_var.dtype in NativeNumeric:
+-                    func_call_arg_names.append(orig_var.name)
+-                    continue
+-            func_call_arg_names.append(a.var.name)
+-
+         # Get the arguments and results which should be used to call the c-compatible function
+-        func_call_args = [self.scope.find(n, category='variables') for n in func_call_arg_names]
++        func_call_args = [self.scope.find(n.var.name, category='variables', raise_if_missing = True) for n in original_c_args]
+ 
+         # Get the names of the results collected from the C-compatible function
+         c_result_names = []
+@@ -769,7 +762,7 @@ class CToPythonWrapper(Wrapper):
+                     c_result_names.append(orig_var.name)
+                     continue
+             c_result_names.append(r.var.name)
+-        c_results = [self.scope.find(n, category='variables') for n in c_result_names]
++        c_results = [self.scope.find(n, category='variables', raise_if_missing = True) for n in c_result_names]
+         for n, r, o_r in zip(c_result_names, c_results, original_c_results):
+             if isinstance(r, DottedVariable):
+                 self.scope.remove_variable(r, name=n)
+@@ -792,8 +785,8 @@ class CToPythonWrapper(Wrapper):
+         # is an ndarray.
+         for a in original_c_args:
+             orig_var = getattr(a, 'original_function_argument_variable', a.var)
+-            v = self.scope.find(orig_var.name, category='variables')
+-            if v.is_ndarray:
++            if orig_var.is_ndarray:
++                v = self.scope.find(orig_var.name, category='variables', raise_if_missing = True)
+                 if v.is_optional:
+                     body.append(If( IfSection(PyccelIsNot(v, Nil()), [Deallocate(v)]) ))
+                 else:
+@@ -865,11 +858,17 @@ class CToPythonWrapper(Wrapper):
+ 
+         if orig_var.is_ndarray:
+             arg_var = orig_var.clone(self.scope.get_expected_name(orig_var.name), is_argument = False, memory_handling='alias')
+-            self._wrapping_arrays = True
++            self._wrapping_arrays = orig_var.is_ndarray
++            self.scope.insert_variable(arg_var, orig_var.name)
+         else:
+-            arg_var = orig_var.clone(self.scope.get_expected_name(expr.var.name), is_argument = False)
++            kwargs = {'is_argument':False}
++            if isinstance(orig_var.dtype, CustomDataType):
++                kwargs['memory_handling']='alias'
++                if isinstance(expr, BindCFunctionDefArgument):
++                    kwargs['dtype'] = NativeVoid()
+ 
+-        self.scope.insert_variable(arg_var, orig_var.name)
++            arg_var = orig_var.clone(self.scope.get_expected_name(expr.var.name), **kwargs)
++            self.scope.insert_variable(arg_var, expr.var.name)
+ 
+         body = []
+ 
+@@ -882,9 +881,21 @@ class CToPythonWrapper(Wrapper):
+                 body.append(Assign(arg_var, default_val))
+ 
+         # Collect the function which casts from a Python object to a C object
+-        if arg_var.rank == 0:
+-            dtype = arg_var.dtype
+-            prec  = get_final_precision(arg_var)
++        dtype = orig_var.dtype
++        if isinstance(dtype, CustomDataType):
++            python_cls_base = self.scope.find(dtype.name, 'classes', raise_if_missing = True)
++            scope = python_cls_base.scope
++            attribute = scope.find('instance', 'variables', raise_if_missing = True)
++            cast_type = Variable(dtype=self._python_object_map[dtype],
++                                name=self.scope.get_new_name(collect_arg.name),
++                                memory_handling='alias',
++                                cls_base = self.scope.find(dtype.name, 'classes', raise_if_missing = True))
++            self.scope.insert_variable(cast_type)
++            c_res = attribute.clone(attribute.name, new_class = DottedVariable, lhs = cast_type)
++            cast = [AliasAssign(cast_type, PointerCast(collect_arg, cast_type)),
++                    AliasAssign(arg_var, PointerCast(c_res, arg_var))]
++        elif arg_var.rank == 0:
++            prec  = get_final_precision(orig_var)
+             try :
+                 cast_function = py_to_c_registry[(dtype, prec)]
+             except KeyError:
+@@ -893,22 +904,22 @@ class CToPythonWrapper(Wrapper):
+                                body      = [],
+                                arguments = [FunctionDefArgument(Variable(dtype=PyccelPyObject(), name = 'o', memory_handling='alias'))],
+                                results   = [FunctionDefResult(Variable(dtype=dtype, name = 'v', precision = prec))])
++            cast = [Assign(arg_var, FunctionCall(cast_func, [collect_arg]))]
+         else:
+-            cast_func = pyarray_to_ndarray
++            cast = [Assign(arg_var, FunctionCall(pyarray_to_ndarray, [collect_arg]))]
+ 
+-        cast = [Assign(arg_var, FunctionCall(cast_func, [collect_arg]))]
+-        if arg_var.is_optional:
++        if arg_var.is_optional and not isinstance(dtype, CustomDataType):
+             memory_var = self.scope.get_temporary_variable(arg_var, name = arg_var.name + '_memory', is_optional = False)
+             cast.insert(0, AliasAssign(arg_var, memory_var))
+ 
+         # Create any necessary type checks and errors
+         if expr.has_default:
+-            check_func, err = self._get_check_function(collect_arg, arg_var, False)
++            check_func, err = self._get_check_function(collect_arg, orig_var, False)
+             body.append(If( IfSection(check_func, cast),
+                         IfSection(PyccelIsNot(collect_arg, Py_None), [*err, Return([Nil()])])
+                         ))
+         elif not in_interface:
+-            check_func, err = self._get_check_function(collect_arg, arg_var, True)
++            check_func, err = self._get_check_function(collect_arg, orig_var, True)
+             body.append(If( IfSection(check_func, cast),
+                         IfSection(LiteralTrue(), [*err, Return([Nil()])])
+                         ))
+@@ -958,7 +969,7 @@ class CToPythonWrapper(Wrapper):
+                 self.scope.insert_variable(v,s.name)
+ 
+             # Get the C-compatible variable created in self._wrap_FunctionDefArgument
+-            c_arg = self.scope.find(orig_var.name, category='variables')
++            c_arg = self.scope.find(orig_var.name, category='variables', raise_if_missing = True)
+ 
+             # Unpack the C-compatible variable
+             body.append(AliasAssign(arg_var, FunctionCall(array_get_data, [c_arg])))
+@@ -1010,7 +1021,7 @@ class CToPythonWrapper(Wrapper):
+             self._wrapping_arrays = True
+         elif isinstance(orig_var.dtype, CustomDataType):
+             scope = python_res.cls_base.scope
+-            attribute = scope.find('instance', 'variables')
++            attribute = scope.find('instance', 'variables', raise_if_missing = True)
+             c_res = attribute.clone(attribute.name, new_class = DottedVariable, lhs = python_res)
+         else:
+             c_res = orig_var.clone(name, is_argument = False)
+@@ -1089,7 +1100,7 @@ class CToPythonWrapper(Wrapper):
+             body.append(AliasAssign(python_res, FunctionCall(C_to_Python(c_res), [c_res])))
+         else:
+             scope = python_res.cls_base.scope
+-            attribute = scope.find('instance', 'variables')
++            attribute = scope.find('instance', 'variables', raise_if_missing = True)
+             attrib_var = attribute.clone(attribute.name, new_class = DottedVariable, lhs = python_res)
+             body.append(AliasAssign(attrib_var, c_res))
+ 
+diff --git a/pyccel/codegen/wrapper/fortran_to_c_wrapper.py b/pyccel/codegen/wrapper/fortran_to_c_wrapper.py
+index 21960f38..c4820435 100644
+--- a/pyccel/codegen/wrapper/fortran_to_c_wrapper.py
++++ b/pyccel/codegen/wrapper/fortran_to_c_wrapper.py
+@@ -97,6 +97,8 @@ class FortranToCWrapper(Wrapper):
+                      for fa in func_def_args
+                      if not isinstance(func_arg_to_call_arg[fa], IndexedElement) \
+                         and fa.original_function_argument_variable.is_optional]
++            body += [C_F_Pointer(fa.var, func_arg_to_call_arg[fa]) for fa in func_def_args
++                    if isinstance(func_arg_to_call_arg[fa].dtype, CustomDataType)]
+ 
+             # If the function is inlined and takes an array argument create a pointer to ensure that the bounds
+             # are respected
+diff --git a/pyccel/parser/scope.py b/pyccel/parser/scope.py
+index 86077b86..7c0d0a6a 100644
+--- a/pyccel/parser/scope.py
++++ b/pyccel/parser/scope.py
+@@ -211,13 +211,14 @@ class Scope(object):
+         """
+         return self._locals['symbolic_functions']
+ 
+-    def find(self, name, category = None, local_only = False):
++    def find(self, name, category = None, local_only = False, raise_if_missing = False):
+         """
+         Find and return the specified object in the scope.
+ 
+         Find a specified object in the scope and return it.
+         The object is identified by a string contianing its name.
+-        If the object cannot be found then None is returned.
++        If the object cannot be found then None is returned unless
++        an error is requested.
+ 
+         Parameters
+         ----------
+@@ -231,6 +232,9 @@ class Scope(object):
+             Indicates whether we should look for variables in the
+             entire scope or whether we should limit ourselves to the
+             local scope.
++        raise_if_missing : bool, default=False
++            Indicates whether an error should be raised if the object
++            cannot be found.
+ 
+         Returns
+         -------
+@@ -246,7 +250,9 @@ class Scope(object):
+ 
+         # Walk up the tree of Scope objects, until the root if needed
+         if self.parent_scope and (self.is_loop or not local_only):
+-            return self.parent_scope.find(name, category, local_only)
++            return self.parent_scope.find(name, category, local_only, raise_if_missing)
++        elif raise_if_missing:
++            raise RuntimeError(f"Can't find expected object {name} in scope")
+         else:
+             return None
+ 

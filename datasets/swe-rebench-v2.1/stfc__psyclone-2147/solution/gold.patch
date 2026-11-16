@@ -1,0 +1,476 @@
+diff --git a/changelog b/changelog
+index e6c7d653b..bb0e0a575 100644
+--- a/changelog
++++ b/changelog
+@@ -465,6 +465,8 @@
+ 	157) PR #2131 towards #1618. Improves the error handling when we find
+ 	a Routine with the same name as an LFRic Builtin.
+ 
++	158) PR #2147 for #2119. Add elemental and pure routine attributes.
++
+ release 2.3.1 17th of June 2022
+ 
+ 	1) PR #1747 for #1720. Adds support for If blocks to PSyAD.
+diff --git a/src/psyclone/domain/nemo/transformations/nemo_arrayrange2loop_trans.py b/src/psyclone/domain/nemo/transformations/nemo_arrayrange2loop_trans.py
+index 3faeac8aa..4871335b5 100644
+--- a/src/psyclone/domain/nemo/transformations/nemo_arrayrange2loop_trans.py
++++ b/src/psyclone/domain/nemo/transformations/nemo_arrayrange2loop_trans.py
+@@ -32,7 +32,7 @@
+ # POSSIBILITY OF SUCH DAMAGE.
+ # -----------------------------------------------------------------------------
+ # Author R. W. Ford, STFC Daresbury Lab
+-# Modified S. Siso and N. Nobre, STFC Daresbury Lab
++# Modified A. R. Porter, S. Siso and N. Nobre, STFC Daresbury Lab
+ 
+ '''Module providing a transformation that given an Assignment node to an
+ ArrayReference in its left-hand-side which has at least one PSyIR Range
+@@ -41,7 +41,6 @@ to the equivalent explicit loop representation using a NemoLoop node.
+ 
+ '''
+ 
+-from __future__ import absolute_import
+ from psyclone.domain.nemo.transformations.create_nemo_kernel_trans import \
+     CreateNemoKernelTrans
+ from psyclone.errors import LazyString, InternalError
+@@ -115,8 +114,6 @@ class NemoArrayRange2LoopTrans(Transformation):
+         '''
+         self.validate(node)
+ 
+-        array_reference = node.parent
+-        array_index = node.parent.indices.index(node)
+         assignment = node.ancestor(Assignment)
+         parent = assignment.parent
+         # Ensure we always use the routine-level symbol table
+@@ -198,6 +195,8 @@ class NemoArrayRange2LoopTrans(Transformation):
+         :raises TransformationError: if the node argument has nested array \
+             expressions with Ranges or is an invalid tree with ranges in \
+             multiple locations of a structure of arrays.
++        :raises TransformationError: if the node argument contains a \
++            non-elemental Operation or Call.
+ 
+         '''
+         # Am I Range node?
+@@ -238,23 +237,33 @@ class NemoArrayRange2LoopTrans(Transformation):
+                     f" that contain nested Range structures, but found:"
+                     f"\n{assignment.debug_string()}"))
+ 
+-        # Does the rhs of the assignment have any operations that are not
++        # Does the rhs of the assignment have any operations/calls that are not
+         # elemental?
+-        for operation in assignment.rhs.walk(Operation):
+-            # Allow non elemental UBOUND and LBOUND
+-            if operation.operator is BinaryOperation.Operator.LBOUND:
+-                continue
+-            if operation.operator is BinaryOperation.Operator.UBOUND:
+-                continue
+-            if not operation.is_elemental():
+-                raise TransformationError(
+-                    f"Error in NemoArrayRange2LoopTrans transformation. This "
+-                    f"transformation does not support non-elemental operations"
+-                    f" on the rhs of the associated Assignment node, but found"
+-                    f" '{operation.operator.name}'.")
++        for cnode in assignment.rhs.walk((Operation, Call)):
++            # Allow non elemental UBOUND and LBOUND.
++            # TODO #2156 - add support for marking routines as being 'inquiry'
++            # to improve this special-casing.
++            if isinstance(cnode, Operation):
++                if cnode.operator is BinaryOperation.Operator.LBOUND:
++                    continue
++                if cnode.operator is BinaryOperation.Operator.UBOUND:
++                    continue
++                name = cnode.operator.name
++                type_txt = "Operation"
++            else:
++                name = cnode.routine.name
++                type_txt = "Call"
++            if not cnode.is_elemental:
++                # pylint: disable=cell-var-from-loop
++                raise TransformationError(LazyString(
++                    lambda: f"Error in NemoArrayRange2LoopTrans "
++                    f"transformation. This transformation does not support non"
++                    f"-elemental {type_txt}s on the rhs of the associated "
++                    f"Assignment node, but found '{name}' in:\n"
++                    f"{assignment.debug_string()}'."))
+ 
+         # Do a single walk to avoid doing a separate one for each type we need
+-        nodes_to_check = assignment.walk((CodeBlock, Call, Reference))
++        nodes_to_check = assignment.walk((CodeBlock, Reference))
+ 
+         # Do not allow to transform expressions with CodeBlocks
+         if any(isinstance(n, CodeBlock) for n in nodes_to_check):
+@@ -263,15 +272,6 @@ class NemoArrayRange2LoopTrans(Transformation):
+                 f"This transformation does not support array assignments that"
+                 f" contain a CodeBlock anywhere in the expression, but found:"
+                 f"\n{assignment.debug_string()}"))
+-        # Do not allow to transform expressions with function calls (to allow
+-        # this we need to differentiate between elemental and not elemental
+-        # functions as they have different semantics in array notation)
+-        if any(isinstance(n, Call) for n in nodes_to_check):
+-            raise TransformationError(LazyString(
+-                lambda: f"Error in NemoArrayRange2LoopTrans transformation. "
+-                f"This transformation does not support array assignments that"
+-                f" contain a Call anywhere in the expression, but found:"
+-                f"\n{assignment.debug_string()}"))
+ 
+         references = [n for n in nodes_to_check if isinstance(n, Reference)]
+         for reference in references:
+diff --git a/src/psyclone/psyir/frontend/fparser2.py b/src/psyclone/psyir/frontend/fparser2.py
+index efa602cd0..e3e00d5c2 100644
+--- a/src/psyclone/psyir/frontend/fparser2.py
++++ b/src/psyclone/psyir/frontend/fparser2.py
+@@ -99,6 +99,9 @@ INTENT_MAPPING = {"in": ArgumentInterface.Access.READ,
+                   "out": ArgumentInterface.Access.WRITE,
+                   "inout": ArgumentInterface.Access.READWRITE}
+ 
++#: Those routine prefix specifications that we support.
++SUPPORTED_ROUTINE_PREFIXES = ["ELEMENTAL", "PURE", "IMPURE"]
++
+ 
+ # TODO #1987. It may be that this method could be made more general so
+ # that it works for more intrinsics, to help minimise the number of
+@@ -825,8 +828,9 @@ def _process_routine_symbols(module_ast, symbol_table, visibility_map):
+     :param symbol_table: the SymbolTable to which to add the symbols.
+     :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+     :param visibility_map: dict of symbol names with explicit visibilities.
+-    :type visibility_map: dict with symbol names as keys and visibilities as \
+-                          values
++    :type visibility_map: Dict[str, \
++        :py:class:`psyclone.psyir.symbols.Symbol.Visibility`]
++
+     '''
+     routines = walk(module_ast, (Fortran2003.Subroutine_Subprogram,
+                                  Fortran2003.Function_Subprogram))
+@@ -834,12 +838,35 @@ def _process_routine_symbols(module_ast, symbol_table, visibility_map):
+     # it is at this stage so we give all functions a DeferredType.
+     # TODO #1314 extend the frontend to ensure that the type of a Routine's
+     # return_symbol matches the type of the associated RoutineSymbol.
+-    type_map = {Fortran2003.Subroutine_Subprogram: NoType(),
+-                Fortran2003.Function_Subprogram: DeferredType()}
++    type_map = {Fortran2003.Subroutine_Subprogram: NoType,
++                Fortran2003.Function_Subprogram: DeferredType}
++
+     for routine in routines:
++
++        # Fortran routines are impure by default.
++        is_pure = False
++        # By default, Fortran routines are not elemental.
++        is_elemental = False
++        # Name of the routine.
+         name = str(routine.children[0].children[1]).lower()
++        # Type to give the RoutineSymbol.
++        sym_type = type_map[type(routine)]()
++        # Visibility of the symbol.
+         vis = visibility_map.get(name, symbol_table.default_visibility)
+-        rsymbol = RoutineSymbol(name, type_map[type(routine)], visibility=vis,
++        # Check any prefixes on the routine declaration.
++        prefix = routine.children[0].children[0]
++        if prefix:
++            for child in prefix.children:
++                if isinstance(child, Fortran2003.Prefix_Spec):
++                    if child.string == "PURE":
++                        is_pure = True
++                    elif child.string == "IMPURE":
++                        is_pure = False
++                    elif child.string == "ELEMENTAL":
++                        is_elemental = True
++
++        rsymbol = RoutineSymbol(name, sym_type, visibility=vis,
++                                is_pure=is_pure, is_elemental=is_elemental,
+                                 interface=DefaultModuleInterface())
+         symbol_table.add(rsymbol)
+ 
+@@ -4337,6 +4364,9 @@ class Fparser2Reader():
+         :returns: PSyIR representation of node.
+         :rtype: :py:class:`psyclone.psyir.nodes.Routine`
+ 
++        :raises NotImplementedError: if an unsupported prefix is found or no \
++            explicit type information is available for a Function.
++
+         '''
+         name = node.children[0].children[1].string
+         routine = Routine(name, parent=parent)
+@@ -4365,22 +4395,22 @@ class Fparser2Reader():
+ 
+         self.process_declarations(routine, decl_list, arg_list)
+ 
+-        # If this is a function then work out the return type
+-        if isinstance(node, Fortran2003.Function_Subprogram):
+-            # Check whether the function-stmt has a prefix specifying the
+-            # return type.
+-            prefix = node.children[0].children[0]
+-            if prefix:
+-                # If there is anything else in the prefix (PURE, ELEMENTAL or
+-                # RECURSIVE) then we will create a CodeBlock for this function.
+-                if len(prefix.children) > 1:
+-                    raise NotImplementedError()
+-                base_type, _ = self._process_type_spec(parent,
+-                                                       prefix.children[0])
+-            else:
+-                base_type = None
++        # Check whether the function-stmt has a prefix specifying the
++        # return type (other prefixes are handled in
++        # _process_routine_symbols()).
++        base_type = None
++        prefix = node.children[0].children[0]
++        if prefix:
++            for child in prefix.children:
++                if isinstance(child, Fortran2003.Prefix_Spec):
++                    if child.string not in SUPPORTED_ROUTINE_PREFIXES:
++                        raise NotImplementedError(
++                            f"Routine has unsupported prefix: {child.string}")
++                else:
++                    base_type, _ = self._process_type_spec(parent, child)
+ 
+-            # Check whether the function-stmt has a suffix containing
++        if isinstance(node, Fortran2003.Function_Subprogram):
++            # Check whether this function-stmt has a suffix containing
+             # 'RETURNS'
+             suffix = node.children[0].children[3]
+             if suffix:
+@@ -4409,7 +4439,9 @@ class Fparser2Reader():
+                         # The type of the return value was not specified in the
+                         # function prefix either therefore we have no explicit
+                         # type information for it.
+-                        raise NotImplementedError()
++                        raise NotImplementedError(
++                            f"No explicit type information found for "
++                            f"function '{name}'")
+                     # Remove the RoutineSymbol ready to replace it with a
+                     # DataSymbol.
+                     routine.symbol_table.remove(symbol)
+diff --git a/src/psyclone/psyir/nodes/call.py b/src/psyclone/psyir/nodes/call.py
+index 9e73b78a4..1c538eaa9 100644
+--- a/src/psyclone/psyir/nodes/call.py
++++ b/src/psyclone/psyir/nodes/call.py
+@@ -302,6 +302,27 @@ class Call(Statement, DataNode):
+         '''
+         return self._routine
+ 
++    @property
++    def is_elemental(self):
++        '''
++        :returns: whether the routine being called is elemental (provided with\
++            an input array it will apply the operation individually to each of\
++            the array elements and return an array with the results). If this \
++            information is not known then it returns None.
++        :rtype: NoneType | bool
++        '''
++        return self._routine.is_elemental
++
++    @property
++    def is_pure(self):
++        '''
++        :returns: whether the routine being called is pure (guaranteed to \
++            return the same result when provided with the same argument \
++            values).  If this information is not known then it returns None.
++        :rtype: NoneType | bool
++        '''
++        return self._routine.is_pure
++
+     @property
+     def argument_names(self):
+         '''
+diff --git a/src/psyclone/psyir/nodes/intrinsic_call.py b/src/psyclone/psyir/nodes/intrinsic_call.py
+index 58ee69378..111f233c6 100644
+--- a/src/psyclone/psyir/nodes/intrinsic_call.py
++++ b/src/psyclone/psyir/nodes/intrinsic_call.py
+@@ -125,7 +125,12 @@ class IntrinsicCall(Call):
+                 f"'{type(routine).__name__}'.")
+ 
+         # A Call expects a symbol, so give it an intrinsic symbol.
+-        super().__init__(IntrinsicSymbol(routine.name), **kwargs)
++        super().__init__(
++            IntrinsicSymbol(
++                routine.name,
++                is_elemental=(routine in ELEMENTAL_INTRINSICS),
++                is_pure=(routine in PURE_INTRINSICS)),
++            **kwargs)
+         self._intrinsic = routine
+ 
+     @property
+@@ -138,15 +143,6 @@ class IntrinsicCall(Call):
+         '''
+         return self._intrinsic
+ 
+-    def is_elemental(self):
+-        '''
+-        :returns: whether this intrinsic is elemental (provided with an input \
+-            array it will apply the operation individually to each of the \
+-            array elements and return an array with the results).
+-        :rtype: bool
+-        '''
+-        return self.intrinsic in ELEMENTAL_INTRINSICS
+-
+     @classmethod
+     def create(cls, routine, arguments):
+         '''Create an instance of this class given the type of routine and a
+@@ -265,3 +261,11 @@ REDUCTION_INTRINSICS = [
+ # individually to each of the array elements and return an array with
+ # the results.
+ ELEMENTAL_INTRINSICS = []
++
++# Intrinsics that are 'pure' functions. Given the same input arguments, a pure
++# function will always return the same value.
++PURE_INTRINSICS = [IntrinsicCall.Intrinsic.SUM,
++                   IntrinsicCall.Intrinsic.MINVAL,
++                   IntrinsicCall.Intrinsic.MAXVAL,
++                   IntrinsicCall.Intrinsic.TINY,
++                   IntrinsicCall.Intrinsic.HUGE]
+diff --git a/src/psyclone/psyir/nodes/operation.py b/src/psyclone/psyir/nodes/operation.py
+index f50a4f85b..f2aafb804 100644
+--- a/src/psyclone/psyir/nodes/operation.py
++++ b/src/psyclone/psyir/nodes/operation.py
+@@ -256,6 +256,7 @@ class Operation(DataNode, metaclass=ABCMeta):
+                 new_argument_names.append((id(child), None))
+         self._argument_names = new_argument_names
+ 
++    @property
+     def is_elemental(self):
+         '''
+         :returns: whether this operation is elemental (provided with an input \
+diff --git a/src/psyclone/psyir/nodes/routine.py b/src/psyclone/psyir/nodes/routine.py
+index f40b15a1a..ea503d60f 100644
+--- a/src/psyclone/psyir/nodes/routine.py
++++ b/src/psyclone/psyir/nodes/routine.py
+@@ -79,7 +79,7 @@ class Routine(Schedule, CommentableMixin):
+     def __eq__(self, other):
+         '''
+         Checks whether two nodes are equal. Two Routine nodes are equal
+-        if they have the same name, same return symbol, same is_program and
++        if they have the same name, same return symbol, same properties and
+         the inherited __eq__ is True.
+ 
+         :param object other: the object to check equality to.
+@@ -207,7 +207,7 @@ class Routine(Schedule, CommentableMixin):
+                     return  # The preexisting symbol already matches
+                 # Otherwise raise an exception
+                 raise KeyError(
+-                    f"Can't assign {new_name} as the routine name because "
++                    f"Can't assign '{new_name}' as the routine name because "
+                     f"its symbol table contains a symbol ({existing_symbol}) "
+                     f"already tagged as 'own_routine_symbol'.")
+ 
+diff --git a/src/psyclone/psyir/symbols/routinesymbol.py b/src/psyclone/psyir/symbols/routinesymbol.py
+index 6fded5b52..91383a02c 100644
+--- a/src/psyclone/psyir/symbols/routinesymbol.py
++++ b/src/psyclone/psyir/symbols/routinesymbol.py
+@@ -1,7 +1,7 @@
+ # -----------------------------------------------------------------------------
+ # BSD 3-Clause License
+ #
+-# Copyright (c) 2020-2022, Science and Technology Facilities Council.
++# Copyright (c) 2020-2023, Science and Technology Facilities Council.
+ # All rights reserved.
+ #
+ # Redistribution and use in source and binary forms, with or without
+@@ -36,7 +36,6 @@
+ 
+ ''' This module contains the RoutineSymbol.'''
+ 
+-from __future__ import absolute_import
+ from psyclone.psyir.symbols.datatypes import NoType
+ from psyclone.psyir.symbols.typed_symbol import TypedSymbol
+ 
+@@ -60,13 +59,20 @@ class RoutineSymbol(TypedSymbol):
+         # specialised instead of constructed.
+         if datatype is None:
+             datatype = NoType()
+-        super(RoutineSymbol, self).__init__(name, datatype)
++        super().__init__(name, datatype)
++        # Whether this Routine is 'elemental'. A value of None indicates that
++        # this is unknown.
++        self._is_elemental = None
++        # Whether this Routine is 'pure' (has no side effects). A value of
++        # None indicates that this is unknown.
++        self._is_pure = None
+         self._process_arguments(**kwargs)
+ 
+     def _process_arguments(self, **kwargs):
+         ''' Process the arguments for the constructor and the specialise
+-        methods. In this case it provides a default NoType datatype is
+-        none is found or provided.
++        methods. In this case it provides a default NoType datatype if
++        none is found or provided. It also handles the 'is_pure' and
++        'is_elemental' arguments since these are specific to RoutineSymbol.
+ 
+         :param kwargs: keyword arguments which can be:\n
+             the arguments in :py:class:`psyclone.psyir.symbols.TypedSymbol`
+@@ -76,12 +82,74 @@ class RoutineSymbol(TypedSymbol):
+         if "datatype" not in kwargs and \
+            (not hasattr(self, '_datatype') or self.datatype is None):
+             kwargs["datatype"] = NoType()
+-        super(RoutineSymbol, self)._process_arguments(**kwargs)
++        # Use the setters as they perform type checking.
++        self.is_elemental = kwargs.pop("is_elemental", None)
++        self.is_pure = kwargs.pop("is_pure", None)
++
++        super()._process_arguments(**kwargs)
+ 
+     def __str__(self):
+-        # This implementation could be moved to TypedSymbol but it is kept
+-        # here to enable us to keep TypedSymbol abstract.
+-        return f"{self.name}: {type(self).__name__}<{self.datatype}>"
++        is_pure = "unknown" if self.is_pure is None else f"{self.is_pure}"
++        is_elemental = ("unknown" if self.is_elemental is None
++                        else f"{self.is_elemental}")
++        return (f"{self.name}: {type(self).__name__}<{self.datatype}, "
++                f"pure={is_pure}, elemental={is_elemental}>")
++
++    @property
++    def is_pure(self):
++        '''
++        :returns: whether the routine represented by this Symbol has no side \
++            effects (guarantees that the routine always returns the same \
++            result for a given set of inputs).
++        :rtype: bool | NoneType
++        '''
++        return self._is_pure
++
++    @is_pure.setter
++    def is_pure(self, value):
++        '''
++        Sets whether or not the Routine represented by this Symbol is \
++        guaranteed not to have side effects (see the corresponding property \
++        description).
++
++        :param value: the new value for the is_pure property.
++        :type value: NoneType | bool
++
++        :raises TypeError: if the type of the supplied value is invalid.
++
++        '''
++        if value is not None and not isinstance(value, bool):
++            raise TypeError(f"is_pure for a {type(self).__name__} must be a "
++                            f"bool or None but got '{type(value).__name__}'")
++        self._is_pure = value
++
++    @property
++    def is_elemental(self):
++        '''
++        :returns: whether the routine represented by this Symbol is elemental \
++            (acts element-by-element on supplied array arguments) or None if \
++            this is not known.
++        :rtype: bool | NoneType
++        '''
++        return self._is_elemental
++
++    @is_elemental.setter
++    def is_elemental(self, value):
++        '''
++        Sets whether or not the Routine represented by this Symbol is
++        elemental.
++
++        :param value: the new value for the is_elemental property.
++        :type value: NoneType | bool
++
++        :raises TypeError: if the type of the supplied value is invalid.
++
++        '''
++        if value is not None and not isinstance(value, bool):
++            raise TypeError(f"is_elemental for a {type(self).__name__} must "
++                            f"be a bool or None but got "
++                            f"'{type(value).__name__}'")
++        self._is_elemental = value
+ 
+ 
+ # For Sphinx AutoAPI documentation generation

@@ -1,0 +1,96 @@
+diff --git a/pubsub/aws/snssqs/snssqs_test.go b/pubsub/aws/snssqs/snssqs_test.go
+index 9be21f43..61d4b8c4 100644
+--- a/pubsub/aws/snssqs/snssqs_test.go
++++ b/pubsub/aws/snssqs/snssqs_test.go
+@@ -14,8 +14,17 @@ limitations under the License.
+ package snssqs
+ 
+ import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
+ 	"testing"
++	"time"
+ 
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/credentials"
++	"github.com/aws/aws-sdk-go/aws/session"
++	"github.com/aws/aws-sdk-go/service/sns"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/dapr/components-contrib/pubsub"
+@@ -400,3 +409,73 @@ func Test_replaceNameToAWSSanitizedExistingFifoName_Trimmed(t *testing.T) {
+ 	r.Equal(80, len(v))
+ 	r.Equal("012345678901234567890123456789012345678901234567890123456789012345678901234.fifo", v)
+ }
++
++func TestPublishUsesPartitionForConfiguredRegion(t *testing.T) {
++	t.Parallel()
++	for _, tc := range []struct {
++		region    string
++		partition string
++	}{
++		{region: "us-west-2", partition: "aws"},
++		{region: "cn-northwest-1", partition: "aws-cn"},
++		{region: "us-gov-west-1", partition: "aws-us-gov"},
++		{region: "us-iso-east-1", partition: "aws-iso"},
++		{region: "us-isob-east-1", partition: "aws-iso-b"},
++	} {
++		tc := tc
++		t.Run(tc.region, func(t *testing.T) {
++			t.Parallel()
++			expectedARN := fmt.Sprintf("arn:%s:sns:%s:123456789012:myTopic", tc.partition, tc.region)
++			var publishedARN string
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++				if err := req.ParseForm(); err != nil {
++					http.Error(w, err.Error(), http.StatusBadRequest)
++					return
++				}
++				switch req.FormValue("Action") {
++				case "GetTopicAttributes":
++					if req.FormValue("TopicArn") != expectedARN {
++						http.Error(w, "unexpected topic ARN", http.StatusBadRequest)
++						return
++					}
++					fmt.Fprintf(w, `<GetTopicAttributesResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/"><GetTopicAttributesResult><Attributes><entry><key>TopicArn</key><value>%s</value></entry></Attributes></GetTopicAttributesResult><ResponseMetadata><RequestId>request</RequestId></ResponseMetadata></GetTopicAttributesResponse>`, expectedARN)
++				case "Publish":
++					publishedARN = req.FormValue("TopicArn")
++					fmt.Fprint(w, `<PublishResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/"><PublishResult><MessageId>message</MessageId></PublishResult><ResponseMetadata><RequestId>request</RequestId></ResponseMetadata></PublishResponse>`)
++				default:
++					http.Error(w, "unexpected SNS operation", http.StatusBadRequest)
++				}
++			}))
++			defer server.Close()
++
++			md, err := (&snsSqs{logger: logger.NewLogger("SnsSqs publish partition test")}).getSnsSqsMetatdata(pubsub.Metadata{Properties: map[string]string{
++				"consumerID":              "consumer",
++				"accessKey":               "access",
++				"secretKey":               "secret",
++				"region":                  tc.region,
++				"endpoint":                server.URL,
++				"disableEntityManagement": "true",
++			}})
++			require.NoError(t, err)
++			md.accountID = "123456789012"
++			sess, err := session.NewSession(&aws.Config{
++				Region:      aws.String(tc.region),
++				Endpoint:    aws.String(server.URL),
++				Credentials: credentials.NewStaticCredentials("access", "secret", ""),
++			})
++			require.NoError(t, err)
++			ps := &snsSqs{
++				metadata:   md,
++				snsClient:  sns.New(sess),
++				logger:     logger.NewLogger("SnsSqs publish partition test"),
++				ctx:        context.Background(),
++				opsTimeout: time.Second,
++				topicArns:  make(map[string]string),
++			}
++
++			err = ps.Publish(&pubsub.PublishRequest{Topic: "myTopic", Data: []byte("payload")})
++			require.NoError(t, err)
++			require.Equal(t, expectedARN, publishedARN)
++		})
++	}
++}

@@ -1,0 +1,321 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index b492c03..497adc2 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -1,4 +1,5 @@
+ dev
++- Change metadata recorded from version-specified install to allow upgrades in future.  Adds pipx dependency on `packaging` package.
+ - [bugfix] Prevent python error in case where package has no pipx metadata and advise user how to fix.
+ - [feature] `ensurepath` now also ensures that pip user binary path containing pipx itself is in user's PATH if pipx was installed using `pip install --user`.
+ - [bugfix] For `pipx install`, fixed failure to install if user has `PIP_USER=1` or `user=true` in pip.conf. (#110)
+diff --git a/noxfile.py b/noxfile.py
+index a7d0f58..9a168e0 100644
+--- a/noxfile.py
++++ b/noxfile.py
+@@ -31,7 +31,14 @@ else:
+ nox.options.reuse_existing_virtualenvs = True
+ 
+ doc_dependencies = [".", "jinja2", "mkdocs", "mkdocs-material"]
+-lint_dependencies = ["black", "flake8", "flake8-bugbear", "mypy", "check-manifest"]
++lint_dependencies = [
++    "black",
++    "flake8",
++    "flake8-bugbear",
++    "mypy",
++    "check-manifest",
++    "packaging>=20.0",
++]
+ 
+ 
+ @nox.session(python=python)
+diff --git a/setup.py b/setup.py
+index 29f09df..a138974 100755
+--- a/setup.py
++++ b/setup.py
+@@ -18,7 +18,11 @@ import re  # noqa E402
+ 
+ CURDIR = Path(__file__).parent
+ 
+-REQUIRED = ["userpath>=1.4.1", "argcomplete>=1.9.4, <2.0"]  # type: List[str]
++REQUIRED = [
++    "userpath>=1.4.1",
++    "argcomplete>=1.9.4, <2.0",
++    "packaging>=20.0",
++]  # type: List[str]
+ 
+ 
+ def get_version():
+diff --git a/src/pipx/commands/common.py b/src/pipx/commands/common.py
+index b040011..be171a4 100644
+--- a/src/pipx/commands/common.py
++++ b/src/pipx/commands/common.py
+@@ -4,17 +4,18 @@ import shutil
+ import sys
+ import tempfile
+ import time
+-import userpath  # type: ignore
+-
+ from pathlib import Path
+ from shutil import which
+ from tempfile import TemporaryDirectory
+ from typing import Collection, Dict, List, Optional
+ 
++import userpath  # type: ignore
++
+ from pipx import constants
+ from pipx.colors import bold, red
+ from pipx.emojies import hazard, stars
+-from pipx.util import WINDOWS, PipxError, mkdir, rmdir, valid_pypi_name
++from pipx.package_specifier import valid_pypi_name
++from pipx.util import WINDOWS, PipxError, mkdir, rmdir
+ from pipx.venv import Venv
+ 
+ 
+@@ -243,8 +244,11 @@ def package_name_from_spec(
+     start_time = time.time()
+ 
+     # shortcut if valid PyPI name and not a local path
+-    if valid_pypi_name(package_spec) and not Path(package_spec).exists():
+-        package_name = package_spec
++    pypi_name = valid_pypi_name(package_spec)
++    if pypi_name is not None and not Path(package_spec).exists():
++        # NOTE: if pypi name and installed package name differ, this means pipx
++        #       will use the pypi name
++        package_name = pypi_name
+         logging.info(f"Determined package name: {package_name}")
+         logging.info(f"Package name determined in {time.time()-start_time:.1f}s")
+         return package_name
+diff --git a/src/pipx/package_specifier.py b/src/pipx/package_specifier.py
+new file mode 100644
+index 0000000..500a1e4
+--- /dev/null
++++ b/src/pipx/package_specifier.py
+@@ -0,0 +1,93 @@
++# Valid package specifiers for pipx:
++#   PEP508-compliant
++#   git+<URL>
++#   <URL>
++#   <pypi_package_name>
++#   <pypi_package_name><version_specifier>
++
++import logging
++from pathlib import Path
++from typing import Optional
++
++from packaging.requirements import InvalidRequirement, Requirement
++from packaging.utils import canonicalize_name
++
++from pipx.util import PipxError
++
++
++def parse_specifier_for_metadata(package_spec: str) -> str:
++    """Return package_or_url suitable for pipx metadata
++
++    Specifically:
++    * Strip any version specifiers (e.g. package == 1.5.4)
++    * Strip any markers (e.g. python_version > 3.4)
++    * Convert local paths to absolute paths
++    """
++    # NOTE: If package_spec is valid pypi name, pip will always treat it as a
++    #       pypi package, not checking for local path.
++    #       We replicate pypi precedence here (only non-valid-pypi names
++    #       initiate check for local path, e.g. './package-name')
++
++    valid_pep508 = False
++    valid_url = False
++    valid_local_path = False
++    package_or_url = ""
++
++    try:
++        package_req = Requirement(package_spec)
++    except InvalidRequirement:
++        # not a valid PEP508 package specification
++        valid_pep508 = False
++    else:
++        # valid PEP508 package specification
++        valid_pep508 = True
++        if package_req.url:
++            package_or_url = package_req.url
++        else:
++            if package_req.extras:
++                package_or_url = canonicalize_name(
++                    package_req.name + "[" + ",".join(sorted(package_req.extras)) + "]"
++                )
++            else:
++                package_or_url = canonicalize_name(package_req.name)
++
++    # NOTE: packaging currently (2020-07-19) does basic syntax checks on the URL.
++    #   Some examples of what it will not catch:
++    #       - invalid RCS string (e.g. "gat+https://...")
++    #       - non-existent scheme (e.g. "zzzzz://...")
++    if not valid_pep508:
++        try:
++            package_req = Requirement("notapackagename @ " + package_spec)
++        except InvalidRequirement:
++            valid_url = False
++        else:
++            valid_url = True
++            package_or_url = package_spec
++
++    if not valid_pep508 and not valid_url:
++        package_path = Path(package_spec)
++        try:
++            package_path_exists = package_path.exists()
++        except OSError:
++            package_path_exists = False
++
++        if package_path_exists:
++            valid_local_path = True
++            package_or_url = str(package_path.resolve())
++
++    if not valid_pep508 and not valid_url and not valid_local_path:
++        raise PipxError(f"Unable to parse package spec: {package_spec}")
++
++    logging.info(f"cleaned package spec: {package_or_url}")
++
++    return package_or_url
++
++
++def valid_pypi_name(package_spec: str) -> Optional[str]:
++    try:
++        package_req = Requirement(package_spec)
++    except InvalidRequirement:
++        # not a valid PEP508 package specification
++        return None
++
++    return package_req.name
+diff --git a/src/pipx/util.py b/src/pipx/util.py
+index d21b0df..03709c4 100644
+--- a/src/pipx/util.py
++++ b/src/pipx/util.py
+@@ -1,11 +1,10 @@
+ import logging
+ import os
+-import re
+ import shutil
+ import subprocess
+ import sys
+ from pathlib import Path
+-from typing import List, Sequence, Tuple, Union, Optional
++from typing import List, Optional, Sequence, Tuple, Union
+ 
+ from pipx.constants import WINDOWS
+ 
+@@ -137,13 +136,6 @@ def run(cmd: Sequence[Union[str, Path]], check=True) -> int:
+     return returncode
+ 
+ 
+-def valid_pypi_name(package_name: str) -> bool:
+-    # https://www.python.org/dev/peps/pep-0508/#names
+-    return bool(
+-        re.search(r"^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$", package_name, re.I)
+-    )
+-
+-
+ def full_package_description(package: str, package_spec: str) -> str:
+     if package == package_spec:
+         return package
+diff --git a/src/pipx/venv.py b/src/pipx/venv.py
+index c9a3b64..d0c67e9 100644
+--- a/src/pipx/venv.py
++++ b/src/pipx/venv.py
+@@ -1,14 +1,13 @@
+ import json
+ import logging
+ import pkgutil
+-import re
+-import urllib.parse
+ from pathlib import Path
+-from typing import Generator, List, NamedTuple, Dict, Set, Optional
++from typing import Dict, Generator, List, NamedTuple, Optional, Set
+ 
+ from pipx.animate import animate
+ from pipx.constants import DEFAULT_PYTHON, PIPX_SHARED_PTH
+-from pipx.pipx_metadata_file import PipxMetadata, PackageInfo
++from pipx.package_specifier import parse_specifier_for_metadata
++from pipx.pipx_metadata_file import PackageInfo, PipxMetadata
+ from pipx.shared_libs import shared_libs
+ from pipx.util import (
+     PipxError,
+@@ -18,10 +17,8 @@ from pipx.util import (
+     rmdir,
+     run,
+     run_subprocess,
+-    valid_pypi_name,
+ )
+ 
+-
+ venv_metadata_inspector_raw = pkgutil.get_data("pipx", "venv_metadata_inspector.py")
+ assert venv_metadata_inspector_raw is not None, (
+     "pipx could not find required file venv_metadata_inspector.py. "
+@@ -288,7 +285,7 @@ class Venv:
+         venv_package_metadata = self.get_venv_metadata_for_package(package)
+         package_info = PackageInfo(
+             package=package,
+-            package_or_url=abs_path_if_local(package_or_url, self, pip_args),
++            package_or_url=parse_specifier_for_metadata(package_or_url),
+             pip_args=pip_args,
+             include_apps=include_apps,
+             include_dependencies=include_dependencies,
+@@ -365,61 +362,3 @@ class Venv:
+         if not self.verbose:
+             cmd.append("-q")
+         return run(cmd)
+-
+-
+-def abs_path_if_local(package_or_url: str, venv: Venv, pip_args: List[str]) -> str:
+-    """Return the absolute path if package_or_url represents a filepath
+-    and not a pypi package
+-    """
+-    # if valid url leave it untouched
+-    if urllib.parse.urlparse(package_or_url).scheme:
+-        return package_or_url
+-
+-    pkg_path = Path(package_or_url)
+-    if not pkg_path.exists():
+-        # no existing path, must be pypi package or non-existent
+-        return package_or_url
+-
+-    # Editable packages are either local or url, non-url must be local.
+-    # https://pip.pypa.io/en/stable/reference/pip_install/#editable-installs
+-    if "--editable" in pip_args and pkg_path.exists():
+-        return str(pkg_path.resolve())
+-
+-    if not valid_pypi_name(package_or_url):
+-        return str(pkg_path.resolve())
+-
+-    # If all of the above conditions do not return, we may have used a pypi
+-    #   package.
+-    # If we find a pypi package with this name installed, assume we just
+-    #   installed it.
+-    pip_search_args: List[str]
+-
+-    # If user-defined pypi index url, then use it for search
+-    try:
+-        arg_i = pip_args.index("--index-url")
+-    except ValueError:
+-        pip_search_args = []
+-    else:
+-        pip_search_args = pip_args[arg_i : arg_i + 2]
+-
+-    pip_search_result_str = venv.pip_search(package_or_url, pip_search_args)
+-    pip_search_results = pip_search_result_str.split("\n")
+-
+-    # Get package_or_url and following related lines from pip search stdout
+-    pkg_found = False
+-    pip_search_found = []
+-    for pip_search_line in pip_search_results:
+-        if pkg_found:
+-            if re.search(r"^\s", pip_search_line):
+-                pip_search_found.append(pip_search_line)
+-            else:
+-                break
+-        elif pip_search_line.startswith(package_or_url):
+-            pip_search_found.append(pip_search_line)
+-            pkg_found = True
+-    pip_found_str = " ".join(pip_search_found)
+-
+-    if pip_found_str.startswith(package_or_url) and "INSTALLED" in pip_found_str:
+-        return package_or_url
+-    else:
+-        return str(pkg_path.resolve())

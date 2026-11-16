@@ -1,0 +1,300 @@
+diff --git a/cxxheaderparser/lexer.py b/cxxheaderparser/lexer.py
+index fab8311..7003821 100644
+--- a/cxxheaderparser/lexer.py
++++ b/cxxheaderparser/lexer.py
+@@ -51,6 +51,7 @@ class LexToken(Protocol):
+ 
+     #: private
+     lexer: lex.Lexer
++    lexmatch: "re.Match"
+ 
+ 
+ PhonyEnding: LexToken = lex.LexToken()  # type: ignore
+@@ -175,7 +176,10 @@ class PlyLexer:
+         # Comments
+         "COMMENT_SINGLELINE",
+         "COMMENT_MULTILINE",
+-        "PRECOMP_MACRO",
++        "LINE_DIRECTIVE",
++        "PRAGMA_DIRECTIVE",
++        "INCLUDE_DIRECTIVE",
++        "PP_DIRECTIVE",
+         # misc
+         "DIVIDE",
+         "NEWLINE",
+@@ -434,16 +438,35 @@ class PlyLexer:
+             t.type = t.value
+         return t
+ 
+-    @TOKEN(r"\#.*")
+-    def t_PRECOMP_MACRO(self, t: LexToken) -> typing.Optional[LexToken]:
+-        m = _line_re.match(t.value)
+-        if m:
+-            self.filename = m.group(2)
++    @TOKEN(r'\#[\t ]*line (\d+) "(.*)"')
++    def t_LINE_DIRECTIVE(self, t: LexToken) -> None:
++        m = t.lexmatch
++        self.filename = m.group(2)
++        self.line_offset = 1 + self.lex.lineno - int(m.group(1))
+ 
+-            self.line_offset = 1 + self.lex.lineno - int(m.group(1))
+-            return None
++    @TOKEN(r"\#[\t ]*pragma")
++    def t_PRAGMA_DIRECTIVE(self, t: LexToken) -> LexToken:
++        return t
++
++    @TOKEN(r"\#[\t ]*include (.*)")
++    def t_INCLUDE_DIRECTIVE(self, t: LexToken) -> LexToken:
++        return t
++
++    @TOKEN(r"\#(.*)")
++    def t_PP_DIRECTIVE(self, t: LexToken):
++        # ignore C++23 warning directive
++        if t.value.startswith("#warning"):
++            return
++        if "define" in t.value:
++            msgtype = "#define"
+         else:
+-            return t
++            msgtype = "preprocessor"
++        self._error(
++            "cxxheaderparser does not support "
++            + msgtype
++            + " directives, please use a C++ preprocessor first",
++            t,
++        )
+ 
+     t_DIVIDE = r"/(?!/)"
+     t_ELLIPSIS = r"\.\.\."
+@@ -541,6 +564,12 @@ class TokenStream:
+         "WHITESPACE",
+     }
+ 
++    _discard_types_except_newline = {
++        "COMMENT_SINGLELINE",
++        "COMMENT_MULTILINE",
++        "WHITESPACE",
++    }
++
+     def token(self) -> LexToken:
+         tokbuf = self.tokbuf
+         while True:
+@@ -563,6 +592,17 @@ class TokenStream:
+             if not self._fill_tokbuf(tokbuf):
+                 return None
+ 
++    def token_newline_eof_ok(self) -> typing.Optional[LexToken]:
++        tokbuf = self.tokbuf
++        while True:
++            while tokbuf:
++                tok = tokbuf.popleft()
++                if tok.type not in self._discard_types_except_newline:
++                    return tok
++
++            if not self._fill_tokbuf(tokbuf):
++                return None
++
+     def token_if(self, *types: str) -> typing.Optional[LexToken]:
+         tok = self.token_eof_ok()
+         if tok is None:
+@@ -659,7 +699,12 @@ class LexerTokenStream(TokenStream):
+             tokbuf.append(tok)
+ 
+             if tok.type == "NEWLINE":
+-                break
++                # detect/remove line continuations
++                if len(tokbuf) > 2 and tokbuf[-2].type == "\\":
++                    tokbuf.pop()
++                    tokbuf.pop()
++                else:
++                    break
+ 
+             # detect/combine user defined literals
+             if tok.type in udl_start:
+diff --git a/cxxheaderparser/parser.py b/cxxheaderparser/parser.py
+index 3148400..c05abaa 100644
+--- a/cxxheaderparser/parser.py
++++ b/cxxheaderparser/parser.py
+@@ -304,7 +304,8 @@ class CxxParser:
+             "{": self._on_empty_block_start,
+             "}": self._on_block_end,
+             "DBL_LBRACKET": self._consume_attribute_specifier_seq,
+-            "PRECOMP_MACRO": self._process_preprocessor_token,
++            "INCLUDE_DIRECTIVE": self._process_include_directive,
++            "PRAGMA_DIRECTIVE": self._process_pragma_directive,
+             ";": lambda _1, _2: None,
+         }
+ 
+@@ -361,20 +362,29 @@ class CxxParser:
+     _preprocessor_compress_re = re.compile(r"^#[\t ]+")
+     _preprocessor_split_re = re.compile(r"[\t ]+")
+ 
+-    def _process_preprocessor_token(
+-        self, tok: LexToken, doxygen: typing.Optional[str]
+-    ) -> None:
++    def _process_include_directive(self, tok: LexToken, doxygen: typing.Optional[str]):
+         value = self._preprocessor_compress_re.sub("#", tok.value)
+         svalue = self._preprocessor_split_re.split(value, 1)
+         if len(svalue) == 2:
+             self.state.location = tok.location
+-            macro = svalue[0].lower().replace(" ", "")
+-            if macro.startswith("#include"):
+-                self.visitor.on_include(self.state, svalue[1])
+-            elif macro.startswith("#define"):
+-                self.visitor.on_define(self.state, svalue[1])
+-            elif macro.startswith("#pragma"):
+-                self.visitor.on_pragma(self.state, svalue[1])
++            self.visitor.on_include(self.state, svalue[1])
++        else:
++            raise CxxParseError("incomplete #include directive", tok)
++
++    def _process_pragma_directive(self, _: LexToken, doxygen: typing.Optional[str]):
++        # consume all tokens until the end of the line
++        # -- but if we find a paren, get the group
++        tokens: LexTokenList = []
++        while True:
++            tok = self.lex.token_newline_eof_ok()
++            if not tok or tok.type == "NEWLINE":
++                break
++            if tok.type in self._balanced_token_map:
++                tokens.extend(self._consume_balanced_tokens(tok))
++            else:
++                tokens.append(tok)
++
++        self.visitor.on_pragma(self.state, self._create_value(tokens))
+ 
+     #
+     # Various
+@@ -952,7 +962,7 @@ class CxxParser:
+         self.visitor.on_enum(self.state, enum)
+ 
+         # Finish it up
+-        self._finish_class_or_enum(enum.typename, is_typedef, mods, "enum")
++        self._finish_class_or_enum(enum.typename, is_typedef, mods)
+ 
+     def _parse_enumerator_list(self) -> typing.List[Enumerator]:
+         """
+@@ -1131,12 +1141,7 @@ class CxxParser:
+         self.visitor.on_class_start(state)
+ 
+     def _finish_class_decl(self, state: ClassBlockState) -> None:
+-        self._finish_class_or_enum(
+-            state.class_decl.typename,
+-            state.typedef,
+-            state.mods,
+-            state.class_decl.classkey,
+-        )
++        self._finish_class_or_enum(state.class_decl.typename, state.typedef, state.mods)
+ 
+     def _process_access_specifier(
+         self, tok: LexToken, doxygen: typing.Optional[str]
+@@ -2478,7 +2483,6 @@ class CxxParser:
+         name: PQName,
+         is_typedef: bool,
+         mods: ParsedTypeModifiers,
+-        classkey: typing.Optional[str],
+     ) -> None:
+         parsed_type = Type(name)
+ 
+@@ -2487,23 +2491,6 @@ class CxxParser:
+             self._consume_gcc_attribute(tok)
+ 
+         if not is_typedef and self.lex.token_if(";"):
+-            # if parent scope is a class, add the anonymous
+-            # union or struct to the parent fields
+-            if isinstance(self.state, ClassBlockState):
+-                class_state = self.state
+-
+-                access = self._current_access
+-                assert access is not None
+-                if (
+-                    classkey is not None
+-                    and classkey in ["union", "struct"]
+-                    and isinstance(name.segments[-1], AnonymousName)
+-                ):
+-                    f = Field(
+-                        type=Type(name),
+-                        access=access,
+-                    )
+-                    self.visitor.on_class_field(class_state, f)
+             return
+ 
+         while True:
+diff --git a/cxxheaderparser/simple.py b/cxxheaderparser/simple.py
+index 65cf04a..6d1d1c1 100644
+--- a/cxxheaderparser/simple.py
++++ b/cxxheaderparser/simple.py
+@@ -45,6 +45,7 @@ from .types import (
+     UsingAlias,
+     UsingDecl,
+     Variable,
++    Value,
+ )
+ 
+ from .parserstate import (
+@@ -123,14 +124,9 @@ class NamespaceScope:
+ Block = typing.Union[ClassScope, NamespaceScope]
+ 
+ 
+-@dataclass
+-class Define:
+-    content: str
+-
+-
+ @dataclass
+ class Pragma:
+-    content: str
++    content: Value
+ 
+ 
+ @dataclass
+@@ -171,9 +167,6 @@ class ParsedData:
+     #: Global namespace
+     namespace: NamespaceScope = field(default_factory=lambda: NamespaceScope())
+ 
+-    #: Any ``#define`` preprocessor directives encountered
+-    defines: typing.List[Define] = field(default_factory=list)
+-
+     #: Any ``#pragma`` directives encountered
+     pragmas: typing.List[Pragma] = field(default_factory=list)
+ 
+@@ -208,10 +201,7 @@ class SimpleCxxVisitor:
+ 
+         self.data = ParsedData(self.namespace)
+ 
+-    def on_define(self, state: State, content: str) -> None:
+-        self.data.defines.append(Define(content))
+-
+-    def on_pragma(self, state: State, content: str) -> None:
++    def on_pragma(self, state: State, content: Value) -> None:
+         self.data.pragmas.append(Pragma(content))
+ 
+     def on_include(self, state: State, filename: str) -> None:
+diff --git a/cxxheaderparser/visitor.py b/cxxheaderparser/visitor.py
+index 6f5708c..73b5ad0 100644
+--- a/cxxheaderparser/visitor.py
++++ b/cxxheaderparser/visitor.py
+@@ -20,6 +20,7 @@ from .types import (
+     UsingAlias,
+     UsingDecl,
+     Variable,
++    Value,
+ )
+ 
+ from .parserstate import (
+@@ -36,14 +37,7 @@ class CxxVisitor(Protocol):
+     Defines the interface used by the parser to emit events
+     """
+ 
+-    def on_define(self, state: State, content: str) -> None:
+-        """
+-        .. warning:: cxxheaderparser intentionally does not have a C preprocessor
+-                     implementation. If you are parsing code with macros in it,
+-                     use a conforming preprocessor like ``pcpp``
+-        """
+-
+-    def on_pragma(self, state: State, content: str) -> None:
++    def on_pragma(self, state: State, content: Value) -> None:
+         """
+         Called once for each ``#pragma`` directive encountered
+         """

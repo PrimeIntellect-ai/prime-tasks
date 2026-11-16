@@ -1,0 +1,688 @@
+diff --git a/crates/analyzer/src/analyzer_error.rs b/crates/analyzer/src/analyzer_error.rs
+index cb7bed1a..2510b8f7 100644
+--- a/crates/analyzer/src/analyzer_error.rs
++++ b/crates/analyzer/src/analyzer_error.rs
+@@ -1133,6 +1133,22 @@ pub enum AnalyzerError {
+         error_location: SourceSpan,
+     },
+ 
++    #[diagnostic(
++        severity(Error),
++        code(unassignable_output),
++        help(""),
++        url(
++            "https://doc.veryl-lang.org/book/07_appendix/02_semantic_error.html#unassignable_output"
++        )
++    )]
++    #[error("unassignable type is connected to output port")]
++    UnassignableOutput {
++        #[source_code]
++        input: MultiSources,
++        #[label("Error location")]
++        error_location: SourceSpan,
++    },
++
+     #[diagnostic(
+         severity(Warning),
+         code(uncovered_branch),
+@@ -1868,6 +1884,13 @@ impl AnalyzerError {
+         }
+     }
+ 
++    pub fn unassignable_output(token: &TokenRange) -> Self {
++        AnalyzerError::UnassignableOutput {
++            input: source(token),
++            error_location: token.into(),
++        }
++    }
++
+     pub fn uncovered_branch(identifier: &str, token: &TokenRange, uncovered: &TokenRange) -> Self {
+         AnalyzerError::UncoveredBranch {
+             identifier: identifier.to_string(),
+diff --git a/crates/analyzer/src/evaluator.rs b/crates/analyzer/src/evaluator.rs
+index f4a6528e..a63660f9 100644
+--- a/crates/analyzer/src/evaluator.rs
++++ b/crates/analyzer/src/evaluator.rs
+@@ -132,6 +132,14 @@ impl Evaluated {
+         matches!(self.r#type, EvaluatedType::Reset(_))
+     }
+ 
++    pub fn is_explicit_reset(&self) -> bool {
++        if let EvaluatedType::Reset(x) = &self.r#type {
++            !matches!(x.kind, EvaluatedTypeResetKind::Implicit)
++        } else {
++            false
++        }
++    }
++
+     pub fn is_4state(&self) -> bool {
+         matches!(
+             self.r#type,
+diff --git a/crates/analyzer/src/handlers/check_port.rs b/crates/analyzer/src/handlers/check_port.rs
+index 6fdf2aec..68d96f05 100644
+--- a/crates/analyzer/src/handlers/check_port.rs
++++ b/crates/analyzer/src/handlers/check_port.rs
+@@ -56,7 +56,7 @@ impl VerylGrammarTrait for CheckPort {
+                         Direction::Output(_) => {
+                             // For SystemVerilog, output ports of a function cannot be released.
+                             !self.in_function
+-                                && is_anonymous_expression(&x.port_default_value.expression)
++                                && x.port_default_value.expression.is_anonymous_expression()
+                         }
+                         _ => false,
+                     };
+diff --git a/crates/analyzer/src/handlers/check_var_ref.rs b/crates/analyzer/src/handlers/check_var_ref.rs
+index 05cbdb0b..049642eb 100644
+--- a/crates/analyzer/src/handlers/check_var_ref.rs
++++ b/crates/analyzer/src/handlers/check_var_ref.rs
+@@ -3,7 +3,8 @@ use crate::analyzer_error::AnalyzerError;
+ use crate::attribute::Attribute as Attr;
+ use crate::attribute::{AllowItem, CondTypeItem};
+ use crate::attribute_table;
+-use crate::symbol::{Direction, GenericBoundKind, Symbol, SymbolId, SymbolKind, TypeKind};
++use crate::evaluator::Evaluator;
++use crate::symbol::{Direction, GenericBoundKind, Symbol, SymbolId, SymbolKind};
+ use crate::symbol_table;
+ use crate::var_ref::{
+     AssignDeclarationType, AssignPosition, AssignPositionType, AssignStatementBranchItemType,
+@@ -685,24 +686,62 @@ impl VerylGrammarTrait for CheckVarRef {
+                         r#type: AssignDeclarationType::Inst,
+                     });
+ 
+-                    for (token, targets) in &x.connects {
+-                        for target in targets {
++                    let mut evaluator = Evaluator::new();
++
++                    for (token, target) in &x.connects {
++                        // Gather port information
++                        let dir_output = if let Some(port) = ports.get(&token.text) {
++                            matches!(
++                                port.direction,
++                                Direction::Ref | Direction::Inout | Direction::Output
++                            )
++                        } else {
++                            false
++                        };
++                        let (is_clock, is_reset) = if let Some(port) = ports.get(&token.text) {
++                            (port.r#type.kind.is_clock(), port.r#type.kind.is_reset())
++                        } else {
++                            (false, false)
++                        };
++
++                        let exp = evaluator.expression(&target.expression);
++
++                        // Check assignment of clock/reset type
++                        if is_clock && !exp.is_clock() {
++                            self.errors.push(AnalyzerError::mismatch_type(
++                                &token.text.to_string(),
++                                "clock type",
++                                "non-clock type",
++                                &token.into(),
++                            ));
++                        }
++
++                        if is_reset && !exp.is_reset() {
++                            self.errors.push(AnalyzerError::mismatch_type(
++                                &token.text.to_string(),
++                                "reset type",
++                                "non-reset type",
++                                &token.into(),
++                            ));
++                        }
++
++                        // Check implicit reset to SV instance
++                        if sv_instance && exp.is_reset() && !exp.is_explicit_reset() {
++                            self.errors
++                                .push(AnalyzerError::sv_with_implicit_reset(&token.into()));
++                        }
++
++                        // Check output to non-assignable variable
++                        if dir_output && !target.expression.is_assignable() {
++                            self.errors
++                                .push(AnalyzerError::unassignable_output(&token.into()));
++                        }
++
++                        // Check assignment from output port
++                        for target in &target.identifiers {
+                             if let Ok(path) =
+                                 VarRefPath::try_from((target, &symbol.found.namespace))
+                             {
+-                                let full_path = path.full_path();
+-                                let symbol = symbol_table::get(*full_path.last().unwrap()).unwrap();
+-
+-                                // Check assignment from output port
+-                                let dir_output = if let Some(port) = ports.get(&token.text) {
+-                                    matches!(
+-                                        port.direction,
+-                                        Direction::Ref | Direction::Inout | Direction::Output
+-                                    )
+-                                } else {
+-                                    false
+-                                };
+-
+                                 if dir_output | port_unknown {
+                                     self.assign_position.push(AssignPositionType::Connect {
+                                         token: *token,
+@@ -710,44 +749,6 @@ impl VerylGrammarTrait for CheckVarRef {
+                                     });
+                                     self.add_assign(&path);
+                                 }
+-
+-                                // Check assignment of clock/reset type
+-                                let (is_clock, is_reset) =
+-                                    if let Some(port) = ports.get(&token.text) {
+-                                        (port.r#type.kind.is_clock(), port.r#type.kind.is_reset())
+-                                    } else {
+-                                        (false, false)
+-                                    };
+-
+-                                if is_clock && !symbol.kind.is_clock() {
+-                                    self.errors.push(AnalyzerError::mismatch_type(
+-                                        &token.text.to_string(),
+-                                        "clock type",
+-                                        "non-clock type",
+-                                        &token.into(),
+-                                    ));
+-                                }
+-
+-                                if is_reset && !symbol.kind.is_reset() {
+-                                    self.errors.push(AnalyzerError::mismatch_type(
+-                                        &token.text.to_string(),
+-                                        "reset type",
+-                                        "non-reset type",
+-                                        &token.into(),
+-                                    ));
+-                                }
+-
+-                                // Check implicit reset to SV instance
+-                                let is_implicit_reset = match &symbol.kind {
+-                                    SymbolKind::Port(x) => x.r#type.kind == TypeKind::Reset,
+-                                    SymbolKind::Variable(x) => x.r#type.kind == TypeKind::Reset,
+-                                    _ => false,
+-                                };
+-
+-                                if sv_instance && is_implicit_reset {
+-                                    self.errors
+-                                        .push(AnalyzerError::sv_with_implicit_reset(&token.into()));
+-                                }
+                             }
+                         }
+                     }
+diff --git a/crates/analyzer/src/handlers/create_symbol_table.rs b/crates/analyzer/src/handlers/create_symbol_table.rs
+index b81920f7..5aa7beba 100644
+--- a/crates/analyzer/src/handlers/create_symbol_table.rs
++++ b/crates/analyzer/src/handlers/create_symbol_table.rs
+@@ -12,13 +12,13 @@ use crate::symbol::Direction as SymDirection;
+ use crate::symbol::ModportDefault as SymModportDefault;
+ use crate::symbol::Type as SymType;
+ use crate::symbol::{
+-    ConnectTarget, DocComment, EnumMemberProperty, EnumMemberValue, EnumProperty, FunctionProperty,
+-    GenericBoundKind, GenericParameterProperty, InstanceProperty, InterfaceProperty,
+-    ModportFunctionMemberProperty, ModportProperty, ModportVariableMemberProperty, ModuleProperty,
+-    PackageProperty, Parameter, ParameterKind, ParameterProperty, Port, PortProperty,
+-    ProtoModuleProperty, StructMemberProperty, StructProperty, Symbol, SymbolId, SymbolKind,
+-    TestProperty, TestType, TypeDefProperty, TypeKind, UnionMemberProperty, UnionProperty,
+-    VariableAffiliation, VariableProperty,
++    ConnectTarget, ConnectTargetIdentifier, DocComment, EnumMemberProperty, EnumMemberValue,
++    EnumProperty, FunctionProperty, GenericBoundKind, GenericParameterProperty, InstanceProperty,
++    InterfaceProperty, ModportFunctionMemberProperty, ModportProperty,
++    ModportVariableMemberProperty, ModuleProperty, PackageProperty, Parameter, ParameterKind,
++    ParameterProperty, Port, PortProperty, ProtoModuleProperty, StructMemberProperty,
++    StructProperty, Symbol, SymbolId, SymbolKind, TestProperty, TestType, TypeDefProperty,
++    TypeKind, UnionMemberProperty, UnionProperty, VariableAffiliation, VariableProperty,
+ };
+ use crate::symbol_path::{GenericSymbolPath, SymbolPath, SymbolPathNamespace};
+ use crate::symbol_table;
+@@ -80,8 +80,8 @@ pub struct CreateSymbolTable {
+     enum_members: Vec<Option<SymbolId>>,
+     struct_union_members: Vec<Option<SymbolId>>,
+     affiliation: Vec<VariableAffiliation>,
+-    connect_targets: Vec<ConnectTarget>,
+-    connects: HashMap<Token, Vec<ConnectTarget>>,
++    connect_target_identifiers: Vec<ConnectTargetIdentifier>,
++    connects: HashMap<Token, ConnectTarget>,
+     parameters: Vec<Vec<Parameter>>,
+     ports: Vec<Vec<Port>>,
+     needs_default_generic_argument: bool,
+@@ -519,7 +519,7 @@ impl VerylGrammarTrait for CreateSymbolTable {
+             // This should be `After` not `Before`.
+             // because namespace_table insertion of identifiers
+             // in the expression_identifier should be done until `arg.into()`.
+-            self.connect_targets.push(arg.into());
++            self.connect_target_identifiers.push(arg.into());
+ 
+             // This should be `After` not `Before`.
+             // Because this should be executed after scoped_identifier to handle hierarchical access only
+@@ -1002,19 +1002,27 @@ impl VerylGrammarTrait for CreateSymbolTable {
+         match self.point {
+             HandlerPoint::Before => {
+                 reference_table::add(arg.into());
+-                self.connect_targets.clear();
++                self.connect_target_identifiers.clear();
+             }
+             HandlerPoint::After => {
+                 let port = arg.identifier.identifier_token.token;
+-                let targets = if arg.inst_port_item_opt.is_some() {
+-                    self.connect_targets.drain(0..).collect()
++                let identifiers = if arg.inst_port_item_opt.is_some() {
++                    self.connect_target_identifiers.drain(0..).collect()
+                 } else {
+-                    let target = ConnectTarget {
++                    vec![ConnectTargetIdentifier {
+                         path: vec![(port.text, vec![])],
+-                    };
+-                    vec![target]
++                    }]
++                };
++                let expression = if let Some(x) = &arg.inst_port_item_opt {
++                    x.expression.as_ref().clone()
++                } else {
++                    arg.identifier.as_ref().into()
++                };
++                let target = ConnectTarget {
++                    identifiers,
++                    expression,
+                 };
+-                self.connects.insert(port, targets);
++                self.connects.insert(port, target);
+             }
+         }
+         Ok(())
+diff --git a/crates/analyzer/src/handlers/create_type_dag.rs b/crates/analyzer/src/handlers/create_type_dag.rs
+index 0f43ed75..d10a3df4 100644
+--- a/crates/analyzer/src/handlers/create_type_dag.rs
++++ b/crates/analyzer/src/handlers/create_type_dag.rs
+@@ -328,11 +328,11 @@ impl VerylGrammarTrait for CreateTypeDag {
+                         if let SymbolKind::Port(port) = symbol_table::get(port.symbol).unwrap().kind
+                         {
+                             self.is_anonymous_identifier = port.direction == Direction::Output
+-                                && is_anonymous_expression(&x.expression);
++                                && x.expression.is_anonymous_expression();
+                         }
+                     } else if self.inst_sv_module {
+                         // For SV module, any ports can be connected with anonymous identifier
+-                        self.is_anonymous_identifier = is_anonymous_expression(&x.expression);
++                        self.is_anonymous_identifier = x.expression.is_anonymous_expression();
+                     }
+                 }
+             }
+@@ -359,7 +359,7 @@ impl VerylGrammarTrait for CreateTypeDag {
+             HandlerPoint::Before => {
+                 self.is_anonymous_identifier =
+                     matches!(self.port_direction.unwrap(), Direction::Output)
+-                        && is_anonymous_expression(&arg.expression);
++                        && arg.expression.is_anonymous_expression();
+             }
+             _ => self.is_anonymous_identifier = false,
+         }
+diff --git a/crates/analyzer/src/symbol.rs b/crates/analyzer/src/symbol.rs
+index 0959aff9..447a5a0b 100644
+--- a/crates/analyzer/src/symbol.rs
++++ b/crates/analyzer/src/symbol.rs
+@@ -1356,10 +1356,16 @@ pub struct FunctionProperty {
+ 
+ #[derive(Debug, Clone)]
+ pub struct ConnectTarget {
++    pub identifiers: Vec<ConnectTargetIdentifier>,
++    pub expression: syntax_tree::Expression,
++}
++
++#[derive(Debug, Clone)]
++pub struct ConnectTargetIdentifier {
+     pub path: Vec<(StrId, Vec<syntax_tree::Expression>)>,
+ }
+ 
+-impl ConnectTarget {
++impl ConnectTargetIdentifier {
+     pub fn path(&self) -> Vec<StrId> {
+         self.path.iter().map(|x| x.0).collect()
+     }
+@@ -1373,7 +1379,7 @@ impl ConnectTarget {
+     }
+ }
+ 
+-impl From<&syntax_tree::ExpressionIdentifier> for ConnectTarget {
++impl From<&syntax_tree::ExpressionIdentifier> for ConnectTargetIdentifier {
+     fn from(value: &syntax_tree::ExpressionIdentifier) -> Self {
+         let path: SymbolPath = value.scoped_identifier.as_ref().into();
+ 
+@@ -1408,7 +1414,7 @@ impl From<&syntax_tree::ExpressionIdentifier> for ConnectTarget {
+ pub struct InstanceProperty {
+     pub array: Vec<syntax_tree::Expression>,
+     pub type_name: GenericSymbolPath,
+-    pub connects: HashMap<Token, Vec<ConnectTarget>>,
++    pub connects: HashMap<Token, ConnectTarget>,
+     pub clock_domain: ClockDomain,
+ }
+ 
+diff --git a/crates/analyzer/src/var_ref.rs b/crates/analyzer/src/var_ref.rs
+index da57d9aa..662da30e 100644
+--- a/crates/analyzer/src/var_ref.rs
++++ b/crates/analyzer/src/var_ref.rs
+@@ -1,6 +1,6 @@
+ use crate::evaluator::{Evaluated, EvaluatedValue, Evaluator};
+ use crate::namespace::Namespace;
+-use crate::symbol::{ConnectTarget, SymbolId};
++use crate::symbol::{ConnectTargetIdentifier, SymbolId};
+ use crate::symbol_table;
+ use miette::Result;
+ use std::convert::{From, TryFrom};
+@@ -417,10 +417,10 @@ impl TryFrom<&ExpressionIdentifier> for VarRefPath {
+     }
+ }
+ 
+-impl TryFrom<(&ConnectTarget, &Namespace)> for VarRefPath {
++impl TryFrom<(&ConnectTargetIdentifier, &Namespace)> for VarRefPath {
+     type Error = ();
+ 
+-    fn try_from(arg: (&ConnectTarget, &Namespace)) -> Result<Self, Self::Error> {
++    fn try_from(arg: (&ConnectTargetIdentifier, &Namespace)) -> Result<Self, Self::Error> {
+         if arg.0.is_empty() {
+             return Err(());
+         }
+diff --git a/crates/parser/src/veryl_grammar_trait.rs b/crates/parser/src/veryl_grammar_trait.rs
+index e6da55ab..b985f83a 100644
+--- a/crates/parser/src/veryl_grammar_trait.rs
++++ b/crates/parser/src/veryl_grammar_trait.rs
+@@ -178,6 +178,87 @@ impl From<&AssignDestination> for Vec<HierarchicalIdentifier> {
+     }
+ }
+ 
++impl From<&Identifier> for Expression {
++    fn from(value: &Identifier) -> Self {
++        let scoped_identifier_group =
++            Box::new(ScopedIdentifierGroup::IdentifierScopedIdentifierOpt(
++                ScopedIdentifierGroupIdentifierScopedIdentifierOpt {
++                    identifier: Box::new(value.clone()),
++                    scoped_identifier_opt: None,
++                },
++            ));
++        let scoped_identifier = Box::new(ScopedIdentifier {
++            scoped_identifier_group,
++            scoped_identifier_list: vec![],
++        });
++        let expression_identifier = Box::new(ExpressionIdentifier {
++            scoped_identifier,
++            expression_identifier_opt: None,
++            expression_identifier_list: vec![],
++            expression_identifier_list0: vec![],
++        });
++        let identifier_factor = Box::new(IdentifierFactor {
++            expression_identifier,
++            identifier_factor_opt: None,
++        });
++        let factor = Box::new(Factor::IdentifierFactor(FactorIdentifierFactor {
++            identifier_factor,
++        }));
++        let expression12 = Box::new(Expression12 {
++            expression12_list: vec![],
++            factor,
++        });
++        let expression11 = Box::new(Expression11 {
++            expression12,
++            expression11_opt: None,
++        });
++        let expression10 = Box::new(Expression10 {
++            expression11,
++            expression10_list: vec![],
++        });
++        let expression09 = Box::new(Expression09 {
++            expression10,
++            expression09_list: vec![],
++        });
++        let expression08 = Box::new(Expression08 {
++            expression09,
++            expression08_list: vec![],
++        });
++        let expression07 = Box::new(Expression07 {
++            expression08,
++            expression07_list: vec![],
++        });
++        let expression06 = Box::new(Expression06 {
++            expression07,
++            expression06_list: vec![],
++        });
++        let expression05 = Box::new(Expression05 {
++            expression06,
++            expression05_list: vec![],
++        });
++        let expression04 = Box::new(Expression04 {
++            expression05,
++            expression04_list: vec![],
++        });
++        let expression03 = Box::new(Expression03 {
++            expression04,
++            expression03_list: vec![],
++        });
++        let expression02 = Box::new(Expression02 {
++            expression03,
++            expression02_list: vec![],
++        });
++        let expression01 = Box::new(Expression01 {
++            expression02,
++            expression01_list: vec![],
++        });
++        Expression {
++            expression01,
++            expression_list: vec![],
++        }
++    }
++}
++
+ list_group_to_item!(Modport);
+ list_group_to_item!(Enum);
+ list_group_to_item!(StructUnion);
+@@ -189,6 +270,7 @@ list_to_item!(WithGenericParameter);
+ list_to_item!(WithGenericArgument);
+ list_to_item!(Attribute);
+ list_to_item!(Argument);
++list_to_item!(Concatenation);
+ list_to_item!(AssignConcatenation);
+ group_to_item!(Module);
+ group_to_item!(Interface);
+@@ -197,99 +279,132 @@ group_to_item!(Package);
+ group_to_item!(Description);
+ group_to_item!(StatementBlock);
+ 
+-pub fn is_anonymous_expression(arg: &Expression) -> bool {
+-    if !arg.expression_list.is_empty() {
+-        return false;
+-    }
++impl Expression {
++    fn unwrap_factor(&self) -> Option<&Factor> {
++        if !self.expression_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*arg.expression01;
+-    if !exp.expression01_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*self.expression01;
++        if !exp.expression01_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression02;
+-    if !exp.expression02_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression02;
++        if !exp.expression02_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression03;
+-    if !exp.expression03_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression03;
++        if !exp.expression03_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression04;
+-    if !exp.expression04_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression04;
++        if !exp.expression04_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression05;
+-    if !exp.expression05_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression05;
++        if !exp.expression05_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression06;
+-    if !exp.expression06_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression06;
++        if !exp.expression06_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression07;
+-    if !exp.expression07_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression07;
++        if !exp.expression07_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression08;
+-    if !exp.expression08_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression08;
++        if !exp.expression08_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression09;
+-    if !exp.expression09_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression09;
++        if !exp.expression09_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression10;
+-    if !exp.expression10_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression10;
++        if !exp.expression10_list.is_empty() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression11;
+-    if exp.expression11_opt.is_some() {
+-        return false;
+-    }
++        let exp = &*exp.expression11;
++        if exp.expression11_opt.is_some() {
++            return None;
++        }
+ 
+-    let exp = &*exp.expression12;
+-    if !exp.expression12_list.is_empty() {
+-        return false;
+-    }
++        let exp = &*exp.expression12;
++        if !exp.expression12_list.is_empty() {
++            return None;
++        }
+ 
+-    match &*exp.factor {
+-        Factor::IdentifierFactor(x) => {
+-            let factor = &x.identifier_factor;
++        Some(exp.factor.as_ref())
++    }
+ 
+-            if factor.identifier_factor_opt.is_some() {
+-                return false;
+-            }
++    pub fn is_assignable(&self) -> bool {
++        let Some(factor) = self.unwrap_factor() else {
++            return false;
++        };
+ 
+-            let exp_identifier = &*factor.expression_identifier;
+-            if exp_identifier.expression_identifier_opt.is_some() {
+-                return false;
+-            }
+-            if !exp_identifier.expression_identifier_list.is_empty() {
+-                return false;
++        match factor {
++            Factor::IdentifierFactor(x) => {
++                // Function call
++                if x.identifier_factor.identifier_factor_opt.is_some() {
++                    return false;
++                }
++                true
+             }
+-            if !exp_identifier.expression_identifier_list0.is_empty() {
+-                return false;
++            Factor::LBraceConcatenationListRBrace(x) => {
++                let items: Vec<_> = x.concatenation_list.as_ref().into();
++                items
++                    .iter()
++                    .all(|x| x.concatenation_item_opt.is_none() && x.expression.is_assignable())
+             }
++            _ => false,
++        }
++    }
+ 
+-            let scoped_identifier = &*exp_identifier.scoped_identifier;
+-            if !scoped_identifier.scoped_identifier_list.is_empty() {
+-                return false;
+-            }
++    pub fn is_anonymous_expression(&self) -> bool {
++        let Some(factor) = self.unwrap_factor() else {
++            return false;
++        };
++
++        match factor {
++            Factor::IdentifierFactor(x) => {
++                let factor = &x.identifier_factor;
++
++                if factor.identifier_factor_opt.is_some() {
++                    return false;
++                }
++
++                let exp_identifier = &*factor.expression_identifier;
++                if exp_identifier.expression_identifier_opt.is_some() {
++                    return false;
++                }
++                if !exp_identifier.expression_identifier_list.is_empty() {
++                    return false;
++                }
++                if !exp_identifier.expression_identifier_list0.is_empty() {
++                    return false;
++                }
+ 
+-            let token = scoped_identifier.identifier().token;
+-            is_anonymous_token(&token)
++                let scoped_identifier = &*exp_identifier.scoped_identifier;
++                if !scoped_identifier.scoped_identifier_list.is_empty() {
++                    return false;
++                }
++
++                let token = scoped_identifier.identifier().token;
++                is_anonymous_token(&token)
++            }
++            _ => false,
+         }
+-        _ => false,
+     }
+ }
+ 

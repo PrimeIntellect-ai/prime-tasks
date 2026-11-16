@@ -1,0 +1,134 @@
+diff --git a/pkg/oci/containerd_test.go b/pkg/oci/containerd_test.go
+index f94d2b8..c401adc 100644
+--- a/pkg/oci/containerd_test.go
++++ b/pkg/oci/containerd_test.go
+@@ -5,7 +5,9 @@ import (
+ 	"fmt"
+ 	iofs "io/fs"
+ 	"maps"
++	"net"
+ 	"net/url"
++	"os"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -14,6 +16,9 @@ import (
+ 	"github.com/go-logr/logr"
+ 	"github.com/spf13/afero"
+ 	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/health"
++	"google.golang.org/grpc/health/grpc_health_v1"
+ 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+ )
+ 
+@@ -31,6 +36,109 @@ func TestNewContainerd(t *testing.T) {
+ 	require.Equal(t, "local", c.contentPath)
+ }
+ 
++type fakeRuntimeService struct {
++	runtimeapi.UnimplementedRuntimeServiceServer
++	version    string
++	statusResp *runtimeapi.StatusResponse
++}
++
++func (f *fakeRuntimeService) Version(_ context.Context, _ *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
++	return &runtimeapi.VersionResponse{
++		RuntimeName:       "containerd",
++		RuntimeVersion:    f.version,
++		RuntimeApiVersion: "v1",
++	}, nil
++}
++
++func (f *fakeRuntimeService) Status(_ context.Context, _ *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
++	return f.statusResp, nil
++}
++
++func startFakeContainerd(t *testing.T, svc *fakeRuntimeService) string {
++	t.Helper()
++
++	dir, err := os.MkdirTemp("", "containerd")
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		_ = os.RemoveAll(dir)
++	})
++	sock := filepath.Join(dir, "containerd.sock")
++	lis, err := net.Listen("unix", sock)
++	require.NoError(t, err)
++
++	srv := grpc.NewServer()
++	runtimeapi.RegisterRuntimeServiceServer(srv, svc)
++	hs := health.NewServer()
++	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
++	grpc_health_v1.RegisterHealthServer(srv, hs)
++	go func() {
++		_ = srv.Serve(lis)
++	}()
++	t.Cleanup(srv.Stop)
++
++	return sock
++}
++
++func TestContainerdVerifyVersionHandling(t *testing.T) {
++	t.Parallel()
++
++	const validConfig = `{"containerd":{"discardUnpackedLayers":false},"registry":{"configPath":"/etc/containerd/config.toml"}}`
++
++	tests := []struct {
++		name        string
++		version     string
++		config      string
++		expectError bool
++	}{
++		{
++			name:        "suffixed version below 2.0.0 verifies configuration",
++			version:     "1.6.20~ds1",
++			config:      validConfig,
++			expectError: false,
++		},
++		{
++			name:        "suffixed version below 2.0.0 with invalid configuration",
++			version:     "1.6.20~ds1",
++			config:      "{}",
++			expectError: true,
++		},
++		{
++			name:        "suffixed version at or above 2.0.0 skips configuration verification",
++			version:     "2.0.2~ds1",
++			config:      "{}",
++			expectError: false,
++		},
++		{
++			name:        "version at or above 2.0.0 skips configuration verification",
++			version:     "2.1.4",
++			config:      "{}",
++			expectError: false,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++
++			svc := &fakeRuntimeService{
++				version: tt.version,
++				statusResp: &runtimeapi.StatusResponse{
++					Info: map[string]string{"config": tt.config},
++				},
++			}
++			sock := startFakeContainerd(t, svc)
++			c, err := NewContainerd(sock, "", "/etc/containerd/config.toml", nil)
++			require.NoError(t, err)
++
++			err = c.Verify(context.Background())
++			if tt.expectError {
++				require.Error(t, err)
++			} else {
++				require.NoError(t, err)
++			}
++		})
++	}
++}
++
+ func TestVerifyStatusResponse(t *testing.T) {
+ 	t.Parallel()
+ 

@@ -1,0 +1,787 @@
+diff --git a/libcontainer/configs/validate/validator_test.go b/libcontainer/configs/validate/validator_test.go
+index a882fa64..07c8317d 100644
+--- a/libcontainer/configs/validate/validator_test.go
++++ b/libcontainer/configs/validate/validator_test.go
+@@ -170,7 +170,7 @@ func TestValidateSecurityWithoutNEWNS(t *testing.T) {
+ 	}
+ }
+ 
+-func TestValidateUsernamespace(t *testing.T) {
++func TestValidateUserNamespace(t *testing.T) {
+ 	if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
+ 		t.Skip("Test requires userns.")
+ 	}
+@@ -181,6 +181,8 @@ func TestValidateUsernamespace(t *testing.T) {
+ 				{Type: configs.NEWUSER},
+ 			},
+ 		),
++		UIDMappings: []configs.IDMap{{HostID: 0, ContainerID: 123, Size: 100}},
++		GIDMappings: []configs.IDMap{{HostID: 0, ContainerID: 123, Size: 100}},
+ 	}
+ 
+ 	err := Validate(config)
+@@ -189,11 +191,11 @@ func TestValidateUsernamespace(t *testing.T) {
+ 	}
+ }
+ 
+-func TestValidateUsernamespaceWithoutUserNS(t *testing.T) {
+-	uidMap := configs.IDMap{ContainerID: 123}
++func TestValidateUsernsMappingWithoutNamespace(t *testing.T) {
+ 	config := &configs.Config{
+ 		Rootfs:      "/var",
+-		UIDMappings: []configs.IDMap{uidMap},
++		UIDMappings: []configs.IDMap{{HostID: 0, ContainerID: 123, Size: 100}},
++		GIDMappings: []configs.IDMap{{HostID: 0, ContainerID: 123, Size: 100}},
+ 	}
+ 
+ 	err := Validate(config)
+diff --git a/libcontainer/integration/exec_test.go b/libcontainer/integration/exec_test.go
+index 9795964c..096e2cfd 100644
+--- a/libcontainer/integration/exec_test.go
++++ b/libcontainer/integration/exec_test.go
+@@ -1550,6 +1550,9 @@ func TestInitJoinNetworkAndUser(t *testing.T) {
+ 	config2 := newTemplateConfig(t, &tParam{userns: true})
+ 	config2.Namespaces.Add(configs.NEWNET, netns1)
+ 	config2.Namespaces.Add(configs.NEWUSER, userns1)
++	// The joined namespace has the mappings configured for its creator.
++	config2.UIDMappings = config1.UIDMappings
++	config2.GIDMappings = config1.GIDMappings
+ 	config2.Cgroups.Path = "integration/test2"
+ 	container2, err := newContainer(t, config2)
+ 	ok(t, err)
+diff --git a/libcontainer/specconv/spec_linux_test.go b/libcontainer/specconv/spec_linux_test.go
+index d84853bc..fd3edb74 100644
+--- a/libcontainer/specconv/spec_linux_test.go
++++ b/libcontainer/specconv/spec_linux_test.go
+@@ -608,6 +608,61 @@ func TestDupNamespaces(t *testing.T) {
+ 	}
+ }
+ 
++func TestUserNamespaceMappingAndPath(t *testing.T) {
++	if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
++		t.Skip("Test requires userns.")
++	}
++
++	spec := &specs.Spec{
++		Root: &specs.Root{
++			Path: "rootfs",
++		},
++		Linux: &specs.Linux{
++			UIDMappings: []specs.LinuxIDMapping{
++				{ContainerID: 0, HostID: 1000, Size: 1000},
++			},
++			GIDMappings: []specs.LinuxIDMapping{
++				{ContainerID: 0, HostID: 2000, Size: 1000},
++			},
++			Namespaces: []specs.LinuxNamespace{
++				{
++					Type: "user",
++					Path: "/proc/1/ns/user",
++				},
++			},
++		},
++	}
++
++	_, err := CreateLibcontainerConfig(&CreateOpts{
++		Spec: spec,
++	})
++
++	if err == nil {
++		t.Fatal("expected an error when a user namespace path is combined with UID/GID mappings")
++	}
++}
++
++func TestJoinUserNamespaceUsesEffectiveMappingsWithoutExplicitMappings(t *testing.T) {
++	if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
++		t.Skip("Test requires userns.")
++	}
++
++	spec := &specs.Spec{
++		Root: &specs.Root{Path: "rootfs"},
++		Linux: &specs.Linux{
++			Namespaces: []specs.LinuxNamespace{{Type: "user", Path: "/proc/1/ns/user"}},
++		},
++	}
++	config, err := CreateLibcontainerConfig(&CreateOpts{Spec: spec})
++	if err != nil {
++		t.Fatalf("joining a user namespace without explicit mappings should succeed: %v", err)
++	}
++
++	if got := config.Namespaces.PathOf(configs.NEWUSER); got != "/proc/1/ns/user" {
++		t.Errorf("user namespace path = %q, want %q", got, "/proc/1/ns/user")
++	}
++}
++
+ func TestNonZeroEUIDCompatibleSpecconvValidate(t *testing.T) {
+ 	if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
+ 		t.Skip("Test requires userns.")
+diff --git a/tests/integration/delete.bats b/tests/integration/delete.bats
+index a1a21748..a7ade108 100644
+--- a/tests/integration/delete.bats
++++ b/tests/integration/delete.bats
+@@ -10,70 +10,10 @@ function teardown() {
+ 	teardown_bundle
+ }
+ 
+-@test "runc delete" {
+-	# Need a permission to create a cgroup.
+-	# XXX(@kolyshkin): currently this test does not handle rootless when
+-	# fs cgroup driver is used, because in this case cgroup (with a
+-	# predefined name) is created by tests/rootless.sh, not by runc.
+-	[ $EUID -ne 0 ] && requires systemd
+-	set_resources_limit
+-
+-	runc run -d --console-socket "$CONSOLE_SOCKET" testbusyboxdelete
+-	[ "$status" -eq 0 ]
+-
+-	testcontainer testbusyboxdelete running
+-	# Ensure the find statement used later is correct.
+-	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope 2>/dev/null || true)
+-	if [ -z "$output" ]; then
+-		fail "expected cgroup not found"
+-	fi
+-
+-	runc kill testbusyboxdelete KILL
+-	[ "$status" -eq 0 ]
+-	wait_for_container 10 1 testbusyboxdelete stopped
+-
+-	runc delete testbusyboxdelete
+-	[ "$status" -eq 0 ]
+-
+-	runc state testbusyboxdelete
+-	[ "$status" -ne 0 ]
+-
+-	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope 2>/dev/null || true)
+-	[ "$output" = "" ] || fail "cgroup not cleaned up correctly: $output"
+-}
+-
+-@test "runc delete --force" {
+-	# run busybox detached
+-	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
+-	[ "$status" -eq 0 ]
+-
+-	# check state
+-	testcontainer test_busybox running
+-
+-	# force delete test_busybox
+-	runc delete --force test_busybox
+-
+-	runc state test_busybox
+-	[ "$status" -ne 0 ]
+-}
+-
+-@test "runc delete --force ignore not exist" {
+-	runc delete --force notexists
+-	[ "$status" -eq 0 ]
+-}
+-
+-# Issue 4047, case "runc delete".
+-@test "runc delete [host pidns + init gone]" {
+-	test_runc_delete_host_pidns
+-}
+-
+-# Issue 4047, case "runc delete --force" (different code path).
+-# shellcheck disable=SC2030
+-@test "runc delete --force [host pidns + init gone]" {
+-	test_runc_delete_host_pidns --force
+-}
+-
+ # See also: "kill KILL [host pidns + init gone]" test in kill.bats.
++#
++# This needs to be placed at the top of the bats file to work around
++# a shellcheck bug. See <https://github.com/koalaman/shellcheck/issues/2873>.
+ function test_runc_delete_host_pidns() {
+ 	requires cgroups_freezer
+ 
+@@ -101,7 +41,6 @@ function test_runc_delete_host_pidns() {
+ 	fi
+ 
+ 	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
+-	# shellcheck disable=SC2031
+ 	[ "$status" -eq 0 ]
+ 	cgpath=$(get_cgroup_path "pids")
+ 	init_pid=$(cat "$cgpath"/cgroup.procs)
+@@ -125,13 +64,10 @@ function test_runc_delete_host_pidns() {
+ 	done
+ 
+ 	# Must kill those processes and remove container.
+-	# shellcheck disable=SC2031
+ 	runc delete "$@" test_busybox
+-	# shellcheck disable=SC2031
+ 	[ "$status" -eq 0 ]
+ 
+ 	runc state test_busybox
+-	# shellcheck disable=SC2031
+ 	[ "$status" -ne 0 ] # "Container does not exist"
+ 
+ 	# Make sure all processes are gone.
+@@ -140,6 +76,68 @@ function test_runc_delete_host_pidns() {
+ 	[ -z "$pids" ]
+ }
+ 
++@test "runc delete" {
++	# Need a permission to create a cgroup.
++	# XXX(@kolyshkin): currently this test does not handle rootless when
++	# fs cgroup driver is used, because in this case cgroup (with a
++	# predefined name) is created by tests/rootless.sh, not by runc.
++	[ $EUID -ne 0 ] && requires systemd
++	set_resources_limit
++
++	runc run -d --console-socket "$CONSOLE_SOCKET" testbusyboxdelete
++	[ "$status" -eq 0 ]
++
++	testcontainer testbusyboxdelete running
++	# Ensure the find statement used later is correct.
++	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope 2>/dev/null || true)
++	if [ -z "$output" ]; then
++		fail "expected cgroup not found"
++	fi
++
++	runc kill testbusyboxdelete KILL
++	[ "$status" -eq 0 ]
++	wait_for_container 10 1 testbusyboxdelete stopped
++
++	runc delete testbusyboxdelete
++	[ "$status" -eq 0 ]
++
++	runc state testbusyboxdelete
++	[ "$status" -ne 0 ]
++
++	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope 2>/dev/null || true)
++	[ "$output" = "" ] || fail "cgroup not cleaned up correctly: $output"
++}
++
++@test "runc delete --force" {
++	# run busybox detached
++	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
++	[ "$status" -eq 0 ]
++
++	# check state
++	testcontainer test_busybox running
++
++	# force delete test_busybox
++	runc delete --force test_busybox
++
++	runc state test_busybox
++	[ "$status" -ne 0 ]
++}
++
++@test "runc delete --force ignore not exist" {
++	runc delete --force notexists
++	[ "$status" -eq 0 ]
++}
++
++# Issue 4047, case "runc delete".
++@test "runc delete [host pidns + init gone]" {
++	test_runc_delete_host_pidns
++}
++
++# Issue 4047, case "runc delete --force" (different code path).
++@test "runc delete --force [host pidns + init gone]" {
++	test_runc_delete_host_pidns --force
++}
++
+ @test "runc delete --force [paused container]" {
+ 	runc run -d --console-socket "$CONSOLE_SOCKET" ct1
+ 	[ "$status" -eq 0 ]
+@@ -251,7 +249,6 @@ EOF
+ 	requires systemd_v244 # Older systemd lacks RuntimeMaxSec support.
+ 
+ 	set_cgroups_path
+-	# shellcheck disable=SC2016
+ 	update_config '	  .annotations += {
+ 				"org.systemd.property.RuntimeMaxSec": "2",
+ 				"org.systemd.property.TimeoutStopSec": "1"
+diff --git a/tests/integration/events.bats b/tests/integration/events.bats
+index 707fe4e7..cf42eaf5 100644
+--- a/tests/integration/events.bats
++++ b/tests/integration/events.bats
+@@ -10,7 +10,40 @@ function teardown() {
+ 	teardown_bundle
+ }
+ 
+-# shellcheck disable=SC2030
++# This needs to be placed at the top of the bats file to work around
++# a shellcheck bug. See <https://github.com/koalaman/shellcheck/issues/2873>.
++function test_events() {
++	# XXX: currently cgroups require root containers.
++	requires root
++	init_cgroup_paths
++
++	local status interval retry_every=1
++	if [ $# -eq 2 ]; then
++		interval="$1"
++		retry_every="$2"
++	fi
++
++	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
++	[ "$status" -eq 0 ]
++
++	# Spawn two subshels:
++	# 1. Event logger that sends stats events to events.log.
++	(__runc events ${interval:+ --interval "$interval"} test_busybox >events.log) &
++	# 2. Waits for an event that includes test_busybox then kills the
++	#    test_busybox container which causes the event logger to exit.
++	(
++		retry 10 "$retry_every" grep -q test_busybox events.log
++		__runc delete -f test_busybox
++	) &
++	wait # for both subshells to finish
++
++	[ -e events.log ]
++
++	output=$(head -1 events.log)
++	[[ "$output" == [\{]"\"type\""[:]"\"stats\""[,]"\"id\""[:]"\"test_busybox\""[,]* ]]
++	[[ "$output" == *"data"* ]]
++}
++
+ @test "events --stats" {
+ 	# XXX: currently cgroups require root containers.
+ 	requires root
+@@ -27,7 +60,6 @@ function teardown() {
+ 	[[ "${lines[0]}" == *"data"* ]]
+ }
+ 
+-# shellcheck disable=SC2030
+ @test "events --stats with psi data" {
+ 	requires root cgroups_v2 psi
+ 	init_cgroup_paths
+@@ -56,39 +88,6 @@ function teardown() {
+ 	done
+ }
+ 
+-function test_events() {
+-	# XXX: currently cgroups require root containers.
+-	requires root
+-	init_cgroup_paths
+-
+-	local status interval retry_every=1
+-	if [ $# -eq 2 ]; then
+-		interval="$1"
+-		retry_every="$2"
+-	fi
+-
+-	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
+-	# shellcheck disable=SC2031
+-	[ "$status" -eq 0 ]
+-
+-	# Spawn two subshels:
+-	# 1. Event logger that sends stats events to events.log.
+-	(__runc events ${interval:+ --interval "$interval"} test_busybox >events.log) &
+-	# 2. Waits for an event that includes test_busybox then kills the
+-	#    test_busybox container which causes the event logger to exit.
+-	(
+-		retry 10 "$retry_every" grep -q test_busybox events.log
+-		__runc delete -f test_busybox
+-	) &
+-	wait # for both subshells to finish
+-
+-	[ -e events.log ]
+-
+-	output=$(head -1 events.log)
+-	[[ "$output" == [\{]"\"type\""[:]"\"stats\""[,]"\"id\""[:]"\"test_busybox\""[,]* ]]
+-	[[ "$output" == *"data"* ]]
+-}
+-
+ @test "events --interval default" {
+ 	test_events
+ }
+diff --git a/tests/integration/helpers.bash b/tests/integration/helpers.bash
+index 44af05d9..42f86251 100755
+--- a/tests/integration/helpers.bash
++++ b/tests/integration/helpers.bash
+@@ -18,6 +18,7 @@ SD_HELPER="${INTEGRATION_ROOT}/../../contrib/cmd/sd-helper/sd-helper"
+ SECCOMP_AGENT="${INTEGRATION_ROOT}/../../contrib/cmd/seccompagent/seccompagent"
+ FS_IDMAP="${INTEGRATION_ROOT}/../../contrib/cmd/fs-idmap/fs-idmap"
+ PIDFD_KILL="${INTEGRATION_ROOT}/../../contrib/cmd/pidfd-kill/pidfd-kill"
++REMAP_ROOTFS="${INTEGRATION_ROOT}/../../contrib/cmd/remap-rootfs/remap-rootfs"
+ 
+ # Some variables may not always be set. Set those to empty value,
+ # if unset, to avoid "unbound variable" error.
+@@ -657,6 +658,12 @@ function teardown_bundle() {
+ 	remove_parent
+ }
+ 
++function remap_rootfs() {
++	[ ! -v ROOT ] && return 0 # nothing to remap
++
++	"$REMAP_ROOTFS" "$ROOT/bundle"
++}
++
+ function is_kernel_gte() {
+ 	local major_required minor_required
+ 	major_required=$(echo "$1" | cut -d. -f1)
+diff --git a/tests/integration/idmap.bats b/tests/integration/idmap.bats
+index 5bd554ca..53784b55 100644
+--- a/tests/integration/idmap.bats
++++ b/tests/integration/idmap.bats
+@@ -16,7 +16,6 @@ function setup() {
+ 	# Use other owner for source-2
+ 	chown 1:1 source-2/foo.txt
+ 
+-	mkdir -p rootfs/{proc,sys,tmp}
+ 	mkdir -p rootfs/tmp/mount-{1,2}
+ 	mkdir -p rootfs/mnt/bind-mount-{1,2}
+ 
+@@ -43,6 +42,8 @@ function setup() {
+ 						]
+ 					}
+ 				] '
++
++	remap_rootfs
+ }
+ 
+ function teardown() {
+diff --git a/tests/integration/kill.bats b/tests/integration/kill.bats
+index 3124bb0e..d1e0de19 100644
+--- a/tests/integration/kill.bats
++++ b/tests/integration/kill.bats
+@@ -10,32 +10,8 @@ function teardown() {
+ 	teardown_bundle
+ }
+ 
+-# shellcheck disable=SC2030
+-@test "kill detached busybox" {
+-	# run busybox detached
+-	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
+-	[ "$status" -eq 0 ]
+-
+-	# check state
+-	testcontainer test_busybox running
+-
+-	runc kill test_busybox KILL
+-	[ "$status" -eq 0 ]
+-	wait_for_container 10 1 test_busybox stopped
+-
+-	# Check that kill errors on a stopped container.
+-	runc kill test_busybox 0
+-	[ "$status" -ne 0 ]
+-	[[ "$output" == *"container not running"* ]]
+-
+-	# Check that -a (now obsoleted) makes kill return no error for a stopped container.
+-	runc kill -a test_busybox 0
+-	[ "$status" -eq 0 ]
+-
+-	runc delete test_busybox
+-	[ "$status" -eq 0 ]
+-}
+-
++# This needs to be placed at the top of the bats file to work around
++# a shellcheck bug. See <https://github.com/koalaman/shellcheck/issues/2873>.
+ test_host_pidns_kill() {
+ 	requires cgroups_freezer
+ 
+@@ -53,7 +29,6 @@ test_host_pidns_kill() {
+ 	fi
+ 
+ 	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
+-	# shellcheck disable=SC2031
+ 	[ "$status" -eq 0 ]
+ 	cgpath=$(get_cgroup_path "pids")
+ 	init_pid=$(cat "$cgpath"/cgroup.procs)
+@@ -82,7 +57,6 @@ test_host_pidns_kill() {
+ 	done
+ 
+ 	runc kill test_busybox KILL
+-	# shellcheck disable=SC2031
+ 	[ "$status" -eq 0 ]
+ 	wait_for_container 10 1 test_busybox stopped
+ 
+@@ -92,6 +66,31 @@ test_host_pidns_kill() {
+ 	[ -z "$pids" ]
+ }
+ 
++@test "kill detached busybox" {
++	# run busybox detached
++	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
++	[ "$status" -eq 0 ]
++
++	# check state
++	testcontainer test_busybox running
++
++	runc kill test_busybox KILL
++	[ "$status" -eq 0 ]
++	wait_for_container 10 1 test_busybox stopped
++
++	# Check that kill errors on a stopped container.
++	runc kill test_busybox 0
++	[ "$status" -ne 0 ]
++	[[ "$output" == *"container not running"* ]]
++
++	# Check that -a (now obsoleted) makes kill return no error for a stopped container.
++	runc kill -a test_busybox 0
++	[ "$status" -eq 0 ]
++
++	runc delete test_busybox
++	[ "$status" -eq 0 ]
++}
++
+ # This is roughly the same as TestPIDHostInitProcessWait in libcontainer/integration.
+ # The differences are:
+ #
+diff --git a/tests/integration/mounts.bats b/tests/integration/mounts.bats
+index 3cd01da8..a4d997ca 100644
+--- a/tests/integration/mounts.bats
++++ b/tests/integration/mounts.bats
+@@ -10,6 +10,20 @@ function teardown() {
+ 	teardown_bundle
+ }
+ 
++# https://github.com/opencontainers/runc/security/advisories/GHSA-m8cg-xc2p-r3fc
++#
++# This needs to be placed at the top of the bats file to work around
++# a shellcheck bug. See <https://github.com/koalaman/shellcheck/issues/2873>.
++function test_ro_cgroup_mount() {
++	local lines status
++	# shellcheck disable=SC2016
++	update_config '.process.args |= ["sh", "-euc", "for f in `grep /sys/fs/cgroup /proc/mounts | awk \"{print \\\\$2}\"| uniq`; do test -e $f && grep -w $f /proc/mounts | tail -n1; done"]'
++	runc run test_busybox
++	[ "$status" -eq 0 ]
++	[ "${#lines[@]}" -ne 0 ]
++	for line in "${lines[@]}"; do [[ "${line}" == *'ro,'* ]]; done
++}
++
+ # https://github.com/opencontainers/runc/issues/3991
+ @test "runc run [tmpcopyup]" {
+ 	mkdir -p rootfs/dir1/dir2
+@@ -88,22 +102,9 @@ function teardown() {
+ 	test_ro_cgroup_mount
+ }
+ 
+-# shellcheck disable=SC2030
+ @test "runc run [ro /sys/fs/cgroup mounts + cgroupns]" {
+ 	requires cgroupns
+ 	# With cgroup namespace.
+ 	update_config '.linux.namespaces |= if index({"type": "cgroup"}) then . else . + [{"type": "cgroup"}] end'
+ 	test_ro_cgroup_mount
+ }
+-
+-# https://github.com/opencontainers/runc/security/advisories/GHSA-m8cg-xc2p-r3fc
+-# shellcheck disable=SC2031
+-function test_ro_cgroup_mount() {
+-	local lines status
+-	# shellcheck disable=SC2016
+-	update_config '.process.args |= ["sh", "-euc", "for f in `grep /sys/fs/cgroup /proc/mounts | awk \"{print \\\\$2}\"| uniq`; do test -e $f && grep -w $f /proc/mounts | tail -n1; done"]'
+-	runc run test_busybox
+-	[ "$status" -eq 0 ]
+-	[ "${#lines[@]}" -ne 0 ]
+-	for line in "${lines[@]}"; do [[ "${line}" == *'ro,'* ]]; done
+-}
+diff --git a/tests/integration/run.bats b/tests/integration/run.bats
+index e2eda270..f6bd3c86 100644
+--- a/tests/integration/run.bats
++++ b/tests/integration/run.bats
+@@ -160,3 +160,73 @@ function teardown() {
+ 	[[ "$output" = *"Hello World"* ]]
+ 	[[ "$output" = *"runc-dmz: using /proc/self/exe clone"* ]]
+ }
++
++@test "runc run [joining existing container namespaces]" {
++	requires timens
++
++	# Create a detached container with the namespaces we want. We notably want
++	# to include both userns and timens, which require config-related
++	# configuration.
++	if [ $EUID -eq 0 ]; then
++		update_config '.linux.namespaces += [{"type": "user"}]
++			| .linux.uidMappings += [{"containerID": 0, "hostID": 100000, "size": 100}]
++			| .linux.gidMappings += [{"containerID": 0, "hostID": 200000, "size": 200}]'
++		remap_rootfs
++	fi
++	update_config '.linux.namespaces += [{"type": "time"}]
++		| .linux.timeOffsets = {
++			"monotonic": { "secs": 7881, "nanosecs": 2718281 },
++			"boottime": { "secs": 1337, "nanosecs": 3141519 }
++		}'
++	update_config '.process.args = ["sleep", "infinity"]'
++
++	runc run -d --console-socket "$CONSOLE_SOCKET" target_ctr
++	[ "$status" -eq 0 ]
++
++	# Modify our container's configuration such that it is just going to
++	# inherit all of the namespaces of the target container.
++	#
++	# NOTE: We cannot join the mount namespace of another container because of
++	# some quirks of the runtime-spec. In particular, we MUST pivot_root into
++	# root.path and root.path MUST be set in the config, so runc cannot just
++	# ignore root.path when joining namespaces (and root.path doesn't exist
++	# inside root.path, for obvious reasons).
++	#
++	# We could hack around this (create a copy of the rootfs inside the rootfs,
++	# or use a simpler mount namespace target), but those wouldn't be similar
++	# tests to the other namespace joining tests.
++	target_pid="$(__runc state target_ctr | jq .pid)"
++	update_config '.linux.namespaces |= map_values(.path = if .type == "mount" then "" else "/proc/'"$target_pid"'/ns/" + ({"network": "net", "mount": "mnt"}[.type] // .type) end)'
++	# Remove the userns and timens configuration (they cannot be changed).
++	update_config '.linux |= (del(.uidMappings) | del(.gidMappings) | del(.timeOffsets))'
++
++	runc run -d --console-socket "$CONSOLE_SOCKET" attached_ctr
++	[ "$status" -eq 0 ]
++
++	# Make sure there are two sleep processes in our container.
++	runc exec attached_ctr ps aux
++	[ "$status" -eq 0 ]
++	run -0 grep "sleep infinity" <<<"$output"
++	[ "${#lines[@]}" -eq 2 ]
++
++	# ... that the userns mappings are the same...
++	runc exec attached_ctr cat /proc/self/uid_map
++	[ "$status" -eq 0 ]
++	if [ $EUID -eq 0 ]; then
++		grep -E '^\s+0\s+100000\s+100$' <<<"$output"
++	else
++		grep -E '^\s+0\s+'$EUID'\s+1$' <<<"$output"
++	fi
++	runc exec attached_ctr cat /proc/self/gid_map
++	[ "$status" -eq 0 ]
++	if [ $EUID -eq 0 ]; then
++		grep -E '^\s+0\s+200000\s+200$' <<<"$output"
++	else
++		grep -E '^\s+0\s+'$EUID'\s+1$' <<<"$output"
++	fi
++
++	# ... as well as the timens offsets.
++	runc exec attached_ctr cat /proc/self/timens_offsets
++	grep -E '^monotonic\s+7881\s+2718281$' <<<"$output"
++	grep -E '^boottime\s+1337\s+3141519$' <<<"$output"
++}
+diff --git a/tests/integration/timens.bats b/tests/integration/timens.bats
+index e0d21d55..fb33e2b2 100644
+--- a/tests/integration/timens.bats
++++ b/tests/integration/timens.bats
+@@ -53,3 +53,25 @@ function teardown() {
+ 	grep -E '^monotonic\s+7881\s+2718281$' <<<"$output"
+ 	grep -E '^boottime\s+1337\s+3141519$' <<<"$output"
+ }
++
++@test "runc run [simple timens + userns]" {
++	requires root
++	requires timens
++
++	update_config ' .linux.namespaces += [{"type": "user"}]
++		| .linux.uidMappings += [{"hostID": 100000, "containerID": 0, "size": 65534}]
++		| .linux.gidMappings += [{"hostID": 200000, "containerID": 0, "size": 65534}] '
++	remap_rootfs
++
++	update_config '.process.args = ["cat", "/proc/self/timens_offsets"]'
++	update_config '.linux.namespaces += [{"type": "time"}]
++		| .linux.timeOffsets = {
++			"monotonic": { "secs": 7881, "nanosecs": 2718281 },
++			"boottime": { "secs": 1337, "nanosecs": 3141519 }
++		}'
++
++	runc run test_busybox
++	[ "$status" -eq 0 ]
++	grep -E '^monotonic\s+7881\s+2718281$' <<<"$output"
++	grep -E '^boottime\s+1337\s+3141519$' <<<"$output"
++}
+diff --git a/tests/integration/userns.bats b/tests/integration/userns.bats
+index d52444ca..2094cbf1 100644
+--- a/tests/integration/userns.bats
++++ b/tests/integration/userns.bats
+@@ -12,18 +12,28 @@ function setup() {
+ 	# Permissions only to the owner, it is inaccessible to group/others
+ 	chmod 700 source-inaccessible-{1,2}
+ 
+-	mkdir -p rootfs/{proc,sys,tmp}
+ 	mkdir -p rootfs/tmp/mount-{1,2}
+ 
++	to_umount_list="$(mktemp "$BATS_RUN_TMPDIR/userns-mounts.XXXXXX")"
+ 	if [ $EUID -eq 0 ]; then
+ 		update_config ' .linux.namespaces += [{"type": "user"}]
+ 			| .linux.uidMappings += [{"hostID": 100000, "containerID": 0, "size": 65534}]
+-			| .linux.gidMappings += [{"hostID": 100000, "containerID": 0, "size": 65534}] '
++			| .linux.gidMappings += [{"hostID": 200000, "containerID": 0, "size": 65534}] '
++		remap_rootfs
+ 	fi
+ }
+ 
+ function teardown() {
+ 	teardown_bundle
++
++	if [ -v to_umount_list ]; then
++		while read -r mount_path; do
++			umount -l "$mount_path" || :
++			rm -f "$mount_path"
++		done <"$to_umount_list"
++		rm -f "$to_umount_list"
++		unset to_umount_list
++	fi
+ }
+ 
+ @test "userns with simple mount" {
+@@ -83,3 +93,74 @@ function teardown() {
+ 	runc exec test_busybox cat /sys/fs/cgroup/{pids,memory}/tasks
+ 	[ "$status" -eq 0 ]
+ }
++
++@test "userns join other container userns" {
++	# Create a detached container with the id-mapping we want.
++	update_config '.process.args = ["sleep", "infinity"]'
++	runc run -d --console-socket "$CONSOLE_SOCKET" target_userns
++	[ "$status" -eq 0 ]
++
++	# Configure our container to attach to the first container's userns.
++	target_pid="$(__runc state target_userns | jq .pid)"
++	update_config '.linux.namespaces |= map(if .type == "user" then (.path = "/proc/'"$target_pid"'/ns/" + .type) else . end)
++		| del(.linux.uidMappings)
++		| del(.linux.gidMappings)'
++	runc run -d --console-socket "$CONSOLE_SOCKET" in_userns
++	[ "$status" -eq 0 ]
++
++	runc exec in_userns cat /proc/self/uid_map
++	[ "$status" -eq 0 ]
++	if [ $EUID -eq 0 ]; then
++		grep -E '^\s+0\s+100000\s+65534$' <<<"$output"
++	else
++		grep -E '^\s+0\s+'$EUID'\s+1$' <<<"$output"
++	fi
++
++	runc exec in_userns cat /proc/self/gid_map
++	[ "$status" -eq 0 ]
++	if [ $EUID -eq 0 ]; then
++		grep -E '^\s+0\s+200000\s+65534$' <<<"$output"
++	else
++		grep -E '^\s+0\s+'$EUID'\s+1$' <<<"$output"
++	fi
++}
++
++@test "userns join other container userns [bind-mounted nsfd]" {
++	requires root
++
++	# Create a detached container with the id-mapping we want.
++	update_config '.process.args = ["sleep", "infinity"]'
++	runc run -d --console-socket "$CONSOLE_SOCKET" target_userns
++	[ "$status" -eq 0 ]
++
++	# Bind-mount the first containers userns nsfd to a different path, to
++	# exercise the non-fast-path (where runc has to join the userns to get the
++	# mappings).
++	target_pid="$(__runc state target_userns | jq .pid)"
++	userns_path=$(mktemp "$BATS_RUN_TMPDIR/userns.XXXXXX")
++	mount --bind "/proc/$target_pid/ns/user" "$userns_path"
++	echo "$userns_path" >>"$to_umount_list"
++
++	# Configure our container to attach to the first container's userns.
++	update_config '.linux.namespaces |= map(if .type == "user" then (.path = "'"$userns_path"'") else . end)
++		| del(.linux.uidMappings)
++		| del(.linux.gidMappings)'
++	runc run -d --console-socket "$CONSOLE_SOCKET" in_userns
++	[ "$status" -eq 0 ]
++
++	runc exec in_userns cat /proc/self/uid_map
++	[ "$status" -eq 0 ]
++	if [ $EUID -eq 0 ]; then
++		grep -E '^\s+0\s+100000\s+65534$' <<<"$output"
++	else
++		grep -E '^\s+0\s+'$EUID'\s+1$' <<<"$output"
++	fi
++
++	runc exec in_userns cat /proc/self/gid_map
++	[ "$status" -eq 0 ]
++	if [ $EUID -eq 0 ]; then
++		grep -E '^\s+0\s+200000\s+65534$' <<<"$output"
++	else
++		grep -E '^\s+0\s+'$EUID'\s+1$' <<<"$output"
++	fi
++}

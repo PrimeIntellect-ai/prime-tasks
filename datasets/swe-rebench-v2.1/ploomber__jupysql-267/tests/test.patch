@@ -1,0 +1,350 @@
+diff --git a/src/tests/test_run.py b/src/tests/test_run.py
+new file mode 100644
+index 0000000..111e037
+--- /dev/null
++++ b/src/tests/test_run.py
+@@ -0,0 +1,344 @@
++import importlib
++import logging
++import sqlite3
++from unittest.mock import Mock
++
++import pandas
++import polars
++import pytest
++
++from sql.connection import Connection
++
++run_module = importlib.import_module("sql.run")
++run = run_module.run
++
++
++@pytest.fixture
++def mock_conns():
++    Connection.name = str()
++    Connection.dialect = "postgres"
++    return Connection
++
++
++@pytest.fixture
++def mock_config():
++    class Config:
++        autopandas = None
++        autopolars = None
++        autocommit = True
++        feedback = True
++        autolimit = None
++        style = "DEFAULT"
++        displaylimit = None
++
++    return Config
++
++
++@pytest.fixture
++def config_pandas(mock_config):
++    mock_config.autopandas = True
++    mock_config.autopolars = False
++
++    return mock_config
++
++
++@pytest.fixture
++def config_polars(mock_config):
++    mock_config.autopandas = False
++    mock_config.autopolars = True
++
++    return mock_config
++
++
++@pytest.fixture
++def mock_resultset():
++    class ResultSet:
++        def __init__(self, *args, **kwargs):
++            ...
++
++        @classmethod
++        def DataFrame(cls):
++            return pandas.DataFrame()
++
++        @classmethod
++        def PolarsDataFrame(cls):
++            return polars.DataFrame()
++
++    return ResultSet
++
++
++def _make_conn(dialect="sqlite", rowcount=1, returns_rows=False):
++    """Build a fake connection whose session returns a fake result."""
++    result = Mock()
++    result.returns_rows = returns_rows
++    result.rowcount = rowcount
++
++    session = Mock()
++    session.execute.return_value = result
++
++    conn = Mock()
++    conn.dialect = dialect
++    conn.session = session
++    conn.name = "test"
++    return conn, session
++
++
++@pytest.mark.parametrize(
++    "dialect",
++    [
++        "postgres",
++        "redshift",
++    ],
++)
++def test_is_postgres_or_redshift(dialect):
++    assert run_module.is_postgres_or_redshift(dialect) is True
++
++
++def test_is_not_postgres_or_redshift():
++    assert run_module.is_postgres_or_redshift("mysql") is False
++
++
++def test_handle_postgres_special_executes_command(monkeypatch):
++    class Cursor:
++        rowcount = 1
++
++        def fetchall(self):
++            return [("table_a",)]
++
++        def fetchmany(self, size):
++            return [("table_a",)]
++
++    cursor = Cursor()
++    conn = Mock()
++    conn.session.connection.cursor.return_value = cursor
++    executed = []
++
++    class Special:
++        def execute(self, supplied_cursor, statement):
++            executed.append((supplied_cursor, statement))
++            return [(None, cursor, ["name"], None)]
++
++    monkeypatch.setattr(run_module, "PGSpecial", Special)
++    run_module.handle_postgres_special(conn, "\\dt")
++
++    assert any(
++        supplied_cursor is cursor and statement == "\\dt"
++        for supplied_cursor, statement in executed
++    )
++
++
++def test_handle_postgres_special_raises_when_unavailable(mock_conns):
++    with pytest.raises(ImportError):
++        run_module.handle_postgres_special(mock_conns, "\\")
++
++
++def test_set_autocommit(mock_conns, mock_config, caplog):
++    caplog.set_level(logging.DEBUG)
++    output = run_module.set_autocommit(mock_conns, mock_config)
++    assert any(
++        "The database driver doesn't support such " in record.getMessage()
++        for record in caplog.records
++    )
++    assert output is True
++
++
++def test_set_autocommit_disabled(mock_config):
++    mock_config.autocommit = False
++    conn = Mock()
++    assert run_module.set_autocommit(conn, mock_config) is False
++
++
++def test_set_autocommit_success(mock_config):
++    mock_config.autocommit = True
++    conn = Mock()
++    assert run_module.set_autocommit(conn, mock_config) is False
++
++
++def test_select_df_type_is_pandas(config_pandas, mock_resultset):
++    output = run_module.select_df_type(mock_resultset, config_pandas)
++    assert isinstance(output, pandas.DataFrame)
++
++
++def test_select_df_type_is_polars(config_polars, mock_resultset):
++    output = run_module.select_df_type(mock_resultset, config_polars)
++    assert isinstance(output, polars.DataFrame)
++
++
++def test_select_df_type_is_resultset(mock_config, mock_resultset):
++    mock_config.autopandas = False
++    mock_config.autopolars = False
++    output = run_module.select_df_type(mock_resultset, mock_config)
++    assert output is mock_resultset
++
++
++def test_select_df_type_prefers_pandas_when_both_enabled(mock_config, mock_resultset):
++    mock_config.autopandas = True
++    mock_config.autopolars = True
++
++    output = run_module.select_df_type(mock_resultset, mock_config)
++
++    assert isinstance(output, pandas.DataFrame)
++
++
++def test_sql_starts_with_begin(mock_conns, mock_config):
++    with pytest.raises(ValueError, match="does not support transactions"):
++        run(mock_conns, "BEGIN", mock_config)
++
++
++def test_sql_is_empty(mock_conns, mock_config):
++    assert run(mock_conns, "  ", mock_config) == "Connected: %s" % mock_conns.name
++
++
++def test_run_executes_sql(mock_config):
++    mock_config.autocommit = False
++    mock_config.feedback = False
++    mock_config.autopandas = False
++    mock_config.autopolars = False
++
++    conn, session = _make_conn()
++
++    run(conn, "SELECT 1", mock_config)
++
++    session.execute.assert_called_once()
++    assert "SELECT 1" in str(session.execute.call_args[0][0])
++
++
++def test_run_returns_dataframe(mock_config):
++    mock_config.autocommit = False
++    mock_config.feedback = False
++    mock_config.autopandas = True
++    mock_config.autopolars = False
++
++    conn, _ = _make_conn()
++
++    output = run(conn, "SELECT 1", mock_config)
++
++    assert isinstance(output, pandas.DataFrame)
++
++
++def test_run_returns_result_for_last_statement(mock_config):
++    class Result:
++        returns_rows = True
++        rowcount = 1
++
++        def __init__(self, value):
++            self.value = value
++
++        def keys(self):
++            return ["value"]
++
++        def fetchall(self):
++            return [(self.value,)]
++
++    first_result = Result("first")
++    last_result = Result("last")
++    mock_config.autocommit = False
++    mock_config.feedback = False
++    mock_config.autopandas = False
++    mock_config.autopolars = False
++    mock_config.style = "_deprecated_default"
++    conn, session = _make_conn()
++    session.execute.side_effect = [first_result, last_result]
++
++    output = run(conn, "SELECT 'first'; SELECT 'last'", mock_config)
++
++    assert list(output) == [("last",)]
++
++
++def test_run_returns_resultset(mock_config):
++    from sql.run import ResultSet
++
++    mock_config.autocommit = False
++    mock_config.feedback = False
++    mock_config.autopandas = False
++    mock_config.autopolars = False
++
++    conn, _ = _make_conn()
++
++    output = run(conn, "SELECT 1", mock_config)
++
++    assert isinstance(output, ResultSet)
++
++
++def test_run_prints_feedback(mock_config, capsys):
++    mock_config.autocommit = False
++    mock_config.feedback = True
++    mock_config.autopandas = False
++    mock_config.autopolars = False
++
++    conn, _ = _make_conn(rowcount=3)
++
++    run(conn, "SELECT 1; SELECT 2", mock_config)
++
++    captured = capsys.readouterr()
++    assert captured.out.count("3 rows affected.") == 2
++
++
++def test_run_postgres_special_import_error(mock_conns, mock_config):
++    with pytest.raises(ImportError):
++        run(mock_conns, "\\", mock_config)
++
++
++def test_interpret_rowcount():
++    assert run_module.interpret_rowcount(-1) == "Done."
++    assert run_module.interpret_rowcount(-2) == "Done."
++    assert run_module.interpret_rowcount(1) == "%d rows affected." % 1
++
++
++def test_run_commits_statement_changes(mock_config, tmp_path):
++    database = tmp_path / "commit-check.sqlite"
++    db_connection = sqlite3.connect(database)
++    db_connection.execute("CREATE TABLE records (value INTEGER)")
++    db_connection.commit()
++
++    class Result:
++        returns_rows = False
++        rowcount = 1
++
++    class Session:
++        def execution_options(self, **kwargs):
++            raise NotImplementedError("AUTOCOMMIT is unavailable")
++
++        def __init__(self):
++            self.insert_count = 0
++            self.visible_before_next_statement = []
++
++        def commit(self):
++            db_connection.commit()
++
++        def execute(self, statement):
++            sql_statement = str(statement)
++            if sql_statement.startswith("INSERT"):
++                if self.insert_count:
++                    with sqlite3.connect(database) as observer:
++                        self.visible_before_next_statement.append(
++                            observer.execute(
++                                "SELECT COUNT(*) FROM records"
++                            ).fetchone()[0]
++                        )
++                self.insert_count += 1
++            db_connection.execute(sql_statement)
++            return Result()
++
++    conn = Mock()
++    conn.name = "sqlite-test"
++    conn.dialect = "sqlite"
++    conn.session = Session()
++    mock_config.autocommit = True
++    mock_config.feedback = False
++    mock_config.autopandas = False
++    mock_config.autopolars = False
++
++    run(
++        conn,
++        "INSERT INTO records VALUES (1); INSERT INTO records VALUES (2)",
++        mock_config,
++    )
++
++    with sqlite3.connect(database) as observer:
++        assert (
++            observer.execute("SELECT value FROM records ORDER BY value").fetchall()
++            == [(1,), (2,)]
++        )
++    assert conn.session.visible_before_next_statement == [1]
++    db_connection.close()

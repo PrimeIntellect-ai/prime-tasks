@@ -1,0 +1,222 @@
+diff --git a/conn_test.go b/conn_test.go
+index 7a1b0c4..c86b0a3 100644
+--- a/conn_test.go
++++ b/conn_test.go
+@@ -1,16 +1,17 @@
+ // Copyright (c) 2012 The gocql Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
++//go:build all || unit
+ // +build all unit
+ 
+ package gocql
+ 
+ import (
+-	"bufio"
+ 	"bytes"
+ 	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+@@ -22,8 +23,6 @@ import (
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+-
+-	"github.com/gocql/gocql/internal/streams"
+ )
+ 
+ const (
+@@ -285,6 +284,116 @@ func TestTimeout(t *testing.T) {
+ 	wg.Wait()
+ }
+ 
++func TestConcurrentPreparedQueryCancellationIsIsolated(t *testing.T) {
++	srv := NewTestServer(t, defaultProto, context.Background())
++	srv.prepareStarted = make(chan struct{}, 1)
++	srv.prepareDelay = 300 * time.Millisecond
++	defer srv.Stop()
++
++	db, err := testCluster(defaultProto, srv.Address).CreateSession()
++	if err != nil {
++		t.Fatalf("NewCluster: %v", err)
++	}
++	defer db.Close()
++
++	canceledCtx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	results := make(chan struct {
++		name string
++		err  error
++	}, 2)
++	statement := "INSERT INTO cancellation_test (value) VALUES (1)"
++
++	go func() {
++		results <- struct {
++			name string
++			err  error
++		}{name: "canceled", err: db.Query(statement).WithContext(canceledCtx).Exec()}
++	}()
++
++	select {
++	case <-srv.prepareStarted:
++	case <-time.After(5 * time.Second):
++		t.Fatal("timed out waiting for the statement to be prepared")
++	}
++
++	go func() {
++		results <- struct {
++			name string
++			err  error
++		}{name: "active", err: db.Query(statement).WithContext(context.Background()).Exec()}
++	}()
++	time.Sleep(20 * time.Millisecond)
++	cancel()
++
++	var canceledErr, activeErr error
++	for i := 0; i < 2; i++ {
++		result := <-results
++		if result.name == "canceled" {
++			canceledErr = result.err
++		} else {
++			activeErr = result.err
++		}
++	}
++	if !errors.Is(canceledErr, context.Canceled) {
++		t.Errorf("canceled query returned %v, want %v", canceledErr, context.Canceled)
++	}
++	if activeErr != nil {
++		t.Errorf("query with an independent context failed: %v", activeErr)
++	}
++}
++
++func TestPreCanceledPreparedQueryDoesNotCancelConcurrentQuery(t *testing.T) {
++	srv := NewTestServer(t, defaultProto, context.Background())
++	srv.prepareStarted = make(chan struct{}, 1)
++	srv.prepareDelay = 300 * time.Millisecond
++	defer srv.Stop()
++
++	db, err := testCluster(defaultProto, srv.Address).CreateSession()
++	if err != nil {
++		t.Fatalf("NewCluster: %v", err)
++	}
++	defer db.Close()
++
++	canceledCtx, cancel := context.WithCancel(context.Background())
++	cancel()
++	results := make(chan struct {
++		name string
++		err  error
++	}, 2)
++	statement := "INSERT INTO cancellation_test (value) VALUES (1)"
++
++	go func() {
++		results <- struct {
++			name string
++			err  error
++		}{name: "active", err: db.Query(statement).WithContext(context.Background()).Exec()}
++	}()
++
++	go func() {
++		results <- struct {
++			name string
++			err  error
++		}{name: "canceled", err: db.Query(statement).WithContext(canceledCtx).Exec()}
++	}()
++
++	var canceledErr, activeErr error
++	for i := 0; i < 2; i++ {
++		result := <-results
++		if result.name == "canceled" {
++			canceledErr = result.err
++		} else {
++			activeErr = result.err
++		}
++	}
++	if !errors.Is(canceledErr, context.Canceled) {
++		t.Errorf("pre-canceled query returned %v, want %v", canceledErr, context.Canceled)
++	}
++	if activeErr != nil {
++		t.Errorf("query with an independent context failed: %v", activeErr)
++	}
++}
++
+ func TestCancel(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+@@ -755,32 +864,6 @@ func TestQueryTimeoutClose(t *testing.T) {
+ 	}
+ }
+ 
+-func TestStream0(t *testing.T) {
+-	// TODO: replace this with type check
+-	const expErr = "gocql: received unexpected frame on stream 0"
+-
+-	var buf bytes.Buffer
+-	f := newFramer(nil, &buf, nil, protoVersion4)
+-	f.writeHeader(0, opResult, 0)
+-	f.writeInt(resultKindVoid)
+-	f.wbuf[0] |= 0x80
+-	if err := f.finishWrite(); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	conn := &Conn{
+-		r:       bufio.NewReader(&buf),
+-		streams: streams.New(protoVersion4),
+-	}
+-
+-	err := conn.recv()
+-	if err == nil {
+-		t.Fatal("expected to get an error on stream 0")
+-	} else if !strings.HasPrefix(err.Error(), expErr) {
+-		t.Fatalf("expected to get error prefix %q got %q", expErr, err.Error())
+-	}
+-}
+-
+ func TestContext_Timeout(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+@@ -1107,6 +1190,9 @@ type TestServer struct {
+ 	quit   chan struct{}
+ 	mu     sync.Mutex
+ 	closed bool
++
++	prepareDelay   time.Duration
++	prepareStarted chan struct{}
+ }
+ 
+ func (srv *TestServer) session() (*Session, error) {
+@@ -1198,6 +1284,29 @@ func (srv *TestServer) process(f *framer) {
+ 	}
+ 
+ 	switch head.op {
++	case opPrepare:
++		if srv.prepareStarted != nil {
++			select {
++			case srv.prepareStarted <- struct{}{}:
++			default:
++			}
++		}
++		if srv.prepareDelay > 0 {
++			time.Sleep(srv.prepareDelay)
++		}
++		f.writeHeader(0, opResult, head.stream)
++		f.writeInt(resultKindPrepared)
++		f.writeShortBytes([]byte("test-prepared-id"))
++		f.writeInt(0) // prepared metadata flags
++		f.writeInt(0) // bound column count
++		if srv.protocol >= byte(protoVersion4) {
++			f.writeInt(0) // partition key count
++		}
++		f.writeInt(0) // result metadata flags
++		f.writeInt(0) // result column count
++	case opExecute:
++		f.writeHeader(0, opResult, head.stream)
++		f.writeInt(resultKindVoid)
+ 	case opStartup:
+ 		if atomic.LoadInt32(&srv.TimeoutOnStartup) > 0 {
+ 			// Do not respond to startup command

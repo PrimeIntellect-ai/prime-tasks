@@ -1,0 +1,118 @@
+diff --git a/tests/test_websocket_writer.py b/tests/test_websocket_writer.py
+index 82bed546..deafdcb8 100644
+--- a/tests/test_websocket_writer.py
++++ b/tests/test_websocket_writer.py
+@@ -1,11 +1,15 @@
+ # type: ignore
++import asyncio
+ import random
+-from typing import Any
++import zlib
++from typing import Any, Callable
+ from unittest import mock
+ 
+ import pytest
+ 
+-from aiohttp.http import WebSocketWriter
++from aiohttp import DataQueue, WSMessage
++from aiohttp.compression_utils import ZLibCompressor
++from aiohttp.http import WebSocketReader, WebSocketWriter
+ from aiohttp.test_utils import make_mocked_coro
+ 
+ 
+@@ -106,3 +110,95 @@ async def test_send_compress_text_per_message(protocol: Any, transport: Any) ->
+     writer.transport.write.assert_called_with(b"\x81\x04text")
+     await writer.send(b"text", compress=15)
+     writer.transport.write.assert_called_with(b"\xc1\x06*I\xad(\x01\x00")
++
++
++@pytest.mark.parametrize(
++    ("max_sync_chunk_size", "payload_point_generator"),
++    (
++        (16, lambda count: count),
++        (4096, lambda count: count),
++        (32, lambda count: 64 + count if count % 2 else count),
++    ),
++)
++async def test_concurrent_messages(
++    protocol: Any,
++    transport: Any,
++    max_sync_chunk_size: int,
++    payload_point_generator: Callable[[int], int],
++) -> None:
++    """Ensure messages are compressed correctly when there are multiple concurrent writers.
++
++    This test generates is parametrized to
++
++    - Generate messages that are larger than patch
++      WEBSOCKET_MAX_SYNC_CHUNK_SIZE of 16
++      where compression will run in the executor
++
++    - Generate messages that are smaller than patch
++      WEBSOCKET_MAX_SYNC_CHUNK_SIZE of 4096
++      where compression will run in the event loop
++
++    - Interleave generated messages with a
++      WEBSOCKET_MAX_SYNC_CHUNK_SIZE of 32
++      where compression will run in the event loop
++      and in the executor
++    """
++    with mock.patch(
++        "aiohttp.http_websocket.WEBSOCKET_MAX_SYNC_CHUNK_SIZE", max_sync_chunk_size
++    ):
++        writer = WebSocketWriter(protocol, transport, compress=15)
++        queue: DataQueue[WSMessage] = DataQueue(asyncio.get_running_loop())
++        reader = WebSocketReader(queue, 50000)
++        writers = []
++        payloads = []
++        for count in range(1, 64 + 1):
++            point = payload_point_generator(count)
++            payload = bytes((point,)) * point
++            payloads.append(payload)
++            writers.append(writer.send(payload, binary=True))
++        await asyncio.gather(*writers)
++
++    received = []
++    for call in writer.transport.write.call_args_list:
++        call_bytes = call[0][0]
++        result, _ = reader.feed_data(call_bytes)
++        assert result is False
++        msg = await queue.read()
++        received.append(msg.data)
++
++    # Every payload must be delivered exactly once and unchanged.  If the
++    # shared compressor mixes up concurrent frames, the decoded messages
++    # will not match the payloads that were sent.
++    assert len(received) == len(payloads)
++    assert sorted(received) == sorted(payloads)
++
++
++async def test_shared_compressor_concurrent_compress() -> None:
++    """A single ZLibCompressor shared by concurrent coroutines must not mix data.
++
++    This mirrors the reproduction from the issue: one compressor instance is
++    used by several coroutines at the same time.  Each coroutine compresses a
++    distinct payload and flushes it; the resulting frames must each decode
++    back to their own payload.
++    """
++    compressobj = ZLibCompressor(
++        level=zlib.Z_BEST_SPEED,
++        wbits=-15,
++        max_sync_chunk_size=5 * 1024,
++    )
++    rnd = random.Random(1234)
++    payloads = [
++        bytes(rnd.randrange(256) for _ in range(20000 + i * 1000))
++        for i in range(10)
++    ]
++
++    async def compress_one(payload: bytes) -> bytes:
++        compressed = await compressobj.compress(payload)
++        compressed += compressobj.flush(zlib.Z_SYNC_FLUSH)
++        return compressed
++
++    messages = await asyncio.gather(*(compress_one(p) for p in payloads))
++
++    for payload, message in zip(payloads, messages):
++        decompressor = zlib.decompressobj(wbits=-15)
++        assert decompressor.decompress(message) == payload

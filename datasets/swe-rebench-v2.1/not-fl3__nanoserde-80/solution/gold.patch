@@ -1,0 +1,199 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c57e45b..3cb711f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "nanoserde"
+-version = "0.1.34"
++version = "0.1.36"
+ authors = ["makepad <info@makepad.nl>", "Fedor <not.fl3@gmail.com>"]
+ license = "MIT OR Apache-2.0"
+ description = """
+diff --git a/src/serde_bin.rs b/src/serde_bin.rs
+index d82d6b6..1b12b84 100644
+--- a/src/serde_bin.rs
++++ b/src/serde_bin.rs
+@@ -402,14 +402,32 @@ where
+     T: DeBin,
+ {
+     fn de_bin(o: &mut usize, d: &[u8]) -> Result<Self, DeBinErr> {
+-        unsafe {
+-            let mut to = core::mem::MaybeUninit::<[T; N]>::uninit();
+-            let top: *mut T = core::mem::transmute(&mut to);
+-            for c in 0..N {
+-                top.add(c).write(DeBin::de_bin(o, d)?);
++        use core::mem::MaybeUninit;
++
++        // waiting for uninit_array(or for array::try_from_fn) stabilization
++        // https://github.com/rust-lang/rust/issues/96097
++        // https://github.com/rust-lang/rust/issues/89379
++        let mut to: [MaybeUninit<T>; N] =
++            unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
++
++        for index in 0..N {
++            to[index] = match DeBin::de_bin(o, d) {
++                Ok(v) => MaybeUninit::new(v),
++                Err(e) => {
++                    // drop all the MaybeUninit values which we've already
++                    // successfully deserialized so we don't leak memory.
++                    // See https://github.com/not-fl3/nanoserde/issues/79
++                    for (_, to_drop) in (0..index).zip(to) {
++                        unsafe { to_drop.assume_init() };
++                    }
++                    return Err(e);
++                }
+             }
+-            Ok(to.assume_init())
+         }
++
++        // waiting for array_assume_init or core::array::map optimizations
++        // https://github.com/rust-lang/rust/issues/61956
++        Ok(unsafe { (&*(&to as *const _ as *const MaybeUninit<_>)).assume_init_read() })
+     }
+ }
+ 
+diff --git a/src/serde_json.rs b/src/serde_json.rs
+index 6bff6f3..9a1775b 100644
+--- a/src/serde_json.rs
++++ b/src/serde_json.rs
+@@ -999,31 +999,42 @@ where
+     T: DeJson,
+ {
+     fn de_json(o: &mut DeJsonState, d: &mut Chars) -> Result<Self, DeJsonErr> {
+-        unsafe {
+-            let mut to = core::mem::MaybeUninit::<[T; N]>::uninit();
+-            let top: *mut T = core::mem::transmute(&mut to);
+-            de_json_array_impl_inner(top, N, o, d)?;
+-            Ok(to.assume_init())
++        use core::mem::MaybeUninit;
++
++        // waiting for uninit_array(or for array::try_from_fn) stabilization
++        // https://github.com/rust-lang/rust/issues/96097
++        // https://github.com/rust-lang/rust/issues/89379
++        let mut to: [MaybeUninit<T>; N] =
++            unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
++        o.block_open(d)?;
++
++        for index in 0..N {
++            to[index] = match DeJson::de_json(o, d).and_then(|ret| {
++                o.eat_comma_block(d)?;
++                Ok(ret)
++            }) {
++                Ok(v) => MaybeUninit::new(v),
++                Err(e) => {
++                    // drop all the MaybeUninit values which we've already
++                    // successfully deserialized so we don't leak memory.
++                    // See https://github.com/not-fl3/nanoserde/issues/79
++                    for (_, to_drop) in (0..index).zip(to) {
++                        unsafe { to_drop.assume_init() };
++                    }
++                    return Err(e);
++                }
++            }
+         }
+-    }
+-}
+ 
+-unsafe fn de_json_array_impl_inner<T>(
+-    top: *mut T,
+-    count: usize,
+-    s: &mut DeJsonState,
+-    i: &mut Chars,
+-) -> Result<(), DeJsonErr>
+-where
+-    T: DeJson,
+-{
+-    s.block_open(i)?;
+-    for c in 0..count {
+-        top.add(c).write(DeJson::de_json(s, i)?);
+-        s.eat_comma_block(i)?;
++        // waiting for array_assume_init or core::array::map optimizations
++        // https://github.com/rust-lang/rust/issues/61956
++        // initializing before block close so that drop will run automatically if err encountered there
++        let initialized =
++            unsafe { (&*(&to as *const _ as *const MaybeUninit<_>)).assume_init_read() };
++        o.block_close(d)?;
++
++        Ok(initialized)
+     }
+-    s.block_close(i)?;
+-    Ok(())
+ }
+ 
+ fn de_json_comma_block<T>(s: &mut DeJsonState, i: &mut Chars) -> Result<T, DeJsonErr>
+diff --git a/src/serde_ron.rs b/src/serde_ron.rs
+index c768545..71d349a 100644
+--- a/src/serde_ron.rs
++++ b/src/serde_ron.rs
+@@ -1021,35 +1021,46 @@ where
+     }
+ }
+ 
+-unsafe fn de_ron_array_impl_inner<T>(
+-    top: *mut T,
+-    count: usize,
+-    s: &mut DeRonState,
+-    i: &mut Chars,
+-) -> Result<(), DeRonErr>
+-where
+-    T: DeRon,
+-{
+-    s.paren_open(i)?;
+-    for c in 0..count {
+-        top.add(c).write(DeRon::de_ron(s, i)?);
+-        s.eat_comma_paren(i)?;
+-    }
+-    s.paren_close(i)?;
+-    Ok(())
+-}
+-
+ impl<T, const N: usize> DeRon for [T; N]
+ where
+     T: DeRon,
+ {
+-    fn de_ron(s: &mut DeRonState, i: &mut Chars) -> Result<Self, DeRonErr> {
+-        unsafe {
+-            let mut to = core::mem::MaybeUninit::<[T; N]>::uninit();
+-            let top: *mut T = core::mem::transmute(&mut to);
+-            de_ron_array_impl_inner(top, N, s, i)?;
+-            Ok(to.assume_init())
++    fn de_ron(o: &mut DeRonState, d: &mut Chars) -> Result<Self, DeRonErr> {
++        use core::mem::MaybeUninit;
++
++        // waiting for uninit_array(or for array::try_from_fn) stabilization
++        // https://github.com/rust-lang/rust/issues/96097
++        // https://github.com/rust-lang/rust/issues/89379
++        let mut to: [MaybeUninit<T>; N] =
++            unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
++        o.paren_open(d)?;
++
++        for index in 0..N {
++            to[index] = match DeRon::de_ron(o, d).and_then(|ret| {
++                o.eat_comma_paren(d)?;
++                Ok(ret)
++            }) {
++                Ok(v) => MaybeUninit::new(v),
++                Err(e) => {
++                    // drop all the MaybeUninit values which we've already
++                    // successfully deserialized so we don't leak memory.
++                    // See https://github.com/not-fl3/nanoserde/issues/79
++                    for (_, to_drop) in (0..index).zip(to) {
++                        unsafe { to_drop.assume_init() };
++                    }
++                    return Err(e);
++                }
++            }
+         }
++
++        // waiting for array_assume_init or core::array::map optimizations
++        // https://github.com/rust-lang/rust/issues/61956
++        // initializing before block close so that drop will run automatically if err encountered there
++        let initialized =
++            unsafe { (&*(&to as *const _ as *const MaybeUninit<_>)).assume_init_read() };
++        o.paren_close(d)?;
++
++        Ok(initialized)
+     }
+ }
+ 

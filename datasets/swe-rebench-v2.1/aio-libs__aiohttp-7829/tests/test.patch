@@ -1,0 +1,188 @@
+diff --git a/tests/test_urldispatch.py b/tests/test_urldispatch.py
+index 5f5687ea..adb1e52e 100644
+--- a/tests/test_urldispatch.py
++++ b/tests/test_urldispatch.py
+@@ -1264,10 +1264,17 @@ async def test_prefixed_subapp_overlap(app: Any) -> None:
+     subapp2.router.add_get("/b", handler2)
+     app.add_subapp("/ss", subapp2)
+ 
++    subapp3 = web.Application()
++    handler3 = make_handler()
++    subapp3.router.add_get("/c", handler3)
++    app.add_subapp("/s/s", subapp3)
++
+     match_info = await app.router.resolve(make_mocked_request("GET", "/s/a"))
+     assert match_info.route.handler is handler1
+     match_info = await app.router.resolve(make_mocked_request("GET", "/ss/b"))
+     assert match_info.route.handler is handler2
++    match_info = await app.router.resolve(make_mocked_request("GET", "/s/s/c"))
++    assert match_info.route.handler is handler3
+ 
+ 
+ async def test_prefixed_subapp_empty_route(app: Any) -> None:
+diff --git a/tests/test_web_urldispatcher.py b/tests/test_web_urldispatcher.py
+index 79bd42a3..aa404d4e 100644
+--- a/tests/test_web_urldispatcher.py
++++ b/tests/test_web_urldispatcher.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import functools
+ import pathlib
++import time
+ from typing import Optional
+ from unittest import mock
+ from unittest.mock import MagicMock
+@@ -10,7 +11,7 @@ import yarl
+ 
+ from aiohttp import web
+ from aiohttp.pytest_plugin import AiohttpClient
+-from aiohttp.web_urldispatcher import SystemRoute
++from aiohttp.web_urldispatcher import SystemRoute, UrlDispatcher
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -544,3 +545,144 @@ async def test_decoded_url_match(
+     r = await client.get(yarl.URL(urlencoded_path, encoded=True))
+     assert r.status == expected_http_resp_status
+     await r.release()
++
++
++async def test_order_is_preserved(aiohttp_client: AiohttpClient) -> None:
++    """Test route order is preserved.
++
++    Note that fixed/static paths are always preferred over a regex path.
++    """
++    app = web.Application()
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(text=request.match_info.route.resource.canonical)
++
++    app.router.add_get("/first/x/{b}/", handler)
++    app.router.add_get(r"/first/{x:.*/b}", handler)
++
++    app.router.add_get(r"/second/{user}/info", handler)
++    app.router.add_get("/second/bob/info", handler)
++
++    app.router.add_get("/third/bob/info", handler)
++    app.router.add_get(r"/third/{user}/info", handler)
++
++    app.router.add_get(r"/forth/{name:\d+}", handler)
++    app.router.add_get("/forth/42", handler)
++
++    app.router.add_get("/fifth/42", handler)
++    app.router.add_get(r"/fifth/{name:\d+}", handler)
++
++    client = await aiohttp_client(app)
++
++    r = await client.get("/first/x/b/")
++    assert r.status == 200
++    assert await r.text() == "/first/x/{b}/"
++
++    r = await client.get("/second/frank/info")
++    assert r.status == 200
++    assert await r.text() == "/second/{user}/info"
++
++    # Fixed/static paths are always preferred over regex paths
++    r = await client.get("/second/bob/info")
++    assert r.status == 200
++    assert await r.text() == "/second/bob/info"
++
++    r = await client.get("/third/bob/info")
++    assert r.status == 200
++    assert await r.text() == "/third/bob/info"
++
++    r = await client.get("/third/frank/info")
++    assert r.status == 200
++    assert await r.text() == "/third/{user}/info"
++
++    r = await client.get("/forth/21")
++    assert r.status == 200
++    assert await r.text() == "/forth/{name}"
++
++    # Fixed/static paths are always preferred over regex paths
++    r = await client.get("/forth/42")
++    assert r.status == 200
++    assert await r.text() == "/forth/42"
++
++    r = await client.get("/fifth/21")
++    assert r.status == 200
++    assert await r.text() == "/fifth/{name}"
++
++    r = await client.get("/fifth/42")
++    assert r.status == 200
++    assert await r.text() == "/fifth/42"
++
++
++async def test_dynamic_route_precedence(aiohttp_client: AiohttpClient) -> None:
++    app = web.Application()
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(text=request.match_info.route.resource.canonical)
++
++    # The second route has a longer fixed prefix, so it takes precedence even
++    # though the first registered route also matches.
++    app.router.add_get("/a/{x}/c", handler)
++    app.router.add_get("/a/b/{y}", handler)
++
++    # Equal fixed prefixes are resolved in registration order.
++    app.router.add_get("/tie/{x}/c", handler)
++    app.router.add_get("/tie/{y}/c", handler)
++
++    client = await aiohttp_client(app)
++
++    response = await client.get("/a/b/c")
++    assert response.status == 200
++    assert await response.text() == "/a/b/{y}"
++
++    response = await client.get("/tie/value/c")
++    assert response.status == 200
++    assert await response.text() == "/tie/{x}/c"
++
++
++async def test_resolution_time_does_not_scale_with_route_count() -> None:
++    """Resolving a URL must not require scanning every registered route.
++
++    See https://github.com/aio-libs/aiohttp/issues/7828
++    """
++
++    def make_request(url: str) -> web.Request:
++        return web.Request(
++            MagicMock(url=yarl.URL(url), method="GET"),
++            MagicMock(),
++            protocol=MagicMock(),
++            host="example.com",
++            task=MagicMock(),
++            loop=asyncio.get_running_loop(),
++            payload_writer=MagicMock(),
++        )
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response()
++
++    async def measure(
++        dispatcher: UrlDispatcher, request: web.Request, times: int
++    ) -> float:
++        start = time.perf_counter()
++        for _ in range(times):
++            await dispatcher.resolve(request)
++        return time.perf_counter() - start
++
++    route_count = 5000
++    times = 1000
++
++    single = UrlDispatcher()
++    single.add_get("/static/sub/path0", handler)
++    single_request = make_request("/static/sub/path0")
++
++    many = UrlDispatcher()
++    for i in range(route_count):
++        many.add_get(f"/static/sub/path{i}", handler)
++    last_request = make_request(f"/static/sub/path{route_count - 1}")
++
++    single_time = min([await measure(single, single_request, times) for _ in range(3)])
++    many_time = min([await measure(many, last_request, times) for _ in range(3)])
++
++    # A linear scan makes resolving the last of many routes orders of
++    # magnitude slower than resolving a single route.  Indexed resolution
++    # keeps the cost proportional to the number of URL parts.
++    assert many_time < single_time * 50

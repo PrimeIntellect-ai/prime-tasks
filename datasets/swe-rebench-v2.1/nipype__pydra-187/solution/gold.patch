@@ -1,0 +1,231 @@
+diff --git a/pydra/engine/core.py b/pydra/engine/core.py
+index 11111396..697e7940 100644
+--- a/pydra/engine/core.py
++++ b/pydra/engine/core.py
+@@ -335,7 +335,7 @@ class TaskBase:
+             return [self._cache_dir / checksum for checksum in self.checksum_states()]
+         return self._cache_dir / self.checksum
+ 
+-    def __call__(self, submitter=None, plugin=None, **kwargs):
++    def __call__(self, submitter=None, plugin=None, rerun=False, **kwargs):
+         """Make tasks callable themselves."""
+         from .submitter import Submitter
+ 
+@@ -355,10 +355,10 @@ class TaskBase:
+                 raise NotImplementedError(
+                     "TODO: linear workflow execution - assign submitter or plugin for now"
+                 )
+-            res = self._run(**kwargs)
++            res = self._run(rerun=rerun, **kwargs)
+         return res
+ 
+-    def _run(self, **kwargs):
++    def _run(self, rerun=False, **kwargs):
+         self.inputs = attr.evolve(self.inputs, **kwargs)
+         self.inputs.check_fields_input_spec()
+         checksum = self.checksum
+@@ -367,9 +367,10 @@ class TaskBase:
+         self.hooks.pre_run(self)
+         # TODO add signal handler for processes killed after lock acquisition
+         with SoftFileLock(lockfile):
+-            result = self.result()
+-            if result is not None:
+-                return result
++            if not rerun:
++                result = self.result()
++                if result is not None:
++                    return result
+             # Let only one equivalent process run
+             odir = self.output_dir
+             if not self.can_resume and odir.exists():
+@@ -775,14 +776,15 @@ class Workflow(TaskBase):
+                     task.name, splitter=old_splitter, other_states=other_states
+                 )
+ 
+-    async def _run(self, submitter=None, **kwargs):
++    async def _run(self, submitter=None, rerun=False, **kwargs):
+         # self.inputs = dc.replace(self.inputs, **kwargs) don't need it?
+         checksum = self.checksum
+         lockfile = self.cache_dir / (checksum + ".lock")
+         # Eagerly retrieve cached
+-        result = self.result()
+-        if result is not None:
+-            return result
++        if not rerun:
++            result = self.result()
++            if result is not None:
++                return result
+         # creating connections that were defined after adding tasks to the wf
+         for task in self.graph.nodes:
+             self.create_connections(task)
+diff --git a/pydra/engine/helpers.py b/pydra/engine/helpers.py
+index f012fdfb..c46c5e29 100644
+--- a/pydra/engine/helpers.py
++++ b/pydra/engine/helpers.py
+@@ -348,7 +348,7 @@ def get_open_loop():
+     return loop
+ 
+ 
+-def create_pyscript(script_path, checksum):
++def create_pyscript(script_path, checksum, rerun=False):
+     """
+     Create standalone script for task execution in a different environment.
+ 
+@@ -378,7 +378,7 @@ task_pkl = (cache_path / "_task.pklz")
+ task = cp.loads(task_pkl.read_bytes())
+ 
+ # submit task
+-task()
++task(rerun={rerun})
+ 
+ if not task.result():
+     raise Exception("Something went wrong")
+diff --git a/pydra/engine/submitter.py b/pydra/engine/submitter.py
+index 077a36c0..4937169b 100644
+--- a/pydra/engine/submitter.py
++++ b/pydra/engine/submitter.py
+@@ -37,7 +37,7 @@ class Submitter:
+             raise Exception("plugin {} not available".format(self.plugin))
+         self.worker.loop = self.loop
+ 
+-    def __call__(self, runnable, cache_locations=None):
++    def __call__(self, runnable, cache_locations=None, rerun=False):
+         """Submit."""
+         if cache_locations is not None:
+             runnable.cache_locations = cache_locations
+@@ -51,23 +51,23 @@ class Submitter:
+                 nd.checksum for nd in runnable.graph_sorted
+             ]
+         if is_workflow(runnable) and runnable.state is None:
+-            self.loop.run_until_complete(self.submit_workflow(runnable))
++            self.loop.run_until_complete(self.submit_workflow(runnable, rerun=rerun))
+         else:
+-            self.loop.run_until_complete(self.submit(runnable, wait=True))
++            self.loop.run_until_complete(self.submit(runnable, wait=True, rerun=rerun))
+         if is_workflow(runnable):
+             # resetting all connections with LazyFields
+             runnable._reset()
+         return runnable.result()
+ 
+-    async def submit_workflow(self, workflow):
++    async def submit_workflow(self, workflow, rerun=False):
+         """Distribute or initiate workflow execution."""
+         if workflow.plugin and workflow.plugin != self.plugin:
+             # dj: this is not tested!!!
+-            await self.worker.run_el(workflow)
++            await self.worker.run_el(workflow, rerun=rerun)
+         else:
+-            await workflow._run(self)
++            await workflow._run(self, rerun=rerun)
+ 
+-    async def submit(self, runnable, wait=False):
++    async def submit(self, runnable, wait=False, rerun=False):
+         """
+         Coroutine entrypoint for task submission.
+ 
+@@ -104,16 +104,16 @@ class Submitter:
+                 )
+                 if is_workflow(runnable):
+                     # job has no state anymore
+-                    futures.add(self.submit_workflow(job))
++                    futures.add(self.submit_workflow(job, rerun=rerun))
+                 else:
+                     # tasks are submitted to worker for execution
+-                    futures.add(self.worker.run_el(job))
++                    futures.add(self.worker.run_el(job, rerun=rerun))
+         else:
+             if is_workflow(runnable):
+-                await self._run_workflow(runnable)
++                await self._run_workflow(runnable, rerun=rerun)
+             else:
+                 # submit task to worker
+-                futures.add(self.worker.run_el(runnable))
++                futures.add(self.worker.run_el(runnable, rerun=rerun))
+ 
+         if wait and futures:
+             # run coroutines concurrently and wait for execution
+@@ -123,7 +123,7 @@ class Submitter:
+         # pass along futures to be awaited independently
+         return futures
+ 
+-    async def _run_workflow(self, wf):
++    async def _run_workflow(self, wf, rerun=False):
+         """
+         Expand and execute a stateless :class:`~pydra.engine.core.Workflow`.
+ 
+@@ -155,9 +155,9 @@ class Submitter:
+                 # checksum has to be updated, so resetting
+                 task._checksum = None
+                 if is_workflow(task) and not task.state:
+-                    await self.submit_workflow(task)
++                    await self.submit_workflow(task, rerun=rerun)
+                 else:
+-                    for fut in await self.submit(task):
++                    for fut in await self.submit(task, rerun=rerun):
+                         task_futures.add(fut)
+             task_futures = await self.worker.fetch_finished(task_futures)
+         return wf
+diff --git a/pydra/engine/workers.py b/pydra/engine/workers.py
+index 589b059c..ff418b80 100644
+--- a/pydra/engine/workers.py
++++ b/pydra/engine/workers.py
+@@ -66,14 +66,14 @@ class DistributedWorker(Worker):
+         """Maximum number of concurrently running jobs."""
+         self._jobs = 0
+ 
+-    def _prepare_runscripts(self, task, interpreter="/bin/sh"):
++    def _prepare_runscripts(self, task, interpreter="/bin/sh", rerun=False):
+         script_dir = (
+             task.cache_dir / f"{self.__class__.__name__}_scripts" / task.checksum
+         )
+         script_dir.mkdir(parents=True, exist_ok=True)
+         if not (script_dir / "_task.pkl").exists():
+             save(script_dir, task=task)
+-        pyscript = create_pyscript(script_dir, task.checksum)
++        pyscript = create_pyscript(script_dir, task.checksum, rerun=rerun)
+         batchscript = script_dir / f"batchscript_{task.checksum}.sh"
+         bcmd = "\n".join(
+             (
+@@ -149,9 +149,9 @@ class SerialWorker(Worker):
+         logger.debug("Initialize SerialWorker")
+         self.pool = SerialPool()
+ 
+-    def run_el(self, interface, **kwargs):
++    def run_el(self, interface, rerun=False, **kwargs):
+         """Run a task."""
+-        self.pool.submit(interface=interface, **kwargs)
++        self.pool.submit(interface=interface, rerun=rerun, **kwargs)
+         return self.pool
+ 
+     def close(self):
+@@ -170,14 +170,14 @@ class ConcurrentFuturesWorker(Worker):
+         # self.loop = asyncio.get_event_loop()
+         logger.debug("Initialize ConcurrentFuture")
+ 
+-    def run_el(self, runnable, **kwargs):
++    def run_el(self, runnable, rerun=False, **kwargs):
+         """Run a task."""
+         assert self.loop, "No event loop available to submit tasks"
+-        return self.exec_as_coro(runnable)
++        return self.exec_as_coro(runnable, rerun=rerun)
+ 
+-    async def exec_as_coro(self, runnable):
++    async def exec_as_coro(self, runnable, rerun=False):
+         """Run a task (coroutine wrapper)."""
+-        res = await self.loop.run_in_executor(self.pool, runnable._run)
++        res = await self.loop.run_in_executor(self.pool, runnable._run, rerun)
+         return res
+ 
+     def close(self):
+@@ -215,9 +215,9 @@ class SlurmWorker(DistributedWorker):
+         self.poll_delay = poll_delay
+         self.sbatch_args = sbatch_args or ""
+ 
+-    def run_el(self, runnable):
++    def run_el(self, runnable, rerun=False):
+         """Worker submission API."""
+-        script_dir, _, batch_script = self._prepare_runscripts(runnable)
++        script_dir, _, batch_script = self._prepare_runscripts(runnable, rerun=rerun)
+         if (script_dir / script_dir.parts[1]) == gettempdir():
+             logger.warning("Temporary directories may not be shared across computers")
+         return self._submit_job(runnable, batch_script)

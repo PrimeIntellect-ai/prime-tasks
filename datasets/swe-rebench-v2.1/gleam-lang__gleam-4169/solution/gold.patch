@@ -1,0 +1,257 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b032f929..81cd4bca 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,11 @@
+   shell starting from OTP27.
+   ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+ 
++- Parsing of `case` expressions is now fault tolerant. If a `case` expressions
++  is missing its body, the compiler can still perform type inference. This also
++  allows the Language Server to provide completion hints for `case` subjects.
++  ([Surya Rose](https://github.com/GearsDatapacks))
++
+ ### Build tool
+ 
+ - `gleam new` now has refined project name validation - rather than failing on
+diff --git a/compiler-core/src/ast/untyped.rs b/compiler-core/src/ast/untyped.rs
+index 5a1adafc..112b40be 100644
+--- a/compiler-core/src/ast/untyped.rs
++++ b/compiler-core/src/ast/untyped.rs
+@@ -69,7 +69,8 @@ pub enum UntypedExpr {
+     Case {
+         location: SrcSpan,
+         subjects: Vec<Self>,
+-        clauses: Vec<Clause<Self, (), ()>>,
++        // None if the case expression is missing a body.
++        clauses: Option<Vec<Clause<Self, (), ()>>>,
+     },
+ 
+     FieldAccess {
+diff --git a/compiler-core/src/ast_folder.rs b/compiler-core/src/ast_folder.rs
+index 8d0c3df2..9c20312a 100644
+--- a/compiler-core/src/ast_folder.rs
++++ b/compiler-core/src/ast_folder.rs
+@@ -457,23 +457,25 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
+                 clauses,
+             } => {
+                 let subjects = subjects.into_iter().map(|e| self.fold_expr(e)).collect();
+-                let clauses = clauses
+-                    .into_iter()
+-                    .map(|mut c| {
+-                        c.pattern = c
+-                            .pattern
+-                            .into_iter()
+-                            .map(|p| self.fold_pattern(p))
+-                            .collect();
+-                        c.alternative_patterns = c
+-                            .alternative_patterns
+-                            .into_iter()
+-                            .map(|p| p.into_iter().map(|p| self.fold_pattern(p)).collect())
+-                            .collect();
+-                        c.then = self.fold_expr(c.then);
+-                        c
+-                    })
+-                    .collect();
++                let clauses = clauses.map(|clauses| {
++                    clauses
++                        .into_iter()
++                        .map(|mut c| {
++                            c.pattern = c
++                                .pattern
++                                .into_iter()
++                                .map(|p| self.fold_pattern(p))
++                                .collect();
++                            c.alternative_patterns = c
++                                .alternative_patterns
++                                .into_iter()
++                                .map(|p| p.into_iter().map(|p| self.fold_pattern(p)).collect())
++                                .collect();
++                            c.then = self.fold_expr(c.then);
++                            c
++                        })
++                        .collect()
++                });
+                 UntypedExpr::Case {
+                     location,
+                     subjects,
+@@ -742,7 +744,7 @@ pub trait UntypedExprFolder: TypeAstFolder + UntypedConstantFolder + PatternFold
+         &mut self,
+         location: SrcSpan,
+         subjects: Vec<UntypedExpr>,
+-        clauses: Vec<UntypedClause>,
++        clauses: Option<Vec<UntypedClause>>,
+     ) -> UntypedExpr {
+         UntypedExpr::Case {
+             location,
+diff --git a/compiler-core/src/call_graph.rs b/compiler-core/src/call_graph.rs
+index c860d4fd..535ca754 100644
+--- a/compiler-core/src/call_graph.rs
++++ b/compiler-core/src/call_graph.rs
+@@ -278,7 +278,7 @@ impl<'a> CallGraphBuilder<'a> {
+                 for subject in subjects {
+                     self.expression(subject);
+                 }
+-                for clause in clauses {
++                for clause in clauses.as_deref().unwrap_or_default() {
+                     let names = self.names.clone();
+                     for pattern in &clause.pattern {
+                         self.pattern(pattern);
+diff --git a/compiler-core/src/error.rs b/compiler-core/src/error.rs
+index 5e5a52a1..bd6477b3 100644
+--- a/compiler-core/src/error.rs
++++ b/compiler-core/src/error.rs
+@@ -3066,6 +3066,27 @@ The missing patterns are:\n"
+                     }
+                 }
+ 
++                TypeError::MissingCaseBody { location } => {
++                    let text = wrap(
++                        "This case expression is missing its body."
++                        );
++                    Diagnostic {
++                        title: "Missing case body".into(),
++                        text,
++                        hint: None,
++                        level: Level::Error,
++                        location: Some(Location {
++                            src: src.clone(),
++                            path: path.to_path_buf(),
++                            label: Label {
++                                text: None,
++                                span: *location,
++                            },
++                            extra_labels: Vec::new(),
++                        }),
++                    }
++                }
++
+                 TypeError::UnsupportedExpressionTarget {
+                     location,
+                     target: current_target,
+diff --git a/compiler-core/src/format.rs b/compiler-core/src/format.rs
+index 2f48ccc9..8bb47bde 100644
+--- a/compiler-core/src/format.rs
++++ b/compiler-core/src/format.rs
+@@ -1030,7 +1030,7 @@ impl<'comments> Formatter<'comments> {
+                 subjects,
+                 clauses,
+                 location,
+-            } => self.case(subjects, clauses, location),
++            } => self.case(subjects, clauses.as_deref().unwrap_or_default(), location),
+ 
+             UntypedExpr::FieldAccess {
+                 label, container, ..
+diff --git a/compiler-core/src/parse.rs b/compiler-core/src/parse.rs
+index e59dfd55..211fbe36 100644
+--- a/compiler-core/src/parse.rs
++++ b/compiler-core/src/parse.rs
+@@ -701,20 +701,33 @@ where
+                 self.advance();
+                 let subjects =
+                     Parser::series_of(self, &Parser::parse_expression, Some(&Token::Comma))?;
+-                let _ = self.expect_one_following_series(&Token::LeftBrace, "an expression")?;
+-                let clauses = Parser::series_of(self, &Parser::parse_case_clause, None)?;
+-                let (_, end) =
+-                    self.expect_one_following_series(&Token::RightBrace, "a case clause")?;
+-                if subjects.is_empty() {
+-                    return parse_error(
+-                        ParseErrorType::ExpectedExpr,
+-                        SrcSpan { start, end: case_e },
+-                    );
++                if self.maybe_one(&Token::LeftBrace).is_some() {
++                    let clauses = Parser::series_of(self, &Parser::parse_case_clause, None)?;
++                    let (_, end) =
++                        self.expect_one_following_series(&Token::RightBrace, "a case clause")?;
++                    if subjects.is_empty() {
++                        return parse_error(
++                            ParseErrorType::ExpectedExpr,
++                            SrcSpan { start, end: case_e },
++                        );
++                    } else {
++                        UntypedExpr::Case {
++                            location: SrcSpan { start, end },
++                            subjects,
++                            clauses: Some(clauses),
++                        }
++                    }
+                 } else {
+                     UntypedExpr::Case {
+-                        location: SrcSpan { start, end },
++                        location: SrcSpan::new(
++                            start,
++                            subjects
++                                .last()
++                                .map(|subject| subject.location().end)
++                                .unwrap_or(case_e),
++                        ),
+                         subjects,
+-                        clauses,
++                        clauses: None,
+                     }
+                 }
+             }
+diff --git a/compiler-core/src/type_/error.rs b/compiler-core/src/type_/error.rs
+index 95ea0118..7ec6cff4 100644
+--- a/compiler-core/src/type_/error.rs
++++ b/compiler-core/src/type_/error.rs
+@@ -443,6 +443,11 @@ pub enum Error {
+         missing: Vec<EcoString>,
+     },
+ 
++    /// A case expression is missing its body.
++    MissingCaseBody {
++        location: SrcSpan,
++    },
++
+     /// Let assignment's pattern does not match all possible values of the type.
+     InexhaustiveLetAssignment {
+         location: SrcSpan,
+@@ -1031,6 +1036,7 @@ impl Error {
+             | Error::InvalidExternalJavascriptModule { location, .. }
+             | Error::InvalidExternalJavascriptFunction { location, .. }
+             | Error::InexhaustiveCaseExpression { location, .. }
++            | Error::MissingCaseBody { location }
+             | Error::InexhaustiveLetAssignment { location, .. }
+             | Error::UnusedTypeAliasParameter { location, .. }
+             | Error::DuplicateTypeParameter { location, .. }
+diff --git a/compiler-core/src/type_/expression.rs b/compiler-core/src/type_/expression.rs
+index 6a087863..60a85b80 100644
+--- a/compiler-core/src/type_/expression.rs
++++ b/compiler-core/src/type_/expression.rs
+@@ -1428,13 +1428,12 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
+     fn infer_case(
+         &mut self,
+         subjects: Vec<UntypedExpr>,
+-        clauses: Vec<UntypedClause>,
++        clauses: Option<Vec<UntypedClause>>,
+         location: SrcSpan,
+     ) -> TypedExpr {
+         let subjects_count = subjects.len();
+         let mut typed_subjects = Vec::with_capacity(subjects_count);
+         let mut subject_types = Vec::with_capacity(subjects_count);
+-        let mut typed_clauses = Vec::with_capacity(clauses.len());
+ 
+         let return_type = self.new_unbound_var();
+ 
+@@ -1459,6 +1458,20 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
+             typed_subjects.push(subject);
+         }
+ 
++        let clauses = match clauses {
++            Some(clauses) => clauses,
++            None => {
++                self.problems.error(Error::MissingCaseBody { location });
++                return TypedExpr::Case {
++                    location,
++                    type_: return_type,
++                    subjects: typed_subjects,
++                    clauses: Vec::new(),
++                };
++            }
++        };
++
++        let mut typed_clauses = Vec::with_capacity(clauses.len());
+         let mut has_a_guard = false;
+         let mut all_patterns_are_discards = true;
+         // NOTE: if there are 0 clauses then there are 0 panics

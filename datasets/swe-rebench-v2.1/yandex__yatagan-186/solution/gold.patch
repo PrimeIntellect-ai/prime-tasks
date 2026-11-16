@@ -1,0 +1,136 @@
+diff --git a/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspLexicalScope.kt b/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspLexicalScope.kt
+index 6926228e..18ad381c 100644
+--- a/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspLexicalScope.kt
++++ b/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspLexicalScope.kt
+@@ -1,6 +1,7 @@
+ package com.yandex.yatagan.lang.ksp
+ 
+ import com.google.devtools.ksp.processing.Resolver
++import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
+ import com.google.devtools.ksp.symbol.KSClassDeclaration
+ import com.yandex.yatagan.lang.LangModelFactory
+ import com.yandex.yatagan.lang.TypeDeclaration
+@@ -15,10 +16,14 @@ import com.yandex.yatagan.lang.scope.CachingMetaFactory
+  */
+ class KspLexicalScope(
+     resolver: Resolver,
++    environment: SymbolProcessorEnvironment,
+ ) : LexicalScopeBase() {
+     init {
+         ext[CachingMetaFactory] = CachingFactorySimple
+-        ext[ProcessingUtils] = ProcessingUtils(resolver)
++        ext[ProcessingUtils] = ProcessingUtils(
++            resolver = resolver,
++            isKsp2 = environment.kspVersion >= KotlinVersion(2, 0),
++        )
+         ext[LangModelFactory] = KspModelFactoryImpl(this)
+     }
+ 
+diff --git a/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspTypeImpl.kt b/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspTypeImpl.kt
+index 4f50f7e4..20e5fe68 100644
+--- a/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspTypeImpl.kt
++++ b/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/KspTypeImpl.kt
+@@ -20,6 +20,7 @@ import com.google.devtools.ksp.symbol.KSClassDeclaration
+ import com.google.devtools.ksp.symbol.KSType
+ import com.google.devtools.ksp.symbol.KSTypeParameter
+ import com.google.devtools.ksp.symbol.KSTypeReference
++import com.google.devtools.ksp.symbol.Variance
+ import com.yandex.yatagan.lang.Type
+ import com.yandex.yatagan.lang.TypeDeclaration
+ import com.yandex.yatagan.lang.common.NoDeclaration
+@@ -34,9 +35,9 @@ import kotlin.LazyThreadSafetyMode.PUBLICATION
+ 
+ internal class KspTypeImpl private constructor(
+     lexicalScope: LexicalScope,
+-    resolvedTypeInfo: Pair<JvmTypeInfo, KSType>,
++    resolvedTypeInfo: Pair<JvmTypeInfo, KSTypeEquivalence>,
+ ) : CtTypeBase(), LexicalScope by lexicalScope {
+-    val impl: KSType = resolvedTypeInfo.second
++    val impl: KSType = resolvedTypeInfo.second.type
+     private val jvmType: JvmTypeInfo = resolvedTypeInfo.first
+ 
+     override val nameModel: CtTypeNameModel by lazy {
+@@ -93,7 +94,44 @@ internal class KspTypeImpl private constructor(
+     )
+ 
+     companion object Factory : FactoryKey<ResolveTypeInfo, Type> {
+-        private object Caching : FactoryKey<Pair<JvmTypeInfo, KSType>, KspTypeImpl> {
++        /**
++         * A polymorphic wrapper over KSType required to correctly cache the KspTypeImpl instances.
++         */
++        private sealed interface KSTypeEquivalence {
++            val type: KSType
++
++            /**
++             * Use KSType directly - its equals/hashcode suit us.
++             */
++            @JvmInline value class Ksp1(override val type: KSType) : KSTypeEquivalence
++
++            /**
++             * KSP2 uses semantic type equivalence, which ignores "wildcards" - redundant projections.
++             * Given `interface Lazy<out T> {}` and `interface Foo`,
++             * types `Lazy<Foo>` and `Lazy<out Foo>` are semantically equivalent,
++             * but we need to distinguish between them.
++             *
++             * So we capture type projections and compare them additionally.
++             */
++            class Ksp2(
++                override val type: KSType,
++            ) : KSTypeEquivalence {
++                private val flatProjections: List<Variance> = buildList { flatten(type) }
++                private val hashCode by lazy { type.hashCode() + 31 * flatProjections.hashCode() }
++                private fun MutableList<Variance>.flatten(type: KSType?) {
++                    type?.arguments?.forEach {
++                        add(it.variance)
++                        flatten(it.type?.resolve())
++                    }
++                }
++
++                override fun hashCode(): Int = hashCode
++                override fun equals(other: Any?) =
++                    other === this || other is Ksp2 && type == other.type && flatProjections == other.flatProjections
++            }
++        }
++
++        private object Caching : FactoryKey<Pair<JvmTypeInfo, KSTypeEquivalence>, KspTypeImpl> {
+             override fun LexicalScope.factory() = caching(createWithScope = ::KspTypeImpl)
+         }
+ 
+@@ -121,7 +159,11 @@ internal class KspTypeImpl private constructor(
+                         nameModel = InvalidNameModel.TypeVariable(typeVar = type.declaration.simpleName.asString())
+                     )
+                 }
+-                else -> Caching(JvmTypeInfo(jvmSignature = jvmSignatureHint, type = type) to type)
++                else -> {
++                    val equivalenceWrapped =
++                        if (Utils.isKsp2) KSTypeEquivalence.Ksp2(type) else KSTypeEquivalence.Ksp1(type)
++                    Caching(JvmTypeInfo(jvmSignature = jvmSignatureHint, type = type) to equivalenceWrapped)
++                }
+             }
+         }
+     }
+diff --git a/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/ProcessingUtils.kt b/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/ProcessingUtils.kt
+index 1155429d..a9927284 100644
+--- a/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/ProcessingUtils.kt
++++ b/lang/ksp/src/main/kotlin/com/yandex/yatagan/lang/ksp/ProcessingUtils.kt
+@@ -24,6 +24,7 @@ import com.yandex.yatagan.lang.scope.LexicalScope
+ 
+ internal class ProcessingUtils(
+     val resolver: Resolver,
++    val isKsp2: Boolean,
+ ) {
+     val classType by lazy {
+         resolver.getClassDeclarationByName("java.lang.Class")!!
+diff --git a/processor/ksp/src/main/kotlin/com/yandex/yatagan/processor/ksp/KspYataganProcessor.kt b/processor/ksp/src/main/kotlin/com/yandex/yatagan/processor/ksp/KspYataganProcessor.kt
+index d64b3037..05285e0b 100644
+--- a/processor/ksp/src/main/kotlin/com/yandex/yatagan/processor/ksp/KspYataganProcessor.kt
++++ b/processor/ksp/src/main/kotlin/com/yandex/yatagan/processor/ksp/KspYataganProcessor.kt
+@@ -42,7 +42,7 @@ internal class KspYataganProcessor(
+     override lateinit var lexicalScope: KspLexicalScope
+ 
+     override fun process(resolver: Resolver): List<KSAnnotated> {
+-        lexicalScope = KspLexicalScope(resolver)
++        lexicalScope = KspLexicalScope(resolver, environment)
+         initScopedOptions(lexicalScope, this)
+         process(
+             sources = sequenceOf(

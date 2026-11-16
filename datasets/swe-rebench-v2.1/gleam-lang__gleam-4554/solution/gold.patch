@@ -1,0 +1,255 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eb17e58be..8422906c8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -416,3 +416,6 @@
+   if they were shadowing an unqualified module function.
+   ([Samuel Cristobal](https://github.com/scristobal))
+ 
++- Fixed a bug where renaming a local variable which is used in combination with
++  label shorthand syntax would produce invalid code.
++  ([Surya Rose](https://github.com/GearsDatapacks))
+diff --git a/compiler-core/src/language_server/code_action.rs b/compiler-core/src/language_server/code_action.rs
+index 6525442ed..729262cd3 100644
+--- a/compiler-core/src/language_server/code_action.rs
++++ b/compiler-core/src/language_server/code_action.rs
+@@ -5487,7 +5487,7 @@ impl<'a> InlineVariable<'a> {
+     fn maybe_inline(&mut self, location: SrcSpan) {
+         let variable_location =
+             match find_variable_references(&self.module.ast, location).as_slice() {
+-                [only_reference] => *only_reference,
++                [only_reference] => only_reference.location,
+                 _ => return,
+             };
+ 
+diff --git a/compiler-core/src/language_server/engine.rs b/compiler-core/src/language_server/engine.rs
+index fd70b34d1..092c8f238 100644
+--- a/compiler-core/src/language_server/engine.rs
++++ b/compiler-core/src/language_server/engine.rs
+@@ -48,11 +48,10 @@ use super::{
+     },
+     completer::Completer,
+     reference::{
+-        Referenced, find_module_references, find_variable_references, reference_for_ast_node,
+-    },
+-    rename::{
+-        RenameTarget, Renamed, VariableRenameKind, rename_local_variable, rename_module_entity,
++        Referenced, VariableReferenceKind, find_module_references, find_variable_references,
++        reference_for_ast_node,
+     },
++    rename::{RenameTarget, Renamed, rename_local_variable, rename_module_entity},
+     signature_help, src_span_to_lsp_range,
+ };
+ 
+@@ -693,10 +692,10 @@ where
+                     let rename_kind = match origin {
+                         Some(VariableOrigin::Generated) => return Ok(None),
+                         Some(VariableOrigin::LabelShorthand(_)) => {
+-                            VariableRenameKind::LabelShorthand
++                            VariableReferenceKind::LabelShorthand
+                         }
+                         Some(VariableOrigin::AssignmentPattern | VariableOrigin::Variable(_))
+-                        | None => VariableRenameKind::Variable,
++                        | None => VariableReferenceKind::Variable,
+                     };
+                     rename_local_variable(module, &lines, &params, definition_location, rename_kind)
+                 }
+@@ -774,16 +773,26 @@ where
+                         | VariableOrigin::AssignmentPattern
+                         | VariableOrigin::Variable(_),
+                     )
+-                    | None => Some(
+-                        find_variable_references(&module.ast, definition_location)
+-                            .into_iter()
+-                            .chain(std::iter::once(definition_location))
+-                            .map(|location| lsp::Location {
++                    | None => {
++                        let variable_references =
++                            find_variable_references(&module.ast, definition_location);
++
++                        let mut reference_locations =
++                            Vec::with_capacity(variable_references.len() + 1);
++                        reference_locations.push(lsp::Location {
++                            uri: uri.clone(),
++                            range: src_span_to_lsp_range(definition_location, &lines),
++                        });
++
++                        for reference in variable_references {
++                            reference_locations.push(lsp::Location {
+                                 uri: uri.clone(),
+-                                range: src_span_to_lsp_range(location, &lines),
++                                range: src_span_to_lsp_range(reference.location, &lines),
+                             })
+-                            .collect(),
+-                    ),
++                        }
++
++                        Some(reference_locations)
++                    }
+                 },
+                 Some(Referenced::ModuleValue {
+                     module,
+diff --git a/compiler-core/src/language_server/reference.rs b/compiler-core/src/language_server/reference.rs
+index 6467764c0..328a263f1 100644
+--- a/compiler-core/src/language_server/reference.rs
++++ b/compiler-core/src/language_server/reference.rs
+@@ -329,10 +329,20 @@ fn find_references_in_module(
+     }
+ }
+ 
++pub struct VariableReference {
++    pub location: SrcSpan,
++    pub kind: VariableReferenceKind,
++}
++
++pub enum VariableReferenceKind {
++    Variable,
++    LabelShorthand,
++}
++
+ pub fn find_variable_references(
+     module: &TypedModule,
+     definition_location: SrcSpan,
+-) -> Vec<SrcSpan> {
++) -> Vec<VariableReference> {
+     let mut finder = FindVariableReferences {
+         references: Vec::new(),
+         definition_location,
+@@ -342,7 +352,7 @@ pub fn find_variable_references(
+ }
+ 
+ struct FindVariableReferences {
+-    references: Vec<SrcSpan>,
++    references: Vec<VariableReference>,
+     definition_location: SrcSpan,
+ }
+ 
+@@ -363,7 +373,12 @@ impl<'ast> Visit<'ast> for FindVariableReferences {
+             ValueConstructorVariant::LocalVariable {
+                 location: definition_location,
+                 ..
+-            } if definition_location == self.definition_location => self.references.push(*location),
++            } if definition_location == self.definition_location => {
++                self.references.push(VariableReference {
++                    location: *location,
++                    kind: VariableReferenceKind::Variable,
++                })
++            }
+             _ => {}
+         }
+     }
+@@ -376,7 +391,10 @@ impl<'ast> Visit<'ast> for FindVariableReferences {
+         definition_location: &'ast SrcSpan,
+     ) {
+         if *definition_location == self.definition_location {
+-            self.references.push(*location)
++            self.references.push(VariableReference {
++                location: *location,
++                kind: VariableReferenceKind::Variable,
++            })
+         }
+     }
+ 
+@@ -396,9 +414,39 @@ impl<'ast> Visit<'ast> for FindVariableReferences {
+                 location: definition_location,
+                 ..
+             } if *definition_location == self.definition_location => {
+-                self.references.push(*location)
++                self.references.push(VariableReference {
++                    location: *location,
++                    kind: VariableReferenceKind::Variable,
++                })
+             }
+             _ => {}
+         }
+     }
++
++    fn visit_typed_call_arg(&mut self, arg: &'ast crate::type_::TypedCallArg) {
++        if let TypedExpr::Var {
++            location,
++            constructor,
++            ..
++        } = &arg.value
++        {
++            match &constructor.variant {
++                ValueConstructorVariant::LocalVariable {
++                    location: definition_location,
++                    ..
++                } if arg.uses_label_shorthand()
++                    && *definition_location == self.definition_location =>
++                {
++                    self.references.push(VariableReference {
++                        location: *location,
++                        kind: VariableReferenceKind::LabelShorthand,
++                    });
++                    return;
++                }
++                _ => {}
++            }
++        }
++
++        ast::visit::visit_typed_call_arg(self, arg);
++    }
+ }
+diff --git a/compiler-core/src/language_server/rename.rs b/compiler-core/src/language_server/rename.rs
+index 5985e4c35..a8d836c4a 100644
+--- a/compiler-core/src/language_server/rename.rs
++++ b/compiler-core/src/language_server/rename.rs
+@@ -13,7 +13,9 @@ use crate::{
+ };
+ 
+ use super::{
+-    TextEdits, compiler::ModuleSourceInformation, reference::find_variable_references,
++    TextEdits,
++    compiler::ModuleSourceInformation,
++    reference::{VariableReferenceKind, find_variable_references},
+     url_from_path,
+ };
+ 
+@@ -28,17 +30,12 @@ fn workspace_edit(uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
+     }
+ }
+ 
+-pub enum VariableRenameKind {
+-    Variable,
+-    LabelShorthand,
+-}
+-
+ pub fn rename_local_variable(
+     module: &Module,
+     line_numbers: &LineNumbers,
+     params: &RenameParams,
+     definition_location: SrcSpan,
+-    kind: VariableRenameKind,
++    kind: VariableReferenceKind,
+ ) -> Option<WorkspaceEdit> {
+     if name::check_name_case(
+         Default::default(),
+@@ -56,14 +53,23 @@ pub fn rename_local_variable(
+     let references = find_variable_references(&module.ast, definition_location);
+ 
+     match kind {
+-        VariableRenameKind::Variable => edits.replace(definition_location, params.new_name.clone()),
+-        VariableRenameKind::LabelShorthand => {
++        VariableReferenceKind::Variable => {
++            edits.replace(definition_location, params.new_name.clone())
++        }
++        VariableReferenceKind::LabelShorthand => {
+             edits.insert(definition_location.end, format!(" {}", params.new_name))
+         }
+     }
+ 
+-    for location in references {
+-        edits.replace(location, params.new_name.clone());
++    for reference in references {
++        match reference.kind {
++            VariableReferenceKind::Variable => {
++                edits.replace(reference.location, params.new_name.clone())
++            }
++            VariableReferenceKind::LabelShorthand => {
++                edits.insert(reference.location.end, format!(" {}", params.new_name))
++            }
++        }
+     }
+ 
+     Some(workspace_edit(uri, edits.edits))

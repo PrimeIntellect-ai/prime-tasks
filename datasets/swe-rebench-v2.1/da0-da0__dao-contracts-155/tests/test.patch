@@ -1,0 +1,232 @@
+diff --git a/contracts/cw3-dao/src/tests.rs b/contracts/cw3-dao/src/tests.rs
+index cf790b6..60fd552 100644
+--- a/contracts/cw3-dao/src/tests.rs
++++ b/contracts/cw3-dao/src/tests.rs
+@@ -1858,6 +1858,227 @@ fn test_update_staking_contract() {
+     )
+ }
+ 
++fn pause_dao_raw_wasm_message(dao_addr: &Addr, expiration: &Expiration) -> WasmMsg {
++    let expiration = String::from_utf8(to_binary(expiration).unwrap().to_vec()).unwrap();
++    let msg = format!("{{\"pause_d_a_o\":{{\"expiration\":{}}}}}", expiration);
++    WasmMsg::Execute {
++        contract_addr: dao_addr.to_string(),
++        msg: cosmwasm_std::Binary::from(msg.into_bytes()),
++        funds: vec![],
++    }
++}
++
++#[test]
++fn test_pause_dao_until_height_expiration() {
++    let mut app = mock_app();
++
++    let voting_period = Duration::Time(2000000);
++    let threshold = Threshold::ThresholdQuorum {
++        threshold: Decimal::percent(20),
++        quorum: Decimal::percent(10),
++    };
++    let (dao_addr, _cw20_addr, _staking_addr) = setup_test_case(
++        &mut app,
++        threshold,
++        voting_period,
++        coins(100, NATIVE_TOKEN_DENOM),
++        None,
++        None,
++    );
++
++    // Pause DAO until height
++    const PAUSE_HEIGHT: u64 = 100000000;
++    let pause_expiration = Expiration::AtHeight(PAUSE_HEIGHT);
++
++    // Nobody can call the pause method directly; only the DAO contract itself may
++    let err = app
++        .execute(
++            Addr::unchecked(VOTER1),
++            pause_dao_raw_wasm_message(&dao_addr, &pause_expiration).into(),
++        )
++        .unwrap_err();
++    assert_eq!(ContractError::Unauthorized {}, err.downcast().unwrap());
++    let err = app
++        .execute(
++            Addr::unchecked(OWNER),
++            pause_dao_raw_wasm_message(&dao_addr, &pause_expiration).into(),
++        )
++        .unwrap_err();
++    assert_eq!(ContractError::Unauthorized {}, err.downcast().unwrap());
++
++    let wasm_msg = pause_dao_raw_wasm_message(&dao_addr, &pause_expiration);
++
++    // Pause DAO proposal must be made
++    let proposal_msg = ExecuteMsg::Propose(ProposeMsg {
++        title: String::from("Change params"),
++        description: String::from("Updates threshold and max voting params"),
++        msgs: vec![wasm_msg.into()],
++        latest: None,
++    });
++    let res = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[])
++        .unwrap();
++    let proposal_id: u64 = res.custom_attrs(1)[2].value.parse().unwrap();
++
++    // Imediately passes on yes vote
++    let yes_vote = ExecuteMsg::Vote(VoteMsg {
++        proposal_id,
++        vote: Vote::Yes,
++    });
++    let res = app.execute_contract(Addr::unchecked(VOTER3), dao_addr.clone(), &yes_vote, &[]);
++    assert!(res.is_ok());
++
++    // Execute
++    let execution = ExecuteMsg::Execute { proposal_id };
++    let res = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &execution, &[])
++        .unwrap();
++
++    // The pause execution reports the action and the expiration it was paused until
++    let pause_event = res
++        .events
++        .iter()
++        .find(|ev| {
++            ev.attributes
++                .iter()
++                .any(|a| a.key == "action" && a.value == "pause_dao")
++        })
++        .expect("pause_dao event not found");
++    assert!(pause_event
++        .attributes
++        .iter()
++        .any(|a| a.key == "expiration"));
++
++    // Check that DAO is paused, Propose should fail
++    let res = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[])
++        .unwrap_err();
++    assert_eq!(format!("{:?}", res.downcast::<ContractError>().unwrap()), "Paused");
++
++    // Vote should fail
++    let res = app
++        .execute_contract(Addr::unchecked(VOTER3), dao_addr.clone(), &yes_vote, &[])
++        .unwrap_err();
++    assert_eq!(format!("{:?}", res.downcast::<ContractError>().unwrap()), "Paused");
++
++    // Execute should fail
++    let res = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &execution, &[])
++        .unwrap_err();
++    assert_eq!(format!("{:?}", res.downcast::<ContractError>().unwrap()), "Paused");
++
++    // Close should fail
++    let res = app
++        .execute_contract(
++            Addr::unchecked(OWNER),
++            dao_addr.clone(),
++            &ExecuteMsg::Close { proposal_id },
++            &[],
++        )
++        .unwrap_err();
++    assert_eq!(format!("{:?}", res.downcast::<ContractError>().unwrap()), "Paused");
++
++    // Pause expiration height is reached
++    app.update_block(|b| b.height = PAUSE_HEIGHT + 1);
++
++    // Propose succeeds
++    let res = app.execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[]);
++    assert!(res.is_ok());
++
++    // Vote yields different error
++    let res = app
++        .execute_contract(Addr::unchecked(VOTER3), dao_addr.clone(), &yes_vote, &[])
++        .unwrap_err();
++    assert_eq!(res.to_string(), ContractError::NotOpen {}.to_string());
++
++    // Expiration yields different error
++    let res = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &execution, &[])
++        .unwrap_err();
++    assert_eq!(
++        res.to_string(),
++        ContractError::WrongExecuteStatus {}.to_string()
++    );
++
++    // Close yields different error
++    let res = app
++        .execute_contract(
++            Addr::unchecked(OWNER),
++            dao_addr,
++            &ExecuteMsg::Close { proposal_id },
++            &[],
++        )
++        .unwrap_err();
++    assert_eq!(
++        res.to_string(),
++        ContractError::WrongCloseStatus {}.to_string()
++    );
++}
++
++#[test]
++fn test_pause_dao_at_time() {
++    let mut app = mock_app();
++
++    let voting_period = Duration::Time(2000000);
++    let threshold = Threshold::ThresholdQuorum {
++        threshold: Decimal::percent(20),
++        quorum: Decimal::percent(10),
++    };
++    let (dao_addr, _cw20_addr, _staking_addr) = setup_test_case(
++        &mut app,
++        threshold,
++        voting_period,
++        coins(100, NATIVE_TOKEN_DENOM),
++        None,
++        None,
++    );
++
++    // Pause DAO until a point in time
++    let pause_time = app.block_info().time.plus_seconds(1000);
++    let pause_expiration = Expiration::AtTime(pause_time);
++    let wasm_msg = pause_dao_raw_wasm_message(&dao_addr, &pause_expiration);
++
++    let proposal_msg = ExecuteMsg::Propose(ProposeMsg {
++        title: String::from("Pause DAO"),
++        description: String::from("Pause governance until a point in time"),
++        msgs: vec![wasm_msg.into()],
++        latest: None,
++    });
++    let res = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[])
++        .unwrap();
++    let proposal_id: u64 = res.custom_attrs(1)[2].value.parse().unwrap();
++
++    let yes_vote = ExecuteMsg::Vote(VoteMsg {
++        proposal_id,
++        vote: Vote::Yes,
++    });
++    app.execute_contract(Addr::unchecked(VOTER3), dao_addr.clone(), &yes_vote, &[])
++        .unwrap();
++
++    let execution = ExecuteMsg::Execute { proposal_id };
++    app.execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &execution, &[])
++        .unwrap();
++
++    // While paused, proposing is rejected
++    let err = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[])
++        .unwrap_err();
++    assert_eq!(format!("{:?}", err.downcast::<ContractError>().unwrap()), "Paused");
++
++    // Still before the pause time, governance stays paused
++    app.update_block(|b| b.time = pause_time.minus_seconds(1));
++    let err = app
++        .execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[])
++        .unwrap_err();
++    assert_eq!(format!("{:?}", err.downcast::<ContractError>().unwrap()), "Paused");
++
++    // Once the pause time is reached, governance resumes
++    app.update_block(|b| b.time = pause_time.plus_seconds(1));
++    let res = app.execute_contract(Addr::unchecked(OWNER), dao_addr.clone(), &proposal_msg, &[]);
++    assert!(res.is_ok());
++}
++
+ #[test]
+ fn test_config_query() {
+     let mut app = mock_app();

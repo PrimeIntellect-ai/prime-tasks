@@ -1,0 +1,406 @@
+diff --git a/client/clientimpl_test.go b/client/clientimpl_test.go
+index 1af68c6..557e6b1 100644
+--- a/client/clientimpl_test.go
++++ b/client/clientimpl_test.go
+@@ -896,142 +896,6 @@ func TestReportEffectiveConfig(t *testing.T) {
+ 	})
+ }
+ 
+-func verifyRemoteConfigUpdate(t *testing.T, successCase bool, expectStatus *protobufs.RemoteConfigStatus) {
+-	testClients(t, func(t *testing.T, client OpAMPClient) {
+-
+-		// Start a Server.
+-		srv := internal.StartMockServer(t)
+-		srv.EnableExpectMode()
+-
+-		// Start a client.
+-		settings := types.StartSettings{
+-			OpAMPServerURL: "ws://" + srv.Endpoint,
+-			Callbacks: types.CallbacksStruct{
+-				OnMessageFunc: func(ctx context.Context, msg *types.MessageData) {
+-					if msg.RemoteConfig != nil {
+-						if successCase {
+-							client.SetRemoteConfigStatus(
+-								&protobufs.RemoteConfigStatus{
+-									LastRemoteConfigHash: msg.RemoteConfig.ConfigHash,
+-									Status:               protobufs.RemoteConfigStatus_APPLIED,
+-								})
+-						} else {
+-							client.SetRemoteConfigStatus(
+-								&protobufs.RemoteConfigStatus{
+-									LastRemoteConfigHash: msg.RemoteConfig.ConfigHash,
+-									Status:               protobufs.RemoteConfigStatus_FAILED,
+-									ErrorMessage:         "cannot update remote config",
+-								})
+-						}
+-					}
+-				},
+-			},
+-			Capabilities: protobufs.AgentCapabilities_AcceptsRemoteConfig,
+-		}
+-		prepareClient(t, &settings, client)
+-
+-		// Client --->
+-		assert.NoError(t, client.Start(context.Background(), settings))
+-
+-		remoteCfg := createRemoteConfig()
+-		// ---> Server
+-		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+-			assert.EqualValues(t, 0, msg.SequenceNum)
+-			// Send the remote config to the Agent.
+-			return &protobufs.ServerToAgent{
+-				InstanceUid:  msg.InstanceUid,
+-				RemoteConfig: remoteCfg,
+-			}
+-		})
+-
+-		// The Agent will try to apply the remote config and will send the status
+-		// report about it back to the Server.
+-
+-		var firstConfigStatus *protobufs.RemoteConfigStatus
+-
+-		// ---> Server
+-		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+-			assert.EqualValues(t, 1, msg.SequenceNum)
+-			// Verify that the remote config status is as expected.
+-			status := msg.RemoteConfigStatus
+-			assert.EqualValues(t, expectStatus.Status, status.Status)
+-			assert.Equal(t, expectStatus.ErrorMessage, status.ErrorMessage)
+-			assert.EqualValues(t, remoteCfg.ConfigHash, status.LastRemoteConfigHash)
+-
+-			firstConfigStatus = proto.Clone(status).(*protobufs.RemoteConfigStatus)
+-
+-			return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+-		})
+-
+-		// Client --->
+-		// Trigger another status report by setting AgentDescription.
+-		_ = client.SetAgentDescription(client.AgentDescription())
+-
+-		// ---> Server
+-		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+-			// This time the RemoteConfigStatus field must be unset. This is expected
+-			// as compression in OpAMP.
+-			require.Nil(t, msg.RemoteConfigStatus)
+-			assert.EqualValues(t, 2, msg.SequenceNum)
+-
+-			return &protobufs.ServerToAgent{
+-				InstanceUid: msg.InstanceUid,
+-				// Ask client to report full status.
+-				Flags: protobufs.ServerToAgent_ReportFullState,
+-			}
+-		})
+-
+-		// ---> Server
+-		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+-			assert.EqualValues(t, 3, msg.SequenceNum)
+-			// Exact same full status must be present again.
+-			status := msg.RemoteConfigStatus
+-			assert.True(t, proto.Equal(status, firstConfigStatus))
+-
+-			return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+-		})
+-
+-		// Shutdown the Server.
+-		srv.Close()
+-
+-		// Shutdown the client.
+-		err := client.Stop(context.Background())
+-		assert.NoError(t, err)
+-	})
+-}
+-
+-func TestRemoteConfigUpdate(t *testing.T) {
+-
+-	tests := []struct {
+-		name           string
+-		success        bool
+-		expectedStatus *protobufs.RemoteConfigStatus
+-	}{
+-		{
+-			name:    "success",
+-			success: true,
+-			expectedStatus: &protobufs.RemoteConfigStatus{
+-				Status:       protobufs.RemoteConfigStatus_APPLIED,
+-				ErrorMessage: "",
+-			},
+-		},
+-		{
+-			name:    "fail",
+-			success: false,
+-			expectedStatus: &protobufs.RemoteConfigStatus{
+-				Status:       protobufs.RemoteConfigStatus_FAILED,
+-				ErrorMessage: "cannot update remote config",
+-			},
+-		},
+-	}
+-
+-	for _, test := range tests {
+-		t.Run(test.name, func(t *testing.T) {
+-			verifyRemoteConfigUpdate(t, test.success, test.expectedStatus)
+-		})
+-	}
+-}
+-
+ type packageTestCase struct {
+ 	name                string
+ 	errorOnCallback     bool
+diff --git a/client/httpclient_test.go b/client/httpclient_test.go
+index 14f1003..4d2f243 100644
+--- a/client/httpclient_test.go
++++ b/client/httpclient_test.go
+@@ -1,7 +1,10 @@
+ package client
+ 
+ import (
++	"compress/gzip"
+ 	"context"
++	"io/ioutil"
++	"net/http"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -10,6 +13,7 @@ import (
+ 	"github.com/open-telemetry/opamp-go/client/types"
+ 	"github.com/open-telemetry/opamp-go/protobufs"
+ 	"github.com/stretchr/testify/assert"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ func TestHTTPPolling(t *testing.T) {
+@@ -48,3 +52,44 @@ func TestHTTPPolling(t *testing.T) {
+ 	err := client.Stop(context.Background())
+ 	assert.NoError(t, err)
+ }
++
++func TestHTTPClientCompression(t *testing.T) {
++	srv := internal.StartMockServer(t)
++	var reqCounter int64
++
++	srv.OnRequest = func(w http.ResponseWriter, r *http.Request) {
++		atomic.AddInt64(&reqCounter, 1)
++		assert.Equal(t, "gzip", r.Header.Get("Content-Encoding"))
++		reader, err := gzip.NewReader(r.Body)
++		assert.NoError(t, err)
++		body, err := ioutil.ReadAll(reader)
++		assert.NoError(t, err)
++		_ = r.Body.Close()
++		var response protobufs.AgentToServer
++		err = proto.Unmarshal(body, &response)
++		assert.NoError(t, err)
++		assert.Equal(t, response.AgentDescription.IdentifyingAttributes, []*protobufs.KeyValue{
++			{
++				Key:   "host.name",
++				Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "somehost"}},
++			}},
++		)
++		w.WriteHeader(http.StatusOK)
++	}
++
++	settings := types.StartSettings{EnableCompression: true}
++	settings.OpAMPServerURL = "http://" + srv.Endpoint
++	client := NewHTTP(nil)
++	prepareClient(t, &settings, client)
++
++	client.sender.SetPollingInterval(time.Millisecond * 10)
++
++	assert.NoError(t, client.Start(context.Background(), settings))
++
++	eventually(t, func() bool { return atomic.LoadInt64(&reqCounter) == 1 })
++
++	srv.Close()
++
++	err := client.Stop(context.Background())
++	assert.NoError(t, err)
++}
+diff --git a/server/serverimpl_test.go b/server/serverimpl_test.go
+index ef0e722..86534bd 100644
+--- a/server/serverimpl_test.go
++++ b/server/serverimpl_test.go
+@@ -2,6 +2,7 @@ package server
+ 
+ import (
+ 	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"io"
+ 	"net/http"
+@@ -295,3 +296,178 @@ func TestServerAttachAcceptConnection(t *testing.T) {
+ 	conn.Close()
+ 	eventually(t, func() bool { return atomic.LoadInt32(&connectionCloseCalled) == 1 })
+ }
++
++func TestServerHonoursClientRequestContentEncoding(t *testing.T) {
++
++	hc := http.Client{}
++	var rcvMsg atomic.Value
++	var onConnectedCalled, onCloseCalled int32
++	callbacks := CallbacksStruct{
++		OnConnectingFunc: func(request *http.Request) types.ConnectionResponse {
++			return types.ConnectionResponse{Accept: true}
++		},
++		OnConnectedFunc: func(conn types.Connection) {
++			atomic.StoreInt32(&onConnectedCalled, 1)
++		},
++		OnMessageFunc: func(conn types.Connection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
++			// Remember received message.
++			rcvMsg.Store(message)
++
++			// Send a response.
++			response := protobufs.ServerToAgent{
++				InstanceUid:  message.InstanceUid,
++				Capabilities: protobufs.ServerCapabilities_AcceptsStatus,
++			}
++			return &response
++		},
++		OnConnectionCloseFunc: func(conn types.Connection) {
++			atomic.StoreInt32(&onCloseCalled, 1)
++		},
++	}
++
++	// Start a Server.
++	settings := &StartSettings{Settings: Settings{Callbacks: callbacks}}
++	srv := startServer(t, settings)
++	defer srv.Stop(context.Background())
++
++	// Send a message to the Server.
++	sendMsg := protobufs.AgentToServer{
++		InstanceUid: "12345678",
++	}
++	b, err := proto.Marshal(&sendMsg)
++	require.NoError(t, err)
++
++	// gzip compress the request payload
++	b, err = gzipBytesForTest(b)
++	require.NoError(t, err)
++
++	req, err := http.NewRequest("POST", "http://"+settings.ListenEndpoint+settings.ListenPath, bytes.NewReader(b))
++	req.Header.Set(headerContentType, contentTypeProtobuf)
++	req.Header.Set("Content-Encoding", "gzip")
++	resp, err := hc.Do(req)
++	require.NoError(t, err)
++
++	// Wait until Server receives the message.
++	eventually(t, func() bool { return rcvMsg.Load() != nil })
++	assert.True(t, atomic.LoadInt32(&onConnectedCalled) == 1)
++
++	// Verify the received message is what was sent.
++	assert.True(t, proto.Equal(rcvMsg.Load().(proto.Message), &sendMsg))
++
++	// Read Server's response.
++	b, err = io.ReadAll(resp.Body)
++	require.NoError(t, err)
++
++	assert.EqualValues(t, http.StatusOK, resp.StatusCode)
++	assert.EqualValues(t, contentTypeProtobuf, resp.Header.Get(headerContentType))
++
++	// Decode the response.
++	var response protobufs.ServerToAgent
++	err = proto.Unmarshal(b, &response)
++	require.NoError(t, err)
++
++	// Verify the response.
++	assert.EqualValues(t, sendMsg.InstanceUid, response.InstanceUid)
++	assert.EqualValues(t, protobufs.ServerCapabilities_AcceptsStatus, response.Capabilities)
++
++	eventually(t, func() bool { return atomic.LoadInt32(&onCloseCalled) == 1 })
++}
++
++func TestServerHonoursAcceptEncoding(t *testing.T) {
++
++	hc := http.Client{}
++	var rcvMsg atomic.Value
++	var onConnectedCalled, onCloseCalled int32
++	callbacks := CallbacksStruct{
++		OnConnectingFunc: func(request *http.Request) types.ConnectionResponse {
++			return types.ConnectionResponse{Accept: true}
++		},
++		OnConnectedFunc: func(conn types.Connection) {
++			atomic.StoreInt32(&onConnectedCalled, 1)
++		},
++		OnMessageFunc: func(conn types.Connection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
++			// Remember received message.
++			rcvMsg.Store(message)
++
++			// Send a response.
++			response := protobufs.ServerToAgent{
++				InstanceUid:  message.InstanceUid,
++				Capabilities: protobufs.ServerCapabilities_AcceptsStatus,
++			}
++			return &response
++		},
++		OnConnectionCloseFunc: func(conn types.Connection) {
++			atomic.StoreInt32(&onCloseCalled, 1)
++		},
++	}
++
++	// Start a Server.
++	settings := &StartSettings{Settings: Settings{Callbacks: callbacks}}
++	srv := startServer(t, settings)
++	defer srv.Stop(context.Background())
++
++	// Send a message to the Server.
++	sendMsg := protobufs.AgentToServer{
++		InstanceUid: "12345678",
++	}
++	b, err := proto.Marshal(&sendMsg)
++	require.NoError(t, err)
++	req, err := http.NewRequest("POST", "http://"+settings.ListenEndpoint+settings.ListenPath, bytes.NewReader(b))
++	req.Header.Set(headerContentType, contentTypeProtobuf)
++	req.Header.Set("Accept-Encoding", "gzip")
++	resp, err := hc.Do(req)
++	require.NoError(t, err)
++
++	// Wait until Server receives the message.
++	eventually(t, func() bool { return rcvMsg.Load() != nil })
++	assert.True(t, atomic.LoadInt32(&onConnectedCalled) == 1)
++
++	// Verify the received message is what was sent.
++	assert.True(t, proto.Equal(rcvMsg.Load().(proto.Message), &sendMsg))
++
++	// Read Server's response.
++	b, err = io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	// The server may compress the response; decompress it only if it says it did.
++	if resp.Header.Get("Content-Encoding") == "gzip" {
++		b, err = gunzipBytesForTest(b)
++		require.NoError(t, err)
++	}
++
++	assert.EqualValues(t, http.StatusOK, resp.StatusCode)
++	assert.EqualValues(t, contentTypeProtobuf, resp.Header.Get(headerContentType))
++
++	// Decode the response.
++	var response protobufs.ServerToAgent
++	err = proto.Unmarshal(b, &response)
++	require.NoError(t, err)
++
++	// Verify the response.
++	assert.EqualValues(t, sendMsg.InstanceUid, response.InstanceUid)
++	assert.EqualValues(t, protobufs.ServerCapabilities_AcceptsStatus, response.Capabilities)
++
++	eventually(t, func() bool { return atomic.LoadInt32(&onCloseCalled) == 1 })
++}
++
++// gzipBytesForTest compresses data with gzip for use as a request body.
++func gzipBytesForTest(data []byte) ([]byte, error) {
++	var buf bytes.Buffer
++	w := gzip.NewWriter(&buf)
++	if _, err := w.Write(data); err != nil {
++		return nil, err
++	}
++	if err := w.Close(); err != nil {
++		return nil, err
++	}
++	return buf.Bytes(), nil
++}
++
++// gunzipBytesForTest decompresses a gzip-encoded response body.
++func gunzipBytesForTest(data []byte) ([]byte, error) {
++	r, err := gzip.NewReader(bytes.NewReader(data))
++	if err != nil {
++		return nil, err
++	}
++	defer r.Close()
++	return io.ReadAll(r)
++}

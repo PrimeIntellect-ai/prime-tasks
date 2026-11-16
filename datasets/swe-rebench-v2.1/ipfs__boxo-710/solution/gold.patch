@@ -1,0 +1,750 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 176a0fb7..6c5c621d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,8 @@ The following emojis are used to highlight certain changes:
+ 
+ ### Changed
+ 
++- No longer using `github.com/jbenet/goprocess` to avoid requiring in dependents.
++
+ ### Removed
+ 
+ ### Fixed
+diff --git a/bitswap/bitswap.go b/bitswap/bitswap.go
+index 393ab96a..ddc50f6d 100644
+--- a/bitswap/bitswap.go
++++ b/bitswap/bitswap.go
+@@ -144,10 +144,9 @@ func (bs *Bitswap) Stat() (*Stat, error) {
+ 
+ func (bs *Bitswap) Close() error {
+ 	bs.net.Stop()
+-	return multierr.Combine(
+-		bs.Client.Close(),
+-		bs.Server.Close(),
+-	)
++	bs.Client.Close()
++	bs.Server.Close()
++	return nil
+ }
+ 
+ func (bs *Bitswap) WantlistForPeer(p peer.ID) []cid.Cid {
+diff --git a/bitswap/client/client.go b/bitswap/client/client.go
+index fc735f44..bab03c3c 100644
+--- a/bitswap/client/client.go
++++ b/bitswap/client/client.go
+@@ -31,8 +31,6 @@ import (
+ 	delay "github.com/ipfs/go-ipfs-delay"
+ 	logging "github.com/ipfs/go-log/v2"
+ 	"github.com/ipfs/go-metrics-interface"
+-	process "github.com/jbenet/goprocess"
+-	procctx "github.com/jbenet/goprocess/context"
+ 	"github.com/libp2p/go-libp2p/core/peer"
+ 	"go.opentelemetry.io/otel/attribute"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -117,10 +115,6 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
+ 	// exclusively. We should probably find another way to share logging data
+ 	ctx, cancelFunc := context.WithCancel(parent)
+ 
+-	px := process.WithTeardown(func() error {
+-		return nil
+-	})
+-
+ 	// onDontHaveTimeout is called when a want-block is sent to a peer that
+ 	// has an old version of Bitswap that doesn't support DONT_HAVE messages,
+ 	// or when no response is received within a timeout.
+@@ -165,7 +159,8 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
+ 	bs = &Client{
+ 		blockstore:                 bstore,
+ 		network:                    network,
+-		process:                    px,
++		cancel:                     cancelFunc,
++		closing:                    make(chan struct{}),
+ 		pm:                         pm,
+ 		sm:                         sm,
+ 		sim:                        sim,
+@@ -185,16 +180,6 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
+ 
+ 	pqm.Startup()
+ 
+-	// bind the context and process.
+-	// do it over here to avoid closing before all setup is done.
+-	go func() {
+-		<-px.Closing() // process closes first
+-		sm.Shutdown()
+-		cancelFunc()
+-		notif.Shutdown()
+-	}()
+-	procctx.CloseAfterContext(px, ctx) // parent cancelled first
+-
+ 	return bs
+ }
+ 
+@@ -212,7 +197,9 @@ type Client struct {
+ 	// manages channels of outgoing blocks for sessions
+ 	notif notifications.PubSub
+ 
+-	process process.Process
++	cancel    context.CancelFunc
++	closing   chan struct{}
++	closeOnce sync.Once
+ 
+ 	// Counters for various statistics
+ 	counterLk sync.Mutex
+@@ -287,7 +274,7 @@ func (bs *Client) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) err
+ 	defer span.End()
+ 
+ 	select {
+-	case <-bs.process.Closing():
++	case <-bs.closing:
+ 		return errors.New("bitswap is closed")
+ 	default:
+ 	}
+@@ -310,10 +297,10 @@ func (bs *Client) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) err
+ 	return nil
+ }
+ 
+-// receiveBlocksFrom process blocks received from the network
++// receiveBlocksFrom processes blocks received from the network
+ func (bs *Client) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []blocks.Block, haves []cid.Cid, dontHaves []cid.Cid) error {
+ 	select {
+-	case <-bs.process.Closing():
++	case <-bs.closing:
+ 		return errors.New("bitswap is closed")
+ 	default:
+ 	}
+@@ -466,7 +453,13 @@ func (bs *Client) ReceiveError(err error) {
+ 
+ // Close is called to shutdown the Client
+ func (bs *Client) Close() error {
+-	return bs.process.Close()
++	bs.closeOnce.Do(func() {
++		close(bs.closing)
++		bs.sm.Shutdown()
++		bs.cancel()
++		bs.notif.Shutdown()
++	})
++	return nil
+ }
+ 
+ // GetWantlist returns the current local wantlist (both want-blocks and
+diff --git a/bitswap/server/internal/decision/engine.go b/bitswap/server/internal/decision/engine.go
+index 5e4463e3..a46d67dd 100644
+--- a/bitswap/server/internal/decision/engine.go
++++ b/bitswap/server/internal/decision/engine.go
+@@ -25,7 +25,6 @@ import (
+ 	"github.com/ipfs/go-peertaskqueue"
+ 	"github.com/ipfs/go-peertaskqueue/peertask"
+ 	"github.com/ipfs/go-peertaskqueue/peertracker"
+-	process "github.com/jbenet/goprocess"
+ 	"github.com/libp2p/go-libp2p/core/peer"
+ 	mh "github.com/multiformats/go-multihash"
+ )
+@@ -195,6 +194,9 @@ type Engine struct {
+ 
+ 	taskWorkerLock  sync.Mutex
+ 	taskWorkerCount int
++	waitWorkers     sync.WaitGroup
++	cancel          context.CancelFunc
++	closeOnce       sync.Once
+ 
+ 	targetMessageSize int
+ 
+@@ -376,12 +378,13 @@ func wrapTaskComparator(tc TaskComparator) peertask.QueueTaskComparator {
+ // maxOutstandingBytesPerPeer hints to the peer task queue not to give a peer
+ // more tasks if it has some maximum work already outstanding.
+ func NewEngine(
+-	ctx context.Context,
+ 	bs bstore.Blockstore,
+ 	peerTagger PeerTagger,
+ 	self peer.ID,
+ 	opts ...Option,
+ ) *Engine {
++	ctx, cancel := context.WithCancel(context.Background())
++
+ 	e := &Engine{
+ 		scoreLedger:                     NewDefaultScoreLedger(),
+ 		bstoreWorkerCount:               defaults.BitswapEngineBlockstoreWorkerCount,
+@@ -401,6 +404,7 @@ func NewEngine(
+ 		tagUseful:                       fmt.Sprintf(tagFormat, "useful", uuid.New().String()),
+ 		maxQueuedWantlistEntriesPerPeer: defaults.MaxQueuedWantlistEntiresPerPeer,
+ 		maxCidSize:                      defaults.MaximumAllowedCid,
++		cancel:                          cancel,
+ 	}
+ 
+ 	for _, opt := range opts {
+@@ -437,6 +441,8 @@ func NewEngine(
+ 		log.Infow("Replace WantHave with WantBlock is enabled", "maxSize", e.wantHaveReplaceSize)
+ 	}
+ 
++	e.startWorkers(ctx)
++
+ 	return e
+ }
+ 
+@@ -462,7 +468,7 @@ func (e *Engine) SetSendDontHaves(send bool) {
+ // Starts the score ledger. Before start the function checks and,
+ // if it is unset, initializes the scoreLedger with the default
+ // implementation.
+-func (e *Engine) startScoreLedger(px process.Process) {
++func (e *Engine) startScoreLedger() {
+ 	e.scoreLedger.Start(func(p peer.ID, score int) {
+ 		if score == 0 {
+ 			e.peerTagger.UntagPeer(p, e.tagUseful)
+@@ -470,35 +476,34 @@ func (e *Engine) startScoreLedger(px process.Process) {
+ 			e.peerTagger.TagPeer(p, e.tagUseful, score)
+ 		}
+ 	})
+-	px.Go(func(ppx process.Process) {
+-		<-ppx.Closing()
+-		e.scoreLedger.Stop()
+-	})
+ }
+ 
+-func (e *Engine) startBlockstoreManager(px process.Process) {
++// startWorkers starts workers to handle requests from other nodes for the data
++// on this node.
++func (e *Engine) startWorkers(ctx context.Context) {
+ 	e.bsm.start()
+-	px.Go(func(ppx process.Process) {
+-		<-ppx.Closing()
+-		e.bsm.stop()
+-	})
+-}
+-
+-// Start up workers to handle requests from other nodes for the data on this node
+-func (e *Engine) StartWorkers(ctx context.Context, px process.Process) {
+-	e.startBlockstoreManager(px)
+-	e.startScoreLedger(px)
++	e.startScoreLedger()
+ 
+ 	e.taskWorkerLock.Lock()
+ 	defer e.taskWorkerLock.Unlock()
+ 
++	e.waitWorkers.Add(e.taskWorkerCount)
+ 	for i := 0; i < e.taskWorkerCount; i++ {
+-		px.Go(func(_ process.Process) {
+-			e.taskWorker(ctx)
+-		})
++		go e.taskWorker(ctx)
+ 	}
+ }
+ 
++// Close shuts down the decision engine and returns after all workers have
++// finished. Safe to call multiple times/concurrently.
++func (e *Engine) Close() {
++	e.closeOnce.Do(func() {
++		e.cancel()
++		e.bsm.stop()
++		e.scoreLedger.Stop()
++	})
++	e.waitWorkers.Wait()
++}
++
+ func (e *Engine) onPeerAdded(p peer.ID) {
+ 	e.peerTagger.TagPeer(p, e.tagQueued, queuedTagWeight)
+ }
+@@ -524,6 +529,7 @@ func (e *Engine) LedgerForPeer(p peer.ID) *Receipt {
+ // and adds them to an envelope that is passed off to the bitswap workers,
+ // which send the message to the network.
+ func (e *Engine) taskWorker(ctx context.Context) {
++	defer e.waitWorkers.Done()
+ 	defer e.taskWorkerExit()
+ 	for {
+ 		oneTimeUse := make(chan *Envelope, 1) // buffer to prevent blocking
+diff --git a/bitswap/server/server.go b/bitswap/server/server.go
+index 46d29a8f..2cc3e247 100644
+--- a/bitswap/server/server.go
++++ b/bitswap/server/server.go
+@@ -20,8 +20,6 @@ import (
+ 	"github.com/ipfs/go-cid"
+ 	logging "github.com/ipfs/go-log/v2"
+ 	"github.com/ipfs/go-metrics-interface"
+-	process "github.com/jbenet/goprocess"
+-	procctx "github.com/jbenet/goprocess/context"
+ 	"github.com/libp2p/go-libp2p/core/peer"
+ 	"go.uber.org/zap"
+ )
+@@ -57,7 +55,12 @@ type Server struct {
+ 	// the total number of simultaneous threads sending outgoing messages
+ 	taskWorkerCount int
+ 
+-	process process.Process
++	// Cancel stops the server
++	cancel    context.CancelFunc
++	closing   chan struct{}
++	closeOnce sync.Once
++	// waitWorkers waits for all worker goroutines to exit.
++	waitWorkers sync.WaitGroup
+ 
+ 	// newBlocks is a channel for newly added blocks to be provided to the
+ 	// network.  blocks pushed down this channel get buffered and fed to the
+@@ -78,20 +81,13 @@ type Server struct {
+ func New(ctx context.Context, network bsnet.BitSwapNetwork, bstore blockstore.Blockstore, options ...Option) *Server {
+ 	ctx, cancel := context.WithCancel(ctx)
+ 
+-	px := process.WithTeardown(func() error {
+-		return nil
+-	})
+-	go func() {
+-		<-px.Closing() // process closes first
+-		cancel()
+-	}()
+-
+ 	s := &Server{
+ 		sentHistogram:      bmetrics.SentHist(ctx),
+ 		sendTimeHistogram:  bmetrics.SendTimeHist(ctx),
+ 		taskWorkerCount:    defaults.BitswapTaskWorkerCount,
+ 		network:            network,
+-		process:            px,
++		cancel:             cancel,
++		closing:            make(chan struct{}),
+ 		provideEnabled:     true,
+ 		hasBlockBufferSize: defaults.HasBlockBufferSize,
+ 		provideKeys:        make(chan cid.Cid, provideKeysBufferSize),
+@@ -103,7 +99,6 @@ func New(ctx context.Context, network bsnet.BitSwapNetwork, bstore blockstore.Bl
+ 	}
+ 
+ 	s.engine = decision.NewEngine(
+-		ctx,
+ 		bstore,
+ 		network.ConnectionManager(),
+ 		network.Self(),
+@@ -111,7 +106,7 @@ func New(ctx context.Context, network bsnet.BitSwapNetwork, bstore blockstore.Bl
+ 	)
+ 	s.engineOptions = nil
+ 
+-	s.startWorkers(ctx, px)
++	s.startWorkers(ctx)
+ 
+ 	return s
+ }
+@@ -293,33 +288,26 @@ func (bs *Server) WantlistForPeer(p peer.ID) []cid.Cid {
+ 	return out
+ }
+ 
+-func (bs *Server) startWorkers(ctx context.Context, px process.Process) {
+-	bs.engine.StartWorkers(ctx, px)
+-
++func (bs *Server) startWorkers(ctx context.Context) {
+ 	// Start up workers to handle requests from other nodes for the data on this node
++	bs.waitWorkers.Add(bs.taskWorkerCount)
+ 	for i := 0; i < bs.taskWorkerCount; i++ {
+ 		i := i
+-		px.Go(func(px process.Process) {
+-			bs.taskWorker(ctx, i)
+-		})
++		go bs.taskWorker(ctx, i)
+ 	}
+ 
+ 	if bs.provideEnabled {
+-		// Start up a worker to manage sending out provides messages
+-		px.Go(func(px process.Process) {
+-			bs.provideCollector(ctx)
+-		})
+-
+-		// Spawn up multiple workers to handle incoming blocks
+-		// consider increasing number if providing blocks bottlenecks
+-		// file transfers
+-		px.Go(bs.provideWorker)
++		bs.waitWorkers.Add(1)
++		go bs.provideCollector(ctx)
++		bs.startProvideWorkers(ctx)
+ 	}
+ }
+ 
+ func (bs *Server) taskWorker(ctx context.Context, id int) {
+-	defer log.Debug("bitswap task worker shutting down...")
++	defer bs.waitWorkers.Done()
++
+ 	log := log.With("ID", id)
++	defer log.Debug("bitswap task worker shutting down...")
+ 	for {
+ 		log.Debug("Bitswap.TaskWorker.Loop")
+ 		select {
+@@ -341,8 +329,7 @@ func (bs *Server) taskWorker(ctx context.Context, id int) {
+ 				}
+ 				bs.sendBlocks(ctx, envelope)
+ 
+-				dur := time.Since(start)
+-				bs.sendTimeHistogram.Observe(dur.Seconds())
++				bs.sendTimeHistogram.Observe(time.Since(start).Seconds())
+ 
+ 			case <-ctx.Done():
+ 				return
+@@ -452,7 +439,7 @@ func (bs *Server) Stat() (Stat, error) {
+ // that those blocks are available in the blockstore before calling this function.
+ func (bs *Server) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) error {
+ 	select {
+-	case <-bs.process.Closing():
++	case <-bs.closing:
+ 		return errors.New("bitswap is closed")
+ 	default:
+ 	}
+@@ -466,8 +453,8 @@ func (bs *Server) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) err
+ 			select {
+ 			case bs.newBlocks <- blk.Cid():
+ 				// send block off to be reprovided
+-			case <-bs.process.Closing():
+-				return bs.process.Close()
++			case <-bs.closing:
++				return nil
+ 			}
+ 		}
+ 	}
+@@ -476,6 +463,7 @@ func (bs *Server) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) err
+ }
+ 
+ func (bs *Server) provideCollector(ctx context.Context) {
++	defer bs.waitWorkers.Done()
+ 	defer close(bs.provideKeys)
+ 	var toProvide []cid.Cid
+ 	var nextKey cid.Cid
+@@ -508,56 +496,32 @@ func (bs *Server) provideCollector(ctx context.Context) {
+ 	}
+ }
+ 
+-func (bs *Server) provideWorker(px process.Process) {
+-	// FIXME: OnClosingContext returns a _custom_ context type.
+-	// Unfortunately, deriving a new cancelable context from this custom
+-	// type fires off a goroutine. To work around this, we create a single
+-	// cancelable context up-front and derive all sub-contexts from that.
+-	//
+-	// See: https://github.com/ipfs/go-ipfs/issues/5810
+-	ctx := procctx.OnClosingContext(px)
+-	ctx, cancel := context.WithCancel(ctx)
+-	defer cancel()
+-
+-	limit := make(chan struct{}, provideWorkerMax)
+-
+-	limitedGoProvide := func(k cid.Cid, wid int) {
+-		defer func() {
+-			// replace token when done
+-			<-limit
+-		}()
+-
+-		log.Debugw("Bitswap.ProvideWorker.Start", "ID", wid, "cid", k)
+-		defer log.Debugw("Bitswap.ProvideWorker.End", "ID", wid, "cid", k)
+-
+-		ctx, cancel := context.WithTimeout(ctx, defaults.ProvideTimeout) // timeout ctx
+-		defer cancel()
+-
+-		if err := bs.network.Provide(ctx, k); err != nil {
+-			log.Warn(err)
+-		}
+-	}
+-
+-	// worker spawner, reads from bs.provideKeys until it closes, spawning a
+-	// _ratelimited_ number of workers to handle each key.
+-	for wid := 2; ; wid++ {
+-		log.Debug("Bitswap.ProvideWorker.Loop")
++// startProvideWorkers starts provide worker goroutines that provide CID
++// supplied by provideCollector.
++//
++// If providing blocks bottlenecks file transfers then consider increasing
++// provideWorkerMax,
++func (bs *Server) startProvideWorkers(ctx context.Context) {
++	bs.waitWorkers.Add(provideWorkerMax)
++	for id := 0; id < provideWorkerMax; id++ {
++		go func(wid int) {
++			defer bs.waitWorkers.Done()
++
++			var runCount int
++			// Read bs.proviudeKeys until closed, when provideCollector exits.
++			for k := range bs.provideKeys {
++				runCount++
++				log.Debugw("Bitswap provider worker start", "ID", wid, "run", runCount, "cid", k)
++
++				ctx, cancel := context.WithTimeout(ctx, defaults.ProvideTimeout)
++				if err := bs.network.Provide(ctx, k); err != nil {
++					log.Warn(err)
++				}
++				cancel()
+ 
+-		select {
+-		case <-px.Closing():
+-			return
+-		case k, ok := <-bs.provideKeys:
+-			if !ok {
+-				log.Debug("provideKeys channel closed")
+-				return
+-			}
+-			select {
+-			case <-px.Closing():
+-				return
+-			case limit <- struct{}{}:
+-				go limitedGoProvide(k, wid)
++				log.Debugw("Bitswap provider worker done", "ID", wid, "run", runCount, "cid", k)
+ 			}
+-		}
++		}(id)
+ 	}
+ }
+ 
+@@ -597,7 +561,13 @@ func (bs *Server) PeerDisconnected(p peer.ID) {
+ 	bs.engine.PeerDisconnected(p)
+ }
+ 
+-// Close is called to shutdown the Client
+-func (bs *Server) Close() error {
+-	return bs.process.Close()
++// Close is called to shutdown the Server. Returns when all workers and
++// decision engine have finished. Safe to calling multiple times/concurrently.
++func (bs *Server) Close() {
++	bs.closeOnce.Do(func() {
++		close(bs.closing)
++		bs.cancel()
++	})
++	bs.engine.Close()
++	bs.waitWorkers.Wait()
+ }
+diff --git a/bootstrap/bootstrap.go b/bootstrap/bootstrap.go
+index 28b00455..eea833be 100644
+--- a/bootstrap/bootstrap.go
++++ b/bootstrap/bootstrap.go
+@@ -10,9 +10,6 @@ import (
+ 	"time"
+ 
+ 	logging "github.com/ipfs/go-log/v2"
+-	"github.com/jbenet/goprocess"
+-	goprocessctx "github.com/jbenet/goprocess/context"
+-	periodicproc "github.com/jbenet/goprocess/periodic"
+ 	"github.com/libp2p/go-libp2p/core/host"
+ 	"github.com/libp2p/go-libp2p/core/network"
+ 	"github.com/libp2p/go-libp2p/core/peer"
+@@ -112,78 +109,105 @@ func (cfg *BootstrapConfig) SetBackupPeers(load func(context.Context) []peer.Add
+ // connections to well-known bootstrap peers. It also kicks off subsystem
+ // bootstrapping (i.e. routing).
+ func Bootstrap(id peer.ID, host host.Host, rt routing.Routing, cfg BootstrapConfig) (io.Closer, error) {
+-	// make a signal to wait for one bootstrap round to complete.
+-	doneWithRound := make(chan struct{})
+-
+ 	if len(cfg.BootstrapPeers()) == 0 {
+ 		// We *need* to bootstrap but we have no bootstrap peers
+ 		// configured *at all*, inform the user.
+ 		log.Warn("no bootstrap nodes configured: go-ipfs may have difficulty connecting to the network")
+ 	}
+ 
+-	// the periodic bootstrap function -- the connection supervisor
+-	periodic := func(worker goprocess.Process) {
+-		ctx := goprocessctx.OnClosingContext(worker)
++	ctx, cancel := context.WithCancel(context.Background())
+ 
+-		if err := bootstrapRound(ctx, host, cfg); err != nil {
+-			log.Debugf("%s bootstrap error: %s", id, err)
++	// Signal when first bootstrap round is complete, started independent of ticker.
++	doneWithRound := make(chan struct{})
++
++	go func() {
++		// the periodic bootstrap function -- the connection supervisor
++		periodic := func() {
++			if err := bootstrapRound(ctx, host, cfg); err != nil {
++				log.Debugf("%s bootstrap error: %s", id, err)
++			}
+ 		}
+ 
+-		// Exit the first call (triggered independently by `proc.Go`, not `Tick`)
+-		// only after being done with the *single* Routing.Bootstrap call. Following
+-		// periodic calls (`Tick`) will not block on this.
++		ticker := time.NewTicker(cfg.Period)
++		defer ticker.Stop()
++
++		// Run first round independent of ticker.
++		periodic()
+ 		<-doneWithRound
+-	}
++		if ctx.Err() != nil {
++			return
++		}
+ 
+-	// kick off the node's periodic bootstrapping
+-	proc := periodicproc.Tick(cfg.Period, periodic)
+-	proc.Go(periodic) // run one right now.
++		for {
++			select {
++			case <-ticker.C:
++				periodic()
++			case <-ctx.Done():
++				return
++			}
++		}
++	}()
+ 
+ 	// kick off Routing.Bootstrap
+ 	if rt != nil {
+-		ctx := goprocessctx.OnClosingContext(proc)
+ 		if err := rt.Bootstrap(ctx); err != nil {
+-			proc.Close()
++			cancel()
++			close(doneWithRound)
+ 			return nil, err
+ 		}
+ 	}
+ 
+-	doneWithRound <- struct{}{}
+-	close(doneWithRound) // it no longer blocks periodic
+-
+ 	// If loadBackupBootstrapPeers is not nil then saveBackupBootstrapPeers
+ 	// must also not be nil.
+ 	if cfg.loadBackupBootstrapPeers != nil {
+-		startSavePeersAsTemporaryBootstrapProc(cfg, host, proc)
++		doneWithRound <- struct{}{} // wait for first bootstrap
++		startSavePeersAsTemporaryBootstrapProc(ctx, cfg, host)
+ 	}
+ 
+-	return proc, nil
++	return &bootstrapCloser{
++		cancel: cancel,
++	}, nil
++}
++
++type bootstrapCloser struct {
++	cancel context.CancelFunc
++}
++
++func (bsc *bootstrapCloser) Close() error {
++	bsc.cancel()
++	return nil
+ }
+ 
+ // Aside of the main bootstrap process we also run a secondary one that saves
+ // connected peers as a backup measure if we can't connect to the official
+ // bootstrap ones. These peers will serve as *temporary* bootstrap nodes.
+-func startSavePeersAsTemporaryBootstrapProc(cfg BootstrapConfig, host host.Host, bootstrapProc goprocess.Process) {
+-	savePeersFn := func(worker goprocess.Process) {
+-		ctx := goprocessctx.OnClosingContext(worker)
++func startSavePeersAsTemporaryBootstrapProc(ctx context.Context, cfg BootstrapConfig, host host.Host) {
++	go func() {
++		periodic := func() {
++			if err := saveConnectedPeersAsTemporaryBootstrap(ctx, host, cfg); err != nil {
++				log.Debugf("saveConnectedPeersAsTemporaryBootstrap error: %s", err)
++			}
++		}
++
++		ticker := time.NewTicker(cfg.BackupBootstrapInterval)
++		defer ticker.Stop()
+ 
+-		if err := saveConnectedPeersAsTemporaryBootstrap(ctx, host, cfg); err != nil {
+-			log.Debugf("saveConnectedPeersAsTemporaryBootstrap error: %s", err)
++		// Run the first round now (after the first bootstrap process has
++		// finished) as the SavePeersPeriod can be much longer than bootstrap.
++		periodic()
++		if ctx.Err() != nil {
++			return
+ 		}
+-	}
+-	savePeersProc := periodicproc.Tick(cfg.BackupBootstrapInterval, savePeersFn)
+ 
+-	// When the main bootstrap process ends also terminate the 'save connected
+-	// peers' ones. Coupling the two seems the easiest way to handle this backup
+-	// process without additional complexity.
+-	go func() {
+-		<-bootstrapProc.Closing()
+-		savePeersProc.Close()
++		for {
++			select {
++			case <-ticker.C:
++				periodic()
++			case <-ctx.Done():
++				return
++			}
++		}
+ 	}()
+-
+-	// Run the first round now (after the first bootstrap process has finished)
+-	// as the SavePeersPeriod can be much longer than bootstrap.
+-	savePeersProc.Go(savePeersFn)
+ }
+ 
+ func saveConnectedPeersAsTemporaryBootstrap(ctx context.Context, host host.Host, cfg BootstrapConfig) error {
+diff --git a/go.mod b/go.mod
+index 54cb060e..3054db65 100644
+--- a/go.mod
++++ b/go.mod
+@@ -37,7 +37,6 @@ require (
+ 	github.com/ipld/go-car/v2 v2.14.2
+ 	github.com/ipld/go-codec-dagpb v1.6.0
+ 	github.com/ipld/go-ipld-prime v0.21.0
+-	github.com/jbenet/goprocess v0.1.4
+ 	github.com/libp2p/go-buffer-pool v0.1.0
+ 	github.com/libp2p/go-doh-resolver v0.4.0
+ 	github.com/libp2p/go-libp2p v0.37.0
+@@ -118,6 +117,7 @@ require (
+ 	github.com/ipfs/go-verifcid v0.0.3 // indirect
+ 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
+ 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
++	github.com/jbenet/goprocess v0.1.4 // indirect
+ 	github.com/klauspost/compress v1.17.11 // indirect
+ 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
+ 	github.com/koron/go-ssdp v0.0.4 // indirect
+diff --git a/go.sum b/go.sum
+index 30323017..57bb266c 100644
+--- a/go.sum
++++ b/go.sum
+@@ -233,7 +233,6 @@ github.com/ipld/go-ipld-prime/storage/bsadapter v0.0.0-20230102063945-1a409dc236
+ github.com/ipld/go-ipld-prime/storage/bsadapter v0.0.0-20230102063945-1a409dc236dd/go.mod h1:wZ8hH8UxeryOs4kJEJaiui/s00hDSbE37OKsL47g+Sw=
+ github.com/jackpal/go-nat-pmp v1.0.2 h1:KzKSgb7qkJvOUTqYl9/Hg/me3pWgBmERKrTGD7BdWus=
+ github.com/jackpal/go-nat-pmp v1.0.2/go.mod h1:QPH045xvCAeXUZOxsnwmrtiCoxIr9eob+4orBN1SBKc=
+-github.com/jbenet/go-cienv v0.1.0 h1:Vc/s0QbQtoxX8MwwSLWWh+xNNZvM3Lw7NsTcHrvvhMc=
+ github.com/jbenet/go-cienv v0.1.0/go.mod h1:TqNnHUmJgXau0nCzC7kXWeotg3J9W34CUv5Djy1+FlA=
+ github.com/jbenet/go-temp-err-catcher v0.1.0 h1:zpb3ZH6wIE8Shj2sKS+khgRvf7T7RABoLk/+KKHggpk=
+ github.com/jbenet/go-temp-err-catcher v0.1.0/go.mod h1:0kJRvmDZXNMIiJirNPEYfhpPwbGVtZVWC34vc5WLsDk=
+diff --git a/namesys/republisher/repub.go b/namesys/republisher/repub.go
+index 7ca2ae93..95e44043 100644
+--- a/namesys/republisher/repub.go
++++ b/namesys/republisher/repub.go
+@@ -16,8 +16,6 @@ import (
+ 	"github.com/ipfs/boxo/ipns"
+ 	ds "github.com/ipfs/go-datastore"
+ 	logging "github.com/ipfs/go-log/v2"
+-	"github.com/jbenet/goprocess"
+-	gpctx "github.com/jbenet/goprocess/context"
+ 	ic "github.com/libp2p/go-libp2p/core/crypto"
+ 	"github.com/libp2p/go-libp2p/core/peer"
+ )
+@@ -67,8 +65,17 @@ func NewRepublisher(ns namesys.Publisher, ds ds.Datastore, self ic.PrivKey, ks k
+ 	}
+ }
+ 
+-// Run starts the republisher facility. It can be stopped by stopping the provided proc.
+-func (rp *Republisher) Run(proc goprocess.Process) {
++// Run starts the republisher facility. It can be stopped by calling the returned function..
++func (rp *Republisher) Run() func() {
++	ctx, cancel := context.WithCancel(context.Background())
++	go rp.run(ctx)
++	return func() {
++		log.Debug("stopping republisher")
++		cancel()
++	}
++}
++
++func (rp *Republisher) run(ctx context.Context) {
+ 	timer := time.NewTimer(InitialRebroadcastDelay)
+ 	defer timer.Stop()
+ 	if rp.Interval < InitialRebroadcastDelay {
+@@ -79,21 +86,21 @@ func (rp *Republisher) Run(proc goprocess.Process) {
+ 		select {
+ 		case <-timer.C:
+ 			timer.Reset(rp.Interval)
+-			err := rp.republishEntries(proc)
++			err := rp.republishEntries(ctx)
+ 			if err != nil {
+ 				log.Info("republisher failed to republish: ", err)
+ 				if FailureRetryInterval < rp.Interval {
+ 					timer.Reset(FailureRetryInterval)
+ 				}
+ 			}
+-		case <-proc.Closing():
++		case <-ctx.Done():
+ 			return
+ 		}
+ 	}
+ }
+ 
+-func (rp *Republisher) republishEntries(p goprocess.Process) error {
+-	ctx, cancel := context.WithCancel(gpctx.OnClosingContext(p))
++func (rp *Republisher) republishEntries(ctx context.Context) error {
++	ctx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 	ctx, span := startSpan(ctx, "Republisher.RepublishEntries")
+ 	defer span.End()

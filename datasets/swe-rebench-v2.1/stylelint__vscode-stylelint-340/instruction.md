@@ -1,0 +1,4 @@
+Show old Stylelint warning regardless of if document is configured to be linted
+As mentioned in https://github.com/stylelint/vscode-stylelint/issues/284#issuecomment-972638636, in workspaces with an old copy of Stylelint, the error will not show unless the open document is configured to be linted in the extension using `stylelint.validate`. However, this isn't great because if the user had an environment in which they were using non-standard syntax and relying on the automatic inferral of syntaxes, they won't get a notification with a link to the migration guide when opening a non-standard file. So effectively, the extension doesn't lint and is silent about the old copy of Stylelint.
+
+We should change the warning's conditions such that it will still warn the user regardless of if the file that's been opened is configured to be linted.

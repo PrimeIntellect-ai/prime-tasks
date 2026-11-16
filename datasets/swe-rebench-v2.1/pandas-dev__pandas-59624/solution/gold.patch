@@ -1,0 +1,198 @@
+diff --git a/doc/source/whatsnew/v2.3.0.rst b/doc/source/whatsnew/v2.3.0.rst
+index 8a64aa7c60..03355f655e 100644
+--- a/doc/source/whatsnew/v2.3.0.rst
++++ b/doc/source/whatsnew/v2.3.0.rst
+@@ -103,7 +103,8 @@ Conversion
+ Strings
+ ^^^^^^^
+ - Bug in :meth:`Series.str.replace` when ``n < 0`` for :class:`StringDtype` with ``storage="pyarrow"`` (:issue:`59628`)
+--
++- Bug in the ``center`` method on :class:`Series` and :class:`Index` object ``str`` accessors with pyarrow-backed dtype not matching the python behavior in corner cases with an odd number of fill characters (:issue:`54792`)
++
+ 
+ Interval
+ ^^^^^^^^
+diff --git a/pandas/core/array_algos/quantile.py b/pandas/core/array_algos/quantile.py
+index b2f78182b9..8a920d1849 100644
+--- a/pandas/core/array_algos/quantile.py
++++ b/pandas/core/array_algos/quantile.py
+@@ -91,7 +91,7 @@ def quantile_with_mask(
+     if is_empty:
+         # create the array of na_values
+         # 2d len(values) * len(qs)
+-        flat = np.array([fill_value] * len(qs))
++        flat = np.full(len(qs), fill_value)
+         result = np.repeat(flat, len(values)).reshape(len(values), len(qs))
+     else:
+         result = _nanquantile(
+diff --git a/pandas/core/arrays/_arrow_string_mixins.py b/pandas/core/arrays/_arrow_string_mixins.py
+index c810af32f7..b5cf0573e7 100644
+--- a/pandas/core/arrays/_arrow_string_mixins.py
++++ b/pandas/core/arrays/_arrow_string_mixins.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from functools import partial
+ from typing import (
+     TYPE_CHECKING,
+     Literal,
+@@ -7,7 +8,10 @@ from typing import (
+ 
+ import numpy as np
+ 
+-from pandas.compat import pa_version_under10p1
++from pandas.compat import (
++    pa_version_under10p1,
++    pa_version_under17p0,
++)
+ 
+ from pandas.core.dtypes.missing import isna
+ 
+@@ -49,7 +53,19 @@ class ArrowStringArrayMixin:
+         elif side == "right":
+             pa_pad = pc.utf8_rpad
+         elif side == "both":
+-            pa_pad = pc.utf8_center
++            if pa_version_under17p0:
++                # GH#59624 fall back to object dtype
++                from pandas import array
++
++                obj_arr = self.astype(object, copy=False)  # type: ignore[attr-defined]
++                obj = array(obj_arr, dtype=object)
++                result = obj._str_pad(width, side, fillchar)  # type: ignore[attr-defined]
++                return type(self)._from_sequence(result, dtype=self.dtype)  # type: ignore[attr-defined]
++            else:
++                # GH#54792
++                # https://github.com/apache/arrow/issues/15053#issuecomment-2317032347
++                lean_left = (width % 2) == 0
++                pa_pad = partial(pc.utf8_center, lean_left_on_odd_padding=lean_left)
+         else:
+             raise ValueError(
+                 f"Invalid side: {side}. Side must be one of 'left', 'right', 'both'"
+diff --git a/pandas/core/arrays/_ranges.py b/pandas/core/arrays/_ranges.py
+index 600ddc7f71..88f5ac4ebd 100644
+--- a/pandas/core/arrays/_ranges.py
++++ b/pandas/core/arrays/_ranges.py
+@@ -18,6 +18,8 @@ from pandas._libs.tslibs import (
+     iNaT,
+ )
+ 
++from pandas.core.construction import range_to_ndarray
++
+ if TYPE_CHECKING:
+     from pandas._typing import npt
+ 
+@@ -82,17 +84,7 @@ def generate_regular_range(
+             "at least 'start' or 'end' should be specified if a 'period' is given."
+         )
+ 
+-    with np.errstate(over="raise"):
+-        # If the range is sufficiently large, np.arange may overflow
+-        #  and incorrectly return an empty array if not caught.
+-        try:
+-            values = np.arange(b, e, stride, dtype=np.int64)
+-        except FloatingPointError:
+-            xdr = [b]
+-            while xdr[-1] != e:
+-                xdr.append(xdr[-1] + stride)
+-            values = np.array(xdr[:-1], dtype=np.int64)
+-    return values
++    return range_to_ndarray(range(b, e, stride))
+ 
+ 
+ def _generate_range_overflow_safe(
+diff --git a/pandas/core/arrays/string_arrow.py b/pandas/core/arrays/string_arrow.py
+index e8e74b0ba1..a316998582 100644
+--- a/pandas/core/arrays/string_arrow.py
++++ b/pandas/core/arrays/string_arrow.py
+@@ -284,6 +284,7 @@ class ArrowStringArray(ObjectStringArrayMixin, ArrowExtensionArray, BaseStringAr
+     _str_map = BaseStringArray._str_map
+     _str_startswith = ArrowStringArrayMixin._str_startswith
+     _str_endswith = ArrowStringArrayMixin._str_endswith
++    _str_pad = ArrowStringArrayMixin._str_pad
+ 
+     def _str_contains(
+         self, pat, case: bool = True, flags: int = 0, na=np.nan, regex: bool = True
+@@ -546,7 +547,6 @@ class ArrowStringArrayNumpySemantics(ArrowStringArray):
+     _str_get = ArrowStringArrayMixin._str_get
+     _str_removesuffix = ArrowStringArrayMixin._str_removesuffix
+     _str_capitalize = ArrowStringArrayMixin._str_capitalize
+-    _str_pad = ArrowStringArrayMixin._str_pad
+     _str_title = ArrowStringArrayMixin._str_title
+     _str_swapcase = ArrowStringArrayMixin._str_swapcase
+     _str_slice_replace = ArrowStringArrayMixin._str_slice_replace
+diff --git a/pandas/core/dtypes/dtypes.py b/pandas/core/dtypes/dtypes.py
+index d3ad36c74d..6928335330 100644
+--- a/pandas/core/dtypes/dtypes.py
++++ b/pandas/core/dtypes/dtypes.py
+@@ -513,7 +513,7 @@ class CategoricalDtype(PandasExtensionDtype, ExtensionDtype):
+                 [cat_array, np.arange(len(cat_array), dtype=cat_array.dtype)]
+             )
+         else:
+-            cat_array = np.array([cat_array])
++            cat_array = cat_array.reshape(1, len(cat_array))
+         combined_hashed = combine_hash_arrays(iter(cat_array), num_items=len(cat_array))
+         return np.bitwise_xor.reduce(combined_hashed)
+ 
+diff --git a/pandas/core/groupby/groupby.py b/pandas/core/groupby/groupby.py
+index 8c9c92594e..5b718f0ce2 100644
+--- a/pandas/core/groupby/groupby.py
++++ b/pandas/core/groupby/groupby.py
+@@ -4370,11 +4370,12 @@ class GroupBy(BaseGroupBy[NDFrameT]):
+ 
+             return vals
+ 
+-        qs = np.array(q, dtype=np.float64)
+-        pass_qs: np.ndarray | None = qs
+         if is_scalar(q):
+             qs = np.array([q], dtype=np.float64)
+-            pass_qs = None
++            pass_qs: None | np.ndarray = None
++        else:
++            qs = np.asarray(q, dtype=np.float64)
++            pass_qs = qs
+ 
+         ids = self._grouper.ids
+         ngroups = self._grouper.ngroups
+diff --git a/pandas/core/indexes/multi.py b/pandas/core/indexes/multi.py
+index 878170c837..a4b92e7042 100644
+--- a/pandas/core/indexes/multi.py
++++ b/pandas/core/indexes/multi.py
+@@ -2686,9 +2686,9 @@ class MultiIndex(Index):
+         a valid valid
+         """
+ 
+-        def cats(level_codes):
++        def cats(level_codes: np.ndarray) -> np.ndarray:
+             return np.arange(
+-                np.array(level_codes).max() + 1 if len(level_codes) else 0,
++                level_codes.max() + 1 if len(level_codes) else 0,
+                 dtype=level_codes.dtype,
+             )
+ 
+diff --git a/pandas/core/tools/datetimes.py b/pandas/core/tools/datetimes.py
+index 0e91bfa99e..86c7316320 100644
+--- a/pandas/core/tools/datetimes.py
++++ b/pandas/core/tools/datetimes.py
+@@ -418,7 +418,7 @@ def _convert_listlike_datetimes(
+         arg, _ = maybe_convert_dtype(arg, copy=False, tz=libtimezones.maybe_get_tz(tz))
+     except TypeError:
+         if errors == "coerce":
+-            npvalues = np.array(["NaT"], dtype="datetime64[ns]").repeat(len(arg))
++            npvalues = np.full(len(arg), np.datetime64("NaT", "ns"))
+             return DatetimeIndex(npvalues, name=name)
+         raise
+ 
+diff --git a/pandas/core/window/rolling.py b/pandas/core/window/rolling.py
+index 37dcf3bc14..9ea825ad4e 100644
+--- a/pandas/core/window/rolling.py
++++ b/pandas/core/window/rolling.py
+@@ -1186,7 +1186,7 @@ class Window(BaseWindow):
+                 return values.copy()
+ 
+             def calc(x):
+-                additional_nans = np.array([np.nan] * offset)
++                additional_nans = np.full(offset, np.nan)
+                 x = np.concatenate((x, additional_nans))
+                 return func(
+                     x,

@@ -1,0 +1,686 @@
+diff --git a/src/index.ts b/src/index.ts
+index 8cd49c65d..9b8fa3bdd 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -141,6 +141,7 @@ export * from './storage/conversion/RepresentationConverter';
+ export * from './storage/conversion/TypedRepresentationConverter';
+ 
+ // Storage/Mapping
++export * from './storage/mapping/BaseFileIdentifierMapper';
+ export * from './storage/mapping/ExtensionBasedMapper';
+ export * from './storage/mapping/FileIdentifierMapper';
+ export * from './storage/mapping/FixedContentTypeMapper';
+diff --git a/src/ldp/permissions/SparqlPatchPermissionsExtractor.ts b/src/ldp/permissions/SparqlPatchPermissionsExtractor.ts
+index c4f1ab5b3..820f58413 100644
+--- a/src/ldp/permissions/SparqlPatchPermissionsExtractor.ts
++++ b/src/ldp/permissions/SparqlPatchPermissionsExtractor.ts
+@@ -22,8 +22,8 @@ export class SparqlPatchPermissionsExtractor extends PermissionsExtractor {
+     if (!this.isSparql(body)) {
+       throw new NotImplementedHttpError('Cannot determine permissions of non-SPARQL patches.');
+     }
+-    if (!this.isDeleteInsert(body.algebra)) {
+-      throw new NotImplementedHttpError('Cannot determine permissions of a PATCH without DELETE/INSERT.');
++    if (!this.isSupported(body.algebra)) {
++      throw new NotImplementedHttpError('Can only determine permissions of a PATCH with DELETE/INSERT operations.');
+     }
+   }
+ 
+@@ -42,15 +42,33 @@ export class SparqlPatchPermissionsExtractor extends PermissionsExtractor {
+     return Boolean((data as SparqlUpdatePatch).algebra);
+   }
+ 
++  private isSupported(op: Algebra.Operation): boolean {
++    if (op.type === Algebra.types.DELETE_INSERT) {
++      return true;
++    }
++    if (op.type === Algebra.types.COMPOSITE_UPDATE) {
++      return (op as Algebra.CompositeUpdate).updates.every((update): boolean => this.isSupported(update));
++    }
++    return false;
++  }
++
+   private isDeleteInsert(op: Algebra.Operation): op is Algebra.DeleteInsert {
+     return op.type === Algebra.types.DELETE_INSERT;
+   }
+ 
+-  private needsAppend(update: Algebra.DeleteInsert): boolean {
+-    return Boolean(update.insert && update.insert.length > 0);
++  private needsAppend(update: Algebra.Operation): boolean {
++    if (this.isDeleteInsert(update)) {
++      return Boolean(update.insert && update.insert.length > 0);
++    }
++
++    return (update as Algebra.CompositeUpdate).updates.some((op): boolean => this.needsAppend(op));
+   }
+ 
+-  private needsWrite(update: Algebra.DeleteInsert): boolean {
+-    return Boolean(update.delete && update.delete.length > 0);
++  private needsWrite(update: Algebra.Operation): boolean {
++    if (this.isDeleteInsert(update)) {
++      return Boolean(update.delete && update.delete.length > 0);
++    }
++
++    return (update as Algebra.CompositeUpdate).updates.some((op): boolean => this.needsWrite(op));
+   }
+ }
+diff --git a/src/storage/mapping/BaseFileIdentifierMapper.ts b/src/storage/mapping/BaseFileIdentifierMapper.ts
+new file mode 100644
+index 000000000..49daab823
+--- /dev/null
++++ b/src/storage/mapping/BaseFileIdentifierMapper.ts
+@@ -0,0 +1,145 @@
++import type { ResourceIdentifier } from '../../ldp/representation/ResourceIdentifier';
++import { getLoggerFor } from '../../logging/LogUtil';
++import { APPLICATION_OCTET_STREAM } from '../../util/ContentTypes';
++import {
++  encodeUriPathComponents,
++  ensureTrailingSlash,
++  isContainerIdentifier,
++  normalizeFilePath,
++  trimTrailingSlashes,
++} from '../../util/PathUtil';
++import type { FileIdentifierMapper, ResourceLink } from './FileIdentifierMapper';
++import { getAbsolutePath, getRelativePath, validateRelativePath } from './MapperUtil';
++
++/**
++ * Base class for {@link FileIdentifierMapper} implementations.
++ */
++export class BaseFileIdentifierMapper implements FileIdentifierMapper {
++  protected readonly logger = getLoggerFor(this);
++  protected readonly baseRequestURI: string;
++  protected readonly rootFilepath: string;
++
++  public constructor(base: string, rootFilepath: string) {
++    this.baseRequestURI = trimTrailingSlashes(base);
++    this.rootFilepath = trimTrailingSlashes(normalizeFilePath(rootFilepath));
++  }
++
++  /**
++   * Maps the given resource identifier / URL to a file path.
++   * Determines the content type if none was provided.
++   * For containers the content-type input is ignored.
++   * @param identifier - The input identifier.
++   * @param contentType - The content-type provided with the request.
++   *
++   * @returns A ResourceLink with all the necessary metadata.
++   */
++  public async mapUrlToFilePath(identifier: ResourceIdentifier, contentType?: string): Promise<ResourceLink> {
++    const path = getRelativePath(this.baseRequestURI, identifier);
++    validateRelativePath(path, identifier);
++
++    const filePath = getAbsolutePath(this.rootFilepath, path);
++    return isContainerIdentifier(identifier) ?
++      this.mapUrlToContainerPath(identifier, filePath) :
++      this.mapUrlToDocumentPath(identifier, filePath, contentType);
++  }
++
++  /**
++   * Maps the given container identifier to a file path,
++   * possibly making alterations to the direct translation.
++   * @param identifier - The input identifier.
++   * @param filePath - The direct translation of the identifier onto the file path.
++   *
++   * @returns A ResourceLink with all the necessary metadata.
++   */
++  protected async mapUrlToContainerPath(identifier: ResourceIdentifier, filePath: string): Promise<ResourceLink> {
++    this.logger.debug(`URL ${identifier.path} points to the container ${filePath}`);
++    return { identifier, filePath };
++  }
++
++  /**
++   * Maps the given document identifier to a file path,
++   * possibly making alterations to the direct translation
++   * (for instance, based on its content type)).
++   * Determines the content type if none was provided.
++   * @param identifier - The input identifier.
++   * @param filePath - The direct translation of the identifier onto the file path.
++   * @param contentType - The content-type provided with the request.
++   *
++   * @returns A ResourceLink with all the necessary metadata.
++   */
++  protected async mapUrlToDocumentPath(identifier: ResourceIdentifier, filePath: string, contentType?: string):
++  Promise<ResourceLink> {
++    contentType = await this.getContentTypeFromUrl(identifier, contentType);
++    this.logger.debug(`The path for ${identifier.path} is ${filePath}`);
++    return { identifier, filePath, contentType };
++  }
++
++  /**
++   * Determines the content type from the document identifier.
++   * @param identifier - The input identifier.
++   * @param contentType - The content-type provided with the request.
++   *
++   * @returns The content type of the document.
++   */
++  protected async getContentTypeFromUrl(identifier: ResourceIdentifier, contentType?: string): Promise<string> {
++    return contentType ?? APPLICATION_OCTET_STREAM;
++  }
++
++  /**
++   * Maps the given file path to a URL and determines its content type.
++   * @param filePath - The input file path.
++   * @param isContainer - If the path corresponds to a file.
++   *
++   * @returns A ResourceLink with all the necessary metadata.
++   */
++  public async mapFilePathToUrl(filePath: string, isContainer: boolean): Promise<ResourceLink> {
++    if (!filePath.startsWith(this.rootFilepath)) {
++      this.logger.error(`Trying to access file ${filePath} outside of ${this.rootFilepath}`);
++      throw new Error(`File ${filePath} is not part of the file storage at ${this.rootFilepath}`);
++    }
++    const relative = filePath.slice(this.rootFilepath.length);
++    let url: string;
++    let contentType: string | undefined;
++
++    if (isContainer) {
++      url = await this.getContainerUrl(relative);
++      this.logger.debug(`Container filepath ${filePath} maps to URL ${url}`);
++    } else {
++      url = await this.getDocumentUrl(relative);
++      this.logger.debug(`Document ${filePath} maps to URL ${url}`);
++      contentType = await this.getContentTypeFromPath(filePath);
++    }
++    return { identifier: { path: url }, filePath, contentType };
++  }
++
++  /**
++   * Maps the given container path to a URL and determines its content type.
++   * @param relative - The relative container path.
++   *
++   * @returns A ResourceLink with all the necessary metadata.
++   */
++  protected async getContainerUrl(relative: string): Promise<string> {
++    return ensureTrailingSlash(this.baseRequestURI + encodeUriPathComponents(relative));
++  }
++
++  /**
++   * Maps the given document path to a URL and determines its content type.
++   * @param relative - The relative document path.
++   *
++   * @returns A ResourceLink with all the necessary metadata.
++   */
++  protected async getDocumentUrl(relative: string): Promise<string> {
++    return trimTrailingSlashes(this.baseRequestURI + encodeUriPathComponents(relative));
++  }
++
++  /**
++   * Determines the content type from the relative path.
++   * @param filePath - The file path of the document.
++   *
++   * @returns The content type of the document.
++   */
++  // eslint-disable-next-line @typescript-eslint/no-unused-vars
++  protected async getContentTypeFromPath(filePath: string): Promise<string> {
++    return APPLICATION_OCTET_STREAM;
++  }
++}
+diff --git a/src/storage/mapping/ExtensionBasedMapper.ts b/src/storage/mapping/ExtensionBasedMapper.ts
+index 611bbfd7b..987750e0c 100644
+--- a/src/storage/mapping/ExtensionBasedMapper.ts
++++ b/src/storage/mapping/ExtensionBasedMapper.ts
+@@ -1,82 +1,22 @@
+ import { promises as fsPromises } from 'fs';
+ import * as mime from 'mime-types';
+ import type { ResourceIdentifier } from '../../ldp/representation/ResourceIdentifier';
+-import { getLoggerFor } from '../../logging/LogUtil';
+-import { APPLICATION_OCTET_STREAM, TEXT_TURTLE } from '../../util/ContentTypes';
++import { TEXT_TURTLE } from '../../util/ContentTypes';
+ import { NotImplementedHttpError } from '../../util/errors/NotImplementedHttpError';
+-import {
+-  encodeUriPathComponents,
+-  ensureTrailingSlash,
+-  isContainerIdentifier,
+-  joinFilePath,
+-  normalizeFilePath,
+-  trimTrailingSlashes,
+-} from '../../util/PathUtil';
+-import type { FileIdentifierMapper, FileIdentifierMapperFactory, ResourceLink } from './FileIdentifierMapper';
+-import { getAbsolutePath, getRelativePath, validateRelativePath } from './MapperUtil';
++import { joinFilePath, getExtension } from '../../util/PathUtil';
++import { BaseFileIdentifierMapper } from './BaseFileIdentifierMapper';
++import type { FileIdentifierMapperFactory, ResourceLink } from './FileIdentifierMapper';
+ 
+-export interface ResourcePath {
+-
+-  /**
+-   * The path of the container.
+-   */
+-  containerPath: string;
+-
+-  /**
+-   * The document name.
+-   */
+-  documentName?: string;
+-}
+-
+-/**
+- * A mapper that stores the content-type of resources in the file path extension.
+- * In case the extension of the identifier does not correspond to the correct content-type,
+- * a new extension will be appended (with a `$` in front of it).
+- * E.g. if the path is `input.ttl` with content-type `text/plain`, the path would actually be `input.ttl$.txt`.
+- * This new extension is stripped again when generating an identifier.
+- *
+- * Warning: Since this mapper iterates over all files in the requested directory,
+- * it can experience performance issues over directories with a huge number of files (10.000+).
+- * For typical directory structures, the performance of this mapper should be sufficient.
+- * @see https://github.com/solid/community-server/issues/333
+- */
+-export class ExtensionBasedMapper implements FileIdentifierMapper {
+-  protected readonly logger = getLoggerFor(this);
+-
+-  private readonly baseRequestURI: string;
+-  private readonly rootFilepath: string;
++export class ExtensionBasedMapper extends BaseFileIdentifierMapper {
+   private readonly types: Record<string, any>;
+ 
+   public constructor(base: string, rootFilepath: string, overrideTypes = { acl: TEXT_TURTLE, meta: TEXT_TURTLE }) {
+-    this.baseRequestURI = trimTrailingSlashes(base);
+-    this.rootFilepath = trimTrailingSlashes(normalizeFilePath(rootFilepath));
++    super(base, rootFilepath);
+     this.types = { ...mime.types, ...overrideTypes };
+   }
+ 
+-  /**
+-   * Maps the given resource identifier / URL to a file path.
+-   * Determines the content-type if no content-type was provided.
+-   * For containers the content-type input gets ignored.
+-   * @param identifier - The input identifier.
+-   * @param contentType - The (optional) content-type of the resource.
+-   *
+-   * @returns A ResourceLink with all the necessary metadata.
+-   */
+-  public async mapUrlToFilePath(identifier: ResourceIdentifier, contentType?: string): Promise<ResourceLink> {
+-    const path = getRelativePath(this.baseRequestURI, identifier);
+-    validateRelativePath(path, identifier);
+-
+-    let filePath = getAbsolutePath(this.rootFilepath, path);
+-
+-    // Container
+-    if (isContainerIdentifier(identifier)) {
+-      this.logger.debug(`URL ${identifier.path} points to the container ${filePath}`);
+-      return {
+-        identifier,
+-        filePath,
+-      };
+-    }
+-
++  protected async mapUrlToDocumentPath(identifier: ResourceIdentifier, filePath: string, contentType?: string):
++  Promise<ResourceLink> {
+     // Would conflict with how new extensions are stored
+     if (/\$\.\w+$/u.test(filePath)) {
+       this.logger.warn(`Identifier ${identifier.path} contains a dollar sign before its extension`);
+@@ -85,35 +25,23 @@ export class ExtensionBasedMapper implements FileIdentifierMapper {
+ 
+     // Existing file
+     if (!contentType) {
++      // Find a matching file
+       const [ , folder, documentName ] = /^(.*\/)(.*)$/u.exec(filePath)!;
+-
+       let fileName: string | undefined;
+       try {
+         const files = await fsPromises.readdir(folder);
+-        fileName = files.find(
+-          (file): boolean =>
+-            file.startsWith(documentName) && /^(?:\$\..+)?$/u.test(file.slice(documentName.length)),
+-        );
++        fileName = files.find((file): boolean =>
++          file.startsWith(documentName) && /^(?:\$\..+)?$/u.test(file.slice(documentName.length)));
+       } catch {
+         // Parent folder does not exist (or is not a folder)
+       }
+-
+-      // Matching file found
+       if (fileName) {
+         filePath = joinFilePath(folder, fileName);
+       }
+-
+-      this.logger.debug(`The path for ${identifier.path} is ${filePath}`);
+-      return {
+-        identifier,
+-        filePath,
+-        contentType: this.getContentTypeFromExtension(filePath),
+-      };
+-    }
+-
++      contentType = await this.getContentTypeFromPath(filePath);
+     // If the extension of the identifier matches a different content-type than the one that is given,
+     // we need to add a new extension to match the correct type.
+-    if (contentType !== this.getContentTypeFromExtension(filePath)) {
++    } else if (contentType !== await this.getContentTypeFromPath(filePath)) {
+       const extension = mime.extension(contentType);
+       if (!extension) {
+         this.logger.warn(`No extension found for ${contentType}`);
+@@ -121,74 +49,20 @@ export class ExtensionBasedMapper implements FileIdentifierMapper {
+       }
+       filePath += `$.${extension}`;
+     }
+-
+-    this.logger.debug(`The path for ${identifier.path} is ${filePath}`);
+-    return {
+-      identifier,
+-      filePath,
+-      contentType,
+-    };
++    return super.mapUrlToDocumentPath(identifier, filePath, contentType);
+   }
+ 
+-  /**
+-   * Maps the given file path to an URL and determines the content-type
+-   * @param filePath - The input file path.
+-   * @param isContainer - If the path corresponds to a file.
+-   *
+-   * @returns A ResourceLink with all the necessary metadata.
+-   */
+-  public async mapFilePathToUrl(filePath: string, isContainer: boolean): Promise<ResourceLink> {
+-    if (!filePath.startsWith(this.rootFilepath)) {
+-      this.logger.error(`Trying to access file ${filePath} outside of ${this.rootFilepath}`);
+-      throw new Error(`File ${filePath} is not part of the file storage at ${this.rootFilepath}`);
+-    }
+-
+-    let relative = filePath.slice(this.rootFilepath.length);
+-    if (isContainer) {
+-      const path = ensureTrailingSlash(this.baseRequestURI + encodeUriPathComponents(relative));
+-      this.logger.debug(`Container filepath ${filePath} maps to URL ${path}`);
+-      return {
+-        identifier: { path },
+-        filePath,
+-      };
+-    }
+-
+-    // Files
+-    const extension = this.getExtension(relative);
+-    const contentType = this.getContentTypeFromExtension(relative);
++  protected async getDocumentUrl(relative: string): Promise<string> {
++    const extension = getExtension(relative);
+     if (extension && relative.endsWith(`$.${extension}`)) {
+       relative = relative.slice(0, -(extension.length + 2));
+     }
+-
+-    const path = trimTrailingSlashes(this.baseRequestURI + encodeUriPathComponents(relative));
+-    this.logger.debug(`File ${filePath} (${contentType}) maps to URL ${path}`);
+-
+-    return {
+-      identifier: { path },
+-      filePath,
+-      contentType,
+-    };
++    return super.getDocumentUrl(relative);
+   }
+ 
+-  /**
+-   * Get the content type from a file path, using its extension.
+-   * @param path - The file path.
+-   *
+-   * @returns Content type of the file.
+-   */
+-  private getContentTypeFromExtension(path: string): string {
+-    const extension = this.getExtension(path);
+-    return (extension && this.types[extension.toLowerCase()]) || APPLICATION_OCTET_STREAM;
+-  }
+-
+-  /**
+-   * Extracts the extension (without dot) from a path.
+-   * Custom functin since `path.extname` does not work on all cases (e.g. ".acl")
+-   * @param path - Input path to parse.
+-   */
+-  private getExtension(path: string): string | null {
+-    const extension = /\.([^./]+)$/u.exec(path);
+-    return extension && extension[1];
++  protected async getContentTypeFromPath(filePath: string): Promise<string> {
++    return this.types[getExtension(filePath).toLowerCase()] ||
++      super.getContentTypeFromPath(filePath);
+   }
+ }
+ 
+@@ -197,4 +71,3 @@ export class ExtensionBasedMapperFactory implements FileIdentifierMapperFactory<
+     return new ExtensionBasedMapper(base, rootFilePath);
+   }
+ }
+-
+diff --git a/src/storage/mapping/FixedContentTypeMapper.ts b/src/storage/mapping/FixedContentTypeMapper.ts
+index c1e04b293..3d5cc8994 100644
+--- a/src/storage/mapping/FixedContentTypeMapper.ts
++++ b/src/storage/mapping/FixedContentTypeMapper.ts
+@@ -1,83 +1,24 @@
+ import type { ResourceIdentifier } from '../../ldp/representation/ResourceIdentifier';
+-import { getLoggerFor } from '../../logging/LogUtil';
+ import { NotImplementedHttpError } from '../../util/errors/NotImplementedHttpError';
+-import {
+-  encodeUriPathComponents,
+-  ensureTrailingSlash,
+-  isContainerIdentifier,
+-  normalizeFilePath,
+-  trimTrailingSlashes,
+-} from '../../util/PathUtil';
+-import type { FileIdentifierMapper, ResourceLink } from './FileIdentifierMapper';
+-import { getAbsolutePath, getRelativePath, validateRelativePath } from './MapperUtil';
++import { BaseFileIdentifierMapper } from './BaseFileIdentifierMapper';
+ 
+-/**
+- * A mapper that always returns a fixed content type for files.
+- */
+-export class FixedContentTypeMapper implements FileIdentifierMapper {
+-  protected readonly logger = getLoggerFor(this);
+-
+-  private readonly baseRequestURI: string;
+-  private readonly rootFilepath: string;
+-  private readonly contentType: string;
++export class FixedContentTypeMapper extends BaseFileIdentifierMapper {
++  protected readonly contentType: string;
+ 
+   public constructor(base: string, rootFilepath: string, contentType: string) {
+-    this.baseRequestURI = trimTrailingSlashes(base);
+-    this.rootFilepath = trimTrailingSlashes(normalizeFilePath(rootFilepath));
++    super(base, rootFilepath);
+     this.contentType = contentType;
+   }
+ 
+-  public async mapUrlToFilePath(identifier: ResourceIdentifier, contentType?: string): Promise<ResourceLink> {
+-    const path = getRelativePath(this.baseRequestURI, identifier);
+-    validateRelativePath(path, identifier);
+-
+-    const filePath = getAbsolutePath(this.rootFilepath, path);
+-
+-    // Container
+-    if (isContainerIdentifier(identifier)) {
+-      this.logger.debug(`URL ${identifier.path} points to the container ${filePath}`);
+-      return {
+-        identifier,
+-        filePath,
+-      };
+-    }
+-
++  protected async getContentTypeFromUrl(identifier: ResourceIdentifier, contentType?: string): Promise<string> {
+     // Only allow the configured content type
+     if (contentType && contentType !== this.contentType) {
+       throw new NotImplementedHttpError(`Unsupported content type ${contentType}, only ${this.contentType} is allowed`);
+     }
+-
+-    this.logger.debug(`The path for ${identifier.path} is ${filePath}`);
+-    return {
+-      identifier,
+-      filePath,
+-      contentType: this.contentType,
+-    };
++    return this.contentType;
+   }
+ 
+-  public async mapFilePathToUrl(filePath: string, isContainer: boolean): Promise<ResourceLink> {
+-    if (!filePath.startsWith(this.rootFilepath)) {
+-      this.logger.error(`Trying to access file ${filePath} outside of ${this.rootFilepath}`);
+-      throw new Error(`File ${filePath} is not part of the file storage at ${this.rootFilepath}`);
+-    }
+-
+-    const relative = filePath.slice(this.rootFilepath.length);
+-    if (isContainer) {
+-      const path = ensureTrailingSlash(this.baseRequestURI + encodeUriPathComponents(relative));
+-      this.logger.debug(`Container filepath ${filePath} maps to URL ${path}`);
+-      return {
+-        identifier: { path },
+-        filePath,
+-      };
+-    }
+-
+-    const path = trimTrailingSlashes(this.baseRequestURI + encodeUriPathComponents(relative));
+-    this.logger.debug(`File ${filePath} maps to URL ${path}`);
+-
+-    return {
+-      identifier: { path },
+-      filePath,
+-      contentType: this.contentType,
+-    };
++  protected async getContentTypeFromPath(): Promise<string> {
++    return this.contentType;
+   }
+ }
+diff --git a/src/storage/patch/SparqlUpdatePatchHandler.ts b/src/storage/patch/SparqlUpdatePatchHandler.ts
+index d9c8529a3..53a7ce187 100644
+--- a/src/storage/patch/SparqlUpdatePatchHandler.ts
++++ b/src/storage/patch/SparqlUpdatePatchHandler.ts
+@@ -41,11 +41,43 @@ export class SparqlUpdatePatchHandler extends PatchHandler {
+     // Verify the patch
+     const { identifier, patch } = input;
+     const op = patch.algebra;
+-    if (!this.isDeleteInsert(op)) {
++    this.validateUpdate(op);
++
++    const lock = await this.locker.acquire(identifier);
++    try {
++      await this.applyPatch(identifier, op);
++    } finally {
++      await lock.release();
++    }
++  }
++
++  private isDeleteInsert(op: Algebra.Operation): op is Algebra.DeleteInsert {
++    return op.type === Algebra.types.DELETE_INSERT;
++  }
++
++  private isComposite(op: Algebra.Operation): op is Algebra.CompositeUpdate {
++    return op.type === Algebra.types.COMPOSITE_UPDATE;
++  }
++
++  /**
++   * Checks if the input operation is of a supported type (DELETE/INSERT or composite of those)
++   */
++  private validateUpdate(op: Algebra.Operation): void {
++    if (this.isDeleteInsert(op)) {
++      this.validateDeleteInsert(op);
++    } else if (this.isComposite(op)) {
++      this.validateComposite(op);
++    } else {
+       this.logger.warn(`Unsupported operation: ${op.type}`);
+       throw new NotImplementedHttpError('Only DELETE/INSERT SPARQL update operations are supported');
+     }
++  }
+ 
++  /**
++   * Checks if the input DELETE/INSERT is supported.
++   * This means: no GRAPH statements, no DELETE WHERE.
++   */
++  private validateDeleteInsert(op: Algebra.DeleteInsert): void {
+     const def = defaultGraph();
+     const deletes = op.delete ?? [];
+     const inserts = op.insert ?? [];
+@@ -62,24 +94,21 @@ export class SparqlUpdatePatchHandler extends PatchHandler {
+       this.logger.warn('WHERE statements are not supported');
+       throw new NotImplementedHttpError('WHERE statements are not supported');
+     }
+-
+-    const lock = await this.locker.acquire(identifier);
+-    try {
+-      await this.applyPatch(identifier, deletes, inserts);
+-    } finally {
+-      await lock.release();
+-    }
+   }
+ 
+-  private isDeleteInsert(op: Algebra.Operation): op is Algebra.DeleteInsert {
+-    return op.type === Algebra.types.DELETE_INSERT;
++  /**
++   * Checks if the composite update only contains supported update components.
++   */
++  private validateComposite(op: Algebra.CompositeUpdate): void {
++    for (const update of op.updates) {
++      this.validateUpdate(update);
++    }
+   }
+ 
+   /**
+-   * Applies the given deletes and inserts to the resource.
++   * Apply the given algebra operation to the given identifier.
+    */
+-  private async applyPatch(identifier: ResourceIdentifier, deletes: Algebra.Pattern[], inserts: Algebra.Pattern[]):
+-  Promise<void> {
++  private async applyPatch(identifier: ResourceIdentifier, op: Algebra.Operation): Promise<void> {
+     const store = new Store<BaseQuad>();
+     try {
+       // Read the quads of the current representation
+@@ -100,13 +129,42 @@ export class SparqlUpdatePatchHandler extends PatchHandler {
+       this.logger.debug(`Patching new resource ${identifier.path}.`);
+     }
+ 
+-    // Apply the patch
+-    store.removeQuads(deletes);
+-    store.addQuads(inserts);
+-    this.logger.debug(`Removed ${deletes.length} and added ${inserts.length} quads to ${identifier.path}.`);
++    this.applyOperation(store, op);
+     this.logger.debug(`${store.size} quads will be stored to ${identifier.path}.`);
+ 
+     // Write the result
+     await this.source.setRepresentation(identifier, new BasicRepresentation(store.match() as Readable, INTERNAL_QUADS));
+   }
++
++  /**
++   * Apply the given algebra update operation to the store of quads.
++   */
++  private applyOperation(store: Store<BaseQuad>, op: Algebra.Operation): void {
++    if (this.isDeleteInsert(op)) {
++      this.applyDeleteInsert(store, op);
++    // Only other options is Composite after passing `validateUpdate`
++    } else {
++      this.applyComposite(store, op as Algebra.CompositeUpdate);
++    }
++  }
++
++  /**
++   * Apply the given composite update operation to the store of quads.
++   */
++  private applyComposite(store: Store<BaseQuad>, op: Algebra.CompositeUpdate): void {
++    for (const update of op.updates) {
++      this.applyOperation(store, update);
++    }
++  }
++
++  /**
++   * Apply the given DELETE/INSERT update operation to the store of quads.
++   */
++  private applyDeleteInsert(store: Store<BaseQuad>, op: Algebra.DeleteInsert): void {
++    const deletes = op.delete ?? [];
++    const inserts = op.insert ?? [];
++    store.removeQuads(deletes);
++    store.addQuads(inserts);
++    this.logger.debug(`Removed ${deletes.length} and added ${inserts.length} quads.`);
++  }
+ }
+diff --git a/src/util/PathUtil.ts b/src/util/PathUtil.ts
+index 4329505db..e521e0b59 100644
+--- a/src/util/PathUtil.ts
++++ b/src/util/PathUtil.ts
+@@ -59,6 +59,16 @@ export function trimTrailingSlashes(path: string): string {
+   return path.replace(/\/+$/u, '');
+ }
+ 
++/**
++ * Extracts the extension (without dot) from a path.
++ * Custom function since `path.extname` does not work on all cases (e.g. ".acl")
++ * @param path - Input path to parse.
++ */
++export function getExtension(path: string): string {
++  const extension = /\.([^./]+)$/u.exec(path);
++  return extension ? extension[1] : '';
++}
++
+ /**
+  * Converts a URI path to the canonical version by splitting on slashes,
+  * decoding any percent-based encodings,

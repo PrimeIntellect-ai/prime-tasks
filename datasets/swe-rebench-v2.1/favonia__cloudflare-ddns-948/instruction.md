@@ -1,0 +1,3 @@
+Support `CLOUDFLARE_*` environment variables
+- `CF_API_TOKEN` and `CLOUDFLARE_API_TOKEN`
+- `CF_API_TOKEN_FILE` and `CLOUDFLARE_API_TOKEN_FILE`

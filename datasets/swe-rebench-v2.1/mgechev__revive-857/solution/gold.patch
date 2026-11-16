@@ -1,0 +1,258 @@
+diff --git a/README.md b/README.md
+index 43800ae..2bdb47e 100644
+--- a/README.md
++++ b/README.md
+@@ -425,6 +425,37 @@ warningCode = 0
+ [rule.redefines-builtin-id]
+ ```
+ 
++### Rule-level file excludes
++
++You also can setup custom excludes for each rule.
++
++It's alternative for global `-exclude` program arg.
++
++```toml
++ignoreGeneratedHeader = false
++severity = "warning"
++confidence = 0.8
++errorCode = 0
++warningCode = 0
++
++[rule.blank-imports]
++   Exclude=["**/*.pb.go"]
++[rule.context-as-argument]
++   Exclude=["src/somepkg/*.go", "TEST"]
++```
++
++You can use following exclude patterns
++
++1. full paths to files `src/pkg/mypkg/some.go`
++2. globs `src/**/*.pb.go`
++3. regexes (should have prefix ~) `~\.(pb|auto|generated)\.go$`
++4. well-known `TEST` (same as `**/*_test.go`)
++5. special cases:
++  a. `*` and `~` patterns exclude all files (same effect than disabling the rule)
++  b. `""` (empty) pattern excludes nothing
++
++> NOTE: do not mess with `exclude` that can  be used at top level of TOML file, that mean "exclude package patterns", not "exclude file patterns"
++
+ ## Available Rules
+ 
+ List of all available rules. The rules ported from `golint` are left unchanged and indicated in the `golint` column.
+diff --git a/config/config.go b/config/config.go
+index 225a570..7643d27 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -149,6 +149,14 @@ func parseConfig(path string, config *lint.Config) error {
+ 	if err != nil {
+ 		return fmt.Errorf("cannot parse the config file: %v", err)
+ 	}
++	for k, r := range config.Rules {
++		err := r.Initialize()
++		if err != nil {
++			return fmt.Errorf("error in config of rule [%s] : [%v]", k, err)
++		}
++		config.Rules[k] = r
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/lint/config.go b/lint/config.go
+index 2763058..9b26d58 100644
+--- a/lint/config.go
++++ b/lint/config.go
+@@ -3,16 +3,44 @@ package lint
+ // Arguments is type used for the arguments of a rule.
+ type Arguments = []interface{}
+ 
++type FileFilters = []*FileFilter
++
+ // RuleConfig is type used for the rule configuration.
+ type RuleConfig struct {
+ 	Arguments Arguments
+ 	Severity  Severity
+ 	Disabled  bool
++	// Exclude - rule-level file excludes, TOML related (strings)
++	Exclude []string
++	// excludeFilters - regex-based file filters, initialized from Exclude
++	excludeFilters []*FileFilter
++}
++
++// Initialize - should be called after reading from TOML file
++func (rc *RuleConfig) Initialize() error {
++	for _, f := range rc.Exclude {
++		ff, err := ParseFileFilter(f)
++		if err != nil {
++			return err
++		}
++		rc.excludeFilters = append(rc.excludeFilters, ff)
++	}
++	return nil
+ }
+ 
+ // RulesConfig defines the config for all rules.
+ type RulesConfig = map[string]RuleConfig
+ 
++// MustExclude - checks if given filename `name` must be excluded
++func (rcfg *RuleConfig) MustExclude(name string) bool {
++	for _, exclude := range rcfg.excludeFilters {
++		if exclude.MatchFileName(name) {
++			return true
++		}
++	}
++	return false
++}
++
+ // DirectiveConfig is type used for the linter directive configuration.
+ type DirectiveConfig struct {
+ 	Severity Severity
+diff --git a/lint/file.go b/lint/file.go
+index dcf0e60..2325530 100644
+--- a/lint/file.go
++++ b/lint/file.go
+@@ -102,6 +102,9 @@ func (f *File) lint(rules []Rule, config Config, failures chan Failure) {
+ 	disabledIntervals := f.disabledIntervals(rules, mustSpecifyDisableReason, failures)
+ 	for _, currentRule := range rules {
+ 		ruleConfig := rulesConfig[currentRule.Name()]
++		if ruleConfig.MustExclude(f.Name) {
++			continue
++		}
+ 		currentFailures := currentRule.Apply(f, ruleConfig.Arguments)
+ 		for idx, failure := range currentFailures {
+ 			if failure.RuleName == "" {
+diff --git a/lint/filefilter.go b/lint/filefilter.go
+new file mode 100644
+index 0000000..8da090b
+--- /dev/null
++++ b/lint/filefilter.go
+@@ -0,0 +1,128 @@
++package lint
++
++import (
++	"fmt"
++	"regexp"
++	"strings"
++)
++
++// FileFilter - file filter to exclude some files for rule
++// supports whole
++// 1. file/dir names : pkg/mypkg/my.go,
++// 2. globs: **/*.pb.go,
++// 3. regexes (~ prefix) ~-tmp\.\d+\.go
++// 4. special test marker `TEST` - treats as `~_test\.go`
++type FileFilter struct {
++	// raw definition of filter inside config
++	raw string
++	// don't care what was at start, will use regexes inside
++	rx *regexp.Regexp
++	// marks filter as matching everything
++	matchesAll bool
++	// marks filter as matching nothing
++	matchesNothing bool
++}
++
++// ParseFileFilter - creates [FileFilter] for given raw filter
++// if empty string, it matches nothing
++// if `*`, or `~`, it matches everything
++// while regexp could be invalid, it could return it's compilation error
++func ParseFileFilter(rawFilter string) (*FileFilter, error) {
++	rawFilter = strings.TrimSpace(rawFilter)
++	result := new(FileFilter)
++	result.raw = rawFilter
++	result.matchesNothing = len(result.raw) == 0
++	result.matchesAll = result.raw == "*" || result.raw == "~"
++	if !result.matchesAll && !result.matchesNothing {
++		if err := result.prepareRegexp(); err != nil {
++			return nil, err
++		}
++	}
++	return result, nil
++}
++
++func (ff *FileFilter) String() string { return ff.raw }
++
++// MatchFileName - checks if file name matches filter
++func (ff *FileFilter) MatchFileName(name string) bool {
++	if ff.matchesAll {
++		return true
++	}
++	if ff.matchesNothing {
++		return false
++	}
++	name = strings.ReplaceAll(name, "\\", "/")
++	return ff.rx.MatchString(name)
++}
++
++var fileFilterInvalidGlobRegexp = regexp.MustCompile(`[^/]\*\*[^/]`)
++var escapeRegexSymbols = ".+{}()[]^$"
++
++func (ff *FileFilter) prepareRegexp() error {
++	var err error
++	var src = ff.raw
++	if src == "TEST" {
++		src = "~_test\\.go"
++	}
++	if strings.HasPrefix(src, "~") {
++		ff.rx, err = regexp.Compile(src[1:])
++		if err != nil {
++			return fmt.Errorf("invalid file filter [%s], regexp compile error: [%v]", ff.raw, err)
++		}
++		return nil
++	}
++	/* globs */
++	if strings.Contains(src, "*") {
++		if fileFilterInvalidGlobRegexp.MatchString(src) {
++			return fmt.Errorf("invalid file filter [%s], invalid glob pattern", ff.raw)
++		}
++		var rxBuild strings.Builder
++		rxBuild.WriteByte('^')
++		wasStar := false
++		justDirGlob := false
++		for _, c := range src {
++			if c == '*' {
++				if wasStar {
++					rxBuild.WriteString(`[\s\S]*`)
++					wasStar = false
++					justDirGlob = true
++					continue
++				}
++				wasStar = true
++				continue
++			}
++			if wasStar {
++				rxBuild.WriteString("[^/]*")
++				wasStar = false
++			}
++			if strings.ContainsRune(escapeRegexSymbols, c) {
++				rxBuild.WriteByte('\\')
++			}
++			rxBuild.WriteRune(c)
++			if c == '/' && justDirGlob {
++				rxBuild.WriteRune('?')
++			}
++			justDirGlob = false
++		}
++		if wasStar {
++			rxBuild.WriteString("[^/]*")
++		}
++		rxBuild.WriteByte('$')
++		ff.rx, err = regexp.Compile(rxBuild.String())
++		if err != nil {
++			return fmt.Errorf("invalid file filter [%s], regexp compile error after glob expand: [%v]", ff.raw, err)
++		}
++		return nil
++	}
++
++	// it's whole file mask, just escape dots and normilze separators
++	fillRx := src
++	fillRx = strings.ReplaceAll(fillRx, "\\", "/")
++	fillRx = strings.ReplaceAll(fillRx, ".", `\.`)
++	fillRx = "^" + fillRx + "$"
++	ff.rx, err = regexp.Compile(fillRx)
++	if err != nil {
++		return fmt.Errorf("invalid file filter [%s], regexp compile full path: [%v]", ff.raw, err)
++	}
++	return nil
++}

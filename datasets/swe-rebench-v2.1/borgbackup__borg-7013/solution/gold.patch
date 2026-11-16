@@ -1,0 +1,171 @@
+diff --git a/src/borg/archiver/__init__.py b/src/borg/archiver/__init__.py
+index 5ebf5460..201b32ce 100644
+--- a/src/borg/archiver/__init__.py
++++ b/src/borg/archiver/__init__.py
+@@ -15,7 +15,7 @@
+     import shlex
+     import signal
+     import time
+-    from datetime import datetime
++    from datetime import datetime, timezone
+ 
+     from ..logger import create_logger, setup_logging
+ 
+@@ -27,6 +27,7 @@
+     from ..helpers import Error, set_ec
+     from ..helpers import format_file_size
+     from ..helpers import remove_surrogates
++    from ..helpers import DatetimeWrapper, replace_placeholders
+     from ..helpers import check_python, check_extension_modules
+     from ..helpers import is_slow_msgpack, is_supported_msgpack, sysinfo
+     from ..helpers import signal_handler, raising_signal_handler, SigHup, SigTerm
+@@ -402,8 +403,18 @@ def parse_args(self, args=None):
+             }
+             if func not in bypass_allowed:
+                 raise Error("Not allowed to bypass locking mechanism for chosen command")
++        # we can only have a complete knowledge of placeholder replacements we should do **after** arg parsing,
++        # e.g. due to options like --timestamp that override the current time.
++        # thus we have to initialize replace_placeholders here and process all args that need placeholder replacement.
+         if getattr(args, "timestamp", None):
++            replace_placeholders.override("now", DatetimeWrapper(args.timestamp))
++            replace_placeholders.override("utcnow", DatetimeWrapper(args.timestamp.astimezone(timezone.utc)))
+             args.location = args.location.with_timestamp(args.timestamp)
++        for name in "name", "other_name", "newname", "glob_archives", "comment":
++            value = getattr(args, name, None)
++            if value is not None:
++                setattr(args, name, replace_placeholders(value))
++
+         return args
+ 
+     def prerun_checks(self, logger, is_serve):
+diff --git a/src/borg/archiver/_common.py b/src/borg/archiver/_common.py
+index 29da8d1c..a3af9063 100644
+--- a/src/borg/archiver/_common.py
++++ b/src/borg/archiver/_common.py
+@@ -8,7 +8,7 @@
+ from ..constants import *  # NOQA
+ from ..cache import Cache, assert_secure
+ from ..helpers import Error
+-from ..helpers import GlobSpec, SortBySpec, positive_int_validator, location_validator, Location
++from ..helpers import SortBySpec, positive_int_validator, location_validator, Location
+ from ..helpers.nanorst import rst_to_terminal
+ from ..manifest import Manifest, AI_HUMAN_SORT_KEYS
+ from ..patterns import PatternMatcher
+@@ -363,7 +363,6 @@ def define_archive_filters_group(subparser, *, sort_by=True, first_last=True):
+         "--glob-archives",
+         metavar="GLOB",
+         dest="glob_archives",
+-        type=GlobSpec,
+         action=Highlander,
+         help="only consider archive names matching the glob. " 'sh: rules apply, see "borg help patterns".',
+     )
+diff --git a/src/borg/archiver/create_cmd.py b/src/borg/archiver/create_cmd.py
+index cf5272a1..af046111 100644
+--- a/src/borg/archiver/create_cmd.py
++++ b/src/borg/archiver/create_cmd.py
+@@ -17,7 +17,7 @@
+ from ..constants import *  # NOQA
+ from ..compress import CompressionSpec
+ from ..helpers import ChunkerParams
+-from ..helpers import NameSpec, CommentSpec, FilesCacheMode
++from ..helpers import NameSpec, FilesCacheMode
+ from ..helpers import eval_escapes
+ from ..helpers import timestamp
+ from ..helpers import get_cache_dir, os_stat
+@@ -806,12 +806,7 @@ def build_parser_create(self, subparsers, common_parser, mid_common_parser):
+ 
+         archive_group = subparser.add_argument_group("Archive options")
+         archive_group.add_argument(
+-            "--comment",
+-            dest="comment",
+-            metavar="COMMENT",
+-            type=CommentSpec,
+-            default="",
+-            help="add a comment text to the archive",
++            "--comment", dest="comment", metavar="COMMENT", default="", help="add a comment text to the archive"
+         )
+         archive_group.add_argument(
+             "--timestamp",
+diff --git a/src/borg/archiver/recreate_cmd.py b/src/borg/archiver/recreate_cmd.py
+index 544588d6..40f2d6f2 100644
+--- a/src/borg/archiver/recreate_cmd.py
++++ b/src/borg/archiver/recreate_cmd.py
+@@ -6,7 +6,6 @@
+ from ..constants import *  # NOQA
+ from ..compress import CompressionSpec
+ from ..helpers import archivename_validator, ChunkerParams
+-from ..helpers import CommentSpec
+ from ..helpers import timestamp
+ from ..manifest import Manifest
+ 
+@@ -162,12 +161,7 @@ def build_parser_recreate(self, subparsers, common_parser, mid_common_parser):
+             help="write checkpoint every SECONDS seconds (Default: 1800)",
+         )
+         archive_group.add_argument(
+-            "--comment",
+-            dest="comment",
+-            metavar="COMMENT",
+-            type=CommentSpec,
+-            default=None,
+-            help="add a comment text to the archive",
++            "--comment", dest="comment", metavar="COMMENT", default=None, help="add a comment text to the archive"
+         )
+         archive_group.add_argument(
+             "--timestamp",
+diff --git a/src/borg/helpers/__init__.py b/src/borg/helpers/__init__.py
+index fc05b2b4..ba9bdb37 100644
+--- a/src/borg/helpers/__init__.py
++++ b/src/borg/helpers/__init__.py
+@@ -24,7 +24,7 @@
+ from .parseformat import format_file_size, parse_file_size, FileSize, parse_storage_quota
+ from .parseformat import sizeof_fmt, sizeof_fmt_iec, sizeof_fmt_decimal
+ from .parseformat import format_line, replace_placeholders, PlaceholderError
+-from .parseformat import PrefixSpec, GlobSpec, CommentSpec, SortBySpec, NameSpec
++from .parseformat import SortBySpec, NameSpec
+ from .parseformat import format_archive, parse_stringified_list, clean_lines
+ from .parseformat import Location, location_validator, archivename_validator
+ from .parseformat import BaseFormatter, ArchiveFormatter, ItemFormatter, file_status
+diff --git a/src/borg/helpers/parseformat.py b/src/borg/helpers/parseformat.py
+index d1508aef..ced8e77e 100644
+--- a/src/borg/helpers/parseformat.py
++++ b/src/borg/helpers/parseformat.py
+@@ -185,7 +185,7 @@ def format_line(format, data):
+         raise PlaceholderError(format, data, e.__class__.__name__, str(e))
+ 
+ 
+-def replace_placeholders(text, overrides={}):
++def _replace_placeholders(text, overrides={}):
+     """Replace placeholders in text with their values."""
+     from ..platform import fqdn, hostname, getosusername
+ 
+@@ -208,13 +208,26 @@ def replace_placeholders(text, overrides={}):
+     return format_line(text, data)
+ 
+ 
+-PrefixSpec = replace_placeholders
++class PlaceholderReplacer:
++    def __init__(self):
++        self.reset()
+ 
+-GlobSpec = replace_placeholders
++    def override(self, key, value):
++        self.overrides[key] = value
+ 
+-NameSpec = replace_placeholders
++    def reset(self):
++        self.overrides = {}
+ 
+-CommentSpec = replace_placeholders
++    def __call__(self, text, overrides=None):
++        ovr = {}
++        ovr.update(self.overrides)
++        ovr.update(overrides or {})
++        return _replace_placeholders(text, overrides=ovr)
++
++
++replace_placeholders = PlaceholderReplacer()
++
++NameSpec = str
+ 
+ 
+ def SortBySpec(text):

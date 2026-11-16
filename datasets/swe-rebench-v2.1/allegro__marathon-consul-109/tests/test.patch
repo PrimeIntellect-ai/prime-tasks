@@ -1,0 +1,180 @@
+diff --git a/apps/app_test.go b/apps/app_test.go
+index aafb856..85b7866 100644
+--- a/apps/app_test.go
++++ b/apps/app_test.go
+@@ -54,37 +54,25 @@ func TestParseApp(t *testing.T) {
+ 
+ 	appBlob, _ := ioutil.ReadFile("app.json")
+ 
+-	expected := &App{Labels: map[string]string{"consul": "true", "public": "tag"},
+-		HealthChecks: []HealthCheck{{Path: "/",
+-			PortIndex:              0,
+-			Protocol:               "HTTP",
+-			GracePeriodSeconds:     10,
+-			IntervalSeconds:        5,
+-			TimeoutSeconds:         10,
+-			MaxConsecutiveFailures: 3}},
+-		ID: "/myapp",
+-		Tasks: []Task{{
+-			ID:    "myapp.cc49ccc1-9812-11e5-a06e-56847afe9799",
+-			AppID: "/myapp",
+-			Host:  "10.141.141.10",
+-			Ports: []int{31678,
+-				31679,
+-				31680,
+-				31681},
+-			HealthCheckResults: []HealthCheckResult{{Alive: true}}},
+-			{
+-				ID:    "myapp.c8b449f0-9812-11e5-a06e-56847afe9799",
+-				AppID: "/myapp",
+-				Host:  "10.141.141.10",
+-				Ports: []int{31307,
+-					31308,
+-					31309,
+-					31310},
+-				HealthCheckResults: []HealthCheckResult{{Alive: true}}}}}
+-
+ 	app, err := ParseApp(appBlob)
+ 	assert.NoError(t, err)
+-	assert.Equal(t, expected, app)
++
++	assert.Equal(t, "/myapp", app.ID.String())
++	assert.Equal(t, map[string]string{"consul": "true", "public": "tag"}, app.Labels)
++	assert.Len(t, app.Tasks, 2)
++
++	// The fixture always contains the original port-index based health check.
++	// Additional checks (e.g. static port ones) may be present and are not
++	// asserted here so the test does not depend on fixture-only data.
++	assert.Contains(t, app.HealthChecks, HealthCheck{
++		Path:                   "/",
++		PortIndex:              0,
++		Protocol:               "HTTP",
++		GracePeriodSeconds:     10,
++		IntervalSeconds:        5,
++		TimeoutSeconds:         10,
++		MaxConsecutiveFailures: 3,
++	})
+ }
+ 
+ func TestConsulApp(t *testing.T) {
+diff --git a/consul/consul_test.go b/consul/consul_test.go
+index daf9678..6942351 100644
+--- a/consul/consul_test.go
++++ b/consul/consul_test.go
+@@ -1,7 +1,11 @@
+ package consul
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
+ 	"testing"
+ 	"time"
+ 
+@@ -484,6 +488,46 @@ func TestDeregisterServices_shouldReturnErrorOnFailure(t *testing.T) {
+ 	assert.Error(t, err)
+ }
+ 
++func TestRegisterServiceChecksHonourStaticPortsOfHealthChecks(t *testing.T) {
++	t.Parallel()
++
++	var registered consulapi.AgentServiceRegistration
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assert.NoError(t, json.NewDecoder(r.Body).Decode(&registered))
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++
++	host, port, err := net.SplitHostPort(server.Listener.Addr().String())
++	assert.NoError(t, err)
++	consul := New(ConsulConfig{Port: port, Timeout: time.Second})
++	app, err := apps.ParseApp([]byte(`{"app":{"id":"/static-port-app","labels":{"consul":"true"},"healthChecks":[{"path":"/health","protocol":"HTTP","port":8123,"intervalSeconds":60,"timeoutSeconds":20},{"path":"/secure","protocol":"HTTPS","port":8125,"intervalSeconds":60,"timeoutSeconds":20},{"protocol":"TCP","port":8124,"intervalSeconds":60,"timeoutSeconds":20}]}}`))
++	assert.NoError(t, err)
++
++	task := &apps.Task{
++		ID:    "static-port-task",
++		AppID: app.ID,
++		Host:  host,
++		Ports: []int{8090},
++	}
++	assert.NoError(t, consul.Register(task, app))
++	assert.Contains(t, registered.Checks, &consulapi.AgentServiceCheck{
++		HTTP:     "http://" + host + ":8123/health",
++		Interval: "60s",
++		Timeout:  "20s",
++	})
++	assert.Contains(t, registered.Checks, &consulapi.AgentServiceCheck{
++		HTTP:     "https://" + host + ":8125/secure",
++		Interval: "60s",
++		Timeout:  "20s",
++	})
++	assert.Contains(t, registered.Checks, &consulapi.AgentServiceCheck{
++		TCP:      host + ":8124",
++		Interval: "60s",
++		Timeout:  "20s",
++	})
++}
++
+ func TestMarathonTaskToConsulServiceMapping(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -564,28 +608,26 @@ func TestMarathonTaskToConsulServiceMapping(t *testing.T) {
+ 	assert.Nil(t, service.Check)
+ 	assert.Equal(t, 4, len(service.Checks))
+ 
+-	assert.Equal(t, consulapi.AgentServiceChecks{
+-		{
+-			HTTP:     "http://127.0.0.6:8090/api/health?with=query",
+-			Interval: "60s",
+-			Timeout:  "20s",
+-		},
+-		{
+-			HTTP:     "https://127.0.0.6:8090/secure/health?with=query",
+-			Interval: "50s",
+-			Timeout:  "20s",
+-		},
+-		{
+-			TCP:      "127.0.0.6:8443",
+-			Interval: "40s",
+-			Timeout:  "20s",
+-		},
+-		{
+-			Script:   "echo 1",
+-			Interval: "30s",
+-			Timeout:  "20s",
+-		},
+-	}, service.Checks)
++	assert.Contains(t, service.Checks, &consulapi.AgentServiceCheck{
++		HTTP:     "http://127.0.0.6:8090/api/health?with=query",
++		Interval: "60s",
++		Timeout:  "20s",
++	})
++	assert.Contains(t, service.Checks, &consulapi.AgentServiceCheck{
++		HTTP:     "https://127.0.0.6:8090/secure/health?with=query",
++		Interval: "50s",
++		Timeout:  "20s",
++	})
++	assert.Contains(t, service.Checks, &consulapi.AgentServiceCheck{
++		TCP:      "127.0.0.6:8443",
++		Interval: "40s",
++		Timeout:  "20s",
++	})
++	assert.Contains(t, service.Checks, &consulapi.AgentServiceCheck{
++		Script:   "echo 1",
++		Interval: "30s",
++		Timeout:  "20s",
++	})
+ }
+ 
+ func TestMarathonTaskToConsulServiceMapping_NotResolvableTaskHost(t *testing.T) {
+@@ -613,7 +655,7 @@ func TestMarathonTaskToConsulServiceMapping_NotResolvableTaskHost(t *testing.T)
+ 	task := &apps.Task{
+ 		ID:    "someTask",
+ 		AppID: app.ID,
+-		Host:  "invalid.localhost",
++		Host:  "consul-task-host.invalid",
+ 		Ports: []int{8090, 8443},
+ 	}
+ 

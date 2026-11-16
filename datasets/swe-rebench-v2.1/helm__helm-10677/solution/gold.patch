@@ -1,0 +1,215 @@
+diff --git a/cmd/helm/lint.go b/cmd/helm/lint.go
+index 73a37b6fe..46f3c0efd 100644
+--- a/cmd/helm/lint.go
++++ b/cmd/helm/lint.go
+@@ -27,6 +27,7 @@ import (
+ 	"github.com/spf13/cobra"
+ 
+ 	"helm.sh/helm/v3/pkg/action"
++	"helm.sh/helm/v3/pkg/chartutil"
+ 	"helm.sh/helm/v3/pkg/cli/values"
+ 	"helm.sh/helm/v3/pkg/getter"
+ 	"helm.sh/helm/v3/pkg/lint/support"
+@@ -44,6 +45,7 @@ or recommendation, it will emit [WARNING] messages.
+ func newLintCmd(out io.Writer) *cobra.Command {
+ 	client := action.NewLint()
+ 	valueOpts := &values.Options{}
++	var kubeVersion string
+ 
+ 	cmd := &cobra.Command{
+ 		Use:   "lint PATH",
+@@ -54,6 +56,15 @@ func newLintCmd(out io.Writer) *cobra.Command {
+ 			if len(args) > 0 {
+ 				paths = args
+ 			}
++
++			if kubeVersion != "" {
++				parsedKubeVersion, err := chartutil.ParseKubeVersion(kubeVersion)
++				if err != nil {
++					return fmt.Errorf("invalid kube version '%s': %s", kubeVersion, err)
++				}
++				client.KubeVersion = parsedKubeVersion
++			}
++
+ 			if client.WithSubcharts {
+ 				for _, p := range paths {
+ 					filepath.Walk(filepath.Join(p, "charts"), func(path string, info os.FileInfo, err error) error {
+@@ -137,6 +148,7 @@ func newLintCmd(out io.Writer) *cobra.Command {
+ 	f.BoolVar(&client.Strict, "strict", false, "fail on lint warnings")
+ 	f.BoolVar(&client.WithSubcharts, "with-subcharts", false, "lint dependent charts")
+ 	f.BoolVar(&client.Quiet, "quiet", false, "print only warnings and errors")
++	f.StringVar(&kubeVersion, "kube-version", "", "Kubernetes version used for capabilities and deprecation checks")
+ 	addValueOptionsFlags(f, valueOpts)
+ 
+ 	return cmd
+diff --git a/cmd/helm/testdata/testcharts/chart-with-deprecated-api/values.yaml b/cmd/helm/testdata/testcharts/chart-with-deprecated-api/values.yaml
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/pkg/action/lint.go b/pkg/action/lint.go
+index e71cfe733..ca497f2b8 100644
+--- a/pkg/action/lint.go
++++ b/pkg/action/lint.go
+@@ -36,6 +36,7 @@ type Lint struct {
+ 	Namespace     string
+ 	WithSubcharts bool
+ 	Quiet         bool
++	KubeVersion   *chartutil.KubeVersion
+ }
+ 
+ // LintResult is the result of Lint
+@@ -58,7 +59,7 @@ func (l *Lint) Run(paths []string, vals map[string]interface{}) *LintResult {
+ 	}
+ 	result := &LintResult{}
+ 	for _, path := range paths {
+-		linter, err := lintChart(path, vals, l.Namespace, l.Strict)
++		linter, err := lintChart(path, vals, l.Namespace, l.KubeVersion)
+ 		if err != nil {
+ 			result.Errors = append(result.Errors, err)
+ 			continue
+@@ -85,7 +86,7 @@ func HasWarningsOrErrors(result *LintResult) bool {
+ 	return len(result.Errors) > 0
+ }
+ 
+-func lintChart(path string, vals map[string]interface{}, namespace string, strict bool) (support.Linter, error) {
++func lintChart(path string, vals map[string]interface{}, namespace string, kubeVersion *chartutil.KubeVersion) (support.Linter, error) {
+ 	var chartPath string
+ 	linter := support.Linter{}
+ 
+@@ -124,5 +125,5 @@ func lintChart(path string, vals map[string]interface{}, namespace string, stric
+ 		return linter, errors.Wrap(err, "unable to check Chart.yaml file in chart")
+ 	}
+ 
+-	return lint.All(chartPath, vals, namespace, strict), nil
++	return lint.AllWithKubeVersion(chartPath, vals, namespace, kubeVersion), nil
+ }
+diff --git a/pkg/lint/lint.go b/pkg/lint/lint.go
+index 67e76bd3d..c0e79f55b 100644
+--- a/pkg/lint/lint.go
++++ b/pkg/lint/lint.go
+@@ -19,19 +19,25 @@ package lint // import "helm.sh/helm/v3/pkg/lint"
+ import (
+ 	"path/filepath"
+ 
++	"helm.sh/helm/v3/pkg/chartutil"
+ 	"helm.sh/helm/v3/pkg/lint/rules"
+ 	"helm.sh/helm/v3/pkg/lint/support"
+ )
+ 
+ // All runs all of the available linters on the given base directory.
+-func All(basedir string, values map[string]interface{}, namespace string, strict bool) support.Linter {
++func All(basedir string, values map[string]interface{}, namespace string, _ bool) support.Linter {
++	return AllWithKubeVersion(basedir, values, namespace, nil)
++}
++
++// AllWithKubeVersion runs all the available linters on the given base directory, allowing to specify the kubernetes version.
++func AllWithKubeVersion(basedir string, values map[string]interface{}, namespace string, kubeVersion *chartutil.KubeVersion) support.Linter {
+ 	// Using abs path to get directory context
+ 	chartDir, _ := filepath.Abs(basedir)
+ 
+ 	linter := support.Linter{ChartDir: chartDir}
+ 	rules.Chartfile(&linter)
+ 	rules.ValuesWithOverrides(&linter, values)
+-	rules.Templates(&linter, values, namespace, strict)
++	rules.TemplatesWithKubeVersion(&linter, values, namespace, kubeVersion)
+ 	rules.Dependencies(&linter)
+ 	return linter
+ }
+diff --git a/pkg/lint/rules/deprecations.go b/pkg/lint/rules/deprecations.go
+index ce19b91d5..90e7748a4 100644
+--- a/pkg/lint/rules/deprecations.go
++++ b/pkg/lint/rules/deprecations.go
+@@ -24,6 +24,8 @@ import (
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"k8s.io/apiserver/pkg/endpoints/deprecation"
+ 	kscheme "k8s.io/client-go/kubernetes/scheme"
++
++	"helm.sh/helm/v3/pkg/chartutil"
+ )
+ 
+ var (
+@@ -45,7 +47,7 @@ func (e deprecatedAPIError) Error() string {
+ 	return msg
+ }
+ 
+-func validateNoDeprecations(resource *K8sYamlStruct) error {
++func validateNoDeprecations(resource *K8sYamlStruct, kubeVersion *chartutil.KubeVersion) error {
+ 	// if `resource` does not have an APIVersion or Kind, we cannot test it for deprecation
+ 	if resource.APIVersion == "" {
+ 		return nil
+@@ -54,6 +56,14 @@ func validateNoDeprecations(resource *K8sYamlStruct) error {
+ 		return nil
+ 	}
+ 
++	majorVersion := k8sVersionMajor
++	minorVersion := k8sVersionMinor
++
++	if kubeVersion != nil {
++		majorVersion = kubeVersion.Major
++		minorVersion = kubeVersion.Minor
++	}
++
+ 	runtimeObject, err := resourceToRuntimeObject(resource)
+ 	if err != nil {
+ 		// do not error for non-kubernetes resources
+@@ -62,11 +72,12 @@ func validateNoDeprecations(resource *K8sYamlStruct) error {
+ 		}
+ 		return err
+ 	}
+-	maj, err := strconv.Atoi(k8sVersionMajor)
++
++	maj, err := strconv.Atoi(majorVersion)
+ 	if err != nil {
+ 		return err
+ 	}
+-	min, err := strconv.Atoi(k8sVersionMinor)
++	min, err := strconv.Atoi(minorVersion)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/lint/rules/template.go b/pkg/lint/rules/template.go
+index 1a061bd90..aa1dbb701 100644
+--- a/pkg/lint/rules/template.go
++++ b/pkg/lint/rules/template.go
+@@ -46,6 +46,11 @@ var (
+ 
+ // Templates lints the templates in the Linter.
+ func Templates(linter *support.Linter, values map[string]interface{}, namespace string, _ bool) {
++	TemplatesWithKubeVersion(linter, values, namespace, nil)
++}
++
++// TemplatesWithKubeVersion lints the templates in the Linter, allowing to specify the kubernetes version.
++func TemplatesWithKubeVersion(linter *support.Linter, values map[string]interface{}, namespace string, kubeVersion *chartutil.KubeVersion) {
+ 	fpath := "templates/"
+ 	templatesPath := filepath.Join(linter.ChartDir, fpath)
+ 
+@@ -70,6 +75,11 @@ func Templates(linter *support.Linter, values map[string]interface{}, namespace
+ 		Namespace: namespace,
+ 	}
+ 
++	caps := chartutil.DefaultCapabilities.Copy()
++	if kubeVersion != nil {
++		caps.KubeVersion = *kubeVersion
++	}
++
+ 	// lint ignores import-values
+ 	// See https://github.com/helm/helm/issues/9658
+ 	if err := chartutil.ProcessDependenciesWithMerge(chart, values); err != nil {
+@@ -80,7 +90,8 @@ func Templates(linter *support.Linter, values map[string]interface{}, namespace
+ 	if err != nil {
+ 		return
+ 	}
+-	valuesToRender, err := chartutil.ToRenderValues(chart, cvals, options, nil)
++
++	valuesToRender, err := chartutil.ToRenderValues(chart, cvals, options, caps)
+ 	if err != nil {
+ 		linter.RunLinterRule(support.ErrorSev, fpath, err)
+ 		return
+@@ -150,7 +161,7 @@ func Templates(linter *support.Linter, values map[string]interface{}, namespace
+ 					// NOTE: set to warnings to allow users to support out-of-date kubernetes
+ 					// Refs https://github.com/helm/helm/issues/8596
+ 					linter.RunLinterRule(support.WarningSev, fpath, validateMetadataName(yamlStruct))
+-					linter.RunLinterRule(support.WarningSev, fpath, validateNoDeprecations(yamlStruct))
++					linter.RunLinterRule(support.WarningSev, fpath, validateNoDeprecations(yamlStruct, kubeVersion))
+ 
+ 					linter.RunLinterRule(support.ErrorSev, fpath, validateMatchSelector(yamlStruct, renderedContent))
+ 					linter.RunLinterRule(support.ErrorSev, fpath, validateListAnnotations(yamlStruct, renderedContent))

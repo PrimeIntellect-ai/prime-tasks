@@ -1,0 +1,273 @@
+diff --git a/exchanges/graphcache/e2e-tests/query.spec.tsx b/exchanges/graphcache/e2e-tests/query.spec.tsx
+index 3736b941..9c479e1f 100644
+--- a/exchanges/graphcache/e2e-tests/query.spec.tsx
++++ b/exchanges/graphcache/e2e-tests/query.spec.tsx
+@@ -156,7 +156,7 @@ describe('Graphcache Queries', () => {
+     };
+ 
+     const SecondComponent = () => {
+-      const [{ error, data, fetching }] = useQuery({
++      const [{ error, data, fetching, stale }] = useQuery({
+         query: `{
+           movie {
+             id
+@@ -176,6 +176,7 @@ describe('Graphcache Queries', () => {
+           <div>Second Component</div>
+           <div id="second-data">{`Data: ${data.movie.id}`}</div>
+           <div id="second-error">{`Error: ${error?.message}`}</div>
++          <div id="second-stale">{`Stale: ${!!stale}`}</div>
+         </div>
+       );
+     };
+@@ -189,6 +190,7 @@ describe('Graphcache Queries', () => {
+ 
+     cy.get('#first-data').should('have.text', 'Data: title');
+     cy.get('#second-data').should('have.text', 'Data: foo');
++    cy.get('#second-stale').should('have.text', 'Stale: true');
+     // TODO: ideally we would be able to keep the error here but...
+     // cy.get('#first-error').should('have.text', 'Error: [GraphQL] Test');
+     // cy.get('#second-error').should('have.text', 'Error: [GraphQL] Test');
+diff --git a/exchanges/graphcache/src/offlineExchange.test.ts b/exchanges/graphcache/src/offlineExchange.test.ts
+index f78d083c..19da9a9f 100644
+--- a/exchanges/graphcache/src/offlineExchange.test.ts
++++ b/exchanges/graphcache/src/offlineExchange.test.ts
+@@ -8,7 +8,9 @@ import {
+ import { print } from 'graphql';
+ import { vi, expect, it, describe } from 'vitest';
+ 
+-import { pipe, map, makeSubject, tap, publish } from 'wonka';
++import { pipe, map, makeSubject, tap, publish, delay, filter } from 'wonka';
++import { minifyIntrospectionQuery } from '@urql/introspection';
++import { cacheExchange } from './index';
+ import { offlineExchange } from './offlineExchange';
+ 
+ const mutationOne = gql`
+@@ -213,7 +215,7 @@ describe('offline', () => {
+     expect(result).toBeCalledTimes(1);
+     expect(response).toBeCalledTimes(1);
+ 
+-    expect(result.mock.calls[0][0]).toEqual({
++    expect(result.mock.calls[0][0]).toMatchObject({
+       data: null,
+       error: undefined,
+       extensions: undefined,
+@@ -314,3 +316,97 @@ describe('offline', () => {
+     );
+   });
+ });
++
++describe('cache results', () => {
++  it('keeps loop-blocked partial results stale', () => {
++    vi.useFakeTimers();
++
++    const client = createClient({ url: 'http://0.0.0.0' });
++    const { source: operations$, next } = makeSubject<Operation>();
++    const reexecutions: Operation[] = [];
++    vi.spyOn(client, 'reexecuteOperation').mockImplementation(operation => {
++      reexecutions.push(operation);
++    });
++
++    const initialQuery = gql`
++      query {
++        todos {
++          id
++          text
++          __typename
++        }
++      }
++    `;
++    const partialQuery = gql`
++      query {
++        todos {
++          id
++          text
++          complete
++          author {
++            id
++            name
++            __typename
++          }
++          __typename
++        }
++      }
++    `;
++
++    const dependentOperation = client.createRequestOperation('query', {
++      key: 2,
++      query: partialQuery,
++      variables: undefined,
++    });
++    const initialOperation = client.createRequestOperation('query', {
++      key: 1,
++      query: initialQuery,
++      variables: undefined,
++    });
++    const initialData = {
++      __typename: 'Query',
++      todos: [
++        { __typename: 'Todo', id: '123', text: 'Learn' },
++        { __typename: 'Todo', id: '456', text: 'Teach' },
++      ],
++    };
++    const forward = (source: typeof operations$) =>
++      pipe(
++        source,
++        filter(operation => operation.key === initialOperation.key),
++        delay(1),
++        map(() => ({ operation: initialOperation, data: initialData }))
++      );
++    const results = vi.fn();
++
++    pipe(
++      cacheExchange({
++        schema: minifyIntrospectionQuery(
++          require('./test-utils/simple_schema.json')
++        ),
++      })({ forward, client, dispatchDebug })(operations$),
++      tap(results),
++      publish
++    );
++
++    // Register the more specific query before data arrives so that the initial
++    // query's cache write schedules it again. Its partial cache result is then
++    // suppressed from causing another reexecution to prevent a loop.
++    next(dependentOperation);
++    next(initialOperation);
++    vi.runAllTimers();
++    reexecutions.forEach(operation => next(operation));
++
++    const partialResult = results.mock.calls
++      .map(([result]) => result as OperationResult)
++      .find(result => result.operation.key === dependentOperation.key);
++
++    expect(partialResult?.data).toMatchObject({
++      todos: [
++        { id: '123', text: 'Learn' },
++        { id: '456', text: 'Teach' },
++      ],
++    });
++    expect(partialResult?.stale).toBe(true);
++  });
++});
+diff --git a/exchanges/graphcache/src/store/store.test.ts b/exchanges/graphcache/src/store/store.test.ts
+index aee9d14c..352617d8 100644
+--- a/exchanges/graphcache/src/store/store.test.ts
++++ b/exchanges/graphcache/src/store/store.test.ts
+@@ -448,42 +448,8 @@ describe('Store with OptimisticMutationConfig', () => {
+     InMemoryData.clearDataState();
+   });
+ 
+-  it('should invalidate null keys correctly', () => {
+-    const connection = gql`
+-      query test {
+-        exercisesConnection(page: { after: null, first: 10 }) {
+-          id
+-        }
+-      }
+-    `;
+-
+-    write(
+-      store,
+-      {
+-        query: connection,
+-      },
+-      {
+-        exercisesConnection: null,
+-      } as any
+-    );
+-    let { data } = query(store, { query: connection });
+-
+-    InMemoryData.initDataState('read', store.data, null);
+-    expect((data as any).exercisesConnection).toEqual(null);
+-    const fields = store.inspectFields({ __typename: 'Query' });
+-    fields.forEach(({ fieldName, arguments: args }) => {
+-      if (fieldName === 'exercisesConnection') {
+-        store.invalidate('Query', fieldName, args);
+-      }
+-    });
+-    InMemoryData.clearDataState();
+-
+-    ({ data } = query(store, { query: connection }));
+-    expect(data).toBe(null);
+-  });
+-
+   it('should be able to write a fragment', () => {
+-    InMemoryData.initDataState('read', store.data, null);
++    InMemoryData.initDataState('write', store.data, null);
+ 
+     store.writeFragment(
+       gql`
+@@ -520,7 +486,7 @@ describe('Store with OptimisticMutationConfig', () => {
+   });
+ 
+   it('should be able to write a fragment by name', () => {
+-    InMemoryData.initDataState('read', store.data, null);
++    InMemoryData.initDataState('write', store.data, null);
+ 
+     store.writeFragment(
+       gql`
+@@ -626,7 +592,7 @@ describe('Store with OptimisticMutationConfig', () => {
+   });
+ 
+   it('should be able to update a query', () => {
+-    InMemoryData.initDataState('read', store.data, null);
++    InMemoryData.initDataState('write', store.data, null);
+     store.updateQuery({ query: Todos }, data => ({
+       ...data,
+       todos: [
+@@ -669,47 +635,6 @@ describe('Store with OptimisticMutationConfig', () => {
+     });
+   });
+ 
+-  it('should be able to update a query with variables', () => {
+-    write(
+-      store,
+-      {
+-        query: Appointment,
+-        variables: { id: '1' },
+-      },
+-      {
+-        __typename: 'Query',
+-        appointment: {
+-          __typename: 'Appointment',
+-          id: '1',
+-          info: 'urql meeting',
+-        },
+-      }
+-    );
+-
+-    InMemoryData.initDataState('read', store.data, null);
+-    store.updateQuery({ query: Appointment, variables: { id: '1' } }, data => ({
+-      ...data,
+-      appointment: {
+-        ...data.appointment,
+-        info: 'urql meeting revisited',
+-      },
+-    }));
+-    InMemoryData.clearDataState();
+-
+-    const { data: result } = query(store, {
+-      query: Appointment,
+-      variables: { id: '1' },
+-    });
+-    expect(result).toEqual({
+-      __typename: 'Query',
+-      appointment: {
+-        id: '1',
+-        info: 'urql meeting revisited',
+-        __typename: 'Appointment',
+-      },
+-    });
+-  });
+-
+   it('should be able to read a query', () => {
+     InMemoryData.initDataState('read', store.data, null);
+     const result = store.readQuery({ query: Todos });
+@@ -827,6 +752,7 @@ describe('Store with OptimisticMutationConfig', () => {
+ 
+   describe('Invalidating an entity', () => {
+     it('removes an entity from a list.', () => {
++      InMemoryData.initDataState('write', store.data, null);
+       store.invalidate(todosData.todos[1]);
+       const { data } = query(store, { query: Todos });
+       expect(data).toBe(null);

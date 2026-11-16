@@ -1,0 +1,204 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index ecc6613..d98f24f 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -48,6 +48,26 @@ repos:
+     hooks:
+     -   id: refurb
+         args: [--ignore, FURB126]
++-   repo: https://github.com/econchick/interrogate
++    rev: 1.5.0
++    hooks:
++    -   id: interrogate
++        args: [-v, --fail-under=75]
++        exclude: ^(tests/|docs/|scripts/)
++-   repo: https://github.com/pre-commit/mirrors-mypy
++    rev: 'v1.0.1'
++    hooks:
++    -   id: mypy
++        args: [
++            --no-strict-optional,
++            --ignore-missing-imports,
++        ]
++        additional_dependencies: [
++            attrs>=21.3.0,
++            click,
++            types-setuptools
++        ]
++        pass_filenames: false
+ -   repo: https://github.com/executablebooks/mdformat
+     rev: 0.7.16
+     hooks:
+@@ -82,12 +102,6 @@ repos:
+                 docs/source/tutorials/selecting_tasks.md|
+                 docs/source/tutorials/set_up_a_project.md
+             )$
+--   repo: https://github.com/econchick/interrogate
+-    rev: 1.5.0
+-    hooks:
+-    -   id: interrogate
+-        args: [-v, --fail-under=75]
+-        exclude: ^(tests/|docs/|scripts/)
+ -   repo: https://github.com/codespell-project/codespell
+     rev: v2.2.2
+     hooks:
+@@ -99,20 +113,6 @@ repos:
+     -   id: check-manifest
+         args: [--no-build-isolation]
+         additional_dependencies: [setuptools-scm, toml]
+--   repo: https://github.com/pre-commit/mirrors-mypy
+-    rev: 'v1.0.1'
+-    hooks:
+-    -   id: mypy
+-        args: [
+-            --no-strict-optional,
+-            --ignore-missing-imports,
+-        ]
+-        additional_dependencies: [
+-            attrs>=21.3.0,
+-            click,
+-            types-setuptools
+-        ]
+-        pass_filenames: false
+ -   repo: meta
+     hooks:
+     -   id: check-hooks-apply
+diff --git a/docs/source/changes.md b/docs/source/changes.md
+index 5f25deb..d5a1b06 100644
+--- a/docs/source/changes.md
++++ b/docs/source/changes.md
+@@ -12,6 +12,8 @@ releases are available on [PyPI](https://pypi.org/project/pytask) and
+ - {pull}`354` adds a `-f/--force` flag to execute tasks even though nothing may have
+   changed.
+ - {pull}`355` refactors a lot of things related to nodes.
++- {pull}`357` add hashing for task files to detect changes when modification times do
++  not match.
+ 
+ ## 0.3.1 - 2023-12-25
+ 
+diff --git a/src/_pytask/dag.py b/src/_pytask/dag.py
+index d35c0d9..a706855 100644
+--- a/src/_pytask/dag.py
++++ b/src/_pytask/dag.py
+@@ -1,6 +1,7 @@
+ """This module contains code related to resolving dependencies."""
+ from __future__ import annotations
+ 
++import hashlib
+ import itertools
+ import sys
+ 
+@@ -130,16 +131,30 @@ def _have_task_or_neighbors_changed(
+ def pytask_dag_has_node_changed(session: Session, node: Node, task_name: str) -> bool:
+     """Indicate whether a single dependency or product has changed."""
+     if isinstance(node, (FilePathNode, Task)):
+-        state = session.hook.pytask_node_state(node=node)
+-        if state is None:
++        # If node does not exist, we receive None.
++        file_state = session.hook.pytask_node_state(node=node)
++        if file_state is None:
+             return True
+ 
++        # If the node is not in the database.
+         try:
+-            state_in_db = State[task_name, node.name].state  # type: ignore[misc]
+-            has_changed = state != state_in_db
++            name = node.name
++            db_state = State[task_name, name]  # type: ignore[type-arg, valid-type]
+         except orm.ObjectNotFound:
+-            has_changed = True
+-        return has_changed
++            return True
++
++        # If the modification times match, the node has not been changed.
++        if file_state == db_state.modification_time:
++            return False
++
++        # If the modification time changed, quickly return for non-tasks.
++        if isinstance(node, FilePathNode):
++            return True
++
++        # When modification times changed, we are still comparing the hash of the file
++        # to avoid unnecessary and expensive reexecutions of tasks.
++        file_hash = hashlib.sha256(node.path.read_bytes()).hexdigest()
++        return file_hash != db_state.file_hash
+     return None
+ 
+ 
+diff --git a/src/_pytask/database_utils.py b/src/_pytask/database_utils.py
+index cc1e167..1de2c1f 100644
+--- a/src/_pytask/database_utils.py
++++ b/src/_pytask/database_utils.py
+@@ -1,7 +1,10 @@
+ """This module contains utilities for the database."""
+ from __future__ import annotations
+ 
++import hashlib
++
+ from _pytask.dag_utils import node_and_neighbors
++from _pytask.nodes_utils import Task
+ from _pytask.session import Session
+ from pony import orm
+ 
+@@ -17,7 +20,8 @@ class State(db.Entity):  # type: ignore[name-defined]
+ 
+     task = orm.Required(str)
+     node = orm.Required(str)
+-    state = orm.Required(str)
++    modification_time = orm.Required(str)
++    file_hash = orm.Optional(str)
+ 
+     orm.PrimaryKey(task, node)
+ 
+@@ -34,19 +38,34 @@ def create_database(
+ 
+ 
+ @orm.db_session
+-def _create_or_update_state(first_key: str, second_key: str, state: str) -> None:
++def _create_or_update_state(
++    first_key: str, second_key: str, modification_time: str, file_hash: str
++) -> None:
+     """Create or update a state."""
+     try:
+         state_in_db = State[first_key, second_key]  # type: ignore[type-arg, valid-type]
+     except orm.ObjectNotFound:
+-        State(task=first_key, node=second_key, state=state)
++        State(
++            task=first_key,
++            node=second_key,
++            modification_time=modification_time,
++            file_hash=file_hash,
++        )
+     else:
+-        state_in_db.state = state
++        state_in_db.modification_time = modification_time
++        state_in_db.file_hash = file_hash
+ 
+ 
+ def update_states_in_database(session: Session, task_name: str) -> None:
+     """Update the state for each node of a task in the database."""
+     for name in node_and_neighbors(session.dag, task_name):
+         node = session.dag.nodes[name].get("task") or session.dag.nodes[name]["node"]
+-        state = session.hook.pytask_node_state(node=node)
+-        _create_or_update_state(task_name, node.name, state)
++
++        modification_time = session.hook.pytask_node_state(node=node)
++
++        if isinstance(node, Task):
++            hash_ = hashlib.sha256(node.path.read_bytes()).hexdigest()
++        else:
++            hash_ = ""
++
++        _create_or_update_state(task_name, node.name, modification_time, hash_)
+diff --git a/src/_pytask/report.py b/src/_pytask/report.py
+index 24ce81b..4e3c4ce 100644
+--- a/src/_pytask/report.py
++++ b/src/_pytask/report.py
+@@ -49,6 +49,7 @@ class DagReport:
+ 
+     @classmethod
+     def from_exception(cls, exc_info: ExceptionInfo) -> DagReport:
++        exc_info = remove_internal_traceback_frames_from_exc_info(exc_info)
+         return cls(exc_info)
+ 
+ 

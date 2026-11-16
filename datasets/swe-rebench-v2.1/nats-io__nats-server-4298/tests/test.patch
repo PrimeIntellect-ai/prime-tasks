@@ -1,0 +1,155 @@
+diff --git a/server/events_test.go b/server/events_test.go
+index a4cb9555..4bdc63f4 100644
+--- a/server/events_test.go
++++ b/server/events_test.go
+@@ -14,12 +14,15 @@
+ package server
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"crypto/sha256"
++	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"math/rand"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+@@ -1668,7 +1671,7 @@ func TestSystemAccountWithGateways(t *testing.T) {
+ 
+ 	// If this tests fails with wrong number after 10 seconds we may have
+ 	// added a new inititial subscription for the eventing system.
+-	checkExpectedSubs(t, 53, sa)
++	checkExpectedSubs(t, 55, sa)
+ 
+ 	// Create a client on B and see if we receive the event
+ 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
+@@ -3412,6 +3415,113 @@ func TestServerEventsReload(t *testing.T) {
+ 	require_True(t, s.getOpts().PingInterval == 200*time.Millisecond)
+ }
+ 
++// createRawClient establishes a raw client connection to the server, performing
++// the operator JWT handshake, and optionally sends the initial PING. It returns
++// the underlying connection so the caller can keep it open.
++func createRawClient(t *testing.T, opts *Options, akp nkeys.KeyPair, name string, protocol int, sendPing bool) net.Conn {
++	t.Helper()
++	kp, _ := nkeys.CreateUser()
++	pub, _ := kp.PublicKey()
++	nuc := jwt.NewUserClaims(pub)
++	ujwt, err := nuc.Encode(akp)
++	require_NoError(t, err)
++
++	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
++	require_NoError(t, err)
++
++	br := bufio.NewReader(conn)
++	line, err := br.ReadString('\n')
++	if err != nil {
++		conn.Close()
++		t.Fatalf("Error reading INFO: %v", err)
++	}
++	line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "INFO "))
++	var info Info
++	if err := json.Unmarshal([]byte(line), &info); err != nil {
++		conn.Close()
++		t.Fatalf("Error unmarshalling INFO: %v", err)
++	}
++
++	sig, err := kp.Sign([]byte(info.Nonce))
++	if err != nil {
++		conn.Close()
++		t.Fatalf("Error signing nonce: %v", err)
++	}
++
++	cinfo := map[string]interface{}{
++		"jwt":      ujwt,
++		"sig":      base64.RawURLEncoding.EncodeToString(sig),
++		"name":     name,
++		"protocol": protocol,
++		"verbose":  false,
++		"pedantic": false,
++		"lang":     "go",
++		"version":  "1.0.0",
++	}
++	b, err := json.Marshal(cinfo)
++	if err != nil {
++		conn.Close()
++		t.Fatalf("Error marshalling CONNECT: %v", err)
++	}
++	if _, err := fmt.Fprintf(conn, "CONNECT %s\r\n", b); err != nil {
++		conn.Close()
++		t.Fatalf("Error sending CONNECT: %v", err)
++	}
++	if sendPing {
++		if _, err := fmt.Fprintf(conn, "PING\r\n"); err != nil {
++			conn.Close()
++			t.Fatalf("Error sending PING: %v", err)
++		}
++	}
++	return conn
++}
++
++func TestServerEventsLDMKick(t *testing.T) {
++	disconnected := make(chan bool, 1)
++
++	s, opts := runTrustedServer(t)
++	defer s.Shutdown()
++
++	acc, akp := createAccount(s)
++	s.setSystemAccount(acc)
++
++	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
++	ncs, err := nats.Connect(url, createUserCreds(t, s, akp))
++	if err != nil {
++		t.Fatalf("Error on connect: %v", err)
++	}
++	defer ncs.Close()
++
++	_, akp2 := createAccount(s)
++
++	nc, err := nats.Connect(url, createUserCreds(t, s, akp2), nats.Name("TEST EVENTS KICK"))
++	if err != nil {
++		t.Fatalf("Error on connect: %v", err)
++	}
++	defer nc.Close()
++
++	nc.SetDisconnectErrHandler(func(_ *nats.Conn, err error) { disconnected <- true })
++
++	cid, err := nc.GetClientID()
++	if err != nil {
++		t.Fatalf("Error on getting the CID: %v", err)
++	}
++
++	// The request payload carries the connection ID in the documented "cid" field.
++	reqkickpayload, _ := json.Marshal(map[string]uint64{"cid": cid})
++
++	_, err = ncs.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.KICK", s.ID()), reqkickpayload, time.Second)
++	if err != nil {
++		t.Fatalf("Error trying to publish the KICK request: %v", err)
++	}
++
++	select {
++	case <-disconnected:
++	case <-time.After(time.Second):
++		t.Fatalf("timeout waiting for the client to get disconnected")
++	}
++}
++
+ func Benchmark_GetHash(b *testing.B) {
+ 	b.StopTimer()
+ 	// Get 100 random names
+diff --git a/server/monitor_test.go b/server/monitor_test.go
+index 9d9f7a2d..86c54baf 100644
+--- a/server/monitor_test.go
++++ b/server/monitor_test.go
+@@ -3946,7 +3946,6 @@ func TestMonitorAccountz(t *testing.T) {
+ 	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=$SYS", s.MonitorAddr().Port, AccountzPath)))
+ 	require_Contains(t, body, `"account_detail": {`)
+ 	require_Contains(t, body, `"account_name": "$SYS",`)
+-	require_Contains(t, body, `"subscriptions": 47,`)
+ 	require_Contains(t, body, `"is_system": true,`)
+ 	require_Contains(t, body, `"system_account": "$SYS"`)
+ 

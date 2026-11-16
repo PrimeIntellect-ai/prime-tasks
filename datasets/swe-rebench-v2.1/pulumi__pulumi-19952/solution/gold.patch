@@ -1,0 +1,199 @@
+diff --git a/changelog/pending/20250626--engine--synthesize-delete-steps-for-views-during-preview.yaml b/changelog/pending/20250626--engine--synthesize-delete-steps-for-views-during-preview.yaml
+new file mode 100644
+index 0000000000..909fe1deb9
+--- /dev/null
++++ b/changelog/pending/20250626--engine--synthesize-delete-steps-for-views-during-preview.yaml
+@@ -0,0 +1,4 @@
++changes:
++- type: fix
++  scope: engine
++  description: Synthesize delete steps for views during preview
+diff --git a/pkg/resource/deploy/resource_status.go b/pkg/resource/deploy/resource_status.go
+index 77021ef184..b1522301e2 100644
+--- a/pkg/resource/deploy/resource_status.go
++++ b/pkg/resource/deploy/resource_status.go
+@@ -164,25 +164,35 @@ func (rs *resourceStatusServer) Address() string {
+ }
+ 
+ // ReserveToken reserves a token for a resource status operation.
+-func (rs *resourceStatusServer) ReserveToken(urn resource.URN, refresh bool, persisted bool) (string, error) {
++func (rs *resourceStatusServer) ReserveToken(urn resource.URN, refresh, persisted bool) (string, error) {
+ 	if rs == nil {
+ 		return "", nil
+ 	}
++	token, _, err := rs.reserveToken(urn, refresh, persisted)
++	return token, err
++}
++
++// reserveToken reserves a token for a resource status operation, and returns the token and tokenInfo.
++func (rs *resourceStatusServer) reserveToken(urn resource.URN, refresh, persisted bool) (string, *tokenInfo, error) {
++	if rs == nil {
++		return "", nil, nil
++	}
+ 
+ 	logging.V(5).Infof("Reserving token for %s (refresh: %t)", urn, refresh)
+ 
+ 	token, err := uuid.NewV4()
+ 	if err != nil {
+-		return "", fmt.Errorf("creating token: %w", err)
++		return "", nil, fmt.Errorf("creating token: %w", err)
+ 	}
+ 	tokenString := token.String()
+ 	rs.urns.Store(urn, tokenString)
+-	rs.tokens.Store(tokenString, &tokenInfo{
++	info := &tokenInfo{
+ 		urn:       urn,
+ 		refresh:   refresh,
+ 		persisted: persisted,
+-	})
+-	return tokenString, nil
++	}
++	rs.tokens.Store(tokenString, info)
++	return tokenString, info, nil
+ }
+ 
+ // ReleaseToken returns the view steps published for the URN and releases the associated token so that no further
+@@ -247,6 +257,10 @@ func (rs *resourceStatusServer) PublishViewSteps(ctx context.Context,
+ 	}
+ 	viewOf := info.urn
+ 
++	if len(req.Steps) == 0 {
++		return &pulumirpc.PublishViewStepsResponse{}, nil
++	}
++
+ 	// Unmarshal the steps.
+ 	steps, err := slice.MapError(req.Steps, func(step *pulumirpc.ViewStep) (Step, error) {
+ 		return rs.unmarshalViewStep(viewOf, step, info.refresh, info.persisted)
+@@ -256,10 +270,6 @@ func (rs *resourceStatusServer) PublishViewSteps(ctx context.Context,
+ 		return nil, fmt.Errorf("unmarshaling steps: %w", err)
+ 	}
+ 
+-	if len(steps) == 0 {
+-		return &pulumirpc.PublishViewStepsResponse{}, nil
+-	}
+-
+ 	// Save any refresh steps.
+ 	for _, step := range steps {
+ 		if step.Op() == OpRefresh {
+@@ -269,27 +279,44 @@ func (rs *resourceStatusServer) PublishViewSteps(ctx context.Context,
+ 		}
+ 	}
+ 
++	// Publish the steps.
++	if err := rs.publishViewSteps(info, steps); err != nil {
++		return nil, err
++	}
++
++	return &pulumirpc.PublishViewStepsResponse{}, nil
++}
++
++// publishViewStepsWithTokenInfo publishes the view steps.
++func (rs *resourceStatusServer) publishViewSteps(info *tokenInfo, steps []Step) error {
++	if rs == nil {
++		return nil
++	}
++
++	contract.Requiref(info != nil, "info", "must not be nil")
++
+ 	events := rs.deployment.events
++	if events == nil {
++		return nil
++	}
+ 
+ 	// Raise the OnResourceStepPre event and keep track of the payload context.
+-	if events != nil {
+-		for _, step := range steps {
+-			payload, err := events.OnResourceStepPre(step)
+-			if err != nil {
+-				logging.V(5).Infof("ResourceStatus: error publishing view steps: %v", err)
+-				return nil, fmt.Errorf("publishing view steps: %w", err)
+-			}
+-
+-			info.mu.Lock()
+-			info.steps = append(info.steps, stepInfo{
+-				step:    step,
+-				payload: payload,
+-			})
+-			info.mu.Unlock()
++	for _, step := range steps {
++		payload, err := events.OnResourceStepPre(step)
++		if err != nil {
++			logging.V(5).Infof("ResourceStatus: error publishing view steps: %v", err)
++			return fmt.Errorf("publishing view steps: %w", err)
+ 		}
++
++		info.mu.Lock()
++		info.steps = append(info.steps, stepInfo{
++			step:    step,
++			payload: payload,
++		})
++		info.mu.Unlock()
+ 	}
+ 
+-	return &pulumirpc.PublishViewStepsResponse{}, nil
++	return nil
+ }
+ 
+ func (rs *resourceStatusServer) unmarshalViewStep(
+diff --git a/pkg/resource/deploy/step.go b/pkg/resource/deploy/step.go
+index 6494d8548a..9b0bc50614 100644
+--- a/pkg/resource/deploy/step.go
++++ b/pkg/resource/deploy/step.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/pulumi/pulumi/sdk/v3/go/common/promise"
+ 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+ 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
++	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
+ 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+ 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+ 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
+@@ -500,7 +501,13 @@ func (s *DeleteStep) Apply() (resource.Status, StepCompleteFunc, error) {
+ 	}
+ 
+ 	if s.deployment.opts.DryRun {
+-		// Do nothing in preview
++		// Do nothing in preview other than synthesize and publish delete view steps for any views of this resource.
++		// We do this because when not running a preview the provider's Delete is responsible for publishing delete
++		// view steps so the provider can properly report partial failures, but during preview we don't call Delete
++		// on the provider, so we synthesize the view delete steps here for display purposes.
++		if err := s.publishSynthesizedViewSteps(); err != nil {
++			return resource.StatusOK, nil, err
++		}
+ 	} else if s.old.External {
+ 		// Deleting an External resource is a no-op, since Pulumi does not own the lifecycle.
+ 	} else if s.old.RetainOnDelete {
+@@ -568,6 +575,34 @@ func (s *DeleteStep) Apply() (resource.Status, StepCompleteFunc, error) {
+ 	return resource.StatusOK, func() {}, nil
+ }
+ 
++// publishSynthesizedViewSteps synthesizes delete view steps for any views of the resource
++// and publishes those view steps.
++func (s *DeleteStep) publishSynthesizedViewSteps() error {
++	oldViews := s.deployment.oldViews[s.old.URN]
++	if len(oldViews) == 0 {
++		return nil
++	}
++
++	// Synthesize delete view steps for any views.
++	deleteViewSteps := slice.Map(oldViews, func(res *resource.State) Step {
++		return NewViewStep(s.deployment, OpDelete, resource.StatusOK, "", res, nil, nil, nil, nil, "", false)
++	})
++
++	// Reserve a token.
++	_, tokenInfo, err := s.deployment.resourceStatus.reserveToken(
++		s.URN(), false /*refresh*/, false /*persisted*/)
++	if err != nil {
++		return err
++	}
++
++	// Publish the synthesized delete steps.
++	if err := s.deployment.resourceStatus.publishViewSteps(tokenInfo, deleteViewSteps); err != nil {
++		return err
++	}
++
++	return nil
++}
++
+ func (s *DeleteStep) Fail() {
+ 	// Nothing to do here.
+ }

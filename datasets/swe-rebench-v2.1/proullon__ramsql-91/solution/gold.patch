@@ -1,0 +1,225 @@
+diff --git a/README.md b/README.md
+index 0465dab..fd2265e 100644
+--- a/README.md
++++ b/README.md
+@@ -137,7 +137,7 @@ Find bellow all objectives for `v1.0.0`
+ | Table          | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+ | Schema         | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+ | CREATE         | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+-| PRIMARY_KEY    | SQL           | :heavy_check_mark:       | :heavy_multiplication_x: |
++| PRIMARY_KEY    | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+ | DEFAULT        | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+ | INSERT         | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+ | UNIQUE         | SQL           | :heavy_check_mark:       | :heavy_check_mark:       |
+diff --git a/driver/conn.go b/driver/conn.go
+index 99da5ae..a2564a3 100644
+--- a/driver/conn.go
++++ b/driver/conn.go
+@@ -104,6 +104,7 @@ func (c *Conn) Begin() (driver.Tx, error) {
+ 		return nil, err
+ 	}
+ 	c.tx = tx
++	log.Debug("%p BEGIN", c.tx)
+ 	return c, nil
+ }
+ 
+@@ -120,6 +121,7 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
+ 		return nil, err
+ 	}
+ 	c.tx = tx
++	log.Debug("%p BEGIN", c.tx)
+ 	return c, nil
+ }
+ 
+@@ -127,6 +129,7 @@ func (c *Conn) Rollback() error {
+ 	if c.tx == nil {
+ 		return nil
+ 	}
++	log.Debug("%p ROLLBACK", c.tx)
+ 	err := c.tx.Rollback()
+ 	c.tx = nil
+ 	return err
+@@ -136,6 +139,7 @@ func (c *Conn) Commit() error {
+ 	if c.tx == nil {
+ 		return nil
+ 	}
++	log.Debug("%p COMMIT", c.tx)
+ 	err := c.tx.Commit()
+ 	c.tx = nil
+ 	return err
+@@ -148,7 +152,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
+ 	var err error
+ 	autocommit := false
+ 
+-	log.Info("Conn.QueryContext: %s", query)
++	log.Debug("Conn.QueryContext: %s", query)
+ 
+ 	tx := c.tx
+ 
+diff --git a/engine/agnostic/index.go b/engine/agnostic/index.go
+index 8a2bb94..06cc363 100644
+--- a/engine/agnostic/index.go
++++ b/engine/agnostic/index.go
+@@ -20,6 +20,7 @@ type Index interface {
+ 	Remove(*list.Element)
+ 	Name() string
+ 	CanSourceWith(p Predicate) (bool, int64)
++	Get(values []any) (*list.Element, error)
+ }
+ 
+ type HashIndex struct {
+diff --git a/engine/agnostic/relation.go b/engine/agnostic/relation.go
+index 3703214..d1c70bd 100644
+--- a/engine/agnostic/relation.go
++++ b/engine/agnostic/relation.go
+@@ -56,6 +56,38 @@ func NewRelation(schema, name string, attributes []Attribute, pk []string) (*Rel
+ 	return r, nil
+ }
+ 
++func (r *Relation) CheckPrimaryKey(tuple *Tuple) (bool, error) {
++	if len(r.pk) == 0 {
++		return true, nil
++	}
++
++	var index Index
++	for i, _ := range r.indexes {
++		if strings.HasPrefix(r.indexes[i].Name(), "pk") {
++			index = r.indexes[i]
++			break
++		}
++	}
++	if index == nil {
++		return false, fmt.Errorf("primary key index not found")
++	}
++
++	var vals []any
++	for _, idx := range r.pk {
++		vals = append(vals, tuple.values[idx])
++	}
++
++	e, err := index.Get(vals)
++	if err != nil {
++		return false, err
++	}
++	if e == nil {
++		return true, nil
++	}
++
++	return false, nil
++}
++
+ func (r *Relation) Attribute(name string) (int, Attribute, error) {
+ 	name = strings.ToLower(name)
+ 	index, ok := r.attrIndex[name]
+diff --git a/engine/agnostic/transaction.go b/engine/agnostic/transaction.go
+index b1d6bc3..7d1275a 100644
+--- a/engine/agnostic/transaction.go
++++ b/engine/agnostic/transaction.go
+@@ -446,8 +446,14 @@ func (t *Transaction) Insert(schema, relation string, values map[string]any) (*T
+ 		return nil, t.abort(fmt.Errorf("attribute %s does not exist in relation %s", k, relation))
+ 	}
+ 
+-	// check primary key
+-	// TODO
++	// check primary key violation
++	ok, err := r.CheckPrimaryKey(tuple)
++	if err != nil {
++		return nil, t.abort(err)
++	}
++	if !ok {
++		return nil, t.abort(fmt.Errorf("primary key violation"))
++	}
+ 
+ 	// insert into row list
+ 	log.Debug("Inserting %v", tuple.values)
+diff --git a/engine/executor/engine.go b/engine/executor/engine.go
+index cdbc886..92a6bb6 100644
+--- a/engine/executor/engine.go
++++ b/engine/executor/engine.go
+@@ -206,6 +206,9 @@ func createTableExecutor(t *Tx, tableDecl *parser.Decl, args []NamedValue) (int6
+ 	// Fetch attributes
+ 	i++
+ 	for i < len(tableDecl.Decl) {
++		if tableDecl.Decl[i].Token != parser.StringToken {
++			break
++		}
+ 		attr, isPk, err := parseAttribute(tableDecl.Decl[i])
+ 		if err != nil {
+ 			return 0, 0, nil, nil, err
+@@ -217,6 +220,13 @@ func createTableExecutor(t *Tx, tableDecl *parser.Decl, args []NamedValue) (int6
+ 		i++
+ 	}
+ 
++	if i < len(tableDecl.Decl) && tableDecl.Decl[i].Token == parser.PrimaryToken {
++		d := tableDecl.Decl[i].Decl[0]
++		for _, attr := range d.Decl {
++			pk = append(pk, attr.Lexeme)
++		}
++	}
++
+ 	err := t.tx.CreateRelation(schemaName, relationName, attributes, pk)
+ 	if err != nil {
+ 		return 0, 0, nil, nil, err
+diff --git a/engine/executor/tx.go b/engine/executor/tx.go
+index ce620a3..2ede54f 100644
+--- a/engine/executor/tx.go
++++ b/engine/executor/tx.go
+@@ -57,12 +57,10 @@ func NewTx(ctx context.Context, e *Engine, opts sql.TxOptions) (*Tx, error) {
+ 		parser.GrantToken:    grantExecutor,
+ 	}
+ 
+-	log.Info("Begin(%p)", t.tx)
+ 	return t, nil
+ }
+ 
+ func (t *Tx) QueryContext(ctx context.Context, query string, args []NamedValue) ([]string, []*agnostic.Tuple, error) {
+-	log.Info("QueryContext(%p, %s)", t.tx, query)
+ 
+ 	instructions, err := parser.ParseInstruction(query)
+ 	if err != nil {
+@@ -91,14 +89,12 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args []NamedValue)
+ 
+ // Commit the transaction on server
+ func (t *Tx) Commit() error {
+-	log.Info("Commit(%p)", t.tx)
+ 	_, err := t.tx.Commit()
+ 	return err
+ }
+ 
+ // Rollback all changes
+ func (t *Tx) Rollback() error {
+-	log.Info("Rollback(%p)", t.tx)
+ 	t.tx.Rollback()
+ 	return nil
+ }
+diff --git a/engine/parser/create.go b/engine/parser/create.go
+index a591c88..790ae9b 100644
+--- a/engine/parser/create.go
++++ b/engine/parser/create.go
+@@ -223,10 +223,11 @@ func (p *parser) parseTable(tokens []Token) (*Decl, error) {
+ 
+ 		switch p.cur().Token {
+ 		case PrimaryToken:
+-			_, err := p.parsePrimaryKey()
++			pkDecl, err := p.parsePrimaryKey()
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			tableDecl.Add(pkDecl)
+ 			continue
+ 		default:
+ 		}
+@@ -385,11 +386,13 @@ func (p *parser) parsePrimaryKey() (*Decl, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		keyDecl.Add(d)
+ 
+ 		d, err = p.consumeToken(CommaToken, BracketClosingToken)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++
+ 		if d.Token == BracketClosingToken {
+ 			break
+ 		}

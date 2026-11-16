@@ -1,0 +1,625 @@
+diff --git a/examples/shadow/.gitignore b/examples/shadow/.gitignore
+new file mode 100644
+index 0000000..bd99514
+--- /dev/null
++++ b/examples/shadow/.gitignore
+@@ -0,0 +1,4 @@
++shadow
++root-CA.crt
++certificate.pem.crt
++private.pem.key
+diff --git a/examples/shadow/main.go b/examples/shadow/main.go
+new file mode 100644
+index 0000000..ec0a947
+--- /dev/null
++++ b/examples/shadow/main.go
+@@ -0,0 +1,120 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"time"
++
++	"github.com/at-wat/mqtt-go"
++	"github.com/seqsense/aws-iot-device-sdk-go/v4"
++	"github.com/seqsense/aws-iot-device-sdk-go/v4/shadow"
++)
++
++func main() {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if len(os.Args) != 3 {
++		println("usage: shadow AWS_IOT_ENDPOINT THING_NAME")
++		println("")
++		println("This example updates and deletes AWS IoT Thing Shadow.")
++		println("THING_NAME must be registered to your account of AWS IoT beforehand.")
++		println("")
++		println("Following files must be placed under the current working directory:")
++		println("         root-CA.crt: root CA certificate")
++		println(" certificate.pem.crt: client certificate associated to THING_NAME")
++		println("     private.pem.key: private key associated to THING_NAME")
++		os.Exit(1)
++	}
++	host := os.Args[1]
++	thingName := os.Args[2]
++
++	for _, file := range []string{
++		"root-CA.crt",
++		"certificate.pem.crt",
++		"private.pem.key",
++	} {
++		_, err := os.Stat(file)
++		if os.IsNotExist(err) {
++			println(file, "not found")
++			os.Exit(1)
++		}
++	}
++
++	cli, err := awsiotdev.New(
++		thingName,
++		&mqtt.URLDialer{
++			URL: fmt.Sprintf("mqtts://%s:8883", host),
++			Options: []mqtt.DialOption{
++				mqtt.WithTLSCertFiles(
++					host,
++					"root-CA.crt",
++					"certificate.pem.crt",
++					"private.pem.key",
++				),
++				mqtt.WithConnStateHandler(func(s mqtt.ConnState, err error) {
++					fmt.Printf("%s: %v\n", s, err)
++				}),
++			},
++		},
++		mqtt.WithReconnectWait(500*time.Millisecond, 2*time.Second),
++	)
++	if err != nil {
++		panic(err)
++	}
++	cli.Handle(mqtt.HandlerFunc(func(m *mqtt.Message) {
++		fmt.Printf("Message dropped: %v\n", *m)
++	}))
++
++	if _, err := cli.Connect(ctx,
++		thingName,
++		mqtt.WithKeepAlive(30),
++	); err != nil {
++		panic(err)
++	}
++
++	s, err := shadow.New(ctx, cli)
++	if err != nil {
++		panic(err)
++	}
++	s.OnError(func(err error) {
++		fmt.Printf("async error: %v\n", err)
++	})
++	cli.Handle(s)
++
++	fmt.Print("> update desire\n")
++	doc, err := s.Desire(ctx, sampleState{Value: 1})
++	if err != nil {
++		panic(err)
++	}
++	fmt.Printf("document: %v\n", doc)
++
++	fmt.Print("> update report\n")
++	doc, err = s.Report(ctx, sampleState{Value: 2})
++	if err != nil {
++		panic(err)
++	}
++	fmt.Printf("document: %v\n", doc)
++
++	fmt.Print("> get document\n")
++	doc, err = s.Get(ctx)
++	if err != nil {
++		panic(err)
++	}
++	fmt.Printf("document: %v\n", doc)
++
++	fmt.Print("> delete\n")
++	err = s.Delete(ctx)
++	if err != nil {
++		panic(err)
++	}
++	fmt.Printf("document: %v\n", s.Document())
++}
++
++type sampleState struct {
++	Value  int
++	Struct struct {
++		NestedValue int
++	}
++}
+diff --git a/shadow/clienttoken.go b/shadow/clienttoken.go
+new file mode 100644
+index 0000000..bb422df
+--- /dev/null
++++ b/shadow/clienttoken.go
+@@ -0,0 +1,42 @@
++// Copyright 2020 SEQSENSE, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package shadow
++
++import (
++	"reflect"
++)
++
++func clientToken(i interface{}) (string, bool) {
++	v := reflect.ValueOf(i).Elem().FieldByName("ClientToken")
++	if !v.IsValid() {
++		return "", false
++	}
++	if v.Kind() != reflect.String {
++		return "", false
++	}
++	return v.String(), true
++}
++
++func setClientToken(i interface{}, token string) bool {
++	v := reflect.ValueOf(i).Elem().FieldByName("ClientToken")
++	if !v.IsValid() {
++		return false
++	}
++	if v.Kind() != reflect.String {
++		return false
++	}
++	v.Set(reflect.ValueOf(token))
++	return true
++}
+diff --git a/shadow/shadow.go b/shadow/shadow.go
+index 3eecaed..c22c288 100644
+--- a/shadow/shadow.go
++++ b/shadow/shadow.go
+@@ -3,8 +3,10 @@ package shadow
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/at-wat/mqtt-go"
+ 	"github.com/seqsense/aws-iot-device-sdk-go/v4"
+@@ -13,12 +15,12 @@ import (
+ // Shadow is an interface of Thing Shadow.
+ type Shadow interface {
+ 	mqtt.Handler
+-	// Get thing state.
+-	Get(ctx context.Context) error
+-	// Report thing state.
+-	Report(ctx context.Context, state interface{}) error
+-	// Desire sets desired thing state.
+-	Desire(ctx context.Context, state interface{}) error
++	// Get thing state and update local state document.
++	Get(ctx context.Context) (*ThingDocument, error)
++	// Report thing state and update local state document.
++	Report(ctx context.Context, state interface{}) (*ThingDocument, error)
++	// Desire sets desired thing state and update local state document.
++	Desire(ctx context.Context, state interface{}) (*ThingDocument, error)
+ 	// Document returns full thing document.
+ 	Document() *ThingDocument
+ 	// Delete thing shadow.
+@@ -29,6 +31,12 @@ type Shadow interface {
+ 	OnError(func(error))
+ }
+ 
++// ErrRejected is returned if AWS IoT responded on rejected topic.
++var ErrRejected = errors.New("rejected")
++
++// ErrInvalidResponse is returned if failed to parse response from AWS IoT.
++var ErrInvalidResponse = errors.New("invalid response from AWS IoT")
++
+ type shadow struct {
+ 	mqtt.ServeMux
+ 	cli       mqtt.Client
+@@ -37,12 +45,38 @@ type shadow struct {
+ 	mu        sync.Mutex
+ 	onDelta   func(delta map[string]interface{})
+ 	onError   func(err error)
++
++	chResps map[string]chan interface{}
++
++	msgToken uint32
++}
++
++func (s *shadow) token() string {
++	token := atomic.AddUint32(&s.msgToken, 1)
++	return fmt.Sprintf("%x", token)
+ }
+ 
+ func (s *shadow) topic(operation string) string {
+ 	return "$aws/things/" + s.thingName + "/shadow/" + operation
+ }
+ 
++func (s *shadow) handleResponse(r interface{}) {
++	token, ok := clientToken(r)
++	if !ok {
++		return
++	}
++	s.mu.Lock()
++	ch, ok := s.chResps[token]
++	s.mu.Unlock()
++	if !ok {
++		return
++	}
++	select {
++	case ch <- r:
++	default:
++	}
++}
++
+ func (s *shadow) getAccepted(msg *mqtt.Message) {
+ 	doc := &ThingDocument{}
+ 	if err := json.Unmarshal(msg.Payload, doc); err != nil {
+@@ -50,11 +84,18 @@ func (s *shadow) getAccepted(msg *mqtt.Message) {
+ 		return
+ 	}
+ 	s.doc = doc
++	s.handleResponse(doc)
++
+ 	s.handleDelta(s.doc.State.Delta)
+ }
+ 
+-func (s *shadow) getRejected(msg *mqtt.Message) {
+-	s.handleError(fmt.Errorf("%s: %s", msg.Topic, string(msg.Payload)))
++func (s *shadow) rejected(msg *mqtt.Message) {
++	e := &ErrorResponse{}
++	if err := json.Unmarshal(msg.Payload, e); err != nil {
++		s.handleError(err)
++		return
++	}
++	s.handleResponse(e)
+ }
+ 
+ func (s *shadow) updateAccepted(msg *mqtt.Message) {
+@@ -67,6 +108,7 @@ func (s *shadow) updateAccepted(msg *mqtt.Message) {
+ 		s.handleError(err)
+ 		return
+ 	}
++	s.handleResponse(doc)
+ }
+ 
+ func (s *shadow) updateDelta(msg *mqtt.Message) {
+@@ -81,16 +123,14 @@ func (s *shadow) updateDelta(msg *mqtt.Message) {
+ 	}
+ }
+ 
+-func (s *shadow) updateRejected(msg *mqtt.Message) {
+-	s.handleError(fmt.Errorf("%s: %s", msg.Topic, string(msg.Payload)))
+-}
+-
+ func (s *shadow) deleteAccepted(msg *mqtt.Message) {
++	doc := &thingDocumentRaw{}
++	if err := json.Unmarshal(msg.Payload, doc); err != nil {
++		s.handleError(err)
++		return
++	}
+ 	s.doc = nil
+-}
+-
+-func (s *shadow) deleteRejected(msg *mqtt.Message) {
+-	s.handleError(fmt.Errorf("%s: %s", msg.Topic, string(msg.Payload)))
++	s.handleResponse(doc)
+ }
+ 
+ // New creates Thing Shadow interface.
+@@ -98,6 +138,15 @@ func New(ctx context.Context, cli awsiotdev.Device) (Shadow, error) {
+ 	s := &shadow{
+ 		cli:       cli,
+ 		thingName: cli.ThingName(),
++		doc: &ThingDocument{
++			State: ThingState{
++				Desired:  map[string]interface{}{},
++				Reported: map[string]interface{}{},
++				Delta:    map[string]interface{}{},
++			},
++		},
++
++		chResps: make(map[string]chan interface{}),
+ 	}
+ 	for _, sub := range []struct {
+ 		topic   string
+@@ -105,11 +154,11 @@ func New(ctx context.Context, cli awsiotdev.Device) (Shadow, error) {
+ 	}{
+ 		{s.topic("update/delta"), mqtt.HandlerFunc(s.updateDelta)},
+ 		{s.topic("update/accepted"), mqtt.HandlerFunc(s.updateAccepted)},
+-		{s.topic("update/rejected"), mqtt.HandlerFunc(s.updateRejected)},
++		{s.topic("update/rejected"), mqtt.HandlerFunc(s.rejected)},
+ 		{s.topic("get/accepted"), mqtt.HandlerFunc(s.getAccepted)},
+-		{s.topic("get/rejected"), mqtt.HandlerFunc(s.getRejected)},
++		{s.topic("get/rejected"), mqtt.HandlerFunc(s.rejected)},
+ 		{s.topic("delete/accepted"), mqtt.HandlerFunc(s.deleteAccepted)},
+-		{s.topic("delete/rejected"), mqtt.HandlerFunc(s.deleteRejected)},
++		{s.topic("delete/rejected"), mqtt.HandlerFunc(s.rejected)},
+ 	} {
+ 		if err := s.ServeMux.Handle(sub.topic, sub.handler); err != nil {
+ 			return nil, err
+@@ -131,70 +180,185 @@ func New(ctx context.Context, cli awsiotdev.Device) (Shadow, error) {
+ 	return s, nil
+ }
+ 
+-func (s *shadow) Report(ctx context.Context, state interface{}) error {
++func (s *shadow) Report(ctx context.Context, state interface{}) (*ThingDocument, error) {
+ 	rawState, err := json.Marshal(state)
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
++	token := s.token()
+ 	rawStateJSON := json.RawMessage(rawState)
+ 	data, err := json.Marshal(&thingDocumentRaw{
+-		State: thingStateRaw{Reported: rawStateJSON},
++		State:       thingStateRaw{Reported: rawStateJSON},
++		ClientToken: token,
+ 	})
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
++
++	ch := make(chan interface{}, 1)
++	s.mu.Lock()
++	s.chResps[token] = ch
++	s.mu.Unlock()
++	defer func() {
++		s.mu.Lock()
++		delete(s.chResps, token)
++		s.mu.Unlock()
++	}()
++
+ 	if err := s.cli.Publish(ctx, &mqtt.Message{
+ 		Topic:   s.topic("update"),
+ 		QoS:     mqtt.QoS1,
+ 		Payload: data,
+ 	}); err != nil {
+-		return err
++		return nil, err
++	}
++
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case res := <-ch:
++		switch r := res.(type) {
++		case *thingDocumentRaw:
++			return s.doc, nil
++		case *ErrorResponse:
++			return nil, r
++		default:
++			return nil, ErrInvalidResponse
++		}
+ 	}
+-	return nil
+ }
+ 
+-func (s *shadow) Desire(ctx context.Context, state interface{}) error {
++func (s *shadow) Desire(ctx context.Context, state interface{}) (*ThingDocument, error) {
+ 	rawState, err := json.Marshal(state)
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
++	token := s.token()
+ 	rawStateJSON := json.RawMessage(rawState)
+ 	data, err := json.Marshal(&thingDocumentRaw{
+-		State: thingStateRaw{Desired: rawStateJSON},
++		State:       thingStateRaw{Desired: rawStateJSON},
++		ClientToken: token,
+ 	})
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
++
++	ch := make(chan interface{}, 1)
++	s.mu.Lock()
++	s.chResps[token] = ch
++	s.mu.Unlock()
++	defer func() {
++		s.mu.Lock()
++		delete(s.chResps, token)
++		s.mu.Unlock()
++	}()
++
+ 	if err := s.cli.Publish(ctx, &mqtt.Message{
+ 		Topic:   s.topic("update"),
+ 		QoS:     mqtt.QoS1,
+ 		Payload: data,
+ 	}); err != nil {
+-		return err
++		return nil, err
++	}
++
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case res := <-ch:
++		switch r := res.(type) {
++		case *thingDocumentRaw:
++			return s.doc, nil
++		case *ErrorResponse:
++			return nil, r
++		default:
++			return nil, ErrInvalidResponse
++		}
+ 	}
+-	return nil
+ }
+ 
+-func (s *shadow) Get(ctx context.Context) error {
++func (s *shadow) Get(ctx context.Context) (*ThingDocument, error) {
++	token := s.token()
++	data, err := json.Marshal(&simpleRequest{
++		ClientToken: token,
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	ch := make(chan interface{}, 1)
++	s.mu.Lock()
++	s.chResps[token] = ch
++	s.mu.Unlock()
++	defer func() {
++		s.mu.Lock()
++		delete(s.chResps, token)
++		s.mu.Unlock()
++	}()
++
+ 	if err := s.cli.Publish(ctx, &mqtt.Message{
+ 		Topic:   s.topic("get"),
+ 		QoS:     mqtt.QoS1,
+-		Payload: []byte{},
++		Payload: []byte(data),
+ 	}); err != nil {
+-		return err
++		return nil, err
++	}
++
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case res := <-ch:
++		switch r := res.(type) {
++		case *ThingDocument:
++			setClientToken(r, "")
++			return r, nil
++		case *ErrorResponse:
++			return nil, r
++		default:
++			return nil, ErrInvalidResponse
++		}
+ 	}
+-	return nil
+ }
+ 
+ func (s *shadow) Delete(ctx context.Context) error {
++	token := s.token()
++	data, err := json.Marshal(&simpleRequest{
++		ClientToken: token,
++	})
++	if err != nil {
++		return err
++	}
++
++	ch := make(chan interface{}, 1)
++	s.mu.Lock()
++	s.chResps[token] = ch
++	s.mu.Unlock()
++	defer func() {
++		s.mu.Lock()
++		delete(s.chResps, token)
++		s.mu.Unlock()
++	}()
++
+ 	if err := s.cli.Publish(ctx, &mqtt.Message{
+ 		Topic:   s.topic("delete"),
+ 		QoS:     mqtt.QoS1,
+-		Payload: []byte{},
++		Payload: []byte(data),
+ 	}); err != nil {
+ 		return err
+ 	}
+-	return nil
++
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case res := <-ch:
++		switch r := res.(type) {
++		case *thingDocumentRaw:
++			return nil
++		case *ErrorResponse:
++			return r
++		default:
++			return ErrInvalidResponse
++		}
++	}
+ }
+ 
+ func (s *shadow) Document() *ThingDocument {
+diff --git a/shadow/state.go b/shadow/state.go
+index 6001064..e2e21af 100644
+--- a/shadow/state.go
++++ b/shadow/state.go
+@@ -3,11 +3,29 @@ package shadow
+ import (
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ )
+ 
+ // ErrVersionConflict means thing state update was aborted due to version conflict.
+ var ErrVersionConflict = errors.New("version conflict")
+ 
++type simpleRequest struct {
++	ClientToken string `json:"clientToken"`
++}
++
++// ErrorResponse represents error response from AWS IoT.
++type ErrorResponse struct {
++	Code        string `json:"code"`
++	Message     string `json:"message"`
++	Timestamp   int64  `json:"timestamp"`
++	ClientToken string `json:"clientToken"`
++}
++
++// Error implements error interface.
++func (e *ErrorResponse) Error() string {
++	return fmt.Sprintf("%s (%s): %s", e.Code, e.ClientToken, e.Message)
++}
++
+ // ThingState represents Thing Shadow State.
+ type ThingState struct {
+ 	Desired  map[string]interface{} `json:"desired,omitempty"`
+@@ -17,21 +35,24 @@ type ThingState struct {
+ 
+ // ThingDocument represents Thing Shadow Document.
+ type ThingDocument struct {
+-	State     ThingState `json:"state"`
+-	Version   int        `json:"version,omitempty"`
+-	Timestamp int        `json:"timestamp,omitempty"`
++	State       ThingState `json:"state"`
++	Version     int        `json:"version,omitempty"`
++	Timestamp   int        `json:"timestamp,omitempty"`
++	ClientToken string     `json:"clientToken,omitempty"`
+ }
+ 
+ type thingStateRaw struct {
+-	Desired  json.RawMessage `json:"desired,omitempty"`
+-	Reported json.RawMessage `json:"reported,omitempty"`
+-	Delta    json.RawMessage `json:"delta,omitempty"`
++	Desired     json.RawMessage `json:"desired,omitempty"`
++	Reported    json.RawMessage `json:"reported,omitempty"`
++	Delta       json.RawMessage `json:"delta,omitempty"`
++	ClientToken string          `json:"clientToken,omitempty"`
+ }
+ 
+ type thingDocumentRaw struct {
+-	State     thingStateRaw `json:"state"`
+-	Version   int           `json:"version,omitempty"`
+-	Timestamp int           `json:"timestamp,omitempty"`
++	State       thingStateRaw `json:"state"`
++	Version     int           `json:"version,omitempty"`
++	Timestamp   int           `json:"timestamp,omitempty"`
++	ClientToken string        `json:"clientToken,omitempty"`
+ }
+ 
+ type thingDelta struct {

@@ -1,0 +1,6 @@
+AutoForm with autosave validates stale model
+[Reproduction playground](https://uniforms.tools/playground/#?N4IgDgTgpgzlAuIBcIDqUA2BjA9gWygEIQAacCHMGZUAQwFd4cZaA3KZeCeqMhpluwAimWgE9kABjIATAJYsARhigzkAM1oY4ZDLUWZO3XuD1YoACxwYZUCBq06QMLBah5ayEADsoAdwACAGU5PDAVINd3WgAmACEIORkAcygACgAdbwCA30CQsIiojzTgLJycmDkALygkALLsipz4MTA64K45b2SScuaArQwcP1UANS0eGHqAbQByAA8YOZIAueXVubwVtYwdxb2AXT6mnIBffrOASiyr0mcrPwBJbwxuqABRCAp7JE1tEy0GBibxYADy3iC9EUeDkiD-jkBwNBEImbxktHgHARALOZHgbgIXno3hgrRUajOQA). Workaround: set `autosaveDelay` to 1.
+
+### Additional contract requirements
+
+When AutoForm autosaves after one or more model changes, validation must receive the current model after the pending changes have been applied. If changes happen rapidly before autosave runs, validation must not receive an intermediate model.

@@ -1,0 +1,2 @@
+Generated help with aliased group shows abbreviated command in usage
+The typical AliasGroup class overrides the get_command method and returns a matching sub command; however, when help is displayed, the usage information shows the matched abbreviated subcommand instead of the full subcommand name. After debugging, I found that the context.info_name contains the the abbreviated sub command name. I think when a sub-command context is being created, it should use the full command name for this field rather than what the user typed.

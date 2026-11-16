@@ -1,0 +1,213 @@
+diff --git a/hypothesis-python/RELEASE.rst b/hypothesis-python/RELEASE.rst
+new file mode 100644
+index 000000000..af51f5ce9
+--- /dev/null
++++ b/hypothesis-python/RELEASE.rst
+@@ -0,0 +1,4 @@
++RELEASE_TYPE: minor
++
++This release makes ``st.functions(pure=True)`` less noisy (:issue:`3253`),
++and generally improves pretty-printing of functions.
+diff --git a/hypothesis-python/src/hypothesis/core.py b/hypothesis-python/src/hypothesis/core.py
+index 02b720e60..7dde40683 100644
+--- a/hypothesis-python/src/hypothesis/core.py
++++ b/hypothesis-python/src/hypothesis/core.py
+@@ -82,7 +82,6 @@ from hypothesis.internal.escalation import (
+ )
+ from hypothesis.internal.healthcheck import fail_health_check
+ from hypothesis.internal.reflection import (
+-    arg_string,
+     convert_positional_arguments,
+     define_function_signature,
+     function_digest,
+@@ -91,6 +90,7 @@ from hypothesis.internal.reflection import (
+     impersonate,
+     is_mock,
+     proxies,
++    repr_call,
+ )
+ from hypothesis.internal.scrutineer import Tracer, explanatory_lines
+ from hypothesis.reporting import (
+@@ -584,7 +584,7 @@ class StateForActualGivenExecution:
+ 
+         data.is_find = self.is_find
+ 
+-        text_repr = [None]
++        text_repr = None
+         if self.settings.deadline is None:
+             test = self.test
+         else:
+@@ -617,7 +617,8 @@ class StateForActualGivenExecution:
+                         # Generate all arguments to the test function.
+                         args, kwargs = data.draw(self.search_strategy)
+                         if expected_failure is not None:
+-                            text_repr[0] = arg_string(test, args, kwargs)
++                            nonlocal text_repr
++                            text_repr = repr_call(test, args, kwargs)
+ 
+                         if print_example or current_verbosity() >= Verbosity.verbose:
+                             output = StringIO()
+@@ -682,9 +683,8 @@ class StateForActualGivenExecution:
+             else:
+                 report("Failed to reproduce exception. Expected: \n" + traceback)
+             self.__flaky(
+-                "Hypothesis %s(%s) produces unreliable results: Falsified"
++                f"Hypothesis {text_repr} produces unreliable results: Falsified"
+                 " on the first call but did not on a subsequent one"
+-                % (test.__name__, text_repr[0])
+             )
+         return result
+ 
+diff --git a/hypothesis-python/src/hypothesis/internal/reflection.py b/hypothesis-python/src/hypothesis/internal/reflection.py
+index de1b74330..662ecd730 100644
+--- a/hypothesis-python/src/hypothesis/internal/reflection.py
++++ b/hypothesis-python/src/hypothesis/internal/reflection.py
+@@ -431,7 +431,7 @@ def nicerepr(v):
+         return re.sub(r"(\[)~([A-Z][a-z]*\])", r"\g<1>\g<2>", pretty(v))
+ 
+ 
+-def arg_string(f, args, kwargs, reorder=True):
++def repr_call(f, args, kwargs, reorder=True):
+     if reorder:
+         args, kwargs = convert_positional_arguments(f, args, kwargs)
+ 
+@@ -444,7 +444,10 @@ def arg_string(f, args, kwargs, reorder=True):
+         for a in sorted(kwargs):
+             bits.append(f"{a}={nicerepr(kwargs[a])}")
+ 
+-    return ", ".join(bits)
++    rep = nicerepr(f)
++    if rep.startswith("lambda") and ":" in rep:
++        rep = f"({rep})"
++    return rep + "(" + ", ".join(bits) + ")"
+ 
+ 
+ def check_valid_identifier(identifier):
+diff --git a/hypothesis-python/src/hypothesis/strategies/_internal/functions.py b/hypothesis-python/src/hypothesis/strategies/_internal/functions.py
+index aedc8e354..9eb6fcb75 100644
+--- a/hypothesis-python/src/hypothesis/strategies/_internal/functions.py
++++ b/hypothesis-python/src/hypothesis/strategies/_internal/functions.py
+@@ -8,15 +8,16 @@
+ # v. 2.0. If a copy of the MPL was not distributed with this file, You can
+ # obtain one at https://mozilla.org/MPL/2.0/.
+ 
++from weakref import WeakKeyDictionary
++
+ from hypothesis.control import note
+ from hypothesis.errors import InvalidState
+ from hypothesis.internal.reflection import (
+-    arg_string,
+     convert_positional_arguments,
+     nicerepr,
+     proxies,
++    repr_call,
+ )
+-from hypothesis.strategies._internal.shared import SharedStrategy
+ from hypothesis.strategies._internal.strategies import SearchStrategy
+ 
+ 
+@@ -28,6 +29,9 @@ class FunctionStrategy(SearchStrategy):
+         self.like = like
+         self.returns = returns
+         self.pure = pure
++        # Using wekrefs-to-generated-functions means that the cache can be
++        # garbage-collected at the end of each example, reducing memory use.
++        self._cache = WeakKeyDictionary()
+ 
+     def calc_is_empty(self, recur):
+         return recur(self.returns)
+@@ -37,19 +41,22 @@ class FunctionStrategy(SearchStrategy):
+         def inner(*args, **kwargs):
+             if data.frozen:
+                 raise InvalidState(
+-                    "This generated %s function can only be called within the "
+-                    "scope of the @given that created it." % (nicerepr(self.like),)
++                    f"This generated {nicerepr(self.like)} function can only "
++                    "be called within the scope of the @given that created it."
+                 )
+             if self.pure:
+                 args, kwargs = convert_positional_arguments(self.like, args, kwargs)
+-                key = (inner, args, frozenset(kwargs.items()))
+-                val = data.draw(SharedStrategy(base=self.returns, key=key))
++                key = (args, frozenset(kwargs.items()))
++                cache = self._cache.setdefault(inner, {})
++                if key not in cache:
++                    cache[key] = data.draw(self.returns)
++                    rep = repr_call(self.like, args, kwargs, reorder=False)
++                    note(f"Called function: {rep} -> {cache[key]!r}")
++                return cache[key]
+             else:
+                 val = data.draw(self.returns)
+-            note(
+-                "Called function: %s(%s) -> %r"
+-                % (nicerepr(self.like), arg_string(self.like, args, kwargs), val)
+-            )
+-            return val
++                rep = repr_call(self.like, args, kwargs, reorder=False)
++                note(f"Called function: {rep} -> {val!r}")
++                return val
+ 
+         return inner
+diff --git a/hypothesis-python/src/hypothesis/strategies/_internal/lazy.py b/hypothesis-python/src/hypothesis/strategies/_internal/lazy.py
+index 873f7b0c4..18292c044 100644
+--- a/hypothesis-python/src/hypothesis/strategies/_internal/lazy.py
++++ b/hypothesis-python/src/hypothesis/strategies/_internal/lazy.py
+@@ -13,10 +13,10 @@ from typing import MutableMapping
+ from weakref import WeakKeyDictionary
+ 
+ from hypothesis.internal.reflection import (
+-    arg_string,
+     convert_keyword_arguments,
+     convert_positional_arguments,
+     get_pretty_function_description,
++    repr_call,
+ )
+ from hypothesis.strategies._internal.strategies import SearchStrategy
+ 
+@@ -147,11 +147,9 @@ class LazyStrategy(SearchStrategy):
+                 for k, v in _kwargs.items()
+                 if k not in sig.parameters or v is not sig.parameters[k].default
+             }
+-            self.__representation = "{}({}){}".format(
+-                self.function.__name__,
+-                arg_string(self.function, _args, kwargs_for_repr, reorder=False),
+-                "".join(map(_repr_filter, self.__filters)),
+-            )
++            self.__representation = repr_call(
++                self.function, _args, kwargs_for_repr, reorder=False
++            ) + "".join(map(_repr_filter, self.__filters))
+         return self.__representation
+ 
+     def do_draw(self, data):
+diff --git a/hypothesis-python/src/hypothesis/strategies/_internal/strategies.py b/hypothesis-python/src/hypothesis/strategies/_internal/strategies.py
+index 680e6b58c..3600711b3 100644
+--- a/hypothesis-python/src/hypothesis/strategies/_internal/strategies.py
++++ b/hypothesis-python/src/hypothesis/strategies/_internal/strategies.py
+@@ -862,7 +862,7 @@ class FilteredStrategy(SearchStrategy):
+             self._cached_repr = "{!r}{}".format(
+                 self.filtered_strategy,
+                 "".join(
+-                    ".filter(%s)" % get_pretty_function_description(cond)
++                    f".filter({get_pretty_function_description(cond)})"
+                     for cond in self.flat_conditions
+                 ),
+             )
+diff --git a/hypothesis-python/src/hypothesis/vendor/pretty.py b/hypothesis-python/src/hypothesis/vendor/pretty.py
+index 68204f30c..99da3a525 100644
+--- a/hypothesis-python/src/hypothesis/vendor/pretty.py
++++ b/hypothesis-python/src/hypothesis/vendor/pretty.py
+@@ -718,11 +718,9 @@ def _repr_pprint(obj, p, cycle):
+ 
+ def _function_pprint(obj, p, cycle):
+     """Base pprint for all functions and builtin functions."""
+-    name = _safe_getattr(obj, "__qualname__", obj.__name__)
+-    mod = obj.__module__
+-    if mod and mod not in ("__builtin__", "builtins", "exceptions"):
+-        name = mod + "." + name
+-    p.text(f"<function {name}>")
++    from hypothesis.internal.reflection import get_pretty_function_description
++
++    p.text(get_pretty_function_description(obj))
+ 
+ 
+ def _exception_pprint(obj, p, cycle):

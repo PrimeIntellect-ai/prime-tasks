@@ -1,0 +1,121 @@
+diff --git a/docs/releases/1.26-NOTES.md b/docs/releases/1.26-NOTES.md
+index 31e1b86e8a..5bc1c6b2af 100644
+--- a/docs/releases/1.26-NOTES.md
++++ b/docs/releases/1.26-NOTES.md
+@@ -13,6 +13,12 @@ with "control-plane-". The names of groups for existing clusters are unchanged.
+ 
+ * The channels CLI that kOps use to manage addons is now bundled with the kOps binary. These commands are useful for addon diagnostics and troubleshooting. For example, to list installed addons, run `kops toolbox addons get addons`.
+ 
++* Since kOps 1.24, by default during rolling updates, kOps will time out after
++spending 15 minutes on an InstanceGroup (instead of hanging indefinitely on
++eviction errors), proceeding to the next InstanceGroup after timing out.
++As of kOps 1.26, rolling updates will not proceed if a cluster validation
++error is encountered while updating an InstanceGroup.
++
+ ## AWS
+ 
+ * Bastions are now fronted by a Network Load Balancer.
+@@ -69,4 +75,4 @@ CNIs, use the "cni" networking option instead.
+ # Help Wanted
+ 
+ * kOps needs maintainers for Canal, Flannel, and Kube-Router, to keep versions up to date and move the integration from experimental to stable.
+-If no volunteers step up by the time kOps 1.27 is released, support will be phased out.
+\ No newline at end of file
++If no volunteers step up by the time kOps 1.27 is released, support will be phased out.
+diff --git a/pkg/instancegroups/instancegroups.go b/pkg/instancegroups/instancegroups.go
+index e9226db258..231b633ee1 100644
+--- a/pkg/instancegroups/instancegroups.go
++++ b/pkg/instancegroups/instancegroups.go
+@@ -43,6 +43,30 @@ import (
+ 
+ const rollingUpdateTaintKey = "kops.k8s.io/scheduled-for-update"
+ 
++// ValidationTimeoutError represents an error that occurs when
++// the cluster fails to validate within the designated timeout.
++type ValidationTimeoutError struct {
++	operation string
++	err       error
++}
++
++func (v *ValidationTimeoutError) Error() string {
++	return fmt.Sprintf("error validating cluster%s: %s", v.operation, v.err.Error())
++}
++
++func (v *ValidationTimeoutError) Unwrap() error {
++	return v.err
++}
++
++// Is checks that a given error is a ValidationTimeoutError.
++func (v *ValidationTimeoutError) Is(err error) bool {
++	// Currently all validation timeout errors are equivalent
++	// If you wish to differentiate, please update the instances of `errors.Is` that check
++	// this error to take that into account
++	_, ok := err.(*ValidationTimeoutError)
++	return ok
++}
++
+ // promptInteractive asks the user to continue, mostly copied from vendor/google.golang.org/api/examples/gmail.go.
+ func promptInteractive(upgradedHostID, upgradedHostName string) (stopPrompting bool, err error) {
+ 	stopPrompting = false
+@@ -480,7 +504,10 @@ func (c *RollingUpdateCluster) maybeValidate(operation string, validateCount int
+ 
+ 			if c.FailOnValidate {
+ 				klog.Errorf("Cluster did not validate within %s", c.ValidationTimeout)
+-				return fmt.Errorf("error validating cluster%s: %v", operation, err)
++				return &ValidationTimeoutError{
++					operation: operation,
++					err:       err,
++				}
+ 			}
+ 
+ 			klog.Warningf("Cluster validation failed%s, proceeding since fail-on-validate is set to false: %v", operation, err)
+diff --git a/pkg/instancegroups/rollingupdate.go b/pkg/instancegroups/rollingupdate.go
+index d03484f27b..f361d3db2d 100644
+--- a/pkg/instancegroups/rollingupdate.go
++++ b/pkg/instancegroups/rollingupdate.go
+@@ -18,6 +18,7 @@ package instancegroups
+ 
+ import (
+ 	"context"
++	stderrors "errors"
+ 	"fmt"
+ 	"sort"
+ 	"sync"
+@@ -191,7 +192,10 @@ func (c *RollingUpdateCluster) RollingUpdate(groups map[string]*cloudinstances.C
+ 			if err != nil {
+ 				klog.Errorf("failed to roll InstanceGroup %q: %v", k, err)
+ 			}
+-			// TODO: Bail on error?
++
++			if isExitableError(err) {
++				return err
++			}
+ 		}
+ 	}
+ 
+@@ -213,7 +217,10 @@ func (c *RollingUpdateCluster) RollingUpdate(groups map[string]*cloudinstances.C
+ 			if err != nil {
+ 				klog.Errorf("failed to roll InstanceGroup %q: %v", k, err)
+ 			}
+-			// TODO: Bail on error?
++
++			if isExitableError(err) {
++				return err
++			}
+ 		}
+ 	}
+ 
+@@ -236,3 +243,13 @@ func sortGroups(groupMap map[string]*cloudinstances.CloudInstanceGroup) []string
+ 	sort.Strings(groups)
+ 	return groups
+ }
++
++// isExitableError inspects an error to determine if the error is
++// fatal enough that the rolling update cannot continue.
++//
++// For example, if a cluster is unable to be validated by the deadline, then it
++// is unlikely that it will validate on the next instance roll, so an early exit as a
++// warning to the user is more appropriate.
++func isExitableError(err error) bool {
++	return stderrors.Is(err, &ValidationTimeoutError{})
++}

@@ -1,0 +1,123 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eac1923..2a1c563 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,13 @@
+ # Changelog
+ 
++## 2.5.2
++
++April 23, 2020
++
++1. Added support for dates formatted with nanoseconds, such as `2020-04-15T02:40:03.000+0000`. (#102)
++2. Added support for aggregate function in the `ORDER BY` clause (#103)
++3. Queries would not be properly composed if an order by had a function and also specified ASC or DESC (#104)
++
+ ## 2.5.1
+ 
+ April 23, 2020
+diff --git a/src/composer/composer.ts b/src/composer/composer.ts
+index ae0b4f0..1fffc34 100644
+--- a/src/composer/composer.ts
++++ b/src/composer/composer.ts
+@@ -354,7 +354,7 @@ export class Compose {
+       return this.formatter.formatOrderByArray(orderBy.map(ob => this.parseOrderBy(ob)));
+     } else {
+       let output = `${utils.get(orderBy.field, ' ')}`;
+-      output += orderBy.fn ? this.parseFn(orderBy.fn) : '';
++      output += orderBy.fn ? `${this.parseFn(orderBy.fn)} ` : '';
+       output += `${utils.get(orderBy.order, ' ')}${utils.get(orderBy.nulls, '', 'NULLS ')}`;
+       return output.trim();
+     }
+diff --git a/src/models.ts b/src/models.ts
+index 08d5a7d..eb435b4 100644
+--- a/src/models.ts
++++ b/src/models.ts
+@@ -141,8 +141,9 @@ export interface OrderByFunctionExpressionContext extends WithIdentifier {
+   nulls?: IToken[];
+ }
+ 
+-export interface OrderByLocationExpressionContext {
+-  locationFunction: CstNode[];
++export interface orderByAggregateOrLocationExpressionContext {
++  locationFunction?: CstNode[];
++  aggregateFunction?: CstNode[];
+   order?: IToken[];
+   nulls?: IToken[];
+ }
+diff --git a/src/parser/lexer.ts b/src/parser/lexer.ts
+index 7b6484b..a912a9c 100644
+--- a/src/parser/lexer.ts
++++ b/src/parser/lexer.ts
+@@ -714,7 +714,7 @@ export const Minus = createToken({ name: 'MINUS', pattern: '-', categories: [Sym
+ 
+ export const DateTime = createToken({
+   name: 'DATETIME',
+-  pattern: /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\Z|\.[0-9]+Z|\+[0-9]{2}:[0-9]{2}|\-[0-9]{2}:[0-9]{2})/i,
++  pattern: /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{3})?(\Z|\.[0-9]+Z|\+[0-9]{2}:[0-9]{2}|\-[0-9]{2}:[0-9]{2}|\+[0-9]{4}|\-[0-9]{4})/i,
+   categories: [DateIdentifier],
+ });
+ 
+diff --git a/src/parser/parser.ts b/src/parser/parser.ts
+index 5d15618..8b71533 100644
+--- a/src/parser/parser.ts
++++ b/src/parser/parser.ts
+@@ -328,7 +328,7 @@ export class SoqlParser extends CstParser {
+       DEF: () => {
+         this.OR([
+           { ALT: () => this.SUBRULE(this.orderByFunctionExpression, { LABEL: 'orderByExpressionOrFn' }) },
+-          { ALT: () => this.SUBRULE(this.orderByLocationExpression, { LABEL: 'orderByExpressionOrFn' }) },
++          { ALT: () => this.SUBRULE(this.orderByAggregateOrLocationExpression, { LABEL: 'orderByExpressionOrFn' }) },
+           { ALT: () => this.SUBRULE(this.orderByExpression, { LABEL: 'orderByExpressionOrFn' }) },
+         ]);
+       },
+@@ -351,14 +351,14 @@ export class SoqlParser extends CstParser {
+     this.SUBRULE(this.functionExpression);
+   });
+ 
+-  private orderByLocationExpression = this.RULE('orderByLocationExpression', () => {
+-    this.SUBRULE(this.locationFunction);
++  private orderByAggregateOrLocationExpression = this.RULE('orderByAggregateOrLocationExpression', () => {
++    this.OR([{ ALT: () => this.SUBRULE(this.locationFunction) }, { ALT: () => this.SUBRULE(this.aggregateFunction) }]);
+     this.OPTION(() => {
+-      this.OR([{ ALT: () => this.CONSUME(lexer.Asc, { LABEL: 'order' }) }, { ALT: () => this.CONSUME(lexer.Desc, { LABEL: 'order' }) }]);
++      this.OR1([{ ALT: () => this.CONSUME(lexer.Asc, { LABEL: 'order' }) }, { ALT: () => this.CONSUME(lexer.Desc, { LABEL: 'order' }) }]);
+     });
+     this.OPTION1(() => {
+       this.CONSUME(lexer.Nulls);
+-      this.OR1([{ ALT: () => this.CONSUME(lexer.First, { LABEL: 'nulls' }) }, { ALT: () => this.CONSUME(lexer.Last, { LABEL: 'nulls' }) }]);
++      this.OR2([{ ALT: () => this.CONSUME(lexer.First, { LABEL: 'nulls' }) }, { ALT: () => this.CONSUME(lexer.Last, { LABEL: 'nulls' }) }]);
+     });
+   });
+ 
+diff --git a/src/parser/visitor.ts b/src/parser/visitor.ts
+index ae40a58..8bbc3ec 100644
+--- a/src/parser/visitor.ts
++++ b/src/parser/visitor.ts
+@@ -58,7 +58,7 @@ import {
+   WithDateCategoryContext,
+   LocationFunctionContext,
+   GeoLocationFunctionContext,
+-  OrderByLocationExpressionContext,
++  orderByAggregateOrLocationExpressionContext,
+   GroupByFieldListContext,
+   SelectClauseIdentifierContext,
+ } from '../models';
+@@ -473,10 +473,13 @@ class SOQLVisitor extends BaseSoqlVisitor {
+     return orderByClause;
+   }
+ 
+-  orderByLocationExpression(ctx: OrderByLocationExpressionContext): OrderByClause {
+-    const orderByClause: OrderByClause = {
+-      fn: this.visit(ctx.locationFunction, { includeType: false }),
+-    };
++  orderByAggregateOrLocationExpression(ctx: orderByAggregateOrLocationExpressionContext): OrderByClause {
++    const orderByClause: OrderByClause = {};
++    if (ctx.locationFunction) {
++      orderByClause.fn = this.visit(ctx.locationFunction, { includeType: false });
++    } else {
++      orderByClause.fn = this.visit(ctx.aggregateFunction, { includeType: false });
++    }
+     if (ctx.order && ctx.order[0]) {
+       orderByClause.order = ctx.order[0].tokenType.name as OrderByCriterion;
+     }

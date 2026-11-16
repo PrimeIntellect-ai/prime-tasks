@@ -1,0 +1,189 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 03e9783..81f1782 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -2,6 +2,9 @@
+ 
+ ## Unreleased
+ 
++- Fix narrowing on `isinstance` calls with arguments that are not
++  instance of `typing`, such as unions and certain typing special forms (#747)
++- Detect invalid calls to `isinstance` (#747)
+ - Support calls to `TypeVar` and several other typing constructs in
+   code that is not executed (e.g., under `if TYPE_CHECKING`) (#746)
+ - Fix spurious errors for the class-based syntax for creating
+diff --git a/pyanalyze/annotations.py b/pyanalyze/annotations.py
+index 630d925..fe9a934 100644
+--- a/pyanalyze/annotations.py
++++ b/pyanalyze/annotations.py
+@@ -69,7 +69,7 @@ from .extensions import (
+ from .find_unused import used
+ from .functions import FunctionDefNode
+ from .node_visitor import ErrorContext
+-from .safe import is_instance_of_typing_name, is_typing_name
++from .safe import is_instance_of_typing_name, is_typing_name, is_union
+ from .signature import (
+     ANY_SIGNATURE,
+     ELLIPSIS_PARAM,
+@@ -119,11 +119,6 @@ from .value import (
+ if TYPE_CHECKING:
+     from .name_check_visitor import NameCheckVisitor
+ 
+-try:
+-    from types import UnionType
+-except ImportError:
+-    UnionType = None
+-
+ 
+ CONTEXT_MANAGER_TYPES = (typing.ContextManager, contextlib.AbstractContextManager)
+ ASYNC_CONTEXT_MANAGER_TYPES = (
+@@ -1182,9 +1177,7 @@ def _value_of_origin_args(
+                 _type_from_runtime(arg, ctx, allow_unpack=True) for arg in args
+             ]
+             return _make_sequence_value(tuple, args_vals, ctx)
+-    elif is_typing_name(origin, "Union") or (
+-        UnionType is not None and origin is UnionType
+-    ):
++    elif is_union(origin):
+         return unite_values(*[_type_from_runtime(arg, ctx) for arg in args])
+     elif origin is Callable or is_typing_name(origin, "Callable"):
+         if len(args) == 0:
+diff --git a/pyanalyze/implementation.py b/pyanalyze/implementation.py
+index 88a92e5..a77fa35 100644
+--- a/pyanalyze/implementation.py
++++ b/pyanalyze/implementation.py
+@@ -7,6 +7,7 @@ from itertools import product
+ from typing import (
+     Callable,
+     Dict,
++    Iterable,
+     NewType,
+     Optional,
+     Sequence,
+@@ -26,7 +27,7 @@ from .extensions import assert_type, reveal_locals, reveal_type
+ from .format_strings import parse_format_string
+ from .predicates import IsAssignablePredicate
+ from .runtime import is_compatible
+-from .safe import hasattr_static, safe_isinstance, safe_issubclass
++from .safe import hasattr_static, is_union, safe_isinstance, safe_issubclass
+ from .signature import (
+     ANY_SIGNATURE,
+     CallContext,
+@@ -120,15 +121,19 @@ def _issubclass_impl(ctx: CallContext) -> Value:
+     varname = ctx.varname_for_arg("cls")
+     if varname is None or not isinstance(class_or_tuple, KnownValue):
+         return TypedValue(bool)
+-    if isinstance(class_or_tuple.val, type):
+-        narrowed_type = SubclassValue(TypedValue(class_or_tuple.val))
+-    elif isinstance(class_or_tuple.val, tuple) and all(
+-        isinstance(elt, type) for elt in class_or_tuple.val
+-    ):
+-        vals = [SubclassValue(TypedValue(elt)) for elt in class_or_tuple.val]
+-        narrowed_type = unite_values(*vals)
+-    else:
++    try:
++        narrowed_types = list(_resolve_isinstance_arg(class_or_tuple.val))
++    except _CannotResolve as e:
++        ctx.show_error(
++            f'Second argument to "issubclass" must be a type, union,'
++            f' or tuple of types, not "{e.args[0]!r}"',
++            ErrorCode.incompatible_argument,
++            arg="class_or_tuple",
++        )
+         return TypedValue(bool)
++    narrowed_type = unite_values(
++        *[SubclassValue(TypedValue(typ)) for typ in narrowed_types]
++    )
+     predicate = IsAssignablePredicate(narrowed_type, ctx.visitor, positive_only=False)
+     constraint = Constraint(varname, ConstraintType.predicate, True, predicate)
+     return annotate_with_constraint(TypedValue(bool), constraint)
+@@ -139,20 +144,43 @@ def _isinstance_impl(ctx: CallContext) -> Value:
+     varname = ctx.varname_for_arg("obj")
+     if varname is None or not isinstance(class_or_tuple, KnownValue):
+         return TypedValue(bool)
+-    if isinstance(class_or_tuple.val, type):
+-        narrowed_type = TypedValue(class_or_tuple.val)
+-    elif isinstance(class_or_tuple.val, tuple) and all(
+-        isinstance(elt, type) for elt in class_or_tuple.val
+-    ):
+-        vals = [TypedValue(elt) for elt in class_or_tuple.val]
+-        narrowed_type = unite_values(*vals)
+-    else:
++    try:
++        narrowed_types = list(_resolve_isinstance_arg(class_or_tuple.val))
++    except _CannotResolve as e:
++        ctx.show_error(
++            f'Second argument to "isinstance" must be a type, union,'
++            f' or tuple of types, not "{e.args[0]!r}"',
++            ErrorCode.incompatible_argument,
++            arg="class_or_tuple",
++        )
+         return TypedValue(bool)
++    narrowed_type = unite_values(*[TypedValue(typ) for typ in narrowed_types])
+     predicate = IsAssignablePredicate(narrowed_type, ctx.visitor, positive_only=False)
+     constraint = Constraint(varname, ConstraintType.predicate, True, predicate)
+     return annotate_with_constraint(TypedValue(bool), constraint)
+ 
+ 
++class _CannotResolve(Exception):
++    pass
++
++
++def _resolve_isinstance_arg(val: object) -> Iterable[type]:
++    if safe_isinstance(val, type):
++        yield val
++    elif safe_isinstance(val, tuple):
++        for elt in val:
++            yield from _resolve_isinstance_arg(elt)
++    else:
++        origin = typing_extensions.get_origin(val)
++        if is_union(origin):
++            for arg in typing_extensions.get_args(val):
++                yield from _resolve_isinstance_arg(arg)
++        elif safe_isinstance(origin, type):
++            yield origin
++        else:
++            raise _CannotResolve(val)
++
++
+ def _constraint_from_isinstance(
+     varname: Optional[VarnameWithOrigin], class_or_tuple: Value
+ ) -> AbstractConstraint:
+diff --git a/pyanalyze/patma.py b/pyanalyze/patma.py
+index 0ff4cf2..04832ff 100644
+--- a/pyanalyze/patma.py
++++ b/pyanalyze/patma.py
+@@ -80,7 +80,11 @@ try:
+ except ImportError:
+     # 3.9 and lower
+     MatchAs = MatchClass = MatchMapping = Any
+-    MatchOr = MatchSequence = MatchSingleton = MatchStar = MatchValue = Any
++    MatchOr = MatchSequence = MatchSingleton = MatchValue = Any
++
++    # Avoid false positive errors on isinstance() in 3.8/3.9 self check
++    class MatchStar(ast.AST):
++        pass
+ 
+ 
+ # For these types, a single class subpattern matches the whole thing
+diff --git a/pyanalyze/safe.py b/pyanalyze/safe.py
+index 1668816..40273a4 100644
+--- a/pyanalyze/safe.py
++++ b/pyanalyze/safe.py
+@@ -154,6 +154,16 @@ def is_typing_name(obj: object, name: str) -> bool:
+     return safe_in(obj, names)
+ 
+ 
++try:
++    from types import UnionType
++except ImportError:
++    UnionType = None
++
++
++def is_union(obj: object) -> bool:
++    return is_typing_name(obj, "Union") or (UnionType is not None and obj is UnionType)
++
++
+ def is_instance_of_typing_name(obj: object, name: str) -> bool:
+     objs, _ = _fill_typing_name_cache(name)
+     return isinstance(obj, objs)

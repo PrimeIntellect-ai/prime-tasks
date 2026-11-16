@@ -1,0 +1,212 @@
+diff --git a/CTFd/api/v1/files.py b/CTFd/api/v1/files.py
+index d1ad5ebb..9dd6626b 100644
+--- a/CTFd/api/v1/files.py
++++ b/CTFd/api/v1/files.py
+@@ -90,10 +90,25 @@ class FilesList(Resource):
+         # challenge_id
+         # page_id
+ 
++        # Handle situation where users attempt to upload multiple files with a single location
++        if len(files) > 1 and request.form.get("location"):
++            return {
++                "success": False,
++                "errors": {
++                    "location": ["Location cannot be specified with multiple files"]
++                },
++            }, 400
++
+         objs = []
+         for f in files:
+             # uploads.upload_file(file=f, chalid=req.get('challenge'))
+-            obj = uploads.upload_file(file=f, **request.form.to_dict())
++            try:
++                obj = uploads.upload_file(file=f, **request.form.to_dict())
++            except ValueError as e:
++                return {
++                    "success": False,
++                    "errors": {"location": [str(e)]},
++                }, 400
+             objs.append(obj)
+ 
+         schema = FileSchema(many=True)
+diff --git a/CTFd/models/__init__.py b/CTFd/models/__init__.py
+index 0518ee2f..97f8e5de 100644
+--- a/CTFd/models/__init__.py
++++ b/CTFd/models/__init__.py
+@@ -288,6 +288,7 @@ class Files(db.Model):
+     id = db.Column(db.Integer, primary_key=True)
+     type = db.Column(db.String(80), default="standard")
+     location = db.Column(db.Text)
++    sha1sum = db.Column(db.String(40))
+ 
+     __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
+ 
+diff --git a/CTFd/utils/uploads/__init__.py b/CTFd/utils/uploads/__init__.py
+index 9c490385..e73a62ee 100644
+--- a/CTFd/utils/uploads/__init__.py
++++ b/CTFd/utils/uploads/__init__.py
+@@ -1,4 +1,6 @@
++import hashlib
+ import shutil
++from pathlib import Path
+ 
+ from CTFd.models import ChallengeFiles, Files, PageFiles, db
+ from CTFd.utils import get_app_config
+@@ -16,8 +18,23 @@ def upload_file(*args, **kwargs):
+     challenge_id = kwargs.get("challenge_id") or kwargs.get("challenge")
+     page_id = kwargs.get("page_id") or kwargs.get("page")
+     file_type = kwargs.get("type", "standard")
+-
+-    model_args = {"type": file_type, "location": None}
++    location = kwargs.get("location")
++
++    # Validate location and default filename to uploaded file's name
++    parent = None
++    filename = file_obj.filename
++    if location:
++        path = Path(location)
++        if len(path.parts) != 2:
++            raise ValueError(
++                "Location must contain two parts, a directory and a filename"
++            )
++        # Allow location to override the directory and filename
++        parent = path.parts[0]
++        filename = path.parts[1]
++        location = parent + "/" + filename
++
++    model_args = {"type": file_type, "location": location}
+ 
+     model = Files
+     if file_type == "challenge":
+@@ -28,16 +45,39 @@ def upload_file(*args, **kwargs):
+         model_args["page_id"] = page_id
+ 
+     uploader = get_uploader()
+-    location = uploader.upload(file_obj=file_obj, filename=file_obj.filename)
++    location = uploader.upload(file_obj=file_obj, filename=filename, path=parent)
+ 
+-    model_args["location"] = location
++    sha1sum = hash_file(fp=file_obj)
+ 
+-    file_row = model(**model_args)
+-    db.session.add(file_row)
+-    db.session.commit()
++    model_args["location"] = location
++    model_args["sha1sum"] = sha1sum
++
++    existing_file = Files.query.filter_by(location=location).first()
++    if existing_file:
++        for k, v in model_args.items():
++            setattr(existing_file, k, v)
++        db.session.commit()
++        file_row = existing_file
++    else:
++        file_row = model(**model_args)
++        db.session.add(file_row)
++        db.session.commit()
+     return file_row
+ 
+ 
++def hash_file(fp, algo="sha1"):
++    fp.seek(0)
++    if algo == "sha1":
++        h = hashlib.sha1()  # nosec
++        # https://stackoverflow.com/a/64730457
++        while chunk := fp.read(1024):
++            h.update(chunk)
++        fp.seek(0)
++        return h.hexdigest()
++    else:
++        raise NotImplementedError
++
++
+ def delete_file(file_id):
+     f = Files.query.filter_by(id=file_id).first_or_404()
+ 
+diff --git a/CTFd/utils/uploads/uploaders.py b/CTFd/utils/uploads/uploaders.py
+index 0ea3afd7..04fe561c 100644
+--- a/CTFd/utils/uploads/uploaders.py
++++ b/CTFd/utils/uploads/uploaders.py
+@@ -54,13 +54,20 @@ class FilesystemUploader(BaseUploader):
+ 
+         return filename
+ 
+-    def upload(self, file_obj, filename):
++    def upload(self, file_obj, filename, path=None):
+         if len(filename) == 0:
+             raise Exception("Empty filenames cannot be used")
+ 
++        # Sanitize directory name
++        if path:
++            path = secure_filename(path) or hexencode(os.urandom(16))
++            path = path.replace(".", "")
++        else:
++            path = hexencode(os.urandom(16))
++
++        # Sanitize file name
+         filename = secure_filename(filename)
+-        md5hash = hexencode(os.urandom(16))
+-        file_path = posixpath.join(md5hash, filename)
++        file_path = posixpath.join(path, filename)
+ 
+         return self.store(file_obj, file_path)
+ 
+@@ -110,7 +117,17 @@ class S3Uploader(BaseUploader):
+         self.s3.upload_fileobj(fileobj, self.bucket, filename)
+         return filename
+ 
+-    def upload(self, file_obj, filename):
++    def upload(self, file_obj, filename, path=None):
++        # Sanitize directory name
++        if path:
++            path = secure_filename(path) or hexencode(os.urandom(16))
++            path = path.replace(".", "")
++            # Sanitize path
++            path = filter(self._clean_filename, secure_filename(path).replace(" ", "_"))
++        else:
++            path = hexencode(os.urandom(16))
++
++        # Sanitize file name
+         filename = filter(
+             self._clean_filename, secure_filename(filename).replace(" ", "_")
+         )
+@@ -118,9 +135,7 @@ class S3Uploader(BaseUploader):
+         if len(filename) <= 0:
+             return False
+ 
+-        md5hash = hexencode(os.urandom(16))
+-
+-        dst = md5hash + "/" + filename
++        dst = path + "/" + filename
+         self.s3.upload_fileobj(file_obj, self.bucket, dst)
+         return dst
+ 
+diff --git a/migrations/versions/5c4996aeb2cb_add_sha1sum_field_to_files_require_.py b/migrations/versions/5c4996aeb2cb_add_sha1sum_field_to_files_require_.py
+new file mode 100644
+index 00000000..ece8cf97
+--- /dev/null
++++ b/migrations/versions/5c4996aeb2cb_add_sha1sum_field_to_files_require_.py
+@@ -0,0 +1,23 @@
++"""Add sha1sum field to Files
++
++Revision ID: 5c4996aeb2cb
++Revises: 9e6f6578ca84
++Create Date: 2024-01-07 13:09:08.843903
++
++"""
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision = "5c4996aeb2cb"
++down_revision = "9e6f6578ca84"
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.add_column("files", sa.Column("sha1sum", sa.String(length=40), nullable=True))
++
++
++def downgrade():
++    op.drop_column("files", "sha1sum")

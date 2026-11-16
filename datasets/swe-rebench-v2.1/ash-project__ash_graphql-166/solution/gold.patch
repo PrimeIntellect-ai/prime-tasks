@@ -1,0 +1,1119 @@
+diff --git a/.formatter.exs b/.formatter.exs
+index bf791fe..f497cb2 100644
+--- a/.formatter.exs
++++ b/.formatter.exs
+@@ -42,6 +42,7 @@ spark_locals_without_parens = [
+   metadata_names: 1,
+   metadata_types: 1,
+   modify_resolution: 1,
++  paginate_relationship_with: 1,
+   paginate_with: 1,
+   primary_key_delimiter: 1,
+   read_action: 1,
+diff --git a/documentation/dsls/DSL:-AshGraphql.Resource.md b/documentation/dsls/DSL:-AshGraphql.Resource.md
+index 8a12046..9d212c2 100644
+--- a/documentation/dsls/DSL:-AshGraphql.Resource.md
++++ b/documentation/dsls/DSL:-AshGraphql.Resource.md
+@@ -56,6 +56,7 @@ end
+ | [`derive_sort?`](#graphql-derive_sort?){: #graphql-derive_sort? } | `boolean` | `true` | Set to false to disable the automatic generation of a sort input for read actions. |
+ | [`encode_primary_key?`](#graphql-encode_primary_key?){: #graphql-encode_primary_key? } | `boolean` | `true` | For resources with composite primary keys, or primary keys not called `:id`, this will cause the id to be encoded as a single `id` attribute, both in the representation of the resource and in get requests |
+ | [`relationships`](#graphql-relationships){: #graphql-relationships } | `list(atom)` |  | A list of relationships to include on the created type. Defaults to all public relationships where the destination defines a graphql type. |
++| [`paginate_relationship_with`](#graphql-paginate_relationship_with){: #graphql-paginate_relationship_with } | `keyword` | `[]` | A keyword list indicating which kind of pagination should be used for each `has_many` and `many_to_many` relationships, e.g. `related_things: :keyset, other_related_things: :offset`. Valid pagination values are `nil`, `:offset`, `:keyset` and `:relay`. |
+ | [`field_names`](#graphql-field_names){: #graphql-field_names } | `keyword` |  | A keyword list of name overrides for attributes. |
+ | [`hide_fields`](#graphql-hide_fields){: #graphql-hide_fields } | `list(atom)` |  | A list of attributes to hide from the domain |
+ | [`show_fields`](#graphql-show_fields){: #graphql-show_fields } | `list(atom)` |  | A list of attributes to show in the domain. If not specified includes all (excluding `hide_fiels`). |
+diff --git a/lib/graphql/resolver.ex b/lib/graphql/resolver.ex
+index d4e376b..33135d4 100644
+--- a/lib/graphql/resolver.ex
++++ b/lib/graphql/resolver.ex
+@@ -436,7 +436,7 @@ defmodule AshGraphql.Graphql.Resolver do
+                    ),
+                  result_fields <-
+                    get_result_fields(
+-                     AshGraphql.Resource.pagination_strategy(
++                     AshGraphql.Resource.query_pagination_strategy(
+                        gql_query,
+                        Ash.Resource.Info.action(resource, action)
+                      ),
+@@ -774,32 +774,37 @@ defmodule AshGraphql.Graphql.Resolver do
+   def validate_resolve_opts(resolution, resource, pagination, relay?, opts, args, query, action) do
+     action = Ash.Resource.Info.action(resource, action)
+ 
+-    case AshGraphql.Resource.pagination_strategy(query, action) do
++    case AshGraphql.Resource.query_pagination_strategy(query, action) do
+       nil ->
+         {:ok, opts}
+ 
+       strategy ->
+-        with page_opts <-
+-               args
+-               |> Map.take([:limit, :offset, :first, :after, :before, :last])
+-               |> Enum.reject(fn {_, val} -> is_nil(val) end),
+-             {:ok, page_opts} <- validate_offset_opts(page_opts, strategy, pagination),
+-             {:ok, page_opts} <- validate_keyset_opts(page_opts, strategy, pagination) do
+-          type = page_type(resource, strategy, relay?)
+-          field_names = resolution |> fields([], type) |> names_only()
+-
+-          page =
+-            if Enum.any?(field_names, &(&1 == :count)) do
+-              Keyword.put(page_opts, :count, true)
+-            else
+-              page_opts
+-            end
+-
++        with {:ok, page} <- page_opts(resolution, resource, pagination, relay?, args, strategy) do
+           {:ok, Keyword.put(opts, :page, page)}
++        end
++    end
++  end
++
++  defp page_opts(resolution, resource, pagination, relay?, args, strategy, nested \\ []) do
++    page_opts =
++      args
++      |> Map.take([:limit, :offset, :first, :after, :before, :last])
++      |> Enum.reject(fn {_, val} -> is_nil(val) end)
++
++    with {:ok, page_opts} <- validate_offset_opts(page_opts, strategy, pagination),
++         {:ok, page_opts} <- validate_keyset_opts(page_opts, strategy, pagination) do
++      type = page_type(resource, strategy, relay?)
++
++      field_names = resolution |> fields(nested, type) |> names_only()
++
++      page_opts =
++        if Enum.any?(field_names, &(&1 == :count)) do
++          Keyword.put(page_opts, :count, true)
+         else
+-          error ->
+-            error
++          page_opts
+         end
++
++      {:ok, page_opts}
+     end
+   end
+ 
+@@ -820,7 +825,8 @@ defmodule AshGraphql.Graphql.Resolver do
+     {:ok, opts}
+   end
+ 
+-  defp validate_keyset_opts(opts, :keyset, %{max_page_size: max_page_size}) do
++  defp validate_keyset_opts(opts, strategy, %{max_page_size: max_page_size})
++       when strategy in [:keyset, :relay] do
+     case opts |> Keyword.take([:first, :last, :after, :before]) |> Enum.into(%{}) do
+       %{first: _first, last: _last} ->
+         {:error,
+@@ -879,14 +885,15 @@ defmodule AshGraphql.Graphql.Resolver do
+     ["results"]
+   end
+ 
++  defp get_result_fields(:relay, _) do
++    ["edges", "node"]
++  end
++
+   defp get_result_fields(_pagination, _) do
+     []
+   end
+ 
+-  defp paginate(
+-         _resource,
+-         _gql_query,
+-         _action,
++  defp paginate_with_keyset(
+          %Ash.Page.Keyset{
+            results: results,
+            more?: more,
+@@ -947,69 +954,30 @@ defmodule AshGraphql.Graphql.Resolver do
+     end
+   end
+ 
+-  defp paginate(
+-         _resource,
+-         _gql_query,
+-         _action,
+-         %Ash.Page.Offset{results: results, count: count, more?: more},
+-         true
+-       ) do
+-    {start_cursor, end_cursor} =
+-      case results do
+-        [] ->
+-          {nil, nil}
+-
+-        [first] ->
+-          {first.__metadata__.keyset, first.__metadata__.keyset}
+-
+-        [first | rest] ->
+-          last = List.last(rest)
+-          {first.__metadata__.keyset, last.__metadata__.keyset}
+-      end
++  defp paginate_with_offset(%Ash.Page.Offset{results: results, count: count, more?: more?}) do
++    {:ok, %{results: results, count: count, more?: more?}}
++  end
+ 
+-    has_previous_page = false
+-    has_next_page = more
+-
+-    {
+-      :ok,
+-      %{
+-        page_info: %{
+-          start_cursor: start_cursor,
+-          end_cursor: end_cursor,
+-          has_next_page: has_next_page,
+-          has_previous_page: has_previous_page
+-        },
+-        count: count,
+-        edges:
+-          Enum.map(results, fn result ->
+-            %{
+-              cursor: result.__metadata__.keyset,
+-              node: result
+-            }
+-          end)
+-      }
+-    }
++  defp paginate(_resource, _gql_query, _action, %Ash.Page.Keyset{} = keyset, relay?) do
++    paginate_with_keyset(keyset, relay?)
+   end
+ 
+-  defp paginate(
+-         _resource,
+-         _gql_query,
+-         _action,
+-         %Ash.Page.Offset{results: results, count: count, more?: more?},
+-         _
+-       ) do
+-    {:ok, %{results: results, count: count, more?: more?}}
++  defp paginate(resource, query, action, %Ash.Page.Offset{} = offset, relay?) do
++    # If a read action supports both offset and keyset, it will return an offset page by default
++    # Check what strategy we're using and convert the page accordingly
++    pagination_strategy = query_pagination_strategy(query, resource, action)
++
++    if relay? or pagination_strategy == :keyset do
++      offset
++      |> offset_to_keyset()
++      |> paginate_with_keyset(relay?)
++    else
++      paginate_with_offset(offset)
++    end
+   end
+ 
+   defp paginate(resource, query, action, page, relay?) do
+-    action =
+-      if is_atom(action) do
+-        Ash.Resource.Info.action(resource, action)
+-      else
+-        action
+-      end
+-
+-    case AshGraphql.Resource.pagination_strategy(query, action) do
++    case query_pagination_strategy(query, resource, action) do
+       nil ->
+         {:ok, page}
+ 
+@@ -1041,6 +1009,50 @@ defmodule AshGraphql.Graphql.Resolver do
+     end
+   end
+ 
++  defp query_pagination_strategy(query, resource, action) when is_atom(action) do
++    action = Ash.Resource.Info.action(resource, action)
++    query_pagination_strategy(query, resource, action)
++  end
++
++  defp query_pagination_strategy(query, _resource, action) do
++    AshGraphql.Resource.query_pagination_strategy(query, action)
++  end
++
++  defp offset_to_keyset(%Ash.Page.Offset{} = offset) do
++    %Ash.Page.Keyset{
++      results: offset.results,
++      limit: offset.limit,
++      more?: offset.more?,
++      count: offset.count,
++      after: nil,
++      before: nil
++    }
++  end
++
++  defp paginate_relationship(%Ash.Page.Keyset{} = keyset, strategy) do
++    relay? = strategy == :relay
++    paginate_with_keyset(keyset, relay?)
++  end
++
++  defp paginate_relationship(%Ash.Page.Offset{} = offset, strategy)
++       when strategy in [:relay, :keyset] do
++    # If a read action supports both offset and keyset, it will return an offset page by default,
++    # so we might end up here even with relay or keyset strategy
++    relay? = strategy == :relay
++
++    offset
++    |> offset_to_keyset()
++    |> paginate_with_keyset(relay?)
++  end
++
++  defp paginate_relationship(%Ash.Page.Offset{} = offset, :offset) do
++    paginate_with_offset(offset)
++  end
++
++  defp paginate_relationship(page, _) do
++    {:ok, page}
++  end
++
+   def mutate(%Absinthe.Resolution{state: :resolved} = resolution, _),
+     do: resolution
+ 
+@@ -1827,15 +1839,49 @@ defmodule AshGraphql.Graphql.Resolver do
+             |> Ash.Query.set_tenant(Map.get(context, :tenant))
+             |> Ash.Query.set_context(get_context(context))
+ 
++          pagination_strategy =
++            AshGraphql.Resource.relationship_pagination_strategy(
++              resource,
++              relationship.name,
++              read_action
++            )
++
++          will_paginate? = pagination_strategy != nil
++          relay? = pagination_strategy == :relay
++          result_fields = get_result_fields(pagination_strategy, relay?)
++
++          nested = Enum.map(Enum.reverse([selection | path]), & &1.name)
++
++          related_query =
++            if pagination_strategy do
++              case page_opts(
++                     resolution,
++                     relationship.destination,
++                     read_action.pagination,
++                     relay?,
++                     args,
++                     pagination_strategy,
++                     nested
++                   ) do
++                {:ok, page_opts} ->
++                  Ash.Query.page(related_query, page_opts)
++
++                {:error, error} ->
++                  Ash.Query.add_error(related_query, error)
++              end
++            else
++              related_query
++            end
++
+           related_query =
+             args
+-            |> apply_load_arguments(related_query)
++            |> apply_load_arguments(related_query, will_paginate?)
+             |> set_query_arguments(read_action, args)
+             |> select_fields(
+               relationship.destination,
+               resolution,
+               nil,
+-              Enum.map(Enum.reverse([selection | path]), & &1.name)
++              nested
+             )
+             |> load_fields(
+               load_opts,
+@@ -1844,7 +1890,8 @@ defmodule AshGraphql.Graphql.Resolver do
+               [
+                 selection | path
+               ],
+-              context
++              context,
++              result_fields
+             )
+ 
+           if selection.alias do
+@@ -2445,10 +2492,10 @@ defmodule AshGraphql.Graphql.Resolver do
+ 
+   defp unwrap_type_and_constraints(other, constraints), do: {other, constraints}
+ 
+-  def resolve_assoc(%Absinthe.Resolution{state: :resolved} = resolution, _),
++  def resolve_assoc_one(%Absinthe.Resolution{state: :resolved} = resolution, _),
+     do: resolution
+ 
+-  def resolve_assoc(
++  def resolve_assoc_one(
+         %{source: parent} = resolution,
+         {_domain, relationship}
+       ) do
+@@ -2462,6 +2509,25 @@ defmodule AshGraphql.Graphql.Resolver do
+     Absinthe.Resolution.put_result(resolution, {:ok, value})
+   end
+ 
++  def resolve_assoc_many(%Absinthe.Resolution{state: :resolved} = resolution, _),
++    do: resolution
++
++  def resolve_assoc_many(
++        %{source: parent} = resolution,
++        {_domain, relationship, pagination_strategy}
++      ) do
++    page =
++      if resolution.definition.alias do
++        Map.get(parent.calculations, {:__ash_graphql_relationship__, resolution.definition.alias})
++      else
++        Map.get(parent, relationship.name)
++      end
++
++    result = paginate_relationship(page, pagination_strategy)
++
++    Absinthe.Resolution.put_result(resolution, result)
++  end
++
+   def resolve_id(%Absinthe.Resolution{state: :resolved} = resolution, _),
+     do: resolution
+ 
+@@ -2673,7 +2739,7 @@ defmodule AshGraphql.Graphql.Resolver do
+     AshGraphql.Resource.Info.type(resource)
+   end
+ 
+-  defp apply_load_arguments(arguments, query, will_paginate? \\ false) do
++  defp apply_load_arguments(arguments, query, will_paginate?) do
+     Enum.reduce(arguments, query, fn
+       {:limit, limit}, query when not will_paginate? ->
+         Ash.Query.limit(query, limit)
+diff --git a/lib/resource/info.ex b/lib/resource/info.ex
+index e853cdf..cf7fae1 100644
+--- a/lib/resource/info.ex
++++ b/lib/resource/info.ex
+@@ -149,6 +149,11 @@ defmodule AshGraphql.Resource.Info do
+       resource |> Ash.Resource.Info.public_relationships() |> Enum.map(& &1.name)
+   end
+ 
++  @doc "Pagination configuration for list relationships"
++  def paginate_relationship_with(resource) do
++    Extension.get_opt(resource, [:graphql], :paginate_relationship_with, [])
++  end
++
+   @doc "Graphql argument name overrides for the resource"
+   def argument_names(resource) do
+     Extension.get_opt(resource, [:graphql], :argument_names, [])
+diff --git a/lib/resource/resource.ex b/lib/resource/resource.ex
+index 24ef3ea..961f51c 100644
+--- a/lib/resource/resource.ex
++++ b/lib/resource/resource.ex
+@@ -320,6 +320,12 @@ defmodule AshGraphql.Resource do
+         doc:
+           "A list of relationships to include on the created type. Defaults to all public relationships where the destination defines a graphql type."
+       ],
++      paginate_relationship_with: [
++        type: :keyword_list,
++        default: [],
++        doc:
++          "A keyword list indicating which kind of pagination should be used for each `has_many` and `many_to_many` relationships, e.g. `related_things: :keyset, other_related_things: :offset`. Valid pagination values are `nil`, `:offset`, `:keyset` and `:relay`."
++      ],
+       field_names: [
+         type: :keyword_list,
+         doc: "A keyword list of name overrides for attributes."
+@@ -394,7 +400,8 @@ defmodule AshGraphql.Resource do
+ 
+   @verifiers [
+     AshGraphql.Resource.Verifiers.VerifyQueryMetadata,
+-    AshGraphql.Resource.Verifiers.RequirePkeyDelimiter
++    AshGraphql.Resource.Verifiers.RequirePkeyDelimiter,
++    AshGraphql.Resource.Verifiers.VerifyPaginateRelationshipWith
+   ]
+ 
+   @sections [@graphql]
+@@ -1273,7 +1280,7 @@ defmodule AshGraphql.Resource do
+     if relay? do
+       String.to_atom("#{type}_connection")
+     else
+-      case pagination_strategy(query, action) do
++      case query_pagination_strategy(query, action) do
+         :keyset ->
+           String.to_atom("keyset_page_of_#{type}")
+ 
+@@ -1299,44 +1306,62 @@ defmodule AshGraphql.Resource do
+   end
+ 
+   @doc false
+-  def pagination_strategy(nil, _) do
++  def query_pagination_strategy(nil, _) do
+     nil
+   end
+ 
+-  def pagination_strategy(_query, %{pagination: pagination}) when pagination in [nil, false] do
++  def query_pagination_strategy(%{paginate_with: strategy}, action) do
++    pagination_strategy(strategy, action)
++  end
++
++  @doc false
++  def relationship_pagination_strategy(resource, relationship_name, action) do
++    resource
++    |> AshGraphql.Resource.Info.paginate_relationship_with()
++    |> Keyword.get(relationship_name)
++    |> pagination_strategy(action, true)
++  end
++
++  defp pagination_strategy(strategy, action, allow_relay? \\ false)
++
++  defp pagination_strategy(_strategy, %{pagination: pagination}, _allow_relay?)
++       when pagination in [nil, false] do
+     nil
+   end
+ 
+-  def pagination_strategy(%{paginate_with: strategy}, action) do
+-    if action.pagination do
+-      strategies =
+-        if action.pagination.required? do
+-          []
+-        else
+-          [nil]
+-        end
++  defp pagination_strategy(strategy, action, allow_relay?) do
++    strategies =
++      if action.pagination.required? do
++        []
++      else
++        [nil]
++      end
+ 
+-      strategies =
+-        if action.pagination.keyset? do
+-          [:keyset | strategies]
+-        else
+-          strategies
+-        end
++    strategies =
++      if action.pagination.keyset? do
++        [:keyset | strategies]
++      else
++        strategies
++      end
+ 
+-      strategies =
+-        if action.pagination.offset? do
+-          [:offset | strategies]
+-        else
+-          strategies
+-        end
++    strategies =
++      if action.pagination.offset? do
++        [:offset | strategies]
++      else
++        strategies
++      end
+ 
+-      if strategy in strategies do
+-        strategy
++    strategies =
++      if allow_relay? and action.pagination.keyset? do
++        [:relay | strategies]
+       else
+-        Enum.at(strategies, 0)
++        strategies
+       end
++
++    if strategy in strategies do
++      strategy
+     else
+-      nil
++      Enum.at(strategies, 0)
+     end
+   end
+ 
+@@ -1535,30 +1560,15 @@ defmodule AshGraphql.Resource do
+     args ++ pagination_args(query, action) ++ read_args(resource, action, schema, hide_inputs)
+   end
+ 
+-  defp args(:list_related, resource, action, schema, identity, hide_inputs, _) do
+-    args(:list, resource, action, schema, identity, hide_inputs) ++
+-      [
+-        %Absinthe.Blueprint.Schema.InputValueDefinition{
+-          name: "limit",
+-          identifier: :limit,
+-          type: :integer,
+-          description: "The number of records to return.",
+-          __reference__: ref(__ENV__)
+-        },
+-        %Absinthe.Blueprint.Schema.InputValueDefinition{
+-          name: "offset",
+-          identifier: :offset,
+-          type: :integer,
+-          description: "The number of records to skip.",
+-          __reference__: ref(__ENV__)
+-        }
+-      ]
+-  end
+-
+   defp args(:one_related, resource, action, schema, _identity, hide_inputs, _) do
+     read_args(resource, action, schema, hide_inputs)
+   end
+ 
++  defp related_list_args(resource, related_resource, relationship_name, action, schema) do
++    args(:list, related_resource, action, schema) ++
++      relationship_pagination_args(resource, relationship_name, action)
++  end
++
+   defp read_args(resource, action, schema, hide_inputs) do
+     action.arguments
+     |> Enum.filter(&(&1.public? && &1.name not in hide_inputs))
+@@ -1579,8 +1589,44 @@ defmodule AshGraphql.Resource do
+     end)
+   end
+ 
++  defp relationship_pagination_args(resource, relationship_name, action) do
++    case relationship_pagination_strategy(resource, relationship_name, action) do
++      nil ->
++        default_relationship_pagination_args()
++
++      :keyset ->
++        keyset_pagination_args(action)
++
++      :relay ->
++        # Relay has the same args as keyset
++        keyset_pagination_args(action)
++
++      :offset ->
++        offset_pagination_args(action)
++    end
++  end
++
++  defp default_relationship_pagination_args do
++    [
++      %Absinthe.Blueprint.Schema.InputValueDefinition{
++        name: "limit",
++        identifier: :limit,
++        type: :integer,
++        description: "The number of records to return.",
++        __reference__: ref(__ENV__)
++      },
++      %Absinthe.Blueprint.Schema.InputValueDefinition{
++        name: "offset",
++        identifier: :offset,
++        type: :integer,
++        description: "The number of records to skip.",
++        __reference__: ref(__ENV__)
++      }
++    ]
++  end
++
+   defp pagination_args(query, action) do
+-    case pagination_strategy(query, action) do
++    case query_pagination_strategy(query, action) do
+       nil ->
+         []
+ 
+@@ -1711,9 +1757,7 @@ defmodule AshGraphql.Resource do
+       List.wrap(sort_input(resource, schema)) ++
+       List.wrap(filter_input(resource, schema)) ++
+       filter_field_types(resource, schema) ++
+-      List.wrap(page_of(resource, all_domains, schema)) ++
+-      List.wrap(relay_page(resource, all_domains, schema)) ++
+-      List.wrap(keyset_page_of(resource, all_domains, schema)) ++
++      List.wrap(page_type_definitions(resource, schema)) ++
+       enum_definitions(resource, schema, __ENV__) ++
+       managed_relationship_definitions(resource, schema)
+   end
+@@ -3236,101 +3280,71 @@ defmodule AshGraphql.Resource do
+   end
+ 
+   # sobelow_skip ["DOS.StringToAtom"]
+-  defp relay_page(resource, all_domains, schema) do
+-    type = AshGraphql.Resource.Info.type(resource)
+-
+-    paginatable? =
+-      resource
+-      |> Ash.Resource.Info.actions()
+-      |> Enum.any?(fn action ->
+-        action.type == :read && action.pagination
+-      end)
+-
+-    if paginatable? do
+-      relay? =
+-        resource
+-        |> queries(all_domains)
+-        |> Enum.any?(&Map.get(&1, :relay?))
+-
+-      countable? =
+-        resource
+-        |> queries(all_domains)
+-        |> Enum.any?(fn
+-          %{relay?: true} = query ->
+-            action = Ash.Resource.Info.action(resource, query.action)
+-            action.type == :read && action.pagination && action.pagination.countable
+-
+-          _ ->
+-            false
+-        end)
+-
+-      if relay? do
+-        [
+-          %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
+-            description: "#{inspect(type)} edge",
+-            fields: [
+-              %Absinthe.Blueprint.Schema.FieldDefinition{
+-                description: "Cursor",
+-                identifier: :cursor,
+-                module: schema,
+-                name: "cursor",
+-                __reference__: ref(__ENV__),
+-                type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                  of_type: :string
+-                }
+-              },
+-              %Absinthe.Blueprint.Schema.FieldDefinition{
+-                description: "#{inspect(type)} node",
+-                identifier: :node,
+-                module: schema,
+-                name: "node",
+-                __reference__: ref(__ENV__),
+-                type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                  of_type: type
+-                }
+-              }
+-            ],
+-            identifier: String.to_atom("#{type}_edge"),
++  defp relay_page(type, schema, countable?) do
++    [
++      %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
++        description: "#{inspect(type)} edge",
++        fields: [
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "Cursor",
++            identifier: :cursor,
+             module: schema,
+-            name: Macro.camelize("#{type}_edge"),
+-            __reference__: ref(__ENV__)
++            name: "cursor",
++            __reference__: ref(__ENV__),
++            type: %Absinthe.Blueprint.TypeReference.NonNull{
++              of_type: :string
++            }
+           },
+-          %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
+-            description: "#{inspect(type)} connection",
+-            fields:
+-              [
+-                %Absinthe.Blueprint.Schema.FieldDefinition{
+-                  description: "Page information",
+-                  identifier: :page_info,
+-                  module: schema,
+-                  name: "page_info",
+-                  __reference__: ref(__ENV__),
+-                  type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                    of_type: :page_info
+-                  }
+-                },
+-                %Absinthe.Blueprint.Schema.FieldDefinition{
+-                  description: "#{inspect(type)} edges",
+-                  identifier: :edges,
+-                  module: schema,
+-                  name: "edges",
+-                  __reference__: ref(__ENV__),
+-                  type: %Absinthe.Blueprint.TypeReference.List{
+-                    of_type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                      of_type: String.to_atom("#{type}_edge")
+-                    }
+-                  }
+-                }
+-              ]
+-              |> add_count_to_page(schema, countable?),
+-            identifier: String.to_atom("#{type}_connection"),
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "#{inspect(type)} node",
++            identifier: :node,
+             module: schema,
+-            name: Macro.camelize("#{type}_connection"),
+-            __reference__: ref(__ENV__)
++            name: "node",
++            __reference__: ref(__ENV__),
++            type: %Absinthe.Blueprint.TypeReference.NonNull{
++              of_type: type
++            }
+           }
+-        ]
+-      end
+-    end
++        ],
++        identifier: String.to_atom("#{type}_edge"),
++        module: schema,
++        name: Macro.camelize("#{type}_edge"),
++        __reference__: ref(__ENV__)
++      },
++      %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
++        description: "#{inspect(type)} connection",
++        fields:
++          [
++            %Absinthe.Blueprint.Schema.FieldDefinition{
++              description: "Page information",
++              identifier: :page_info,
++              module: schema,
++              name: "page_info",
++              __reference__: ref(__ENV__),
++              type: %Absinthe.Blueprint.TypeReference.NonNull{
++                of_type: :page_info
++              }
++            },
++            %Absinthe.Blueprint.Schema.FieldDefinition{
++              description: "#{inspect(type)} edges",
++              identifier: :edges,
++              module: schema,
++              name: "edges",
++              __reference__: ref(__ENV__),
++              type: %Absinthe.Blueprint.TypeReference.List{
++                of_type: %Absinthe.Blueprint.TypeReference.NonNull{
++                  of_type: String.to_atom("#{type}_edge")
++                }
++              }
++            }
++          ]
++          |> add_count_to_page(schema, countable?),
++        identifier: String.to_atom("#{type}_connection"),
++        module: schema,
++        name: Macro.camelize("#{type}_connection"),
++        __reference__: ref(__ENV__)
++      }
++    ]
+   end
+ 
+   defp add_count_to_page(fields, schema, true) do
+@@ -3350,126 +3364,108 @@ defmodule AshGraphql.Resource do
+   defp add_count_to_page(fields, _, _), do: fields
+ 
+   # sobelow_skip ["DOS.StringToAtom"]
+-  defp page_of(resource, all_domains, schema) do
+-    type = AshGraphql.Resource.Info.type(resource)
+-
+-    paginatable? =
+-      resource
+-      |> queries(all_domains)
+-      |> Enum.any?(fn query ->
+-        action = Ash.Resource.Info.action(resource, query.action)
+-        action.type == :read && action.pagination
+-      end)
+-
+-    countable? =
+-      resource
+-      |> queries(all_domains)
+-      |> Enum.any?(fn query ->
+-        action = Ash.Resource.Info.action(resource, query.action)
+-
+-        action.type == :read && action.pagination && action.pagination.offset? &&
+-          action.pagination.countable
+-      end)
+-
+-    if paginatable? do
+-      %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
+-        description: "A page of #{inspect(type)}",
+-        fields:
+-          [
+-            %Absinthe.Blueprint.Schema.FieldDefinition{
+-              description: "The records contained in the page",
+-              identifier: :results,
+-              module: schema,
+-              name: "results",
+-              __reference__: ref(__ENV__),
+-              type: %Absinthe.Blueprint.TypeReference.List{
+-                of_type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                  of_type: type
+-                }
+-              }
+-            },
+-            %Absinthe.Blueprint.Schema.FieldDefinition{
+-              description: "Whether or not there is a next page",
+-              identifier: :more?,
+-              module: schema,
+-              name: "has_next_page",
+-              __reference__: ref(__ENV__),
+-              type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                of_type: :boolean
++  defp page_of(type, schema, countable?) do
++    %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
++      description: "A page of #{inspect(type)}",
++      fields:
++        [
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "The records contained in the page",
++            identifier: :results,
++            module: schema,
++            name: "results",
++            __reference__: ref(__ENV__),
++            type: %Absinthe.Blueprint.TypeReference.List{
++              of_type: %Absinthe.Blueprint.TypeReference.NonNull{
++                of_type: type
+               }
+             }
+-          ]
+-          |> add_count_to_page(schema, countable?),
+-        identifier: String.to_atom("page_of_#{type}"),
+-        module: schema,
+-        name: Macro.camelize("page_of_#{type}"),
+-        __reference__: ref(__ENV__)
+-      }
+-    end
++          },
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "Whether or not there is a next page",
++            identifier: :more?,
++            module: schema,
++            name: "has_next_page",
++            __reference__: ref(__ENV__),
++            type: %Absinthe.Blueprint.TypeReference.NonNull{
++              of_type: :boolean
++            }
++          }
++        ]
++        |> add_count_to_page(schema, countable?),
++      identifier: String.to_atom("page_of_#{type}"),
++      module: schema,
++      name: Macro.camelize("page_of_#{type}"),
++      __reference__: ref(__ENV__)
++    }
+   end
+ 
+   # sobelow_skip ["DOS.StringToAtom"]
+-  defp keyset_page_of(resource, all_domains, schema) do
++  defp keyset_page_of(type, schema, countable?) do
++    %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
++      description: "A keyset page of #{inspect(type)}",
++      fields:
++        [
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "The records contained in the page",
++            identifier: :results,
++            module: schema,
++            name: "results",
++            __reference__: ref(__ENV__),
++            type: %Absinthe.Blueprint.TypeReference.List{
++              of_type: %Absinthe.Blueprint.TypeReference.NonNull{
++                of_type: type
++              }
++            }
++          },
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "The first keyset in the results",
++            identifier: :start_keyset,
++            module: schema,
++            name: "start_keyset",
++            type: :string,
++            __reference__: ref(__ENV__)
++          },
++          %Absinthe.Blueprint.Schema.FieldDefinition{
++            description: "The last keyset in the results",
++            identifier: :end_keyset,
++            module: schema,
++            name: "end_keyset",
++            type: :string,
++            __reference__: ref(__ENV__)
++          }
++        ]
++        |> add_count_to_page(schema, countable?),
++      identifier: String.to_atom("keyset_page_of_#{type}"),
++      module: schema,
++      name: Macro.camelize("keyset_page_of_#{type}"),
++      __reference__: ref(__ENV__)
++    }
++  end
++
++  defp page_type_definitions(resource, schema) do
+     type = AshGraphql.Resource.Info.type(resource)
+ 
+     paginatable? =
+       resource
+-      |> queries(all_domains)
+-      |> Enum.any?(fn query ->
+-        action = Ash.Resource.Info.action(resource, query.action)
++      |> Ash.Resource.Info.actions()
++      |> Enum.any?(fn action ->
+         action.type == :read && action.pagination
+       end)
+ 
+     countable? =
+       resource
+-      |> queries(all_domains)
+-      |> Enum.any?(fn query ->
+-        action = Ash.Resource.Info.action(resource, query.action)
+-
+-        action.type == :read && action.pagination && action.pagination.keyset? &&
+-          action.pagination.countable
++      |> Ash.Resource.Info.actions()
++      |> Enum.any?(fn action ->
++        action.type == :read && action.pagination && action.pagination.countable
+       end)
+ 
+-    if paginatable? do
+-      %Absinthe.Blueprint.Schema.ObjectTypeDefinition{
+-        description: "A keyset page of #{inspect(type)}",
+-        fields:
+-          [
+-            %Absinthe.Blueprint.Schema.FieldDefinition{
+-              description: "The records contained in the page",
+-              identifier: :results,
+-              module: schema,
+-              name: "results",
+-              __reference__: ref(__ENV__),
+-              type: %Absinthe.Blueprint.TypeReference.List{
+-                of_type: %Absinthe.Blueprint.TypeReference.NonNull{
+-                  of_type: type
+-                }
+-              }
+-            },
+-            %Absinthe.Blueprint.Schema.FieldDefinition{
+-              description: "The first keyset in the results",
+-              identifier: :start_keyset,
+-              module: schema,
+-              name: "start_keyset",
+-              type: :string,
+-              __reference__: ref(__ENV__)
+-            },
+-            %Absinthe.Blueprint.Schema.FieldDefinition{
+-              description: "The last keyset in the results",
+-              identifier: :end_keyset,
+-              module: schema,
+-              name: "end_keyset",
+-              type: :string,
+-              __reference__: ref(__ENV__)
+-            }
+-          ]
+-          |> add_count_to_page(schema, countable?),
+-        identifier: String.to_atom("keyset_page_of_#{type}"),
+-        module: schema,
+-        name: Macro.camelize("keyset_page_of_#{type}"),
+-        __reference__: ref(__ENV__)
+-      }
++    if type && paginatable? do
++      List.wrap(page_of(type, schema, countable?)) ++
++        List.wrap(keyset_page_of(type, schema, countable?)) ++
++        List.wrap(relay_page(type, schema, countable?))
++    else
++      nil
+     end
+   end
+ 
+@@ -3796,7 +3792,7 @@ defmodule AshGraphql.Resource do
+           description: relationship.description,
+           arguments: args(:one_related, relationship.destination, read_action, schema),
+           middleware: [
+-            {{AshGraphql.Graphql.Resolver, :resolve_assoc}, {domain, relationship}}
++            {{AshGraphql.Graphql.Resolver, :resolve_assoc_one}, {domain, relationship}}
+           ],
+           type: type,
+           __reference__: ref(__ENV__)
+@@ -3814,13 +3810,10 @@ defmodule AshGraphql.Resource do
+ 
+         type = AshGraphql.Resource.Info.type(relationship.destination)
+ 
+-        query_type = %Absinthe.Blueprint.TypeReference.NonNull{
+-          of_type: %Absinthe.Blueprint.TypeReference.List{
+-            of_type: %Absinthe.Blueprint.TypeReference.NonNull{
+-              of_type: type
+-            }
+-          }
+-        }
++        pagination_strategy =
++          relationship_pagination_strategy(resource, relationship.name, read_action)
++
++        query_type = related_list_type(pagination_strategy, type)
+ 
+         %Absinthe.Blueprint.Schema.FieldDefinition{
+           identifier: relationship.name,
+@@ -3829,15 +3822,45 @@ defmodule AshGraphql.Resource do
+           description: relationship.description,
+           complexity: {AshGraphql.Graphql.Resolver, :query_complexity},
+           middleware: [
+-            {{AshGraphql.Graphql.Resolver, :resolve_assoc}, {domain, relationship}}
++            {{AshGraphql.Graphql.Resolver, :resolve_assoc_many},
++             {domain, relationship, pagination_strategy}}
+           ],
+-          arguments: args(:list_related, relationship.destination, read_action, schema),
++          arguments:
++            related_list_args(
++              resource,
++              relationship.destination,
++              relationship.name,
++              read_action,
++              schema
++            ),
+           type: query_type,
+           __reference__: ref(__ENV__)
+         }
+     end)
+   end
+ 
++  defp related_list_type(nil, type) do
++    %Absinthe.Blueprint.TypeReference.NonNull{
++      of_type: %Absinthe.Blueprint.TypeReference.List{
++        of_type: %Absinthe.Blueprint.TypeReference.NonNull{
++          of_type: type
++        }
++      }
++    }
++  end
++
++  defp related_list_type(:relay, type) do
++    String.to_atom("#{type}_connection")
++  end
++
++  defp related_list_type(:keyset, type) do
++    String.to_atom("keyset_page_of_#{type}")
++  end
++
++  defp related_list_type(:offset, type) do
++    String.to_atom("page_of_#{type}")
++  end
++
+   defp aggregates(resource, domain, schema) do
+     field_names = AshGraphql.Resource.Info.field_names(resource)
+ 
+diff --git a/lib/resource/verifiers/verify_paginate_relationship_with.ex b/lib/resource/verifiers/verify_paginate_relationship_with.ex
+new file mode 100644
+index 0000000..f70db07
+--- /dev/null
++++ b/lib/resource/verifiers/verify_paginate_relationship_with.ex
+@@ -0,0 +1,55 @@
++defmodule AshGraphql.Resource.Verifiers.VerifyPaginateRelationshipWith do
++  # Validates the paginate_relationship_with option
++  @moduledoc false
++
++  use Spark.Dsl.Verifier
++
++  alias Spark.Dsl.Verifier
++
++  @valid_strategies [
++    nil,
++    :keyset,
++    :offset,
++    :relay
++  ]
++
++  def verify(dsl) do
++    many_relationship_names =
++      dsl
++      |> Verifier.get_entities([:relationships])
++      |> Enum.filter(&(&1.cardinality == :many))
++      |> Enum.map(& &1.name)
++
++    dsl
++    |> Verifier.get_option([:graphql], :paginate_relationship_with, [])
++    |> Enum.each(fn {relationship_name, strategy} ->
++      cond do
++        relationship_name not in many_relationship_names ->
++          module = Verifier.get_persisted(dsl, :module)
++
++          raise Spark.Error.DslError,
++            module: module,
++            path: [:graphql, :paginate_relationship_with],
++            message: """
++            #{relationship_name} is not a relationship with cardinality many.
++            """
++
++        strategy not in @valid_strategies ->
++          module = Verifier.get_persisted(dsl, :module)
++          choices = Enum.map_join(@valid_strategies, ", ", &inspect/1)
++
++          raise Spark.Error.DslError,
++            module: module,
++            path: [:graphql, :paginate_relationship_with],
++            message: """
++            #{inspect(strategy)} is not a valid pagination strategy for relationships.
++
++            Available strategies: #{choices}
++            """
++
++        true ->
++          :ok
++      end
++    end)
++  end
++end

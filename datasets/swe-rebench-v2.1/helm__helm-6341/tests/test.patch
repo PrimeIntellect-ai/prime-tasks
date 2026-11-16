@@ -1,0 +1,325 @@
+diff --git a/pkg/cli/environment_test.go b/pkg/cli/environment_test.go
+index 58cf1c7f..ec719b5a 100644
+--- a/pkg/cli/environment_test.go
++++ b/pkg/cli/environment_test.go
+@@ -14,14 +14,22 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-package cli
++package cli_test
+ 
+ import (
++	"io"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
++	"path/filepath"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/spf13/pflag"
++
++	"helm.sh/helm/v3/pkg/action"
++	"helm.sh/helm/v3/pkg/cli"
+ )
+ 
+ func TestEnvSettings(t *testing.T) {
+@@ -38,7 +46,7 @@ func TestEnvSettings(t *testing.T) {
+ 	}{
+ 		{
+ 			name: "defaults",
+-			ns:   "",
++			ns:   "default",
+ 		},
+ 		{
+ 			name:  "with flags set",
+@@ -71,15 +79,15 @@ func TestEnvSettings(t *testing.T) {
+ 
+ 			flags := pflag.NewFlagSet("testing", pflag.ContinueOnError)
+ 
+-			settings := New()
++			settings := cli.New()
+ 			settings.AddFlags(flags)
+ 			flags.Parse(strings.Split(tt.args, " "))
+ 
+ 			if settings.Debug != tt.debug {
+ 				t.Errorf("expected debug %t, got %t", tt.debug, settings.Debug)
+ 			}
+-			if settings.Namespace != tt.ns {
+-				t.Errorf("expected namespace %q, got %q", tt.ns, settings.Namespace)
++			if settings.Namespace() != tt.ns {
++				t.Errorf("expected namespace %q, got %q", tt.ns, settings.Namespace())
+ 			}
+ 			if settings.KubeContext != tt.kcontext {
+ 				t.Errorf("expected kube-context %q, got %q", tt.kcontext, settings.KubeContext)
+@@ -88,11 +96,52 @@ func TestEnvSettings(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnvSettingsNamespaceFromKubeConfig(t *testing.T) {
++	defer resetEnv()()
++	os.Unsetenv("HELM_NAMESPACE")
++
++	dir := t.TempDir()
++	kubeconfig := filepath.Join(dir, "config")
++	content := `apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: https://example.invalid
++  name: test-cluster
++contexts:
++- context:
++    cluster: test-cluster
++    namespace: kubeconfig-ns
++    user: test-user
++  name: test-context
++current-context: test-context
++users:
++- name: test-user
++  user:
++    token: abc123
++`
++	if err := os.WriteFile(kubeconfig, []byte(content), 0600); err != nil {
++		t.Fatal(err)
++	}
++	os.Setenv("KUBECONFIG", kubeconfig)
++
++	flags := pflag.NewFlagSet("testing", pflag.ContinueOnError)
++	settings := cli.New()
++	settings.AddFlags(flags)
++	if err := flags.Parse([]string{"--kubeconfig=" + kubeconfig}); err != nil {
++		t.Fatal(err)
++	}
++
++	if got := settings.Namespace(); got != "kubeconfig-ns" {
++		t.Errorf("expected namespace %q from kubeconfig, got %q", "kubeconfig-ns", got)
++	}
++}
++
+ func resetEnv() func() {
+ 	origEnv := os.Environ()
+ 
+ 	// ensure any local envvars do not hose us
+-	for e := range New().EnvVars() {
++	for e := range cli.New().EnvVars() {
+ 		os.Unsetenv(e)
+ 	}
+ 
+@@ -103,3 +152,214 @@ func resetEnv() func() {
+ 		}
+ 	}
+ }
++
++func TestInitActionConfig(t *testing.T) {
++	defer resetEnv()()
++
++	dir := t.TempDir()
++	kubeconfig := filepath.Join(dir, "config")
++	content := `apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: https://example.invalid
++  name: test-cluster
++contexts:
++- context:
++    cluster: test-cluster
++    user: test-user
++  name: test-context
++current-context: test-context
++users:
++- name: test-user
++  user:
++    token: abc123
++`
++	if err := os.WriteFile(kubeconfig, []byte(content), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	flags := pflag.NewFlagSet("testing", pflag.ContinueOnError)
++	settings := cli.New()
++	settings.AddFlags(flags)
++	if err := flags.Parse([]string{"--kubeconfig=" + kubeconfig}); err != nil {
++		t.Fatal(err)
++	}
++
++	logged := false
++	logger := func(string, ...interface{}) { logged = true }
++	config, err := action.InitActionConfig(settings, false, "memory", logger)
++	if err != nil {
++		t.Fatalf("initializing action configuration: %v", err)
++	}
++	if config == nil || config.RESTClientGetter == nil || config.KubeClient == nil || config.Releases == nil || config.Log == nil {
++		t.Fatal("expected initialized action configuration")
++	}
++	config.Log("logger forwarding check")
++	if !logged {
++		t.Fatal("expected action configuration to preserve the supplied logger")
++	}
++}
++
++func TestInitActionConfigReturnsErrorWhenKubernetesInitializationFails(t *testing.T) {
++	defer resetEnv()()
++
++	dir := t.TempDir()
++	kubeconfig := filepath.Join(dir, "config")
++	if err := os.WriteFile(kubeconfig, []byte("apiVersion: [invalid"), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	flags := pflag.NewFlagSet("testing", pflag.ContinueOnError)
++	settings := cli.New()
++	settings.AddFlags(flags)
++	if err := flags.Parse([]string{"--kubeconfig=" + kubeconfig}); err != nil {
++		t.Fatal(err)
++	}
++
++	config, err := action.InitActionConfig(settings, false, "memory", nil)
++	if err == nil {
++		t.Fatalf("expected initialization error, got configuration %#v", config)
++	}
++}
++
++// recordingAPI is a minimal fake Kubernetes API server that records the
++// requests it receives and echoes back created objects.
++type recordingAPI struct {
++	mu       sync.Mutex
++	requests []string
++}
++
++func (r *recordingAPI) record(req string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.requests = append(r.requests, req)
++}
++
++func (r *recordingAPI) all() []string {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return append([]string(nil), r.requests...)
++}
++
++func newRecordingAPI(t *testing.T) (*httptest.Server, *recordingAPI) {
++	t.Helper()
++	rec := &recordingAPI{}
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		rec.record(req.Method + " " + req.URL.Path)
++		body, _ := io.ReadAll(req.Body)
++		w.Header().Set("Content-Type", "application/json")
++		if req.Method == http.MethodPost {
++			w.WriteHeader(http.StatusCreated)
++			w.Write(body)
++			return
++		}
++		w.WriteHeader(http.StatusNotFound)
++		w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
++	}))
++	t.Cleanup(srv.Close)
++	return srv, rec
++}
++
++func TestInitActionConfigStorageScopeAndDriver(t *testing.T) {
++	tests := []struct {
++		name          string
++		args          []string
++		allNamespaces bool
++		driver        string
++		// wantPrefix is the API path prefix that a release lookup must hit;
++		// empty means the lookup must not touch the Kubernetes API at all.
++		wantPrefix string
++	}{
++		{
++			name:       "secret driver scoped to namespace",
++			args:       []string{"--namespace=team-a"},
++			driver:     "secret",
++			wantPrefix: "GET /api/v1/namespaces/team-a/secrets",
++		},
++		{
++			name:       "configmap driver scoped to namespace",
++			args:       []string{"--namespace=team-a"},
++			driver:     "configmap",
++			wantPrefix: "GET /api/v1/namespaces/team-a/configmaps",
++		},
++		{
++			name:          "all namespaces does not scope to the namespace",
++			args:          []string{"--namespace=team-a"},
++			allNamespaces: true,
++			driver:        "secret",
++			wantPrefix:    "GET /api/v1/secrets",
++		},
++		{
++			name:   "memory driver makes no API requests",
++			args:   []string{"--namespace=team-a"},
++			driver: "memory",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			defer resetEnv()()
++			os.Unsetenv("HELM_NAMESPACE")
++
++			srv, rec := newRecordingAPI(t)
++			dir := t.TempDir()
++			kubeconfig := filepath.Join(dir, "config")
++			content := `apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: ` + srv.URL + `
++  name: test-cluster
++contexts:
++- context:
++    cluster: test-cluster
++    user: test-user
++  name: test-context
++current-context: test-context
++users:
++- name: test-user
++  user:
++    token: abc123
++`
++			if err := os.WriteFile(kubeconfig, []byte(content), 0600); err != nil {
++				t.Fatal(err)
++			}
++
++			flags := pflag.NewFlagSet("testing", pflag.ContinueOnError)
++			settings := cli.New()
++			settings.AddFlags(flags)
++			args := append([]string{"--kubeconfig=" + kubeconfig}, tt.args...)
++			if err := flags.Parse(args); err != nil {
++				t.Fatal(err)
++			}
++
++			noop := func(string, ...interface{}) {}
++			config, err := action.InitActionConfig(settings, tt.allNamespaces, tt.driver, noop)
++			if err != nil {
++				t.Fatalf("initializing action configuration: %v", err)
++			}
++
++			// The fake API answers 404, so the listing itself reports
++			// "failure"; only the request it issues is of interest here.
++			_, _ = config.Releases.ListReleases()
++
++			requests := rec.all()
++			if tt.wantPrefix == "" {
++				if len(requests) != 0 {
++					t.Fatalf("expected no Kubernetes API requests, got %v", requests)
++				}
++				return
++			}
++			found := false
++			for _, req := range requests {
++				if strings.HasPrefix(req, tt.wantPrefix) {
++					found = true
++				}
++			}
++			if !found {
++				t.Errorf("expected a request with prefix %q, got requests %v", tt.wantPrefix, requests)
++			}
++		})
++	}
++}

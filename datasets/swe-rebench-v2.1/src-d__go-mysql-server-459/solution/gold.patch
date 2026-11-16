@@ -1,0 +1,171 @@
+diff --git a/sql/analyzer/process.go b/sql/analyzer/process.go
+index 678c87b..84a87c4 100644
+--- a/sql/analyzer/process.go
++++ b/sql/analyzer/process.go
+@@ -22,7 +22,8 @@ func trackProcess(ctx *sql.Context, a *Analyzer, n sql.Node) (sql.Node, error) {
+ 	n, err := n.TransformUp(func(n sql.Node) (sql.Node, error) {
+ 		switch n := n.(type) {
+ 		case *plan.ResolvedTable:
+-			if _, ok := n.Table.(*plan.ProcessTable); ok {
++			switch n.Table.(type) {
++			case *plan.ProcessTable, *plan.ProcessIndexableTable:
+ 				return n, nil
+ 			}
+ 
+@@ -42,9 +43,18 @@ func trackProcess(ctx *sql.Context, a *Analyzer, n sql.Node) (sql.Node, error) {
+ 			processList.AddProgressItem(ctx.Pid(), name, total)
+ 
+ 			seen[name] = struct{}{}
+-			t := plan.NewProcessTable(n.Table, func() {
++
++			notify := func() {
+ 				processList.UpdateProgress(ctx.Pid(), name, 1)
+-			})
++			}
++
++			var t sql.Table
++			switch table := n.Table.(type) {
++			case sql.IndexableTable:
++				t = plan.NewProcessIndexableTable(table, notify)
++			default:
++				t = plan.NewProcessTable(table, notify)
++			}
+ 
+ 			return plan.NewResolvedTable(t), nil
+ 		default:
+diff --git a/sql/plan/create_index.go b/sql/plan/create_index.go
+index 2cf09de..6662075 100644
+--- a/sql/plan/create_index.go
++++ b/sql/plan/create_index.go
+@@ -76,10 +76,10 @@ func (c *CreateIndex) Resolved() bool {
+ 
+ func getIndexableTable(t sql.Table) (sql.IndexableTable, error) {
+ 	switch t := t.(type) {
+-	case sql.TableWrapper:
+-		return getIndexableTable(t.Underlying())
+ 	case sql.IndexableTable:
+ 		return t, nil
++	case sql.TableWrapper:
++		return getIndexableTable(t.Underlying())
+ 	default:
+ 		return nil, ErrInsertIntoNotSupported.New()
+ 	}
+diff --git a/sql/plan/insert.go b/sql/plan/insert.go
+index 1994e77..5df3f7b 100644
+--- a/sql/plan/insert.go
++++ b/sql/plan/insert.go
+@@ -49,10 +49,10 @@ func getInsertable(node sql.Node) (sql.Inserter, error) {
+ 
+ func getInsertableTable(t sql.Table) (sql.Inserter, error) {
+ 	switch t := t.(type) {
+-	case sql.TableWrapper:
+-		return getInsertableTable(t.Underlying())
+ 	case sql.Inserter:
+ 		return t, nil
++	case sql.TableWrapper:
++		return getInsertableTable(t.Underlying())
+ 	default:
+ 		return nil, ErrInsertIntoNotSupported.New()
+ 	}
+diff --git a/sql/plan/process.go b/sql/plan/process.go
+index 7126294..3874ed4 100644
+--- a/sql/plan/process.go
++++ b/sql/plan/process.go
+@@ -57,6 +57,50 @@ func (p *QueryProcess) RowIter(ctx *sql.Context) (sql.RowIter, error) {
+ 
+ func (p *QueryProcess) String() string { return p.Child.String() }
+ 
++// ProcessIndexableTable is a wrapper for sql.Tables inside a query process
++// that support indexing.
++// It notifies the process manager about the status of a query when a
++// partition is processed.
++type ProcessIndexableTable struct {
++	sql.IndexableTable
++	Notify NotifyFunc
++}
++
++// NewProcessIndexableTable returns a new ProcessIndexableTable.
++func NewProcessIndexableTable(t sql.IndexableTable, notify NotifyFunc) *ProcessIndexableTable {
++	return &ProcessIndexableTable{t, notify}
++}
++
++// Underlying implements sql.TableWrapper interface.
++func (t *ProcessIndexableTable) Underlying() sql.Table {
++	return t.IndexableTable
++}
++
++// IndexKeyValues implements the sql.IndexableTable interface.
++func (t *ProcessIndexableTable) IndexKeyValues(
++	ctx *sql.Context,
++	columns []string,
++) (sql.PartitionIndexKeyValueIter, error) {
++	iter, err := t.IndexableTable.IndexKeyValues(ctx, columns)
++	if err != nil {
++		return nil, err
++	}
++
++	return &trackedPartitionIndexKeyValueIter{iter, t.Notify}, nil
++}
++
++// PartitionRows implements the sql.Table interface.
++func (t *ProcessIndexableTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
++	iter, err := t.IndexableTable.PartitionRows(ctx, p)
++	if err != nil {
++		return nil, err
++	}
++
++	return &trackedRowIter{iter, t.Notify}, nil
++}
++
++var _ sql.IndexableTable = (*ProcessIndexableTable)(nil)
++
+ // ProcessTable is a wrapper for sql.Tables inside a query process. It
+ // notifies the process manager about the status of a query when a partition
+ // is processed.
+@@ -112,3 +156,46 @@ func (i *trackedRowIter) Close() error {
+ 	i.done()
+ 	return i.iter.Close()
+ }
++
++type trackedPartitionIndexKeyValueIter struct {
++	sql.PartitionIndexKeyValueIter
++	notify NotifyFunc
++}
++
++func (i *trackedPartitionIndexKeyValueIter) Next() (sql.Partition, sql.IndexKeyValueIter, error) {
++	p, iter, err := i.PartitionIndexKeyValueIter.Next()
++	if err != nil {
++		return nil, nil, err
++	}
++
++	return p, &trackedIndexKeyValueIter{iter, i.notify}, nil
++}
++
++type trackedIndexKeyValueIter struct {
++	iter   sql.IndexKeyValueIter
++	notify NotifyFunc
++}
++
++func (i *trackedIndexKeyValueIter) done() {
++	if i.notify != nil {
++		i.notify()
++		i.notify = nil
++	}
++}
++
++func (i *trackedIndexKeyValueIter) Close() error {
++	i.done()
++	return nil
++}
++
++func (i *trackedIndexKeyValueIter) Next() ([]interface{}, []byte, error) {
++	v, k, err := i.iter.Next()
++	if err != nil {
++		if err == io.EOF {
++			i.done()
++		}
++		return nil, nil, err
++	}
++
++	return v, k, nil
++}

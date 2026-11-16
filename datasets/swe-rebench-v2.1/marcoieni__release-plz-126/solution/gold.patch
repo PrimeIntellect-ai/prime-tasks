@@ -1,0 +1,350 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 10d038f4..678d9dd8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -789,6 +789,15 @@ dependencies = [
+  "generic-array 0.14.5",
+ ]
+ 
++[[package]]
++name = "dirs"
++version = "4.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ca3aa72a6f96ea37bbc5aa912f6788242832f75369bdfdadcb0e38423f100059"
++dependencies = [
++ "dirs-sys",
++]
++
+ [[package]]
+ name = "dirs-next"
+ version = "2.0.0"
+@@ -799,6 +808,17 @@ dependencies = [
+  "dirs-sys-next",
+ ]
+ 
++[[package]]
++name = "dirs-sys"
++version = "0.3.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1b1d1d91c932ef41c0f2663aa8b0ca0342d444d842c06914aa0a7e352d0bada6"
++dependencies = [
++ "libc",
++ "redox_users",
++ "winapi",
++]
++
+ [[package]]
+ name = "dirs-sys-next"
+ version = "0.1.2"
+@@ -2329,6 +2349,8 @@ dependencies = [
+  "anyhow",
+  "chrono",
+  "clap 3.1.17",
++ "dirs",
++ "git-cliff-core",
+  "release_plz_core",
+  "secrecy",
+  "tokio",
+diff --git a/README.md b/README.md
+index 68c5a466..d4de8ba5 100644
+--- a/README.md
++++ b/README.md
+@@ -58,6 +58,13 @@ subtle manual mistakes you can make when releasing from your terminal.
+ 
+ You can release all the unpublished packages by running `release-plz release`.
+ 
++## Changelog format
++
++Release-plz generates the changelog by using [git-cliff](https://github.com/orhun/git-cliff).
++By default, release-plz uses the [keep a changelog](https://keepachangelog.com/en/1.1.0/) format.
++You can customize the changelog format, by providing a git-cliff configuration
++file with the `--changelog-config` argument.
++
+ ## Similar projects
+ 
+ - [release-please](https://github.com/googleapis/release-please): release-plz is inspired by release-please,
+@@ -93,3 +100,4 @@ Parts of the codebase are inspired by:
+ - [cargo-workspaces](https://github.com/pksunkara/cargo-workspaces)
+ - [cargo-release](https://github.com/crate-ci/cargo-release)
+ - [cargo-edit](https://github.com/killercup/cargo-edit)
++- [git-cliff](https://github.com/orhun/git-cliff)
+diff --git a/crates/release_plz/Cargo.toml b/crates/release_plz/Cargo.toml
+index 67c2633e..28d595e6 100644
+--- a/crates/release_plz/Cargo.toml
++++ b/crates/release_plz/Cargo.toml
+@@ -23,3 +23,5 @@ tracing = "0.1"
+ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ tracing-log = "0.1"
+ url = "2"
++dirs = "4"
++git-cliff-core = "0.7"
+diff --git a/crates/release_plz/src/args/update.rs b/crates/release_plz/src/args/update.rs
+index 0d8ed431..4024c7d0 100644
+--- a/crates/release_plz/src/args/update.rs
++++ b/crates/release_plz/src/args/update.rs
+@@ -2,6 +2,7 @@ use std::path::PathBuf;
+ 
+ use anyhow::Context;
+ use chrono::{Date, NaiveDate, Utc};
++use git_cliff_core::config::Config as GitCliffConfig;
+ use release_plz_core::{ChangelogRequest, UpdateRequest, CARGO_TOML};
+ 
+ use super::local_manifest;
+@@ -45,6 +46,16 @@ pub struct Update {
+     /// If this flag is not specified, only update the workspace packages by running `cargo update --workspace`.
+     #[clap(short, long)]
+     update_deps: bool,
++    /// Path to the git cliff configuration file.
++    /// If not provided, `dirs::config_dir()/git-cliff/cliff.toml` is used if present.
++    #[clap(
++        long,
++        env = "GIT_CLIFF_CONFIG",
++        value_name = "PATH",
++        conflicts_with("no-changelog"),
++        forbid_empty_values(true)
++    )]
++    changelog_config: Option<PathBuf>,
+ }
+ 
+ impl Update {
+@@ -70,7 +81,11 @@ impl Update {
+                 })
+                 .transpose()?
+                 .map(|date| Date::<Utc>::from_utc(date, Utc));
+-            update = update.with_changelog(ChangelogRequest { release_date });
++            let changelog_req = ChangelogRequest {
++                release_date,
++                changelog_config: self.changelog_config()?,
++            };
++            update = update.with_changelog(changelog_req);
+         }
+         if let Some(package) = &self.package {
+             update = update.with_single_package(package.clone());
+@@ -81,6 +96,34 @@ impl Update {
+         if self.update_deps {
+             update = update.with_update_dependencies(true);
+         }
++
+         Ok(update)
+     }
++
++    fn changelog_config(&self) -> anyhow::Result<Option<GitCliffConfig>> {
++        let default_config_path = dirs::config_dir()
++            .context("cannot get config dir")?
++            .join("git-cliff")
++            .join(git_cliff_core::DEFAULT_CONFIG);
++
++        let path = match self.changelog_config.clone() {
++            Some(provided_path) => {
++                if provided_path.exists() {
++                    provided_path
++                } else {
++                    anyhow::bail!("cannot read {:?}", provided_path)
++                }
++            }
++            None => default_config_path,
++        };
++
++        // Parse the configuration file.
++        let config = if path.exists() {
++            Some(GitCliffConfig::parse(&path).context("failed to parse git cliff config file")?)
++        } else {
++            None
++        };
++
++        Ok(config)
++    }
+ }
+diff --git a/crates/release_plz_core/src/changelog.rs b/crates/release_plz_core/src/changelog.rs
+index bf88955d..b8600177 100644
+--- a/crates/release_plz_core/src/changelog.rs
++++ b/crates/release_plz_core/src/changelog.rs
+@@ -20,12 +20,13 @@ pub const CHANGELOG_FILENAME: &str = "CHANGELOG.md";
+ 
+ pub struct Changelog<'a> {
+     release: Release<'a>,
++    config: Option<Config>,
+ }
+ 
+ impl Changelog<'_> {
+     /// Generate the full changelog.
+     pub fn generate(self) -> String {
+-        let config = git_cliff_config();
++        let config = self.config.unwrap_or_else(default_git_cliff_config);
+         let changelog = GitCliffChangelog::new(vec![self.release], &config)
+             .expect("error while building changelog");
+         let mut out = Vec::new();
+@@ -37,7 +38,7 @@ impl Changelog<'_> {
+ 
+     /// Update an existing changelog.
+     pub fn prepend(self, old_changelog: impl Into<String>) -> String {
+-        let config = git_cliff_config();
++        let config = self.config.unwrap_or_else(default_git_cliff_config);
+         let changelog = GitCliffChangelog::new(vec![self.release], &config)
+             .expect("error while building changelog");
+         let mut out = Vec::new();
+@@ -48,16 +49,17 @@ impl Changelog<'_> {
+     }
+ }
+ 
+-fn git_cliff_config() -> Config {
++fn default_git_cliff_config() -> Config {
+     Config {
+-        changelog: changelog_config(),
+-        git: git_config(),
++        changelog: default_changelog_config(),
++        git: default_git_config(),
+     }
+ }
+ 
+ pub struct ChangelogBuilder {
+     commits: Vec<String>,
+     version: String,
++    config: Option<Config>,
+     release_date: Option<Date<Utc>>,
+ }
+ 
+@@ -67,6 +69,7 @@ impl<'a> ChangelogBuilder {
+             commits: commits.into_iter().map(|s| s.into()).collect(),
+             version: version.into(),
+             release_date: None,
++            config: None,
+         }
+     }
+ 
+@@ -77,14 +80,26 @@ impl<'a> ChangelogBuilder {
+         }
+     }
+ 
++    pub fn with_config(self, config: Config) -> Self {
++        Self {
++            config: Some(config),
++            ..self
++        }
++    }
++
+     pub fn build(self) -> Changelog<'static> {
++        let git_config = self
++            .config
++            .clone()
++            .map(|c| c.git)
++            .unwrap_or_else(default_git_config);
+         let release_date = self.release_timestamp();
+         let commits = self
+             .commits
+             .clone()
+             .into_iter()
+             .map(|c| Commit::new("id".to_string(), c))
+-            .filter_map(|c| c.process(&git_config()).ok())
++            .filter_map(|c| c.process(&git_config).ok())
+             .collect();
+ 
+         Changelog {
+@@ -95,6 +110,7 @@ impl<'a> ChangelogBuilder {
+                 timestamp: release_date,
+                 previous: None,
+             },
++            config: self.config,
+         }
+     }
+ 
+@@ -105,7 +121,7 @@ impl<'a> ChangelogBuilder {
+     }
+ }
+ 
+-fn git_config() -> GitConfig {
++fn default_git_config() -> GitConfig {
+     GitConfig {
+         conventional_commits: Some(true),
+         filter_unconventional: Some(false),
+@@ -187,7 +203,7 @@ fn commit_parsers() -> Vec<CommitParser> {
+     ]
+ }
+ 
+-fn changelog_config() -> ChangelogConfig {
++fn default_changelog_config() -> ChangelogConfig {
+     ChangelogConfig {
+         header: Some(String::from(CHANGELOG_HEADER)),
+         body: Some(String::from(
+diff --git a/crates/release_plz_core/src/next_ver.rs b/crates/release_plz_core/src/next_ver.rs
+index 2c3aecab..7df0b60a 100644
+--- a/crates/release_plz_core/src/next_ver.rs
++++ b/crates/release_plz_core/src/next_ver.rs
+@@ -11,6 +11,7 @@ use cargo_edit::{upgrade_requirement, LocalManifest, VersionExt};
+ use cargo_metadata::{Package, Version};
+ use chrono::{Date, Utc};
+ use fs_extra::dir;
++use git_cliff_core::config::Config as GitCliffConfig;
+ use git_cmd::{self, Repo};
+ use std::{
+     fs, io,
+@@ -38,10 +39,11 @@ pub struct UpdateRequest {
+     update_dependencies: bool,
+ }
+ 
+-#[derive(Debug, Clone, Copy)]
++#[derive(Debug, Clone)]
+ pub struct ChangelogRequest {
+     /// When the new release is published. If unspecified, current date is used.
+     pub release_date: Option<Date<Utc>>,
++    pub changelog_config: Option<GitCliffConfig>,
+ }
+ 
+ fn canonical_local_manifest(local_manifest: &Path) -> io::Result<PathBuf> {
+@@ -143,7 +145,7 @@ pub fn next_versions(
+         local_project,
+         &registry_packages,
+         &repository.repo,
+-        input.changelog_req,
++        input.changelog_req.clone(),
+     )?;
+     Ok((packages_to_update, repository))
+ }
+@@ -214,7 +216,7 @@ impl UpdateResult {
+         package: &Package,
+     ) -> anyhow::Result<UpdateResult> {
+         let changelog = changelog_req
+-            .map(|r| get_changelog(commits, &version, r.release_date, package))
++            .map(|r| get_changelog(commits, &version, Some(r), package))
+             .transpose()?;
+ 
+         Ok(UpdateResult { version, changelog })
+@@ -241,7 +243,7 @@ fn packages_to_update(
+         if next_version != current_version || !diff.registry_package_exists {
+             info!("{}: next version is {next_version}", p.name);
+             let update_result =
+-                UpdateResult::new(diff.commits.clone(), next_version, changelog_req, p)?;
++                UpdateResult::new(diff.commits.clone(), next_version, changelog_req.clone(), p)?;
+ 
+             packages_to_update.push((p.clone(), update_result));
+         } else if diff.is_version_published {
+@@ -297,7 +299,7 @@ fn dependent_packages(
+             );
+             Ok((
+                 p.clone(),
+-                UpdateResult::new(vec![change], next_version, changelog_req, p)?,
++                UpdateResult::new(vec![change], next_version, changelog_req.clone(), p)?,
+             ))
+         })
+         .collect::<anyhow::Result<Vec<_>>>()?;
+@@ -307,12 +309,17 @@ fn dependent_packages(
+ fn get_changelog(
+     commits: Vec<String>,
+     next_version: &Version,
+-    release_date: Option<Date<Utc>>,
++    changelog_req: Option<ChangelogRequest>,
+     package: &Package,
+ ) -> anyhow::Result<String> {
+     let mut changelog_builder = ChangelogBuilder::new(commits, next_version.to_string());
+-    if let Some(release_date) = release_date {
+-        changelog_builder = changelog_builder.with_release_date(release_date)
++    if let Some(changelog_req) = changelog_req {
++        if let Some(release_date) = changelog_req.release_date {
++            changelog_builder = changelog_builder.with_release_date(release_date)
++        }
++        if let Some(config) = changelog_req.changelog_config {
++            changelog_builder = changelog_builder.with_config(config)
++        }
+     }
+     let new_changelog = changelog_builder.build();
+     let changelog = match fs::read_to_string(package.changelog_path()?) {

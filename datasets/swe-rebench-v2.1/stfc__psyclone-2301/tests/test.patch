@@ -1,0 +1,258 @@
+diff --git a/src/psyclone/tests/domain/lfric/lfric_loop_test.py b/src/psyclone/tests/domain/lfric/lfric_loop_test.py
+index 2228e8ce3..b8e975b7d 100644
+--- a/src/psyclone/tests/domain/lfric/lfric_loop_test.py
++++ b/src/psyclone/tests/domain/lfric/lfric_loop_test.py
+@@ -50,6 +50,7 @@ from psyclone.domain.common.psylayer import PSyLoop
+ from psyclone.domain.lfric import LFRicConstants, LFRicSymbolTable
+ from psyclone.dynamo0p3 import DynLoop, DynKern, DynKernMetadata
+ from psyclone.errors import GenerationError, InternalError
++from psyclone.psyir.transformations import TransformationError
+ from psyclone.parse.algorithm import parse
+ from psyclone.psyGen import PSyFactory
+ from psyclone.psyir.nodes import (ArrayReference, Call, Literal, Reference,
+@@ -58,7 +59,8 @@ from psyclone.tests.lfric_build import LFRicBuild
+ from psyclone.tests.utilities import get_invoke
+ from psyclone.transformations import (Dynamo0p3ColourTrans,
+                                       DynamoOMPParallelLoopTrans,
+-                                      Dynamo0p3RedundantComputationTrans)
++                                      Dynamo0p3RedundantComputationTrans,
++                                      OMPLoopTrans)
+ 
+ BASE_PATH = os.path.join(
+     os.path.dirname(os.path.dirname(os.path.dirname(
+@@ -997,3 +999,62 @@ end module testkern_mod
+     assert ("A DynLoop of type 'null' can only contain a kernel that "
+             "operates on the 'domain' but kernel 'testkern_code' operates "
+             "on 'cell_column'" in str(err.value))
++
++
++def test_parallel_validation_of_safe_lfric_loops(dist_mem):
++    """LFRic loops over dofs and single-colour cells can be parallelised."""
++    _, invoke_info = parse(os.path.join(
++        BASE_PATH, "1_single_invoke.f90"), api=TEST_API)
++    psy = PSyFactory(TEST_API, distributed_memory=dist_mem).create(invoke_info)
++    schedule = psy.invokes.invoke_list[0].schedule
++    loop = schedule.walk(DynLoop)[0]
++
++    # A loop over the cells of one colour is safe even for writes to
++    # continuous fields. Rename its induction variable to ensure this is not
++    # tied to a particular fixture name.
++    Dynamo0p3ColourTrans().apply(loop)
++    cell_loop = schedule.walk(DynLoop)[1]
++    schedule.symbol_table.rename_symbol(
++        cell_loop.variable, "cell_index")
++    assert cell_loop.independent_iterations()
++    OMPLoopTrans().validate(cell_loop)
++
++    # A dof loop is also safe. Use a different induction-variable name from
++    # the fixture's conventional name.
++    _, invoke_info = parse(os.path.join(
++        BASE_PATH, "15.1.6_aX_plus_bY_builtin.f90"), api=TEST_API)
++    psy = PSyFactory(TEST_API, distributed_memory=dist_mem).create(invoke_info)
++    schedule = psy.invokes.invoke_list[0].schedule
++    dof_loop = schedule.walk(DynLoop)[0]
++    schedule.symbol_table.rename_symbol(
++        dof_loop.variable, "dof_index")
++    assert dof_loop.independent_iterations()
++    OMPLoopTrans().validate(dof_loop)
++
++
++def test_parallel_validation_of_discontinuous_field_loop(dist_mem):
++    """A discontinuous-space field write is safe in an uncoloured cell loop."""
++    _, invoke_info = parse(os.path.join(
++        BASE_PATH, "1_single_invoke_any_discontinuous_space.f90"),
++        api=TEST_API)
++    psy = PSyFactory(TEST_API, distributed_memory=dist_mem).create(invoke_info)
++    schedule = psy.invokes.invoke_list[0].schedule
++    loop = schedule.walk(DynLoop)[0]
++    schedule.symbol_table.rename_symbol(
++        loop.variable, "cell_index")
++    OMPLoopTrans().validate(loop)
++
++
++def test_parallel_validation_of_continuous_field_write_requires_colouring(
++        dist_mem):
++    """An uncoloured continuous-field write cannot be parallelised."""
++    _, invoke_info = parse(os.path.join(
++        BASE_PATH, "1_single_invoke.f90"), api=TEST_API)
++    psy = PSyFactory(TEST_API,
++                     distributed_memory=dist_mem).create(invoke_info)
++    schedule = psy.invokes.invoke_list[0].schedule
++    loop = schedule.walk(DynLoop)[0]
++    assert not loop.independent_iterations()
++
++    with pytest.raises(TransformationError):
++        DynamoOMPParallelLoopTrans().apply(loop)
+diff --git a/src/psyclone/tests/psyir/tools/dependency_tools_test.py b/src/psyclone/tests/psyir/tools/dependency_tools_test.py
+index 4860522dd..514a13488 100644
+--- a/src/psyclone/tests/psyir/tools/dependency_tools_test.py
++++ b/src/psyclone/tests/psyir/tools/dependency_tools_test.py
+@@ -38,12 +38,9 @@
+ 
+ import pytest
+ 
+-from fparser.common.readfortran import FortranStringReader
+-
+ from psyclone.configuration import Config
+ from psyclone.core import Signature, VariablesAccessInfo
+ from psyclone.errors import InternalError
+-from psyclone.psyGen import PSyFactory
+ from psyclone.psyir.tools import DependencyTools, DTCode, ReadWriteInfo
+ from psyclone.tests.utilities import get_invoke
+ 
+@@ -60,11 +57,14 @@ def test_messages():
+ 
+     dep_tools = DependencyTools()
+     assert dep_tools.get_all_messages() == []
+-    dep_tools._add_message("info-test", DTCode.INFO_NOT_NESTED_LOOP,
++
++    # There aren't currently any INFO messages so we invent one by simply
++    # adding one to the minimum INFO error code.
++    dep_tools._add_message("info-test", DTCode.INFO_MIN+1,
+                            ["a", "b"])
+     msg = dep_tools.get_all_messages()[0]
+     assert str(msg) == "Info: info-test"
+-    assert msg.code == DTCode.INFO_NOT_NESTED_LOOP
++    assert msg.code == DTCode.INFO_MIN + 1
+     assert msg.var_names == ["a", "b"]
+ 
+     dep_tools._add_message("warning-test", DTCode.WARN_SCALAR_REDUCTION,
+@@ -123,69 +123,6 @@ def test_loop_parallelise_errors():
+     assert "node must be an instance of class Loop but got" in str(err.value)
+ 
+ 
+-# -----------------------------------------------------------------------------
+-def test_nested_loop_detection(parser):
+-    '''Tests if nested loop are handled correctly.
+-    '''
+-    reader = FortranStringReader('''program test
+-                                 integer :: ji, jk
+-                                 integer, parameter :: jpi=10, jpk=10
+-                                 real, dimension(jpi,jpi,jpk) :: umask, xmask
+-                                 do jk = 1, jpk   ! loop 0
+-                                   umask(1,1,jk) = -1.0d0
+-                                 end do
+-                                 do ji = 1, jpi   ! loop 1
+-                                   xmask(ji,1,1) = -1.0d0
+-                                 end do
+-                                 end program test''')
+-    prog = parser(reader)
+-    psy = PSyFactory("nemo", distributed_memory=False).create(prog)
+-    loops = psy.invokes.get("test").schedule
+-    dep_tools = DependencyTools(["levels", "lat"])
+-
+-    # Not a nested loop
+-    parallel = dep_tools.can_loop_be_parallelised(loops[0])
+-    assert parallel is False
+-    msg = dep_tools.get_all_messages()[0]
+-    assert "Not a nested loop" in str(msg)
+-    assert msg.code == DTCode.INFO_NOT_NESTED_LOOP
+-    assert msg.var_names == []
+-
+-    # Now disable the test for nested loops:
+-    parallel = dep_tools.can_loop_be_parallelised(loops[0],
+-                                                  only_nested_loops=False)
+-    assert parallel is True
+-    # Make sure can_loop_be_parallelised clears old messages automatically
+-    assert dep_tools.get_all_messages() == []
+-
+-
+-# -----------------------------------------------------------------------------
+-def test_loop_type(parser):
+-    '''Tests general functionality of can_loop_be_parallelised.
+-    '''
+-    reader = FortranStringReader('''program test
+-                                 integer ji
+-                                 integer, parameter :: jpi=10
+-                                 real, dimension(jpi,1,1) :: xmask
+-                                 do ji = 1, jpi
+-                                   xmask(ji,1,1) = -1.0d0
+-                                 end do
+-                                 end program test''')
+-    prog = parser(reader)
+-    psy = PSyFactory("nemo", distributed_memory=False).create(prog)
+-    loop = psy.invokes.get("test").schedule[0]
+-    dep_tools = DependencyTools(["levels", "lat"])
+-
+-    # Check a loop that has the wrong loop type
+-    parallel = dep_tools.can_loop_be_parallelised(loop,
+-                                                  only_nested_loops=False)
+-    assert parallel is False
+-    msg = dep_tools.get_all_messages()[0]
+-    assert "wrong loop type 'lon'" in str(msg)
+-    assert msg.code == DTCode.INFO_WRONG_LOOP_TYPE
+-    assert msg.var_names == []
+-
+-
+ # -----------------------------------------------------------------------------
+ def test_arrays_parallelise(fortran_reader):
+     '''Tests the array checks of can_loop_be_parallelised.
+diff --git a/src/psyclone/tests/psyir/transformations/parallel_loop_trans_test.py b/src/psyclone/tests/psyir/transformations/parallel_loop_trans_test.py
+index 8e9e725c5..a51e113ce 100644
+--- a/src/psyclone/tests/psyir/transformations/parallel_loop_trans_test.py
++++ b/src/psyclone/tests/psyir/transformations/parallel_loop_trans_test.py
+@@ -158,8 +158,7 @@ end subroutine my_sub'''
+     trans = ParaTrans()
+     # Check that the dependency tools will raise the expected warning.
+     dep_tools = DependencyTools()
+-    dep_tools.can_loop_be_parallelised(loop,
+-                                       only_nested_loops=False)
++    dep_tools.can_loop_be_parallelised(loop)
+     for message in dep_tools.get_all_messages():
+         if message.code == DTCode.WARN_SCALAR_WRITTEN_ONCE:
+             break
+@@ -169,29 +168,6 @@ end subroutine my_sub'''
+     trans.validate(loop)
+ 
+ 
+-def test_paralooptrans_validate_ignore_key_error(fortran_reader, monkeypatch):
+-    '''
+-    Test that a KeyError in the dependence analysis is ignored.
+-    (This is required because LFRic still has symbols that don't exist in the
+-    symbol_table until the gen_code() step, so the dependency analysis raises
+-    KeyErrors in some cases.
+-
+-    '''
+-    psyir = fortran_reader.psyir_from_source(CODE)
+-    loop = psyir.walk(Loop)[0]
+-    trans = ParaTrans()
+-
+-    # Create a fake routine that just raises a KeyError.
+-    def fake(_1, _2, only_nested_loops=False):
+-        raise KeyError()
+-
+-    # Replace the `can_loop_be_parallelised` method of DependencyTools with
+-    # our fake routine.
+-    monkeypatch.setattr(DependencyTools, "can_loop_be_parallelised", fake)
+-    # `validate` should still complete successfully.
+-    trans.validate(loop)
+-
+-
+ def test_paralooptrans_apply_calls_validate(fortran_reader, monkeypatch):
+     '''
+     Check that the apply() method calls the validate() method.
+diff --git a/src/psyclone/tests/psyir/transformations/transformations_test.py b/src/psyclone/tests/psyir/transformations/transformations_test.py
+index b2a43b3da..b1d85d2c6 100644
+--- a/src/psyclone/tests/psyir/transformations/transformations_test.py
++++ b/src/psyclone/tests/psyir/transformations/transformations_test.py
+@@ -407,10 +407,6 @@ def test_parallellooptrans_validate_dependencies(fortran_reader):
+     # just with 'jk' and it is not modified in the inner loops
+     omplooptrans.validate(loops[1])
+ 
+-    # Check if there is missing symbol information it still validates
+-    del loops[1].ancestor(Routine).symbol_table._symbols['zws']
+-    omplooptrans.validate(loops[1])
+-
+     # Reductions also indicate a data dependency that needs to be handled, so
+     # we don't permit the parallelisation of the loop (until we support
+     # reduction clauses)
+@@ -438,8 +434,7 @@ def test_parallellooptrans_validate_dependencies(fortran_reader):
+             enddo
+           enddo
+         enddo''')
+-    assert not DependencyTools().can_loop_be_parallelised(
+-                    loops[0], only_nested_loops=False)
++    assert not DependencyTools().can_loop_be_parallelised(loops[0])
+     omplooptrans.validate(loops[0])
+ 
+ 

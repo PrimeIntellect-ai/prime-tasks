@@ -1,0 +1,578 @@
+diff --git a/docs/modules/configuration/pages/engine.adoc b/docs/modules/configuration/pages/engine.adoc
+index a263eb65..047d32f6 100644
+--- a/docs/modules/configuration/pages/engine.adoc
++++ b/docs/modules/configuration/pages/engine.adoc
+@@ -48,3 +48,17 @@ engine:
+   globals:
+     environment: ${CERBOS_ENVIRONMENT:development}
+ ----
++
++[#lenient_scopes]
++== Lenient scope search
++
++When working with xref:policies:scoped_policies.adoc[scopes], the default behaviour of the Cerbos engine is to expect that a policy file exists for the requested scope. For example, if the API request defines `a.b.c` as the `scope`, a policy file _must exist_ in the policy repository with the `a.b.c` scope. This behaviour can be overridden by setting `lenientScopeSearch` configuration to `true`. When lenient scope search is enabled, if a policy with scope `a.b.c` does not exist in the store, Cerbos will attempt to find scopes `a.b`, `a` and `` in that order.
++
++NOTE: This setting only affects how Cerbos treats missing leaf scopes when searching for policies. The policies stored in your policy store _must_ have unbroken scope chains (for example, if you have a scoped policy `a.b.c` in the store, the policy files for scopes `a.b`, `a` and `` must also exist).
++
++
++[source,yaml,linenums]
++----
++engine:
++  lenientScopeSearch: true
++----
+diff --git a/docs/modules/configuration/partials/fullconfiguration.adoc b/docs/modules/configuration/partials/fullconfiguration.adoc
+index 989617c1..f054e8e2 100644
+--- a/docs/modules/configuration/partials/fullconfiguration.adoc
++++ b/docs/modules/configuration/partials/fullconfiguration.adoc
+@@ -51,6 +51,7 @@ compile:
+ engine:
+   defaultPolicyVersion: "default" # DefaultPolicyVersion defines what version to assume if the request does not specify one.
+   globals: {"environment": "staging"} # Globals are environment-specific variables to be made available to policy conditions.
++  lenientScopeSearch: false # LenientScopeSearch configures the engine to ignore missing scopes and search upwards through the scope tree until it finds a usable policy.
+ schema:
+   cacheSize: 1024 # CacheSize defines the number of schemas to cache in memory.
+   enforcement: reject # Enforcement defines level of the validations. Possible values are none, warn, reject.
+diff --git a/docs/modules/policies/pages/scoped_policies.adoc b/docs/modules/policies/pages/scoped_policies.adoc
+index 16e0ee47..a3be743d 100644
+--- a/docs/modules/policies/pages/scoped_policies.adoc
++++ b/docs/modules/policies/pages/scoped_policies.adoc
+@@ -15,11 +15,11 @@ Cerbos resource and principal policies have an optional `scope` field that can b
+ ----
+ apiVersion: api.cerbos.dev/v1
+ resourcePolicy:
+-  version: "default" 
++  version: "default"
+   scope: "acme.corp" <1>
+-  resource: "album:object"  
++  resource: "album:object"
+   rules:
+-    - actions: ['*'] 
++    - actions: ['*']
+       effect: EFFECT_ALLOW
+       roles: ["admin"]
+ ----
+@@ -37,15 +37,15 @@ To illustrate, consider the following Check request:
+ [source,json,linenums]
+ ----
+ {
+-  "requestId":  "test01", 
+-  "actions":  ["view", "comment"], 
++  "requestId":  "test01",
++  "actions":  ["view", "comment"],
+   "resource":  {
+-    "kind":  "album:object", 
++    "kind":  "album:object",
+     "policyVersion": "default",
+     "scope": "customer.abc", <1>
+-    "instances": { 
+-      "XX125": { 
+-        "attr":  { 
++    "instances": {
++      "XX125": {
++        "attr":  {
+           "owner":  "alicia",
+           "public": false,
+           "tags": ["x", "y"],
+@@ -54,11 +54,11 @@ To illustrate, consider the following Check request:
+     }
+   },
+   "principal":  {
+-    "id":  "alicia", 
++    "id":  "alicia",
+     "policyVersion": "default",
+     "scope": "customer", <2>
+-    "roles":  ["user"], 
+-    "attr": { 
++    "roles":  ["user"],
++    "attr": {
+       "geography": "GB"
+     }
+   }
+@@ -78,5 +78,6 @@ image::decision_flow.png[]
+ * There must be no gaps in the policy chain. For example, if you define a policy with scope `a.b.c`, then policies with scopes `a.b`, `a`, and no-scope should also exist in the policy repository.
+ * xref:schemas.adoc[Schemas] must be the same among all the policies in the chain. The schemas used to validate the request are taken from the base policy (policy without a scope). Schemas defined in other policies of the chain will be ignored.
+ * Variables and derived roles imports are not inherited between policies. Explicitly import any derived roles and re-define any variables in each policy that requires them.
+-* First match wins. As illustrated in the flow chart above, scoped policies are evaluated from the most specific to the least specific. The first policy to produce a decision (ALLOW/DENY) for an action is the winner. The remaining policies cannot override the decision for that particular action (but they will still be evaluated if there are other actions that don't yet have a decision). 
++* First match wins. As illustrated in the flow chart above, scoped policies are evaluated from the most specific to the least specific. The first policy to produce a decision (ALLOW/DENY) for an action is the winner. The remaining policies cannot override the decision for that particular action (but they will still be evaluated if there are other actions that don't yet have a decision).
++* Unless xref:configuration:engine.adoc#lenient_scopes[lenient scope search] is enabled, a policy file matching the exact scope requested in the API request must exist in the store.
+ 
+diff --git a/internal/compile/manager.go b/internal/compile/manager.go
+index 72e1fbfb..77e365dc 100644
+--- a/internal/compile/manager.go
++++ b/internal/compile/manager.go
+@@ -7,6 +7,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/bluele/gcache"
+@@ -203,6 +204,54 @@ func (c *Manager) evict(modID namer.ModuleID) {
+ 	c.cache.Remove(modID)
+ }
+ 
++func (c *Manager) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++	keyBuilder := new(strings.Builder)
++	for _, modID := range candidates {
++		rps, err := c.cache.GetIFPresent(modID)
++		if err == nil {
++			cacheHit()
++			if rps != nil {
++				return rps.(*runtimev1.RunnablePolicySet), nil //nolint:forcetypeassert
++			}
++		}
++		keyBuilder.WriteString(modID.String())
++		keyBuilder.WriteRune('|')
++	}
++
++	cacheMiss()
++
++	key := keyBuilder.String()
++	defer c.sf.Forget(key)
++
++	rpsVal, err, _ := c.sf.Do(key, func() (any, error) {
++		cu, err := c.store.GetFirstMatch(ctx, candidates)
++		if err != nil {
++			return nil, fmt.Errorf("failed to get compilation units: %w", err)
++		}
++
++		if cu == nil {
++			return nil, nil
++		}
++
++		rps, err := c.compile(cu)
++		if err != nil {
++			return nil, PolicyCompilationErr{underlying: err}
++		}
++
++		return rps, nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	if rpsVal == nil {
++		return nil, nil
++	}
++
++	//nolint:forcetypeassert
++	return rpsVal.(*runtimev1.RunnablePolicySet), nil
++}
++
+ func (c *Manager) GetPolicySet(ctx context.Context, modID namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+ 	key := modID.String()
+ 	defer c.sf.Forget(key)
+diff --git a/internal/engine/conf.go b/internal/engine/conf.go
+index cd542bfd..acd9a95d 100644
+--- a/internal/engine/conf.go
++++ b/internal/engine/conf.go
+@@ -22,7 +22,9 @@ type Conf struct {
+ 	Globals map[string]any `yaml:"globals" conf:",example={\"environment\": \"staging\"}"`
+ 	// DefaultPolicyVersion defines what version to assume if the request does not specify one.
+ 	DefaultPolicyVersion string `yaml:"defaultPolicyVersion" conf:",example=\"default\""`
+-	NumWorkers           uint   `yaml:"numWorkers" conf:",ignore"`
++	// LenientScopeSearch configures the engine to ignore missing scopes and search upwards through the scope tree until it finds a usable policy.
++	LenientScopeSearch bool `yaml:"lenientScopeSearch" conf:",example=false"`
++	NumWorkers         uint `yaml:"numWorkers" conf:",ignore"`
+ }
+ 
+ func (c *Conf) Key() string {
+diff --git a/internal/engine/engine.go b/internal/engine/engine.go
+index c82829fd..8bbd075a 100644
+--- a/internal/engine/engine.go
++++ b/internal/engine/engine.go
+@@ -42,7 +42,7 @@ const (
+ )
+ 
+ type PolicyLoader interface {
+-	GetPolicySet(context.Context, namer.ModuleID) (*runtimev1.RunnablePolicySet, error)
++	GetFirstMatch(context.Context, []namer.ModuleID) (*runtimev1.RunnablePolicySet, error)
+ }
+ 
+ type checkOptions struct {
+@@ -501,8 +501,8 @@ func (engine *Engine) getPrincipalPolicySet(ctx context.Context, principal, poli
+ 	defer span.End()
+ 	span.SetAttributes(tracing.PolicyName(principal), tracing.PolicyVersion(policyVer), tracing.PolicyScope(scope))
+ 
+-	principalModID := namer.PrincipalPolicyModuleID(principal, policyVer, scope)
+-	rps, err := engine.policyLoader.GetPolicySet(ctx, principalModID)
++	principalModIDs := namer.ScopedPrincipalPolicyModuleIDs(principal, policyVer, scope, engine.conf.LenientScopeSearch)
++	rps, err := engine.policyLoader.GetFirstMatch(ctx, principalModIDs)
+ 	if err != nil {
+ 		tracing.MarkFailed(span, http.StatusInternalServerError, err)
+ 		return nil, err
+@@ -529,8 +529,8 @@ func (engine *Engine) getResourcePolicySet(ctx context.Context, resource, policy
+ 	defer span.End()
+ 	span.SetAttributes(tracing.PolicyName(resource), tracing.PolicyVersion(policyVer), tracing.PolicyScope(scope))
+ 
+-	resourceModID := namer.ResourcePolicyModuleID(resource, policyVer, scope)
+-	rps, err := engine.policyLoader.GetPolicySet(ctx, resourceModID)
++	resourceModIDs := namer.ScopedResourcePolicyModuleIDs(resource, policyVer, scope, engine.conf.LenientScopeSearch)
++	rps, err := engine.policyLoader.GetFirstMatch(ctx, resourceModIDs)
+ 	if err != nil {
+ 		tracing.MarkFailed(span, http.StatusInternalServerError, err)
+ 		return nil, err
+diff --git a/internal/namer/namer.go b/internal/namer/namer.go
+index 5434899f..243595e9 100644
+--- a/internal/namer/namer.go
++++ b/internal/namer/namer.go
+@@ -117,20 +117,24 @@ func FQNTree(p *policyv1.Policy) []string {
+ 		panic(fmt.Errorf("unknown policy type %T", pt))
+ 	}
+ 
++	return buildFQNTree(fqn, scope, func(s string) string { return s })
++}
++
++func buildFQNTree[T any](fqn, scope string, elementFn func(string) T) []T {
+ 	if scope == "" {
+-		return []string{fqn}
++		return []T{elementFn(fqn)}
+ 	}
+ 
+-	fqnTree := []string{withScope(fqn, scope)}
++	fqnTree := []T{elementFn(withScope(fqn, scope))}
+ 
+ 	for i := len(scope) - 1; i >= 0; i-- {
+ 		if scope[i] == '.' {
+-			fqnTree = append(fqnTree, withScope(fqn, scope[:i]))
++			fqnTree = append(fqnTree, elementFn(withScope(fqn, scope[:i])))
+ 		}
+ 	}
+ 
+ 	// add the no scope FQN as the root
+-	fqnTree = append(fqnTree, fqn)
++	fqnTree = append(fqnTree, elementFn(fqn))
+ 
+ 	return fqnTree
+ }
+@@ -161,6 +165,16 @@ func ResourcePolicyModuleID(resource, version, scope string) ModuleID {
+ 	return GenModuleIDFromFQN(ResourcePolicyFQN(resource, version, scope))
+ }
+ 
++// ScopedResourcePolicyModuleIDs returns a list of module IDs for each scope segment if `strict` is false.
++// For example, if the scope is `a.b.c`, the list will contain the module IDs for scopes `a.b.c`, `a.b`, `a` and `""` in that order.
++func ScopedResourcePolicyModuleIDs(resource, version, scope string, genTree bool) []ModuleID {
++	if !genTree || scope == "" {
++		return []ModuleID{ResourcePolicyModuleID(resource, version, scope)}
++	}
++
++	return buildFQNTree(ResourcePolicyFQN(resource, version, ""), scope, GenModuleIDFromFQN)
++}
++
+ // PrincipalPolicyFQN returns the fully-qualified module name for the principal policy with given principal, version and scope.
+ func PrincipalPolicyFQN(principal, version, scope string) string {
+ 	fqn := fmt.Sprintf("%s.%s.v%s", PrincipalPoliciesPrefix, Sanitize(principal), Sanitize(version))
+@@ -172,6 +186,16 @@ func PrincipalPolicyModuleID(principal, version, scope string) ModuleID {
+ 	return GenModuleIDFromFQN(PrincipalPolicyFQN(principal, version, scope))
+ }
+ 
++// ScopedPrincipalPolicyModuleIDs returns a list of module IDs for each scope segment if `strict` is false.
++// For example, if the scope is `a.b.c`, the list will contain the module IDs for scopes `a.b.c`, `a.b`, `a` and `""` in that order.
++func ScopedPrincipalPolicyModuleIDs(principal, version, scope string, genTree bool) []ModuleID {
++	if !genTree || scope == "" {
++		return []ModuleID{PrincipalPolicyModuleID(principal, version, scope)}
++	}
++
++	return buildFQNTree(PrincipalPolicyFQN(principal, version, ""), scope, GenModuleIDFromFQN)
++}
++
+ // DerivedRolesFQN returns the fully-qualified module name for the given derived roles set.
+ func DerivedRolesFQN(roleSetName string) string {
+ 	return fmt.Sprintf("%s.%s", DerivedRolesPrefix, Sanitize(roleSetName))
+diff --git a/internal/storage/blob/store.go b/internal/storage/blob/store.go
+index 967ec213..a5f2ec81 100644
+--- a/internal/storage/blob/store.go
++++ b/internal/storage/blob/store.go
+@@ -306,6 +306,10 @@ func (s *Store) Driver() string {
+ 	return DriverName
+ }
+ 
++func (s *Store) GetFirstMatch(_ context.Context, candidates []namer.ModuleID) (*policy.CompilationUnit, error) {
++	return s.idx.GetFirstMatch(candidates)
++}
++
+ func (s *Store) GetCompilationUnits(_ context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error) {
+ 	return s.idx.GetCompilationUnits(ids...)
+ }
+diff --git a/internal/storage/bundle/bundle.go b/internal/storage/bundle/bundle.go
+index 6bcc5a54..d4f43079 100644
+--- a/internal/storage/bundle/bundle.go
++++ b/internal/storage/bundle/bundle.go
+@@ -171,18 +171,26 @@ func loadManifest(bundleFS afero.Fs) (*bundlev1.Manifest, error) {
+ 	return manifest, nil
+ }
+ 
+-func (b *Bundle) GetPolicySet(_ context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+-	idHex := id.HexStr()
+-	fileName := policyDir + idHex
++func (b *Bundle) GetFirstMatch(_ context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++	for _, id := range candidates {
++		idHex := id.HexStr()
++		fileName := policyDir + idHex
+ 
+-	if _, err := b.bundleFS.Stat(fileName); err != nil {
+-		if errors.Is(err, fs.ErrNotExist) {
+-			return nil, nil
++		if _, err := b.bundleFS.Stat(fileName); err != nil {
++			if errors.Is(err, fs.ErrNotExist) {
++				continue
++			}
++
++			return nil, fmt.Errorf("failed to stat policy %s: %w", idHex, err)
+ 		}
+ 
+-		return nil, fmt.Errorf("failed to stat policy %s: %w", idHex, err)
++		return b.loadPolicySet(idHex, fileName)
+ 	}
+ 
++	return nil, nil
++}
++
++func (b *Bundle) loadPolicySet(idHex, fileName string) (*runtimev1.RunnablePolicySet, error) {
+ 	f, err := b.bundleFS.Open(fileName)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to open policy %s: %w", idHex, err)
+diff --git a/internal/storage/bundle/local_source.go b/internal/storage/bundle/local_source.go
+index 19d418d0..5a2fe67f 100644
+--- a/internal/storage/bundle/local_source.go
++++ b/internal/storage/bundle/local_source.go
+@@ -140,9 +140,9 @@ func (ls *LocalSource) LoadSchema(ctx context.Context, id string) (schema io.Rea
+ 	return schema, err
+ }
+ 
+-func (ls *LocalSource) GetPolicySet(ctx context.Context, id namer.ModuleID) (ps *runtimev1.RunnablePolicySet, err error) {
++func (ls *LocalSource) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (ps *runtimev1.RunnablePolicySet, err error) {
+ 	ls.mu.RLock()
+-	ps, err = ls.bundle.GetPolicySet(ctx, id)
++	ps, err = ls.bundle.GetFirstMatch(ctx, candidates)
+ 	ls.mu.RUnlock()
+ 	return ps, err
+ }
+diff --git a/internal/storage/bundle/remote_source.go b/internal/storage/bundle/remote_source.go
+index 2afdd418..964e9e99 100644
+--- a/internal/storage/bundle/remote_source.go
++++ b/internal/storage/bundle/remote_source.go
+@@ -409,7 +409,7 @@ func (s *RemoteSource) IsHealthy() bool {
+ 	return s.healthy
+ }
+ 
+-func (s *RemoteSource) GetPolicySet(ctx context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++func (s *RemoteSource) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+ 
+@@ -417,7 +417,7 @@ func (s *RemoteSource) GetPolicySet(ctx context.Context, id namer.ModuleID) (*ru
+ 		return nil, ErrBundleNotLoaded
+ 	}
+ 
+-	return s.bundle.GetPolicySet(ctx, id)
++	return s.bundle.GetFirstMatch(ctx, candidates)
+ }
+ 
+ func (s *RemoteSource) ListPolicyIDs(ctx context.Context, params storage.ListPolicyIDsParams) ([]string, error) {
+diff --git a/internal/storage/bundle/source_wrappers.go b/internal/storage/bundle/source_wrappers.go
+index 6ed49d8c..de579172 100644
+--- a/internal/storage/bundle/source_wrappers.go
++++ b/internal/storage/bundle/source_wrappers.go
+@@ -51,9 +51,9 @@ func (is instrumentedSource) LoadSchema(ctx context.Context, id string) (io.Read
+ 	})
+ }
+ 
+-func (is instrumentedSource) GetPolicySet(ctx context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+-	return measureBinaryOp(ctx, is.name, "GetPolicySet", func(ctx context.Context) (*runtimev1.RunnablePolicySet, error) {
+-		return is.source.GetPolicySet(ctx, id)
++func (is instrumentedSource) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++	return measureBinaryOp(ctx, is.name, "GetFirstMatch", func(ctx context.Context) (*runtimev1.RunnablePolicySet, error) {
++		return is.source.GetFirstMatch(ctx, candidates)
+ 	})
+ }
+ 
+diff --git a/internal/storage/bundle/store.go b/internal/storage/bundle/store.go
+index ba9cc9e4..5a36a651 100644
+--- a/internal/storage/bundle/store.go
++++ b/internal/storage/bundle/store.go
+@@ -116,8 +116,8 @@ func (hs *HybridStore) LoadSchema(ctx context.Context, id string) (io.ReadCloser
+ 	return hs.withActiveSource().LoadSchema(ctx, id)
+ }
+ 
+-func (hs *HybridStore) GetPolicySet(ctx context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+-	return hs.withActiveSource().GetPolicySet(ctx, id)
++func (hs *HybridStore) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
++	return hs.withActiveSource().GetFirstMatch(ctx, candidates)
+ }
+ 
+ func (hs *HybridStore) SourceKind() string {
+diff --git a/internal/storage/db/internal/db.go b/internal/storage/db/internal/db.go
+index d0bfa012..9db9a1b1 100644
+--- a/internal/storage/db/internal/db.go
++++ b/internal/storage/db/internal/db.go
+@@ -38,6 +38,7 @@ type DBStorage interface {
+ 	storage.Reloadable
+ 	storage.Verifiable
+ 	AddOrUpdate(ctx context.Context, policies ...policy.Wrapper) error
++	GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*policy.CompilationUnit, error)
+ 	GetCompilationUnits(ctx context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error)
+ 	GetDependents(ctx context.Context, ids ...namer.ModuleID) (map[namer.ModuleID][]namer.ModuleID, error)
+ 	HasDescendants(ctx context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]bool, error)
+@@ -308,6 +309,21 @@ func (s *dbStorage) AddOrUpdate(ctx context.Context, policies ...policy.Wrapper)
+ 	return nil
+ }
+ 
++func (s *dbStorage) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*policy.CompilationUnit, error) {
++	results, err := s.GetCompilationUnits(ctx, candidates...)
++	if err != nil {
++		return nil, err
++	}
++
++	for _, id := range candidates {
++		if cu, ok := results[id]; ok {
++			return cu, nil
++		}
++	}
++
++	return nil, nil
++}
++
+ func (s *dbStorage) GetCompilationUnits(ctx context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error) {
+ 	// SELECT p.id as parent, p.id, p.definition
+ 	// FROM policy p
+diff --git a/internal/storage/disk/disk.go b/internal/storage/disk/disk.go
+index 69e348f4..d733d248 100644
+--- a/internal/storage/disk/disk.go
++++ b/internal/storage/disk/disk.go
+@@ -91,6 +91,10 @@ func (s *Store) Driver() string {
+ 	return DriverName
+ }
+ 
++func (s *Store) GetFirstMatch(_ context.Context, candidates []namer.ModuleID) (*policy.CompilationUnit, error) {
++	return s.idx.GetFirstMatch(candidates)
++}
++
+ func (s *Store) GetCompilationUnits(_ context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error) {
+ 	return s.idx.GetCompilationUnits(ids...)
+ }
+diff --git a/internal/storage/git/store.go b/internal/storage/git/store.go
+index 3d08b66f..d181ee54 100644
+--- a/internal/storage/git/store.go
++++ b/internal/storage/git/store.go
+@@ -134,6 +134,10 @@ func (s *Store) Driver() string {
+ 	return DriverName
+ }
+ 
++func (s *Store) GetFirstMatch(_ context.Context, candidates []namer.ModuleID) (*policy.CompilationUnit, error) {
++	return s.idx.GetFirstMatch(candidates)
++}
++
+ func (s *Store) GetCompilationUnits(_ context.Context, ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error) {
+ 	return s.idx.GetCompilationUnits(ids...)
+ }
+diff --git a/internal/storage/index/index.go b/internal/storage/index/index.go
+index 629e2ea3..9decbae6 100644
+--- a/internal/storage/index/index.go
++++ b/internal/storage/index/index.go
+@@ -41,6 +41,7 @@ type Entry struct {
+ 
+ type Index interface {
+ 	storage.Instrumented
++	GetFirstMatch([]namer.ModuleID) (*policy.CompilationUnit, error)
+ 	GetCompilationUnits(...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error)
+ 	GetDependents(...namer.ModuleID) (map[namer.ModuleID][]namer.ModuleID, error)
+ 	AddOrUpdate(Entry) (storage.Event, error)
+@@ -84,6 +85,50 @@ func (idx *index) GetFiles() []string {
+ 	return files
+ }
+ 
++func (idx *index) GetFirstMatch(candidates []namer.ModuleID) (*policy.CompilationUnit, error) {
++	idx.mu.RLock()
++	defer idx.mu.RUnlock()
++
++	for _, id := range candidates {
++		if _, ok := idx.modIDToFile[id]; !ok {
++			continue
++		}
++
++		p, err := idx.loadPolicy(id)
++		if err != nil {
++			return nil, err
++		}
++
++		policyKey := namer.PolicyKey(p)
++
++		cu := &policy.CompilationUnit{
++			ModID:       id,
++			Definitions: map[namer.ModuleID]*policyv1.Policy{id: p},
++		}
++
++		// add dependencies
++		if err := idx.addDepsToCompilationUnit(cu, id); err != nil {
++			return nil, fmt.Errorf("failed to load dependencies of %s: %w", policyKey, err)
++		}
++
++		// load ancestors of the policy
++		for _, ancestor := range cu.Ancestors() {
++			p, err := idx.loadPolicy(ancestor)
++			if err != nil {
++				return nil, fmt.Errorf("failed to load ancestor %q of scoped policy %s: %w", ancestor.String(), policyKey, err)
++			}
++			cu.AddDefinition(ancestor, p)
++			if err := idx.addDepsToCompilationUnit(cu, ancestor); err != nil {
++				return nil, fmt.Errorf("failed to load dependencies of ancestor %q of %s: %w", ancestor.String(), policyKey, err)
++			}
++		}
++
++		return cu, nil
++	}
++
++	return nil, nil
++}
++
+ func (idx *index) GetCompilationUnits(ids ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error) {
+ 	result := make(map[namer.ModuleID]*policy.CompilationUnit, len(ids))
+ 
+diff --git a/internal/storage/overlay/store.go b/internal/storage/overlay/store.go
+index c567a6ab..121d072c 100644
+--- a/internal/storage/overlay/store.go
++++ b/internal/storage/overlay/store.go
+@@ -162,12 +162,13 @@ func withCircuitBreaker[T any](s *Store, baseFn, fallbackFn func() (T, error)) (
+ // PolicyLoader interface
+ //
+ 
+-func (s *Store) GetPolicySet(ctx context.Context, id namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+-	// Both `SourceStore` (via `compile.Manager`) and `BinaryStore` implement GetPolicySet
++func (s *Store) GetFirstMatch(ctx context.Context, candidates []namer.ModuleID) (*runtimev1.RunnablePolicySet, error) {
+ 	return withCircuitBreaker(
+ 		s,
+-		func() (*runtimev1.RunnablePolicySet, error) { return s.basePolicyLoader.GetPolicySet(ctx, id) },
+-		func() (*runtimev1.RunnablePolicySet, error) { return s.fallbackPolicyLoader.GetPolicySet(ctx, id) },
++		func() (*runtimev1.RunnablePolicySet, error) { return s.basePolicyLoader.GetFirstMatch(ctx, candidates) },
++		func() (*runtimev1.RunnablePolicySet, error) {
++			return s.fallbackPolicyLoader.GetFirstMatch(ctx, candidates)
++		},
+ 	)
+ }
+ 
+diff --git a/internal/storage/store.go b/internal/storage/store.go
+index aa06c5e9..3ea2c367 100644
+--- a/internal/storage/store.go
++++ b/internal/storage/store.go
+@@ -127,6 +127,8 @@ type Store interface {
+ type SourceStore interface {
+ 	Store
+ 	Subscribable
++	// GetFirstMatch searches for the given module IDs in order and returns the first one found.
++	GetFirstMatch(context.Context, []namer.ModuleID) (*policy.CompilationUnit, error)
+ 	// GetCompilationUnits gets the compilation units for the given module IDs.
+ 	GetCompilationUnits(context.Context, ...namer.ModuleID) (map[namer.ModuleID]*policy.CompilationUnit, error)
+ 	// GetDependents returns the dependents of the given modules.
+@@ -138,8 +140,8 @@ type SourceStore interface {
+ // BinaryStore is implemented by stores that have pre-compiled policies in binary format.
+ type BinaryStore interface {
+ 	Store
+-	// GetPolicySet gets the compiled policy set identified by the given module ID.
+-	GetPolicySet(context.Context, namer.ModuleID) (*runtimev1.RunnablePolicySet, error)
++	// GetFirstMatch searches for the given module IDs in order and returns the first one found.
++	GetFirstMatch(context.Context, []namer.ModuleID) (*runtimev1.RunnablePolicySet, error)
+ }
+ 
+ // MutableStore is a store that allows mutations.

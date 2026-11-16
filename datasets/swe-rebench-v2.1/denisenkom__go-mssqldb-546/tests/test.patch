@@ -1,0 +1,229 @@
+diff --git a/accesstokenconnector_test.go b/accesstokenconnector_test.go
+new file mode 100644
+index 0000000..80bc425
+--- /dev/null
++++ b/accesstokenconnector_test.go
+@@ -0,0 +1,142 @@
++//go:build go1.10
++// +build go1.10
++
++package mssql
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"io"
++	"net"
++	"strconv"
++	"testing"
++	"time"
++)
++
++func TestNewAccessTokenConnector(t *testing.T) {
++	dsn := "Server=server.database.windows.net;Database=db"
++	connector, err := NewAccessTokenConnector(dsn, func() (string, error) {
++		return "token", nil
++	})
++	if err != nil {
++		t.Fatalf("creating access-token connector: %v", err)
++	}
++	if connector == nil {
++		t.Fatal("expected a connector")
++	}
++}
++
++func TestAccessTokenConnectorFailsToConnectIfNoAccessToken(t *testing.T) {
++	providerErr := errors.New("token unavailable")
++	dsn := "Server=server.database.windows.net;Database=db"
++	providerCalls := 0
++	tp := func() (string, error) {
++		providerCalls++
++		return "", providerErr
++	}
++	sut, err := NewAccessTokenConnector(dsn, tp)
++	if err != nil {
++		t.Fatalf("expected err==nil, but got %+v", err)
++	}
++	_, err = sut.Connect(context.TODO())
++	if err == nil {
++		t.Fatal("expected token-provider failure to be returned")
++	}
++	if providerCalls == 0 {
++		t.Fatal("expected token provider to be called during connection")
++	}
++}
++
++func TestAccessTokenConnectorSendsTokenInLogin(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++
++	loginPackets := make(chan []byte, 2)
++	serverErr := make(chan error, 1)
++	go func() {
++		for i := 0; i < 2; i++ {
++			conn, err := listener.Accept()
++			if err != nil {
++				serverErr <- err
++				return
++			}
++			func() {
++				defer conn.Close()
++				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
++				readPacket := func() ([]byte, error) {
++					header := make([]byte, 8)
++					if _, err := io.ReadFull(conn, header); err != nil {
++						return nil, err
++					}
++					packetLength := int(binary.BigEndian.Uint16(header[2:4]))
++					packet := make([]byte, packetLength-8)
++					if _, err := io.ReadFull(conn, packet); err != nil {
++						return nil, err
++					}
++					return append(header, packet...), nil
++				}
++				if _, err := readPacket(); err != nil {
++					serverErr <- err
++					return
++				}
++				// Negotiate no encryption so that the login request is visible to this local peer.
++				prelogin := []byte{4, 1, 0, 15, 0, 0, 1, 0, 1, 0, 6, 0, 1, 255, 2}
++				if _, err := conn.Write(prelogin); err != nil {
++					serverErr <- err
++					return
++				}
++				packet, err := readPacket()
++				if err != nil {
++					serverErr <- err
++					return
++				}
++				loginPackets <- packet
++			}()
++		}
++	}()
++
++	port := listener.Addr().(*net.TCPAddr).Port
++	token := "first-token"
++	connector, err := NewAccessTokenConnector(
++		"Server=127.0.0.1;Port="+strconv.Itoa(port)+";Database=db;encrypt=disable",
++		func() (string, error) { return token, nil },
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	readLogin := func() []byte {
++		t.Helper()
++		_, _ = connector.Connect(context.Background()) // the peer closes after observing the login
++		select {
++		case err := <-serverErr:
++			t.Fatalf("local SQL peer: %v", err)
++		case packet := <-loginPackets:
++			return packet
++		case <-time.After(3 * time.Second):
++			t.Fatal("timed out waiting for SQL login exchange")
++			return nil
++		}
++		return nil
++	}
++	firstLogin := readLogin()
++	token = "second-token"
++	secondLogin := readLogin()
++
++	for _, tc := range []struct {
++		packet []byte
++		token  string
++	}{{firstLogin, "first-token"}, {secondLogin, "second-token"}} {
++		encodedToken := make([]byte, 0, len(tc.token)*2)
++		for i := 0; i < len(tc.token); i++ {
++			encodedToken = append(encodedToken, tc.token[i], 0)
++		}
++		if !bytes.Contains(tc.packet, encodedToken) {
++			t.Fatalf("access token %q was not present in its SQL login exchange", tc.token)
++		}
++	}
++}
+diff --git a/tds_test.go b/tds_test.go
+index 00360d8..7604277 100644
+--- a/tds_test.go
++++ b/tds_test.go
+@@ -5,7 +5,6 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"encoding/hex"
+-	"fmt"
+ 	"net/url"
+ 	"os"
+ 	"runtime"
+@@ -62,11 +61,11 @@ func TestSendLogin(t *testing.T) {
+ 		116, 0, 104, 0}
+ 	out := memBuf.Bytes()
+ 	if !bytes.Equal(ref, out) {
+-		fmt.Println("Expected:")
+-		fmt.Print(hex.Dump(ref))
+-		fmt.Println("Returned:")
+-		fmt.Print(hex.Dump(out))
+-		t.Error("input output don't match")
++		t.Log("Expected:")
++		t.Log(hex.Dump(ref))
++		t.Log("Returned:")
++		t.Log(hex.Dump(out))
++		t.Fatal("input output don't match")
+ 	}
+ }
+ 
+@@ -109,7 +108,7 @@ loop:
+ 		case []interface{}:
+ 			lastRow = token
+ 		default:
+-			fmt.Println("unknown token", tok)
++			t.Log("unknown token", tok)
+ 		}
+ 	}
+ 
+@@ -176,8 +175,6 @@ func (l testLogger) Println(v ...interface{}) {
+ 	l.t.Log(v...)
+ }
+ 
+-
+-
+ func TestConnect(t *testing.T) {
+ 	checkConnStr(t)
+ 	SetLogger(testLogger{t})
+@@ -413,7 +410,7 @@ func TestSSPIAuth(t *testing.T) {
+ 
+ func TestUcs22Str(t *testing.T) {
+ 	// Test valid input
+-	s, err := ucs22str([]byte{0x31, 0, 0x32, 0, 0x33, 0})  // 123 in UCS2 encoding
++	s, err := ucs22str([]byte{0x31, 0, 0x32, 0, 0x33, 0}) // 123 in UCS2 encoding
+ 	if err != nil {
+ 		t.Errorf("ucs22str should not fail for valid ucs2 byte sequence: %s", err)
+ 	}
+@@ -429,7 +426,7 @@ func TestUcs22Str(t *testing.T) {
+ }
+ 
+ func TestReadUcs2(t *testing.T) {
+-	buf := bytes.NewBuffer([]byte{0x31, 0, 0x32, 0, 0x33, 0})  // 123 in UCS2 encoding
++	buf := bytes.NewBuffer([]byte{0x31, 0, 0x32, 0, 0x33, 0}) // 123 in UCS2 encoding
+ 	s, err := readUcs2(buf, 3)
+ 	if err != nil {
+ 		t.Errorf("readUcs2 should not fail for valid ucs2 byte sequence: %s", err)
+@@ -447,7 +444,7 @@ func TestReadUcs2(t *testing.T) {
+ 
+ func TestReadUsVarChar(t *testing.T) {
+ 	// should succeed for valid buffer
+-	buf := bytes.NewBuffer([]byte{3, 0, 0x31, 0, 0x32, 0, 0x33, 0})  // 123 in UCS2 encoding with length prefix 3 uint16
++	buf := bytes.NewBuffer([]byte{3, 0, 0x31, 0, 0x32, 0, 0x33, 0}) // 123 in UCS2 encoding with length prefix 3 uint16
+ 	s, err := readUsVarChar(buf)
+ 	if err != nil {
+ 		t.Errorf("readUsVarChar should not fail for valid ucs2 byte sequence: %s", err)
+@@ -487,4 +484,4 @@ func TestReadBVarByte(t *testing.T) {
+ 	if err == nil {
+ 		t.Error("readUsVarByte should fail on short buffer, but it didn't")
+ 	}
+-}
+\ No newline at end of file
++}

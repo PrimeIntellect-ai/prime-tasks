@@ -1,0 +1,320 @@
+diff --git a/index.js b/index.js
+index 4ee707b..b34b342 100644
+--- a/index.js
++++ b/index.js
+@@ -7,10 +7,10 @@ import stripFinalNewline from 'strip-final-newline';
+ import {npmRunPathEnv} from 'npm-run-path';
+ import onetime from 'onetime';
+ import {makeError} from './lib/error.js';
+-import {handleStdioOption, normalizeStdioNode} from './lib/stdio.js';
++import {handleStdioOption, handleInputOption, pipeStdioOption, normalizeStdioNode} from './lib/stdio.js';
+ import {spawnedKill, spawnedCancel, setupTimeout, validateTimeout, setExitHandler} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+-import {validateInputOptions, handleInput, getSpawnedResult, makeAllStream, handleInputSync} from './lib/stream.js';
++import {getSpawnedResult, makeAllStream} from './lib/stream.js';
+ import {mergePromise, getSpawnedPromise} from './lib/promise.js';
+ import {joinCommand, parseCommand, parseTemplates, getEscapedCommand} from './lib/command.js';
+ import {logCommand, verboseDefault} from './lib/verbose.js';
+@@ -52,14 +52,12 @@ const handleArguments = (file, args, options = {}) => {
+ 
+ 	options.env = getEnv(options);
+ 
+-	const stdioStreams = handleStdioOption(options);
+-
+ 	if (process.platform === 'win32' && path.basename(file, '.exe') === 'cmd') {
+ 		// #116
+ 		args.unshift('/q');
+ 	}
+ 
+-	return {file, args, options, parsed, stdioStreams};
++	return {file, args, options};
+ };
+ 
+ const handleOutput = (options, value, error) => {
+@@ -77,13 +75,13 @@ const handleOutput = (options, value, error) => {
+ 
+ export function execa(file, args, options) {
+ 	const parsed = handleArguments(file, args, options);
++	const stdioStreams = handleStdioOption(parsed.options);
++	validateTimeout(parsed.options);
++
+ 	const command = joinCommand(file, args);
+ 	const escapedCommand = getEscapedCommand(file, args);
+ 	logCommand(escapedCommand, parsed.options);
+ 
+-	validateTimeout(parsed.options);
+-	validateInputOptions(parsed.options, parsed.stdioStreams);
+-
+ 	let spawned;
+ 	try {
+ 		spawned = childProcess.spawn(parsed.file, parsed.args, parsed.options);
+@@ -116,7 +114,7 @@ export function execa(file, args, options) {
+ 	spawned.cancel = spawnedCancel.bind(null, spawned, context);
+ 
+ 	const handlePromise = async () => {
+-		const [{error, exitCode, signal, timedOut}, stdoutResult, stderrResult, allResult] = await getSpawnedResult(spawned, parsed.options, parsed.stdioStreams, processDone);
++		const [{error, exitCode, signal, timedOut}, stdoutResult, stderrResult, allResult] = await getSpawnedResult(spawned, parsed.options, stdioStreams, processDone);
+ 		const stdout = handleOutput(parsed.options, stdoutResult);
+ 		const stderr = handleOutput(parsed.options, stderrResult);
+ 		const all = handleOutput(parsed.options, allResult);
+@@ -160,7 +158,7 @@ export function execa(file, args, options) {
+ 
+ 	const handlePromiseOnce = onetime(handlePromise);
+ 
+-	handleInput(spawned, parsed.options, parsed.stdioStreams);
++	pipeStdioOption(spawned, stdioStreams);
+ 
+ 	spawned.all = makeAllStream(spawned, parsed.options);
+ 
+@@ -171,16 +169,15 @@ export function execa(file, args, options) {
+ 
+ export function execaSync(file, args, options) {
+ 	const parsed = handleArguments(file, args, options);
++	handleInputOption(parsed.options);
++
+ 	const command = joinCommand(file, args);
+ 	const escapedCommand = getEscapedCommand(file, args);
+ 	logCommand(escapedCommand, parsed.options);
+ 
+-	validateInputOptions(parsed.options, parsed.stdioStreams);
+-	const inputOption = handleInputSync(parsed.options, parsed.stdioStreams);
+-
+ 	let result;
+ 	try {
+-		result = childProcess.spawnSync(parsed.file, parsed.args, {...parsed.options, input: inputOption});
++		result = childProcess.spawnSync(parsed.file, parsed.args, parsed.options);
+ 	} catch (error) {
+ 		throw makeError({
+ 			error,
+diff --git a/lib/stdio.js b/lib/stdio.js
+index 750649b..20f8ca8 100644
+--- a/lib/stdio.js
++++ b/lib/stdio.js
+@@ -1,41 +1,134 @@
++import {createReadStream, readFileSync} from 'node:fs';
+ import {Readable} from 'node:stream';
+ import {isStream} from 'is-stream';
+ 
+ const aliases = ['stdin', 'stdout', 'stderr'];
+ 
++const arrifyStdio = (stdio = []) => Array.isArray(stdio) ? stdio : [stdio, stdio, stdio];
++
+ const isIterableStdin = stdinOption => typeof stdinOption === 'object'
+ 	&& stdinOption !== null
+ 	&& !isStream(stdinOption)
+ 	&& (typeof stdinOption[Symbol.asyncIterator] === 'function' || typeof stdinOption[Symbol.iterator] === 'function');
+ 
+-const transformStdioItem = (stdioItem, index) => {
+-	if (index === 0 && isIterableStdin(stdioItem)) {
+-		return 'pipe';
++const getIterableStdin = stdioArray => isIterableStdin(stdioArray[0])
++	? stdioArray[0]
++	: undefined;
++
++// Check whether the `stdin` option results in `spawned.stdin` being `undefined`.
++// We use a deny list instead of an allow list to be forward compatible with new options.
++const cannotPipeStdio = stdioOption => NO_PIPE_STDIN.has(stdioOption)
++	|| isStream(stdioOption)
++	|| typeof stdioOption === 'number'
++	|| isIterableStdin(stdioOption);
++
++const NO_PIPE_STDIN = new Set(['ipc', 'ignore', 'inherit']);
++
++const validateInputOptions = (stdioArray, input, inputFile) => {
++	if (input !== undefined && inputFile !== undefined) {
++		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
++	}
++
++	const noPipeStdin = cannotPipeStdio(stdioArray[0]);
++	if (noPipeStdin && input !== undefined) {
++		throw new TypeError('The `input` and `stdin` options cannot be both set.');
+ 	}
+ 
+-	return stdioItem;
++	if (noPipeStdin && inputFile !== undefined) {
++		throw new TypeError('The `inputFile` and `stdin` options cannot be both set.');
++	}
+ };
+ 
+-const transformStdio = stdio => Array.isArray(stdio)
+-	? stdio.map((stdioItem, index) => transformStdioItem(stdioItem, index))
+-	: stdio;
++const getStdioStreams = (stdioArray, {input, inputFile}) => {
++	const iterableStdin = getIterableStdin(stdioArray);
++
++	if (iterableStdin !== undefined) {
++		return {stdinStream: Readable.from(iterableStdin)};
++	}
+ 
+-const getStdioStreams = stdio => {
+-	if (!Array.isArray(stdio) || !isIterableStdin(stdio[0])) {
++	if (inputFile !== undefined) {
++		return {stdinStream: createReadStream(inputFile)};
++	}
++
++	if (input === undefined) {
+ 		return {};
+ 	}
+ 
+-	const stdinIterableStream = Readable.from(stdio[0]);
+-	return {stdinIterableStream};
++	if (isStream(input)) {
++		return {stdinStream: input};
++	}
++
++	return {stdinInput: input};
+ };
+ 
++// When the `stdin: iterable`, `input` or `inputFile` option is used, we pipe to `spawned.stdin`.
++// Therefore the `stdin` option must be either `pipe` or `overlapped`. Other values do not set `spawned.stdin`.
++const willPipeStdin = (index, {stdinStream, stdinInput}) =>
++	index === 0 && (stdinStream !== undefined || stdinInput !== undefined);
++
++const transformStdioItem = (stdioItem, index, stdioStreams) =>
++	willPipeStdin(index, stdioStreams) && stdioItem !== 'overlapped' ? 'pipe' : stdioItem;
++
++const transformStdio = (stdio, stdioStreams) => Array.isArray(stdio)
++	? stdio.map((stdioItem, index) => transformStdioItem(stdioItem, index, stdioStreams))
++	: stdio;
++
++// Handle `input`, `inputFile` and `stdin` options, before spawning, in async mode
+ export const handleStdioOption = options => {
+ 	const stdio = normalizeStdio(options);
+-	const stdioStreams = getStdioStreams(stdio);
+-	options.stdio = transformStdio(stdio);
++	const stdioArray = arrifyStdio(stdio);
++	validateInputOptions(stdioArray, options.input, options.inputFile);
++	const stdioStreams = getStdioStreams(stdioArray, options);
++	options.stdio = transformStdio(stdio, stdioStreams);
+ 	return stdioStreams;
+ };
+ 
++// Handle `input`, `inputFile` and `stdin` options, after spawning, in async mode
++export const pipeStdioOption = (spawned, {stdinStream, stdinInput}) => {
++	if (stdinStream !== undefined) {
++		stdinStream.pipe(spawned.stdin);
++		return;
++	}
++
++	if (stdinInput !== undefined) {
++		spawned.stdin.end(stdinInput);
++	}
++};
++
++const validateInputOptionsSync = (stdioArray, input) => {
++	if (getIterableStdin(stdioArray) !== undefined) {
++		throw new TypeError('The `stdin` option cannot be an iterable in sync mode');
++	}
++
++	if (isStream(input)) {
++		throw new TypeError('The `input` option cannot be a stream in sync mode');
++	}
++};
++
++const getInputOption = (stdio, {input, inputFile}) => {
++	const stdioArray = arrifyStdio(stdio);
++	validateInputOptions(stdioArray, input, inputFile);
++	validateInputOptionsSync(stdioArray, input);
++
++	if (inputFile !== undefined) {
++		return readFileSync(inputFile);
++	}
++
++	return input;
++};
++
++// Handle `input`, `inputFile` and `stdin` options, before spawning, in sync mode
++export const handleInputOption = options => {
++	const stdio = normalizeStdio(options);
++
++	const input = getInputOption(stdio, options);
++	if (input !== undefined) {
++		options.input = input;
++	}
++
++	options.stdio = stdio;
++};
++
+ const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
+ 
+ export const normalizeStdio = options => {
+diff --git a/lib/stream.js b/lib/stream.js
+index 556c521..29420a7 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,61 +1,8 @@
+ import {once} from 'node:events';
+-import {createReadStream, readFileSync} from 'node:fs';
+ import {setTimeout} from 'node:timers/promises';
+-import {isStream} from 'is-stream';
+ import getStream, {getStreamAsBuffer} from 'get-stream';
+ import mergeStreams from '@sindresorhus/merge-streams';
+ 
+-export const validateInputOptions = ({input, inputFile}, {stdinIterableStream}) => {
+-	if (input !== undefined && inputFile !== undefined) {
+-		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
+-	}
+-
+-	if (stdinIterableStream !== undefined) {
+-		if (input !== undefined) {
+-			throw new TypeError('The `stdin` option cannot be an iterable when the `input` option is set.');
+-		}
+-
+-		if (inputFile !== undefined) {
+-			throw new TypeError('The `stdin` option cannot be an iterable when the `inputFile` option is set.');
+-		}
+-	}
+-};
+-
+-// `input` and `inputFile` option in sync mode
+-export const handleInputSync = ({input, inputFile}, {stdinIterableStream}) => {
+-	if (stdinIterableStream !== undefined) {
+-		throw new TypeError('The `stdin` option cannot be an iterable in sync mode');
+-	}
+-
+-	const inputOption = typeof inputFile === 'string' ? readFileSync(inputFile) : input;
+-
+-	if (isStream(inputOption)) {
+-		throw new TypeError('The `input` option cannot be a stream in sync mode');
+-	}
+-
+-	return inputOption;
+-};
+-
+-// `input` and `inputFile` option in async mode
+-export const handleInput = (spawned, {input, inputFile}, {stdinIterableStream}) => {
+-	if (stdinIterableStream !== undefined) {
+-		stdinIterableStream.pipe(spawned.stdin);
+-		return;
+-	}
+-
+-	const inputOption = typeof inputFile === 'string' ? createReadStream(inputFile) : input;
+-
+-	if (inputOption === undefined) {
+-		return;
+-	}
+-
+-	if (isStream(inputOption)) {
+-		inputOption.pipe(spawned.stdin);
+-	} else {
+-		spawned.stdin.end(inputOption);
+-	}
+-};
+-
+ // `all` interleaves `stdout` and `stderr`
+ export const makeAllStream = (spawned, {all}) => {
+ 	if (!all || (!spawned.stdout && !spawned.stderr)) {
+@@ -116,11 +63,11 @@ const throwOnStreamError = async stream => {
+ };
+ 
+ // Retrieve result of child process: exit code, signal, error, streams (stdout/stderr/all)
+-export const getSpawnedResult = async (spawned, {encoding, buffer, maxBuffer}, {stdinIterableStream}, processDone) => {
++export const getSpawnedResult = async (spawned, {encoding, buffer, maxBuffer}, {stdinStream}, processDone) => {
+ 	const stdoutPromise = getStreamPromise(spawned.stdout, {encoding, buffer, maxBuffer});
+ 	const stderrPromise = getStreamPromise(spawned.stderr, {encoding, buffer, maxBuffer});
+ 	const allPromise = getStreamPromise(spawned.all, {encoding, buffer, maxBuffer: maxBuffer * 2});
+-	const processDoneOrStreamsError = Promise.race([processDone, ...throwOnStreamsError([stdinIterableStream])]);
++	const processDoneOrStreamsError = Promise.race([processDone, ...throwOnStreamsError([stdinStream])]);
+ 
+ 	try {
+ 		return await Promise.all([processDoneOrStreamsError, stdoutPromise, stderrPromise, allPromise]);

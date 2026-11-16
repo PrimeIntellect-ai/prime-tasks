@@ -1,0 +1,278 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0c0f2c0..0ae450e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,10 @@
+ - Add `include_execution_result` option to command dispatch ([#96](https://github.com/slashdotdash/commanded/pull/96)).
+ - Add `Commanded.Aggregate.Multi` ([#98](https://github.com/slashdotdash/commanded/pull/98)).
+ 
++### Bug fixes
++
++- Adding a prefix to the aggregate in the router breaks the strong consistency of command dispatch ([#101](https://github.com/slashdotdash/commanded/issues/101)).
++
+ ## v0.14.0
+ 
+ ### Enhancements
+diff --git a/lib/commanded/aggregates/aggregate.ex b/lib/commanded/aggregates/aggregate.ex
+index 65f633f..edefb54 100644
+--- a/lib/commanded/aggregates/aggregate.ex
++++ b/lib/commanded/aggregates/aggregate.ex
+@@ -31,17 +31,15 @@ defmodule Commanded.Aggregates.Aggregate do
+     aggregate_uuid: nil,
+     aggregate_state: nil,
+     aggregate_version: 0,
+-    identity_prefix: nil,
+   ]
+ 
+-  def start_link(aggregate_module, aggregate_uuid, identity_prefix \\ nil)
+-  def start_link(aggregate_module, aggregate_uuid, identity_prefix) do
++  def start_link(aggregate_module, aggregate_uuid)
++  def start_link(aggregate_module, aggregate_uuid) do
+     name = via_tuple(aggregate_module, aggregate_uuid)
+ 
+     GenServer.start_link(__MODULE__, %Aggregate{
+       aggregate_module: aggregate_module,
+       aggregate_uuid: aggregate_uuid,
+-      identity_prefix: identity_prefix,
+     },
+     name: name)
+   end
+@@ -66,14 +64,16 @@ defmodule Commanded.Aggregates.Aggregate do
+   - `context` - includes command execution arguments
+     (see `Commanded.Aggregates.ExecutionContext` for details).
+   - `timeout` - an integer greater than zero which specifies how many
+-    milliseconds to wait for a reply, or the atom :infinity to wait indefinitely.
+-    The default value is five seconds (5,000ms).
++    milliseconds to wait for a reply, or the atom :infinity to wait
++    indefinitely. The default value is five seconds (5,000ms).
+ 
+   ## Return values
+ 
+-  Returns `{:ok, aggregate_version, events}` on success, or `{:error, reason}` on failure.
++  Returns `{:ok, aggregate_version, events}` on success, or `{:error, reason}`
++  on failure.
+ 
+-    - `aggregate_version` - the updated version of the aggregate after executing the command.
++    - `aggregate_version` - the updated version of the aggregate after executing
++       the command.
+     - `events` - events produced by the command, can be an empty list.
+ 
+   """
+@@ -123,7 +123,8 @@ defmodule Commanded.Aggregates.Aggregate do
+     {:stop, :normal, state}
+   end
+ 
+-  # Load any existing events for the aggregate from storage and repopulate the state using those events
++  # Load any existing events for the aggregate from storage and repopulate the
++  # state using those events
+   defp populate_aggregate_state(%Aggregate{aggregate_module: aggregate_module} = state) do
+     aggregate = %Aggregate{state |
+       aggregate_version: 0,
+@@ -134,8 +135,8 @@ defmodule Commanded.Aggregates.Aggregate do
+   end
+ 
+   # Load events from the event store, in batches, to rebuild the aggregate state
+-  defp rebuild_from_events(%Aggregate{aggregate_module: aggregate_module} = state) do
+-    case EventStore.stream_forward(stream_uuid(state), 0, @read_event_batch_size) do
++  defp rebuild_from_events(%Aggregate{aggregate_module: aggregate_module, aggregate_uuid: aggregate_uuid} = state) do
++    case EventStore.stream_forward(aggregate_uuid, 0, @read_event_batch_size) do
+       {:error, :stream_not_found} ->
+         # aggregate does not exist so return empty state
+         state
+@@ -199,8 +200,8 @@ defmodule Commanded.Aggregates.Aggregate do
+     Enum.reduce(events, aggregate_state, &aggregate_module.apply(&2, &1))
+   end
+ 
+-  defp persist_events(pending_events, aggregate_state, metadata, %Aggregate{aggregate_version: expected_version} = state) do
+-    with {:ok, stream_version} <- append_to_stream(pending_events, stream_uuid(state), expected_version, metadata) do
++  defp persist_events(pending_events, aggregate_state, metadata, %Aggregate{aggregate_uuid: aggregate_uuid, aggregate_version: expected_version} = state) do
++    with {:ok, stream_version} <- append_to_stream(pending_events, aggregate_uuid, expected_version, metadata) do
+       state = %Aggregate{state |
+         aggregate_state: aggregate_state,
+         aggregate_version: stream_version,
+@@ -219,8 +220,4 @@ defmodule Commanded.Aggregates.Aggregate do
+ 
+     EventStore.append_to_stream(stream_uuid, expected_version, event_data)
+   end
+-
+-  # Get the stream indentity to read/append events for the aggregate, with an optional prefix
+-  defp stream_uuid(%Aggregate{aggregate_uuid: aggregate_uuid, identity_prefix: nil}), do: aggregate_uuid
+-  defp stream_uuid(%Aggregate{aggregate_uuid: aggregate_uuid, identity_prefix: identity_prefix}), do: identity_prefix <> aggregate_uuid
+ end
+diff --git a/lib/commanded/aggregates/supervisor.ex b/lib/commanded/aggregates/supervisor.ex
+index e090e30..18b448b 100644
+--- a/lib/commanded/aggregates/supervisor.ex
++++ b/lib/commanded/aggregates/supervisor.ex
+@@ -15,15 +15,15 @@ defmodule Commanded.Aggregates.Supervisor do
+ 
+   Returns `{:ok, aggregate_uuid}` when a process is sucessfully started, or is already running.
+   """
+-  def open_aggregate(aggregate_module, aggregate_uuid, identity_prefix \\ nil)
+-  def open_aggregate(aggregate_module, aggregate_uuid, identity_prefix)
++  def open_aggregate(aggregate_module, aggregate_uuid)
++  def open_aggregate(aggregate_module, aggregate_uuid)
+     when is_integer(aggregate_uuid) or
+          is_atom(aggregate_uuid) or
+          is_bitstring(aggregate_uuid) do
+ 
+     Logger.debug(fn -> "Locating aggregate process for `#{inspect aggregate_module}` with UUID #{inspect aggregate_uuid}" end)
+ 
+-    case Supervisor.start_child(__MODULE__, [aggregate_module, aggregate_uuid, identity_prefix]) do
++    case Supervisor.start_child(__MODULE__, [aggregate_module, aggregate_uuid]) do
+       {:ok, _pid} -> {:ok, aggregate_uuid}
+       {:error, {:already_started, _pid}} -> {:ok, aggregate_uuid}
+       other -> {:error, other}
+diff --git a/lib/commanded/commands/dispatcher.ex b/lib/commanded/commands/dispatcher.ex
+index bff4527..cd49d33 100644
+--- a/lib/commanded/commands/dispatcher.ex
++++ b/lib/commanded/commands/dispatcher.ex
+@@ -51,15 +51,20 @@ defmodule Commanded.Commands.Dispatcher do
+     end
+   end
+ 
+-  defp to_pipeline(%Payload{command: command, consistency: consistency, identity: identity}) do
+-    %Pipeline{command: command, consistency: consistency, identity: identity}
++  defp to_pipeline(%Payload{command: command, consistency: consistency, identity: identity, identity_prefix: identity_prefix}) do
++    %Pipeline{
++      command: command,
++      consistency: consistency,
++      identity: identity,
++      identity_prefix: identity_prefix,
++    }
+   end
+ 
+   defp execute(
+     %Pipeline{assigns: %{aggregate_uuid: aggregate_uuid}} = pipeline,
+-    %Payload{aggregate_module: aggregate_module, identity_prefix: identity_prefix, timeout: timeout} = payload)
++    %Payload{aggregate_module: aggregate_module, timeout: timeout} = payload)
+   do
+-    {:ok, ^aggregate_uuid} = Commanded.Aggregates.Supervisor.open_aggregate(aggregate_module, aggregate_uuid, identity_prefix)
++    {:ok, ^aggregate_uuid} = Commanded.Aggregates.Supervisor.open_aggregate(aggregate_module, aggregate_uuid)
+ 
+     context = to_execution_context(pipeline, payload)
+     task = Task.Supervisor.async_nolink(Commanded.Commands.TaskDispatcher, Aggregates.Aggregate, :execute, [aggregate_module, aggregate_uuid, context, timeout])
+diff --git a/lib/commanded/middleware/extract_aggregate_identity.ex b/lib/commanded/middleware/extract_aggregate_identity.ex
+index fbc48a6..70ea5a3 100644
+--- a/lib/commanded/middleware/extract_aggregate_identity.ex
++++ b/lib/commanded/middleware/extract_aggregate_identity.ex
+@@ -1,6 +1,7 @@
+ defmodule Commanded.Middleware.ExtractAggregateIdentity do
+   @moduledoc """
+-  A `Commanded.Middleware` that extracts the target aggregate's identity from the command
++  A `Commanded.Middleware` that extracts the target aggregate's identity from
++  the command.
+   """
+ 
+   @behaviour Commanded.Middleware
+@@ -16,7 +17,7 @@ defmodule Commanded.Middleware.ExtractAggregateIdentity do
+         |> halt()
+ 
+       aggregate_uuid ->
+-        assign(pipeline, :aggregate_uuid, aggregate_uuid)
++        assign(pipeline, :aggregate_uuid, prefix(aggregate_uuid, pipeline))
+     end
+   end
+ 
+@@ -24,13 +25,21 @@ defmodule Commanded.Middleware.ExtractAggregateIdentity do
+ 
+   def after_failure(%Pipeline{} = pipeline), do: pipeline
+ 
+-  # extract identity using a user-provider function
+-  defp extract_aggregate_uuid(%Pipeline{command: command, identity: identity}) when is_function(identity) do
++  # extract identity using a user defined function
++  defp extract_aggregate_uuid(%Pipeline{command: command, identity: identity})
++    when is_function(identity)
++  do
+     identity.(command)
+   end
+ 
+   # extract identity using a field in the command
+-  defp extract_aggregate_uuid(%Pipeline{command: command, identity: identity}) when is_atom(identity) do
++  defp extract_aggregate_uuid(%Pipeline{command: command, identity: identity})
++    when is_atom(identity)
++  do
+     Map.get(command, identity)
+   end
++
++  defp prefix(aggregate_uuid, %Pipeline{identity_prefix: nil}), do: aggregate_uuid
++  defp prefix(aggregate_uuid, %Pipeline{identity_prefix: identity_prefix}),
++    do: identity_prefix <> aggregate_uuid
+ end
+diff --git a/lib/commanded/middleware/pipeline.ex b/lib/commanded/middleware/pipeline.ex
+index a61cbbf..d3f2949 100644
+--- a/lib/commanded/middleware/pipeline.ex
++++ b/lib/commanded/middleware/pipeline.ex
+@@ -1,19 +1,23 @@
+ defmodule Commanded.Middleware.Pipeline do
+   @moduledoc """
+-  Pipeline is a struct used as an argument in the callback functions of modules implementing the `Commanded.Middleware` behaviour.
++  Pipeline is a struct used as an argument in the callback functions of modules
++  implementing the `Commanded.Middleware` behaviour.
+ 
+-  This struct must be returned by each function to be used in the next middleware based on the configured middleware chain.
++  This struct must be returned by each function to be used in the next
++  middleware based on the configured middleware chain.
+ 
+   ## Pipeline fields
+ 
+-    * `assigns` - shared user data as a map.
+-    * `command` - the command struct being dispatched.
+-    * `consistency` - the requested dispatch consistency, either: `:eventual` (default) or `:strong`
+-    * `identity` - an atom specifying a field in the command containing the
+-                   aggregate's identity or a one-arity function that returns
+-                   an identity from the command being dispatched.
+-    * `halted` - the boolean status on whether the pipeline was halted
+-    * `response` - set the response to send back to the caller
++    * `assigns` - Shared user data as a map.
++    * `command` - Command struct being dispatched.
++    * `consistency` - Requested dispatch consistency, either: `:eventual`
++       (default) or `:strong`
++    * `identity` - An atom specifying a field in the command containing the
++       aggregate's identity or a one-arity function that returns
++       an identity from the command being dispatched.
++    * `identity_prefix` - An optional prefix to the aggregate's identity.
++    * `halted` - Boolean status on whether the pipeline was halted
++    * `response` - Set the response to send back to the caller
+ 
+   """
+ 
+@@ -22,6 +26,7 @@ defmodule Commanded.Middleware.Pipeline do
+     command: nil,
+     consistency: nil,
+     identity: nil,
++    identity_prefix: nil,
+     halted: false,
+     response: nil,
+   ]
+@@ -29,9 +34,11 @@ defmodule Commanded.Middleware.Pipeline do
+   alias Commanded.Middleware.Pipeline
+ 
+   @doc """
+-  Puts the `key` with value equal to `value` into `assigns` map
++  Puts the `key` with value equal to `value` into `assigns` map.
+   """
+-  def assign(%Pipeline{assigns: assigns} = pipeline, key, value) when is_atom(key) do
++  def assign(%Pipeline{assigns: assigns} = pipeline, key, value)
++    when is_atom(key)
++  do
+     %Pipeline{pipeline | assigns: Map.put(assigns, key, value)}
+   end
+ 
+@@ -55,7 +62,7 @@ defmodule Commanded.Middleware.Pipeline do
+   def response(%Pipeline{response: response}), do: response
+ 
+   @doc """
+-  Sets the response to be returned to the dispatch caller, unless already set
++  Sets the response to be returned to the dispatch caller, unless already set.
+   """
+   def respond(%Pipeline{response: nil} = pipeline, response) do
+     %Pipeline{pipeline | response: response}
+@@ -63,7 +70,7 @@ defmodule Commanded.Middleware.Pipeline do
+   def respond(%Pipeline{} = pipeline, _response), do: pipeline
+ 
+   @doc """
+-  Executes the middleware chain
++  Executes the middleware chain.
+   """
+   def chain(pipeline, stage, middleware)
+   def chain(%Pipeline{} = pipeline, _stage, []), do: pipeline

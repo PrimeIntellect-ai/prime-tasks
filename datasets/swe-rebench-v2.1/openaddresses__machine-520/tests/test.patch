@@ -1,0 +1,138 @@
+diff --git a/openaddr/tests/ci.py b/openaddr/tests/ci.py
+index 399d108..9c6dd6d 100644
+--- a/openaddr/tests/ci.py
++++ b/openaddr/tests/ci.py
+@@ -13,11 +13,12 @@ from io import BytesIO, StringIO
+ from mock import patch
+ from time import sleep
+ from uuid import uuid4
++from types import SimpleNamespace
+ import hmac, hashlib, mock
+ 
+ import unittest, json, os, sys, itertools, logging
+ 
+-from flask import Flask
++from flask import Flask, render_template
+ from requests import get, ConnectionError
+ from httmock import HTTMock, response
+ 
+@@ -43,10 +44,12 @@ from ..ci.objects import (
+     read_completed_source_runs
+     )
+ 
++from ..ci import collect
++
+ from ..ci.collect import (
+     is_us_northeast, is_us_midwest, is_us_south, is_us_west, is_europe, is_asia,
+-    add_source_to_zipfile, CollectorPublisher, prepare_collections,
+-    add_csv_to_zipfile, write_to_s3, MULTIPART_CHUNK_SIZE
++    add_source_to_zipfile, CollectorPublisher,
++    prepare_collections, add_csv_to_zipfile, write_to_s3, MULTIPART_CHUNK_SIZE
+     )
+ 
+ from ..ci.tileindex import (
+@@ -3605,7 +3608,9 @@ class TestCollect (unittest.TestCase):
+         '''
+         '''
+         _ = None
+-        test_funcs = is_us_northeast, is_us_midwest, is_us_south, is_us_west, is_europe, is_asia
++        is_south_america = getattr(collect, 'is_south_america', None)
++        self.assertTrue(callable(is_south_america), 'South America classification is available')
++        test_funcs = is_us_northeast, is_us_midwest, is_us_south, is_us_west, is_europe, is_asia, is_south_america
+         
+         for abbr in ('ct', 'me', 'ma', 'nh', 'ri', 'vt', 'nj', 'ny', 'pa'):
+             for source_base in ('us/{}'.format(abbr), 'us/{}.---'.format(abbr), 'us/{}/---'.format(abbr)):
+@@ -3673,6 +3678,93 @@ class TestCollect (unittest.TestCase):
+                     if test_func is not is_asia:
+                         self.assertFalse(test_func(result), '{}("{}") should be false'.format(test_func.__name__, source_base))
+ 
++        for iso in ('ar', 'bo', 'br', 'cl', 'co', 'ec', 'gf', 'gy', 'pe', 'py', 'sr', 'uy', 've'):
++            for source_base in (iso, '{}.---'.format(iso), '{}/---'.format(iso)):
++                result = LocalProcessedResult(source_base, None, RunState(None), None)
++                self.assertTrue(is_south_america(result), 'is_south_america("{}") should be true'.format(source_base))
++
++    def test_south_america_collection_download_is_on_results_page(self):
++        template_dir = join(os.path.dirname(collect.__file__), 'templates')
++        app = Flask(__name__, template_folder=template_dir)
++        apply_webhooks_blueprint(app)
++        apply_webapi_blueprint(app)
++        app.jinja_env.filters.update({
++            'nice_integer': str,
++            'nice_size': str,
++            'breakstate': lambda value: value,
++            'element_id': lambda value: value,
++        })
++
++        south_america_zip = SimpleNamespace(
++            url='https://downloads.example/south_america.zip', content_length=2048)
++        with app.test_request_context('/'):
++            page = render_template(
++                'index.html', s3_bucket='downloads', set=None,
++                zips={('south_america', ''): south_america_zip},
++                additional_runs=0, counts={'addresses': 0, 'processed': 0},
++                last_modified=datetime.now(), states=[])
++
++        link = r'''href\s*=\s*["']https://downloads\.example/south_america\.zip["']'''
++        self.assertRegex(page, link, 'South America extract should be linked from the results page')
++
++    def test_main_south_america_collection(self):
++        ''' Check that the collection pipeline builds a South America collection
++            and classifies South American sources into it.
++        '''
++        tmpdir = mkdtemp(prefix='TestCollect-main-')
++        self.addCleanup(rmtree, tmpdir)
++
++        handle, south_america_zip = mkstemp(suffix='.zip'); close(handle)
++        self.addCleanup(remove, south_america_zip)
++        with ZipFile(south_america_zip, 'w') as zipfile:
++            zipfile.writestr('br.csv', 'LON,LAT\n-46.6,-23.5\n')
++
++        handle, europe_zip = mkstemp(suffix='.zip'); close(handle)
++        self.addCleanup(remove, europe_zip)
++        with ZipFile(europe_zip, 'w') as zipfile:
++            zipfile.writestr('fr.csv', 'LON,LAT\n2.3,48.8\n')
++
++        the_set = SimpleNamespace(owner='openaddresses', repository='openaddresses',
++                                  commit_sha='ff9900', id=1)
++        south_america = LocalProcessedResult('br', south_america_zip, RunState(None), None)
++        europe = LocalProcessedResult('fr', europe_zip, RunState(None), None)
++
++        args = mock.Mock(owner='openaddresses', repository='openaddresses',
++                         bucket=None, sns_arn=None, loglevel=logging.INFO,
++                         database_url=None)
++        uploaded_collections = []
++
++        def record_upload(bucket, filename, keyname, **kwargs):
++            with ZipFile(filename) as archive:
++                uploaded_collections.append((keyname, set(archive.namelist())))
++            return SimpleNamespace(name=keyname)
++
++        with patch('openaddr.ci.collect.parser.parse_args', return_value=args), \
++             patch('openaddr.ci.collect.setup_logger'), \
++             patch('openaddr.ci.collect.S3'), \
++             patch('openaddr.ci.collect.util.prepare_db_kwargs', return_value={}), \
++             patch('openaddr.ci.collect.db_connect'), \
++             patch('openaddr.ci.collect.db_cursor'), \
++             patch('openaddr.ci.collect.read_latest_set', return_value=the_set), \
++             patch('openaddr.ci.collect.read_completed_runs_to_date', return_value=[]), \
++             patch('openaddr.ci.collect.mkdtemp', return_value=tmpdir), \
++             patch('openaddr.ci.collect.rmtree'), \
++             patch('openaddr.ci.collect.iterate_local_processed_files',
++                   return_value=[south_america, europe]), \
++             patch('openaddr.ci.collect.write_to_s3', side_effect=record_upload), \
++             patch('openaddr.ci.collect.util.summarize_result_licenses', return_value='license'), \
++             patch('openaddr.ci.collect.util.s3_key_url', return_value='http://example.com/x.zip'):
++            collect.main()
++
++        south_america_uploads = [names for key, names in uploaded_collections
++                                 if 'south_america' in key]
++        self.assertTrue(south_america_uploads,
++                        'pipeline should upload a South America collection')
++
++        south_america_names = set.union(*south_america_uploads)
++        self.assertIn('br.csv', south_america_names)
++        self.assertNotIn('fr.csv', south_america_names)
++
+     def test_add_source_to_zipfile(self):
+         '''
+         '''

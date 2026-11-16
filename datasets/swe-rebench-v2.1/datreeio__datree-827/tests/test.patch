@@ -1,0 +1,233 @@
+diff --git a/bl/validation/k8sValidator_test.go b/bl/validation/k8sValidator_test.go
+index c7e8aa7..46d212d 100644
+--- a/bl/validation/k8sValidator_test.go
++++ b/bl/validation/k8sValidator_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"path/filepath"
+ 	"sync"
+ 	"testing"
+ 
+@@ -223,10 +224,12 @@ func test_get_all_schema_locations_offline(t *testing.T) {
+ }
+ 
+ func test_validateResource_offline_with_local_schema(t *testing.T) {
++	validationClient := &mockValidationClient{}
++	validationClient.On("Validate", mock.Anything, mock.Anything).Return([]kubeconformValidator.Result{
++		{Status: kubeconformValidator.Error, Err: fmt.Errorf("could not find schema for Deployment")},
++	})
+ 	k8sValidator := &K8sValidator{
+-		validationClient: newKubeconformValidator("1.21.0", false, getAllSchemaLocations([]string{
+-			"some-path-to-non-existing-file-to-get-404.yaml",
+-		}, true)),
++		validationClient:              validationClient,
+ 		isOffline:                     true,
+ 		areThereCustomSchemaLocations: true,
+ 	}
+@@ -241,7 +244,6 @@ func test_validateResource_offline_with_local_schema(t *testing.T) {
+ 
+ func test_validateResource_offline_without_custom_schema_location(t *testing.T) {
+ 	k8sValidator := &K8sValidator{
+-		validationClient:              newKubeconformValidator("1.21.0", false, getAllSchemaLocations([]string{}, true)),
+ 		isOffline:                     true,
+ 		areThereCustomSchemaLocations: false,
+ 	}
+@@ -255,3 +257,69 @@ func test_validateResource_offline_without_custom_schema_location(t *testing.T)
+ 		WarningMessage: "k8s schema validation skipped: no internet connection",
+ 	}, validationWarningResult)
+ }
++
++func TestInitClientPermissiveSchema(t *testing.T) {
++	schemaDir, manifestPath := writePermissiveSchemaFixtures(t)
++
++	runValidation := func(permissive bool) (bool, bool) {
++		validator := New()
++		validator.InitClient("1.21.0", false, []string{schemaDir}, permissive)
++
++		filesConfigurationsChan := make(chan *extractor.FileConfigurations, 1)
++		filesConfigurationsChan <- &extractor.FileConfigurations{
++			FileName:       manifestPath,
++			Configurations: []extractor.Configuration{},
++		}
++		close(filesConfigurationsChan)
++
++		validChan, invalidChan, _ := validator.ValidateResources(filesConfigurationsChan, 1, false)
++		hasValid := false
++		hasInvalid := false
++		for range validChan {
++			hasValid = true
++		}
++		for range invalidChan {
++			hasInvalid = true
++		}
++		return hasValid, hasInvalid
++	}
++
++	strictValid, strictInvalid := runValidation(false)
++	assert.False(t, strictValid, "strict schema validation must reject resources with additional properties")
++	assert.True(t, strictInvalid, "strict schema validation must report the resource as invalid")
++
++	permissiveValid, permissiveInvalid := runValidation(true)
++	assert.True(t, permissiveValid, "permissive schema validation must accept resources with additional properties")
++	assert.False(t, permissiveInvalid, "permissive schema validation must not report the resource as invalid")
++}
++
++func writePermissiveSchemaFixtures(t *testing.T) (string, string) {
++	t.Helper()
++	schemaDir := t.TempDir()
++	strictSchemaDir := filepath.Join(schemaDir, "v1.21.0-standalone-strict")
++	permissiveSchemaDir := filepath.Join(schemaDir, "v1.21.0-standalone")
++	if err := os.MkdirAll(strictSchemaDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(permissiveSchemaDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	strictSchema := `{"type":"object","properties":{"apiVersion":{"type":"string"},"kind":{"type":"string"},"metadata":{"type":"object"},"spec":{"type":"object"}},"additionalProperties":false}`
++	permissiveSchema := `{"type":"object","properties":{"apiVersion":{"type":"string"},"kind":{"type":"string"},"metadata":{"type":"object"},"spec":{"type":"object"}}}`
++
++	if err := os.WriteFile(filepath.Join(strictSchemaDir, "deployment-apps-v1.json"), []byte(strictSchema), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(permissiveSchemaDir, "deployment-apps-v1.json"), []byte(permissiveSchema), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	manifestPath := filepath.Join(schemaDir, "deployment.yaml")
++	manifest := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: test\nspec:\n  replicas: 1\nextraField: hello\n"
++	if err := os.WriteFile(manifestPath, []byte(manifest), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	return schemaDir, manifestPath
++}
+diff --git a/cmd/kustomize/main_test.go b/cmd/kustomize/main_test.go
+index c63a4f7..0a8cff3 100644
+--- a/cmd/kustomize/main_test.go
++++ b/cmd/kustomize/main_test.go
+@@ -137,7 +137,7 @@ func (kv *k8sValidatorMock) GetK8sFiles(filesConfigurationsChan chan *extractor.
+ 	return args.Get(0).(chan *extractor.FileConfigurations), args.Get(1).(chan *extractor.FileConfigurations)
+ }
+ 
+-func (kv *k8sValidatorMock) InitClient(k8sVersion string, ignoreMissingSchemas bool, schemaLocations []string) {
++func (kv *k8sValidatorMock) InitClient(k8sVersion string, ignoreMissingSchemas bool, schemaLocations []string, permissiveSchema bool) {
+ }
+ 
+ type PrinterMock struct {
+diff --git a/cmd/test/main.go b/cmd/test/main.go
+index 4446130..fc8e237 100644
+--- a/cmd/test/main.go
++++ b/cmd/test/main.go
+@@ -45,7 +45,7 @@ type Messager interface {
+ 
+ type K8sValidator interface {
+ 	ValidateResources(filesConfigurations chan *extractor.FileConfigurations, concurrency int, skipSchemaValidation bool) (chan *extractor.FileConfigurations, chan *extractor.InvalidFile, chan *validation.FileWithWarning)
+-	InitClient(k8sVersion string, ignoreMissingSchemas bool, schemaLocations []string)
++	InitClient(k8sVersion string, ignoreMissingSchemas bool, schemaLocations []string, permissiveSchema bool)
+ 	GetK8sFiles(filesConfigurationsChan chan *extractor.FileConfigurations, concurrency int) (chan *extractor.FileConfigurations, chan *extractor.FileConfigurations)
+ }
+ 
+@@ -61,6 +61,7 @@ type TestCommandFlags struct {
+ 	NoRecord             bool
+ 	SkipValidation       string
+ 	SaveRendered         bool
++	PermissiveSchema     bool
+ }
+ 
+ // TestCommandFlags constructor
+@@ -75,6 +76,7 @@ func NewTestCommandFlags() *TestCommandFlags {
+ 		SchemaLocations:      make([]string, 0),
+ 		SkipValidation:       "",
+ 		SaveRendered:         false,
++		PermissiveSchema:     false,
+ 	}
+ }
+ 
+@@ -151,6 +153,7 @@ type TestCommandData struct {
+ 	ClientId              string
+ 	SkipSchemaValidation  bool
+ 	SaveRendered          bool
++	PermissiveSchema      bool
+ }
+ 
+ type TestCommandContext struct {
+@@ -265,7 +268,8 @@ func (flags *TestCommandFlags) AddFlags(cmd *cobra.Command) {
+ 	// kubeconform flag
+ 	cmd.Flags().StringArrayVarP(&flags.SchemaLocations, "schema-location", "", []string{}, "Override schemas location search path (can be specified multiple times)")
+ 	cmd.Flags().BoolVarP(&flags.IgnoreMissingSchemas, "ignore-missing-schemas", "", false, "Ignore missing schemas when executing schema validation step")
+-	cmd.Flags().BoolVarP(&flags.SaveRendered, "save-rendered", "", false, "Don't delete rendered files after the policy check (e.g helm, kustomize)")
++	cmd.Flags().BoolVarP(&flags.SaveRendered, "save-rendered", "", false, "Don't delete rendered files after the policy check (e.g. helm, kustomize)")
++	cmd.Flags().BoolVarP(&flags.PermissiveSchema, "permissive-schema", "", false, "Perform non-strict schema validation (i.e. allow additional properties)")
+ }
+ 
+ func GenerateTestCommandData(testCommandFlags *TestCommandFlags, localConfigContent *localConfig.LocalConfig, evaluationPrerunDataResp *cliClient.EvaluationPrerunDataResponse) (*TestCommandData, error) {
+@@ -321,6 +325,7 @@ func GenerateTestCommandData(testCommandFlags *TestCommandFlags, localConfigCont
+ 		PromptRegistrationURL: evaluationPrerunDataResp.PromptRegistrationURL,
+ 		SkipSchemaValidation:  testCommandFlags.SkipValidation == "schema",
+ 		SaveRendered:          testCommandFlags.SaveRendered,
++		PermissiveSchema:      testCommandFlags.PermissiveSchema,
+ 	}
+ 
+ 	return testCommandOptions, nil
+@@ -490,7 +495,7 @@ func evaluate(ctx *TestCommandContext, filesPaths []string, testCommandData *Tes
+ 
+ 	validationManager := NewValidationManager()
+ 
+-	ctx.K8sValidator.InitClient(testCommandData.K8sVersion, testCommandData.IgnoreMissingSchemas, testCommandData.SchemaLocations)
++	ctx.K8sValidator.InitClient(testCommandData.K8sVersion, testCommandData.IgnoreMissingSchemas, testCommandData.SchemaLocations, testCommandData.PermissiveSchema)
+ 
+ 	concurrency := 100
+ 	var wg sync.WaitGroup
+diff --git a/cmd/test/main_test.go b/cmd/test/main_test.go
+index f31f641..1607cf0 100644
+--- a/cmd/test/main_test.go
++++ b/cmd/test/main_test.go
+@@ -137,7 +137,8 @@ func (kv *K8sValidatorMock) GetK8sFiles(filesConfigurationsChan chan *extractor.
+ 	return args.Get(0).(chan *extractor.FileConfigurations), args.Get(1).(chan *extractor.FileConfigurations)
+ }
+ 
+-func (kv *K8sValidatorMock) InitClient(k8sVersion string, ignoreMissingSchemas bool, schemaLocations []string) {
++func (kv *K8sValidatorMock) InitClient(k8sVersion string, ignoreMissingSchemas bool, schemaLocations []string, permissiveSchema bool) {
++	kv.Called(k8sVersion, ignoreMissingSchemas, schemaLocations, permissiveSchema)
+ }
+ 
+ type PrinterMock struct {
+@@ -242,7 +243,7 @@ func TestTestFlow(t *testing.T) {
+ 			readerMock.On("FilterFiles", mock.Anything).Return(tt.args.path, nil)
+ 			filesExtractorMock.On("ExtractFilesConfigurations", mock.Anything, 100).Return(tt.mock.ExtractFilesConfigurations.filesConfigurationsChan, tt.mock.ExtractFilesConfigurations.invalidFilesChan)
+ 			k8sValidatorMock.On("ValidateResources", mock.Anything, 100).Return(tt.mock.ValidateResources.k8sFilesConfigurationsChan, tt.mock.ValidateResources.k8sInvalidFilesChan, tt.mock.ValidateResources.filesWithWarningsChan)
+-			k8sValidatorMock.On("InitClient", mock.Anything, mock.Anything, mock.Anything).Return()
++			k8sValidatorMock.On("InitClient", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+ 			evaluatorMock.On("Evaluate", mock.Anything, mock.Anything, mock.Anything).Return(tt.mock.Evaluate.policyCheckResultData, tt.mock.Evaluate.err)
+ 			evaluatorMock.On("SendEvaluationResult", mock.Anything).Return(tt.mock.SendEvaluationResult.sendEvaluationResultsResponse, tt.mock.SendEvaluationResult.err)
+ 
+@@ -690,7 +691,7 @@ func setup() {
+ 
+ 	k8sValidatorMock.On("ValidateResources", mock.Anything, mock.Anything, mock.Anything).Return(filesConfigurationsChan, invalidK8sFilesChan, k8sValidationWarningsChan, newErrorsChan())
+ 	k8sValidatorMock.On("GetK8sFiles", mock.Anything, mock.Anything).Return(filesConfigurationsChan, ignoredFilesChan, newErrorsChan())
+-	k8sValidatorMock.On("InitClient", mock.Anything, mock.Anything, mock.Anything).Return()
++	k8sValidatorMock.On("InitClient", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+ 
+ 	filesExtractorMock := &FilesExtractorMock{}
+ 	filesExtractorMock.On("ExtractFilesConfigurations", mock.Anything, 100).Return(filesConfigurationsChan, invalidFilesChan)
+@@ -999,3 +1000,17 @@ func mockGetPreRunData() *cliClient.EvaluationPrerunDataResponse {
+ 	}
+ 	return policiesJson
+ }
++
++func TestTestCommandPermissiveSchemaFlag(t *testing.T) {
++	setup()
++	cmd := New(ctx)
++	flag := cmd.Flags().Lookup("permissive-schema")
++	assert.NotNil(t, flag, "the test command must register a --permissive-schema flag")
++	assert.Equal(t, "false", flag.DefValue)
++}
++
++func TestTestCommandPermissiveSchemaPropagation(t *testing.T) {
++	setup()
++	_ = executeTestCommand(ctx, []string{"valid/path", "--permissive-schema"})
++	k8sValidatorMock.AssertCalled(t, "InitClient", mock.Anything, mock.Anything, mock.Anything, true)
++}

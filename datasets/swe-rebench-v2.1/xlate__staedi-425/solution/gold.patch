@@ -1,0 +1,201 @@
+diff --git a/src/main/java/io/xlate/edi/internal/stream/StaEDIStreamWriter.java b/src/main/java/io/xlate/edi/internal/stream/StaEDIStreamWriter.java
+index 5ce2c42..fc88d0b 100644
+--- a/src/main/java/io/xlate/edi/internal/stream/StaEDIStreamWriter.java
++++ b/src/main/java/io/xlate/edi/internal/stream/StaEDIStreamWriter.java
+@@ -24,8 +24,10 @@ import java.nio.CharBuffer;
+ import java.nio.charset.Charset;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Deque;
+ import java.util.HashMap;
+ import java.util.Iterator;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+@@ -42,6 +44,7 @@ import io.xlate.edi.internal.stream.tokenization.EDIException;
+ import io.xlate.edi.internal.stream.tokenization.EDIFACTDialect;
+ import io.xlate.edi.internal.stream.tokenization.ElementDataHandler;
+ import io.xlate.edi.internal.stream.tokenization.State;
++import io.xlate.edi.internal.stream.tokenization.StreamEvent;
+ import io.xlate.edi.internal.stream.tokenization.ValidationEventHandler;
+ import io.xlate.edi.internal.stream.tokenization.X12Dialect;
+ import io.xlate.edi.internal.stream.validation.UsageError;
+@@ -96,6 +99,9 @@ public class StaEDIStreamWriter implements EDIStreamWriter, ElementDataHandler,
+     private List<EDIValidationException> errors = new ArrayList<>();
+     private CharArraySequence elementHolder = new CharArraySequence();
+ 
++    private final StreamEvent currentEvent = new StreamEvent();
++    private final Deque<StreamEvent> currentEventQueue = new LinkedList<>(Arrays.asList(currentEvent));
++
+     private char segmentTerminator;
+     private char segmentTagTerminator;
+     private char dataElementSeparator;
+@@ -214,7 +220,7 @@ public class StaEDIStreamWriter implements EDIStreamWriter, ElementDataHandler,
+     }
+ 
+     private void ensureLevelBetween(int min, int max) {
+-        ensureFalse(this.level < min || this.level > max);
++        ensureFalse(this.level < min || this.level > max); // NOSONAR - ISE should be thrown when in an illegal state
+     }
+ 
+     @Override
+@@ -527,7 +533,10 @@ public class StaEDIStreamWriter implements EDIStreamWriter, ElementDataHandler,
+             validateElement(this.elementBuffer::flip, this.elementBuffer);
+         }
+         level = LEVEL_SEGMENT;
+-        validate(validator -> validator.validateSyntax(dialect, this, this, location, false));
++        validate(validator -> {
++            validator.clearImplementationCandidates(this);
++            validator.validateSyntax(dialect, this, this, location, false);
++        });
+ 
+         if (state == State.ELEMENT_DATA_BINARY) {
+             state = State.ELEMENT_END_BINARY;
+@@ -981,6 +990,11 @@ public class StaEDIStreamWriter implements EDIStreamWriter, ElementDataHandler,
+             reportElementErrors(validator, elementData);
+         }
+ 
++        if (validator.isPendingDiscrimination()) {
++            currentEvent.update(EDIStreamEvent.ELEMENT_DATA, null, data, null, location);
++            validator.selectImplementation(currentEventQueue, this);
++        }
++
+         if (!errors.isEmpty()) {
+             throw validationExceptionChain(errors);
+         }
+diff --git a/src/main/java/io/xlate/edi/internal/stream/StaEDIXMLStreamReader.java b/src/main/java/io/xlate/edi/internal/stream/StaEDIXMLStreamReader.java
+index b8f136b..6557bfc 100644
+--- a/src/main/java/io/xlate/edi/internal/stream/StaEDIXMLStreamReader.java
++++ b/src/main/java/io/xlate/edi/internal/stream/StaEDIXMLStreamReader.java
+@@ -43,6 +43,7 @@ import io.xlate.edi.stream.EDIInputFactory;
+ import io.xlate.edi.stream.EDINamespaces;
+ import io.xlate.edi.stream.EDIStreamEvent;
+ import io.xlate.edi.stream.EDIStreamReader;
++import io.xlate.edi.stream.EDIValidationException;
+ 
+ final class StaEDIXMLStreamReader implements XMLStreamReader {
+ 
+@@ -251,17 +252,13 @@ final class StaEDIXMLStreamReader implements XMLStreamReader {
+             break;
+ 
+         case SEGMENT_ERROR:
+-            throw new XMLStreamException(String.format("Segment %s has error %s",
+-                                                       ediReader.getText(),
+-                                                       ediReader.getErrorType()),
+-                                         this.location);
+-
+         case ELEMENT_OCCURRENCE_ERROR:
+         case ELEMENT_DATA_ERROR:
+-            throw new XMLStreamException(String.format("Element %s has error %s",
+-                                                       ediReader.getText(),
+-                                                       ediReader.getErrorType()),
+-                                         this.location);
++            EDIValidationException cause = new EDIValidationException(ediEvent,
++                ediReader.getErrorType(),
++                ediReader.getLocation().copy(),
++                ediReader.getText());
++            throw new XMLStreamException("Validation exception reading EDI data as XML", this.location, cause);
+ 
+         default:
+             throw new IllegalStateException("Unknown state: " + ediEvent);
+diff --git a/src/main/java/io/xlate/edi/internal/stream/tokenization/ProxyEventHandler.java b/src/main/java/io/xlate/edi/internal/stream/tokenization/ProxyEventHandler.java
+index 2fad475..2bb0b82 100644
+--- a/src/main/java/io/xlate/edi/internal/stream/tokenization/ProxyEventHandler.java
++++ b/src/main/java/io/xlate/edi/internal/stream/tokenization/ProxyEventHandler.java
+@@ -471,11 +471,7 @@ public class ProxyEventHandler implements EventHandler {
+             completeLevel(startedLevel, startedLevelParentId);
+ 
+             StreamEvent openLevel = getPooledEvent();
+-            openLevel.type = EDIStreamEvent.END_LOOP;
+-            openLevel.errorType = startedLevel.errorType;
+-            openLevel.setData(startedLevel.data);
+-            openLevel.setTypeReference(startedLevel.typeReference);
+-            openLevel.setLocation(startedLevel.location);
++            openLevel.update(EDIStreamEvent.END_LOOP, startedLevel.errorType, startedLevel.data, startedLevel.typeReference, startedLevel.location);
+ 
+             /*
+              * startedLevelId will not be null due to Validator#validateSyntax.
+@@ -595,12 +591,7 @@ public class ProxyEventHandler implements EventHandler {
+                               StaEDIStreamLocation location) {
+ 
+         StreamEvent target = getPooledEvent();
+-
+-        target.type = event;
+-        target.errorType = error;
+-        target.setData(data);
+-        target.setTypeReference(typeReference);
+-        target.setLocation(location);
++        target.update(event, error, data, typeReference, location);
+ 
+         eventQueue.add(target);
+     }
+diff --git a/src/main/java/io/xlate/edi/internal/stream/tokenization/StreamEvent.java b/src/main/java/io/xlate/edi/internal/stream/tokenization/StreamEvent.java
+index 1283b6b..3df0452 100644
+--- a/src/main/java/io/xlate/edi/internal/stream/tokenization/StreamEvent.java
++++ b/src/main/java/io/xlate/edi/internal/stream/tokenization/StreamEvent.java
+@@ -23,6 +23,14 @@ public class StreamEvent {
+ 
+     StaEDIStreamLocation location;
+ 
++    public void update(EDIStreamEvent type, EDIStreamValidationError errorType, CharSequence data, EDIReference typeReference, StaEDIStreamLocation location) {
++        this.type = type;
++        this.errorType = errorType;
++        setData(data);
++        setTypeReference(typeReference);
++        setLocation(location);
++    }
++
+     @Override
+     public String toString() {
+         return String.format(TOSTRING_FORMAT, type, errorType, data, typeReference, location);
+diff --git a/src/main/java/io/xlate/edi/internal/stream/validation/Validator.java b/src/main/java/io/xlate/edi/internal/stream/validation/Validator.java
+index e0ad7f8..9ee4a05 100644
+--- a/src/main/java/io/xlate/edi/internal/stream/validation/Validator.java
++++ b/src/main/java/io/xlate/edi/internal/stream/validation/Validator.java
+@@ -632,7 +632,7 @@ public class Validator {
+             } else if (node.getNodeType() == Type.SEGMENT) {
+                 useErrors.add(new UsageError(segmentNode.getLink(), IMPLEMENTATION_SEGMENT_BELOW_MINIMUM_USE, node.getDepth()));
+             } else {
+-                useErrors.add(new UsageError(segmentNode.getLink(), IMPLEMENTATION_LOOP_OCCURS_UNDER_MINIMUM_TIMES, node.getDepth()));
++                useErrors.add(new UsageError(segmentNode.getParent().getLink(), IMPLEMENTATION_LOOP_OCCURS_UNDER_MINIMUM_TIMES, node.getDepth()));
+             }
+         }
+     }
+@@ -877,7 +877,7 @@ public class Validator {
+             implSeg.incrementUsage();
+ 
+             if (candidate.exceedsMaximumUsage(SEGMENT_VERSION)) {
+-                handler.segmentError(implSeg.getId(), implSeg.getLink(), LOOP_OCCURS_OVER_MAXIMUM_TIMES);
++                handler.segmentError(implSeg.getId(), candidate.getLink(), LOOP_OCCURS_OVER_MAXIMUM_TIMES);
+             }
+         } else {
+             candidate.incrementUsage();
+@@ -1096,7 +1096,8 @@ public class Validator {
+             return true;
+         }
+ 
+-        boolean valueReceived = value != null && value.length() > 0;
++        boolean valueReceived = value.length() > 0;
++
+         clearElements();
+         elementErrors.clear();
+ 
+diff --git a/src/main/java/io/xlate/edi/stream/EDIInputFactory.java b/src/main/java/io/xlate/edi/stream/EDIInputFactory.java
+index 1ef7dd7..025d9cd 100644
+--- a/src/main/java/io/xlate/edi/stream/EDIInputFactory.java
++++ b/src/main/java/io/xlate/edi/stream/EDIInputFactory.java
+@@ -118,11 +118,11 @@ public abstract class EDIInputFactory extends PropertySupport {
+      *             additional information for non-textual event types.
+      */
+     @Deprecated
+-    public static final String EDI_ENABLE_LOOP_TEXT = "io.xlate.edi.stream.EDI_ENABLE_LOOP_TEXT"; //NOSONAR
++    public static final String EDI_ENABLE_LOOP_TEXT = "io.xlate.edi.stream.EDI_ENABLE_LOOP_TEXT"; // NOSONAR
+ 
+     /**
+      * When set to true, simple data elements not containing data will be
+-     * represented via the JSON parsers as a <i>null</i> value.
++     * represented via the JSON parsers as a {@code null} value.
+      *
+      * Default value: false
+      *

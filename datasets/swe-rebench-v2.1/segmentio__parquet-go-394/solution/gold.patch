@@ -1,0 +1,235 @@
+diff --git a/config.go b/config.go
+index 4e2efc2..b18a13a 100644
+--- a/config.go
++++ b/config.go
+@@ -2,6 +2,7 @@ package parquet
+ 
+ import (
+ 	"fmt"
++	"math"
+ 	"runtime/debug"
+ 	"strings"
+ 	"sync"
+@@ -18,6 +19,7 @@ const (
+ 	DefaultDataPageStatistics   = false
+ 	DefaultSkipPageIndex        = false
+ 	DefaultSkipBloomFilters     = false
++	DefaultMaxRowsPerRowGroup   = math.MaxInt64
+ )
+ 
+ const (
+@@ -188,6 +190,7 @@ type WriterConfig struct {
+ 	WriteBufferSize      int
+ 	DataPageVersion      int
+ 	DataPageStatistics   bool
++	MaxRowsPerRowGroup   int64
+ 	KeyValueMetadata     map[string]string
+ 	Schema               *Schema
+ 	SortingColumns       []SortingColumn
+@@ -206,6 +209,7 @@ func DefaultWriterConfig() *WriterConfig {
+ 		WriteBufferSize:      DefaultWriteBufferSize,
+ 		DataPageVersion:      DefaultDataPageVersion,
+ 		DataPageStatistics:   DefaultDataPageStatistics,
++		MaxRowsPerRowGroup:   DefaultMaxRowsPerRowGroup,
+ 	}
+ }
+ 
+@@ -246,6 +250,7 @@ func (c *WriterConfig) ConfigureWriter(config *WriterConfig) {
+ 		WriteBufferSize:      coalesceInt(c.WriteBufferSize, config.WriteBufferSize),
+ 		DataPageVersion:      coalesceInt(c.DataPageVersion, config.DataPageVersion),
+ 		DataPageStatistics:   config.DataPageStatistics,
++		MaxRowsPerRowGroup:   config.MaxRowsPerRowGroup,
+ 		KeyValueMetadata:     keyValueMetadata,
+ 		Schema:               coalesceSchema(c.Schema, config.Schema),
+ 		SortingColumns:       coalesceSortingColumns(c.SortingColumns, config.SortingColumns),
+@@ -370,8 +375,8 @@ func SkipBloomFilters(skip bool) FileOption {
+ // like network storage it can be advantageous to increase this value.
+ //
+ // Defaults to 4096.
+-func ReadBufferSize(sz int) FileOption {
+-	return fileOption(func(config *FileConfig) { config.ReadBufferSize = sz })
++func ReadBufferSize(size int) FileOption {
++	return fileOption(func(config *FileConfig) { config.ReadBufferSize = size })
+ }
+ 
+ // PageBufferSize configures the size of column page buffers on parquet writers.
+@@ -397,6 +402,19 @@ func WriteBufferSize(size int) WriterOption {
+ 	return writerOption(func(config *WriterConfig) { config.WriteBufferSize = size })
+ }
+ 
++// MaxRowsPerRowGroup configures the maximum number of rows that a writer will
++// produce in each row group.
++//
++// This limit is useful to control size of row groups in both number of rows and
++// byte size. While controlling the byte size of a row group is difficult to
++// achieve with parquet due to column encoding and compression, the number of
++// rows remains a useful proxy.
++//
++// Defaults to unlimited.
++func MaxRowsPerRowGroup(numRows int64) WriterOption {
++	return writerOption(func(config *WriterConfig) { config.MaxRowsPerRowGroup = numRows })
++}
++
+ // CreatedBy creates a configuration option which sets the name of the
+ // application that created a parquet file.
+ //
+diff --git a/writer.go b/writer.go
+index 1a1be8a..d9fbf18 100644
+--- a/writer.go
++++ b/writer.go
+@@ -211,9 +211,11 @@ func (w *Writer) ReadRowsFrom(rows RowReader) (written int64, err error) {
+ func (w *Writer) Schema() *Schema { return w.schema }
+ 
+ type writer struct {
+-	buffer *bufio.Writer
+-	writer offsetTrackingWriter
+-	values [][]Value
++	buffer  *bufio.Writer
++	writer  offsetTrackingWriter
++	values  [][]Value
++	numRows int64
++	maxRows int64
+ 
+ 	createdBy string
+ 	metadata  []format.KeyValue
+@@ -240,6 +242,7 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
+ 		w.buffer = bufio.NewWriterSize(output, config.WriteBufferSize)
+ 		w.writer.Reset(w.buffer)
+ 	}
++	w.maxRows = config.MaxRowsPerRowGroup
+ 	w.createdBy = config.CreatedBy
+ 	w.metadata = make([]format.KeyValue, 0, len(config.KeyValueMetadata))
+ 	for k, v := range config.KeyValueMetadata {
+@@ -550,6 +553,7 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
+ 	}
+ 
+ 	defer func() {
++		w.numRows = 0
+ 		for _, c := range w.columns {
+ 			c.reset()
+ 		}
+@@ -653,33 +657,65 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
+ }
+ 
+ func (w *writer) WriteRows(rows []Row) (int, error) {
+-	defer func() {
+-		for i, values := range w.values {
+-			clearValues(values)
+-			w.values[i] = values[:0]
++	return w.writeRows(len(rows), func(start, end int) (int, error) {
++		defer func() {
++			for i, values := range w.values {
++				clearValues(values)
++				w.values[i] = values[:0]
++			}
++		}()
++
++		// TODO: if an error occurs in this method the writer may be left in an
++		// partially functional state. Applications are not expected to continue
++		// using the writer after getting an error, but maybe we could ensure that
++		// we are preventing further use as well?
++		for _, row := range rows[start:end] {
++			for _, value := range row {
++				columnIndex := value.Column()
++				w.values[columnIndex] = append(w.values[columnIndex], value)
++			}
+ 		}
+-	}()
+ 
+-	// TODO: if an error occurs in this method the writer may be left in an
+-	// partially functional state. Applications are not expected to continue
+-	// using the writer after getting an error, but maybe we could ensure that
+-	// we are preventing further use as well?
+-	for _, row := range rows {
+-		for _, value := range row {
+-			columnIndex := value.Column()
+-			w.values[columnIndex] = append(w.values[columnIndex], value)
++		for i, values := range w.values {
++			if len(values) > 0 {
++				if err := w.columns[i].writeRows(values); err != nil {
++					return 0, err
++				}
++			}
+ 		}
+-	}
+ 
+-	for i, values := range w.values {
+-		if len(values) > 0 {
+-			if err := w.columns[i].writeRows(values); err != nil {
+-				return 0, err
++		return end - start, nil
++	})
++}
++
++func (w *writer) writeRows(numRows int, write func(i, j int) (int, error)) (int, error) {
++	written := 0
++
++	for written < numRows {
++		remain := w.maxRows - w.numRows
++		length := numRows - written
++
++		if remain == 0 {
++			remain = w.maxRows
++
++			if err := w.flush(); err != nil {
++				return written, err
+ 			}
+ 		}
++
++		if remain < int64(length) {
++			length = int(remain)
++		}
++
++		n, err := write(written, written+length)
++		written += n
++		w.numRows += int64(n)
++		if err != nil {
++			return written, err
++		}
+ 	}
+ 
+-	return len(rows), nil
++	return written, nil
+ }
+ 
+ // The WriteValues method is intended to work in pair with WritePage to allow
+diff --git a/writer_go18.go b/writer_go18.go
+index 92e0d0e..1145894 100644
+--- a/writer_go18.go
++++ b/writer_go18.go
+@@ -148,22 +148,24 @@ func (w *GenericWriter[T]) Reset(output io.Writer) {
+ }
+ 
+ func (w *GenericWriter[T]) Write(rows []T) (int, error) {
+-	n, err := w.write(w, rows)
+-	if err != nil {
+-		return n, err
+-	}
++	return w.base.writer.writeRows(len(rows), func(i, j int) (int, error) {
++		n, err := w.write(w, rows[i:j:j])
++		if err != nil {
++			return n, err
++		}
+ 
+-	for _, c := range w.base.writer.columns {
+-		c.numValues = int32(c.columnBuffer.NumValues())
++		for _, c := range w.base.writer.columns {
++			c.numValues = int32(c.columnBuffer.NumValues())
+ 
+-		if c.numValues > 0 && c.numValues >= c.maxValues {
+-			if err := c.flush(); err != nil {
+-				return 0, err
++			if c.numValues > 0 && c.numValues >= c.maxValues {
++				if err := c.flush(); err != nil {
++					return 0, err
++				}
+ 			}
+ 		}
+-	}
+ 
+-	return n, nil
++		return n, nil
++	})
+ }
+ 
+ func (w *GenericWriter[T]) WriteRows(rows []Row) (int, error) {

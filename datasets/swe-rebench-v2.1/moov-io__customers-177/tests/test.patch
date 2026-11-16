@@ -1,0 +1,202 @@
+diff --git a/cmd/server/accounts/router_test.go b/cmd/server/accounts/router_test.go
+index 1574a0e..5bd65e1 100644
+--- a/cmd/server/accounts/router_test.go
++++ b/cmd/server/accounts/router_test.go
+@@ -10,21 +10,26 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"github.com/moov-io/customers/internal/testclient"
+-	watchman "github.com/moov-io/watchman/client"
+-	"github.com/stretchr/testify/assert"
++	"mime"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+ 
++	watchman "github.com/moov-io/watchman/client"
++	"github.com/stretchr/testify/assert"
++
++	"github.com/moov-io/customers/internal/testclient"
++
+ 	"github.com/moov-io/base"
++	"github.com/stretchr/testify/require"
++
+ 	"github.com/moov-io/customers/cmd/server/accounts/validator"
+ 	"github.com/moov-io/customers/cmd/server/accounts/validator/testvalidator"
++
+ 	"github.com/moov-io/customers/cmd/server/fed"
+ 	"github.com/moov-io/customers/pkg/client"
+ 	"github.com/moov-io/customers/pkg/secrets"
+-	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/go-kit/kit/log"
+ 	"github.com/gorilla/mux"
+@@ -170,6 +175,166 @@ func TestAccountCreationRequest(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetAccountByID(t *testing.T) {
++	testFedClient := &fed.MockClient{}
++	repo := setupTestAccountRepository(t)
++	validations := &validator.MockRepository{}
++	keeper := secrets.TestStringKeeper(t)
++	validationStrategies := map[validator.StrategyKey]validator.Strategy{
++		{Strategy: "test", Vendor: "moov"}: testvalidator.NewStrategy(),
++	}
++
++	handler := mux.NewRouter()
++	RegisterRoutes(log.NewNopLogger(), handler, repo, validations, testFedClient, keeper, keeper, validationStrategies, createTestOFACSearcher(repo, nil))
++
++	type account struct { // wrapper to associate an account with its customerID
++		customerID string
++		*client.Account
++	}
++
++	var accounts []*account
++	var err error
++	for i := 0; i < 5; i++ {
++		accounts = append(accounts, &account{customerID: base.ID()})
++		accounts[i].Account, err = repo.createCustomerAccount(accounts[i].customerID, base.ID(), &createAccountRequest{
++			AccountNumber: fmt.Sprintf("%d", i),
++			RoutingNumber: "987654320",
++			Type:          client.CHECKING,
++		})
++		require.NoError(t, err)
++	}
++
++	for _, acct := range accounts {
++		res := httptest.NewRecorder()
++		req := httptest.NewRequest("GET", fmt.Sprintf("/customers/%s/accounts/%s", acct.customerID, acct.AccountID), nil)
++		handler.ServeHTTP(res, req)
++		res.Flush()
++
++		require.Equal(t, http.StatusOK, res.Code, res.Body.String())
++		mediaType, _, err := mime.ParseMediaType(res.Header().Get("Content-Type"))
++		require.NoError(t, err)
++		require.Equal(t, "application/json", mediaType)
++
++		var got *client.Account
++		require.NoError(t, json.NewDecoder(res.Body).Decode(&got))
++		require.Equal(t, got, acct.Account)
++	}
++}
++func setupRouterWithFedClient(t *testing.T, repo Repository, fedClient fed.Client) *mux.Router {
++	handler := mux.NewRouter()
++
++	validations := &validator.MockRepository{}
++	keeper := secrets.TestStringKeeper(t)
++	validationStrategies := map[validator.StrategyKey]validator.Strategy{
++		{Strategy: "test", Vendor: "moov"}: testvalidator.NewStrategy(),
++	}
++
++	RegisterRoutes(log.NewNopLogger(), handler, repo, validations, fedClient, keeper, keeper, validationStrategies, createTestOFACSearcher(repo, nil))
++
++	return handler
++}
++
++func TestGetAccountByID__InstitutionDetails(t *testing.T) {
++	accountID := base.ID()
++	repo := &mockRepository{
++		Accounts: []*client.Account{
++			{
++				AccountID:     accountID,
++				RoutingNumber: "987654320",
++			},
++		},
++	}
++	testFedClient := &fed.MockClient{
++		Details: &client.InstitutionDetails{
++			Name:          "Test Bank",
++			RoutingNumber: "987654320",
++		},
++	}
++	handler := setupRouterWithFedClient(t, repo, testFedClient)
++
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", fmt.Sprintf("/customers/%s/accounts/%s", base.ID(), accountID), nil)
++	handler.ServeHTTP(w, req)
++	w.Flush()
++
++	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++
++	var got client.Account
++	require.NoError(t, json.NewDecoder(w.Body).Decode(&got))
++	require.Equal(t, accountID, got.AccountID)
++	require.Equal(t, "Test Bank", got.Institution.Name)
++	require.Equal(t, "987654320", got.Institution.RoutingNumber)
++}
++
++func TestGetAccountByID__NotFound(t *testing.T) {
++	repo := &mockRepository{} // no accounts stored
++	handler := setupRouterWithFedClient(t, repo, &fed.MockClient{})
++
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", fmt.Sprintf("/customers/%s/accounts/%s", base.ID(), base.ID()), nil)
++	handler.ServeHTTP(w, req)
++	w.Flush()
++
++	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
++	require.Contains(t, w.Body.String(), "error")
++}
++
++func TestGetAccountByID__DifferentCustomer(t *testing.T) {
++	customerID, otherCustomerID := base.ID(), base.ID()
++	repo := setupTestAccountRepository(t)
++	account, err := repo.createCustomerAccount(customerID, base.ID(), &createAccountRequest{
++		AccountNumber: "12345",
++		RoutingNumber: "987654320",
++		Type:          client.CHECKING,
++	})
++	require.NoError(t, err)
++
++	handler := setupRouterWithFedClient(t, repo, &fed.MockClient{})
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", fmt.Sprintf("/customers/%s/accounts/%s", otherCustomerID, account.AccountID), nil)
++	handler.ServeHTTP(w, req)
++
++	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
++	var body map[string]interface{}
++	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
++	require.Contains(t, body, "error")
++}
++
++func TestGetAccountByID__RepositoryError(t *testing.T) {
++	repo := &mockRepository{Err: errors.New("bad error")}
++	handler := setupRouterWithFedClient(t, repo, &fed.MockClient{})
++
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", fmt.Sprintf("/customers/%s/accounts/%s", base.ID(), base.ID()), nil)
++	handler.ServeHTTP(w, req)
++	w.Flush()
++
++	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
++	require.Contains(t, w.Body.String(), "error")
++}
++
++func TestGetAccountByID__InstitutionLookupError(t *testing.T) {
++	accountID := base.ID()
++	repo := &mockRepository{
++		Accounts: []*client.Account{
++			{
++				AccountID:     accountID,
++				RoutingNumber: "987654320",
++			},
++		},
++	}
++	testFedClient := &fed.MockClient{Err: errors.New("bad fed")}
++	handler := setupRouterWithFedClient(t, repo, testFedClient)
++
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", fmt.Sprintf("/customers/%s/accounts/%s", base.ID(), accountID), nil)
++	handler.ServeHTTP(w, req)
++	w.Flush()
++
++	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
++	require.Contains(t, w.Body.String(), "error")
++}
++
+ func TestRoutes__DecryptAccountNumber(t *testing.T) {
+ 	customerID := base.ID()
+ 

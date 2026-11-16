@@ -1,0 +1,212 @@
+diff --git a/src/analyzer.rs b/src/analyzer.rs
+index eb85b4f1..822b8128 100644
+--- a/src/analyzer.rs
++++ b/src/analyzer.rs
+@@ -13,8 +13,9 @@ impl<'src> Analyzer<'src> {
+     paths: &HashMap<PathBuf, PathBuf>,
+     asts: &HashMap<PathBuf, Ast<'src>>,
+     root: &Path,
++    name: Option<Name<'src>>,
+   ) -> CompileResult<'src, Justfile<'src>> {
+-    Self::default().justfile(loaded, paths, asts, root)
++    Self::default().justfile(loaded, paths, asts, root, name)
+   }
+ 
+   fn justfile(
+@@ -23,6 +24,7 @@ impl<'src> Analyzer<'src> {
+     paths: &HashMap<PathBuf, PathBuf>,
+     asts: &HashMap<PathBuf, Ast<'src>>,
+     root: &Path,
++    name: Option<Name<'src>>,
+   ) -> CompileResult<'src, Justfile<'src>> {
+     let mut recipes = Vec::new();
+ 
+@@ -33,7 +35,7 @@ impl<'src> Analyzer<'src> {
+ 
+     let mut warnings = Vec::new();
+ 
+-    let mut modules: BTreeMap<String, (Name, Justfile)> = BTreeMap::new();
++    let mut modules: Table<Justfile> = Table::new();
+ 
+     let mut definitions: HashMap<&str, (&'static str, Name)> = HashMap::new();
+ 
+@@ -83,10 +85,7 @@ impl<'src> Analyzer<'src> {
+           Item::Module { absolute, name, .. } => {
+             if let Some(absolute) = absolute {
+               define(*name, "module", false)?;
+-              modules.insert(
+-                name.lexeme().into(),
+-                (*name, Self::analyze(loaded, paths, asts, absolute)?),
+-              );
++              modules.insert(Self::analyze(loaded, paths, asts, absolute, Some(*name))?);
+             }
+           }
+           Item::Recipe(recipe) => {
+@@ -149,6 +148,8 @@ impl<'src> Analyzer<'src> {
+     let root = paths.get(root).unwrap();
+ 
+     Ok(Justfile {
++      aliases,
++      assignments: self.assignments,
+       default: recipes
+         .values()
+         .filter(|recipe| recipe.name.path == root)
+@@ -160,16 +161,12 @@ impl<'src> Analyzer<'src> {
+             Rc::clone(next)
+           }),
+         }),
+-      aliases,
+-      assignments: self.assignments,
+       loaded: loaded.into(),
++      modules,
++      name,
+       recipes,
+       settings,
+       warnings,
+-      modules: modules
+-        .into_iter()
+-        .map(|(name, (_name, justfile))| (name, justfile))
+-        .collect(),
+     })
+   }
+ 
+diff --git a/src/compiler.rs b/src/compiler.rs
+index ac3dfc75..066c135b 100644
+--- a/src/compiler.rs
++++ b/src/compiler.rs
+@@ -106,7 +106,7 @@ impl Compiler {
+       asts.insert(current.path, ast.clone());
+     }
+ 
+-    let justfile = Analyzer::analyze(&loaded, &paths, &asts, root)?;
++    let justfile = Analyzer::analyze(&loaded, &paths, &asts, root, None)?;
+ 
+     Ok(Compilation {
+       asts,
+@@ -182,7 +182,7 @@ impl Compiler {
+     asts.insert(root.clone(), ast);
+     let mut paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+     paths.insert(root.clone(), root.clone());
+-    Analyzer::analyze(&[], &paths, &asts, &root)
++    Analyzer::analyze(&[], &paths, &asts, &root, None)
+   }
+ }
+ 
+diff --git a/src/justfile.rs b/src/justfile.rs
+index 0f1bdabf..57fdb54e 100644
+--- a/src/justfile.rs
++++ b/src/justfile.rs
+@@ -16,7 +16,9 @@ pub(crate) struct Justfile<'src> {
+   pub(crate) default: Option<Rc<Recipe<'src>>>,
+   #[serde(skip)]
+   pub(crate) loaded: Vec<PathBuf>,
+-  pub(crate) modules: BTreeMap<String, Justfile<'src>>,
++  pub(crate) modules: Table<'src, Justfile<'src>>,
++  #[serde(skip)]
++  pub(crate) name: Option<Name<'src>>,
+   pub(crate) recipes: Table<'src, Rc<Recipe<'src>>>,
+   pub(crate) settings: Settings<'src>,
+   pub(crate) warnings: Vec<Warning>,
+@@ -401,6 +403,10 @@ impl<'src> Justfile<'src> {
+     }
+   }
+ 
++  pub(crate) fn name(&self) -> &'src str {
++    self.name.map(|name| name.lexeme()).unwrap_or_default()
++  }
++
+   fn run_recipe(
+     arguments: &[String],
+     context: &RecipeContext<'src, '_>,
+@@ -465,7 +471,22 @@ impl<'src> Justfile<'src> {
+     Ok(())
+   }
+ 
+-  pub(crate) fn public_recipes(&self, source_order: bool) -> Vec<&Recipe<'src, Dependency>> {
++  pub(crate) fn modules(&self, config: &Config) -> Vec<&Justfile> {
++    let mut modules = self.modules.values().collect::<Vec<&Justfile>>();
++
++    if config.unsorted {
++      modules.sort_by_key(|module| {
++        module
++          .name
++          .map(|name| name.token.offset)
++          .unwrap_or_default()
++      });
++    }
++
++    modules
++  }
++
++  pub(crate) fn public_recipes(&self, config: &Config) -> Vec<&Recipe<'src, Dependency>> {
+     let mut recipes = self
+       .recipes
+       .values()
+@@ -473,7 +494,7 @@ impl<'src> Justfile<'src> {
+       .filter(|recipe| recipe.is_public())
+       .collect::<Vec<&Recipe<Dependency>>>();
+ 
+-    if source_order {
++    if config.unsorted {
+       recipes.sort_by_key(|recipe| {
+         (
+           self
+@@ -531,6 +552,12 @@ impl<'src> ColorDisplay for Justfile<'src> {
+   }
+ }
+ 
++impl<'src> Keyed<'src> for Justfile<'src> {
++  fn key(&self) -> &'src str {
++    self.name()
++  }
++}
++
+ #[cfg(test)]
+ mod tests {
+   use super::*;
+diff --git a/src/subcommand.rs b/src/subcommand.rs
+index 024bd5b9..18af7c03 100644
+--- a/src/subcommand.rs
++++ b/src/subcommand.rs
+@@ -223,7 +223,7 @@ impl Subcommand {
+     while let Some(module) = stack.pop() {
+       recipes.extend(
+         module
+-          .public_recipes(config.unsorted)
++          .public_recipes(config)
+           .iter()
+           .filter(|recipe| recipe.min_arguments() == 0),
+       );
+@@ -532,7 +532,7 @@ impl Subcommand {
+ 
+     let groups = {
+       let mut groups = BTreeMap::<Option<String>, Vec<&Recipe>>::new();
+-      for recipe in justfile.public_recipes(config.unsorted) {
++      for recipe in justfile.public_recipes(config) {
+         let recipe_groups = recipe.groups();
+         if recipe_groups.is_empty() {
+           groups.entry(None).or_default().push(recipe);
+@@ -592,12 +592,12 @@ impl Subcommand {
+       }
+     }
+ 
+-    for (i, (name, module)) in justfile.modules.iter().enumerate() {
++    for (i, module) in justfile.modules(config).into_iter().enumerate() {
+       if i + groups.len() > 0 {
+         println!();
+       }
+ 
+-      println!("{}{name}:", config.list_prefix.repeat(level + 1));
++      println!("{}{}:", config.list_prefix.repeat(level + 1), module.name());
+       Self::list(config, level + 1, module);
+     }
+   }
+@@ -637,7 +637,7 @@ impl Subcommand {
+   ) {
+     let path = components.join("::");
+ 
+-    for recipe in justfile.public_recipes(config.unsorted) {
++    for recipe in justfile.public_recipes(config) {
+       if *printed > 0 {
+         print!(" ");
+       }
