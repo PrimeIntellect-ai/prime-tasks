@@ -1,8 +1,0 @@
-apt-get update && apt-get install -y python3 python3-pip ffmpeg
-    pip3 install pytest flask fastapi uvicorn numpy pillow opencv-python-headless requests
-
-    mkdir -p /app
-    ffmpeg -f lavfi -i testsrc=duration=5:size=320x240:rate=10 -c:v libx264 /app/dashcam.mp4
-
-    useradd -m -s /bin/bash user || true
-    chmod -R 777 /home/user

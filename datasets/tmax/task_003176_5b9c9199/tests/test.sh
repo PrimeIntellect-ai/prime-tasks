@@ -1,16 +1,30 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+# test_final_state.py
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import os
+import pytest
+
+def test_self_cite_count_file_exists():
+    """Check if the output file was created."""
+    output_file = "/home/user/self_cite_count.txt"
+    assert os.path.isfile(output_file), f"Output file {output_file} does not exist."
+
+def test_self_cite_count_value():
+    """Check if the output file contains the correct self-citation count."""
+    output_file = "/home/user/self_cite_count.txt"
+
+    with open(output_file, 'r') as f:
+        content = f.read().strip()
+
+    assert content == "7", f"Expected count to be '7', but got '{content}'."
+TEST_EOF
+
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

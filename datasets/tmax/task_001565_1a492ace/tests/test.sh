@@ -1,16 +1,182 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import os
+import secrets
+import shutil
+import stat
+import subprocess
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import pytest
+
+PIPELINE = "/home/user/run_pipeline.py"
+SOURCE = "/home/user/source/legacy_batch.py"
+DEPLOY = "/home/user/deploy"
+ACTIVE = "/home/user/deploy/active_batch.py"
+LOG = "/home/user/deploy/logs/execution.log"
+
+REFERENCE = b'''#!/usr/bin/env python3
+import os
+import sys
+import stat
+import subprocess
+import datetime
+
+def main():
+    log_dir = "/home/user/deploy/logs"
+    log_file = os.path.join(log_dir, "execution.log")
+
+    # 1. Check if running from correct location
+    if not os.path.abspath(__file__).startswith("/home/user/deploy/"):
+        print("Error: Not running from deploy directory.")
+        sys.exit(1)
+
+    # 2. Check permissions (0500)
+    st = os.stat(__file__)
+    perms = stat.S_IMODE(st.st_mode)
+    if perms != 0o500:
+        print(f"Error: Incorrect permissions. Expected 0500, got {oct(perms)}")
+        sys.exit(1)
+
+    # 3. Check environment variables
+    if os.environ.get("TZ") != "Pacific/Fiji":
+        print("Error: TZ environment variable not set to Pacific/Fiji")
+        sys.exit(1)
+
+    if os.environ.get("MIGRATION_LOCALE") != "C.UTF-8":
+        print("Error: MIGRATION_LOCALE environment variable not set to C.UTF-8")
+        sys.exit(1)
+
+    # 4. Write log file (ACL inheritance will be checked by test suite)
+    with open(log_file, "w") as f:
+        f.write("MIGRATION_SUCCESSFUL\\n")
+        f.write(f"Executed at: {datetime.datetime.now()}\\n")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def clean_deploy():
+    shutil.rmtree(DEPLOY, ignore_errors=True)
+
+
+def run_pipeline():
+    result = subprocess.run(
+        ["runuser", "-u", "user", "--", "python3", PIPELINE],
+        cwd="/home/user",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"Pipeline exited with {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def assert_regular_copy(expected):
+    assert os.path.exists(ACTIVE), f"File {ACTIVE} does not exist."
+    assert stat.S_ISREG(os.lstat(ACTIVE).st_mode), f"{ACTIVE} is not a regular file."
+    with open(ACTIVE, "rb") as f:
+        assert f.read() == expected, "active_batch.py is not an exact copy of the supplied artifact."
+
+
+@pytest.fixture(scope="session", autouse=True)
+def execute_and_exercise_pipeline():
+    assert os.path.exists(PIPELINE), f"Required pipeline script {PIPELINE} does not exist."
+    assert stat.S_ISREG(os.lstat(PIPELINE).st_mode), f"{PIPELINE} is not a regular file."
+
+    with open(SOURCE, "rb") as f:
+        original = f.read()
+    assert original == REFERENCE, "The supplied legacy artifact was modified."
+
+    # First run from a clean state against the supplied legacy artifact.
+    clean_deploy()
+    run_pipeline()
+    assert_regular_copy(REFERENCE)
+    assert os.path.exists(LOG), "The legacy script did not generate execution.log."
+    with open(LOG, "r") as f:
+        assert "MIGRATION_SUCCESSFUL" in f.read()
+
+    # Exercise the pipeline with a fresh artifact so a pre-fabricated log or
+    # hard-coded active_batch.py cannot satisfy the verifier.
+    token = "PIPELINE_PROBE_" + secrets.token_hex(24)
+    probe = f'''#!/usr/bin/env python3
+import os
+import stat
+import sys
+
+if os.path.abspath(__file__) != "/home/user/deploy/active_batch.py":
+    sys.exit(21)
+if stat.S_IMODE(os.stat(__file__).st_mode) != 0o500:
+    sys.exit(22)
+if os.environ.get("TZ") != "Pacific/Fiji":
+    sys.exit(23)
+if os.environ.get("MIGRATION_LOCALE") != "C.UTF-8":
+    sys.exit(24)
+with open("/home/user/deploy/logs/execution.log", "w") as f:
+    f.write({token!r} + "\\n")
+'''.encode()
+
+    try:
+        with open(SOURCE, "wb") as f:
+            f.write(probe)
+        os.chmod(SOURCE, 0o644)
+        clean_deploy()
+        run_pipeline()
+        assert_regular_copy(probe)
+        with open(LOG, "r") as f:
+            assert f.read() == token + "\n", "The probe artifact was not actually executed."
+    finally:
+        with open(SOURCE, "wb") as f:
+            f.write(REFERENCE)
+        os.chmod(SOURCE, 0o644)
+
+    # Leave and verify the required final state using the original artifact.
+    clean_deploy()
+    run_pipeline()
+    assert_regular_copy(REFERENCE)
+
+
+def test_active_batch_permissions():
+    """Verify that active_batch.py exists and has 0500 permissions."""
+    path = ACTIVE
+    assert os.path.exists(path), f"File {path} does not exist."
+
+    st = os.stat(path)
+    perms = stat.S_IMODE(st.st_mode)
+    assert perms == 0o500, f"Incorrect permissions for {path}. Expected 0o500, got {oct(perms)}."
+
+
+def test_execution_log_exists_and_content():
+    """Verify that execution.log was generated by the legacy script with correct content."""
+    path = LOG
+    assert os.path.exists(path), f"Log file {path} was not generated. The pipeline script might not have executed the legacy script correctly."
+
+    with open(path, "r") as f:
+        content = f.read()
+    assert "MIGRATION_SUCCESSFUL" in content, f"Log file {path} does not contain 'MIGRATION_SUCCESSFUL'. Execution may have failed."
+
+
+def test_logs_directory_acl():
+    """Verify that the logs directory has the correct default ACLs."""
+    path = "/home/user/deploy/logs"
+    assert os.path.isdir(path), f"Directory {path} does not exist."
+
+    result = subprocess.run(["getfacl", path], capture_output=True, text=True)
+    assert result.returncode == 0, f"Failed to run getfacl on {path}."
+
+    stdout = result.stdout
+    assert "default:user::rw-" in stdout, f"Default ACL for user is not rw-. getfacl output:\n{stdout}"
+    assert "default:group::---" in stdout, f"Default ACL for group is not ---. getfacl output:\n{stdout}"
+    assert "default:other::---" in stdout, f"Default ACL for other is not ---. getfacl output:\n{stdout}"
+TEST_EOF
+
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

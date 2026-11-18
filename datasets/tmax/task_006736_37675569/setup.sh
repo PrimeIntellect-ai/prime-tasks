@@ -1,0 +1,27 @@
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update && apt-get install -y python3 python3-pip coreutils gawk sed grep
+pip3 install pytest
+
+mkdir -p /home/user
+
+# Using base64 to avoid forbidden template variables in the def file
+cat << 'EOF' | base64 -d > /home/user/api_parser.py
+IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwppbXBvcnQgc3lzCmltcG9ydCB1cmxsaWIucGFyc2UKaW1w
+b3J0IGJhc2U2NAoKZGVmIHBhcnNlX3VybCh1cmwpOgogICAgcGFyc2VkID0gdXJsbGliLnBhcnNl
+LnVybHBhcnNlKHVybCkKICAgIHBhcmFtcyA9IHVybGxpYi5wYXJzZS5wYXJzZV9xcyhwYXJzZWQu
+cXVlcnkpCiAgICAKICAgIGlkX3ZhbCA9IHBhcmFtcy5nZXQoJ2lkJywgWycnXSlbMF0KICAgIHBh
+eWxvYWRfdmFsID0gcGFyYW1zLmdldCgncGF5bG9hZCcsIFsnJ10pWzBdCiAgICAKICAgIGRlY29k
+ZWRfcGF5bG9hZCA9ICIiCiAgICBpZiBwYXlsb2FkX3ZhbDoKICAgICAgICB0cnk6CiAgICAgICAg
+ICAgIGRlY29kZWRfcGF5bG9hZCA9IGJhc2U2NC5iNjRkZWNvZGUocGF5bG9hZF92YWwpLmRlY29k
+ZSgndXRmLTgnKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKICAg
+ICAgICAgICAgCiAgICBwcmludChmJ3t7ImlkIjogIntpZF92YWx9IiwgImRhdGEiOiAie2RlY29k
+ZWRfcGF5bG9hZH0ifX0nKQoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIGlmIGxlbihz
+eXMuYXJndikgPiAxOgogICAgICAgIHBhcnNlX3VybChzeXMuYXJndlsxXSkK
+EOF
+
+chmod +x /home/user/api_parser.py
+
+useradd -m -s /bin/bash user || true
+chmod -R 777 /home/user

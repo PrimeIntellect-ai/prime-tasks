@@ -1,5 +1,0 @@
-apt-get update && apt-get install -y python3 python3-pip g++ libeigen3-dev nlohmann-json3-dev
-    pip3 install pytest numpy
-
-    useradd -m -s /bin/bash user || true
-    chmod -R 777 /home/user

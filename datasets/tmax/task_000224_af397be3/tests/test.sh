@@ -1,16 +1,205 @@
 #!/bin/bash
 set -e
-
 mkdir -p /logs/verifier
 
-cd /tests
-python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
-TEST_EXIT=${PIPESTATUS[0]}
+cat << 'TEST_EOF' > /tmp/test_final_state.py
+import hashlib
+import json
+import math
+import os
+import subprocess
 
-if [ $TEST_EXIT -eq 0 ]; then
-    echo 1 > /logs/verifier/reward.txt
+import numpy as np
+import pytest
+from scipy.interpolate import PPoly, UnivariateSpline
+from scipy.stats import shapiro
+
+BINARY = "/home/user/spectro_sim"
+DATA_DIR = "/home/user/sim_data"
+SCRIPT = "/home/user/analyze.py"
+REPORT = "/home/user/report.json"
+
+
+def load_run(path):
+    with open(path, "r") as f:
+        lines = f.readlines()
+    assert len(lines) == 1000, f"{path} does not contain exactly 1000 lines."
+    try:
+        values = np.array([float(line.strip()) for line in lines], dtype=float)
+    except ValueError:
+        pytest.fail(f"Contents of {path} are not valid floating-point numbers.")
+    assert np.all(np.isfinite(values)), f"{path} contains non-finite values."
+    return values
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+
+def independently_compute_report(runs):
+    x = np.arange(1000, dtype=float)
+    peaks = []
+
+    for index, y in enumerate(runs):
+        spline = UnivariateSpline(x, y, s=0.5)
+        # Convert the fitted spline to a piecewise polynomial so all roots of
+        # its first derivative can be obtained without trusting analyze.py.
+        derivative = PPoly.from_spline(spline._eval_args).derivative()
+        roots = np.asarray(derivative.roots(extrapolate=False), dtype=float)
+        roots = roots[np.isfinite(roots)]
+        roots = roots[(roots >= 0.0) & (roots <= 999.0)]
+        assert roots.size > 0, f"No in-domain spline derivative roots for run {index}."
+        peak = float(roots[np.argmax(spline(roots))])
+        peaks.append(peak)
+
+    peaks = np.asarray(peaks, dtype=float)
+    statistic, p_value = shapiro(peaks)
+    return {
+        "mean_peak": float(np.mean(peaks)),
+        "population_variance": float(np.var(peaks, ddof=0)),
+        "sample_variance": float(np.var(peaks, ddof=1)),
+        "shapiro_statistic": float(statistic),
+        "shapiro_p_value": float(p_value),
+        "is_reproducible": bool(np.var(peaks, ddof=0) == 0.0),
+    }
+
+
+def test_compiled_binary_exists_and_runs():
+    assert os.path.exists(BINARY), f"Compiled binary {BINARY} does not exist."
+    assert os.path.isfile(BINARY), f"{BINARY} is not a file."
+    assert os.access(BINARY, os.X_OK), f"{BINARY} is not executable."
+
+    with open(BINARY, "rb") as f:
+        assert f.read(4) == b"\x7fELF", f"{BINARY} is not a compiled ELF binary."
+
+    linked = subprocess.run(
+        ["ldd", BINARY], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, timeout=30, check=True
+    ).stdout
+    assert "libgomp" in linked, f"{BINARY} is not linked with OpenMP support."
+
+    result = subprocess.run(
+        [BINARY], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=180, check=True
+    )
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1000, "The compiled simulator did not output exactly 1000 lines."
+    try:
+        fresh = np.asarray([float(line.strip()) for line in lines], dtype=float)
+    except ValueError:
+        pytest.fail("The compiled simulator produced non-floating-point output.")
+    assert np.all(np.isfinite(fresh)), "The compiled simulator produced non-finite values."
+
+    # Saved runs must be plausible outputs of the executable. Floating-point
+    # reduction order changes low-order bits, so use a small numerical tolerance.
+    for i in range(100):
+        saved = load_run(os.path.join(DATA_DIR, f"run_{i}.txt"))
+        assert np.allclose(saved, fresh, rtol=2e-3, atol=0.1), \
+            f"run_{i}.txt is not consistent with output from {BINARY}."
+
+
+def test_generated_data_files():
+    assert os.path.exists(DATA_DIR), f"Directory {DATA_DIR} does not exist."
+    assert os.path.isdir(DATA_DIR), f"{DATA_DIR} is not a directory."
+
+    hashes = set()
+    for i in range(100):
+        path = os.path.join(DATA_DIR, f"run_{i}.txt")
+        assert os.path.exists(path), f"Data file {path} is missing."
+        assert os.path.isfile(path), f"{path} is not a file."
+        load_run(path)
+        hashes.add(file_hash(path))
+    assert len(hashes) > 1, "All 100 saved run files are byte-identical."
+
+
+def test_analyze_script_exists():
+    assert os.path.exists(SCRIPT), f"Python script {SCRIPT} does not exist."
+    assert os.path.isfile(SCRIPT), f"{SCRIPT} is not a file."
+
+
+def test_report_json_matches_independent_analysis():
+    # Preserve the original assertion that the workflow already produced a report.
+    assert os.path.exists(REPORT), f"Report file {REPORT} does not exist."
+    assert os.path.isfile(REPORT), f"{REPORT} is not a file."
+
+    paths = [os.path.join(DATA_DIR, f"run_{i}.txt") for i in range(100)]
+    hashes_before = [file_hash(path) for path in paths]
+
+    # Ensure the report is actually generated by the submitted analysis script.
+    os.remove(REPORT)
+    result = subprocess.run(
+        ["python3", SCRIPT], cwd="/home/user", text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180
+    )
+    assert result.returncode == 0, \
+        f"analyze.py failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert os.path.exists(REPORT), "analyze.py did not create /home/user/report.json."
+    assert os.path.isfile(REPORT), f"{REPORT} is not a file."
+    assert hashes_before == [file_hash(path) for path in paths], \
+        "analyze.py modified the collected simulation data."
+
+    with open(REPORT, "r") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            pytest.fail(f"Failed to parse {REPORT} as JSON: {e}")
+
+    required_keys = {
+        "mean_peak": float,
+        "variance_peak": float,
+        "shapiro_statistic": float,
+        "shapiro_p_value": float,
+        "is_reproducible": bool,
+    }
+    assert set(data) == set(required_keys), f"{REPORT} does not have exactly the required keys."
+    for key, expected_type in required_keys.items():
+        assert key in data, f"Missing key '{key}' in {REPORT}."
+        if expected_type is bool:
+            assert isinstance(data[key], bool), f"Key '{key}' is not a boolean."
+        else:
+            assert isinstance(data[key], (int, float)) and not isinstance(data[key], bool), \
+                f"Key '{key}' is not numeric."
+            assert math.isfinite(float(data[key])), f"Key '{key}' is not finite."
+
+    runs = [load_run(path) for path in paths]
+    expected = independently_compute_report(runs)
+
+    assert data["is_reproducible"] is False, \
+        "is_reproducible should be false due to non-deterministic floating-point errors."
+    assert data["variance_peak"] > 0.0, "variance_peak should be greater than 0.0."
+    assert 400 < data["mean_peak"] < 600, \
+        f"mean_peak {data['mean_peak']} is out of expected bounds (400, 600)."
+    assert expected["population_variance"] > 0.0, \
+        "The independently computed peak locations do not demonstrate a shift."
+
+    assert math.isclose(float(data["mean_peak"]), expected["mean_peak"], rel_tol=0.0, abs_tol=5e-5), \
+        "mean_peak does not match the peaks independently recomputed from the 100 runs."
+
+    # The instruction does not specify population versus sample variance, so
+    # accept either conventional definition while requiring the real result.
+    reported_variance = float(data["variance_peak"])
+    variance_matches = any(
+        math.isclose(reported_variance, candidate, rel_tol=5e-3, abs_tol=1e-12)
+        for candidate in (expected["population_variance"], expected["sample_variance"])
+    )
+    assert variance_matches, \
+        "variance_peak does not match the independently recomputed peak variance."
+
+    assert math.isclose(float(data["shapiro_statistic"]), expected["shapiro_statistic"],
+                        rel_tol=1e-4, abs_tol=1e-6), \
+        "shapiro_statistic does not match scipy.stats.shapiro on the recomputed peaks."
+    assert math.isclose(float(data["shapiro_p_value"]), expected["shapiro_p_value"],
+                        rel_tol=1e-4, abs_tol=1e-6), \
+        "shapiro_p_value does not match scipy.stats.shapiro on the recomputed peaks."
+    assert data["is_reproducible"] is expected["is_reproducible"], \
+        "is_reproducible is inconsistent with the independently computed variance."
+TEST_EOF
+
+if python3 -m pytest --noconftest -c /dev/null -p no:cacheprovider /tmp/test_final_state.py -x --tb=short 2>&1; then
+    echo "1" > /logs/verifier/reward.txt
 else
-    echo 0 > /logs/verifier/reward.txt
+    echo "0" > /logs/verifier/reward.txt
 fi
-
-exit 0

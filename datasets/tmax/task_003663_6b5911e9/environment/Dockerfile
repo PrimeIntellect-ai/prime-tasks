@@ -1,16 +1,4 @@
-FROM ubuntu:22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LC_ALL=C.UTF-8
-ENV LANG=C.UTF-8
-ENV GOPATH=/home/user/go
-ENV PATH=/home/user/go/bin:/home/user/.cargo/bin:$PATH
-
-COPY base_install.sh /tmp/base_install.sh
-RUN bash /tmp/base_install.sh && rm /tmp/base_install.sh
-
-COPY _fixtures/app/fixtures/audio.wav /app/fixtures/audio.wav
-COPY _fixtures/app/fixtures/audio.label.txt /app/fixtures/audio.label.txt
-
-COPY post_install.sh /tmp/post_install.sh
-RUN bash /tmp/post_install.sh && rm /tmp/post_install.sh
+FROM --platform=linux/amd64 hamishi740/swerl-tmax-v3:d028faea1274
+USER root
+RUN mkdir -p /workspace /output /logs/verifier /root && ([ -d /app ] || ln -sf /workspace /app)
+WORKDIR /app
